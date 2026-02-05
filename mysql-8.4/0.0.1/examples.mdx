@@ -1,0 +1,292 @@
+---
+title: Extension Examples
+description: Learn from the vsql_complex reference implementation using the VEF SDK
+---
+
+The `vsql_complex` extension is VillageSQL's reference implementation for custom types using the VEF SDK—demonstrating production-ready extension patterns.
+
+**Source:** `villagesql/examples/vsql_complex/` in [VillageSQL repository](https://github.com/villagesql/villagesql-server/tree/main/villagesql/examples/vsql-complex)
+
+---
+
+## What vsql_complex Provides
+
+COMPLEX type for complex numbers (a + bi) with arithmetic, utilities, and aggregation.
+
+**Usage Example:**
+```sql
+INSTALL EXTENSION 'vsql_complex';
+
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX
+);
+
+INSERT INTO signals VALUES (1, COMPLEX(50.0, 10.0));
+
+SELECT
+    complex_real(impedance) as resistance,
+    complex_imag(impedance) as reactance,
+    complex_abs(impedance) as magnitude
+FROM signals;
+```
+
+---
+
+## Directory Structure
+
+```
+vsql_complex/
+├── CMakeLists.txt       # Build config with VEF_CREATE_VEB
+├── manifest.json        # Extension metadata
+├── src/
+│   ├── complex.h        # Type operations declarations
+│   ├── complex.cc       # Encode/decode/compare/hash/arithmetic
+│   └── complex_funcs.cc # VEF registration with VEF_GENERATE_ENTRY_POINTS
+└── test/
+    ├── t/*.test         # Test cases
+    └── r/*.result       # Expected results
+```
+
+---
+
+## VEF Registration Pattern
+
+**File: `src/complex_funcs.cc`**
+
+vsql_complex uses the VEF SDK with `VEF_GENERATE_ENTRY_POINTS()`:
+
+```cpp
+#include <villagesql/extension.h>
+#include <villagesql/func_builder.h>
+#include <villagesql/type_builder.h>
+#include "complex.h"
+
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("vsql_complex", "0.0.1")
+
+    // Register COMPLEX type with comparison (enables ORDER BY)
+    .type(make_type(COMPLEX)
+      .persisted_length(16)
+      .max_decode_buffer_length(64)
+      .encode(&complex::encode_complex)
+      .decode(&complex::decode_complex)
+      .compare(&complex::cmp_complex)
+      .build())
+
+    // Register COMPLEX2 type with custom hash
+    .type(make_type(COMPLEX2)
+      .persisted_length(16)
+      .max_decode_buffer_length(64)
+      .encode(&complex::encode_complex2)
+      .decode(&complex::decode_complex)
+      .compare(&complex::cmp_complex)
+      .hash(&complex::hash_complex2)
+      .build())
+
+    // Arithmetic operations
+    .func(make_func("complex_add")
+      .returns(COMPLEX)
+      .param(COMPLEX)
+      .param(COMPLEX)
+      .wrap<&complex_add_impl>())
+
+    .func(make_func("complex_multiply")
+      .returns(COMPLEX)
+      .param(COMPLEX)
+      .param(COMPLEX)
+      .wrap<&complex_multiply_impl>())
+
+    // Utility functions
+    .func(make_func("complex_real")
+      .returns(REAL)
+      .param(COMPLEX)
+      .wrap<&complex_real_impl>())
+
+    .func(make_func("complex_abs")
+      .returns(REAL)
+      .param(COMPLEX)
+      .wrap<&complex_abs_impl>())
+
+    .build()
+);
+```
+
+**Key patterns:**
+- Single macro call registers everything - no manual SQL needed
+- `.compare()` enables ORDER BY and indexing
+- `.hash()` is optional (uses default if not provided)
+- `.wrap<&function>()` creates type-safe wrappers
+
+---
+
+## Binary Storage Format
+
+COMPLEX stores **16 bytes** (little-endian):
+- Bytes 0-7: Real part (double)
+- Bytes 8-15: Imaginary part (double)
+
+**Encode/Decode (complex.h:34-37):**
+```cpp
+bool encode_complex(unsigned char *buffer, uint64_t buffer_size,
+                    const char *from, size_t from_len, int *length);
+bool decode_complex(const unsigned char *buffer, uint64_t buffer_size,
+                    char *to, size_t to_buffer_size, size_t *to_length);
+```
+
+Uses `float8store/float8get` for platform-independent storage.
+
+---
+
+## Wrapper Functions
+
+The VEF SDK allows clean C++ wrapper functions without raw UDF boilerplate:
+
+**Arithmetic Example (from complex_funcs.cc):**
+
+```cpp
+// Clean wrapper - no manual validation needed!
+ComplexNumber complex_add_impl(ComplexNumber a, ComplexNumber b) {
+    return ComplexNumber{a.real + b.real, a.imag + b.imag};
+}
+
+// Utility function wrapper
+double complex_real_impl(ComplexNumber c) {
+    return c.real;
+}
+
+double complex_abs_impl(ComplexNumber c) {
+    return std::sqrt(c.real * c.real + c.imag * c.imag);
+}
+```
+
+---
+
+## Aggregation Support
+
+**SUM for COMPLEX:**
+
+```cpp
+void sum_complex_clear(UDF_INIT *initid, char *is_null, char *error) {
+    // Reset accumulator to 0+0i
+    double *state = (double*)initid->ptr;
+    state[0] = 0.0;  // real
+    state[1] = 0.0;  // imaginary
+}
+
+void sum_complex_add(UDF_INIT *initid, UDF_ARGS *args,
+                     char *is_null, char *error) {
+    if (args->args[0] == nullptr) return;  // Skip NULL
+
+    double *state = (double*)initid->ptr;
+    double real = float8get((unsigned char*)args->args[0]);
+    double imag = float8get((unsigned char*)args->args[0] + 8);
+
+    state[0] += real;
+    state[1] += imag;
+}
+
+char *sum_complex(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                  unsigned long *length, char *is_null, char *error) {
+    double *state = (double*)initid->ptr;
+    float8store((unsigned char*)result, state[0]);
+    float8store((unsigned char*)result + 8, state[1]);
+    *length = 16;
+    return result;
+}
+```
+
+**Usage:**
+```sql
+SELECT SUM(impedance) FROM signals;
+```
+
+---
+
+## Testing Strategy
+
+**Test File (test/t/complex_create.test):**
+```sql
+INSTALL EXTENSION 'vsql_complex';
+
+CREATE TABLE t1 (id INT, val COMPLEX);
+INSERT INTO t1 VALUES (1, COMPLEX(1.0, 2.0));
+SELECT * FROM t1;
+
+DROP TABLE t1;
+UNINSTALL EXTENSION 'vsql_complex';
+```
+
+**Generate Results:**
+```bash
+cd /path/to/villagesql/build/mysql-test
+./mysql-test-run.pl --suite=vsql_complex --record
+```
+
+**Run Tests:**
+```bash
+./mysql-test-run.pl --suite=vsql_complex
+```
+
+---
+
+## Key Implementation Patterns
+
+| Pattern | Usage |
+|---------|-------|
+| **Fixed-length storage** | Set `initid->max_length = 16` in _init |
+| **Platform-independent** | Always use `float8store/float8get` |
+| **NULL handling** | Check `args->args[i] == nullptr` |
+| **Error messages** | Set in _init, not main function |
+| **Persistent state** | Use `initid->ptr` for aggregates |
+
+---
+
+## Manifest
+
+**File: `manifest.json`**
+
+```json
+{
+  "name": "vsql_complex",
+  "version": "0.0.1",
+  "description": "Complex number data type for VillageSQL",
+  "author": "VillageSQL Contributors",
+  "license": "GPL-2.0"
+}
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Create Extension"
+    icon="code"
+    href="/mysql-8.4/0.0.1/create"
+  >
+    Build your own extension
+  </Card>
+  <Card
+    title="Extension Architecture"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.1/architecture"
+  >
+    Understand the internals
+  </Card>
+  <Card
+    title="vsql_complex Source"
+    icon="github"
+    href="https://github.com/villagesql/villagesql-server/tree/main/villagesql/examples/vsql-complex"
+  >
+    View complete source code
+  </Card>
+  <Card
+    title="Available Extensions"
+    icon="list"
+    href="/mysql-8.4/0.0.1/list"
+  >
+    Browse extension catalog
+  </Card>
+</CardGroup>

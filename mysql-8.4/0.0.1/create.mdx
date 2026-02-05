@@ -1,0 +1,797 @@
+---
+title: "Creating Extensions"
+description: "Learn how to create custom VillageSQL extensions using the extension template and VEF framework."
+---
+
+## Overview
+
+VillageSQL's extension framework allows you to add custom functionality to the database server. Build custom extensions using the VEF SDK and extension template.
+
+## What is a VillageSQL Extension?
+
+A VillageSQL extension is packaged as a **VEB file** (VillageSQL Extension Bundle) containing:
+- **Manifest** - Metadata about the extension (name, version, description)
+- **Shared library** - Compiled C++ code implementing the functionality
+- **Optional metadata** - Additional resources or configuration
+
+Extensions are built using the **VEF SDK** (VillageSQL Extension Framework), which provides:
+- C++ API for defining types and functions
+- Automatic registration without SQL scripts
+- Type-safe function wrappers
+- Builder pattern for extension definition
+
+<Note>
+**VDFs vs Traditional UDFs:** Functions registered through the VEF SDK are called VDFs (Village Defined Functions). VillageSQL also supports traditional MySQL UDFs registered via `CREATE FUNCTION ... SONAME`, but the VEF SDK approach is recommended for new extensions.
+</Note>
+
+Extensions can add:
+- **Custom functions (VDFs)** - SQL functions with automatic type checking and validation
+- **Custom data types** - New column types like COMPLEX, UUID, or VECTOR that work with ORDER BY and indexes
+- **Type operations** - Encode, decode, compare, and hash functions for custom types
+
+## Prerequisites
+
+Before you begin, ensure you have:
+
+- **Git** - For cloning and version control
+- **CMake** 3.16 or higher - Build system
+- **C++ Compiler** - GCC 8+, Clang 8+, or MSVC 2019+ with C++11 support
+- **VillageSQL** - Either:
+  - Source build with `VSQL_BUILD_DIR` set to build directory, or
+  - Binary installation with `mysql_config` in PATH
+- **VillageSQL SDK headers** - Included in VillageSQL source at `villagesql/sdk/include/`
+- **Basic C++ knowledge** - Understanding of C++ and function pointers
+
+## Step 1: Get the Extension Template
+
+You can start with the extension template in two ways:
+
+### Option A: Use Template from VillageSQL Source
+
+If you have VillageSQL source code, the template is included:
+
+```bash
+cd /path/to/villagesql-source
+cp -r villagesql/sdk/template my-extension
+cd my-extension
+```
+
+### Option B: Fork from GitHub
+
+Start by forking the VillageSQL extension template repository:
+
+1. Visit the template repository on GitHub:
+   ```
+   https://github.com/villagesql/vsql-extension-template
+   ```
+
+2. Click the **"Fork"** button to create your own copy
+
+3. Clone your fork locally:
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/vsql-extension-template.git
+   cd vsql-extension-template
+   ```
+
+<Tip>
+  Alternatively, use the "Use this template" button on GitHub to create a new repository based on the template without forking history.
+</Tip>
+
+## Step 2: Update the Manifest
+
+Edit `manifest.json` to define your extension's metadata:
+
+```json
+{
+  "name": "my_awesome_extension",
+  "version": "1.0.0",
+  "description": "My custom VillageSQL extension that does amazing things",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+### manifest.json Schema
+
+| Field | Required | Format | Description |
+|-------|----------|--------|-------------|
+| `name` | ✅ Yes | lowercase_with_underscores | Unique identifier. Must match `INSTALL EXTENSION` name. |
+| `version` | ✅ Yes | MAJOR.MINOR.PATCH | Semantic version string |
+| `description` | No | String | Brief explanation of functionality |
+| `author` | No | String | Author name or organization |
+| `license` | No | String | License identifier (GPL-2.0 recommended) |
+
+**Validation rules:**
+- `name`: Must be lowercase letters, numbers, and underscores only. No hyphens in manifest!
+- `version`: Must follow semantic versioning (e.g., 1.0.0, 0.2.1)
+- Invalid manifest will cause `INSTALL EXTENSION` to fail
+
+**Example:**
+```sql
+-- manifest.json has "name": "my_awesome_extension"
+INSTALL EXTENSION 'my_awesome_extension';  -- ✅ Correct
+
+INSTALL EXTENSION 'my-awesome-extension';  -- ❌ Wrong (hyphens)
+```
+
+## Step 3: Implement Your Extension with VEF SDK
+
+The VEF SDK provides a C++ API for defining extensions using a fluent builder pattern:
+- Type-safe function definitions with compile-time checking
+- Automatic argument validation and type conversion
+- Support for custom types with compare/hash functions (enables ORDER BY and indexes)
+
+### Include VillageSQL Headers
+
+Create your main extension file (e.g., `src/extension.cc`) and include the VEF SDK:
+
+```cpp
+#include <villagesql/extension.h>
+#include <villagesql/func_builder.h>
+#include <villagesql/type_builder.h>
+
+// Your implementation code here
+```
+
+### Define Your Extension
+
+Use the `VEF_GENERATE_ENTRY_POINTS()` macro to define your extension:
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")  // name, version
+    .func(make_func("my_reverse")
+      .returns(STRING)
+      .param(STRING)
+      .wrap<&my_reverse_impl>())
+    .func(make_func("count_vowels")
+      .returns(INT)
+      .param(STRING)
+      .wrap<&count_vowels_impl>())
+    .build()
+);
+```
+
+**Function Builder Methods:**
+- `.returns(type)` - Set return type (STRING, INT, REAL, or custom type name)
+- `.param(type)` - Add parameter (maximum 8 parameters)
+- `.buffer_size(size_t)` - Request specific output buffer size for STRING/CUSTOM returns
+- `.prerun<func>()` - Set per-statement setup function (optional)
+- `.postrun<func>()` - Set per-statement cleanup function (optional)
+- `.wrap<impl>()` - Bind your implementation function
+
+<Note>
+**Parameter Limit:** Functions support a maximum of 8 parameters (defined by `kMaxParams`). If you need more, consider using structured types or multiple functions.
+</Note>
+
+### Custom Buffer Sizes
+
+For functions returning variable-length data, request a specific buffer size:
+
+```cpp
+make_func("large_result")
+  .returns(STRING)
+  .param(INT)
+  .buffer_size(65536)  // Request 64KB buffer
+  .wrap<&large_result_impl>()
+```
+
+If your function needs more space than allocated, return `IS_BUF_TOO_SMALL`:
+
+```cpp
+void large_result_impl(vef_context_t* ctx, vef_invalue_t* input,
+                       vef_vdf_result_t* result) {
+    size_t needed = calculate_output_size(input);
+
+    if (needed > result->max_buf_len) {
+        result->type = IS_BUF_TOO_SMALL;
+        result->actual_len = needed;  // Tell framework how much we need
+        return;
+    }
+
+    // Write output to result->buf
+    result->type = IS_VALUE;
+    result->actual_len = actual_output_length;
+}
+```
+
+<Note>
+The framework will retry with a larger buffer if you return `IS_BUF_TOO_SMALL` and set `actual_len` to the required size.
+</Note>
+
+### Implement Wrapper Functions
+
+Wrapper functions use a simplified signature - no manual argument validation needed:
+
+```cpp
+#include <algorithm>
+#include <string>
+
+// String reverse implementation
+std::string my_reverse_impl(const std::string& input) {
+    std::string result = input;
+    std::reverse(result.begin(), result.end());
+    return result;
+}
+
+// Count vowels implementation
+int64_t count_vowels_impl(const std::string& input) {
+    int64_t count = 0;
+    for (char c : input) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    return count;
+}
+```
+
+### Handling NULL Values
+
+Check for NULL via pointer and return NULL by setting the result type:
+
+```cpp
+void my_func_impl(vef_context_t* ctx, vef_invalue_t* input,
+                  vef_vdf_result_t* result) {
+    // Check if input is NULL
+    if (input->value == nullptr) {
+        result->type = IS_NULL;
+        return;
+    }
+
+    // Access input data
+    const char* str = input->value;
+    size_t len = input->len;
+
+    // Process and write result to result->buf
+    // ...
+
+    result->type = IS_VALUE;
+    result->actual_len = output_length;
+}
+```
+
+**NULL handling options:**
+- **Input NULL check:** `if (input->value == nullptr)`
+- **Return NULL:** `result->type = IS_NULL`
+- **Return value:** `result->type = IS_VALUE` + write to `result->buf`
+- **Return error:** `result->type = IS_ERROR` + error message in `result->buf`
+
+### Error Handling
+
+Return errors with custom messages for validation failures or invalid input:
+
+```cpp
+void validate_age_impl(vef_context_t* ctx, vef_invalue_t* age_input,
+                       vef_vdf_result_t* result) {
+    if (age_input->value == nullptr) {
+        result->type = IS_NULL;
+        return;
+    }
+
+    long long age = age_input->int_value;
+
+    // Validate input range
+    if (age < 0 || age > 150) {
+        result->type = IS_ERROR;
+        // Write error message to buffer
+        const char* msg = "Age must be between 0 and 150";
+        size_t msg_len = strlen(msg);
+        memcpy(result->buf, msg, msg_len);
+        result->actual_len = msg_len;
+        return;
+    }
+
+    // Return valid result
+    result->type = IS_VALUE;
+    result->int_value = age;
+}
+```
+
+**Error types:**
+- `IS_ERROR` - Validation failure, invalid input, or runtime error
+- `IS_BUF_TOO_SMALL` - Buffer too small (framework retries with larger buffer)
+- `IS_NULL` - NULL value
+- `IS_VALUE` - Success
+
+<Note>
+  The `SONAME` must match the compiled library name. If your CMakeLists.txt creates `libmyext.so`, use `SONAME "myext.so"` (without the `lib` prefix).
+</Note>
+
+---
+
+## Step 4: Creating Custom Types
+
+Custom types allow you to define new column types that work seamlessly with SQL operations like ORDER BY, GROUP BY, and indexes.
+
+### Define Type Operations
+
+Every custom type needs encode and decode functions, and optionally compare/hash functions:
+
+```cpp
+// Encode: Convert string representation to binary
+bool encode_mytype(unsigned char* buffer, uint64_t buffer_size,
+                   const char* from, size_t from_len, int* length) {
+    // Parse 'from' string and write binary to 'buffer'
+    // Set *length to bytes written
+    // Return true on success, false on error
+}
+
+// Decode: Convert binary to string representation
+bool decode_mytype(const unsigned char* buffer, uint64_t buffer_size,
+                   char* to, size_t to_buffer_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'
+    // Set *to_length to string length
+    // Return true on success, false on error
+}
+
+// Compare: Enable ORDER BY and indexing (optional but recommended)
+int compare_mytype(const unsigned char* a, size_t a_len,
+                   const unsigned char* b, size_t b_len) {
+    // Return: negative if a<b, 0 if a==b, positive if a>b
+}
+
+// Hash: Custom hash function (optional, uses default if not provided)
+size_t hash_mytype(const unsigned char* buffer, size_t buffer_size) {
+    // Return hash value for the binary data
+}
+```
+
+### Register the Type
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes!
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func("MYTYPE")            // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .wrap<&mytype_constructor>())
+    .build()
+);
+```
+
+### Type Conversion Functions
+
+Expose your encode/decode functions as SQL functions for explicit type conversion:
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .type(make_type(MYTYPE)
+      .persisted_length(16)
+      .max_decode_buffer_length(64)
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)
+      .build())
+    // String → Custom Type conversion
+    .func(make_func("mytype_from_string")
+      .from_string<&encode_mytype>(MYTYPE))
+    // Custom Type → String conversion
+    .func(make_func("mytype_to_string")
+      .to_string<&decode_mytype>(MYTYPE))
+    .build()
+);
+```
+
+**Usage in SQL:**
+```sql
+-- Convert string to custom type
+SELECT mytype_from_string('(1.0,2.0)');
+
+-- Convert custom type to string
+SELECT mytype_to_string(my_column) FROM my_table;
+
+-- Explicit conversion in INSERT
+INSERT INTO my_table (id, value)
+VALUES (1, mytype_from_string('(3.0,4.0)'));
+```
+
+<Note>
+The `.from_string<>()` and `.to_string<>()` builders automatically create SQL-callable conversion functions using your encode/decode implementations.
+</Note>
+
+### Example: COMPLEX Type
+
+Here's a complete example implementing a COMPLEX number type:
+
+```cpp
+#include <cstring>
+#include <cmath>
+
+// Encode complex number from "(real,imag)" to 16 bytes
+bool encode_complex(unsigned char* buffer, uint64_t buffer_size,
+                    const char* from, size_t from_len, int* length) {
+    if (buffer_size < 16) return false;
+
+    // Parse "(real,imag)" format
+    double real, imag;
+    if (sscanf(from, "(%lf,%lf)", &real, &imag) != 2) {
+        return false;
+    }
+
+    // Write 16 bytes: 8 bytes real + 8 bytes imag
+    memcpy(buffer, &real, 8);
+    memcpy(buffer + 8, &imag, 8);
+    *length = 16;
+    return true;
+}
+
+// Decode 16 bytes to "(real,imag)" string
+bool decode_complex(const unsigned char* buffer, uint64_t buffer_size,
+                    char* to, size_t to_buffer_size, size_t* to_length) {
+    if (buffer_size < 16) return false;
+
+    double real, imag;
+    memcpy(&real, buffer, 8);
+    memcpy(&imag, buffer + 8, 8);
+
+    int len = snprintf(to, to_buffer_size, "(%.6f,%.6f)", real, imag);
+    if (len < 0 || len >= to_buffer_size) return false;
+
+    *to_length = len;
+    return true;
+}
+
+// Compare for ORDER BY: compare real part first, then imaginary
+int compare_complex(const unsigned char* a, size_t a_len,
+                    const unsigned char* b, size_t b_len) {
+    if (a_len < 16 || b_len < 16) return 0;
+
+    double a_real, a_imag, b_real, b_imag;
+    memcpy(&a_real, a, 8);
+    memcpy(&a_imag, a + 8, 8);
+    memcpy(&b_real, b, 8);
+    memcpy(&b_imag, b + 8, 8);
+
+    if (a_real < b_real) return -1;
+    if (a_real > b_real) return 1;
+    if (a_imag < b_imag) return -1;
+    if (a_imag > b_imag) return 1;
+    return 0;
+}
+```
+
+After defining these operations, users can create tables with your custom type:
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    frequency_response COMPLEX
+);
+
+INSERT INTO signals VALUES (1, COMPLEX(50.0, 10.0), COMPLEX(0.95, 0.31));
+
+-- ORDER BY works because we provided compare_complex!
+SELECT * FROM signals ORDER BY impedance;
+```
+
+See [vsql_complex Example](/mysql-8.4/0.0.1/examples) for the complete implementation.
+
+---
+
+## Step 5: Update Build Configuration
+
+Edit `CMakeLists.txt` to build your extension as a VEB file:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(my_extension)
+
+# Find VillageSQL Extension Framework
+find_package(VillageSQLExtensionFramework QUIET
+    PATHS "${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake"
+)
+
+# The framework detects build flags via 4 methods (in order):
+# 1. Explicit MYSQL_INCLUDE_FLAGS/MYSQL_CXXFLAGS
+# 2. VSQL_BUILD_DIR (reads CMakeCache.txt from VillageSQL build)
+# 3. VSQL_BASE_DIR (uses mysql_config)
+# 4. Default - mysql_config from PATH
+
+# Build shared library with your source files
+add_library(extension SHARED
+    src/extension.cc
+    src/my_functions.cc
+)
+
+# Create VEB archive
+VEF_CREATE_VEB(
+    NAME my_extension
+    LIBRARY_TARGET extension
+    MANIFEST ${CMAKE_CURRENT_SOURCE_DIR}/manifest.json
+)
+
+# Install VEB to VillageSQL extensions directory
+install(FILES ${VEB_OUTPUT} DESTINATION ${INSTALL_DIR})
+```
+
+**Configuration notes:**
+- `VillageSQLExtensionFramework` provides CMake helpers for building extensions
+- `VEF_CREATE_VEB()` packages your library, manifest, and metadata into a `.veb` archive
+- The framework automatically detects MySQL/VillageSQL build flags
+- Library target name is typically `extension` (can be anything)
+- VEB name must match your manifest.json name
+
+---
+
+## Step 6: Create a Build Directory
+
+Create a separate build directory:
+
+```bash
+mkdir build
+cd build
+```
+
+## Step 7: Build with CMake and Make
+
+Configure and build your extension:
+
+```bash
+# Configure the build
+cmake ..
+
+# Or, if building against VillageSQL source:
+cmake .. -DVSQL_BUILD_DIR=/path/to/villagesql/build
+
+# Build the extension
+make
+```
+
+This creates:
+- Compiled shared library (`.so` file)
+- VEB package (`.veb` file) - a tar archive containing manifest and library
+
+### Verify the Build
+
+Check the contents of your VEB file:
+
+```bash
+make show_vef
+```
+
+You should see:
+```
+manifest.json
+lib/myext.so
+```
+
+## Step 8: Install and Test
+
+### Option A: Install to VillageSQL Extensions Directory
+
+Use the install target to copy the VEB to your VillageSQL installation:
+
+```bash
+make install_vef
+```
+
+This copies the `.veb` file to the directory specified by VillageSQL's `vef_dir` variable.
+
+### Option B: Manual Installation
+
+Copy the VEB file manually:
+
+```bash
+# Find the VEF directory
+mysql -u root -p -e "SHOW VARIABLES LIKE 'vef_dir';"
+
+# Copy the VEB file
+sudo cp my-awesome-extension.veb /path/to/vef_dir/
+```
+
+### Test Your Extension
+
+1. **Connect to VillageSQL**:
+   ```bash
+   mysql -u root -p
+   ```
+
+2. **Install the extension**:
+   ```sql
+   INSTALL EXTENSION 'my_awesome_extension';
+   ```
+
+3. **Verify installation**:
+   ```sql
+   SHOW EXTENSIONS;
+   ```
+
+4. **Test your functions**:
+   ```sql
+   SELECT my_reverse('Hello, World!');
+   -- Output: !dlroW ,olleH
+
+   SELECT count_vowels('VillageSQL');
+   -- Output: 4
+   ```
+
+## Creating Tests
+
+Add test files to validate your extension works correctly:
+
+1. **Create a test file** in `test/t/`:
+   ```sql
+   -- test/t/my_basic.test
+   SELECT my_reverse('abc');
+   SELECT my_reverse('');
+   SELECT my_reverse(NULL);
+   ```
+
+2. **Generate expected results**:
+   ```bash
+   cd /path/to/villagesql/build/mysql-test
+   perl mysql-test-run.pl --suite=/path/to/your/extension/test --record
+   ```
+
+3. **Run tests**:
+   ```bash
+   perl mysql-test-run.pl --suite=/path/to/your/extension/test
+   ```
+
+## Advanced Topics
+
+### Per-Statement State with Prerun/Postrun
+
+For VEF SDK functions that need setup/cleanup per SQL statement (not per row):
+
+```cpp
+// Called once before the first row
+void my_prerun(vef_context_t* ctx, vef_prerun_args_t* args,
+               vef_prerun_result_t* result) {
+    // Allocate state, open connections, etc.
+    void* state = malloc(sizeof(MyState));
+    result->user_data = state;
+}
+
+// Called once after all rows processed
+void my_postrun(vef_context_t* ctx, vef_postrun_args_t* args,
+                vef_postrun_result_t* result) {
+    // Clean up state allocated in prerun
+    if (args->user_data) {
+        free(args->user_data);
+    }
+}
+
+// Register with extension
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_ext", "1.0.0")
+    .func(make_func("my_func")
+      .returns(STRING)
+      .param(STRING)
+      .prerun(&my_prerun)
+      .postrun(&my_postrun)
+      .wrap<&my_func_impl>())
+    .build()
+);
+```
+
+<Note>
+**Most extensions don't need prerun/postrun hooks.** The VEF SDK automatically handles common cases like type checking and buffer allocation. Use prerun/postrun only when you need expensive per-statement setup (like opening connections) that shouldn't happen per-row.
+
+If you find you need prerun/postrun for your use case, please share your scenario on the [VillageSQL Discord](https://discord.gg/KSr6whd3Fr) - the team may be able to add SDK support to handle it automatically.
+</Note>
+
+### Aggregate Functions
+
+<Warning>
+Aggregate functions (SUM, COUNT, AVG, MAX, MIN, etc.) are not yet supported for this alpha release. This functionality will be available in a future release.
+</Warning>
+
+Extension functions are called in a per-row execution model:
+
+- Each function call processes one row with its own result buffer (thread-safe)
+- `prerun`/`postrun` provide per-statement setup/teardown
+- **Avoid global state** - use function parameters and return values instead
+- If you must use global state, protect it with mutexes/locks
+
+**Best practice:** Design functions to be stateless for simplicity and safety.
+
+
+## Troubleshooting
+
+### Extension Won't Load
+
+Check the error log and verify the VEB contents:
+```bash
+make show_veb
+tail -f /var/log/mysql/error.log
+```
+
+Verify SONAME matches the library filename in your VEB.
+
+### Function Not Found
+
+Verify installation and registration:
+```sql
+SHOW EXTENSIONS;
+SELECT * FROM information_schema.routines WHERE routine_name = 'my_func';
+```
+
+### Build Errors
+
+```bash
+# Verify mysql_config is available
+which mysql_config
+mysql_config --version
+
+# Check compiler version
+gcc --version  # or clang --version
+
+# Verify CMake version (3.16+ required)
+cmake --version
+```
+
+## Example Extensions
+
+Learn from existing VillageSQL extensions:
+
+<CardGroup cols={2}>
+  <Card
+    title="vsql_complex"
+    icon="wave-square"
+    href="https://github.com/villagesql/vsql-complex"
+  >
+    Complex number data type implementation
+  </Card>
+  <Card
+    title="vsql_extension_template"
+    icon="code"
+    href="https://github.com/villagesql/vsql-extension-template"
+  >
+    Minimal template for creating extensions
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Using Extensions"
+    icon="puzzle-piece"
+    href="/mysql-8.4/0.0.1/install"
+  >
+    Learn how to install and manage extensions
+  </Card>
+  <Card
+    title="Clone and Build from Source"
+    icon="hammer"
+    href="/mysql-8.4/0.0.1/source"
+  >
+    Build VillageSQL from source code
+  </Card>
+  <Card
+    title="GitHub"
+    icon="github"
+    href="https://github.com/villagesql/villagesql-server"
+  >
+    Contribute to VillageSQL Server
+  </Card>
+  <Card
+    title="MySQL UDF API"
+    icon="book"
+    href="https://dev.mysql.com/doc/refman/8.0/en/adding-udf.html"
+  >
+    MySQL UDF API reference documentation
+  </Card>
+</CardGroup>
+
+## Resources
+
+- [VillageSQL Extension Template](https://github.com/villagesql/vsql-extension-template)
+- [MySQL UDF API Documentation](https://dev.mysql.com/doc/refman/8.0/en/adding-udf.html)
+- [CMake Documentation](https://cmake.org/documentation/)
+- [VillageSQL Community Discord](https://discord.gg/KSr6whd3Fr)
