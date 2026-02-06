@@ -45,16 +45,17 @@ VillageSQL's key differentiator is its extension framework. When documenting ext
 
 - **Installation syntax**: `INSTALL EXTENSION 'extension_name';`
 - **Verification**: `SHOW EXTENSIONS;` lists all installed extensions
-- **Built-in extensions**: Built-in extensions are included with VillageSQL and just need to be enabled
+- **Built-in extensions**: When building from source, `vsql_complex` and `vsql_simple` are included. Other extensions are available in separate GitHub repositories.
 - **Example extensions**:
-  - `vsql_complex`: Complex number data types
-  - `vsql_uuid`: UUID generation and validation
-  - `vsql_network_address`: IPv4, IPv6, and MAC address types
+  - `vsql_complex`: Complex number data types (included in source builds)
+  - `vsql_simple`: Minimal demonstration extension (included in source builds)
+  - `vsql_uuid`: UUID generation and validation ([repo](https://github.com/villagesql/vsql-uuid))
+  - `vsql_crypto`: Cryptographic functions ([repo](https://github.com/villagesql/vsql-crypto))
+  - `vsql_network_address`: IPv4, IPv6, and MAC address types ([repo](https://github.com/villagesql/vsql-network-address))
+  - `vsql_ai`: AI prompting via SQL ([repo](https://github.com/villagesql/vsql-ai))
 
 ### Installation Methods
-1. Quick install: `curl -sSL https://install.villagesql.com | bash`
-2. Build from source: Follow instructions at villagesql.com/build
-3. Package managers: apt-get, yum, brew
+1. Build from source: Follow instructions at villagesql.com/build
 
 ### Key URLs
 - Installation: https://villagesql.com/install
