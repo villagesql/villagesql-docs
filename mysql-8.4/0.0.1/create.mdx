@@ -165,25 +165,25 @@ Use the `VEF_GENERATE_ENTRY_POINTS()` macro to define your extension:
 ```cpp
 VEF_GENERATE_ENTRY_POINTS(
   make_extension("my_extension", "1.0.0")  // name, version
-    .func(make_func("my_reverse")
+    .func(make_func<&my_reverse_impl>("my_reverse")
       .returns(STRING)
       .param(STRING)
-      .wrap<&my_reverse_impl>())
-    .func(make_func("count_vowels")
+      .build())
+    .func(make_func<&count_vowels_impl>("count_vowels")
       .returns(INT)
       .param(STRING)
-      .wrap<&count_vowels_impl>())
-    .build()
+      .build())
 );
 ```
 
 **Function Builder Methods:**
+- `make_func<&impl>("name")` - Create function with implementation pointer
 - `.returns(type)` - Set return type (STRING, INT, REAL, or custom type name)
 - `.param(type)` - Add parameter (maximum 8 parameters)
 - `.buffer_size(size_t)` - Request specific output buffer size for STRING/CUSTOM returns
 - `.prerun<func>()` - Set per-statement setup function (optional)
 - `.postrun<func>()` - Set per-statement cleanup function (optional)
-- `.wrap<impl>()` - Bind your implementation function
+- `.build()` - Finalize function registration
 
 <Note>
 **Parameter Limit:** Functions support a maximum of 8 parameters (defined by `kMaxParams`). If you need more, consider using structured types or multiple functions.
@@ -194,95 +194,113 @@ VEF_GENERATE_ENTRY_POINTS(
 For functions returning variable-length data, request a specific buffer size:
 
 ```cpp
-make_func("large_result")
+make_func<&large_result_impl>("large_result")
   .returns(STRING)
   .param(INT)
   .buffer_size(65536)  // Request 64KB buffer
-  .wrap<&large_result_impl>()
+  .build()
 ```
 
-If your function needs more space than allocated, return `IS_BUF_TOO_SMALL`:
+Check available buffer space before writing:
 
 ```cpp
 void large_result_impl(vef_context_t* ctx, vef_invalue_t* input,
                        vef_vdf_result_t* result) {
     size_t needed = calculate_output_size(input);
 
-    if (needed > result->max_buf_len) {
-        result->type = IS_BUF_TOO_SMALL;
-        result->actual_len = needed;  // Tell framework how much we need
+    if (needed > result->max_str_len) {
+        result->type = VEF_RESULT_ERROR;
+        strcpy(result->error_msg, "Output exceeds buffer size");
         return;
     }
 
-    // Write output to result->buf
-    result->type = IS_VALUE;
+    // Write output to result->str_buf
+    result->type = VEF_RESULT_VALUE;
     result->actual_len = actual_output_length;
 }
 ```
 
 <Note>
-The framework will retry with a larger buffer if you return `IS_BUF_TOO_SMALL` and set `actual_len` to the required size.
+Request sufficient buffer size via `.buffer_size()` based on your function's maximum output size.
 </Note>
 
 ### Implement Wrapper Functions
 
-Wrapper functions use a simplified signature - no manual argument validation needed:
+Implementation functions use the VEF API signature:
 
 ```cpp
 #include <algorithm>
 #include <string>
+#include <cstring>
 
 // String reverse implementation
-std::string my_reverse_impl(const std::string& input) {
-    std::string result = input;
-    std::reverse(result.begin(), result.end());
-    return result;
+void my_reverse_impl(vef_context_t* ctx, vef_invalue_t* input,
+                     vef_vdf_result_t* result) {
+    if (input->is_null) {
+        result->type = VEF_RESULT_NULL;
+        return;
+    }
+
+    // Reverse the string
+    size_t len = input->str_len;
+    for (size_t i = 0; i < len; i++) {
+        result->str_buf[i] = input->str_value[len - 1 - i];
+    }
+    result->type = VEF_RESULT_VALUE;
+    result->actual_len = len;
 }
 
 // Count vowels implementation
-int64_t count_vowels_impl(const std::string& input) {
+void count_vowels_impl(vef_context_t* ctx, vef_invalue_t* input,
+                       vef_vdf_result_t* result) {
+    if (input->is_null) {
+        result->type = VEF_RESULT_NULL;
+        return;
+    }
+
     int64_t count = 0;
-    for (char c : input) {
-        char lower = std::tolower(c);
+    for (size_t i = 0; i < input->str_len; i++) {
+        char lower = std::tolower(input->str_value[i]);
         if (lower == 'a' || lower == 'e' || lower == 'i' ||
             lower == 'o' || lower == 'u') {
             count++;
         }
     }
-    return count;
+    result->int_value = count;
+    result->type = VEF_RESULT_VALUE;
 }
 ```
 
 ### Handling NULL Values
 
-Check for NULL via pointer and return NULL by setting the result type:
+Check for NULL via the `is_null` flag and return NULL by setting the result type:
 
 ```cpp
 void my_func_impl(vef_context_t* ctx, vef_invalue_t* input,
                   vef_vdf_result_t* result) {
     // Check if input is NULL
-    if (input->value == nullptr) {
-        result->type = IS_NULL;
+    if (input->is_null) {
+        result->type = VEF_RESULT_NULL;
         return;
     }
 
     // Access input data
-    const char* str = input->value;
-    size_t len = input->len;
+    const char* str = input->str_value;
+    size_t len = input->str_len;
 
-    // Process and write result to result->buf
+    // Process and write result to result->str_buf
     // ...
 
-    result->type = IS_VALUE;
+    result->type = VEF_RESULT_VALUE;
     result->actual_len = output_length;
 }
 ```
 
 **NULL handling options:**
-- **Input NULL check:** `if (input->value == nullptr)`
-- **Return NULL:** `result->type = IS_NULL`
-- **Return value:** `result->type = IS_VALUE` + write to `result->buf`
-- **Return error:** `result->type = IS_ERROR` + error message in `result->buf`
+- **Input NULL check:** `if (input->is_null)`
+- **Return NULL:** `result->type = VEF_RESULT_NULL`
+- **Return value:** `result->type = VEF_RESULT_VALUE` + write to type-specific buffer
+- **Return error:** `result->type = VEF_RESULT_ERROR` + error message in `result->error_msg`
 
 ### Error Handling
 
@@ -291,8 +309,8 @@ Return errors with custom messages for validation failures or invalid input:
 ```cpp
 void validate_age_impl(vef_context_t* ctx, vef_invalue_t* age_input,
                        vef_vdf_result_t* result) {
-    if (age_input->value == nullptr) {
-        result->type = IS_NULL;
+    if (age_input->is_null) {
+        result->type = VEF_RESULT_NULL;
         return;
     }
 
@@ -300,26 +318,23 @@ void validate_age_impl(vef_context_t* ctx, vef_invalue_t* age_input,
 
     // Validate input range
     if (age < 0 || age > 150) {
-        result->type = IS_ERROR;
-        // Write error message to buffer
+        result->type = VEF_RESULT_ERROR;
+        // Write error message
         const char* msg = "Age must be between 0 and 150";
-        size_t msg_len = strlen(msg);
-        memcpy(result->buf, msg, msg_len);
-        result->actual_len = msg_len;
+        strcpy(result->error_msg, msg);
         return;
     }
 
     // Return valid result
-    result->type = IS_VALUE;
+    result->type = VEF_RESULT_VALUE;
     result->int_value = age;
 }
 ```
 
-**Error types:**
-- `IS_ERROR` - Validation failure, invalid input, or runtime error
-- `IS_BUF_TOO_SMALL` - Buffer too small (framework retries with larger buffer)
-- `IS_NULL` - NULL value
-- `IS_VALUE` - Success
+**Result types:**
+- `VEF_RESULT_ERROR` - Validation failure, invalid input, or runtime error
+- `VEF_RESULT_NULL` - NULL value
+- `VEF_RESULT_VALUE` - Success
 
 <Note>
   The `SONAME` must match the compiled library name. If your CMakeLists.txt creates `libmyext.so`, use `SONAME "myext.so"` (without the `lib` prefix).
@@ -377,12 +392,11 @@ VEF_GENERATE_ENTRY_POINTS(
       .compare(&compare_mytype)          // Enables ORDER BY and indexes!
       .hash(&hash_mytype)                // Optional custom hash
       .build())
-    .func(make_func("MYTYPE")            // Constructor function
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
       .returns(MYTYPE)
       .param(REAL)
       .param(REAL)
-      .wrap<&mytype_constructor>())
-    .build()
+      .build())
 );
 ```
 
@@ -694,13 +708,12 @@ void my_postrun(vef_context_t* ctx, vef_postrun_args_t* args,
 // Register with extension
 VEF_GENERATE_ENTRY_POINTS(
   make_extension("my_ext", "1.0.0")
-    .func(make_func("my_func")
+    .func(make_func<&my_func_impl>("my_func")
       .returns(STRING)
       .param(STRING)
       .prerun(&my_prerun)
       .postrun(&my_postrun)
-      .wrap<&my_func_impl>())
-    .build()
+      .build())
 );
 ```
 
