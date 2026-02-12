@@ -40,9 +40,7 @@ vsql_complex/
 ├── CMakeLists.txt       # Build config with VEF_CREATE_VEB
 ├── manifest.json        # Extension metadata
 ├── src/
-│   ├── complex.h        # Type operations declarations
-│   ├── complex.cc       # Encode/decode/compare/hash/arithmetic
-│   └── complex_funcs.cc # VEF registration with VEF_GENERATE_ENTRY_POINTS
+│   └── complex.cc       # Complete implementation: types, functions, and VEF registration
 └── test/
     ├── t/*.test         # Test cases
     └── r/*.result       # Expected results
@@ -52,71 +50,95 @@ vsql_complex/
 
 ## VEF Registration Pattern
 
-**File: `src/complex_funcs.cc`**
+**File: `src/complex.cc`**
 
 vsql_complex uses the VEF SDK with `VEF_GENERATE_ENTRY_POINTS()`:
 
 ```cpp
 #include <villagesql/extension.h>
-#include <villagesql/func_builder.h>
-#include <villagesql/type_builder.h>
-#include "complex.h"
+
+constexpr const char *COMPLEX = "COMPLEX";
+constexpr const char *COMPLEX2 = "COMPLEX2";
 
 VEF_GENERATE_ENTRY_POINTS(
   make_extension("vsql_complex", "0.0.1")
 
     // Register COMPLEX type with comparison (enables ORDER BY)
     .type(make_type(COMPLEX)
-      .persisted_length(16)
+      .persisted_length(kComplexSize)
       .max_decode_buffer_length(64)
-      .encode(&complex::encode_complex)
-      .decode(&complex::decode_complex)
-      .compare(&complex::cmp_complex)
+      .encode(&encode_complex)
+      .decode(&decode_complex)
+      .compare(&cmp_complex)
       .build())
 
     // Register COMPLEX2 type with custom hash
     .type(make_type(COMPLEX2)
-      .persisted_length(16)
+      .persisted_length(kComplexSize)
       .max_decode_buffer_length(64)
-      .encode(&complex::encode_complex2)
-      .decode(&complex::decode_complex)
-      .compare(&complex::cmp_complex)
-      .hash(&complex::hash_complex2)
+      .encode(&encode_complex2)
+      .decode(&decode_complex)
+      .compare(&cmp_complex)
+      .hash(&hash_complex2)
       .build())
 
-    // Arithmetic operations
-    .func(make_func("complex_add")
-      .returns(COMPLEX)
-      .param(COMPLEX)
-      .param(COMPLEX)
-      .wrap<&complex_add_impl>())
+    // Type conversion functions
+    .func(make_func("complex_from_string")
+      .from_string<&encode_complex>(COMPLEX))
+    .func(make_func("complex_to_string")
+      .to_string<&decode_complex>(COMPLEX))
+    .func(make_func("complex2_from_string")
+      .from_string<&encode_complex2>(COMPLEX2))
+    .func(make_func("complex2_to_string")
+      .to_string<&decode_complex>(COMPLEX2))
 
-    .func(make_func("complex_multiply")
+    // Arithmetic operations
+    .func(make_func<&complex_add_impl>("complex_add")
       .returns(COMPLEX)
       .param(COMPLEX)
       .param(COMPLEX)
-      .wrap<&complex_multiply_impl>())
+      .build())
+    .func(make_func<&complex_subtract_impl>("complex_subtract")
+      .returns(COMPLEX)
+      .param(COMPLEX)
+      .param(COMPLEX)
+      .build())
+    .func(make_func<&complex_multiply_impl>("complex_multiply")
+      .returns(COMPLEX)
+      .param(COMPLEX)
+      .param(COMPLEX)
+      .build())
+    .func(make_func<&complex_divide_impl>("complex_divide")
+      .returns(COMPLEX)
+      .param(COMPLEX)
+      .param(COMPLEX)
+      .build())
 
     // Utility functions
-    .func(make_func("complex_real")
+    .func(make_func<&complex_real_impl>("complex_real")
       .returns(REAL)
       .param(COMPLEX)
-      .wrap<&complex_real_impl>())
-
-    .func(make_func("complex_abs")
+      .build())
+    .func(make_func<&complex_imag_impl>("complex_imag")
       .returns(REAL)
       .param(COMPLEX)
-      .wrap<&complex_abs_impl>())
-
-    .build()
-);
+      .build())
+    .func(make_func<&complex_abs_impl>("complex_abs")
+      .returns(REAL)
+      .param(COMPLEX)
+      .build())
+    .func(make_func<&complex_conjugate_impl>("complex_conjugate")
+      .returns(COMPLEX)
+      .param(COMPLEX)
+      .build()))
 ```
 
 **Key patterns:**
 - Single macro call registers everything - no manual SQL needed
 - `.compare()` enables ORDER BY and indexing
 - `.hash()` is optional (uses default if not provided)
-- `.wrap<&function>()` creates type-safe wrappers
+- Function registration uses `make_func<&impl>("name")` with `.build()`
+- Type conversion uses special `.from_string<>()` and `.to_string<>()` methods
 
 ---
 
@@ -126,15 +148,15 @@ COMPLEX stores **16 bytes** (little-endian):
 - Bytes 0-7: Real part (double)
 - Bytes 8-15: Imaginary part (double)
 
-**Encode/Decode (complex.h:34-37):**
+**Encode/Decode (complex.cc):**
 ```cpp
-bool encode_complex(unsigned char *buffer, uint64_t buffer_size,
-                    const char *from, size_t from_len, int *length);
-bool decode_complex(const unsigned char *buffer, uint64_t buffer_size,
+bool encode_complex(unsigned char *buffer, size_t buffer_size,
+                    const char *from, size_t from_len, size_t *length);
+bool decode_complex(const unsigned char *buffer, size_t buffer_size,
                     char *to, size_t to_buffer_size, size_t *to_length);
 ```
 
-Uses `float8store/float8get` for platform-independent storage.
+Uses platform-independent byte-order functions for cross-platform compatibility.
 
 ---
 
@@ -142,64 +164,37 @@ Uses `float8store/float8get` for platform-independent storage.
 
 The VEF SDK allows clean C++ wrapper functions without raw UDF boilerplate:
 
-**Arithmetic Example (from complex_funcs.cc):**
+**Arithmetic Example (from complex.cc):**
 
 ```cpp
-// Clean wrapper - no manual validation needed!
-ComplexNumber complex_add_impl(ComplexNumber a, ComplexNumber b) {
-    return ComplexNumber{a.real + b.real, a.imag + b.imag};
-}
-
-// Utility function wrapper
-double complex_real_impl(ComplexNumber c) {
-    return c.real;
-}
-
-double complex_abs_impl(ComplexNumber c) {
-    return std::sqrt(c.real * c.real + c.imag * c.imag);
+void complex_add_impl(vef_context_t *ctx, vef_invalue_t *in_l,
+                      vef_invalue_t *in_r, vef_vdf_result_t *out) {
+  // Handle NULL inputs and validate arguments
+  // ...
+  ReturnComplex(Complex{lhs->re + rhs->re, lhs->im + rhs->im}, out);
 }
 ```
 
----
-
-## Aggregation Support
-
-**SUM for COMPLEX:**
+**Utility Function Wrappers (from complex.cc):**
 
 ```cpp
-void sum_complex_clear(UDF_INIT *initid, char *is_null, char *error) {
-    // Reset accumulator to 0+0i
-    double *state = (double*)initid->ptr;
-    state[0] = 0.0;  // real
-    state[1] = 0.0;  // imaginary
+void complex_real_impl(vef_context_t *ctx, vef_invalue_t *in,
+                       vef_vdf_result_t *out) {
+  // Handle NULL and validate
+  // ...
+  out->real_value = cx->re;
+  out->type = VEF_RESULT_VALUE;
 }
 
-void sum_complex_add(UDF_INIT *initid, UDF_ARGS *args,
-                     char *is_null, char *error) {
-    if (args->args[0] == nullptr) return;  // Skip NULL
-
-    double *state = (double*)initid->ptr;
-    double real = float8get((unsigned char*)args->args[0]);
-    double imag = float8get((unsigned char*)args->args[0] + 8);
-
-    state[0] += real;
-    state[1] += imag;
-}
-
-char *sum_complex(UDF_INIT *initid, UDF_ARGS *args, char *result,
-                  unsigned long *length, char *is_null, char *error) {
-    double *state = (double*)initid->ptr;
-    float8store((unsigned char*)result, state[0]);
-    float8store((unsigned char*)result + 8, state[1]);
-    *length = 16;
-    return result;
+void complex_abs_impl(vef_context_t *ctx, vef_invalue_t *in,
+                      vef_vdf_result_t *out) {
+  // Handle NULL and validate
+  // ...
+  out->real_value = sqrt(cx->re * cx->re + cx->im * cx->im);
+  out->type = VEF_RESULT_VALUE;
 }
 ```
 
-**Usage:**
-```sql
-SELECT SUM(impedance) FROM signals;
-```
 
 ---
 
@@ -234,11 +229,11 @@ cd /path/to/villagesql/build/mysql-test
 
 | Pattern | Usage |
 |---------|-------|
-| **Fixed-length storage** | Set `initid->max_length = 16` in _init |
-| **Platform-independent** | Always use `float8store/float8get` |
-| **NULL handling** | Check `args->args[i] == nullptr` |
-| **Error messages** | Set in _init, not main function |
-| **Persistent state** | Use `initid->ptr` for aggregates |
+| **Fixed-length storage** | Set `.persisted_length()` in type builder |
+| **Platform-independent** | Use custom byte-order functions for doubles |
+| **NULL handling** | Check `in->is_null` in VDF implementations |
+| **Error handling** | Return `VEF_RESULT_ERROR` with error message |
+| **Result output** | Set `out->type` and populate result fields |
 
 ---
 
