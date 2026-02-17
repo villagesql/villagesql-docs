@@ -89,6 +89,11 @@ VillageSQL's key differentiator is its extension framework. When documenting ext
 - Alt text on all images
 - Relative paths for internal links
 
+## Versioning workflow
+- See [VERSIONING.md](./VERSIONING.md) for the complete versioning policy
+- All changes go to the dev branch (e.g., `mysql-8.4/0.0.3-dev/`)
+- When cutting a release, follow the process in VERSIONING.md
+
 ## Git workflow
 - NEVER use --no-verify when committing
 - Ask how to handle uncommitted changes before starting

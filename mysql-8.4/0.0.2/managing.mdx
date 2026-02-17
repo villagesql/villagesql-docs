@@ -1,0 +1,398 @@
+---
+title: Managing Extensions
+description: Monitor, troubleshoot, and manage VillageSQL extensions
+---
+
+## Viewing Installed Extensions
+
+Query installed extensions using the INFORMATION_SCHEMA view:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+**Output:**
+```
++------------------+-------------------+
+| EXTENSION_NAME   | EXTENSION_VERSION |
++------------------+-------------------+
+| vsql_complex     | 1.0.0             |
+| vsql_uuid        | 0.2.1             |
++------------------+-------------------+
+```
+
+**Usage:**
+- Use in both interactive sessions and scripts
+- Standard SQL interface compatible with MySQL tools
+- Reads from underlying `villagesql.extensions` system table
+
+---
+
+## Checking Extension Functions
+
+Verify UDFs are registered after installing an extension:
+
+```sql
+-- List all UDFs from an extension
+SELECT name, type, dl
+FROM mysql.func
+WHERE dl LIKE '%vsql_complex%';
+
+-- Test a function
+SELECT COMPLEX(1.0, 2.0);
+```
+
+---
+
+## Extension Directory
+
+Check where VillageSQL looks for `.veb` files:
+
+```sql
+SHOW VARIABLES LIKE 'vef_dir';
+```
+
+**Default locations:**
+- **Linux:** `/usr/local/mysql/lib/veb/`
+- **macOS:** `/usr/local/mysql/lib/veb/`
+
+**List available extensions:**
+```bash
+ls -la /path/to/vef_dir/*.veb
+```
+
+### Configuring vef_dir
+
+To change the extension directory location, set `vef_dir` in your MySQL configuration file:
+
+**my.cnf / my.ini:**
+```ini
+[mysqld]
+vef_dir=/custom/path/to/extensions/
+```
+
+**Requirements:**
+- Path must be absolute (not relative)
+- Directory must exist before server start
+- MySQL user must have read permissions on the directory
+- Only one `vef_dir` is supported (cannot have multiple paths)
+- Changes require server restart to take effect
+
+**Verify after restart:**
+```sql
+SHOW VARIABLES LIKE 'vef_dir';
+```
+
+---
+
+## Troubleshooting
+
+### Quick Reference
+
+| Issue | Quick Fix |
+|-------|-----------|
+| Extension not found | Verify `.veb` file exists in vef_dir with correct name |
+| Permission denied | Check permissions: `chmod 644 extension.veb` |
+| Cannot uninstall: types in use | Query `villagesql.custom_columns` for dependencies |
+| Version mismatch | Restart server to clear cache |
+
+### Extension Not Found
+
+**Error:** `Extension 'my_extension' not found`
+
+**Debug steps:**
+```bash
+# 1. Check vef_dir location
+mysql -u root -p -e "SHOW VARIABLES LIKE 'vef_dir';"
+
+# 2. List .veb files
+ls -la /path/to/vef_dir/
+
+# 3. Verify filename matches extension name
+# File: my_extension.veb
+# Install: INSTALL EXTENSION my_extension;
+
+# 4. Check permissions
+ls -l /path/to/vef_dir/my_extension.veb
+sudo chmod 644 /path/to/vef_dir/my_extension.veb
+```
+
+### Function Not Available After Install
+
+**Error:** `FUNCTION my_func does not exist`
+
+**Debug steps:**
+```sql
+-- 1. Verify extension installed
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+
+-- 2. Check UDF registration
+SELECT * FROM mysql.func WHERE dl LIKE '%my_extension%';
+```
+
+### Cannot Uninstall Extension
+
+**Error:** `Cannot uninstall extension: types in use`
+
+**Solution:**
+
+```sql
+-- Find tables using the extension's types
+SELECT
+    db_name,
+    table_name,
+    column_name,
+    type_name
+FROM villagesql.custom_columns
+WHERE extension_name = 'my_extension';
+
+-- Drop or alter those tables
+DROP TABLE mydb.mytable;
+-- OR
+ALTER TABLE mydb.mytable DROP COLUMN my_column;
+
+-- Retry uninstall
+UNINSTALL EXTENSION my_extension;
+```
+
+### Library Loading Errors
+
+**Error:** `Cannot load library: undefined symbol`
+
+**Causes:**
+- Missing library dependencies
+- ABI compatibility mismatch
+- Incorrect MySQL version
+
+**Debug:**
+```bash
+# Check library dependencies (Linux)
+ldd /path/to/vef_dir/_expanded/my_extension/sha256/lib/my_extension.so
+
+# Check library dependencies (macOS)
+otool -L /path/to/vef_dir/_expanded/my_extension/sha256/lib/my_extension.so
+```
+
+### Extension Name Validation Errors
+
+**Error:** `Failed to load VEF extension 'extension_name'` with log message `Extension name mismatch`
+
+**Cause:** The extension name in `manifest.json` doesn't match the VEB filename or the name registered in the extension code.
+
+**Debug steps:**
+
+1. **Check VEB filename matches manifest:**
+   ```bash
+   # VEB filename: my_extension.veb
+   # manifest.json should have:
+   {
+     "name": "my_extension",  # Must match VEB filename (without .veb)
+     ...
+   }
+   ```
+
+2. **Verify manifest.json name field:**
+   ```bash
+   # Extract and check manifest from VEB
+   tar -xOf /path/to/vef_dir/my_extension.veb manifest.json | grep name
+   ```
+
+3. **Check extension registration in code:**
+   ```cpp
+   // In your extension source, these must all match:
+   VEF_GENERATE_ENTRY_POINTS(
+     make_extension("my_extension", "1.0.0")  // Must match manifest name
+       ...
+   )
+   ```
+
+**Solution:**
+
+All three names must be identical (using underscores, not hyphens):
+- VEB filename: `my_extension.veb`
+- manifest.json: `"name": "my_extension"`
+- Extension code: `make_extension("my_extension", ...)`
+
+**Common mistakes:**
+- Using hyphens in manifest: `"name": "my-extension"` ❌
+- VEB filename doesn't match: `my-extension.veb` vs `"name": "my_extension"` ❌
+- Code registration differs: `make_extension("myextension", ...)` ❌
+
+**Correct example:**
+```json
+// manifest.json
+{
+  "name": "my_extension",
+  "version": "1.0.0"
+}
+```
+
+```cpp
+// extension.cc
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .func(...)
+)
+```
+
+```bash
+# VEB filename
+my_extension.veb
+```
+
+---
+
+## Monitoring Extension Usage
+
+### Query Performance
+
+Track UDF execution times using performance_schema:
+
+```sql
+-- Enable statement instrumentation
+UPDATE performance_schema.setup_instruments
+SET ENABLED = 'YES', TIMED = 'YES'
+WHERE NAME LIKE '%statement%';
+
+-- Query UDF execution times
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR as executions,
+    ROUND(SUM_TIMER_WAIT/1000000000, 2) as total_ms,
+    ROUND(AVG_TIMER_WAIT/1000000000, 2) as avg_ms
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST_TEXT LIKE '%complex_%'
+ORDER BY total_ms DESC
+LIMIT 10;
+```
+
+### Custom Type Usage
+
+Track which tables use custom types:
+
+```sql
+SELECT
+    cc.extension_name,
+    COUNT(DISTINCT CONCAT(cc.db_name, '.', cc.table_name)) as table_count,
+    COUNT(cc.column_name) as column_count
+FROM villagesql.custom_columns cc
+GROUP BY cc.extension_name;
+```
+
+---
+
+## Updating Extensions
+
+To update an extension to a newer version, use the manual update process:
+
+<Note>
+  **ALTER EXTENSION UPDATE** is not supported in v0.0.2 and is planned for a future release.
+</Note>
+
+### Manual Update Process
+
+1. **Uninstall the current version:**
+   ```sql
+   UNINSTALL EXTENSION extension_name;
+   ```
+
+2. **Replace the .veb file:**
+   ```bash
+   # Remove old .veb file
+   sudo rm /path/to/vef_dir/extension_name.veb
+
+   # Copy new .veb file
+   sudo cp new_extension_name.veb /path/to/vef_dir/
+   ```
+
+3. **Install the new version:**
+   ```sql
+   INSTALL EXTENSION extension_name;
+   ```
+
+4. **Verify the update:**
+   ```sql
+   SELECT EXTENSION_VERSION
+   FROM INFORMATION_SCHEMA.EXTENSIONS
+   WHERE EXTENSION_NAME = 'extension_name';
+   ```
+
+<Warning>
+  **Data Safety:** If tables use custom types from the extension, you must drop or alter those tables before uninstalling. Back up your data first.
+</Warning>
+
+**Example:**
+```sql
+-- Check for dependencies
+SELECT db_name, table_name, column_name
+FROM villagesql.custom_columns
+WHERE extension_name = 'vsql_complex';
+
+-- If tables exist, back up data and drop/alter them first
+-- Then proceed with update
+UNINSTALL EXTENSION vsql_complex;
+-- (replace .veb file)
+INSTALL EXTENSION vsql_complex;
+```
+
+---
+
+## Cleaning Up
+
+### Remove Orphaned Expansion Directories
+
+VillageSQL expands `.veb` files to `_expanded/{name}/{sha256}/`. Old versions accumulate over time.
+
+```bash
+# List expansion directories
+ls -la /path/to/vef_dir/_expanded/
+
+# Compare with installed extensions
+mysql -u root -p -e "SELECT extension_name, veb_sha256 FROM villagesql.extensions;"
+
+# Manually remove unused SHA256 directories
+rm -rf /path/to/vef_dir/_expanded/my_extension/old_sha256_hash/
+```
+
+<Note>
+  Server restart automatically cleans up orphaned expansion directories.
+</Note>
+
+---
+
+## Getting Help
+
+If you encounter issues not covered here:
+
+1. **Check Error Log:** Most extension errors are logged with details
+2. **Review Extension Docs:** Extension-specific troubleshooting may exist
+3. **Ask on Discord:** Join the [VillageSQL Discord](https://discord.gg/KSr6whd3Fr)
+4. **File an Issue:** Report bugs on [GitHub Issues](https://github.com/villagesql/villagesql-server/issues)
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="System Reference"
+    icon="book"
+    href="/mysql-8.4/0.0.2/reference"
+  >
+    Query system tables and views
+  </Card>
+  <Card
+    title="Uninstall Extensions"
+    icon="trash"
+    href="/mysql-8.4/0.0.2/uninstall"
+  >
+    Remove extensions safely
+  </Card>
+  <Card
+    title="Extension Architecture"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.2/architecture"
+  >
+    Understand the internals
+  </Card>
+</CardGroup>
