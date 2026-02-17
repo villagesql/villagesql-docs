@@ -1,0 +1,370 @@
+---
+title: Extension Architecture
+description: How VillageSQL's extension system works internally
+---
+
+Understanding VillageSQL's extension architecture helps debug issues and optimize performance when building extensions.
+
+---
+
+## Terminology
+
+- **VEB** (VillageSQL Extension Bundle) - The `.veb` file format, a tar archive containing manifest, library, and metadata
+- **VEF** (VillageSQL Extension Framework) - The SDK and C++ API for authoring extensions
+- **VDF** (Village Defined Function) - Functions registered through the VEF SDK using `VEF_GENERATE_ENTRY_POINTS()`
+- **UDF** (User-Defined Function) - Traditional MySQL functions registered via `CREATE FUNCTION ... SONAME` (legacy approach, still supported)
+
+---
+
+## VDF Function Lookup
+
+VDFs support both qualified and unqualified function calls:
+
+```sql
+-- Unqualified lookup
+SELECT complex_abs(value) FROM table;
+
+-- Qualified lookup
+SELECT vsql_complex.complex_abs(value) FROM table;
+```
+
+**Resolution order for unqualified function calls:**
+1. System functions (built-in MySQL)
+2. UDFs (traditional user-defined functions)
+3. VDFs (extension functions) - only if exactly one function with that name exists
+4. Stored functions (created with `CREATE FUNCTION`)
+
+**Performance:** Function lookup adds negligible overhead (~1-10ns). Qualified calls skip the resolution chain and directly invoke the extension function.
+
+---
+
+## VEB File Format
+
+VillageSQL extensions are distributed as `.veb` (VillageSQL Extension Bundle) files - tar archives containing:
+
+```
+extension_name.veb (tar archive)
+├── manifest.json       # Extension metadata (required)
+└── lib/
+    └── extension.so    # Compiled shared library (required)
+```
+
+### manifest.json Schema
+
+```json
+{
+  "name": "extension_name",          // Required: lowercase_with_underscores
+  "version": "1.0.0",                // Required: semantic version
+  "description": "Brief description",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+- **name:** Must match extension name used in SQL (lowercase_with_underscores)
+- **version:** Semantic version (MAJOR.MINOR.PATCH)
+- **description, author, license:** Optional metadata
+
+## Extension Lifecycle
+
+### Installation Flow
+
+```
+INSTALL EXTENSION name
+    ↓
+1. Validate .veb exists in vef_dir
+    ↓
+2. Calculate SHA256 hash of .veb
+    ↓
+3. Expand to _expanded/{name}/{sha256}/
+    ↓
+4. Parse and validate manifest.json
+    ↓
+5. Load .so library (dlopen)
+    ↓
+6. Call vef_register() entry point
+    ↓
+7. Register VDFs and custom types
+    ↓
+8. Insert into villagesql.extensions
+    ↓
+9. Update Victionary cache
+    ↓
+Success
+```
+
+**Rollback:** If any step fails, transaction rolls back and .so is unloaded.
+
+<Note>
+The `vef_dir` system variable points to the directory containing `.veb` files, despite the naming difference between VEB (file format) and VEF (SDK framework).
+</Note>
+
+### Uninstallation Flow
+
+```
+UNINSTALL EXTENSION name
+    ↓
+1. Check for dependencies (custom_columns)
+    ↓
+2. Call vef_unregister() cleanup hook
+    ↓
+3. Drop registered VDFs
+    ↓
+4. Drop custom types
+    ↓
+5. Delete from villagesql.extensions
+    ↓
+6. Unload .so library (dlclose)
+    ↓
+7. Update Victionary cache
+    ↓
+8. Keep _expanded directory (for reinstall)
+    ↓
+Success
+```
+
+**Dependency prevention:** Cannot uninstall if `villagesql.custom_columns` has active usage.
+
+---
+
+## Expansion Directory Structure
+
+VillageSQL expands .veb files to support multiple versions:
+
+```
+vef_dir/
+├── extension_name.veb
+└── _expanded/
+    └── extension_name/
+        ├── abc123.../              # SHA256 of v1.0.0 .veb
+        │   ├── manifest.json
+        │   └── lib/extension.so
+        └── def456.../              # SHA256 of v2.0.0 .veb
+            ├── manifest.json
+            └── lib/extension.so
+```
+
+**Why SHA256 directories?**
+- Test new versions without overwriting
+- Enable rollback
+- Prevent "same version, different code"
+
+**Cleanup:** Orphaned SHA256 directories are removed on server restart.
+
+---
+
+## Victionary Caching Layer
+
+VictionaryClient maintains in-memory caches of system metadata for O(log n) lookups.
+
+### Cached Tables
+
+```cpp
+SystemTableMap<ExtensionEntry> m_extensions;
+SystemTableMap<CustomTypeEntry> m_types;
+SystemTableMap<CustomColumnEntry> m_columns;
+SystemTableMap<PropertyEntry> m_properties;
+```
+
+### Cache Operations
+
+| Operation | Locking | Performance |
+|-----------|---------|-------------|
+| Read (resolve type) | Read lock | O(log n) map lookup |
+| Write (install extension) | Write lock | O(log n) insert + disk I/O |
+| Server startup | N/A | Full table scan into memory |
+
+**Cache invalidation:** Automatic during DDL operations (INSTALL/UNINSTALL EXTENSION).
+
+**Memory overhead:** ~100 bytes per entry.
+
+---
+
+## Custom Type System
+
+### Type Resolution
+
+```cpp
+CREATE TABLE t (col COMPLEX)
+    ↓
+1. Parser encounters COMPLEX
+    ↓
+2. PT_custom_type::create()
+    ↓
+3. ResolveTypeToContext(extension_name, type_name)
+    ↓
+4. VictionaryClient::lookup_type() → O(log n)
+    ↓
+5. Find TypeDescriptor in cache
+    ↓
+6. Create Field with implementation_type
+```
+
+### Implementation Types
+
+Custom types map to MySQL storage types:
+
+| Custom Type | MySQL Implementation | Bytes |
+|-------------|---------------------|-------|
+| COMPLEX     | MYSQL_TYPE_VARCHAR  | 16 |
+| UUID        | MYSQL_TYPE_VARCHAR  | 16 |
+| INET6       | MYSQL_TYPE_VARCHAR  | 16 |
+| JSON_SCHEMA | MYSQL_TYPE_BLOB     | Variable |
+
+---
+
+## Concurrency & Transaction Behavior
+
+### Thread Safety Model
+
+Extension functions are called in a per-row execution model:
+
+- **Isolated per-row execution:** Each function call gets its own result buffer (thread-safe by design)
+- **Prerun/Postrun hooks:** Per-statement setup/cleanup, called once per SQL statement
+- **No guaranteed isolation:** Multiple connections may call your functions concurrently
+- **Best practice:** Avoid global state; use function parameters and return values
+
+<Warning>
+VillageSQL does not guarantee thread isolation for extension functions. If you use global variables or shared state, protect them with mutexes or locks.
+</Warning>
+
+### Transaction Behavior
+
+Extension functions should follow these best practices:
+- Design functions to be stateless when possible
+- Avoid persistent side effects (file writes, external API calls) in functions
+- If using prerun/postrun state, handle cleanup appropriately
+
+---
+
+## Performance Considerations
+
+### VDF Call Overhead
+
+| Operation | Overhead |
+|-----------|----------|
+| Function pointer dereference | ~1ns |
+| Argument marshaling | ~10ns |
+| Result copying | ~10ns |
+
+**Optimization:** Use prerun hooks to cache expensive per-statement setup instead of repeating work per-row.
+
+### Custom Type Performance
+
+```sql
+-- Slow: UDF call per row
+SELECT * FROM signals WHERE complex_abs(impedance) > 100;
+
+-- Fast: Computed column with index
+ALTER TABLE signals
+ADD COLUMN impedance_magnitude DOUBLE AS (complex_abs(impedance)) STORED,
+ADD INDEX(impedance_magnitude);
+
+SELECT * FROM signals WHERE impedance_magnitude > 100;
+```
+
+---
+
+## Security & Debugging
+
+<Accordion title="Security Model">
+
+**Trust model:** Extensions run with full server privileges.
+
+- No sandboxing or permission system
+- Extensions can read any file, access network, execute code
+- **Trust implications:** Only install extensions from trusted sources
+
+**Installation security:** Runs as `villagesql_extension_installer` user (context switch).
+
+</Accordion>
+
+<Accordion title="Debugging Extensions">
+
+**Enable verbose logging:**
+```bash
+mysqld --log-error-verbosity=3
+```
+
+**GDB debugging:**
+```bash
+gdb -p $(pidof mysqld)
+(gdb) break my_func_init
+(gdb) continue
+```
+
+**Check dependencies:**
+```bash
+# Linux
+ldd /path/to/extension.so
+
+# macOS
+otool -L /path/to/extension.so
+```
+
+**Common errors:**
+- **Undefined symbol:** Check `extern "C"` linkage
+- **Cannot open shared object:** Check library dependencies
+- **Crash on UDF call:** Check NULL pointer handling
+
+</Accordion>
+
+---
+
+## Schema Validation
+
+On server startup, SchemaManager validates system table schemas:
+
+```cpp
+1. Open each system table (villagesql.*)
+2. Check column count and names
+3. Validate column types
+4. Verify primary keys
+5. Check indexes
+```
+
+**Failure scenarios:**
+- Missing table → Create from villagesql_schema.sql
+- Wrong schema → Error and refuse to start
+- Version mismatch → Run upgrade scripts
+
+**Schema version:**
+```sql
+SELECT property_value FROM villagesql.properties WHERE property_name = 'schema_version';
+-- Expected: '1' for VillageSQL 0.0.1
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Create Extension"
+    icon="code"
+    href="/mysql-8.4/0.0.3-dev/create"
+  >
+    Build your first extension
+  </Card>
+  <Card
+    title="System Reference"
+    icon="book"
+    href="/mysql-8.4/0.0.3-dev/reference"
+  >
+    System tables and views
+  </Card>
+  <Card
+    title="Examples"
+    icon="lightbulb"
+    href="/mysql-8.4/0.0.3-dev/examples"
+  >
+    Study vsql_complex implementation
+  </Card>
+  <Card
+    title="Managing Extensions"
+    icon="sliders"
+    href="/mysql-8.4/0.0.3-dev/managing"
+  >
+    Monitor and troubleshoot
+  </Card>
+</CardGroup>
