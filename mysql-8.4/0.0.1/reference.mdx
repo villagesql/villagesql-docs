@@ -1,121 +1,9 @@
 ---
-title: System Tables & Views Reference
-description: VillageSQL system catalog schema reference
+title: System Views Reference
+description: VillageSQL system views for querying extension metadata
 ---
 
-VillageSQL stores extension metadata in system tables within the `villagesql` schema. Query this information via system tables or INFORMATION_SCHEMA views.
-
-<Warning>
-  Never modify system tables directly. Use `INSTALL EXTENSION`, `UNINSTALL EXTENSION`, and other SQL commands to manage extensions.
-</Warning>
-
-## System Tables
-
-| Table | Purpose | Key Columns |
-|-------|---------|-------------|
-| `villagesql.extensions` | Installed extensions registry | extension_name, extension_version, veb_sha256 |
-| `villagesql.custom_columns` | Type usage tracking | db_name, table_name, column_name, type_name |
-| `villagesql.properties` | System properties | property_name, property_value |
-
----
-
-### villagesql.extensions
-
-Tracks all installed extensions with version and integrity information.
-
-**Schema:**
-```sql
-CREATE TABLE villagesql.extensions (
-  extension_name VARCHAR(64) NOT NULL PRIMARY KEY,
-  extension_version VARCHAR(64) NOT NULL,
-  veb_sha256 VARCHAR(64) NOT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
-
-**Query Example:**
-```sql
-SELECT extension_name, extension_version
-FROM villagesql.extensions;
-```
-
-**Sample Output:**
-```
-+------------------+-------------------+
-| extension_name   | extension_version |
-+------------------+-------------------+
-| vsql_complex     | 1.0.0             |
-| vsql_uuid        | 0.2.1             |
-+------------------+-------------------+
-```
-
----
-
-### villagesql.custom_columns
-
-Tracks which table columns use custom types. Critical for preventing uninstall of extensions with active usage.
-
-**Schema:**
-```sql
-CREATE TABLE villagesql.custom_columns (
-  db_name VARCHAR(64) NOT NULL,
-  table_name VARCHAR(64) NOT NULL,
-  column_name VARCHAR(64) NOT NULL,
-  type_name VARCHAR(64) NOT NULL,
-  extension_name VARCHAR(64) NOT NULL,
-  extension_version VARCHAR(64) NOT NULL,
-  PRIMARY KEY (db_name, table_name, column_name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
-
-**Query Example:**
-```sql
--- Find all tables using custom types
-SELECT
-    db_name,
-    table_name,
-    column_name,
-    type_name
-FROM villagesql.custom_columns
-ORDER BY db_name, table_name;
-
--- Check dependencies before uninstall
-SELECT COUNT(*) as dependent_columns
-FROM villagesql.custom_columns
-WHERE extension_name = 'vsql_complex';
-```
-
-**Sample Output:**
-```
-+---------+------------+-------------+-----------+
-| db_name | table_name | column_name | type_name |
-+---------+------------+-------------+-----------+
-| mydb    | signals    | impedance   | COMPLEX   |
-| mydb    | signals    | frequency   | COMPLEX   |
-| testdb  | users      | user_id     | UUID      |
-+---------+------------+-------------+-----------+
-```
-
----
-
-### villagesql.properties
-
-System properties and metadata, including schema version.
-
-**Schema:**
-```sql
-CREATE TABLE villagesql.properties (
-  property_name VARCHAR(64) NOT NULL PRIMARY KEY,
-  property_value VARCHAR(256) NOT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
-
-**Query Example:**
-```sql
--- Check schema version
-SELECT property_value
-FROM villagesql.properties
-WHERE property_name = 'schema_version';
-```
+Query extension metadata using the standard SQL interfaces below.
 
 ---
 
@@ -123,7 +11,7 @@ WHERE property_name = 'schema_version';
 
 ### INFORMATION_SCHEMA.EXTENSIONS
 
-Public view for querying installed extensions. Recommended for applications and scripts.
+Lists all installed extensions.
 
 **Schema:**
 ```sql
@@ -132,8 +20,6 @@ SELECT
     EXTENSION_VERSION
 FROM INFORMATION_SCHEMA.EXTENSIONS;
 ```
-
-**Source:** Backed by `villagesql.extensions` table.
 
 **Example:**
 ```sql
@@ -146,58 +32,85 @@ FROM INFORMATION_SCHEMA.EXTENSIONS
 WHERE EXTENSION_NAME = 'vsql_complex';
 ```
 
+**Sample Output:**
+```
++------------------+-------------------+
+| EXTENSION_NAME   | EXTENSION_VERSION |
++------------------+-------------------+
+| vsql_complex     | 0.0.1             |
+| vsql_uuid        | 0.2.1             |
++------------------+-------------------+
+```
+
+---
+
+### INFORMATION_SCHEMA.COLUMNS (Custom Types)
+
+Columns using custom extension types are visible through the standard
+`INFORMATION_SCHEMA.COLUMNS` view. Custom types appear as
+`extension_name.type_name` in the `DATA_TYPE` and `COLUMN_TYPE` columns
+(e.g., `vsql_complex.COMPLEX`).
+
+**Example:**
+```sql
+-- Find all columns using custom extension types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY TABLE_SCHEMA, TABLE_NAME;
+
+-- Find columns using a specific extension's types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
+```
+
+**Sample Output:**
+```
++--------------+------------+-------------+---------------------+
+| TABLE_SCHEMA | TABLE_NAME | COLUMN_NAME | DATA_TYPE           |
++--------------+------------+-------------+---------------------+
+| mydb         | signals    | impedance   | vsql_complex.COMPLEX|
+| mydb         | signals    | frequency   | vsql_complex.COMPLEX|
++--------------+------------+-------------+---------------------+
+```
+
 ---
 
 ## Common Queries
 
 ### Find Extension Dependencies
 
-Check if an extension can be safely uninstalled:
+Find which columns use a specific extension's types before uninstalling:
 
 ```sql
-SELECT
-    'Custom Types' as dependency_type,
-    type_name as name
-FROM villagesql.custom_columns
-WHERE extension_name = 'vsql_complex'
-
-UNION ALL
-
-SELECT
-    'Columns' as dependency_type,
-    CONCAT(db_name, '.', table_name, '.', column_name) as name
-FROM villagesql.custom_columns
-WHERE extension_name = 'vsql_complex';
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
 ```
 
-### List All Custom Types with Usage
+### List All Extensions and Their Custom Type Columns
 
 ```sql
-SELECT
-    ct.type_name,
-    ct.extension_name,
-    e.extension_version,
-    COUNT(cc.column_name) as usage_count
-FROM villagesql.custom_columns ct
-LEFT JOIN villagesql.custom_columns cc
-    ON ct.type_name = cc.type_name
-    AND ct.extension_name = cc.extension_name
-JOIN villagesql.extensions e
-    ON ct.extension_name = e.extension_name
-GROUP BY ct.type_name, ct.extension_name, e.extension_version
-ORDER BY usage_count DESC;
+-- All installed extensions
+SELECT EXTENSION_NAME, EXTENSION_VERSION
+FROM INFORMATION_SCHEMA.EXTENSIONS
+ORDER BY EXTENSION_NAME;
+
+-- All columns using custom types across all extensions
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY DATA_TYPE, TABLE_SCHEMA, TABLE_NAME;
 ```
 
 ### Find Tables Using Extension Types
 
 ```sql
-SELECT DISTINCT
-    cc.db_name,
-    cc.table_name,
-    GROUP_CONCAT(cc.column_name ORDER BY cc.column_name) as columns
-FROM villagesql.custom_columns cc
-WHERE cc.extension_name = 'vsql_complex'
-GROUP BY cc.db_name, cc.table_name;
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%'
+ORDER BY TABLE_SCHEMA, TABLE_NAME;
 ```
 
 ---
