@@ -44,7 +44,7 @@ This is a Mintlify documentation site with the following structure:
 VillageSQL's key differentiator is its extension framework. When documenting extensions:
 
 - **Installation syntax**: `INSTALL EXTENSION extension_name;`
-- **Verification**: `SHOW EXTENSIONS;` lists all installed extensions
+- **Verification**: `SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;` lists all installed extensions
 - **Built-in extensions**: When building from source, `vsql_complex` and `vsql_simple` are included. Other extensions are available in separate GitHub repositories.
 - **Example extensions**:
   - `vsql_complex`: Complex number data types (included in source builds)
