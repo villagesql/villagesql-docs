@@ -111,3 +111,24 @@ VillageSQL's key differentiator is its extension framework. When documenting ext
 - Use absolute URLs for internal links
 - Include untested code examples
 - Make assumptions - always ask for clarification
+
+## Known Agent Anti-Patterns
+
+The following errors have appeared in AI-generated VillageSQL documentation. Do not reproduce them.
+
+**SQL and Commands**
+- NEVER use `SHOW EXTENSIONS` — correct syntax is `SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS`
+- NEVER invent system variable names — correct: `veb_dir` (not `vef_dir`), `make show_veb` (not `make show_vef`)
+- NEVER apply MySQL UDF concepts (`SONAME`, `mysql.func`, `information_schema.routines`) to VEF extensions — they are irrelevant to how VillageSQL loads `.veb` archives into Victionary
+
+**Internal vs. Public Interfaces**
+- NEVER document `villagesql.*` internal tables — they are restricted from user threads (Error 3554); only document public interfaces like `INFORMATION_SCHEMA`
+- You are writing public-facing documentation for end-users — do not expose internal architecture or implementation details
+
+**ABI and Source Code**
+- NEVER assume standard C++ conventions for ABI signatures — derive strictly from the source headers (`types.h`, etc.)
+- The VEF return convention is `false` = success (not `true` = success) — verify in `types.h` before documenting
+
+**Outputs and Performance**
+- NEVER guess command outputs — run the actual command against a live server and use the literal output
+- NEVER generate performance numbers, latency figures, or overhead tables without a specific benchmark report to draw from
