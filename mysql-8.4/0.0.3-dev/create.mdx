@@ -108,6 +108,7 @@ Edit `manifest.json` to define your extension's metadata:
 
 ```json
 {
+  "$schema": "https://raw.githubusercontent.com/villagesql/villagesql-docs/main/mysql-8.4/0.0.3-dev/manifest.json.schema.json",
   "name": "my_awesome_extension",
   "version": "1.0.0",
   "description": "My custom VillageSQL extension that does amazing things",
@@ -116,18 +117,21 @@ Edit `manifest.json` to define your extension's metadata:
 }
 ```
 
+The `$schema` field is optional but enables IDE autocomplete and inline validation
+for all manifest fields.
+
 ### manifest.json Schema
 
 | Field | Required | Format | Description |
 |-------|----------|--------|-------------|
-| `name` | ✅ Yes | lowercase_with_underscores | Unique identifier. Must match `INSTALL EXTENSION` name. |
+| `name` | ✅ Yes | letters, digits, `_`, `-` | Unique identifier. Must match `INSTALL EXTENSION` name. |
 | `version` | ✅ Yes | MAJOR.MINOR.PATCH | Semantic version string |
 | `description` | No | String | Brief explanation of functionality |
 | `author` | No | String | Author name or organization |
 | `license` | No | String | License identifier (GPL-2.0 recommended) |
 
 **Validation rules:**
-- `name`: Must be lowercase letters, numbers, and underscores only. No hyphens in manifest!
+- `name`: Must start with a letter and end with a letter or digit. May contain lowercase letters, digits, underscores, and hyphens. Max 64 characters. **Convention: use underscores** — hyphenated names require SQL quoting to install.
 - `version`: Must follow semantic versioning (e.g., 1.0.0, 0.2.1)
 - Invalid manifest will cause `INSTALL EXTENSION` to fail
 
@@ -136,7 +140,8 @@ Edit `manifest.json` to define your extension's metadata:
 -- manifest.json has "name": "my_awesome_extension"
 INSTALL EXTENSION my_awesome_extension;  -- ✅ Correct
 
-INSTALL EXTENSION my-awesome-extension;  -- ❌ Wrong (hyphens)
+INSTALL EXTENSION my-awesome-extension;  -- ❌ Wrong: hyphens are not valid
+                                         --   in unquoted SQL identifiers
 ```
 
 ## Step 3: Implement Your Extension with VEF SDK
@@ -223,6 +228,147 @@ void large_result_impl(vef_context_t* ctx, vef_invalue_t* input,
 <Note>
 Request sufficient buffer size via `.buffer_size()` based on your function's maximum output size.
 </Note>
+
+## Critical API Contracts
+
+These contracts govern how VDF implementation functions interact with the
+VEF runtime. Every function registered via `make_func<>` must follow them.
+The types referenced below are defined in
+`#include <villagesql/extension.h>` (which transitively includes the ABI
+header `villagesql/abi/types.h`).
+
+### Part A: VDF Function Contracts
+
+**1. VDF implementation functions are `void` -- they never return a value.**
+
+The server calls your function through this typedef:
+
+```cpp
+typedef void (*vef_vdf_func_t)(vef_context_t *ctx, vef_vdf_args_t *args,
+                                vef_vdf_result_t *result);
+```
+
+Extension authors write the per-argument form that the SDK wrapper bridges to
+this ABI:
+
+```cpp
+void my_func_impl(vef_context_t* ctx, vef_invalue_t* input,
+                  vef_vdf_result_t* result) {
+    // ... compute result ...
+    return;  // always void -- no return value
+}
+```
+
+Communicate success, NULL, or error exclusively through `result->type`.
+Do not attempt to return `true`, `false`, or any other value.
+
+**2. Set `result->type` to exactly one of the three result constants.**
+
+Only three constants exist in `vef_return_value_type_t`:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | Success -- the output is in the appropriate union field |
+| `VEF_RESULT_NULL` | 1 | The result is SQL NULL |
+| `VEF_RESULT_ERROR` | 2 | Error -- message is in `result->error_msg` |
+
+There are no type-specific variants. `VEF_RESULT_VALUE` is the single success
+constant for strings, integers, reals, and custom types alike. The type of
+output is determined by which union field you write to (`str_buf`,
+`int_value`, `real_value`, `bin_buf`).
+
+**3. Check `input->is_null` before reading any other field on an input argument.**
+
+If `is_null` is true, every other field on that `vef_invalue_t` is undefined.
+Accessing `str_value`, `int_value`, or any other field without checking
+`is_null` first is undefined behavior.
+
+```cpp
+void my_func_impl(vef_context_t* ctx, vef_invalue_t* input,
+                  vef_vdf_result_t* result) {
+    if (input->is_null) {
+        result->type = VEF_RESULT_NULL;
+        return;
+    }
+    // Safe to read input->str_value, input->int_value, etc.
+}
+```
+
+**4. For string results, write to `result->str_buf` and set `result->actual_len`. Check `result->max_str_len` before writing.**
+
+- `result->str_buf` is a server-managed buffer. Write your output here.
+- `result->actual_len` must be set to the number of bytes written. There is no field named `str_len` on the result struct.
+- `result->max_str_len` is the size of `str_buf` in bytes. Always check it before writing. Do not use `sizeof(result->str_buf)`.
+
+```cpp
+void upper_impl(vef_context_t* ctx, vef_invalue_t* input,
+                vef_vdf_result_t* result) {
+    if (input->is_null) {
+        result->type = VEF_RESULT_NULL;
+        return;
+    }
+
+    size_t len = input->str_len;
+    if (len > result->max_str_len) {
+        result->type = VEF_RESULT_ERROR;
+        snprintf(result->error_msg, VEF_MAX_ERROR_LEN,
+                 "Input length %zu exceeds buffer size %zu",
+                 len, result->max_str_len);
+        return;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        result->str_buf[i] = toupper(input->str_value[i]);
+    }
+    result->type = VEF_RESULT_VALUE;
+    result->actual_len = len;
+}
+```
+
+**5. Write error messages to `result->error_msg`, not to `result->str_buf`. Use `VEF_MAX_ERROR_LEN` (512 bytes) as the `snprintf` size limit.**
+
+`error_msg` is a separate, caller-provided buffer dedicated to error text.
+It is independent of `str_buf`. The maximum size including the null
+terminator is `VEF_MAX_ERROR_LEN` (512), giving 511 usable characters.
+
+```cpp
+// Correct -- error goes to error_msg
+result->type = VEF_RESULT_ERROR;
+snprintf(result->error_msg, VEF_MAX_ERROR_LEN,
+         "Invalid input: expected positive integer, got %lld",
+         input->int_value);
+return;
+```
+
+### Part B: Encode/Decode Return Convention
+
+The bool return convention applies **only** to encode and decode functions
+used by custom types. It does not apply to VDF implementation functions
+(which are `void`, as described above).
+
+```cpp
+typedef bool (*vef_encode_func_t)(unsigned char *buffer, size_t buffer_size,
+                                  const char *from, size_t from_len,
+                                  size_t *length);
+
+typedef bool (*vef_decode_func_t)(const unsigned char *buffer,
+                                  size_t buffer_size, char *to, size_t to_size,
+                                  size_t *to_length);
+```
+
+Both functions return `bool` where:
+- **`false` = success** (the operation completed without error)
+- **`true` = error** (the conversion failed)
+
+<Warning>
+The encode/decode return convention is inverted from what most developers
+expect. `false` means success, `true` means error. This follows the same
+pattern as MySQL UDF functions, which conventionally return 0 (false) for
+success. Double-check every `return` statement in your encode and decode
+implementations.
+</Warning>
+
+---
 
 ### Implement Wrapper Functions
 
