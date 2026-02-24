@@ -186,6 +186,7 @@ VEF_GENERATE_ENTRY_POINTS(
 - `.returns(type)` - Set return type (STRING, INT, REAL, or custom type name)
 - `.param(type)` - Add parameter (maximum 8 parameters)
 - `.buffer_size(size_t)` - Request specific output buffer size for STRING/CUSTOM returns
+- `.deterministic(bool = true)` - Declare that this function always returns the same output for the same inputs and has no side effects. Default is non-deterministic.
 - `.prerun<func>()` - Set per-statement setup function (optional)
 - `.postrun<func>()` - Set per-statement cleanup function (optional)
 - `.build()` - Finalize function registration
@@ -193,6 +194,37 @@ VEF_GENERATE_ENTRY_POINTS(
 <Note>
 **Parameter Limit:** Functions support a maximum of 8 parameters (defined by `kMaxParams`). If you need more, consider using structured types or multiple functions.
 </Note>
+
+### Deterministic Functions
+
+By default, VDFs are registered as non-deterministic. A non-deterministic function is blocked from three SQL contexts: generated columns, CHECK constraints, and expression default values (`DEFAULT (expr)` on a column) — using any of these features with a non-deterministic VDF returns an error. If your function always produces the same output for the same inputs and has no side effects, you can declare it deterministic by adding `.deterministic()` to the builder chain.
+
+The optimizer may use this information to evaluate the function once per statement and reuse the value across rows, rather than calling it per row. Incorrectly marking a non-deterministic function as deterministic can therefore cause the server to return the same result for inputs that should produce different outputs. Only add `.deterministic()` when your function truly has no dependency on external state, randomness, or time.
+
+**Builder signature:** `.deterministic(bool d = true)` — the zero-argument form defaults to `true`.
+
+**Example:**
+
+```cpp
+.func(make_func<&complex_add_impl>("complex_add")
+          .returns(COMPLEX)
+          .param(COMPLEX)
+          .param(COMPLEX)
+          .deterministic()
+          .build())
+```
+
+Because `complex_add` is declared deterministic, it can be used in a generated column definition:
+
+```sql
+-- Deterministic VDFs can be used in generated columns
+CREATE TABLE t (
+    a COMPLEX,
+    b COMPLEX,
+    result COMPLEX GENERATED ALWAYS AS (complex_add(a, b)) STORED
+);
+-- STORED vs VIRTUAL follows standard MySQL generated column rules
+```
 
 ### Custom Buffer Sizes
 
@@ -233,9 +265,7 @@ Request sufficient buffer size via `.buffer_size()` based on your function's max
 
 These contracts govern how VDF implementation functions interact with the
 VEF runtime. Every function registered via `make_func<>` must follow them.
-The types referenced below are defined in
-`#include <villagesql/extension.h>` (which transitively includes the ABI
-header `villagesql/abi/types.h`).
+The types referenced below are defined in `#include <villagesql/extension.h>`.
 
 ### Part A: VDF Function Contracts
 
@@ -260,7 +290,6 @@ void my_func_impl(vef_context_t* ctx, vef_invalue_t* input,
 ```
 
 Communicate success, NULL, or error exclusively through `result->type`.
-Do not attempt to return `true`, `false`, or any other value.
 
 **2. Set `result->type` to exactly one of the three result constants.**
 
@@ -329,7 +358,7 @@ void upper_impl(vef_context_t* ctx, vef_invalue_t* input,
 
 `error_msg` is a separate, caller-provided buffer dedicated to error text.
 It is independent of `str_buf`. The maximum size including the null
-terminator is `VEF_MAX_ERROR_LEN` (512), giving 511 usable characters.
+terminator is `VEF_MAX_ERROR_LEN` (512).
 
 ```cpp
 // Correct -- error goes to error_msg
