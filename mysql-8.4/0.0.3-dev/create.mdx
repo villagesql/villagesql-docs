@@ -571,6 +571,138 @@ VEF_GENERATE_ENTRY_POINTS(
 );
 ```
 
+### Parameterized Types
+
+A parameterized type accepts column-level configuration at `CREATE TABLE`
+time using either an integer or a key-value string:
+
+```sql
+CREATE TABLE t1 (val MYTYPE(10));                -- integer form
+CREATE TABLE t2 (val MYTYPE('precision=10'));     -- key-value string form
+```
+
+To support parameters, add `.resolve_params()` to the TypeBuilder. Setting it
+(or `.int_to_params()`) automatically selects VEF_PROTOCOL_2, which requires
+VillageSQL 0.0.3-dev or later — the server rejects the extension at load time
+if the version is older.
+
+**Required: `.resolve_params(f)`** — validates the key-value array and sets
+`result->persisted_length` (fixed bytes stored per value) and
+`result->max_decode_buffer_length` (maximum decoded string length). Required
+to accept parameters.
+
+**Optional: `.int_to_params(f)`** — converts `MYTYPE(N)` to a key-value array
+before `resolve_params` is called. Omitting it disables the integer syntax.
+When set, `resolve_params` is also required.
+
+Both callbacks return `false` on success, `true` on error.
+
+**Signatures** (`villagesql/sdk/include/villagesql/abi/types.h`):
+
+```cpp
+// Called for MYTYPE(N). Writes up to VEF_MAX_TYPE_PARAMS (16) key-value
+// pairs into params and sets *param_count.
+// Key/value strings must remain valid until the extension is unloaded.
+// Returns false on success, true on error (write message to error_msg).
+typedef bool (*vef_type_int_to_params_func_t)(int64_t value,
+                                              vef_type_param_t *params,
+                                              size_t *param_count,
+                                              char *error_msg);
+
+// Validates params and computes per-column storage sizes.
+// Set result->persisted_length and result->max_decode_buffer_length.
+// Returns false on success, true on error (write message to error_msg).
+typedef bool (*vef_type_resolve_params_func_t)(
+    const vef_type_param_t *params, size_t param_count,
+    vef_type_resolved_params_t *result, char *error_msg);
+```
+
+Supporting types (`villagesql/sdk/include/villagesql/abi/types.h`):
+
+```cpp
+typedef struct { const char *key; const char *value; } vef_type_param_t;
+
+typedef struct {
+    int64_t persisted_length;
+    int64_t max_decode_buffer_length;
+} vef_type_resolved_params_t;
+
+#define VEF_MAX_TYPE_PARAMS 16
+#define VEF_MAX_ERROR_LEN   512
+```
+
+Include `<villagesql/extension.h>` to pull in the full SDK.
+
+**Example:**
+
+```cpp
+#include <villagesql/extension.h>
+#include <cstring>
+#include <cstdlib>
+#include <cinttypes>
+
+bool mytype_resolve_params(const vef_type_param_t *params, size_t param_count,
+                           vef_type_resolved_params_t *result,
+                           char *error_msg) {
+    int64_t precision = 0;
+    for (size_t i = 0; i < param_count; i++) {
+        if (strcmp(params[i].key, "precision") == 0)
+            precision = atoll(params[i].value);
+    }
+    if (precision < 1 || precision > 38) {
+        snprintf(error_msg, VEF_MAX_ERROR_LEN,
+                 "precision must be 1-38, got %" PRId64, precision);
+        return true;
+    }
+    result->persisted_length = 16;           // fixed bytes per stored value
+    result->max_decode_buffer_length = precision + 8;
+    return false;
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .type(make_type("MYTYPE")
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)
+      .resolve_params(&mytype_resolve_params)
+      .build())
+);
+```
+
+To also support `MYTYPE(N)`, add `.int_to_params()`. Key/value strings must
+outlive the extension (not just the call), so they must have static or
+permanent heap lifetime. Static mutable buffers are not safe under concurrent
+DDL; the example below uses a lookup table of string literals:
+
+```cpp
+bool mytype_int_to_params(int64_t value, vef_type_param_t *params,
+                          size_t *param_count, char *error_msg) {
+    static const char key[] = "precision";
+    static const char *values[] = {
+        nullptr,                                              // 0 unused
+        "1","2","3","4","5","6","7","8","9","10",
+        "11","12","13","14","15","16","17","18","19","20",
+        "21","22","23","24","25","26","27","28","29","30",
+        "31","32","33","34","35","36","37","38"
+    };
+    if (value < 1 || value > 38) {
+        snprintf(error_msg, VEF_MAX_ERROR_LEN,
+                 "precision must be 1-38, got %" PRId64, value);
+        return true;
+    }
+    params[0] = {key, values[value]};
+    *param_count = 1;
+    return false;
+}
+```
+
+Add `.int_to_params(&mytype_int_to_params)` to the builder chain alongside
+`.resolve_params()`. See [Define Type Operations](#define-type-operations)
+for the `encode`, `decode`, and `compare` signatures.
+
+---
+
 ### Type Conversion Functions
 
 Expose your encode/decode functions as SQL functions for explicit type conversion:
