@@ -106,3 +106,7 @@ VillageSQL's key differentiator is its extension framework. When documenting ext
 - Use absolute URLs for internal links
 - Include untested code examples
 - Make assumptions - always ask for clarification
+
+## Common mistakes
+- Do not apply MySQL UDF concepts (`SONAME`, `mysql.func`, `information_schema.routines`) to VEF — they don't apply
+- Do not document `villagesql.*` internal tables — they are restricted from user threads (Error 3554)
