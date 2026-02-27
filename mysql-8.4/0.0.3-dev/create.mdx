@@ -371,9 +371,7 @@ return;
 
 ### Part B: Encode/Decode Return Convention
 
-The bool return convention applies **only** to encode and decode functions
-used by custom types. It does not apply to VDF implementation functions
-(which are `void`, as described above).
+The bool return convention applies **only** to encode and decode **function pointers** used by custom types. It does not apply to VDF-name type operations (which use the standard VDF `void` convention) or to VDF implementation functions.
 
 ```cpp
 typedef bool (*vef_encode_func_t)(unsigned char *buffer, size_t buffer_size,
@@ -519,7 +517,9 @@ Custom types allow you to define new column types that work seamlessly with SQL 
 
 ### Define Type Operations
 
-Every custom type needs encode and decode functions, and optionally compare/hash functions:
+Every custom type needs encode, decode, and compare operations, and optionally a hash operation. There are two ways to provide these: **function pointers** or **VDF names** (VEF_PROTOCOL_2 or later). You must use exactly one of the two for each operation.
+
+**Function pointers** (`false` = success, `true` = error — see [Part B](#part-b-encodedecode-return-convention)):
 
 ```cpp
 // Encode: Convert string representation to binary
@@ -532,25 +532,47 @@ bool encode_mytype(unsigned char* buffer, size_t buffer_size,
 
 // Decode: Convert binary to string representation
 bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
-                   char* to, size_t to_buffer_size, size_t* to_length) {
+                   char* to, size_t to_size, size_t* to_length) {
     // Read binary from 'buffer' and write string to 'to'
     // Set *to_length to string length
     // Return false on success, true on error
 }
 
-// Compare: Enable ORDER BY and indexing (optional but recommended)
-int compare_mytype(const unsigned char* a, size_t a_len,
-                   const unsigned char* b, size_t b_len) {
-    // Return: negative if a<b, 0 if a==b, positive if a>b
+// Compare: enables ORDER BY and indexing (required)
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2
 }
 
-// Hash: Custom hash function (optional, uses default if not provided)
-size_t hash_mytype(const unsigned char* buffer, size_t buffer_size) {
+// Hash: custom hash (optional, uses default binary hash if omitted)
+size_t hash_mytype(const unsigned char* data, size_t len) {
     // Return hash value for the binary data
 }
 ```
 
+**VDF names** — reference VDFs from the same extension by name (see [VDF-Name Type Operations](#vdf-name-type-operations)):
+
+```cpp
+// encode VDF: STRING -> CUSTOM(MYTYPE)
+void mytype_from_string(vef_context_t *ctx, vef_invalue_t *arg0,
+                        vef_vdf_result_t *result) { /* ... */ }
+
+// decode VDF: CUSTOM(MYTYPE) -> STRING
+void mytype_to_string(vef_context_t *ctx, vef_invalue_t *arg0,
+                      vef_vdf_result_t *result) { /* ... */ }
+
+// compare VDF: (CUSTOM(MYTYPE), CUSTOM(MYTYPE)) -> INT
+void mytype_compare(vef_context_t *ctx, vef_invalue_t *arg0,
+                    vef_invalue_t *arg1, vef_vdf_result_t *result) { /* ... */ }
+
+// hash VDF: CUSTOM(MYTYPE) -> INT (optional)
+void mytype_hash(vef_context_t *ctx, vef_invalue_t *arg0,
+                 vef_vdf_result_t *result) { /* ... */ }
+```
+
 ### Register the Type
+
+**Using function pointers:**
 
 ```cpp
 VEF_GENERATE_ENTRY_POINTS(
@@ -560,7 +582,7 @@ VEF_GENERATE_ENTRY_POINTS(
       .max_decode_buffer_length(64)      // Max string representation size
       .encode(&encode_mytype)
       .decode(&decode_mytype)
-      .compare(&compare_mytype)          // Enables ORDER BY and indexes!
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
       .hash(&hash_mytype)                // Optional custom hash
       .build())
     .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
@@ -570,6 +592,45 @@ VEF_GENERATE_ENTRY_POINTS(
       .build())
 );
 ```
+
+**Using VDF names** (VEF_PROTOCOL_2 required; see [VDF-Name Type Operations](#vdf-name-type-operations)):
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .type(make_type(MYTYPE)
+      .persisted_length(16)
+      .max_decode_buffer_length(64)
+      .encode("mytype_from_string")      // VDF name instead of &func
+      .decode("mytype_to_string")
+      .compare("mytype_compare")         // Enables ORDER BY and indexes
+      .hash("mytype_hash")              // Optional
+      .build())
+    .func(make_func<&mytype_from_string>("mytype_from_string")
+      .returns(MYTYPE).param(STRING).build())
+    .func(make_func<&mytype_to_string>("mytype_to_string")
+      .returns(STRING).param(MYTYPE).build())
+    .func(make_func<&mytype_compare>("mytype_compare")
+      .returns(INT).param(MYTYPE).param(MYTYPE).build())
+    .func(make_func<&mytype_hash>("mytype_hash")
+      .returns(INT).param(MYTYPE).build())
+);
+```
+
+The named VDFs must also be registered with `.func()` in the same extension. They are registered as callable SQL functions.
+
+### VDF-Name Type Operations
+
+Each VDF named via `.encode()`, `.decode()`, `.compare()`, or `.hash()` must be registered with `make_func<>` in the same extension with the matching signature:
+
+| Operation | VDF SQL Signature |
+|-----------|-------------------|
+| `encode`  | `(STRING) -> CUSTOM(this type)` |
+| `decode`  | `(CUSTOM(this type)) -> STRING` |
+| `compare` | `(CUSTOM(this type), CUSTOM(this type)) -> INT` |
+| `hash`    | `(CUSTOM(this type)) -> INT` |
+
+VDF-name operations use the standard VDF `void` convention (communicate results via `result->type`), not the `bool` return convention of function-pointer encode/decode.
 
 ### ALTER TABLE and Custom Types
 
@@ -582,15 +643,9 @@ VEF_GENERATE_ENTRY_POINTS(
 | Custom | Non-string type | Error: `Cannot convert custom type column 'col' to non-string type` |
 | Custom | Different custom type | Error if incompatible: `Cannot convert between incompatible custom types 'A' and 'B'` |
 
-### Parameterized Types
+Type compatibility requires matching type name, extension name, extension version, and parameters. For example, `TVECTOR(3)` and `TVECTOR(4)` are incompatible because their parameters differ.
 
-<Note>
-  Parameterized types require the development SDK headers (`include-dev/`), not
-  the default stable `include/` path. When building against the staged
-  0.0.3-dev SDK, add `include-dev/` to your include path alongside `include/`.
-  Building with `VillageSQL_BUILD_DIR` pointing to the VillageSQL source tree
-  also provides these headers.
-</Note>
+### Parameterized Types
 
 A parameterized type accepts column-level configuration at `CREATE TABLE`
 time using either an integer or a key-value string:
@@ -601,7 +656,7 @@ CREATE TABLE t2 (val MYTYPE('precision=10'));     -- key-value string form
 ```
 
 To support parameters, add `.resolve_params()` to the TypeBuilder. Setting it
-(or `.int_to_params()`) automatically selects VEF_PROTOCOL_2, which requires
+(or `.int_to_params()`, or any VDF-name field) automatically selects VEF_PROTOCOL_2, which requires
 VillageSQL 0.0.3-dev or later — the server rejects the extension at load time
 if the version is older.
 
@@ -777,35 +832,35 @@ bool encode_complex(unsigned char* buffer, size_t buffer_size,
 
 // Decode 16 bytes to "(real,imag)" string
 bool decode_complex(const unsigned char* buffer, size_t buffer_size,
-                    char* to, size_t to_buffer_size, size_t* to_length) {
+                    char* to, size_t to_size, size_t* to_length) {
     if (buffer_size < 16) return true;
 
     double real, imag;
     memcpy(&real, buffer, 8);
     memcpy(&imag, buffer + 8, 8);
 
-    int len = snprintf(to, to_buffer_size, "(%.6f,%.6f)", real, imag);
-    if (len < 0 || len >= (int)to_buffer_size) return true;
+    int len = snprintf(to, to_size, "(%.6f,%.6f)", real, imag);
+    if (len < 0 || len >= (int)to_size) return true;
 
     *to_length = len;
     return false;
 }
 
 // Compare for ORDER BY: compare real part first, then imaginary
-int compare_complex(const unsigned char* a, size_t a_len,
-                    const unsigned char* b, size_t b_len) {
-    if (a_len < 16 || b_len < 16) return 0;
+int compare_complex(const unsigned char* data1, size_t len1,
+                    const unsigned char* data2, size_t len2) {
+    if (len1 < 16 || len2 < 16) return 0;
 
-    double a_real, a_imag, b_real, b_imag;
-    memcpy(&a_real, a, 8);
-    memcpy(&a_imag, a + 8, 8);
-    memcpy(&b_real, b, 8);
-    memcpy(&b_imag, b + 8, 8);
+    double data1_real, data1_imag, data2_real, data2_imag;
+    memcpy(&data1_real, data1, 8);
+    memcpy(&data1_imag, data1 + 8, 8);
+    memcpy(&data2_real, data2, 8);
+    memcpy(&data2_imag, data2 + 8, 8);
 
-    if (a_real < b_real) return -1;
-    if (a_real > b_real) return 1;
-    if (a_imag < b_imag) return -1;
-    if (a_imag > b_imag) return 1;
+    if (data1_real < data2_real) return -1;
+    if (data1_real > data2_real) return 1;
+    if (data1_imag < data2_imag) return -1;
+    if (data1_imag > data2_imag) return 1;
     return 0;
 }
 ```
