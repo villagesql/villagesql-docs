@@ -17,6 +17,55 @@ Once you have a build directory (e.g., `build/`), you are ready to run regressio
 
 ## Writing Extension Functions
 
+### Type Operation Builders
+
+Custom types require four operations: encode (string → binary), decode
+(binary → string), compare, and hash. Implement them against these
+ergonomic C++ signatures (all defined in `func_builder.h`):
+
+```cpp
+// Encode: string -> binary. false = success, true = error.
+// Set *length = SIZE_MAX to produce SQL NULL.
+using TypeEncodeFunc = bool (*)(std::string_view from,
+                                villagesql::Span<unsigned char> buf,
+                                size_t *length);
+
+// Decode: binary -> string. false = success, true = error.
+using TypeDecodeFunc = bool (*)(villagesql::Span<const unsigned char> data,
+                                villagesql::Span<char> out,
+                                size_t *out_len);
+
+// Compare: returns <0, 0, or >0 (used for ORDER BY and indexes).
+using TypeCompareFunc = int (*)(villagesql::Span<const unsigned char> a,
+                                villagesql::Span<const unsigned char> b);
+
+// Hash: returns hash code (used for hash joins).
+using TypeHashFunc = size_t (*)(villagesql::Span<const unsigned char> data);
+```
+
+Register each operation with `make_type_encode`, `make_type_decode`,
+`make_type_compare`, or `make_type_hash`, passing the function pointer and
+the type name constant. The type descriptor references them by name:
+
+```cpp
+constexpr const char *MYTYPE = "mytype";
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension("my_ext", "1.0.0")
+        .type(make_type(MYTYPE)
+                  .persisted_length(8)
+                  .max_decode_buffer_length(64)
+                  .encode("mytype_encode")    // Name of the encode VDF
+                  .decode("mytype_decode")    // Name of the decode VDF
+                  .compare("mytype_compare")  // Name of the compare VDF
+                  .hash("mytype_hash")        // Optional: name of the hash VDF
+                  .build())
+        .func(make_type_encode<&my_encode>("mytype_encode", MYTYPE))
+        .func(make_type_decode<&my_decode>("mytype_decode", MYTYPE))
+        .func(make_type_compare<&my_compare>("mytype_compare", MYTYPE))
+        .func(make_type_hash<&my_hash>("mytype_hash", MYTYPE)))
+```
+
 ### Parameterized Types
 
 Custom types can accept parameters (e.g., `TVECTOR(1536)`). The server calls
@@ -117,33 +166,45 @@ When a `NOT NULL` custom column receives `NULL` via `INSERT IGNORE` or
 `UPDATE IGNORE`, the server calls the type's intrinsic default to produce a
 fallback binary value. Without one, the server rejects the row.
 
+Fixed-size types use this signature:
+
 ```cpp
-using vef_intrinsic_default_func_t = bool (*)(
-    int64_t buffer_size,   // resolved persisted_length in bytes
-    unsigned char *buffer,
+// false = success, true = error
+using IntrinsicDefaultFunc = bool (*)(
+    villagesql::Span<unsigned char> buffer,
     size_t *length,
-    char *error_msg);  // false = success, true = error
+    char *error_msg);
 ```
 
-`buffer_size` is the resolved `persisted_length`, so variable-size types
-(e.g., `TVECTOR(N)`) produce the correct number of bytes.
+Variable-size types that need type parameters (e.g., `TVECTOR(N)`) use:
 
-Register with `make_intrinsic_default`, bind via
+```cpp
+using IntrinsicDefaultWithParamsFunc = bool (*)(
+    const std::map<std::string, std::string> &params,
+    villagesql::Span<unsigned char> buffer,
+    size_t *length,
+    char *error_msg);
+```
+
+The SDK detects which signature you implement at compile time — write
+whichever matches your type.
+
+Register with `make_intrinsic_default<&func>("name", TYPE)`, bind via
 `TypeBuilder::intrinsic_default()`.
 
 **Complete example** — COMPLEX defaults to `(0,0)`:
 
 ```cpp
-constexpr int64_t kComplexSize = 16;  // two doubles
+constexpr size_t kComplexSize = 16;  // two doubles
 
-bool complex_default(int64_t buffer_size, unsigned char *buffer,
+bool complex_default(villagesql::Span<unsigned char> buffer,
                      size_t *length, char * /*error_msg*/) {
-  if (buffer_size < kComplexSize) {
+  if (buffer.size() < kComplexSize) {
     *length = 0;
     return true;
   }
   Complex cx{0.0, 0.0};
-  store_complex(buffer, cx);
+  store_complex(buffer.data(), cx);
   *length = kComplexSize;
   return false;
 }
@@ -160,7 +221,7 @@ VEF_GENERATE_ENTRY_POINTS(
                   .build())
         // ... other VDFs omitted for brevity ...
         .func(make_intrinsic_default<&complex_default>(
-            "complex_intrinsic_default")))
+            "complex_intrinsic_default", COMPLEX)))
 ```
 
 ## Running Regression Tests
