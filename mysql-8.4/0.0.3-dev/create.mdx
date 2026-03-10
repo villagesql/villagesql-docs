@@ -517,7 +517,29 @@ Custom types allow you to define new column types that work seamlessly with SQL 
 
 ### Define Type Operations
 
-Every custom type needs encode, decode, and compare operations, and optionally a hash operation. There are two ways to provide these: **function pointers** or **VDF names** (VEF_PROTOCOL_2 or later). For each operation, provide one or the other — not both.
+Every custom type needs encode, decode, and compare operations, and optionally a hash operation. There are two ways to provide these: **VDF names** (VEF_PROTOCOL_2 or later, recommended) or **function pointers**. For each operation, provide one or the other — not both.
+
+**VDF names** — reference VDFs from the same extension by name (see [VDF-Name Type Operations](#vdf-name-type-operations)):
+
+```cpp
+// Encode: string -> binary. false = success, true = error.
+// Set *length = SIZE_MAX to produce SQL NULL.
+bool mytype_from_string(std::string_view from,
+                        villagesql::Span<unsigned char> buf,
+                        size_t *length) { /* ... */ }
+
+// Decode: binary -> string. false = success, true = error.
+bool mytype_to_string(villagesql::Span<const unsigned char> data,
+                      villagesql::Span<char> out,
+                      size_t *out_len) { /* ... */ }
+
+// Compare: returns <0, 0, or >0.
+int mytype_compare(villagesql::Span<const unsigned char> a,
+                   villagesql::Span<const unsigned char> b) { /* ... */ }
+
+// Hash: returns hash code (optional).
+size_t mytype_hash(villagesql::Span<const unsigned char> data) { /* ... */ }
+```
 
 **Function pointers** (`false` = success, `true` = error — see [Part B](#part-b-encodedecode-return-convention)):
 
@@ -550,50 +572,7 @@ size_t hash_mytype(const unsigned char* data, size_t len) {
 }
 ```
 
-**VDF names** — reference VDFs from the same extension by name (see [VDF-Name Type Operations](#vdf-name-type-operations)):
-
-```cpp
-// Encode: string -> binary. false = success, true = error.
-// Set *length = SIZE_MAX to produce SQL NULL.
-bool mytype_from_string(std::string_view from,
-                        villagesql::Span<unsigned char> buf,
-                        size_t *length) { /* ... */ }
-
-// Decode: binary -> string. false = success, true = error.
-bool mytype_to_string(villagesql::Span<const unsigned char> data,
-                      villagesql::Span<char> out,
-                      size_t *out_len) { /* ... */ }
-
-// Compare: returns <0, 0, or >0.
-int mytype_compare(villagesql::Span<const unsigned char> a,
-                   villagesql::Span<const unsigned char> b) { /* ... */ }
-
-// Hash: returns hash code (optional).
-size_t mytype_hash(villagesql::Span<const unsigned char> data) { /* ... */ }
-```
-
 ### Register the Type
-
-**Using function pointers:**
-
-```cpp
-VEF_GENERATE_ENTRY_POINTS(
-  make_extension("my_extension", "1.0.0")
-    .type(make_type(MYTYPE)
-      .persisted_length(16)              // Fixed storage size in bytes
-      .max_decode_buffer_length(64)      // Max string representation size
-      .encode(&encode_mytype)
-      .decode(&decode_mytype)
-      .compare(&compare_mytype)          // Enables ORDER BY and indexes
-      .hash(&hash_mytype)                // Optional custom hash
-      .build())
-    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
-      .returns(MYTYPE)
-      .param(REAL)
-      .param(REAL)
-      .build())
-);
-```
 
 **Using VDF names** (VEF_PROTOCOL_2 required; see [VDF-Name Type Operations](#vdf-name-type-operations)):
 
@@ -616,6 +595,27 @@ VEF_GENERATE_ENTRY_POINTS(
 ```
 
 The named VDFs must also be registered with `.func()` in the same extension.
+
+**Using function pointers:**
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
 
 ### VDF-Name Type Operations
 
@@ -640,124 +640,6 @@ VDF-name operations use the `bool` return convention (`false` = success, `true` 
 | Custom | String type | Allowed |
 | Custom | Non-string type | Error: `Cannot convert custom type column 'col' to non-string type` |
 | Custom | Different custom type | Error if incompatible: `Cannot convert between incompatible custom types 'A' and 'B'` |
-
-Type compatibility requires matching type name, extension name, extension version, and parameters. For example, `TVECTOR(3)` and `TVECTOR(4)` are incompatible because their parameters differ.
-
-### Parameterized Types
-
-A parameterized type accepts column-level configuration at `CREATE TABLE`
-time using either an integer or a key-value string:
-
-```sql
-CREATE TABLE t1 (val MYTYPE(10));                -- integer form
-CREATE TABLE t2 (val MYTYPE('precision=10'));     -- key-value string form
-```
-
-To support parameters, add `.resolve_params()` to the TypeBuilder. Setting it
-(or `.int_to_params()`, or any VDF-name field) automatically selects VEF_PROTOCOL_2, which requires
-VillageSQL 0.0.3-dev or later — the server rejects the extension at load time
-if the version is older.
-
-**Required: `.resolve_params(f)`** — validates the key-value array and sets
-`result->persisted_length` (fixed bytes stored per value) and
-`result->max_decode_buffer_length` (maximum decoded string length).
-
-**Optional: `.int_to_params(f)`** — converts `MYTYPE(N)` to a key-value array
-before `resolve_params` is called. Omitting it disables the integer syntax.
-When set, `resolve_params` is also required.
-
-Both callbacks return `false` on success, `true` on error.
-
-**Signatures** (`villagesql/sdk/include/villagesql/abi/types.h`):
-
-```cpp
-typedef bool (*vef_type_int_to_params_func_t)(int64_t value,
-                                              vef_type_param_t *params,
-                                              size_t *param_count,
-                                              char *error_msg);
-
-typedef bool (*vef_type_resolve_params_func_t)(
-    const vef_type_param_t *params, size_t param_count,
-    vef_type_resolved_params_t *result, char *error_msg);
-```
-
-Supporting types (`villagesql/sdk/include/villagesql/abi/types.h`):
-
-```cpp
-typedef struct { const char *key; const char *value; } vef_type_param_t;
-
-typedef struct {
-    int64_t persisted_length;
-    int64_t max_decode_buffer_length;
-} vef_type_resolved_params_t;
-
-#define VEF_MAX_TYPE_PARAMS 16
-#define VEF_MAX_ERROR_LEN   512
-```
-
-**Example:**
-
-```cpp
-bool mytype_resolve_params(const vef_type_param_t *params, size_t param_count,
-                           vef_type_resolved_params_t *result,
-                           char *error_msg) {
-    int64_t precision = 0;
-    for (size_t i = 0; i < param_count; i++) {
-        if (strcmp(params[i].key, "precision") == 0)
-            precision = atoll(params[i].value);
-    }
-    if (precision < 1 || precision > 38) {
-        snprintf(error_msg, VEF_MAX_ERROR_LEN,
-                 "precision must be 1-38, got %" PRId64, precision);
-        return true;
-    }
-    result->persisted_length = 16;           // fixed bytes per stored value
-    result->max_decode_buffer_length = precision + 8;
-    return false;
-}
-
-VEF_GENERATE_ENTRY_POINTS(
-  make_extension("my_extension", "1.0.0")
-    .type(make_type("MYTYPE")
-      .encode(&encode_mytype)
-      .decode(&decode_mytype)
-      .compare(&compare_mytype)
-      .resolve_params(&mytype_resolve_params)
-      .build())
-);
-```
-
-Key/value strings must outlive the extension (not just the call), so they
-must have static or permanent heap lifetime. Static mutable buffers are not
-safe under concurrent DDL.
-
-```cpp
-bool mytype_int_to_params(int64_t value, vef_type_param_t *params,
-                          size_t *param_count, char *error_msg) {
-    static const char key[] = "precision";
-    static const char *values[] = {
-        nullptr, "1","2","3", /* ... */ "37","38"            // 0 unused
-    };
-    if (value < 1 || value > 38) {
-        snprintf(error_msg, VEF_MAX_ERROR_LEN,
-                 "precision must be 1-38, got %" PRId64, value);
-        return true;
-    }
-    params[0] = {key, values[value]};
-    *param_count = 1;
-    return false;
-}
-```
-
-Add `.int_to_params(&mytype_int_to_params)` to the builder chain alongside
-`.resolve_params()`. See [Define Type Operations](#define-type-operations)
-for the `encode`, `decode`, and `compare` signatures.
-
-<Note>
-Expected size for fixed-length binary storage. While the encode function may return
-a smaller length (e.g., 0 to indicate an error), this field defines the standard
-persisted footprint for the type.
-</Note>
 
 ---
 
@@ -807,58 +689,56 @@ The `.from_string<>()` and `.to_string<>()` builders automatically create SQL-ca
 Here's a complete example implementing a COMPLEX number type:
 
 ```cpp
+#include <cstdio>
 #include <cstring>
-#include <cmath>
 
 // Encode complex number from "(real,imag)" to 16 bytes
-bool encode_complex(unsigned char* buffer, size_t buffer_size,
-                    const char* from, size_t from_len, size_t* length) {
-    if (buffer_size < 16) return true;
+bool encode_complex(std::string_view from,
+                    villagesql::Span<unsigned char> buf,
+                    size_t *length) {
+    if (buf.size() < 16) return true;
 
-    // Parse "(real,imag)" format
     double real, imag;
-    if (sscanf(from, "(%lf,%lf)", &real, &imag) != 2) {
-        return true;
-    }
+    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) return true;
 
-    // Write 16 bytes: 8 bytes real + 8 bytes imag
-    memcpy(buffer, &real, 8);
-    memcpy(buffer + 8, &imag, 8);
+    memcpy(buf.data(), &real, 8);
+    memcpy(buf.data() + 8, &imag, 8);
     *length = 16;
     return false;
 }
 
 // Decode 16 bytes to "(real,imag)" string
-bool decode_complex(const unsigned char* buffer, size_t buffer_size,
-                    char* to, size_t to_size, size_t* to_length) {
-    if (buffer_size < 16) return true;
+bool decode_complex(villagesql::Span<const unsigned char> data,
+                    villagesql::Span<char> out,
+                    size_t *out_len) {
+    if (data.size() < 16) return true;
 
     double real, imag;
-    memcpy(&real, buffer, 8);
-    memcpy(&imag, buffer + 8, 8);
+    memcpy(&real, data.data(), 8);
+    memcpy(&imag, data.data() + 8, 8);
 
-    int len = snprintf(to, to_size, "(%.6f,%.6f)", real, imag);
-    if (len < 0 || len >= (int)to_size) return true;
+    int len = snprintf(out.data(), out.size(), "(%.6f,%.6f)", real, imag);
+    if (len < 0 || len >= (int)out.size()) return true;
 
-    *to_length = len;
+    *out_len = len;
     return false;
 }
 
 // Compare for ORDER BY: compare real part first, then imaginary
-int compare_complex(const unsigned char* data1, size_t len1,
-                    const unsigned char* data2, size_t len2) {
-    if (len1 < 16 || len2 < 16) return 0;
+int compare_complex(villagesql::Span<const unsigned char> a,
+                    villagesql::Span<const unsigned char> b) {
+    if (a.size() < 16 || b.size() < 16) return 0;
 
-    double data1_real, data1_imag, data2_real, data2_imag;
-    memcpy(&data1_real, data1, 8);
-    memcpy(&data1_imag, data1 + 8, 8);
-    memcpy(&data2_real, data2, 8);
-    memcpy(&data2_imag, data2 + 8, 8);
+    double a_real, a_imag, b_real, b_imag;
+    memcpy(&a_real, a.data(), 8);
+    memcpy(&a_imag, a.data() + 8, 8);
+    memcpy(&b_real, b.data(), 8);
+    memcpy(&b_imag, b.data() + 8, 8);
 
-    if (data1_real < data2_real) return -1;
-    if (data1_real > data2_real) return 1;
-    if (data1_imag < data2_imag) return -1;
-    if (data1_imag > data2_imag) return 1;
+    if (a_real < b_real) return -1;
+    if (a_real > b_real) return 1;
+    if (a_imag < b_imag) return -1;
+    if (a_imag > b_imag) return 1;
     return 0;
 }
 ```
