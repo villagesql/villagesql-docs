@@ -96,11 +96,17 @@ Custom types require four operations: encode (string → binary), decode
 ergonomic C++ signatures (all defined in `func_builder.h`):
 
 ```cpp
-// Encode: string -> binary. false = success, true = error.
+// Encode (fixed-size types): string -> binary. false = success, true = error.
 // Set *length = SIZE_MAX to produce SQL NULL.
 using TypeEncodeFunc = bool (*)(std::string_view from,
                                 villagesql::Span<unsigned char> buf,
                                 size_t *length);
+
+// Encode (variable-size types that need type parameters):
+using TypeEncodeWithParamsFunc = bool (*)(
+    const std::map<std::string, std::string> &params,
+    std::string_view from,
+    villagesql::Span<unsigned char> buf, size_t *length);
 
 // Decode: binary -> string. false = success, true = error.
 using TypeDecodeFunc = bool (*)(villagesql::Span<const unsigned char> data,
@@ -136,6 +142,34 @@ VEF_GENERATE_ENTRY_POINTS(
         .func(make_type_decode<&my_decode>("mytype_decode", MYTYPE))
         .func(make_type_compare<&my_compare>("mytype_compare", MYTYPE))
         .func(make_type_hash<&my_hash>("mytype_hash", MYTYPE)))
+```
+
+Fixed-size types (like `complex`) use `TypeEncodeFunc`. Variable-size types
+that read type parameters at encode time (like `tvector`) use
+`TypeEncodeWithParamsFunc` — the first argument is a `std::map` of the
+column's type parameters. `make_type_encode` accepts either form:
+
+```cpp
+// TypeEncodeWithParamsFunc: receives type parameters as first argument.
+// The tvector extension reads "dimension" to know how many floats to parse.
+bool tvector_from_string(const std::map<std::string, std::string> &params,
+                         std::string_view from,
+                         villagesql::Span<unsigned char> buf,
+                         size_t *length) {
+  auto it = params.find("dimension");
+  if (it == params.end()) return true;  // error
+  int64_t dimension = strtoll(it->second.c_str(), nullptr, 10);
+  if (dimension <= 0) return true;
+
+  size_t byte_size = static_cast<size_t>(dimension) * 4;
+  if (buf.size() < byte_size) return true;
+  // ... parse input, populate buf ...
+  *length = byte_size;
+  return false;  // success
+}
+
+// Registration is the same for both forms:
+make_type_encode<&tvector_from_string>("tvector_encode", TVECTOR)
 ```
 
 
