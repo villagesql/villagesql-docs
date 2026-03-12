@@ -103,7 +103,7 @@ VillageSQL's key differentiator is its extension framework. When documenting ext
 - Commit message format:
   - Title: < 50 characters
   - Body: Explains the "why"
-  - End with: Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+  - End with: `Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>`
   - Final line: AI=CLAUDE
 
 ## Do not
