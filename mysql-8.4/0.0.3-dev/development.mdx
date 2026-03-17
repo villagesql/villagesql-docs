@@ -89,6 +89,117 @@ void add_impl(vef_context_t* ctx,
 
 Registration is the same as with typed wrappers.
 
+### Type Operation Builders
+
+Custom types require four operations: encode (string → binary), decode
+(binary → string), compare, and hash. Implement them against these
+ergonomic C++ signatures (all defined in `func_builder.h`):
+
+```cpp
+// Encode (fixed-size types): string -> binary. false = success, true = error.
+// Set *length = SIZE_MAX to produce SQL NULL.
+using TypeEncodeFunc = bool (*)(std::string_view from,
+                                villagesql::Span<unsigned char> buf,
+                                size_t *length);
+
+// Encode (variable-size types): TypeEncodeWithParamsFunc — same signature
+// but adds the column's declared type parameters as first argument.
+// See func_builder.h for the full typedef. make_type_encode accepts both.
+
+// Decode (fixed-size types): binary -> string. false = success, true = error.
+using TypeDecodeFunc = bool (*)(villagesql::Span<const unsigned char> data,
+                                villagesql::Span<char> out,
+                                size_t *out_len);
+
+// Decode (variable-size types): TypeDecodeWithParamsFunc — same signature
+// but adds the column's declared type parameters as first argument.
+// See func_builder.h for the full typedef. make_type_decode accepts both.
+
+// Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
+using TypeCompareFunc = int (*)(villagesql::Span<const unsigned char> a,
+                                villagesql::Span<const unsigned char> b);
+
+// Hash: returns hash code (used for hash joins).
+using TypeHashFunc = size_t (*)(villagesql::Span<const unsigned char> data);
+```
+
+Register each operation with `make_type_encode`, `make_type_decode`,
+`make_type_compare`, or `make_type_hash`, passing the function pointer and
+the type name constant. The type descriptor references them by name:
+
+```cpp
+constexpr const char *MYTYPE = "mytype";
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension("my_ext", "1.0.0")
+        .type(make_type(MYTYPE)
+                  .persisted_length(8)
+                  .max_decode_buffer_length(64)
+                  .encode("mytype_encode")    // Name of the encode VDF
+                  .decode("mytype_decode")    // Name of the decode VDF
+                  .compare("mytype_compare")  // Name of the compare VDF
+                  .hash("mytype_hash")        // Optional: name of the hash VDF
+                  .build())
+        .func(make_type_encode<&my_encode>("mytype_encode", MYTYPE))
+        .func(make_type_decode<&my_decode>("mytype_decode", MYTYPE))
+        .func(make_type_compare<&my_compare>("mytype_compare", MYTYPE))
+        .func(make_type_hash<&my_hash>("mytype_hash", MYTYPE)))
+```
+
+Fixed-size types (like `complex`) use `TypeEncodeFunc`. Variable-size types
+that need the column's declared type parameters at encode time use
+`TypeEncodeWithParamsFunc` — it adds a string key-value params map as the
+first argument. `make_type_encode` detects which form you're using
+automatically based on your function's signature:
+
+```cpp
+// TypeEncodeWithParamsFunc example: params contains TYPE('k=v,...') pairs.
+// The tvector extension reads params["dimension"] to determine binary size.
+bool tvector_encode(const TypeParams &params, std::string_view from,
+                    villagesql::Span<unsigned char> buf, size_t *length) {
+  int64_t dim = strtoll(params.at("dimension").c_str(), nullptr, 10);
+  size_t bytes = (size_t)dim * 4;
+  if (buf.size() < bytes) return true;
+  // ... parse from, write floats to buf ...
+  *length = bytes;
+  return false;  // success
+}
+
+// Registration is the same for both forms:
+make_type_encode<&tvector_encode>("tvector_encode", TVECTOR)
+```
+
+`TypeParams` is `std::map<std::string, std::string>` — the full
+`TypeEncodeWithParamsFunc` typedef is in `func_builder.h`.
+
+The same pattern applies to decode. Fixed-size types use `TypeDecodeFunc`.
+Variable-size types that need type parameters at decode time use
+`TypeDecodeWithParamsFunc` — it adds the same params map as the first
+argument. `make_type_decode` accepts both forms:
+
+```cpp
+// TypeDecodeWithParamsFunc example: params contains TYPE('k=v,...') pairs.
+// The tvector extension reads params["dimension"] to know how many floats
+// to decode from the binary representation.
+bool tvector_decode(const std::map<std::string, std::string> &params,
+                    villagesql::Span<const unsigned char> data,
+                    villagesql::Span<char> out, size_t *out_len) {
+  auto it = params.find("dimension");
+  if (it == params.end()) return true;  // error
+  int64_t dimension = strtoll(it->second.c_str(), nullptr, 10);
+  // ... read dimension floats from data, format into out ...
+  *out_len = bytes_written;
+  return false;  // success
+}
+
+// Registration is the same for both forms:
+make_type_decode<&tvector_decode>("tvector_decode", TVECTOR)
+```
+
+`TypeParams` is the same `std::map<std::string, std::string>` alias — the full
+`TypeDecodeWithParamsFunc` typedef is in `func_builder.h`.
+
+
 ## Running Regression Tests
 
 VillageSQL uses the `./villagesql mysql-test` wrapper for regression testing. This command passes arguments through to the MySQL Test Framework. Run all commands below from your VillageSQL dev server directory.
