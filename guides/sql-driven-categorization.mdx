@@ -1,0 +1,136 @@
+---
+title: "SQL-Driven Text Categorization"
+description: "How to use ai_prompt for LLM-based text classification directly within SQL queries in VillageSQL."
+---
+
+`ai_prompt` integrates LLM inference directly into the MySQL query pipeline for SQL-native text classification. You can call it inside `SELECT`, `UPDATE`, and `VIEW` definitions to classify unstructured text into a defined taxonomy without moving data to an external service.
+
+## Setup
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+Verify installation:
+
+```sql
+SELECT * FROM information_schema.EXTENSIONS WHERE EXTENSION_NAME = 'vsql_ai';
+```
+
+## Function Signature
+
+| Parameter | Data Type | Description |
+| :--- | :--- | :--- |
+| `provider` | `VARCHAR` | `'anthropic'`, `'google'`, or `'openai'` |
+| `model` | `VARCHAR` | The model identifier (e.g., `'gpt-4o-mini'`) |
+| `api_key` | `VARCHAR` | Your API key for the provider |
+| `prompt` | `TEXT` | The text to classify, including any instructions |
+| **Returns** | **`VARCHAR`** | The model's response as a plain string |
+
+## Implementation
+
+### Classifying support tickets in a SELECT
+
+```sql
+SET @api_key = 'your-openai-api-key';
+
+SELECT
+    ticket_id,
+    customer_feedback,
+    ai_prompt(
+        'openai',
+        'gpt-4o-mini',
+        @api_key,
+        CONCAT(
+            'Categorize the following ticket into exactly one category: ',
+            'Billing, Technical, Feature Request, Spam. ',
+            'Return only the category name.\n\nTicket: ',
+            customer_feedback
+        )
+    ) AS category
+FROM support_tickets
+WHERE category IS NULL
+LIMIT 10;
+```
+
+### Persisting categories via UPDATE
+
+```sql
+SET @api_key = 'your-openai-api-key';
+
+UPDATE products
+SET tags = ai_prompt(
+    'openai',
+    'gpt-4o-mini',
+    @api_key,
+    CONCAT(
+        'Generate 3 comma-separated SEO tags for this product. ',
+        'Return only the tags, no other text.\n\nProduct: ',
+        product_description
+    )
+)
+WHERE tags IS NULL;
+```
+
+### Creating a categorized view
+
+```sql
+CREATE OR REPLACE VIEW categorized_tickets AS
+SELECT
+    ticket_id,
+    customer_feedback,
+    ai_prompt(
+        'openai',
+        'gpt-4o-mini',
+        @api_key,
+        CONCAT(
+            'Categorize into exactly one of: Billing, Technical, Feature Request, Spam. ',
+            'Return only the category name.\n\nTicket: ',
+            customer_feedback
+        )
+    ) AS category
+FROM support_tickets;
+```
+
+Querying this view calls the LLM for each row. For large datasets, run a batch `UPDATE` to materialize categories into a column instead.
+
+## Comparison: VillageSQL vs. Standard MySQL 8.4
+
+| Feature | Standard MySQL 8.4 | VillageSQL (`vsql_ai`) |
+| :--- | :--- | :--- |
+| **Classification Logic** | Static `CASE` expressions or `REGEXP` | Dynamic LLM-driven inference |
+| **Natural Language** | Fails on synonyms, typos, implicit meaning | Understands context and intent |
+| **Data Movement** | Requires ETL to Python or an external API | In-place execution; data stays in the database |
+| **Taxonomy Changes** | Requires rewriting `CASE` expressions and redeploying | Update the prompt; no code change |
+
+## Related Guides
+
+- **Inference:** [Calling LLMs with ai\_prompt](/guides/vsql-ai-prompt)
+- **Configuration:** [Managing AI Provider API Keys](/guides/llm-configuration)
+- **Embeddings:** [Generating Embeddings with create\_embed](/guides/vsql-ai-embed)
+
+## Frequently Asked Questions
+
+#### Can the LLM return something outside my taxonomy?
+Yes. LLMs are probabilistic and can produce unexpected output even with low-temperature prompts. Validate the returned category against your allowed values before storing it:
+```sql
+WHERE ai_result IN ('Billing', 'Technical', 'Feature Request', 'Spam')
+```
+
+#### Should I use a VIEW or materialize categories into a column?
+Materialize for large or frequently queried datasets — a `VIEW` re-calls the LLM on every query. Use a `VIEW` for exploratory work or small tables.
+
+#### Is this safe to run in a transaction?
+Yes. `ai_prompt` is a scalar function call. If the LLM call fails, the SQL statement raises an error and any open transaction is rolled back.
+
+#### How do I get more consistent classifications?
+Include instructions in the prompt that constrain the output: ask the model to return only one of the allowed category names. Lower temperature models (GPT-4o-mini with explicit constraints) produce more deterministic output than general-purpose models with high variance.
+
+## Troubleshooting
+
+| Problem | Cause | Solution |
+| :--- | :--- | :--- |
+| `FUNCTION ai_prompt does not exist` | Extension not installed | Run `INSTALL EXTENSION vsql_ai` |
+| Categories are inconsistent | Prompt is ambiguous | Add explicit constraints: "Return only one of: X, Y, Z" |
+| Returns `NULL` | Null argument or unsupported provider | Check that all four arguments are non-null; verify provider name |
+| Query times out on large table | LLM latency multiplied by row count | Add `LIMIT` and run in batches; consider a scheduled `UPDATE` job |
