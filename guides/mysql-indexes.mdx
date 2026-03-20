@@ -1,0 +1,174 @@
+---
+title: "How MySQL Indexes Work"
+sidebarTitle: "MySQL Indexes"
+description: "A practical guide to MySQL indexes: how B-tree indexes work, when MySQL uses them, composite index column order, covering indexes, and common mistakes."
+keywords: "mysql index explained, mysql how indexes work, mysql b-tree index, mysql composite index, mysql covering index, mysql explain index"
+---
+
+Indexes are the most impactful performance tool in MySQL — and the most commonly misunderstood. Developers add them when queries are slow, remove them when disk space is tight, and often don't understand why they help or hurt. This guide explains the mechanics so you can make good decisions instead of guessing.
+
+## The Mental Model
+
+Think of a book with 800 pages. To find every mention of "TCP/IP" you could read every page — that's a full table scan. Or you could check the index at the back, find "TCP/IP — pages 42, 107, 391," and go directly to those pages. That's what a database index does.
+
+MySQL's default index structure is a **B-tree** (balanced tree). It keeps values sorted, which enables fast lookups (binary search), range scans (`BETWEEN`, `>`, `<`), and sorted output (`ORDER BY`) — all without reading the entire table.
+
+## How MySQL Uses an Index
+
+When you run a query, MySQL's optimizer checks whether an index can narrow down the rows it needs to read. It uses an index when your query filters or sorts on an indexed column.
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- Without an index, this scans every row
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Add an index on user_id
+CREATE INDEX idx_user_id ON orders (user_id);
+
+-- Now MySQL jumps directly to user_id = 42 rows
+SELECT * FROM orders WHERE user_id = 42;
+```
+
+### EXPLAIN: See what MySQL is actually doing
+
+`EXPLAIN` shows how MySQL plans to execute a query. The `key` column tells you which index it used (or NULL if none), and `rows` estimates how many rows it had to examine.
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
++----+-------------+--------+------+---------------+-------------+---------+-------+------+
+| id | select_type | table  | type | possible_keys | key         | key_len | ref   | rows |
++----+-------------+--------+------+---------------+-------------+---------+-------+------+
+|  1 | SIMPLE      | orders | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |
++----+-------------+--------+------+---------------+-------------+---------+-------+------+
+```
+
+`type: ref` means MySQL used an index lookup. `type: ALL` means a full table scan — usually what you're trying to avoid.
+
+## Composite Indexes: Column Order Matters
+
+A composite index covers multiple columns. The column order determines when the index is usable.
+
+```sql
+-- Index on (user_id, status)
+CREATE INDEX idx_user_status ON orders (user_id, status);
+```
+
+MySQL can use this index for:
+- `WHERE user_id = 42` — yes, leftmost column
+- `WHERE user_id = 42 AND status = 'shipped'` — yes, both columns
+- `WHERE status = 'shipped'` — **no**, skips the leftmost column
+
+The rule: MySQL uses a composite index from the left. Queries must include the leading column(s) to benefit.
+
+This means `(user_id, status)` and `(status, user_id)` are different indexes with different uses. Design composite indexes around your most common query patterns.
+
+## Covering Indexes: Serving Queries from the Index Alone
+
+A covering index includes all the columns a query needs. MySQL can answer the query entirely from the index without reading the actual row data — a significant speedup on large tables.
+
+```sql
+-- Query only needs user_id, status, created_at
+SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+
+-- A covering index for this query
+CREATE INDEX idx_covering ON orders (user_id, status, created_at);
+```
+
+When MySQL uses a covering index, `EXPLAIN` shows `Extra: Using index`. No row lookups needed.
+
+## When NOT to Add an Index
+
+More indexes aren't always better. Every index costs:
+
+- **Write overhead** — every INSERT, UPDATE, and DELETE has to update every index on the table
+- **Storage** — indexes can be as large as the table itself on write-heavy data
+- **Optimizer complexity** — too many indexes and the optimizer sometimes picks the wrong one
+
+Indexes help most when:
+- The column has high cardinality (many distinct values) — `user_id`, `email`, `order_id`
+- The query filters a small fraction of the table
+
+Indexes help least when:
+- Low cardinality — `status` with 3 possible values, boolean `is_active`
+- The table is small enough that a full scan is fast anyway
+- The column is write-heavy and rarely queried
+
+```sql
+-- Probably not worth indexing: 'active' and 'inactive' split the table ~50/50
+CREATE INDEX idx_active ON users (is_active);  -- likely unused by optimizer
+
+-- Worth indexing: email is unique, commonly queried
+CREATE INDEX idx_email ON users (email);
+```
+
+## Primary Key Is Always an Index
+
+InnoDB tables are organized around the primary key — it's not a separate index, it's the physical storage order of rows. This means:
+
+- Primary key lookups are the fastest possible query
+- Rows are physically adjacent when primary key values are sequential
+- Random primary keys (like UUID v4) cause fragmentation on insert — see [UUIDs in MySQL](/guides/uuids)
+
+## Common Index Mistakes
+
+**Using a function on an indexed column** — MySQL can't use an index when you wrap the column in a function:
+
+```sql
+-- Index on created_at exists, but this skips it
+SELECT * FROM orders WHERE YEAR(created_at) = 2024;
+
+-- Use a range instead — index is used
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31';
+```
+
+**Leading wildcard in LIKE** — an index can't help when the pattern starts with `%`:
+
+```sql
+-- Can't use index
+SELECT * FROM users WHERE email LIKE '%@example.com';
+
+-- Can use index (no leading wildcard)
+SELECT * FROM users WHERE email LIKE 'alice%';
+```
+
+**OR across different columns** — MySQL can struggle with `OR` across unindexed combinations:
+
+```sql
+-- May not use indexes efficiently
+SELECT * FROM orders WHERE user_id = 42 OR status = 'urgent';
+
+-- UNION often works better
+SELECT * FROM orders WHERE user_id = 42
+UNION
+SELECT * FROM orders WHERE status = 'urgent';
+```
+
+## Finding Missing Indexes
+
+The slow query log captures queries that exceed a time threshold — a good starting point for finding what to index:
+
+```sql
+-- Enable slow query log (in MySQL config or at runtime)
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 1;  -- log queries over 1 second
+```
+
+Then run `EXPLAIN` on the slow queries. Look for `type: ALL` and `rows` in the millions.
+
+## Summary
+
+- B-tree indexes keep values sorted for fast lookups and range scans
+- MySQL uses an index when your query filters or sorts on the leading indexed column(s)
+- Composite index column order matters — design around your most common queries
+- Covering indexes are the fastest — the query is answered entirely from the index
+- Indexes cost on writes; only add them where the read benefit justifies it
+- Wrap a column in a function and you've disabled its index — use range conditions instead
