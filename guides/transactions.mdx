@@ -1,0 +1,135 @@
+---
+title: "Transactions in MySQL"
+sidebarTitle: "Transactions"
+description: "How MySQL transactions work: COMMIT, ROLLBACK, isolation levels, and how to use transactions to keep data consistent."
+keywords: "mysql transactions, mysql commit rollback, mysql begin transaction, mysql isolation level, mysql autocommit, mysql transaction example, mysql transaction isolation levels"
+---
+
+A transaction groups multiple SQL statements into a single unit of work. Either all of them succeed, or none of them do. Without transactions, a failure halfway through a multi-step operation — a payment, a transfer, an order — can leave your data in a broken intermediate state.
+
+## The Basics: BEGIN, COMMIT, ROLLBACK
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- debit Alice
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- credit Bob
+
+COMMIT;  -- both changes are saved
+```
+
+If something goes wrong between the two updates:
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+
+-- error occurs here, or you decide to cancel
+
+ROLLBACK;  -- neither change is saved — balance unchanged
+```
+
+`ROLLBACK` undoes everything back to the `START TRANSACTION`. The database is left as it was before the transaction began.
+
+`BEGIN` and `START TRANSACTION` are equivalent. Both start a new transaction.
+
+## Autocommit
+
+By default, MySQL runs in autocommit mode — each statement is its own transaction, committed immediately. That's why `DELETE FROM orders WHERE id = 5` takes effect right away without an explicit `COMMIT`.
+
+Calling `START TRANSACTION` temporarily suspends autocommit for the duration of that transaction.
+
+```sql
+-- Check current autocommit setting
+SHOW VARIABLES LIKE 'autocommit';
+
+-- Disable autocommit for the session
+SET autocommit = 0;
+
+-- Now every statement is part of a transaction until you COMMIT or ROLLBACK
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+```
+
+Disabling autocommit means you must explicitly `COMMIT` or `ROLLBACK` after every operation. If you disconnect without committing, MySQL rolls back any open transaction.
+
+## Isolation Levels
+
+When multiple transactions run at the same time, isolation levels control what each transaction can see from the others. MySQL's default is `REPEATABLE READ`.
+
+| Level | Dirty Reads | Non-repeatable Reads | Phantom Reads |
+|:------|:------------|:---------------------|:--------------|
+| `READ UNCOMMITTED` | Possible | Possible | Possible |
+| `READ COMMITTED` | Prevented | Possible | Possible |
+| `REPEATABLE READ` | Prevented | Prevented | Prevented* |
+| `SERIALIZABLE` | Prevented | Prevented | Prevented |
+
+*InnoDB's REPEATABLE READ prevents phantom reads via gap locks, which is stricter than the SQL standard requires.
+
+**READ COMMITTED** is a common choice for applications that prioritize throughput. It prevents dirty reads (seeing uncommitted data from other transactions) but allows non-repeatable reads (the same row read twice in one transaction might return different values if another transaction committed between the reads).
+
+```sql
+-- Set isolation level for the current session
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- Or for the next transaction only
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+-- ...
+```
+
+## Savepoints
+
+Savepoints let you roll back part of a transaction without abandoning the whole thing:
+
+```sql
+START TRANSACTION;
+
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+SAVEPOINT after_order;
+
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 42);
+
+-- something went wrong with the item — roll back just this part
+ROLLBACK TO SAVEPOINT after_order;
+
+-- the order is still there; we can retry the item insert
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 43);
+
+COMMIT;
+```
+
+## What Transactions Don't Cover
+
+Not all MySQL statements can be rolled back. DDL statements (`CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`) cause an implicit commit — MySQL commits any open transaction before executing them, and the DDL itself cannot be rolled back.
+
+```sql
+START TRANSACTION;
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+
+DROP TABLE temp_data;  -- implicit commit happens here — the INSERT is committed
+
+ROLLBACK;  -- nothing to roll back; everything was already committed
+```
+
+## Frequently Asked Questions
+
+#### What happens if a transaction is never committed?
+If you close the connection without committing, MySQL automatically rolls back the open transaction. If the server crashes, InnoDB's redo log recovers committed transactions and rolls back uncommitted ones on startup.
+
+#### Can I use transactions with MyISAM?
+No. Transactions require a transactional storage engine. InnoDB (MySQL's default engine since 5.5) fully supports transactions. MyISAM does not — statements against MyISAM tables take effect immediately and can't be rolled back.
+
+#### How long can a transaction stay open?
+Technically as long as needed, but long-running transactions hold locks and consume undo log space, which causes performance problems for other transactions. The `innodb_lock_wait_timeout` variable (default: 50 seconds) controls how long a transaction waits for a lock before returning an error. Keep transactions short and commit as soon as the work is done.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| Changes aren't persisting | Check if autocommit is off — you may need to call `COMMIT` explicitly |
+| `ROLLBACK` has no effect | A DDL statement (`CREATE`, `ALTER`, `DROP`) caused an implicit commit mid-transaction |
+| Transaction is blocking other queries | A long-running transaction is holding locks — commit or roll back promptly; check `SHOW ENGINE INNODB STATUS` for lock info |
+| `ERROR 1205: Lock wait timeout exceeded` | Another transaction holds a conflicting lock; retry after the blocking transaction completes |
