@@ -1,0 +1,153 @@
+---
+title: "Bulk Inserts in MySQL"
+sidebarTitle: "Bulk Inserts"
+description: "How to insert large amounts of data into MySQL efficiently: multi-row INSERT, LOAD DATA INFILE, INSERT...SELECT, disabling keys, and transaction batching for performance."
+keywords: "mysql bulk insert, mysql load data infile, mysql insert multiple rows, mysql batch insert, mysql fast insert, mysql import csv, mysql bulk load performance"
+---
+
+Inserting rows one at a time is the fastest way to make a large import slow. MySQL processes each single-row `INSERT` as a full transaction commit — parse, plan, execute, fsync. At scale, that per-row overhead dominates. Here's how to avoid it.
+
+## Multi-Row INSERT
+
+The simplest optimization: batch multiple rows into one statement.
+
+```sql
+-- Slow: one round trip and one transaction per row
+INSERT INTO products (name, price) VALUES ('Widget A', 9.99);
+INSERT INTO products (name, price) VALUES ('Widget B', 14.99);
+INSERT INTO products (name, price) VALUES ('Widget C', 19.99);
+
+-- Fast: one round trip, one transaction for all three
+INSERT INTO products (name, price) VALUES
+    ('Widget A',  9.99),
+    ('Widget B', 14.99),
+    ('Widget C', 19.99);
+```
+
+Batch size matters. A few hundred to a few thousand rows per statement is typically optimal — larger batches increase memory pressure and extend transaction duration. Benchmark to find the sweet spot for your workload; 500–2000 rows per batch is a common starting point.
+
+## Transaction Batching
+
+Wrapping many INSERTs in a single transaction avoids per-statement commit overhead:
+
+```sql
+START TRANSACTION;
+INSERT INTO products (name, price) VALUES ('Widget A',  9.99);
+INSERT INTO products (name, price) VALUES ('Widget B', 14.99);
+-- ... hundreds more ...
+INSERT INTO products (name, price) VALUES ('Widget Z', 99.99);
+COMMIT;
+```
+
+Without explicit transactions, each INSERT auto-commits. Auto-commit means each row is individually flushed to disk. Wrapping 500 inserts in one transaction does one flush.
+
+Combine this with multi-row INSERT: batch rows into groups of 500–1000 per statement, wrap each batch in a transaction.
+
+## LOAD DATA INFILE
+
+For large CSV imports, `LOAD DATA INFILE` is the fastest native MySQL option — significantly faster than batched INSERTs because it bypasses SQL parsing for each row.
+
+```sql
+LOAD DATA INFILE '/var/lib/mysql-files/products.csv'
+INTO TABLE products
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES  -- skip header row
+(name, price, category);
+```
+
+The file must be readable by the MySQL server process. By default, the file path is restricted to the directory specified by `secure_file_priv`:
+
+```sql
+SHOW VARIABLES LIKE 'secure_file_priv';
+```
+
+To load a file from the client machine rather than the server:
+
+```sql
+LOAD DATA LOCAL INFILE '/path/on/client/products.csv'
+INTO TABLE products
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n';
+```
+
+`LOCAL INFILE` requires `local_infile = ON` on the server and the client to have the `--local-infile` flag enabled.
+
+## INSERT ... SELECT
+
+For copying data between tables (ETL patterns, staging tables), `INSERT...SELECT` is faster than reading rows into the application and inserting them back:
+
+```sql
+-- Load staging table, validate, then move to production
+INSERT INTO products (name, price, category)
+SELECT name, price, category
+FROM products_staging
+WHERE price > 0 AND name IS NOT NULL;
+```
+
+## Disabling Indexes During Bulk Load
+
+For MyISAM tables, disabling non-unique index updates during a bulk insert speeds things up significantly:
+
+```sql
+ALTER TABLE products DISABLE KEYS;
+-- ... bulk INSERT ...
+ALTER TABLE products ENABLE KEYS;  -- rebuilds indexes in one pass
+```
+
+For InnoDB, this doesn't have the same effect. Instead, InnoDB automatically uses a "change buffer" for secondary index updates. For maximum InnoDB bulk-load performance:
+
+```sql
+-- Temporarily increase the buffer pool if possible
+SET GLOBAL innodb_buffer_pool_size = 4 * 1024 * 1024 * 1024;  -- 4GB example
+
+-- Disable foreign key checks
+SET foreign_key_checks = 0;
+-- ... bulk load ...
+SET foreign_key_checks = 1;
+
+-- Disable unique checks for known-clean data
+SET unique_checks = 0;
+-- ... bulk load ...
+SET unique_checks = 1;
+```
+
+Re-enable these immediately after the load. Disabling `unique_checks` on data that actually has duplicates produces a corrupt index.
+
+## Performance Comparison
+
+| Method | Relative speed | Best for |
+|:-------|:--------------|:---------|
+| Single-row INSERT (auto-commit) | Slowest | Small volumes, interactive |
+| Single-row INSERT (batched in transaction) | 2–5× faster | Moderate volumes |
+| Multi-row INSERT | 5–20× faster | Most bulk loads |
+| LOAD DATA INFILE | Fastest (often 10–100× faster than single-row) | Large CSV imports |
+| INSERT...SELECT | Fast (server-side copy) | Table-to-table copies |
+
+Exact numbers depend heavily on row size, indexes, hardware, and configuration. Benchmark your specific case.
+
+## Frequently Asked Questions
+
+#### How large should each INSERT batch be?
+
+Start at 500–1000 rows and benchmark. Larger batches reduce per-commit overhead but increase memory usage and transaction duration (which holds locks longer). If a batch fails, the whole batch rolls back — smaller batches mean less rollback work. Most applications find the optimal batch size between 500 and 5000 rows.
+
+#### Can I use LOAD DATA INFILE with ON DUPLICATE KEY UPDATE?
+
+`LOAD DATA` supports `REPLACE` or `IGNORE` for duplicate handling, but not `ON DUPLICATE KEY UPDATE`. For upsert semantics during bulk load, load into a staging table, then use `INSERT...SELECT...ON DUPLICATE KEY UPDATE` from the staging table to the target.
+
+#### Does bulk inserting bypass triggers?
+
+No. Triggers fire for every row affected, including those loaded by `LOAD DATA INFILE` and `INSERT...SELECT`. If your trigger does significant work, it will slow bulk loads proportionally. For pure data migrations, you may want to temporarily disable triggers.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1290: The MySQL server is running with the --secure-file-priv option` | Move the file to the directory shown by `SHOW VARIABLES LIKE 'secure_file_priv'`, or use `LOAD DATA LOCAL INFILE` |
+| `ERROR 3948: Loading local data is disabled` | Enable with `SET GLOBAL local_infile = 1` on server and `--local-infile=1` on client |
+| Bulk insert still slow after batching | Check if `autocommit` is ON — each statement commits individually; wrap in explicit `BEGIN...COMMIT` blocks |
+| Duplicate key errors on known-clean data after disabling `unique_checks` | `unique_checks = 0` does not validate uniqueness during load but corrupts the index if duplicates exist — always validate first |
+| `LOAD DATA` misparses rows | Check `FIELDS TERMINATED BY`, `ENCLOSED BY`, and `LINES TERMINATED BY` match your actual file format; use `SHOW WARNINGS` after the load |
