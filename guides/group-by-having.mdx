@@ -1,0 +1,126 @@
+---
+title: "GROUP BY and HAVING in MySQL"
+sidebarTitle: "GROUP BY and HAVING"
+description: "How MySQL GROUP BY and HAVING work: aggregate functions, HAVING vs WHERE, ONLY_FULL_GROUP_BY mode, GROUP BY WITH ROLLUP, and common mistakes."
+keywords: "mysql group by, mysql having, mysql aggregate functions, mysql having vs where, mysql group by having, mysql only_full_group_by, mysql rollup, mysql count sum avg"
+---
+
+`GROUP BY` collapses multiple rows into one row per group. `HAVING` filters those groups after aggregation. Together they're how MySQL handles aggregation queries — counting orders per customer, summing revenue by month, finding categories with more than 10 items.
+
+## GROUP BY Basics
+
+```sql
+-- Count orders per customer
+SELECT customer_id, COUNT(*) AS order_count
+FROM orders
+GROUP BY customer_id;
+
+-- Total revenue by month
+SELECT
+    DATE_FORMAT(created_at, '%Y-%m') AS month,
+    SUM(amount) AS revenue,
+    COUNT(*) AS order_count
+FROM orders
+GROUP BY month
+ORDER BY month;
+```
+
+Common aggregate functions:
+
+| Function | Returns |
+|:---------|:--------|
+| `COUNT(*)` | Number of rows in the group |
+| `COUNT(col)` | Number of non-NULL values in the column |
+| `SUM(col)` | Sum of all non-NULL values |
+| `AVG(col)` | Average of all non-NULL values |
+| `MIN(col)` / `MAX(col)` | Smallest / largest non-NULL value |
+| `GROUP_CONCAT(col)` | Comma-separated list of values in the group |
+
+## HAVING vs WHERE
+
+`WHERE` filters rows before grouping. `HAVING` filters groups after aggregation.
+
+```sql
+-- WHERE: filter before grouping (uses indexes)
+SELECT customer_id, COUNT(*) AS order_count
+FROM orders
+WHERE created_at >= '2024-01-01'   -- only include orders from 2024
+GROUP BY customer_id;
+
+-- HAVING: filter after grouping (on aggregate results)
+SELECT customer_id, COUNT(*) AS order_count
+FROM orders
+WHERE created_at >= '2024-01-01'
+GROUP BY customer_id
+HAVING order_count >= 5;           -- only customers with 5+ orders
+```
+
+`HAVING COUNT(*) >= 5` works because `COUNT(*)` is available after aggregation. `WHERE COUNT(*) >= 5` is a syntax error — `COUNT()` doesn't exist at the WHERE stage.
+
+Use both together: `WHERE` to reduce rows before the grouping (faster — can use indexes), `HAVING` to filter the resulting groups.
+
+## ONLY_FULL_GROUP_BY
+
+MySQL 5.7.5+ enforces `ONLY_FULL_GROUP_BY` by default. Every column in the `SELECT` list must either appear in the `GROUP BY` clause or be wrapped in an aggregate function:
+
+```sql
+-- Fails in ONLY_FULL_GROUP_BY mode: 'name' is not in GROUP BY
+SELECT customer_id, name, COUNT(*) FROM orders GROUP BY customer_id;
+
+-- Fix: add name to GROUP BY
+SELECT customer_id, name, COUNT(*) FROM orders GROUP BY customer_id, name;
+
+-- Or: use ANY_VALUE() if you don't care which name is returned (all rows in the group have the same name)
+SELECT customer_id, ANY_VALUE(name), COUNT(*) FROM orders GROUP BY customer_id;
+```
+
+`ANY_VALUE()` explicitly tells MySQL "I know this column isn't in GROUP BY, pick any value from the group." Use it only when the column is functionally dependent on the GROUP BY column (all rows in the group have the same value).
+
+## GROUP BY WITH ROLLUP
+
+`WITH ROLLUP` adds subtotal rows after each group level and a grand total at the end:
+
+```sql
+SELECT
+    COALESCE(category, 'ALL CATEGORIES') AS category,
+    COALESCE(DATE_FORMAT(created_at, '%Y-%m'), 'ALL MONTHS') AS month,
+    SUM(amount) AS revenue
+FROM orders
+GROUP BY category, DATE_FORMAT(created_at, '%Y-%m') WITH ROLLUP;
+```
+
+MySQL adds NULL for the grouped columns in subtotal and grand total rows. `COALESCE` replaces those NULLs with readable labels. `WITH ROLLUP` is useful for summary reports where you want group subtotals without running multiple queries.
+
+For more complex analytics — running totals, rankings, moving averages — window functions handle cases that `GROUP BY` can't. See [Window Functions in MySQL 8](/guides/window-functions).
+
+## Frequently Asked Questions
+
+#### Can I use a column alias in HAVING?
+
+Yes, in MySQL — unlike most other databases. MySQL resolves column aliases from `SELECT` before evaluating `HAVING`:
+
+```sql
+SELECT customer_id, COUNT(*) AS cnt
+FROM orders
+GROUP BY customer_id
+HAVING cnt > 5;   -- works in MySQL; would fail in PostgreSQL or SQL Server
+```
+
+This is a MySQL-specific extension to the SQL standard. It's convenient but not portable.
+
+#### Why does GROUP BY without ORDER BY return rows in random order?
+
+Because MySQL doesn't guarantee order without an explicit `ORDER BY`. Even if the output looks ordered today, it can change with a different query plan or data distribution. Always add `ORDER BY` when order matters.
+
+#### What's the difference between COUNT(*) and COUNT(col)?
+
+`COUNT(*)` counts all rows including NULLs. `COUNT(col)` counts only rows where `col` is not NULL. `COUNT(DISTINCT col)` counts unique non-NULL values. Use `COUNT(*)` for row counts and `COUNT(col)` when you specifically want to count non-NULL occurrences.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1055: not in GROUP BY clause` | Add the column to GROUP BY or wrap it in `ANY_VALUE()` |
+| `HAVING` on non-aggregate column | Use `WHERE` instead — `HAVING` works on aggregate results, not raw columns |
+| `GROUP_CONCAT` result truncated | Default max length is 1024 bytes; increase with `SET SESSION group_concat_max_len = 10000` |
+| Slow `GROUP BY` query | Add an index on the GROUP BY columns; check `EXPLAIN` for "Using filesort" or "Using temporary" |

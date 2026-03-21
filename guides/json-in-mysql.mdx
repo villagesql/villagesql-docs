@@ -1,0 +1,144 @@
+---
+title: "JSON in MySQL"
+sidebarTitle: "JSON"
+description: "How to store, query, and index JSON data in MySQL: the JSON column type, path expressions, JSON functions, and how to index JSON fields with generated columns."
+keywords: "mysql json, mysql json column, mysql json_extract, mysql json path, mysql json functions, mysql json index, mysql json generated column, mysql 5.7 json"
+---
+
+MySQL has had a native `JSON` column type since 5.7.8. It validates JSON on insert, stores it in a binary format for efficient access, and provides a set of functions for reading and modifying individual fields without parsing the full document.
+
+## Storing JSON
+
+```sql
+CREATE TABLE products (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    name       VARCHAR(100) NOT NULL,
+    attributes JSON
+);
+
+INSERT INTO products (name, attributes) VALUES (
+    'Laptop',
+    '{"brand": "Acme", "ram_gb": 16, "tags": ["portable", "pro"]}'
+);
+```
+
+MySQL validates the JSON on insert. Inserting malformed JSON raises an error.
+
+## Reading JSON Fields
+
+Use `JSON_EXTRACT(column, path)` or the `->` shorthand:
+
+```sql
+-- These are equivalent
+SELECT JSON_EXTRACT(attributes, '$.brand') FROM products;
+SELECT attributes -> '$.brand' FROM products;
+```
+
+Both return a JSON value — the string `"Acme"` with quotes. To get a plain string without quotes, use `->>` (which is shorthand for `JSON_UNQUOTE(JSON_EXTRACT(...))`):
+
+```sql
+SELECT attributes ->> '$.brand' FROM products;  -- returns: Acme
+```
+
+Path syntax:
+- `$.key` — access an object field
+- `$.array[0]` — access array element by index
+- `$.array[*]` — all elements of an array
+- `$.**` — recursive wildcard (all values at any depth)
+
+## Filtering on JSON Fields
+
+```sql
+-- Find all 16GB RAM products
+SELECT name FROM products
+WHERE attributes ->> '$.ram_gb' = '16';
+
+-- Check if a key exists
+SELECT name FROM products
+WHERE JSON_EXTRACT(attributes, '$.brand') IS NOT NULL;
+
+-- Check if an array contains a value
+SELECT name FROM products
+WHERE JSON_CONTAINS(attributes -> '$.tags', '"portable"');
+```
+
+Note that `->>` returns a string, so comparing to `'16'` (not `16`) is correct unless you cast explicitly: `CAST(attributes ->> '$.ram_gb' AS UNSIGNED)`.
+
+## Modifying JSON
+
+```sql
+-- Add or update a field
+UPDATE products
+SET attributes = JSON_SET(attributes, '$.color', 'silver')
+WHERE id = 1;
+
+-- Remove a field
+UPDATE products
+SET attributes = JSON_REMOVE(attributes, '$.tags')
+WHERE id = 1;
+
+-- Insert only if the key doesn't exist
+UPDATE products
+SET attributes = JSON_INSERT(attributes, '$.warranty_years', 2)
+WHERE id = 1;
+```
+
+The key functions:
+
+| Function | Behavior |
+|:---------|:---------|
+| `JSON_SET(doc, path, val)` | Set the value — inserts or replaces |
+| `JSON_INSERT(doc, path, val)` | Insert only if the path doesn't exist |
+| `JSON_REPLACE(doc, path, val)` | Replace only if the path exists |
+| `JSON_REMOVE(doc, path)` | Remove the value at the path |
+
+## Indexing JSON Fields
+
+The JSON column itself can't be indexed directly. To index a specific JSON field, create a generated column and index that:
+
+```sql
+ALTER TABLE products
+    ADD COLUMN brand VARCHAR(100) GENERATED ALWAYS AS (attributes ->> '$.brand') VIRTUAL;
+
+CREATE INDEX idx_brand ON products (brand);
+```
+
+Now `WHERE attributes ->> '$.brand' = 'Acme'` can use `idx_brand`. MySQL recognizes that the generated column expression matches the query condition.
+
+This is covered in more detail in [Choosing MySQL Data Types](/guides/choosing-data-types) — it's the recommended pattern whenever you query a JSON field frequently enough to need an index.
+
+## JSON vs Normalized Columns
+
+| | JSON column | Normalized columns |
+|:--|:------------|:-------------------|
+| Schema flexibility | Any structure, no migration needed | Fixed structure, migration required |
+| Indexing | Only via generated columns | Index any column directly |
+| Query complexity | Path expressions, JSON functions | Standard SQL |
+| Joins | Not possible on JSON keys | Full JOIN support |
+| Storage | Larger (binary JSON overhead) | More compact |
+| Data integrity | No column-level constraints | `NOT NULL`, `DEFAULT`, foreign keys |
+
+Use JSON when the structure is genuinely variable (user-configurable attributes, event metadata, third-party API payloads). Use normalized columns when the structure is fixed and you need to filter, join, or aggregate on the fields.
+
+## Frequently Asked Questions
+
+#### Can I index a JSON array for containment queries?
+
+Not directly with a standard index. For `JSON_CONTAINS` queries, the only option is a full table scan unless you extract the array into a separate child table (normalized) or use a full-text index on a generated column that flattens the array. For high-throughput containment queries, normalization is the better path.
+
+#### What's the difference between `->` and `->>`?
+
+`->` returns a JSON value (strings include surrounding quotes). `->>` returns the unquoted string. For comparisons and `WHERE` clauses, `->>` is usually what you want — comparing `"Acme"` (with quotes) to the string `Acme` won't match.
+
+#### Does storing JSON hurt performance?
+
+Reading a single field from a large JSON document requires parsing the binary structure, which is faster than parsing text but slower than reading a native column. For frequently accessed fields, the generated column + index pattern brings read performance in line with native columns.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 3140: Invalid JSON` on insert | Fix the JSON syntax — MySQL validates on insert |
+| `WHERE attributes -> '$.key' = 'value'` returns no rows | Use `->>`  instead of `->` — the `->` version includes quotes in the returned string |
+| JSON field query not using an index | Add a generated column on the path expression and index that |
+| `JSON_CONTAINS` with nested array not matching | Check path and quoting — string values inside `JSON_CONTAINS` must be quoted JSON: `'"value"'` not `'value'` |

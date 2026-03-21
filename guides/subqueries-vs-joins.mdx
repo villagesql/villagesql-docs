@@ -1,0 +1,141 @@
+---
+title: "Subqueries vs JOINs in MySQL"
+sidebarTitle: "Subqueries vs JOINs"
+description: "When to use subqueries vs JOINs in MySQL: correlated vs uncorrelated subqueries, EXISTS vs IN, performance differences, and how the MySQL optimizer handles each."
+keywords: "mysql subquery vs join, mysql exists vs in, mysql correlated subquery, mysql subquery performance, mysql in subquery, mysql where exists, mysql semi join"
+---
+
+Subqueries and JOINs often produce the same result. The choice between them matters for readability, correctness with NULLs, and — in some cases — performance.
+
+## Types of Subqueries
+
+An **uncorrelated subquery** runs once and its result is used by the outer query:
+
+```sql
+-- Runs once: find all orders over the average amount
+SELECT id, amount
+FROM orders
+WHERE amount > (SELECT AVG(amount) FROM orders);
+```
+
+A **correlated subquery** references a column from the outer query, so it runs once per row:
+
+```sql
+-- Runs once per customer: find customers who have at least one order over $500
+SELECT c.name
+FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+```
+
+Correlated subqueries can be slow on large tables — the subquery executes for every row in the outer query. Check `EXPLAIN` to see how MySQL executes them.
+
+## IN vs EXISTS vs JOIN
+
+These three patterns often solve the same problem:
+
+```sql
+-- IN subquery
+SELECT name FROM customers
+WHERE id IN (SELECT customer_id FROM orders WHERE amount > 500);
+
+-- EXISTS
+SELECT name FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+
+-- JOIN (with DISTINCT to avoid duplicates)
+SELECT DISTINCT c.name
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 500;
+```
+
+| Approach | When to use |
+|:---------|:------------|
+| `IN (subquery)` | Subquery returns a small, static list; readable for simple cases |
+| `EXISTS` | Checking existence only; stops at first match; safe with NULLs |
+| `JOIN` | Need columns from both tables; MySQL optimizer has more flexibility |
+
+In MySQL 8.0, the optimizer often rewrites `IN (subquery)` as a semi-join internally, so the performance difference is frequently negligible. For large subquery result sets, `EXISTS` or a `JOIN` is more reliable.
+
+## The NULL Problem with NOT IN
+
+`NOT IN` behaves unexpectedly when the subquery returns any NULL:
+
+```sql
+-- This returns zero rows if ANY customer_id in orders is NULL
+SELECT name FROM customers
+WHERE id NOT IN (SELECT customer_id FROM orders);
+```
+
+If `orders.customer_id` has even one NULL row, the entire `NOT IN` returns empty. This is correct SQL behavior — `NULL` is unknown, so `NOT IN (NULL, 1, 2)` is UNKNOWN for every comparison. Use `NOT EXISTS` instead:
+
+```sql
+-- Safe: returns customers with no orders, even if some order rows have NULL customer_id
+SELECT name FROM customers c
+WHERE NOT EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id
+);
+```
+
+For more on MySQL's NULL behavior, see [NULL in MySQL](/guides/null-in-mysql).
+
+## Subqueries in FROM (Derived Tables)
+
+A subquery in the `FROM` clause creates a derived table:
+
+```sql
+SELECT dept, avg_salary
+FROM (
+    SELECT department AS dept, AVG(salary) AS avg_salary
+    FROM employees
+    GROUP BY department
+) dept_stats
+WHERE avg_salary > 80000;
+```
+
+In MySQL 8.0, a CTE is usually clearer for this pattern — the logic is named and defined at the top rather than nested inline. See [CTEs in MySQL](/guides/ctes-in-mysql).
+
+## Performance Considerations
+
+The MySQL optimizer rewrites many subquery patterns. Before optimizing manually:
+
+1. Run `EXPLAIN` on both the subquery and JOIN versions to see what MySQL actually executes
+2. Ensure indexes exist on the join/correlation columns — that's usually the bottleneck
+3. Only rewrite if `EXPLAIN` shows a significant difference in execution plan
+
+| Pattern | Watch for |
+|:--------|:----------|
+| Correlated subquery in SELECT | Runs per row — can be O(n²) on large tables |
+| `IN (subquery)` returning large result set | Can be slow pre-8.0; usually optimized in 8.0+ |
+| `NOT IN` with possible NULLs | Wrong results — use `NOT EXISTS` |
+| Derived table in FROM | Optimizer may or may not merge it; check `EXPLAIN` |
+
+## Frequently Asked Questions
+
+#### Is JOIN always faster than a subquery?
+
+Not necessarily. MySQL 8.0's optimizer rewrites `IN (subquery)` to semi-joins in many cases, producing the same execution plan as an explicit JOIN. Measure with `EXPLAIN` rather than assuming one form is always faster.
+
+#### When should I use EXISTS instead of IN?
+
+Use `EXISTS` when you only care whether a match exists (not what the matched data is), when the subquery could return NULLs, or when the subquery returns a large result set. `EXISTS` short-circuits on the first match; `IN` must build the full list.
+
+#### What's a semi-join?
+
+A semi-join returns rows from the left table that have at least one matching row on the right — without producing duplicate left-table rows for multiple matches. MySQL's optimizer uses semi-joins internally to execute `IN (subquery)` and `EXISTS` efficiently. You can't write a semi-join directly in SQL, but `EXISTS` and `IN (subquery)` both trigger the optimizer to consider it.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `NOT IN` returning empty results unexpectedly | NULL in the subquery result — switch to `NOT EXISTS` |
+| Correlated subquery very slow | Add an index on the correlated column; consider rewriting as a JOIN |
+| Same query faster as JOIN than as IN subquery | On MySQL 5.7, the optimizer sometimes fails to rewrite IN subqueries — upgrade or rewrite manually |
+| Derived table query slow | Check if MySQL materialized the derived table — may benefit from CTE with `SQL_NO_CACHE` hints |

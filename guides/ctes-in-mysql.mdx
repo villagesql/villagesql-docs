@@ -1,0 +1,120 @@
+---
+title: "CTEs in MySQL"
+sidebarTitle: "CTEs"
+description: "How to use Common Table Expressions in MySQL 8.0: WITH clause syntax, multiple CTEs, recursive CTEs for hierarchical data, and CTEs vs subqueries."
+keywords: "mysql cte, mysql with clause, mysql common table expression, mysql recursive cte, mysql 8 cte, mysql hierarchical query, mysql with recursive"
+---
+
+A Common Table Expression (CTE) is a named temporary result set defined at the top of a query with the `WITH` keyword. CTEs were introduced in MySQL 8.0 — on MySQL 5.7, use subqueries instead.
+
+## Basic CTE Syntax
+
+```sql
+WITH cte_name AS (
+    SELECT ...
+)
+SELECT * FROM cte_name;
+```
+
+A practical example — find the top 5 customers by total spend, then join their names:
+
+```sql
+WITH top_customers AS (
+    SELECT customer_id, SUM(amount) AS total_spent
+    FROM orders
+    GROUP BY customer_id
+    ORDER BY total_spent DESC
+    LIMIT 5
+)
+SELECT c.name, tc.total_spent
+FROM top_customers tc
+JOIN customers c ON c.id = tc.customer_id;
+```
+
+You can define multiple CTEs in one `WITH` clause, and each can reference the ones defined before it:
+
+```sql
+WITH
+monthly_totals AS (
+    SELECT DATE_FORMAT(created_at, '%Y-%m') AS month, SUM(amount) AS total
+    FROM orders
+    GROUP BY month
+),
+avg_monthly AS (
+    SELECT AVG(total) AS avg_total FROM monthly_totals
+)
+SELECT mt.month, mt.total, am.avg_total
+FROM monthly_totals mt
+CROSS JOIN avg_monthly am;
+```
+
+## CTEs vs Subqueries
+
+| | CTE | Subquery |
+|:--|:----|:---------|
+| Readability | Named, defined once at the top | Inline, can nest deeply |
+| Reuse | Reference the same CTE multiple times | Must repeat the subquery |
+| Debugging | Easy to run the CTE definition in isolation | Have to extract and run the subquery manually |
+| Performance | Generally the same; optimizer often inlines CTEs | Same |
+| MySQL version | 8.0+ | All versions |
+
+Use CTEs when the subquery is complex, when you reference the same result more than once, or when nesting would make the query hard to follow. For a comparison of when inline subqueries are better, see [Subqueries vs JOINs in MySQL](/guides/subqueries-vs-joins).
+
+## Recursive CTEs
+
+A recursive CTE references itself. This is the standard SQL pattern for querying hierarchical data — org charts, category trees, threaded comments.
+
+```sql
+WITH RECURSIVE org_chart AS (
+    -- Anchor member: start at the top
+    SELECT id, name, manager_id, 0 AS depth
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    -- Recursive member: find direct reports of rows already in the CTE
+    SELECT e.id, e.name, e.manager_id, oc.depth + 1
+    FROM employees e
+    JOIN org_chart oc ON e.manager_id = oc.id
+)
+SELECT depth, name FROM org_chart ORDER BY depth, name;
+```
+
+The `RECURSIVE` keyword is required — without it, MySQL doesn't recognize the self-reference and returns `ERROR 1146: Table 'org_chart' doesn't exist`. A recursive CTE has two parts joined by `UNION ALL`:
+
+1. **Anchor member** — the base case (employees with no manager)
+2. **Recursive member** — the step case (reports of employees already in the result)
+
+MySQL stops when the recursive member returns zero rows. If your data has cycles (employee A reports to B, B reports to A), the query runs until it hits `cte_max_recursion_depth` (default: 1000) and errors. Guard against this with a depth column and a `WHERE depth < N` condition.
+
+## Frequently Asked Questions
+
+#### Are CTEs faster than subqueries?
+
+Usually the same. The MySQL optimizer often inlines a CTE the same way it would a subquery. CTEs referenced multiple times may be materialized into a temporary table, which can be faster (avoids re-executing the subquery) or slower (extra I/O). If you suspect unwanted materialization, check `EXPLAIN` for "MATERIALIZED" in the extra column.
+
+#### Can I use CTEs in INSERT, UPDATE, or DELETE?
+
+Yes. CTEs work with DML statements:
+
+```sql
+WITH stale_orders AS (
+    SELECT id FROM orders WHERE created_at < NOW() - INTERVAL 1 YEAR
+)
+DELETE FROM orders WHERE id IN (SELECT id FROM stale_orders);
+```
+
+#### What's the recursion depth limit?
+
+The default is 1000 iterations (`cte_max_recursion_depth`). For deeper hierarchies, increase the session variable: `SET SESSION cte_max_recursion_depth = 5000`. If you hit the limit on normal data, check that your recursive member has a proper termination condition and that the data doesn't contain cycles.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1064` on WITH syntax | CTEs require MySQL 8.0 — check `SELECT VERSION()` |
+| `ERROR 1146: Table 'cte_name' doesn't exist` | Missing `RECURSIVE` keyword — add `WITH RECURSIVE` when the CTE references itself |
+| `ERROR 3577: Recursive query aborted after N iterations` | Add a depth counter and `WHERE depth < N` guard condition |
+| CTE referenced in WHERE clause loses rows | Window functions and CTEs are evaluated after WHERE — filter in a subquery around the CTE |
+| CTE performing worse than subquery | Check `EXPLAIN` for "MATERIALIZED" — try inlining the CTE as a subquery to compare |
