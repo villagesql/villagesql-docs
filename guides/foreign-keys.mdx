@@ -1,0 +1,122 @@
+---
+title: "Foreign Keys in MySQL"
+sidebarTitle: "Foreign Keys"
+description: "How MySQL foreign keys work, how to define them, the CASCADE and RESTRICT options, and the performance trade-offs to understand before using them."
+keywords: "mysql foreign key, mysql foreign key constraint, mysql on delete cascade, mysql referential integrity, mysql innodb foreign key, mysql foreign key performance"
+---
+
+A foreign key is a constraint that enforces a relationship between two tables. It ensures that a value in one table's column exists in another table — and defines what happens when the referenced row is deleted or updated.
+
+## Defining a Foreign Key
+
+```sql
+CREATE TABLE customers (
+    id   INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    CONSTRAINT fk_orders_customer
+        FOREIGN KEY (customer_id) REFERENCES customers (id)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE
+);
+```
+
+The constraint name (`fk_orders_customer`) is optional but worth including — it appears in error messages and makes `ALTER TABLE` operations easier.
+
+Foreign keys require InnoDB — MyISAM silently ignores them.
+
+## Referential Actions
+
+The `ON DELETE` and `ON UPDATE` clauses define what happens to child rows when the referenced parent row is deleted or updated.
+
+| Action | On DELETE | On UPDATE |
+|:-------|:----------|:----------|
+| `RESTRICT` | Block the delete if child rows exist | Block the update if child rows exist |
+| `NO ACTION` | Same as `RESTRICT` (default) | Same as `RESTRICT` |
+| `CASCADE` | Delete child rows automatically | Update child FK value to match |
+| `SET NULL` | Set child FK column to NULL | Set child FK column to NULL |
+
+`SET DEFAULT` is part of the SQL standard but InnoDB rejects it — don't use it.
+
+**`CASCADE` on DELETE** is convenient but dangerous. Deleting a customer deletes all their orders automatically — no error, no warning. Use it only when the dependent rows are genuinely meaningless without the parent (e.g., order line items without an order).
+
+**`RESTRICT`** is the safer default — it forces the application to handle deletion explicitly, preventing accidental data loss.
+
+## The Required Index
+
+MySQL requires an index on the foreign key column. InnoDB creates it automatically if one doesn't exist.
+
+```sql
+-- InnoDB creates this index automatically for the FK above
+-- But you can create it explicitly for control over the name
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+```
+
+This index is what makes foreign key checks fast — without it, every INSERT or DELETE would require a full table scan. It also speeds up JOIN queries on the FK column, which is why you should always index foreign key columns in one-to-many relationships even if you're not using explicit FK constraints.
+
+## Checking and Disabling Foreign Key Checks
+
+During bulk data loads, foreign key checks slow every insert. Disable them temporarily:
+
+```sql
+SET FOREIGN_KEY_CHECKS = 0;
+
+-- Bulk insert or LOAD DATA here
+
+SET FOREIGN_KEY_CHECKS = 1;
+```
+
+**Important**: disabling checks means you can insert orphaned rows. Re-enabling checks doesn't retroactively validate existing data. If you load data with checks off, validate referential integrity manually before turning checks back on.
+
+## Viewing Existing Foreign Keys
+
+```sql
+-- List all foreign keys in a database
+SELECT
+    TABLE_NAME,
+    CONSTRAINT_NAME,
+    COLUMN_NAME,
+    REFERENCED_TABLE_NAME,
+    REFERENCED_COLUMN_NAME
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
+ORDER BY TABLE_NAME;
+```
+
+## Frequently Asked Questions
+
+#### Do foreign keys hurt performance?
+
+Every INSERT to the child table triggers a check against the parent table (an index lookup). Every DELETE from the parent table triggers a check for child rows. On high-throughput tables these checks add up. Teams that prioritize write throughput often enforce referential integrity at the application layer instead. Neither choice is universally right — the trade-off is between database-level safety and write performance.
+
+#### Can I add a foreign key to an existing table?
+
+Yes, with `ALTER TABLE`:
+
+```sql
+ALTER TABLE orders
+    ADD CONSTRAINT fk_orders_customer
+    FOREIGN KEY (customer_id) REFERENCES customers (id)
+    ON DELETE RESTRICT;
+```
+
+If existing rows in `orders` have `customer_id` values that don't exist in `customers`, the `ALTER TABLE` will fail. Fix the data first.
+
+#### Why does MySQL create an index automatically for a foreign key?
+
+InnoDB needs to check child rows quickly when a parent row is deleted or updated. Without an index on the FK column, that check requires a full table scan of the child table. The auto-created index prevents that. If you create your own index first (with a meaningful name), InnoDB uses it instead of creating a second one.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1452: Cannot add or update a child row` | The FK value doesn't exist in the parent table — insert the parent row first |
+| `ERROR 1451: Cannot delete or update a parent row` | Child rows exist and the action is `RESTRICT` — delete children first or use `CASCADE` |
+| `ALTER TABLE` fails when adding FK | Existing data has orphaned rows — find and fix them with a LEFT JOIN check |
+| Slow INSERTs on FK column | Index missing on the FK column — InnoDB should auto-create it, but verify with `SHOW INDEX` |
+| `SET FOREIGN_KEY_CHECKS = 0` didn't persist | It's a session variable — set it again in the same session before your bulk load |

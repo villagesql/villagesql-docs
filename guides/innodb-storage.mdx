@@ -1,0 +1,101 @@
+---
+title: "How InnoDB Stores Data"
+sidebarTitle: "InnoDB Storage"
+description: "How MySQL's InnoDB storage engine organizes data on disk: clustered indexes, pages, the buffer pool, and what this means for query performance."
+keywords: "mysql innodb storage, mysql clustered index, mysql buffer pool, innodb page size, mysql innodb architecture, mysql row format, innodb tablespace"
+---
+
+InnoDB is MySQL's default storage engine and has been since MySQL 5.5. Understanding how it stores data explains why some queries are fast and others aren't — especially why primary key choice matters, why range scans beat random lookups, and why indexes on large tables can hurt write performance.
+
+## Pages: The Unit of Storage
+
+InnoDB stores everything in pages — fixed-size chunks of 16KB by default. A page is the smallest unit InnoDB reads from or writes to disk. When you read one row, InnoDB loads the entire 16KB page that contains it.
+
+This has practical consequences:
+- Queries that read sequential rows (range scans, full table scans on ordered data) load each page once and process many rows from it
+- Queries that read random rows (by secondary index on a large table) load a new page for each row — each likely a separate disk read
+
+## The Clustered Index
+
+InnoDB stores table rows in a **clustered index** — a B-tree where the leaf nodes contain the actual row data, physically sorted by the primary key. There's no separate "table file" and "primary key index file" — they're the same structure.
+
+```sql
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    created_at  DATETIME NOT NULL
+);
+```
+
+Rows in this table are physically stored in `id` order on disk. A query like `WHERE id BETWEEN 1000 AND 2000` reads a contiguous range of pages — fast. A query that retrieves row `id = 1`, then `id = 500000`, then `id = 250` reads three physically scattered pages.
+
+**If you don't define a primary key**, InnoDB creates a hidden 6-byte row ID and uses it as the clustered index key. This wastes the optimization opportunity.
+
+## Secondary Indexes
+
+Every secondary index is a separate B-tree. The leaf nodes don't store the full row — they store the indexed column values plus the primary key. To retrieve columns not in the secondary index, InnoDB does a **row lookup**: it takes the primary key from the secondary index leaf and fetches the full row from the clustered index.
+
+```sql
+CREATE INDEX idx_customer ON orders (customer_id);
+
+-- This query uses idx_customer, then does a row lookup for each match
+SELECT amount FROM orders WHERE customer_id = 42;
+```
+
+This two-step process is why covering indexes matter: if the secondary index includes all the columns the query needs, the row lookup is skipped. See [Covering Indexes in MySQL](/guides/covering-indexes).
+
+The row lookup cost is also why large primary keys are expensive. If your primary key is a UUID string (36 bytes) instead of an INT (4 bytes), every secondary index stores 36 bytes per entry instead of 4, and the row lookup traverses a deeper B-tree.
+
+## The Buffer Pool
+
+InnoDB caches pages in memory in the **buffer pool**. A page read from disk is loaded into the buffer pool and stays there until memory is needed for something else. Subsequent reads of the same page are served from RAM.
+
+```sql
+-- Check buffer pool size
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+
+-- Check hit rate (should be > 99% on a healthy server)
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+-- Innodb_buffer_pool_reads: pages read from disk
+-- Innodb_buffer_pool_read_requests: total page read requests
+-- Hit rate = 1 - (reads / read_requests)
+```
+
+On a dedicated database server, set `innodb_buffer_pool_size` to 70–80% of available RAM. This is the single most impactful configuration change for read-heavy workloads — the more of the working set that fits in memory, the fewer disk reads.
+
+## Row Formats
+
+InnoDB supports four row formats. The default since MySQL 5.7.9 is `DYNAMIC`.
+
+| Format | Variable-length columns | Max row size | Notes |
+|:-------|:------------------------|:-------------|:------|
+| `REDUNDANT` | Stored inline or off-page | 8KB | Legacy format |
+| `COMPACT` | Stored inline or off-page | 8KB | Default before 5.7.9 |
+| `DYNAMIC` | Stored off-page when large | 8KB | Default since 5.7.9; better for TEXT/BLOB |
+| `COMPRESSED` | Compressed off-page | 8KB | Reduces disk usage; adds CPU overhead |
+
+When a `VARCHAR`, `TEXT`, or `BLOB` column overflows the page in `DYNAMIC` format, the entire value is stored in overflow pages — only a 20-byte pointer remains in the main row. `COMPACT` stores the first 768 bytes inline instead. `DYNAMIC`'s approach keeps the main row smaller when long values are present, which means more rows fit per page and the B-tree stays shallower.
+
+## Frequently Asked Questions
+
+#### Why does primary key choice affect performance so much?
+
+Because the clustered index physically orders rows by primary key. Inserts at random positions (like UUID primary keys) cause **page splits** — InnoDB has to split full pages and move data to maintain order. Sequential primary keys (AUTO_INCREMENT, UUID v7) insert at the end and avoid splits. Page splits fragment the tablespace and slow both writes and reads over time.
+
+#### What happens when the buffer pool is too small?
+
+InnoDB has to read pages from disk frequently. You'll see `Innodb_buffer_pool_reads` climbing. The server becomes I/O-bound — queries that would take microseconds from RAM take milliseconds from disk. On a read-heavy workload, a buffer pool that holds the working set is worth more than almost any index optimization.
+
+#### What's the difference between InnoDB and MyISAM?
+
+InnoDB supports transactions, foreign keys, row-level locking, and crash recovery. MyISAM doesn't support any of these — it's faster for specific read-only bulk workloads but unsuitable for most applications. InnoDB has been the MySQL default since 5.5; use InnoDB unless you have a specific reason not to.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| Slow range scans on large tables | Check buffer pool hit rate; consider increasing `innodb_buffer_pool_size` |
+| Inserts slowing down over time | Sequential primary key? Check for page splits with `SHOW ENGINE INNODB STATUS` |
+| High disk I/O despite adequate RAM | Buffer pool may be undersized for the working set; increase it |
+| Large table with mostly full-text reads | Consider `DYNAMIC` row format to keep large text off the main page |

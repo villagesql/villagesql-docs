@@ -1,0 +1,138 @@
+---
+title: "MySQL Connection Pooling"
+sidebarTitle: "Connection Pooling"
+description: "How MySQL connection pooling works, why persistent connections matter for performance, and how to configure ProxySQL and application-level poolers."
+keywords: "mysql connection pooling, mysql persistent connections, mysql max_connections, proxysql mysql, mysql connection limit, mysql too many connections, mysql pooler"
+---
+
+Opening a MySQL connection takes time — TCP handshake, authentication, session initialization. Under load, applications that open and close connections per request spend more time connecting than querying. Connection pooling reuses existing connections instead of creating new ones for every request.
+
+## Why Connections Are Expensive
+
+Each MySQL connection is a thread on the server. The cost at connection time:
+
+- TCP/TLS handshake
+- Authentication (credential check, privilege resolution)
+- Session variable initialization
+
+On a busy application server, this overhead adds up fast. A query that takes 1ms to execute might take 10ms total if connection setup is included.
+
+```sql
+-- See how many connections are currently active
+SHOW STATUS LIKE 'Threads_connected';
+
+-- See the server's connection limit
+SHOW VARIABLES LIKE 'max_connections';
+
+-- See peak connections since last restart
+SHOW STATUS LIKE 'Max_used_connections';
+```
+
+## Application-Level Pooling
+
+Most application frameworks and database drivers include built-in connection pools. These maintain a pool of open connections and lend them to application threads on demand.
+
+**Node.js (mysql2):**
+```javascript
+import mysql from 'mysql2/promise';
+
+const pool = mysql.createPool({
+  host: 'localhost',
+  user: 'app',
+  database: 'mydb',
+  waitForConnections: true,
+  connectionLimit: 10,       // max simultaneous connections
+  queueLimit: 0              // unlimited queue (0 = no limit)
+});
+
+// connection is returned to the pool automatically
+const [rows] = await pool.execute('SELECT * FROM orders WHERE id = ?', [42]);
+```
+
+**Python (SQLAlchemy):**
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    'mysql+mysqlconnector://user:pass@localhost/mydb',
+    pool_size=10,        # persistent connections to keep open
+    max_overflow=5,      # extra connections allowed under peak load
+    pool_timeout=30,     # seconds to wait for a connection from the pool
+    pool_recycle=3600    # recycle connections after 1 hour (avoids stale connections)
+)
+```
+
+The key settings in any pool:
+- **pool size**: how many persistent connections to maintain
+- **max overflow / queue**: how many extra connections are allowed under burst load
+- **recycle / timeout**: when to close and reopen connections (prevents stale connections from MySQL's `wait_timeout`)
+
+## MySQL's wait_timeout and Stale Connections
+
+MySQL closes idle connections after `wait_timeout` seconds (default: 28800 seconds / 8 hours). This applies to non-interactive connections — the kind application pools use. If your pool holds connections longer than this, they go stale and the next query fails with `MySQL server has gone away`.
+
+```sql
+-- Check the server's idle connection timeout
+SHOW VARIABLES LIKE 'wait_timeout';
+```
+
+Fix it in your pool configuration: set `pool_recycle` (or the equivalent) to a value shorter than `wait_timeout`. 3600 seconds (1 hour) is a safe default.
+
+## ProxySQL for Multi-Server Setups
+
+Application-level pools work well for a single server. When you have replicas or multiple application servers, a dedicated proxy like ProxySQL sits between the application and MySQL and handles pooling at the infrastructure level.
+
+ProxySQL benefits:
+- **Query routing**: send reads to replicas, writes to primary
+- **Connection multiplexing**: many application connections share fewer MySQL connections
+- **Failover**: reroute traffic if a server goes down
+
+Basic ProxySQL setup routes reads and writes by query prefix:
+
+```sql
+-- In ProxySQL admin interface
+-- Route SELECT queries to read hostgroup (replicas)
+INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup)
+VALUES (1, 1, '^SELECT', 2);
+
+-- All other queries go to write hostgroup (primary)
+INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup)
+VALUES (2, 1, '.*', 1);
+
+LOAD MYSQL QUERY RULES TO RUNTIME;
+SAVE MYSQL QUERY RULES TO DISK;
+```
+
+## Tuning max_connections
+
+`max_connections` sets the server-side ceiling. Each connection consumes memory — a baseline of roughly 200KB for thread stack and static buffers, plus additional memory allocated on demand during query execution (sort buffers, read buffers, tmp tables). Under heavy query load the per-connection cost can reach several MB. Setting `max_connections` too high wastes memory; too low causes `ERROR 1040 (08004): Too many connections`.
+
+```sql
+-- Increase max connections (requires SUPER privilege)
+SET GLOBAL max_connections = 500;
+```
+
+A rough sizing formula: `max_connections = (available RAM for connections) / (memory per connection)`. Monitor `Max_used_connections` to understand your actual peak, then set `max_connections` 20–30% above that.
+
+## Frequently Asked Questions
+
+#### How many connections should my pool have?
+
+Start with the number of CPU cores on the database server, then tune up based on load. A heavily I/O-bound workload can benefit from more connections than CPU cores; a CPU-bound workload can't. HikariCP's well-known formula `connections = (core_count * 2) + effective_spindle_count` was designed for spinning disks — it doesn't apply to SSDs. On modern infrastructure, measure your actual concurrency with `Threads_running` under peak load and use that as your baseline.
+
+#### What's the difference between `Threads_connected` and `Threads_running`?
+
+`Threads_connected` counts all open connections — including idle ones sitting in a pool. `Threads_running` counts connections actively executing a query right now. The gap between the two is your idle connection count. A large `Threads_connected` with a small `Threads_running` is normal for a healthy pool.
+
+#### Should I use persistent connections in PHP?
+
+Avoid them. PHP has no facility to reset a reused connection — left-open transactions, table locks, temporary tables, and changed session variables carry over to the next request. This can cause deadlocks, data corruption, and hard-to-reproduce bugs. Use a proper connection pool (PDO with pooling, or a proxy like ProxySQL) instead.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1040 (08004): Too many connections` | Increase `max_connections`, reduce pool size, or add ProxySQL |
+| `MySQL server has gone away` | Stale connection — set `pool_recycle` shorter than `wait_timeout` |
+| High `Threads_connected` but low throughput | Pool is oversized — idle connections consume memory; reduce pool size |
+| Connection latency spikes under load | Pool is undersized — requests queue for connections; increase pool size or add a proxy |
