@@ -1,0 +1,191 @@
+---
+title: "MySQL on Docker"
+sidebarTitle: "MySQL on Docker"
+description: "How to run MySQL in Docker: official image setup, environment variables, persistent volumes, Docker Compose configuration, connecting from applications, and production considerations."
+keywords: "mysql docker, mysql docker container, mysql docker compose, mysql official image, mysql docker volume, docker run mysql, mysql container environment variables, mysql docker connect"
+---
+
+The official MySQL Docker image lets you run a fully configured MySQL server in a container. It handles initialization, user creation, and data directory setup automatically through environment variables.
+
+## Quick Start
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -e MYSQL_DATABASE=myapp \
+  -e MYSQL_USER=appuser \
+  -e MYSQL_PASSWORD=apppass \
+  -p 3306:3306 \
+  -d mysql:8.4
+```
+
+Connect from the host machine:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u appuser -p myapp
+```
+
+Or connect inside the container:
+
+```bash
+docker exec -it mysql-dev mysql -u root -p
+```
+
+## Environment Variables
+
+| Variable | Required | Description |
+|:---------|:---------|:------------|
+| `MYSQL_ROOT_PASSWORD` | Yes (or use `ALLOW_EMPTY_PASSWORD`) | Root user password |
+| `MYSQL_DATABASE` | No | Database to create on startup |
+| `MYSQL_USER` | No | Non-root user to create |
+| `MYSQL_PASSWORD` | No | Password for `MYSQL_USER` |
+| `MYSQL_ALLOW_EMPTY_PASSWORD` | No | Set to `yes` to allow empty root password (dev only) |
+| `MYSQL_RANDOM_ROOT_PASSWORD` | No | Set to `yes` to generate a random root password (logged to stdout) |
+| `MYSQL_ONETIME_PASSWORD` | No | Set to `yes` to require password change on first login |
+
+`MYSQL_USER` and `MYSQL_PASSWORD` must be set together. The created user receives full access to `MYSQL_DATABASE`.
+
+## Persistent Data with Volumes
+
+Without a volume, all data is lost when the container is removed. Mount a volume to persist the data directory:
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v mysql-data:/var/lib/mysql \
+  -p 3306:3306 \
+  -d mysql:8.4
+```
+
+Named volume (`mysql-data`) persists across container restarts and removals. To use a host directory instead:
+
+```bash
+-v /path/on/host:/var/lib/mysql
+```
+
+The data directory owns MySQL's data and logs. Never share a volume between two running MySQL containers.
+
+## Docker Compose
+
+For development environments with multiple services, Docker Compose is the standard approach:
+
+```yaml
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: myapp
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppass
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: myapp
+      DB_USER: appuser
+      DB_PASSWORD: apppass
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+```
+
+The `healthcheck` with `depends_on: condition: service_healthy` ensures the application container doesn't start until MySQL is ready to accept connections — not just started.
+
+## Custom Configuration
+
+Pass a custom `my.cnf` by mounting it:
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v /path/to/my.cnf:/etc/mysql/conf.d/custom.cnf:ro \
+  -d mysql:8.4
+```
+
+Or set options directly via command arguments:
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -d mysql:8.4 \
+  --innodb-buffer-pool-size=512M \
+  --max-connections=200
+```
+
+## Initialization Scripts
+
+The container runs any `.sql` or `.sh` files placed in `/docker-entrypoint-initdb.d/` on first startup (when the data directory is empty):
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v /path/to/init-scripts:/docker-entrypoint-initdb.d:ro \
+  -d mysql:8.4
+```
+
+SQL files are executed as root. Shell scripts run in the container environment. These scripts only run on the very first initialization — not on subsequent container starts.
+
+## Connecting from Applications
+
+Inside a Docker Compose network, containers connect to MySQL by service name:
+
+```
+DB_HOST=db   # service name in docker-compose.yml
+DB_PORT=3306
+```
+
+From the host machine, connect via `127.0.0.1` (not `localhost` — MySQL's socket isn't available on the host):
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=3306
+```
+
+## Production Considerations
+
+Docker works well for MySQL in production with a few caveats:
+
+- **Data persistence**: Use named volumes or bind mounts. Never let MySQL data live in the container layer.
+- **Memory limits**: Set `--memory` in Docker to prevent MySQL from exhausting host memory, and tune `innodb_buffer_pool_size` to match.
+- **Backups**: `mysqldump` works inside the container: `docker exec mysql-dev mysqldump -u root -p myapp > backup.sql`
+- **Logging**: MySQL logs go to stdout/stderr in Docker. Use `docker logs mysql-dev` or configure your logging driver.
+- **Upgrades**: Pull the new image tag, stop the old container, and start the new one with the same volume. MySQL's upgrade process runs automatically on first start with a newer version.
+
+## Frequently Asked Questions
+
+#### Why can't I connect with `mysql -h localhost` from the host?
+
+On Linux and macOS, `localhost` causes the MySQL client to try connecting via Unix socket, which isn't available on the host. Use `127.0.0.1` explicitly: `mysql -h 127.0.0.1 -P 3306`.
+
+#### How do I run a SQL file against a running container?
+
+```bash
+docker exec -i mysql-dev mysql -u root -p myapp < /path/to/script.sql
+# or from within the container:
+docker exec -it mysql-dev mysql -u root -p myapp -e "SOURCE /tmp/script.sql"
+```
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| Container exits immediately | Check `docker logs mysql-dev` — missing `MYSQL_ROOT_PASSWORD` or volume permission issue |
+| `ERROR 2002: Can't connect to local MySQL server through socket` | Connect via TCP (`-h 127.0.0.1`) not socket — the Unix socket isn't on the host |
+| Application starts before MySQL is ready | Add a `healthcheck` and use `depends_on: condition: service_healthy` in Compose |
+| Data lost after `docker rm` | Volume wasn't mounted — recreate the container with `-v mysql-data:/var/lib/mysql` |
+| Init scripts didn't run | They only run when the data directory is empty (first-time setup) — remove the volume and restart to reinitialize |
