@@ -1,0 +1,143 @@
+---
+title: "Choosing a Primary Key Strategy in MySQL"
+sidebarTitle: "Primary Key Strategies"
+description: "Compare AUTO_INCREMENT, BINARY(16) UUIDs, and native UUID types in MySQL — when each makes sense and how to avoid the tradeoffs that bite you later."
+keywords: "mysql primary key strategy, auto increment vs uuid mysql, mysql uuid primary key, mysql uuid binary, mysql distributed primary key, mysql uuid v7"
+---
+
+Primary key decisions are hard to undo. The wrong choice early — a schema migration away from `INT AUTO_INCREMENT`, say, once you've got foreign keys scattered across twelve tables — is painful. This guide covers the three main approaches, when each is the right tool, and what VillageSQL adds to the mix.
+
+## The MySQL Default: AUTO_INCREMENT
+
+`AUTO_INCREMENT` integers are the default for a reason. They're small (4 or 8 bytes), insert fast, sort naturally, and are immediately human-readable in a debugger or log file.
+
+```sql
+CREATE TABLE orders (
+    id     BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+InnoDB's clustered index stores rows in primary key order. With an auto-increment key, every new row goes at the end of the B-tree. That means no page splits, no index fragmentation, and fast sequential inserts. For most single-database applications, this is the right choice.
+
+The problems with `AUTO_INCREMENT` emerge when you scale or integrate:
+
+- **Row count exposure**: `SELECT COUNT(*)` from an ID sequence tells an API client how many orders exist. Sequential IDs in URLs let users enumerate records.
+- **Distributed generation**: Generating unique IDs across multiple writers requires coordination — a sequence server, a designated writer, or manual ID ranges.
+- **Data merges**: Merging two tables from different databases produces ID collisions. You're doing a renumber.
+
+If none of those apply, `AUTO_INCREMENT` is probably the right answer. Keep it.
+
+## When You Need Globally Unique IDs
+
+The standard solution is UUIDs: 128-bit random identifiers that can be generated independently on any node without coordination and won't collide in practice.
+
+MySQL's built-in `UUID()` returns a v1 UUID as a `CHAR(36)` string. You can store it directly, but there's a cost: `CHAR(36)` is 36 bytes versus 16 bytes for the binary equivalent, and random UUIDs (v4) cause InnoDB index fragmentation because new rows don't land at the end of the index — they land anywhere, forcing page splits.
+
+The standard workaround is `BINARY(16)` with manual conversion:
+
+```sql
+CREATE TABLE orders (
+    id      BINARY(16) PRIMARY KEY,
+    user_id INT NOT NULL,
+    placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert: convert string UUID to binary at write time
+INSERT INTO orders (id, user_id)
+VALUES (UUID_TO_BIN(UUID(), 1), 101);
+
+-- Read: convert back to readable format
+SELECT BIN_TO_UUID(id, 1), user_id FROM orders;
+```
+
+The `1` flag in `UUID_TO_BIN()` reorders timestamp bits so v1 UUIDs sort chronologically. That reduces fragmentation for v1 UUIDs specifically, but the manual encode/decode adds friction to every query.
+
+## With VillageSQL: Native UUID Type and Sortable Versions
+
+VillageSQL's `vsql_uuid` extension adds a native `UUID` column type and generation functions for UUID v1 through v7. No manual encode/decode, and UUID v7 solves the insert fragmentation problem cleanly.
+
+```sql
+INSTALL EXTENSION vsql_uuid;
+```
+
+```sql
+CREATE TABLE orders (
+    id      UUID PRIMARY KEY,
+    user_id INT NOT NULL,
+    placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- UUID_V7 embeds a Unix timestamp in the high bits —
+-- new values are always larger, so inserts always append to the index
+INSERT INTO orders (id, user_id) VALUES (UUID_V7(), 101);
+INSERT INTO orders (id, user_id) VALUES (UUID_V7(), 102);
+
+-- ORDER BY id is roughly chronological — v7 embeds a millisecond timestamp
+SELECT user_id, placed_at FROM orders ORDER BY id;
+
+-- The timestamp is recoverable
+SELECT UUID_TIMESTAMP(id), user_id FROM orders;
+```
+
+The `UUID` type stores 16 bytes on disk and displays as the standard 36-character string format automatically. No `UUID_TO_BIN` or `BIN_TO_UUID` in your queries.
+
+For deterministic IDs — the same input always produces the same UUID — use v3 or v5:
+
+```sql
+-- Deterministic UUID from a namespace + name (useful for idempotent imports)
+SELECT UUID_V5('6ba7b810-9dad-11d1-80b4-00c04fd430c8', 'user@example.com');
+```
+
+For details on UUID storage mechanics and the insert fragmentation problem, see [UUIDs in MySQL](/guides/uuids).
+
+### UUID version reference
+
+| Version | Sortable | Use when |
+|:---|:---|:---|
+| `UUID_V4()` | No | General-purpose random IDs, low insert volume |
+| `UUID_V7()` | Yes | Primary keys, high insert volume — recommended default |
+| `UUID_V6()` | Yes | Compatibility with v1 format; sortable alternative |
+| `UUID_V1()` | No | Compatibility with systems that expect v1 |
+| `UUID_V3()` | No | Deterministic ID from namespace + name (MD5) |
+| `UUID_V5()` | No | Deterministic ID from namespace + name (SHA-1) |
+
+## Choosing a Strategy
+
+| Strategy | When to use | Watch out for |
+|:---|:---|:---|
+| `BIGINT AUTO_INCREMENT` | Single-database apps, internal IDs, high insert volume | Exposes row counts; can't merge across databases |
+| `BINARY(16)` + `UUID_TO_BIN` | Portable UUIDs without a VillageSQL dependency | Manual encode/decode in every query; use `UUID_TO_BIN(UUID(), 1)` for reduced fragmentation |
+| Native `UUID` + `UUID_V7()` | Distributed systems, public IDs, merge-safe schemas | Requires VillageSQL; 16 bytes vs. 4–8 for integer |
+| Composite natural key | IDs derived from business data (country + code, etc.) | Wide keys slow joins and foreign keys; risky if business data changes |
+
+For most teams starting a new project: `BIGINT AUTO_INCREMENT` for internal tables, native `UUID` with `UUID_V7()` for tables with public-facing IDs or data that might be merged across systems.
+
+## Frequently Asked Questions
+
+#### When should I use UUID_V7 vs UUID_V4?
+
+Use `UUID_V7()` for primary keys on high-write tables. It embeds a timestamp in the high bits, so new UUIDs always sort after existing ones — this keeps InnoDB from splitting index pages on insert. Use `UUID_V4()` only when you need random IDs with no ordering semantics (e.g., one-time tokens).
+
+#### Can I use UUID as a DEFAULT expression?
+
+Not currently. MySQL doesn't allow non-deterministic functions in `DEFAULT` expressions. Generate the UUID in each `INSERT` statement rather than in the column definition.
+
+#### Should I use UUID for foreign keys too?
+
+Yes, but be aware of the storage cost: a UUID foreign key is 16 bytes per row in the referencing table, compared to 4–8 bytes for an integer. On tables with millions of rows and multiple UUID foreign keys, that adds up. For pure internal references, an `AUTO_INCREMENT` + integer foreign key is leaner.
+
+#### What's the difference between UUID_V3 and UUID_V5?
+
+Both generate deterministic UUIDs from a namespace and a name — the same inputs always produce the same output. v3 uses MD5; v5 uses SHA-1. Prefer v5 for new code since SHA-1 is marginally stronger. Use v3 only when you need to match IDs generated by a system that uses v3.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION UUID_V7 does not exist` | Run `INSTALL EXTENSION vsql_uuid` |
+| `DEFAULT (UUID_V7())` rejected | MySQL doesn't allow non-deterministic defaults — generate the UUID in each INSERT |
+| UUID primary key is slower than expected | Check that you're using `UUID_V7()`, not `UUID_V4()`. Random UUIDs cause B-tree page splits. |
+| `Extension vsql_uuid is already installed` | Already loaded — no action needed |
+| Joined query returns duplicate rows when using UUID FK | Confirm UUID type consistency: mixing CHAR(36) and binary UUID columns causes mismatches |
