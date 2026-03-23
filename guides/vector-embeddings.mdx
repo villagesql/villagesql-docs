@@ -1,0 +1,147 @@
+---
+title: "Generating Vector Embeddings in MySQL"
+sidebarTitle: "Vector Embeddings"
+description: "How to generate and store vector embeddings in MySQL using VillageSQL's create_embed() function — for semantic search, similarity matching, and recommendation systems."
+keywords: "mysql vector embeddings, mysql create_embed, mysql semantic search, mysql text embeddings, mysql openai embeddings, mysql similarity search"
+---
+
+Vector embeddings represent text as arrays of numbers that capture semantic meaning. Two pieces of text about the same topic have similar vectors even if they share no words. MySQL has no built-in way to generate embeddings. VillageSQL's `vsql_ai` extension adds `create_embed()`, which calls an embedding model and returns the vector as a JSON array you can store and query.
+
+## What Embeddings Are For
+
+An embedding model converts text to a fixed-length vector of floats. The distance between two vectors reflects semantic similarity:
+
+- `"dog"` and `"puppy"` → similar vectors
+- `"dog"` and `"database index"` → distant vectors
+
+This enables semantic search (find rows that *mean* the same thing as a query), clustering, and recommendation — none of which keyword search handles well.
+
+## With VillageSQL: create_embed()
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+`create_embed(provider, model, api_key, text)` calls an embedding model and returns a JSON array string.
+
+```sql
+SET @key = 'your-openai-api-key';
+
+SELECT create_embed('openai', 'text-embedding-3-small', @key, 'Machine learning is fascinating');
+-- Returns: [0.02646778, 0.019067757, -0.05332306, ...]
+```
+
+### Storing embeddings
+
+Store the JSON array in a `JSON` column:
+
+```sql
+CREATE TABLE documents (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    title    VARCHAR(255),
+    content  TEXT,
+    embedding JSON
+);
+
+SET @key = 'your-openai-api-key';
+SET SESSION max_execution_time = 120000;
+
+INSERT INTO documents (title, content, embedding) VALUES
+    ('Intro to ML',
+     'Machine learning is a subset of artificial intelligence',
+     create_embed('openai', 'text-embedding-3-small', @key,
+                  'Machine learning is a subset of artificial intelligence')),
+    ('Neural Networks',
+     'Deep learning uses multi-layer neural networks',
+     create_embed('openai', 'text-embedding-3-small', @key,
+                  'Deep learning uses multi-layer neural networks'));
+```
+
+### Backfilling embeddings on existing rows
+
+```sql
+ALTER TABLE documents ADD COLUMN embedding JSON;
+
+SET @key = 'your-openai-api-key';
+SET SESSION max_execution_time = 300000;
+
+UPDATE documents
+SET embedding = create_embed('openai', 'text-embedding-3-small', @key, content)
+WHERE embedding IS NULL
+LIMIT 50;  -- Process in batches
+```
+
+## Choosing a Model
+
+| Provider | Model | Dimensions | Use when |
+|:---|:---|:---|:---|
+| `'openai'` | `text-embedding-3-small` | 1536 | Best value — good accuracy, lower cost |
+| `'openai'` | `text-embedding-3-large` | 3072 | Higher accuracy needed |
+| `'google'` | `gemini-embedding-001` | 3072 | Google ecosystem |
+
+Use the same model for all embeddings in a table. Embeddings from different models are not comparable — mixing them produces meaningless similarity scores.
+
+Anthropic does not currently provide an embedding API.
+
+## Semantic Search
+
+MySQL doesn't have a native vector distance function, so full similarity search (finding the nearest vectors in a large table) runs fastest in application code. The typical architecture: store embeddings in MySQL, fetch them, compute cosine similarity in your application, and return the top matches.
+
+For smaller tables (under a few thousand rows), you can compute similarity directly in SQL using JSON functions. Cosine similarity between two JSON vectors is computed as the dot product divided by the product of their magnitudes — this is verbose in MySQL but functional:
+
+```sql
+-- Example: find documents similar to a query embedding (small tables only)
+-- Assumes embedding column holds a JSON array with the same dimensions
+
+SET @query_embedding = create_embed('openai', 'text-embedding-3-small', @key, 'neural networks');
+
+-- Retrieve all embeddings; compute similarity in application code
+SELECT id, title, embedding FROM documents;
+```
+
+For production-scale similarity search, pass the stored JSON embeddings to a vector similarity library in your application layer (NumPy, scikit-learn, Faiss), or use a dedicated vector database alongside MySQL.
+
+## What to Embed
+
+The quality of your embeddings depends on what you embed. Some patterns:
+
+```sql
+-- Embed the full content for document search
+SET embedding = create_embed('openai', 'text-embedding-3-small', @key, content);
+
+-- Embed a specific field for product search
+SET embedding = create_embed('openai', 'text-embedding-3-small', @key, product_description);
+
+-- Embed concatenated fields for richer context
+SET embedding = create_embed('openai', 'text-embedding-3-small', @key,
+    CONCAT(product_name, '. ', category, '. ', product_description));
+```
+
+Keep the text you embed under a few thousand tokens. Longer text gets truncated by the embedding model.
+
+## Frequently Asked Questions
+
+#### Can I compare embeddings from different models?
+
+No. Embeddings from `text-embedding-3-small` and `gemini-embedding-001` live in different vector spaces — their similarity scores are meaningless when compared against each other. Standardize on one model per column.
+
+#### How much storage do embeddings take?
+
+A JSON array of 1536 floats is roughly 10–15 KB per row as a text string. For large tables, this adds up. Consider whether you need all embeddings stored or just the ones you'll query against.
+
+#### Does create_embed() support batch input?
+
+No — each call processes one text input. For bulk embedding, loop through rows in your application and call UPDATE in batches.
+
+#### What happens if the text is too long?
+
+The embedding model truncates input at its token limit (typically 8191 tokens for OpenAI models). The embedding is computed on the truncated text. For long documents, embed a summary or the first few paragraphs rather than the full text.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION create_embed does not exist` | Run `INSTALL EXTENSION vsql_ai` |
+| `create_embed()` returns NULL | Check API key; verify model name; check `max_execution_time` |
+| Similarity search returns wrong results | Confirm all embeddings use the same model; check that embeddings weren't generated with different content than what you're searching |
+| Embeddings take too long to generate | Use LIMIT batches; embeddings are ~1–3 seconds each per API call |

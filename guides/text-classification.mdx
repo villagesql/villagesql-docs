@@ -1,0 +1,167 @@
+---
+title: "Classifying Text in MySQL with AI"
+sidebarTitle: "Text Classification"
+description: "How to classify text in MySQL using VillageSQL's ai_prompt() function — labeling rows by category, intent, or topic without leaving SQL."
+keywords: "mysql text classification, mysql ai classify, mysql label rows ai, mysql spam detection sql, mysql topic classification, mysql ai_prompt classification"
+---
+
+Text classification — assigning rows to categories based on content — usually means exporting data to a Python script, calling an AI model, and importing results back. VillageSQL's `ai_prompt()` lets you do the classification directly in SQL, keeping the logic close to the data and eliminating the export/import cycle.
+
+## The Problem: Classification Outside SQL
+
+The typical workflow without VillageSQL:
+
+```python
+rows = db.query("SELECT id, body FROM support_tickets WHERE category IS NULL")
+for row in rows:
+    category = llm.classify(row["body"], labels=["billing", "technical", "shipping", "other"])
+    db.execute("UPDATE support_tickets SET category = ? WHERE id = ?", category, row["id"])
+```
+
+This works, but the classification logic lives in application code. Migrations, backfills, and one-off relabels all require running a script rather than a SQL query.
+
+## With VillageSQL: ai_prompt() as a Classifier
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+The key to reliable classification is a tight prompt: enumerate the exact categories, tell the model to return only one of them, and optionally give an example.
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE support_tickets ADD COLUMN category VARCHAR(20);
+
+SET SESSION max_execution_time = 300000;
+
+UPDATE support_tickets
+SET category = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT(
+        'Classify this support ticket into exactly one of these categories: ',
+        'billing, technical, shipping, other. ',
+        'Reply with the category name only, lowercase, no punctuation.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE category IS NULL
+LIMIT 100;
+```
+
+### Validating classification output
+
+Models occasionally return unexpected output. Store results as-is and validate separately:
+
+```sql
+-- Check what labels the model returned
+SELECT DISTINCT category, COUNT(*) AS cnt
+FROM support_tickets
+GROUP BY category
+ORDER BY cnt DESC;
+
+-- Fix off-label results
+UPDATE support_tickets
+SET category = 'other'
+WHERE category NOT IN ('billing', 'technical', 'shipping', 'other');
+```
+
+### Multi-label classification
+
+When a row can belong to more than one category, ask for a JSON array and store it in a `JSON` column:
+
+```sql
+ALTER TABLE articles ADD COLUMN topics JSON;
+
+UPDATE articles
+SET topics = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT(
+        'Return a JSON array of topics that apply to this article. ',
+        'Choose from: ["technology", "business", "health", "science", "politics"]. ',
+        'Return only the JSON array, no other text.\n\n',
+        'Article: ', content
+    )
+)
+WHERE topics IS NULL
+LIMIT 50;
+
+-- Query rows tagged with a specific topic
+SELECT title FROM articles
+WHERE JSON_CONTAINS(topics, '"technology"');
+```
+
+### Building a confidence score
+
+Ask the model to return structured JSON with both a label and a confidence level:
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_result JSON;
+
+UPDATE reviews
+SET ai_result = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT(
+        'Classify this review. Return JSON with keys "label" (positive/negative/neutral) ',
+        'and "confidence" (high/medium/low). Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE ai_result IS NULL
+LIMIT 100;
+
+-- Query by label and confidence
+SELECT review_text,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) AS label,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) AS confidence
+FROM reviews
+WHERE JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) = 'negative'
+  AND JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) = 'high';
+```
+
+## Prompt Patterns That Work
+
+| Goal | Prompt pattern |
+|:---|:---|
+| Single label | "Classify as X, Y, or Z. Reply with one word only." |
+| Confidence scoring | "Return JSON: {\"label\": \"X\", \"confidence\": \"high/medium/low\"}" |
+| Multi-label | "Return a JSON array of applicable labels from [X, Y, Z]." |
+| Binary decision | "Does this text contain X? Reply yes or no." |
+
+Give the model fewer categories to choose from for better accuracy. More than 5–6 options degrades reliability for fast/cheap models.
+
+For setup and provider options, see [Connecting MySQL to AI APIs](/guides/ai-api-setup). For broader ai_prompt() usage patterns, see [Running AI Models from MySQL Queries](/guides/ai-prompts-in-mysql).
+
+## Frequently Asked Questions
+
+#### How accurate is AI classification compared to a trained model?
+
+A capable model like Claude Haiku achieves high accuracy on straightforward classification tasks without any training data. For domain-specific categories with subtle distinctions, you may need to provide examples in the prompt or use a larger model.
+
+#### Can I classify rows as they're inserted using a trigger?
+
+Yes, but use caution — a trigger that calls `ai_prompt()` on every INSERT makes every write take 5–30 seconds. Better to classify in a periodic batch job and accept a short delay before labels are available.
+
+#### How do I handle rows where the model returns NULL?
+
+`ai_prompt()` returns NULL when the API call fails. In your batch loop, keep running UPDATE until no NULLs remain, with retry logic for transient failures.
+
+#### What model should I use for classification?
+
+Start with `claude-haiku-4-5-20251001` or `gpt-4o-mini` — both are fast and cheap. Step up to a more capable model only if accuracy is unacceptable.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION ai_prompt does not exist` | Run `INSTALL EXTENSION vsql_ai` |
+| Returns NULL | Check API key and `max_execution_time`; verify model name |
+| Labels outside the allowed set | Add a post-UPDATE query to normalize unexpected values |
+| JSON parse errors on structured output | Add "Return only valid JSON, no other text" to the prompt |
+| Low accuracy | Add 2–3 examples to the prompt; try a more capable model |

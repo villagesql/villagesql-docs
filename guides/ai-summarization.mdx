@@ -1,0 +1,155 @@
+---
+title: "AI Summarization in MySQL"
+sidebarTitle: "AI Summarization"
+description: "How to summarize long text stored in MySQL using VillageSQL's ai_prompt() — generating summaries of support tickets, articles, and documents directly in SQL."
+keywords: "mysql ai summarization, mysql summarize text sql, mysql ai_prompt summarize, mysql text summary column, mysql document summary, mysql support ticket summary"
+---
+
+Summarization converts long text into a shorter version that captures the key points. Support tickets, customer feedback, articles, and log entries all benefit from a short summary field that lets you scan content quickly. MySQL has no summarization function. VillageSQL's `ai_prompt()` adds one.
+
+## With VillageSQL: Summaries in SQL
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+A summarization prompt specifies the desired length and what to keep:
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE support_tickets ADD COLUMN summary VARCHAR(500);
+
+SET SESSION max_execution_time = 300000;
+
+UPDATE support_tickets
+SET summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT(
+        'Summarize this support ticket in one sentence. ',
+        'Include the main issue and any resolution mentioned.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE summary IS NULL
+LIMIT 100;
+```
+
+Query summaries like any other column — no AI call at read time:
+
+```sql
+-- Recent tickets with AI summaries for quick triage
+SELECT id, created_at, summary
+FROM support_tickets
+WHERE created_at > NOW() - INTERVAL 24 HOUR
+ORDER BY created_at DESC;
+```
+
+### Structured summaries
+
+For use cases where you need to extract specific fields, ask for JSON output:
+
+```sql
+ALTER TABLE support_tickets ADD COLUMN ai_extract JSON;
+
+UPDATE support_tickets
+SET ai_extract = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT(
+        'Extract key information from this support ticket. ',
+        'Return JSON with keys: issue (string), urgency (low/medium/high), ',
+        'product_mentioned (string or null), resolution_needed (boolean). ',
+        'Return only valid JSON.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE ai_extract IS NULL
+LIMIT 100;
+
+-- Triage: high-urgency tickets with no resolution
+SELECT id, body,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.issue')) AS issue,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.product_mentioned')) AS product
+FROM support_tickets
+WHERE JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.urgency')) = 'high'
+ORDER BY created_at DESC;
+```
+
+### Summarizing multi-column content
+
+Build richer context for the model by joining multiple fields:
+
+```sql
+UPDATE articles
+SET summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT(
+        'Write a two-sentence summary of this article for a preview card.\n\n',
+        'Title: ', title, '\n',
+        'Author: ', author_name, '\n',
+        'Body: ', LEFT(body, 3000)   -- trim very long bodies
+    )
+)
+WHERE summary IS NULL
+LIMIT 50;
+```
+
+`LEFT(body, 3000)` avoids sending excessively long text to the model. Most AI models have a token limit; for very long documents, summarize the first few thousand characters or chunk the content.
+
+## Length and Style Control
+
+Prompt phrasing controls output length and tone:
+
+| Goal | Prompt phrasing |
+|:---|:---|
+| One sentence | "Summarize in one sentence." |
+| Tweet-length | "Summarize in 280 characters or fewer." |
+| Executive summary | "Write a 2–3 sentence executive summary." |
+| Bullet points | "Summarize as 3 bullet points." |
+| Action-oriented | "What does this ticket ask us to do? One sentence." |
+
+For summaries used in UI previews, specify a character limit to avoid overflow.
+
+## Model Selection
+
+Summarization is generally well-handled by faster, cheaper models. Use `claude-haiku-4-5-20251001` or `gpt-4o-mini` for bulk summarization. Step up to `claude-sonnet-4-5-20250929` when:
+
+- The source text is long and complex
+- You need structured JSON extraction with nuanced fields
+- Accuracy of extracted facts matters more than cost
+
+For setup and provider options, see [Connecting MySQL to AI APIs](/guides/ai-api-setup).
+
+## Frequently Asked Questions
+
+#### How long can the source text be?
+
+Practical limit is a few thousand words per call. AI models have token limits (typically 100K–200K tokens for current models), but very long inputs cost more and take longer. For documents over ~5000 words, summarize the first section or chunk and summarize each chunk.
+
+#### Can I use summaries in a full-text search index?
+
+Yes — add a FULLTEXT index on the summary column after populating it. Summaries are often better targets for full-text search than raw content because they're shorter and more keyword-dense.
+
+#### Will the same document always produce the same summary?
+
+No — AI models are probabilistic. The same prompt can produce slightly different output on different calls. If consistency matters, generate the summary once and store it; don't regenerate on each read.
+
+#### How do I summarize rows that have already been summarized?
+
+Don't re-summarize unless the source content changed. Use `WHERE summary IS NULL` to only process new or updated rows. If you need to track changes, add a `summary_updated_at` column and compare it to the content's last-modified timestamp.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION ai_prompt does not exist` | Run `INSTALL EXTENSION vsql_ai` |
+| Returns NULL | Check API key, `max_execution_time`, and model name |
+| Summary too long or short | Tighten the prompt: specify a character or sentence limit |
+| Model repeats the source text instead of summarizing | Add "Do not copy sentences from the original" to the prompt |
+| Structured JSON extraction has missing keys | Add "If a field is not mentioned, use null" to the prompt |
