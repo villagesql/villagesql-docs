@@ -1,0 +1,131 @@
+---
+title: "Encrypting Columns in MySQL"
+sidebarTitle: "Encrypting Columns"
+description: "How to encrypt sensitive column data in MySQL — why MySQL's AES_ENCRYPT uses an insecure default mode, and how VillageSQL's encrypt() fixes it automatically."
+keywords: "mysql encrypt column, mysql AES_ENCRYPT secure, mysql column encryption, mysql encrypt PII, mysql aes cbc iv, mysql encrypt decrypt data"
+---
+
+MySQL has `AES_ENCRYPT()` built in. The problem is its default mode — `aes-128-ecb` — is insecure. ECB encryption is deterministic: the same plaintext encrypted with the same key always produces the same ciphertext. An attacker who sees your encrypted column can spot repeated values without ever knowing the key. VillageSQL's `encrypt()` uses CBC mode with a random IV automatically, so identical inputs produce different output every time.
+
+## The MySQL Default: ECB Mode
+
+MySQL's `AES_ENCRYPT(data, key)` defaults to `aes-128-ecb` (`block_encryption_mode`). ECB — Electronic Codebook — encrypts each block independently with no randomness. Two rows with the same value produce the same ciphertext:
+
+```sql
+-- These two rows will have identical encrypted values
+INSERT INTO users (email, ssn_enc)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'secretkey')),
+       ('bob@example.com',   AES_ENCRYPT('123-45-6789', 'secretkey'));
+
+-- An attacker can see that Alice and Bob have the same SSN
+-- without knowing the key or the plaintext
+SELECT HEX(ssn_enc) FROM users;
+```
+
+MySQL 8.0 lets you change `block_encryption_mode` to use CBC, but then you have to manage the IV yourself: generate it, store it alongside the ciphertext, and pass it back to `AES_DECRYPT()` every time.
+
+## The Standard Workaround: Manual IV with AES-CBC
+
+Using CBC mode correctly in MySQL requires storing and passing the IV explicitly:
+
+```sql
+SET @@block_encryption_mode = 'aes-256-cbc';
+
+-- Must generate and store IV alongside ciphertext
+SET @iv = RANDOM_BYTES(16);
+INSERT INTO users (email, ssn_enc, ssn_iv)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'key', @iv), @iv);
+
+-- Must retrieve IV to decrypt
+SELECT AES_DECRYPT(ssn_enc, 'key', ssn_iv) AS ssn
+FROM users WHERE email = 'alice@example.com';
+```
+
+This is correct but verbose — every table needs an extra IV column, and every query that touches encrypted data has to pass the IV.
+
+## With VillageSQL: Automatic IV Management
+
+VillageSQL's `vsql_crypto` extension adds `encrypt()` and `decrypt()`, which handle the IV automatically. The IV is generated fresh for each call and prepended to the ciphertext in the stored value. `decrypt()` extracts it without you having to think about it.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+CREATE TABLE users (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    email   VARCHAR(255),
+    ssn_enc VARBINARY(255)   -- IV + ciphertext stored together
+);
+
+SET @key = 'my-32-byte-key-for-aes-256-here!';  -- 32 bytes → AES-256
+
+-- Same plaintext encrypts to different ciphertext every time
+INSERT INTO users (email, ssn_enc) VALUES
+    ('alice@example.com', encrypt('123-45-6789', @key, 'aes-256')),
+    ('bob@example.com',   encrypt('123-45-6789', @key, 'aes-256'));
+
+-- Decrypt in a SELECT
+SELECT email, decrypt(ssn_enc, @key, 'aes-256') AS ssn FROM users;
+```
+
+No IV column, no IV parameter in queries. Two rows with the same SSN produce different ciphertext — no pattern leakage.
+
+### Key sizes
+
+| Cipher type | Key length | When to use |
+|:---|:---|:---|
+| `'aes'` or `'aes-128'` | 16 bytes | Lower-sensitivity data, performance-sensitive workloads |
+| `'aes-192'` | 24 bytes | Intermediate security |
+| `'aes-256'` | 32 bytes | PII, financial data, anything regulated — recommended default |
+
+Keys shorter than the target size are zero-padded; longer keys are truncated. Use exactly 16, 24, or 32 bytes to avoid surprises.
+
+### What to store
+
+The `VARBINARY` column holds the IV (16 bytes) prepended to the ciphertext. The encrypted size is roughly the plaintext size rounded up to the nearest AES block (16 bytes), plus 16 bytes for the IV. Size the column with headroom:
+
+```sql
+-- For strings up to ~200 chars: VARBINARY(255) is sufficient
+-- For longer text: VARBINARY(500) or BLOB
+ssn_enc   VARBINARY(64),    -- SSNs, short codes
+addr_enc  VARBINARY(512),   -- Addresses, longer strings
+notes_enc BLOB              -- Free-form text
+```
+
+## What This Doesn't Cover
+
+Column-level encryption in SQL protects data at rest from someone who has database access but not the key. It doesn't protect against:
+
+- Application code that holds the key and queries decrypted data — an attacker who compromises the app gets both
+- Queries that filter or sort on encrypted columns (you can't `WHERE ssn = ?` without decrypting)
+
+For searchable encryption or envelope key management (rotating keys without re-encrypting all data), you need additional infrastructure at the application layer.
+
+## Frequently Asked Questions
+
+#### Where should I store the encryption key?
+
+Not in the database. The key belongs in a secrets manager (AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager) or environment variable, loaded by the application at runtime. A key stored in the same database it encrypts provides no protection.
+
+#### Can I search on encrypted columns?
+
+Not directly. Decrypting every row to find a match is a full table scan. Common patterns: store a deterministic hash of the value alongside the encrypted column for equality lookups (`sha256(ssn)` for SSN lookup), or decrypt in the application layer and build an encrypted search index.
+
+#### What happens if I lose the key?
+
+The data is unrecoverable. Back up keys separately from the database. Consider envelope encryption — wrapping the data key with a master key — so you can rotate the master key without re-encrypting everything.
+
+#### Can I encrypt a column with a DEFAULT expression?
+
+Not currently. Non-deterministic functions (which `encrypt()` is, due to the random IV) can't be used in DEFAULT expressions. Generate the encrypted value in each INSERT.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION encrypt does not exist` | Run `INSTALL EXTENSION vsql_crypto` |
+| `decrypt()` returns NULL | Ciphertext is corrupted, key is wrong, or wrong cipher type specified |
+| Encrypted values are identical for same plaintext | You're using MySQL's `AES_ENCRYPT` in ECB mode — switch to `encrypt()` |
+| Column too small for ciphertext | Add 32 bytes to your VARBINARY size (16 for IV + up to 16 for padding) |
+| Key is the wrong length | AES-128 needs 16 bytes, AES-192 needs 24, AES-256 needs 32 — check `LENGTH(@key)` |

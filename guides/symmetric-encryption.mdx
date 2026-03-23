@@ -1,0 +1,138 @@
+---
+title: "Symmetric Encryption in MySQL"
+sidebarTitle: "Symmetric Encryption"
+description: "How symmetric encryption works in MySQL — AES key sizes, CBC vs ECB mode, MySQL's AES_ENCRYPT limitations, and when to encrypt in SQL vs the application layer."
+keywords: "mysql symmetric encryption, mysql AES encrypt, mysql aes-256, mysql encrypt decrypt, mysql aes cbc ecb, mysql encryption key management"
+---
+
+Symmetric encryption uses the same key to encrypt and decrypt. It's the right tool when you need to store sensitive data and retrieve the original value later — unlike hashing, which is one-way. MySQL has `AES_ENCRYPT()` built in, but it defaults to an insecure mode. This guide covers the trade-offs, how to use AES correctly in MySQL, and when to do encryption in SQL versus the application layer.
+
+## How AES Encryption Works in MySQL
+
+MySQL's `AES_ENCRYPT(data, key)` uses 128-bit AES with the key derived from the key string. The default mode is ECB — Electronic Codebook — where each 16-byte block is encrypted independently. ECB is deterministic: the same 16-byte input always produces the same 16-byte output. That makes patterns visible in the ciphertext.
+
+```sql
+-- ECB default: identical inputs → identical outputs
+SELECT HEX(AES_ENCRYPT('same data', 'key')) AS first,
+       HEX(AES_ENCRYPT('same data', 'key')) AS second;
+-- Both columns are identical
+```
+
+CBC mode (Cipher Block Chaining) fixes this by XOR-ing each block with the previous ciphertext before encrypting, using a random initialization vector (IV) for the first block. The same plaintext produces a different ciphertext on every call.
+
+MySQL supports CBC, but you have to opt in by changing `block_encryption_mode` and managing the IV yourself:
+
+```sql
+SET @@block_encryption_mode = 'aes-256-cbc';
+SET @iv = RANDOM_BYTES(16);
+
+SET @ciphertext = AES_ENCRYPT('sensitive data', 'my-32-byte-key-here-padded-to-32', @iv);
+SELECT AES_DECRYPT(@ciphertext, 'my-32-byte-key-here-padded-to-32', @iv);
+```
+
+## With VillageSQL: Automatic CBC and IV Handling
+
+VillageSQL's `vsql_crypto` extension provides `encrypt()` and `decrypt()`, which use AES-CBC with a random IV generated per call. The IV is prepended to the ciphertext — no extra column, no extra parameter.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+SET @key = 'my-32-byte-key-here-padded-to-32';  -- exactly 32 bytes for AES-256
+
+-- Different ciphertext every call — CBC with random IV
+SELECT HEX(encrypt('same data', @key, 'aes-256')) AS first,
+       HEX(encrypt('same data', @key, 'aes-256')) AS second;
+-- Both columns differ
+
+-- Round-trip
+SET @enc = encrypt('sensitive data', @key, 'aes-256');
+SELECT decrypt(@enc, @key, 'aes-256');
+-- Returns: sensitive data
+```
+
+### AES key sizes
+
+| Cipher | Key length | Security level |
+|:---|:---|:---|
+| `'aes'` or `'aes-128'` | 16 bytes | 128-bit — adequate for most use cases |
+| `'aes-192'` | 24 bytes | 192-bit |
+| `'aes-256'` | 32 bytes | 256-bit — use for regulated data (PII, HIPAA, PCI) |
+
+Key length is enforced by the byte count of the key string — shorter keys are zero-padded, longer are truncated. Check `LENGTH(@key)` if you're getting unexpected behavior.
+
+### Storing encrypted data
+
+`encrypt()` returns `VARBINARY`. The stored value includes a 16-byte IV prepended to the ciphertext. Size your column accordingly:
+
+```sql
+CREATE TABLE customer_data (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    email    VARCHAR(255),
+    ssn_enc  VARBINARY(64),    -- short strings up to ~32 chars
+    notes_enc BLOB              -- longer text
+);
+
+SET @key = 'my-32-byte-key-here-padded-to-32';
+
+INSERT INTO customer_data (email, ssn_enc)
+VALUES ('alice@example.com', encrypt('123-45-6789', @key, 'aes-256'));
+
+SELECT email, decrypt(ssn_enc, @key, 'aes-256') AS ssn
+FROM customer_data;
+```
+
+## MySQL vs VillageSQL Comparison
+
+| | `AES_ENCRYPT()` (MySQL default) | `encrypt()` (VillageSQL) |
+|:---|:---|:---|
+| **Default mode** | ECB (insecure) | CBC with random IV |
+| **IV management** | Manual — store separately | Automatic — prepended to output |
+| **Schema impact** | Needs IV column for CBC | One column for ciphertext + IV |
+| **Repeated plaintext** | Same ciphertext (ECB) | Different ciphertext each time |
+| **Key size control** | Via `block_encryption_mode` setting | Via cipher type parameter |
+
+## When to Encrypt in SQL vs. Application Layer
+
+Encrypting in SQL is convenient but has trade-offs:
+
+| | SQL-layer encryption | Application-layer encryption |
+|:---|:---|:---|
+| **Key location** | In queries/triggers (risky if visible in logs) | In secrets manager, not in SQL |
+| **Searchability** | Can't filter on encrypted values | Same limitation |
+| **Bulk operations** | Encryption happens in DB | Must go through app code |
+| **Key rotation** | Requires re-encrypting all data in SQL | Can decrypt with old key, re-encrypt with new key in app |
+| **Audit trail** | Query logs may expose plaintext | App controls what's logged |
+
+SQL-layer encryption is useful for protecting data at rest when you trust the application but worry about database-level access (backups, read replicas, compromised DB credentials). Application-layer encryption gives you more control over keys and avoids putting plaintext anywhere near SQL logs.
+
+For column-level patterns and schema design, see [Encrypting Columns in MySQL](/guides/encrypting-columns).
+
+## Frequently Asked Questions
+
+#### What's the difference between symmetric and asymmetric encryption?
+
+Symmetric encryption (AES) uses the same key to encrypt and decrypt. It's fast and well-suited for bulk data. Asymmetric encryption (RSA) uses a public key to encrypt and a private key to decrypt — useful for key exchange, but too slow for bulk data. For storing sensitive column data, symmetric AES is the right choice.
+
+#### Can I search on an encrypted column?
+
+Not directly. To find rows by an encrypted value, you'd have to decrypt every row — a full table scan. A common workaround: store a keyed hash (HMAC) of the plaintext in a separate indexed column for equality lookups. This leaks that two rows have the same value but not what the value is.
+
+#### How do I rotate encryption keys?
+
+Read every row, decrypt with the old key, re-encrypt with the new key, write back. For large tables, do this in batches. This is the main operational cost of SQL-layer encryption. Envelope encryption (encrypting the data key with a master key) lets you rotate the master key without touching the data.
+
+#### Does AES encryption protect against SQL injection?
+
+No. Encryption protects the stored values. SQL injection is an input validation problem — an attacker who can run arbitrary SQL can call `decrypt()` directly.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION encrypt does not exist` | Run `INSTALL EXTENSION vsql_crypto` |
+| `decrypt()` returns NULL | Wrong key, wrong cipher type, or corrupted ciphertext |
+| `AES_ENCRYPT` produces same output for same inputs | You're using ECB mode — switch to `encrypt()` or set `block_encryption_mode = 'aes-256-cbc'` with manual IV |
+| Column too small | Add 32 bytes to `VARBINARY` size (16 for IV + up to 16 for AES block padding) |
+| Key length wrong | Check `LENGTH(@key)` — should be 16, 24, or 32 bytes exactly |

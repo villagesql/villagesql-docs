@@ -1,0 +1,128 @@
+---
+title: "Hashing Data in MySQL"
+sidebarTitle: "Hashing Data"
+description: "How to hash data in MySQL for integrity checks, deduplication, and fingerprinting — using SHA-256 and other algorithms via VillageSQL's digest() function."
+keywords: "mysql sha256 hash, mysql digest function, mysql data integrity hash, mysql checksum column, mysql hash binary, mysql sha2 vs digest"
+---
+
+MySQL has `MD5()`, `SHA1()`, and `SHA2()` built in. They work, but they return hex strings — 64 characters for a SHA-256 hash, when the underlying data is 32 bytes. Storing hashes in binary cuts that in half and is more efficient to index. `digest()` from VillageSQL's `vsql_crypto` extension returns raw binary and gives you a single function for every algorithm.
+
+## The MySQL Default: Scattered Functions, Hex Output
+
+MySQL provides three separate functions for hashing:
+
+```sql
+SELECT MD5('hello');                 -- 32-char hex string
+SELECT SHA1('hello');                -- 40-char hex string
+SELECT SHA2('hello', 256);          -- 64-char hex string (SHA-256)
+SELECT SHA2('hello', 512);          -- 128-char hex string (SHA-512)
+```
+
+They work, but the storage is wasteful. SHA2 with 256 bits returns a 64-character VARCHAR — twice the bytes needed, since each byte of hash is encoded as two hex digits. To get binary output you'd write `UNHEX(SHA2('hello', 256))`, which works but is awkward to type consistently.
+
+There's also no `sha224` or `sha384` option — you're limited to what MySQL exposes.
+
+## The Standard Workaround: UNHEX + SHA2
+
+For compact binary storage, developers wrap `SHA2()` in `UNHEX()`:
+
+```sql
+CREATE TABLE files (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    path     VARCHAR(500),
+    sha256   BINARY(32)
+);
+
+INSERT INTO files (path, sha256)
+VALUES ('/data/report.pdf', UNHEX(SHA2(LOAD_FILE('/data/report.pdf'), 256)));
+
+-- Find duplicate files by hash
+SELECT sha256, COUNT(*) AS count
+FROM files
+GROUP BY sha256
+HAVING count > 1;
+```
+
+This gets you compact storage. It's slightly verbose but it's the standard approach and works fine for SHA-256 and SHA-512.
+
+## With VillageSQL: digest()
+
+VillageSQL's `vsql_crypto` extension adds `digest(data, algorithm)`, which returns a `VARBINARY` hash directly — no `UNHEX()` wrapper needed.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+-- digest() returns VARBINARY — no UNHEX wrapper
+CREATE TABLE files (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    path    VARCHAR(500),
+    sha256  VARBINARY(32)
+);
+
+INSERT INTO files (path, sha256)
+VALUES ('/data/report.pdf', digest(LOAD_FILE('/data/report.pdf'), 'sha256'));
+
+-- Compare hashes for duplicate detection
+SELECT path FROM files
+WHERE sha256 = digest(LOAD_FILE('/data/incoming.pdf'), 'sha256');
+```
+
+Use `HEX()` when you need a readable string for logging or display:
+
+```sql
+SELECT path, HEX(sha256) AS hash_hex FROM files;
+```
+
+### Supported algorithms
+
+| Algorithm | digest() call | Output size | Use when |
+|:---|:---|:---|:---|
+| SHA-256 | `digest(data, 'sha256')` | 32 bytes | General-purpose integrity checks |
+| SHA-512 | `digest(data, 'sha512')` | 64 bytes | Higher collision resistance needed |
+| SHA-224 | `digest(data, 'sha224')` | 28 bytes | Space-constrained with SHA-2 family |
+| SHA-384 | `digest(data, 'sha384')` | 48 bytes | Between 256 and 512 |
+| SHA-1 | `digest(data, 'sha1')` | 20 bytes | Legacy compatibility only |
+| MD5 | `digest(data, 'md5')` | 16 bytes | Legacy compatibility only |
+
+Don't use MD5 or SHA-1 for new applications — both have known collision vulnerabilities. SHA-256 is the practical default for most uses.
+
+For password storage specifically, `digest()` is the wrong tool — see [Password Hashing in MySQL](/guides/password-hashing) for `crypt()` and `gen_salt()`.
+
+## When to Use Each Approach
+
+| Approach | When to use |
+|:---|:---|
+| `SHA2(data, 256)` | You only need hex output; MySQL-only stack |
+| `UNHEX(SHA2(data, 256))` | Binary storage, no VillageSQL dependency |
+| `digest(data, 'sha256')` | Clean binary output with algorithm flexibility |
+
+For new projects on VillageSQL, `digest()` is the cleaner choice. For existing MySQL-only applications, `UNHEX(SHA2())` is equally correct.
+
+## Frequently Asked Questions
+
+#### What's the difference between digest() and SHA2()?
+
+`SHA2('hello', 256)` returns a 64-character hex string. `digest('hello', 'sha256')` returns a 32-byte `VARBINARY`. They compute the same hash — the difference is encoding. Binary storage is more compact and faster to index.
+
+#### Can I use digest() to detect duplicate rows?
+
+Yes. Store `digest(content, 'sha256')` in an indexed column, then query `WHERE sha256 = digest(incoming_content, 'sha256')`. This is a common pattern for deduplicating uploaded files, detecting changed records, or building content-addressable lookups.
+
+#### Is digest() safe for passwords?
+
+No. `digest()` is a fast hash — it computes in microseconds. Password hashing requires a slow, iterated algorithm. Use `crypt()` and `gen_salt()` from the same extension. See [Password Hashing in MySQL](/guides/password-hashing).
+
+#### Does digest() support HMAC?
+
+No — `digest()` is a plain hash with no key. For keyed authentication codes, use `hmac()`. See [HMAC Signatures in MySQL](/guides/hmac-mysql).
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION digest does not exist` | Run `INSTALL EXTENSION vsql_crypto` |
+| `digest()` returns NULL | Check for NULL input or an unsupported algorithm name (e.g., `'SHA256'` — use lowercase `'sha256'`) |
+| Hash stored as hex looks doubled in size | Column is VARCHAR, not VARBINARY — change to `VARBINARY(32)` for SHA-256 |
+| Two identical strings hash differently | Verify encoding and collation — hash is case-sensitive and byte-for-byte exact |
