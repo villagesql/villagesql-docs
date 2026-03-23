@@ -1,0 +1,175 @@
+---
+title: "MySQL Backup Strategies"
+sidebarTitle: "Backup Strategies"
+description: "How to back up MySQL databases: mysqldump for logical backups, MySQL Shell's dump utilities, binary log-based point-in-time recovery, and backup best practices for production systems."
+keywords: "mysql backup, mysqldump, mysql backup strategy, mysql point in time recovery, mysql backup restore, mysql dump database, mysql incremental backup, mysql backup best practices"
+---
+
+A MySQL backup strategy has two parts: taking a consistent snapshot of your data (the full backup) and having a way to replay changes made after that snapshot (point-in-time recovery). The right tools depend on database size, acceptable recovery time, and how much data you can afford to lose.
+
+## mysqldump — Logical Backups
+
+`mysqldump` exports data as SQL statements. It's the most portable format and works for databases of any size, though it's slower to restore than binary backups for large datasets.
+
+**Back up a single database:**
+
+```bash
+mysqldump -u root -p myapp > myapp_backup.sql
+```
+
+**Back up all databases:**
+
+```bash
+mysqldump -u root -p --all-databases > all_databases.sql
+```
+
+**Recommended flags for InnoDB:**
+
+```bash
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --routines \
+  --triggers \
+  --events \
+  -u root -p myapp > myapp_backup.sql
+```
+
+| Flag | Purpose |
+|:-----|:--------|
+| `--single-transaction` | Consistent snapshot without locking tables (InnoDB only) |
+| `--source-data=2` | Records binlog position as a comment — required for PITR |
+| `--routines` | Include stored procedures and functions |
+| `--triggers` | Include triggers (default on, but explicit is clear) |
+| `--events` | Include scheduled events |
+
+Without `--single-transaction`, mysqldump locks tables with `LOCK TABLES`, which blocks writes for the duration of the dump.
+
+**Restore from a dump:**
+
+```bash
+mysql -u root -p myapp < myapp_backup.sql
+```
+
+To restore all databases: `mysql -u root -p < all_databases.sql`
+
+## Point-in-Time Recovery with Binary Logs
+
+Full backups only protect you to the point of the last backup. Binary logging lets you replay every change made after the backup was taken.
+
+**Requirements:**
+- Binary logging enabled (`log_bin = ON`)
+- `--source-data=2` used when taking the backup (records the starting binlog position)
+
+**Workflow:**
+
+1. Restore the full backup:
+```bash
+mysql -u root -p < myapp_backup.sql
+```
+
+2. Find the binlog starting position from the dump file:
+```bash
+head -50 myapp_backup.sql | grep "SOURCE_LOG_FILE"
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='mysql-bin.000003', SOURCE_LOG_POS=154;
+```
+
+3. Replay binary logs up to the point just before the event you want to undo:
+```bash
+mysqlbinlog \
+  --start-position=154 \
+  --stop-datetime="2024-06-15 11:59:00" \
+  mysql-bin.000003 mysql-bin.000004 | mysql -u root -p
+```
+
+See [MySQL Binary Logging](/guides/binary-logging) for full details on mysqlbinlog options.
+
+## MySQL Shell Dump Utilities
+
+MySQL Shell (`mysqlsh`) provides faster dump and load utilities than `mysqldump`. They use parallel threads and produce compressed output, making them practical for large databases.
+
+```bash
+# Dump a single schema
+mysqlsh root@localhost -- util dump-schemas '["myapp"]' --outputUrl=/backups/myapp
+
+# Load it back
+mysqlsh root@localhost -- util load-dump /backups/myapp
+```
+
+MySQL Shell dump utilities compress output by default (zstd) and can parallelize both dump and load across multiple CPU cores. For databases larger than a few GB, the speed difference over `mysqldump` is significant.
+
+## Backup Methods Compared
+
+| Method | Best for | Restore speed | Portability | Cons |
+|:-------|:---------|:-------------|:------------|:-----|
+| `mysqldump` | Small/medium databases, migration | Slow (re-executes SQL) | Any MySQL version | Slow for large databases |
+| MySQL Shell dump | Large databases | Fast (parallel load) | MySQL 8.0+ | Requires MySQL Shell |
+| File copy (cold) | Simple setups, offline servers | Fast | Same MySQL version | Must stop the server |
+| Percona XtraBackup | Large production InnoDB | Fast (hot copy) | Same major version | External tool required |
+
+## Scheduling Backups
+
+A cron job running a nightly dump is the most common production setup:
+
+```bash
+# /etc/cron.d/mysql-backup
+0 2 * * * mysql_user /usr/local/bin/mysql-backup.sh
+```
+
+```bash
+#!/bin/bash
+# mysql-backup.sh
+DATE=$(date +%Y-%m-%d)
+BACKUP_DIR=/backups/mysql
+
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --all-databases \
+  -u backup_user -p"$MYSQL_BACKUP_PASSWORD" \
+  | gzip > "$BACKUP_DIR/all_databases_$DATE.sql.gz"
+
+# Keep 14 days of backups
+find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
+```
+
+The backup user needs only `SELECT`, `LOCK TABLES`, `SHOW VIEW`, `TRIGGER`, `EVENT`, and `RELOAD` privileges — not `ALL PRIVILEGES`.
+
+## Verifying Backups
+
+A backup you haven't tested is not a backup. Verify regularly:
+
+```bash
+# Test restore to a separate instance
+mysql -u root -p --host=test-server < all_databases.sql
+
+# Quick sanity check — verify row counts
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+```
+
+Automated restore testing at least monthly catches corruption, permission issues, and disk space problems before they matter.
+
+## Frequently Asked Questions
+
+#### Does `--single-transaction` work with all storage engines?
+
+No. `--single-transaction` uses a consistent read snapshot, which only InnoDB supports. MyISAM tables in the same database are still locked with `LOCK TABLES` during the dump. If you have mixed engines, `--single-transaction` alone isn't sufficient for a fully consistent dump.
+
+#### How long should I retain backups?
+
+At minimum: daily backups for 7–14 days, weekly backups for 4 weeks, monthly backups for a year. Retention depends on regulatory requirements and how far back you might need to recover. Binary logs should be retained long enough to cover the gap between your oldest retained backup and now.
+
+#### Is copying the data directory a valid backup?
+
+Only if the server is shut down first (cold copy). A running MySQL server writes data files in a way that's not safe to copy directly — you'll get a corrupt backup. For hot backups without stopping the server, use MySQL Shell's dump utility or Percona XtraBackup.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `mysqldump` hangs on large tables | Add `--quick` to stream rows one at a time instead of buffering the whole table in memory |
+| Restore fails with `ERROR 1005: Can't create table` | Foreign key constraint violation during import — add `SET FOREIGN_KEY_CHECKS=0;` at the top of the dump, or use `--disable-keys` |
+| Dump file is too large | Use compression: `mysqldump ... \| gzip > backup.sql.gz`; restore with `zcat backup.sql.gz \| mysql ...` |
+| Point-in-time recovery missed changes | Binary log files have a gap — confirm all log files in the range were replayed in sequence |
+| Backup user can't dump triggers | Grant `TRIGGER` privilege: `GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |

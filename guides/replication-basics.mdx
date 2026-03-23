@@ -1,0 +1,167 @@
+---
+title: "MySQL Replication Basics"
+sidebarTitle: "Replication Basics"
+description: "How MySQL replication works: source and replica setup, binary log-based replication, GTID replication, replication lag, monitoring with SHOW REPLICA STATUS, and common replication problems."
+keywords: "mysql replication, mysql replica setup, mysql gtid replication, mysql replication lag, mysql show replica status, mysql source replica, mysql binlog replication, mysql replication tutorial"
+---
+
+MySQL replication copies changes from one server (the source) to one or more servers (replicas). The source writes every change to the binary log; each replica reads that log and replays the changes. Replication is the foundation for read scaling, high availability, and geographic distribution.
+
+## How Replication Works
+
+1. The source commits a transaction and writes it to the binary log.
+2. The replica's I/O thread connects to the source, reads new binlog events, and writes them to a local relay log.
+3. The replica's SQL thread reads from the relay log and executes each event.
+
+This is asynchronous by default — the source doesn't wait for replicas to confirm receipt. The replica can lag behind the source.
+
+## Setting Up a Replica
+
+**On the source** — enable binary logging and set a unique server ID in `my.cnf`:
+
+```ini
+[mysqld]
+server_id = 1
+log_bin = /var/log/mysql/mysql-bin
+binlog_format = ROW
+```
+
+Create a replication user:
+
+```sql
+CREATE USER 'repl'@'%' IDENTIFIED BY 'repl_password';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+```
+
+Take a consistent snapshot using mysqldump with `--source-data`:
+
+```bash
+mysqldump --single-transaction --source-data=1 --all-databases \
+  -u root -p > source_snapshot.sql
+```
+
+**On the replica** — set a different server ID:
+
+```ini
+[mysqld]
+server_id = 2
+```
+
+Restore the snapshot and start replication:
+
+```bash
+mysql -u root -p < source_snapshot.sql
+```
+
+```sql
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = '192.168.1.10',
+    SOURCE_USER = 'repl',
+    SOURCE_PASSWORD = 'repl_password',
+    SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;
+```
+
+`SOURCE_AUTO_POSITION = 1` enables GTID-based replication. If you're not using GTIDs, specify `SOURCE_LOG_FILE` and `SOURCE_LOG_POS` instead (values from the snapshot file header).
+
+## GTID Replication
+
+Global Transaction Identifiers (GTIDs) assign a unique ID to every committed transaction. They make failover and replica setup simpler — instead of tracking binlog filenames and positions, MySQL tracks which transactions each server has applied.
+
+Enable GTIDs on both source and replica:
+
+```ini
+[mysqld]
+gtid_mode = ON
+enforce_gtid_consistency = ON
+```
+
+With GTIDs enabled, `SOURCE_AUTO_POSITION = 1` is all you need — MySQL figures out which transactions the replica is missing and replays them automatically.
+
+## Monitoring Replication
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+Key fields to watch:
+
+| Field | What it means |
+|:------|:--------------|
+| `Replica_IO_Running` | `Yes` = I/O thread connected and reading from source |
+| `Replica_SQL_Running` | `Yes` = SQL thread applying events |
+| `Seconds_Behind_Source` | Replication lag in seconds (0 = caught up) |
+| `Last_SQL_Error` | Last error that stopped the SQL thread |
+| `Executed_Gtid_Set` | GTIDs this replica has applied (GTID mode) |
+
+Both `Replica_IO_Running` and `Replica_SQL_Running` must be `Yes` for replication to be working.
+
+## Replication Lag
+
+Replication lag happens when the replica's SQL thread can't keep up with the source's write rate. Common causes:
+
+- **Single-threaded SQL thread**: by default, replicas apply events serially. Enable parallel replication with `replica_parallel_workers`:
+
+```sql
+SET GLOBAL replica_parallel_workers = 4;
+SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+```
+
+- **Long-running queries on the replica**: queries that lock rows block the SQL thread.
+- **Network latency**: slow I/O thread causes the SQL thread to run out of work.
+- **Disk I/O on replica**: syncing relay log or data files is the bottleneck.
+
+## Read Scaling with Replicas
+
+Direct read-heavy queries to replicas to reduce load on the source:
+
+```sql
+-- Application connects to replica for reads
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Connect to source for writes
+INSERT INTO orders (customer_id, total) VALUES (42, 99.99);
+```
+
+The application must tolerate replication lag. A replica may not have the row inserted a few milliseconds ago on the source. For reads that must reflect the latest write, connect to the source.
+
+## Stopping and Starting Replication
+
+```sql
+STOP REPLICA;           -- stop both threads
+STOP REPLICA IO_THREAD; -- stop only the I/O thread
+STOP REPLICA SQL_THREAD; -- stop only the SQL thread
+
+START REPLICA;
+```
+
+To skip a single failing event (use carefully — skipping events causes the replica to diverge):
+
+```sql
+-- GTID mode: inject an empty transaction for the failed GTID
+SET GTID_NEXT = 'source_uuid:N';
+BEGIN; COMMIT;
+SET GTID_NEXT = 'AUTOMATIC';
+START REPLICA;
+```
+
+## Frequently Asked Questions
+
+#### Does replication work across MySQL major versions?
+
+MySQL supports replicating from an older source to a newer replica, but not the reverse. A MySQL 8.4 replica can follow a MySQL 8.0 source. A MySQL 8.0 replica cannot follow a MySQL 8.4 source. Always upgrade replicas before upgrading the source.
+
+#### What's the difference between semi-synchronous and asynchronous replication?
+
+In asynchronous replication (the default), the source commits without waiting for any replica to acknowledge receipt. In semi-synchronous replication, the source waits for at least one replica to confirm it received the event before returning to the client. Semi-sync reduces the risk of data loss on source failure, at the cost of slightly higher write latency.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `Replica_IO_Running: No` | Check `Last_IO_Error` — typically a connection or auth failure; verify SOURCE_HOST, user, password, and REPLICATION SLAVE grant |
+| `Replica_SQL_Running: No` | Check `Last_SQL_Error` — usually a data conflict; decide whether to skip the event or fix the root cause |
+| Replication lag growing | Enable `replica_parallel_workers`; check for long-running queries on the replica blocking the SQL thread |
+| `ERROR 1062: Duplicate entry` on replica | Replica has a row the source doesn't — indicates manual writes to the replica; use `replica_skip_errors` cautiously or resync |
+| GTID gap after failover | New source is missing GTIDs the old source had applied — use `SET GTID_PURGED` carefully during failover |

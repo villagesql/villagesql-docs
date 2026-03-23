@@ -1,0 +1,211 @@
+---
+title: "MySQL Security Hardening"
+sidebarTitle: "Security Hardening"
+description: "How to secure a MySQL server: running mysql_secure_installation, removing anonymous users, restricting root access, enforcing password policies, auditing privileges, enabling SSL/TLS, and reducing the attack surface."
+keywords: "mysql security, mysql hardening, mysql secure installation, mysql ssl tls, mysql password policy, mysql root security, mysql user privileges audit, mysql security best practices"
+---
+
+A default MySQL installation prioritizes ease of setup over security. Hardening a production server means removing defaults that made sense on a developer laptop but are inappropriate when the server is reachable by applications or the network.
+
+## mysql_secure_installation
+
+Run this immediately after installing MySQL on any server that isn't a local dev machine:
+
+```bash
+mysql_secure_installation
+```
+
+It walks through the most critical hardening steps:
+
+- Set the root password (if not already set)
+- Remove anonymous users
+- Disallow remote root login
+- Remove the test database
+- Reload privilege tables
+
+These four steps eliminate the most common attack surface on a fresh install.
+
+## Root Account Restrictions
+
+Root should only connect from `localhost`. Verify and enforce this:
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = 'root';
+-- Should show only 'localhost', '127.0.0.1', '::1'
+```
+
+If root has a `'%'` host entry, remove it:
+
+```sql
+DROP USER 'root'@'%';
+```
+
+For remote administration, create a named DBA account with limited host access instead of using root remotely.
+
+## Remove Anonymous Users and Test Database
+
+```sql
+-- Remove any anonymous accounts
+DELETE FROM mysql.user WHERE user = '';
+FLUSH PRIVILEGES;
+
+-- Remove the test database (readable by anonymous users by default)
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE db = 'test' OR db = 'test\\_%';
+FLUSH PRIVILEGES;
+```
+
+## Password Policy
+
+MySQL 8.0+ includes the `validate_password` component, which enforces password complexity rules. It must be installed before use — `mysql_secure_installation` offers to install it automatically. To install manually:
+
+```sql
+INSTALL COMPONENT 'file://component_validate_password';
+```
+
+Verify it's active:
+
+```sql
+SHOW VARIABLES LIKE 'validate_password%';
+```
+
+Configure minimum requirements:
+
+```sql
+SET GLOBAL validate_password.length = 12;
+SET GLOBAL validate_password.mixed_case_count = 1;
+SET GLOBAL validate_password.number_count = 1;
+SET GLOBAL validate_password.special_char_count = 1;
+SET GLOBAL validate_password.policy = 'MEDIUM';
+```
+
+Policy levels: `LOW` (length only), `MEDIUM` (length + character classes), `STRONG` (+ dictionary check).
+
+Set password expiration for accounts that might be forgotten:
+
+```sql
+ALTER USER 'admin'@'localhost' PASSWORD EXPIRE INTERVAL 90 DAY;
+```
+
+## Least-Privilege User Accounts
+
+Application accounts should have the minimum privileges needed. See [MySQL User Management](/guides/user-management) for the full GRANT syntax.
+
+Common patterns:
+
+```sql
+-- Read-only replica account
+CREATE USER 'app_read'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT ON myapp.* TO 'app_read'@'10.0.1.%';
+
+-- Application write account (no schema changes)
+CREATE USER 'app_write'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT, INSERT, UPDATE, DELETE ON myapp.* TO 'app_write'@'10.0.1.%';
+
+-- Migration account (schema changes allowed, used only by deploy scripts)
+CREATE USER 'app_migrate'@'localhost' IDENTIFIED BY 'strong_password';
+GRANT ALL PRIVILEGES ON myapp.* TO 'app_migrate'@'localhost';
+```
+
+Restrict hosts as tightly as possible — use subnet notation or specific IPs, not `'%'`.
+
+## Auditing Existing Privileges
+
+Review all accounts and their privileges:
+
+```sql
+-- List all user accounts
+SELECT user, host, account_locked, password_expired
+FROM mysql.user
+ORDER BY user, host;
+
+-- Check for overly broad grants
+SELECT user, host, Select_priv, Insert_priv, Update_priv, Delete_priv,
+       Super_priv, Grant_priv
+FROM mysql.user
+WHERE host = '%' OR Super_priv = 'Y';
+```
+
+Remove or lock accounts that aren't actively used:
+
+```sql
+ALTER USER 'old_account'@'%' ACCOUNT LOCK;
+-- Or drop entirely:
+DROP USER 'old_account'@'%';
+```
+
+## SSL/TLS Connections
+
+MySQL 8.0 enables SSL/TLS by default and auto-generates certificates on startup. Verify it's active:
+
+```sql
+SHOW VARIABLES LIKE '%ssl%';
+-- ssl_ca, ssl_cert, ssl_key should show file paths
+-- have_ssl should be 'YES'
+```
+
+Require SSL for specific accounts:
+
+```sql
+ALTER USER 'app_write'@'%' REQUIRE SSL;
+```
+
+To verify a client connection is using SSL:
+
+```sql
+SHOW STATUS LIKE 'Ssl_cipher';
+-- Non-empty value means the current connection is encrypted
+```
+
+For production, replace the auto-generated self-signed certificates with certificates from a trusted CA.
+
+## Network Access
+
+Restrict MySQL to listen only on necessary interfaces. In `my.cnf`:
+
+```ini
+[mysqld]
+bind-address = 127.0.0.1     # local only
+# or
+bind-address = 10.0.1.5      # specific internal IP
+```
+
+If MySQL should not be reachable from the network at all (application on the same host), bind to `127.0.0.1` and never expose port 3306 externally. Firewall rules are a second layer of defense, not a substitute for restricting the bind address.
+
+## Disabling Risky Features
+
+Turn off features your application doesn't use:
+
+```sql
+-- Prevent MySQL from reading/writing files on the server filesystem
+-- (prevents SQL injection attacks that use LOAD DATA INFILE to read /etc/passwd)
+SET GLOBAL local_infile = 0;
+```
+
+In `my.cnf`:
+
+```ini
+[mysqld]
+local_infile = 0
+skip_name_resolve = 1       # don't do reverse DNS lookups; use IPs in grants
+```
+
+## Frequently Asked Questions
+
+#### Is the default MySQL 8 install secure?
+
+More secure than MySQL 5.7 defaults, but still not hardened for production. MySQL 8.0 generates random root passwords and enables SSL by default, which are improvements. You still need to: verify the root password is strong, remove anonymous users, restrict host access, and configure the `validate_password` component.
+
+#### Should I run MySQL as root?
+
+Never. MySQL should run as a dedicated low-privilege system user (typically `mysql`). Running the server process as root means a MySQL exploit could lead to full system compromise.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1045: Access denied for user 'root'@'%'` | Root remote login is correctly blocked — create a named admin user with specific host access |
+| Application can't connect after adding `REQUIRE SSL` | Client needs to use SSL flags: `--ssl-mode=REQUIRED`; verify server certificates are valid |
+| `validate_password` rejecting a password | Check current policy: `SHOW VARIABLES LIKE 'validate_password%'`; ensure the password meets all requirements |
+| Can't find root password on a new install | MySQL 8.0 logs the temporary root password to the error log on first start — find the log path with `SELECT @@GLOBAL.log_error;`, then `grep 'temporary password' <path>` |
+| Host `'%'` grants still visible after DELETE | Run `FLUSH PRIVILEGES` after any direct modifications to `mysql.user` |

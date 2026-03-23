@@ -1,0 +1,155 @@
+---
+title: "Migrating from PostgreSQL to MySQL"
+sidebarTitle: "PostgreSQL to MySQL"
+description: "How to migrate a PostgreSQL database to MySQL: schema translation, data type mapping, SQL dialect differences, sequence vs AUTO_INCREMENT, and common migration pitfalls."
+keywords: "postgresql to mysql migration, postgres to mysql, mysql vs postgresql differences, mysql auto_increment vs sequence, mysql migration guide, convert postgresql schema to mysql, mysql dialect differences"
+---
+
+PostgreSQL and MySQL share ANSI SQL syntax but diverge in enough ways that a migration requires careful attention to data types, default behaviors, and SQL dialect differences. Most of the work is schema translation and fixing queries that rely on PostgreSQL-specific features.
+
+## Data Type Mapping
+
+| PostgreSQL type | MySQL equivalent | Notes |
+|:----------------|:----------------|:------|
+| `SERIAL` / `BIGSERIAL` | `INT AUTO_INCREMENT` / `BIGINT AUTO_INCREMENT` | MySQL uses AUTO_INCREMENT, not sequences |
+| `TEXT` | `TEXT` or `LONGTEXT` | MySQL TEXT is limited to 65,535 bytes; use LONGTEXT for larger values |
+| `VARCHAR` (no limit) | Not supported | MySQL VARCHAR requires a length; use TEXT instead |
+| `BOOLEAN` | `TINYINT(1)` | MySQL has no true boolean; 0/1 convention |
+| `BYTEA` | `BLOB` or `LONGBLOB` | Binary data |
+| `JSONB` | `JSON` | MySQL JSON is stored as text with validation; no JSONB binary format |
+| `UUID` | `CHAR(36)` or `BINARY(16)` | No native UUID type; see [UUIDs in MySQL](/guides/uuids) |
+| `TIMESTAMP WITH TIME ZONE` | `DATETIME` + explicit timezone handling | MySQL DATETIME has no timezone; see [Timestamps and Time Zones](/guides/timestamps-timezones) |
+| `NUMERIC` / `DECIMAL` | `DECIMAL(p,s)` | Precision and scale required in MySQL |
+| `ARRAY` | Not supported | Normalize to a child table |
+| `HSTORE` | `JSON` | Key-value pairs; use JSON in MySQL |
+| `INTERVAL` | Not supported as a column type | Store as INT seconds or use application-side logic |
+
+## Sequences vs AUTO_INCREMENT
+
+PostgreSQL uses sequences (independent objects) for auto-increment values. MySQL uses `AUTO_INCREMENT` as a column attribute:
+
+**PostgreSQL:**
+```sql
+CREATE SEQUENCE orders_id_seq;
+CREATE TABLE orders (
+    id INTEGER DEFAULT nextval('orders_id_seq') PRIMARY KEY
+);
+```
+
+**MySQL equivalent:**
+```sql
+CREATE TABLE orders (
+    id INT AUTO_INCREMENT PRIMARY KEY
+);
+```
+
+To get the last inserted ID in MySQL: `SELECT LAST_INSERT_ID();` (equivalent to PostgreSQL's `currval()` or `RETURNING id`).
+
+## SQL Dialect Differences
+
+**String concatenation:**
+```sql
+-- PostgreSQL
+SELECT first_name || ' ' || last_name FROM users;
+
+-- MySQL
+SELECT CONCAT(first_name, ' ', last_name) FROM users;
+```
+
+**String quoting:**
+```sql
+-- PostgreSQL: double quotes for identifiers, single quotes for strings
+SELECT "first_name" FROM users WHERE status = 'active';
+
+-- MySQL: backticks for identifiers, single quotes for strings
+SELECT `first_name` FROM users WHERE status = 'active';
+```
+
+MySQL accepts double quotes for identifiers only when `ANSI_QUOTES` SQL mode is enabled.
+
+**ILIKE (case-insensitive LIKE):**
+```sql
+-- PostgreSQL
+SELECT * FROM users WHERE name ILIKE '%alice%';
+
+-- MySQL (case-insensitive by default with ci collations)
+SELECT * FROM users WHERE name LIKE '%alice%';
+```
+
+MySQL string comparisons are case-insensitive by default with `utf8mb4_general_ci` or similar collations. If you need case-sensitive matching, use a `_bin` collation.
+
+**RETURNING clause:**
+```sql
+-- PostgreSQL
+INSERT INTO users (name) VALUES ('Alice') RETURNING id;
+
+-- MySQL (no RETURNING)
+INSERT INTO users (name) VALUES ('Alice');
+SELECT LAST_INSERT_ID();
+```
+
+**LIMIT / OFFSET:**
+```sql
+-- PostgreSQL
+SELECT * FROM orders LIMIT 10 OFFSET 20;
+
+-- MySQL (same syntax)
+SELECT * FROM orders LIMIT 10 OFFSET 20;
+-- or shorthand:
+SELECT * FROM orders LIMIT 20, 10;  -- LIMIT offset, count
+```
+
+**Schemas vs databases:**
+PostgreSQL uses schemas within a database (`mydb.public.orders`). MySQL uses "schemas" and "databases" interchangeably — there's no concept of a schema within a database. What PostgreSQL calls a schema, MySQL calls a database.
+
+**NULL handling in UNIQUE indexes:**
+PostgreSQL allows multiple NULL values in a unique column (NULLs are not equal to each other). MySQL (InnoDB) also allows multiple NULLs in unique indexes — behavior is the same.
+
+**CTEs:**
+MySQL 8.0+ supports CTEs including recursive CTEs. See [CTEs in MySQL](/guides/ctes-in-mysql).
+
+**Window functions:**
+MySQL 8.0+ supports window functions. See [Window Functions in MySQL](/guides/window-functions).
+
+## Features Without MySQL Equivalents
+
+Some PostgreSQL features have no direct equivalent:
+
+| PostgreSQL feature | MySQL situation |
+|:-------------------|:----------------|
+| Arrays as column types | Normalize to a child table |
+| Table inheritance | Not supported; use separate tables |
+| Custom operators | Not supported |
+| Full `LISTEN`/`NOTIFY` | Not supported; use application-side polling or a message queue |
+| Partial indexes (`WHERE` clause on index) | Not supported; use generated columns to index a subset |
+| Materialized views | Not supported natively; approximate with tables + stored procedures |
+| `COPY` command for bulk load | Use `LOAD DATA INFILE` or MySQL Shell's `loadDump` |
+
+## Migration Approach
+
+1. **Export the schema** from PostgreSQL (`pg_dump --schema-only`) and translate each table manually, using the type mapping above.
+2. **Export the data** from PostgreSQL as CSV (`COPY table TO '/tmp/table.csv' CSV HEADER`).
+3. **Load the data** into MySQL with `LOAD DATA INFILE` or `mysqlimport`.
+4. **Test queries** — find all PostgreSQL-specific syntax and rewrite it.
+5. **Verify counts and checksums** — `SELECT COUNT(*)` on every table; spot-check key rows.
+
+## Frequently Asked Questions
+
+#### Does MySQL support `UPSERT` like PostgreSQL's `ON CONFLICT`?
+
+Yes, using different syntax. See [UPSERT in MySQL](/guides/upsert). MySQL's `INSERT ... ON DUPLICATE KEY UPDATE` and `REPLACE INTO` cover the same use case as PostgreSQL's `ON CONFLICT DO UPDATE` and `ON CONFLICT DO NOTHING`.
+
+#### How do I handle PostgreSQL's `BOOLEAN` columns in MySQL?
+
+Use `TINYINT(1)`. Store 1 for true and 0 for false. Most MySQL client libraries and ORMs handle this automatically and present TINYINT(1) columns as booleans. You can also use `BIT(1)` but TINYINT(1) has broader tooling support.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| Syntax errors on `||` concatenation | Replace with `CONCAT()` |
+| `ILIKE` not recognized | Use `LIKE` (case-insensitive by default with ci collations) |
+| Double-quoted identifiers not working | Enable `ANSI_QUOTES` SQL mode or switch to backtick quoting |
+| `RETURNING` clause not working | Use `LAST_INSERT_ID()` after INSERT; there's no MySQL equivalent |
+| `SERIAL` not recognized | Change to `INT AUTO_INCREMENT` |
+| Array columns failing | Normalize to a child table with a foreign key |
