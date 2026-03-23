@@ -1,0 +1,171 @@
+---
+title: "Querying by Subnet in MySQL"
+sidebarTitle: "Subnet Queries"
+description: "How to query rows by IP subnet in MySQL — bitwise range checks with INET_ATON, and cleaner subnet queries using VillageSQL's INET type and network functions."
+keywords: "mysql subnet query, mysql ip range query, mysql cidr query, mysql inet subnet filter, mysql ip in subnet, mysql network address query"
+---
+
+Finding all rows where an IP address falls within a subnet requires comparing numeric IP values against a range. MySQL's standard approach uses bitwise arithmetic with `INET_ATON()`. VillageSQL's `INET` type provides network functions that make the same query more readable and work for both IPv4 and IPv6.
+
+## The Standard Approach: Bitwise Range Checks
+
+For IPv4, `INET_ATON()` converts an address to an unsigned 32-bit integer. A subnet membership check is a bitwise AND: if `(ip & netmask) == network_address`, the IP is in the subnet.
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INT UNSIGNED,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (INET_ATON('192.168.1.10')),
+    (INET_ATON('192.168.1.50')),
+    (INET_ATON('192.168.2.1')),
+    (INET_ATON('10.0.0.5'));
+
+-- Find all IPs in 192.168.1.0/24
+SELECT INET_NTOA(ip_address) FROM access_log
+WHERE ip_address BETWEEN INET_ATON('192.168.1.0')
+                     AND INET_ATON('192.168.1.255');
+
+-- Or using bitwise AND with the netmask
+SELECT INET_NTOA(ip_address) FROM access_log
+WHERE (ip_address & 0xFFFFFF00) = INET_ATON('192.168.1.0');
+```
+
+Both work for IPv4. The `BETWEEN` approach is readable. The bitwise form is more composable when subnet parameters are variables.
+
+Neither approach works for IPv6 — `INET_ATON()` only handles IPv4.
+
+## With VillageSQL: Network Functions on INET Columns
+
+VillageSQL's `vsql_network_address` extension provides `inet_network()`, `inet_set_masklen()`, and `inet_compare()` — enough to do subnet containment checks on both IPv4 and IPv6 `INET` columns.
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.10')),
+    (inet_from_string('192.168.1.50')),
+    (inet_from_string('192.168.2.1')),
+    (inet_from_string('10.0.0.5')),
+    (inet_from_string('192.168.1.200'));
+```
+
+### Subnet containment query
+
+To check whether a stored IP belongs to a subnet, mask the address to the subnet's prefix length and compare the result to the target network:
+
+```sql
+-- All IPs in 192.168.1.0/24
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip_address, 24)))
+    = '192.168.1.0/24';
+```
+
+For a parameterized version where the subnet comes from a variable:
+
+```sql
+SET @subnet     = '192.168.1.0/24';
+SET @prefix_len = inet_masklen(inet_from_string(@subnet));
+SET @network    = cidr_to_string(cidr_from_string(@subnet));
+
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip_address, @prefix_len)))
+    = @network;
+```
+
+### Range-based containment with inet_compare
+
+An alternative that avoids recomputing the network on every row — useful when you have the broadcast address available:
+
+```sql
+-- IPs in 192.168.1.0/24: from .0 to .255
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE inet_compare(ip_address, inet_from_string('192.168.1.0'))   >= 0
+  AND inet_compare(ip_address, inet_from_string('192.168.1.255')) <= 0;
+```
+
+### IPv6 subnet queries (same pattern)
+
+The same `inet_network()` approach works for IPv6 without any changes:
+
+```sql
+CREATE TABLE ipv6_log (id INT, ip INET);
+INSERT INTO ipv6_log VALUES
+    (1, inet_from_string('2001:db8::1')),
+    (2, inet_from_string('2001:db8::100')),
+    (3, inet_from_string('2001:db9::1'));
+
+-- Find all IPs in 2001:db8::/32
+SET @v6_prefix = 32;
+SET @v6_network = '2001:0db8:0000:0000:0000:0000:0000:0000/32';
+
+SELECT inet_to_string(ip) FROM ipv6_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip, @v6_prefix)))
+    = @v6_network;
+```
+
+### Networks table pattern
+
+A common use case: a `networks` table with authorized CIDRs, and checking whether an incoming IP is in any of them.
+
+```sql
+CREATE TABLE networks (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    network CIDR,
+    label   VARCHAR(100)
+);
+
+INSERT INTO networks (network, label) VALUES
+    (cidr_from_string('192.168.1.0/24'), 'office-lan'),
+    (cidr_from_string('10.0.0.0/8'),     'vpn-range'),
+    (cidr_from_string('172.16.0.0/12'),  'docker-range');
+
+-- Is an incoming IP in any authorized network?
+SELECT label FROM networks
+WHERE cidr_to_string(inet_network(inet_set_masklen(
+    inet_from_string('192.168.1.42'),
+    inet_masklen(inet_from_string(cidr_to_string(network)))
+))) = cidr_to_string(network);
+```
+
+## Standard vs VillageSQL
+
+| Approach | IPv6 | Readable | No manual calculation |
+|:---|:---|:---|:---|
+| `BETWEEN INET_ATON()` | No | Moderate | Requires computing broadcast manually |
+| Bitwise AND with `INET_ATON()` | No | Low | Requires computing netmask manually |
+| `inet_network()` + `inet_set_masklen()` | Yes | High | Functions handle the math |
+
+## Frequently Asked Questions
+
+#### Why doesn't VillageSQL have a contains operator like PostgreSQL's `<<`?
+
+The current version provides functions rather than operators. The `inet_network()` + `inet_set_masklen()` pattern covers the same logic. Operator support may come in a future release.
+
+#### Does the subnet query use the index?
+
+The `cidr_to_string(inet_network(inet_set_masklen(...)))` pattern does not use an index scan — it recomputes the network address for every row. For large tables, the `inet_compare` range approach is more index-friendly since it expresses the query as a range on the `ip_address` column.
+
+#### Can I store subnets and query containment at the same time?
+
+Yes. Store the host address in an `INET` column and the authorized subnet in a `CIDR` column. Compare them using `inet_network(inet_set_masklen(host_ip, inet_masklen(subnet)))` = `cidr_to_string(subnet)`.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION inet_network does not exist` | Run `INSTALL EXTENSION vsql_network_address` |
+| Subnet query returns no rows | Verify `@network` matches the expanded CIDR string — IPv6 CIDRs use expanded notation |
+| Range query includes addresses outside the subnet | Check the broadcast address; for /24 the range is `.0` to `.255` |
+| Mixed IPv4/IPv6 column returns wrong results | IPv4 and IPv6 addresses don't overlap — the query returns correct results per-family |

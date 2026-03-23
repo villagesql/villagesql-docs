@@ -1,0 +1,164 @@
+---
+title: "Geolocation Lookups by IP in MySQL"
+sidebarTitle: "IP Geolocation"
+description: "How to do IP geolocation lookups in MySQL — importing a GeoIP database and querying it with range checks, using VillageSQL's INET type for cleaner IPv4/IPv6 queries."
+keywords: "mysql ip geolocation, mysql geoip database, mysql maxmind mysql, mysql ip country lookup, mysql ip range query, mysql geolite2"
+---
+
+IP geolocation in MySQL works by importing a database that maps IP ranges to locations, then querying it with range checks. The standard approach stores IP ranges as integers and uses `BETWEEN`. VillageSQL's `INET` type makes the schema more expressive and handles IPv4 and IPv6 in the same table.
+
+## How IP Geolocation Works
+
+There's no MySQL function that maps an IP to a country. Geolocation is a lookup problem: you have a table of IP ranges — each row says "addresses from X to Y are in country Z" — and you find which range contains the incoming IP.
+
+Free databases like MaxMind GeoLite2 provide these ranges as CSV files you import into MySQL.
+
+## The Standard Approach: Integer Ranges
+
+MaxMind GeoLite2 (and similar databases) ship with `network` as a CIDR string and the start/end of each range as integers. The integer approach is compact and index-friendly:
+
+```sql
+CREATE TABLE geoip_ranges (
+    start_ip   INT UNSIGNED NOT NULL,
+    end_ip     INT UNSIGNED NOT NULL,
+    country    CHAR(2),
+    INDEX idx_start (start_ip),
+    INDEX idx_end   (end_ip)
+);
+
+-- Import from GeoLite2-Country-Blocks-IPv4.csv after converting to int ranges
+-- Then query:
+SELECT country FROM geoip_ranges
+WHERE INET_ATON('203.0.113.45') BETWEEN start_ip AND end_ip
+LIMIT 1;
+```
+
+This is fast — the index on `start_ip` enables efficient range scanning. The limitation is that it only works for IPv4. A separate table (with `VARBINARY(16)` ranges) is needed for IPv6.
+
+## With VillageSQL: Unified IPv4/IPv6 with INET
+
+VillageSQL's `INET` type stores both IPv4 and IPv6 addresses with natural ordering, so you can use a single table for both families. `inet_compare()` takes the place of `BETWEEN` for range checks.
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE geoip_ranges (
+    start_ip   INET NOT NULL,
+    end_ip     INET NOT NULL,
+    country    CHAR(2),
+    region     VARCHAR(100),
+    INDEX idx_start (start_ip)
+);
+
+-- Import IPv4 ranges
+INSERT INTO geoip_ranges (start_ip, end_ip, country) VALUES
+    (inet_from_string('203.0.113.0'), inet_from_string('203.0.113.255'), 'US'),
+    (inet_from_string('198.51.100.0'), inet_from_string('198.51.100.255'), 'DE');
+
+-- Import IPv6 ranges in the same table
+INSERT INTO geoip_ranges (start_ip, end_ip, country) VALUES
+    (inet_from_string('2001:db8::'), inet_from_string('2001:db8::ffff'), 'US');
+
+-- Look up a country for an IPv4 address
+SELECT country, region FROM geoip_ranges
+WHERE inet_compare(inet_from_string('203.0.113.45'), start_ip) >= 0
+  AND inet_compare(inet_from_string('203.0.113.45'), end_ip)   <= 0
+LIMIT 1;
+
+-- Same query works for IPv6
+SELECT country FROM geoip_ranges
+WHERE inet_compare(inet_from_string('2001:db8::42'), start_ip) >= 0
+  AND inet_compare(inet_from_string('2001:db8::42'), end_ip)   <= 0
+LIMIT 1;
+```
+
+### Storing by CIDR network (alternative schema)
+
+If your GeoIP data provides CIDR blocks rather than start/end pairs, use `CIDR` for the network column and resolve containment via subnet queries:
+
+```sql
+CREATE TABLE geoip_cidrs (
+    network    CIDR NOT NULL,
+    country    CHAR(2),
+    INDEX idx_network (network)
+);
+
+INSERT INTO geoip_cidrs (network, country) VALUES
+    (cidr_from_string('203.0.113.0/24'), 'US'),
+    (cidr_from_string('198.51.100.0/24'), 'DE');
+
+-- Look up by subnet match
+SELECT country FROM geoip_cidrs
+WHERE cidr_to_string(inet_network(inet_set_masklen(
+    inet_from_string('203.0.113.45'),
+    inet_masklen(inet_from_string(cidr_to_string(network)))
+))) = cidr_to_string(network)
+LIMIT 1;
+```
+
+## Choosing an Approach
+
+| Approach | IPv6 | Schema | Performance |
+|:---|:---|:---|:---|
+| `INT UNSIGNED` range + `BETWEEN` | No (separate table) | Two separate IPv4/IPv6 tables | Fast — integer index range scan |
+| `INET` range + `inet_compare` | Yes (unified) | Single table for both | Good — indexed on `start_ip` |
+| `CIDR` network + subnet match | Yes (unified) | Single table | Slower — per-row network computation |
+
+For pure IPv4 and maximum query speed, the `INT UNSIGNED` + `BETWEEN` approach is hard to beat. For schemas that need to handle both IPv4 and IPv6 in one table, `INET` with `inet_compare` is cleaner and avoids maintaining two parallel tables.
+
+## Importing GeoLite2 Data
+
+MaxMind GeoLite2 (free, requires registration) provides CSV files. For the range-based schema:
+
+```sql
+-- After downloading GeoLite2-Country-Blocks-IPv4.csv
+-- Convert the network column to start/end ranges and load:
+LOAD DATA INFILE '/path/to/ipv4_ranges.csv'
+INTO TABLE geoip_ranges
+FIELDS TERMINATED BY ',' ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS
+(start_ip_str, end_ip_str, country)
+SET start_ip = inet_from_string(start_ip_str),
+    end_ip   = inet_from_string(end_ip_str);
+```
+
+MaxMind also provides a binary `.mmdb` format and official client libraries for languages like Python, Node.js, and Go that are faster than SQL lookups for high-volume scenarios.
+
+## Frequently Asked Questions
+
+#### Should I do geolocation in MySQL or in application code?
+
+For high-volume lookups (every HTTP request), application-layer geolocation using MaxMind's `.mmdb` reader library is faster — binary search in memory, no SQL round-trip. SQL-based geolocation makes sense for batch analytics, reporting queries, and data pipelines that already run in MySQL.
+
+#### How do I keep the GeoIP database current?
+
+MaxMind updates GeoLite2 weekly. Script a periodic download and `TRUNCATE` + reload of the geolocation table. Alternatively, use MaxMind's mmdbinspect or a refresh script to apply delta updates.
+
+#### Can I join geolocation with my access logs in one query?
+
+Yes — that's one of the main reasons to keep GeoIP data in MySQL:
+
+```sql
+SELECT
+    inet_to_string(a.ip_address) AS ip,
+    g.country,
+    COUNT(*) AS request_count
+FROM access_log a
+JOIN geoip_ranges g
+  ON inet_compare(a.ip_address, g.start_ip) >= 0
+ AND inet_compare(a.ip_address, g.end_ip)   <= 0
+GROUP BY g.country
+ORDER BY request_count DESC;
+```
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION inet_from_string does not exist` | Run `INSTALL EXTENSION vsql_network_address` |
+| Lookup returns no results | Check that the IP range for that block was imported; try `SELECT COUNT(*) FROM geoip_ranges` |
+| Lookup returns wrong country | GeoIP databases have coverage gaps — verify against MaxMind's web lookup tool |
+| `LOAD DATA INFILE` fails | Check `secure_file_priv` setting; alternatively use application-side batch inserts |
