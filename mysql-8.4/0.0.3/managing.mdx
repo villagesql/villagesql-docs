@@ -1,0 +1,451 @@
+---
+title: Managing Extensions
+description: Monitor, troubleshoot, and manage VillageSQL extensions
+---
+
+## Viewing Installed Extensions
+
+Query installed extensions using the INFORMATION_SCHEMA view:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+**Output:**
+```
++------------------+-------------------+
+| EXTENSION_NAME   | EXTENSION_VERSION |
++------------------+-------------------+
+| vsql_complex     | 0.0.1             |
+| vsql_uuid        | 0.0.3             |
++------------------+-------------------+
+```
+
+**Usage:**
+- Use in both interactive sessions and scripts
+- Standard SQL interface compatible with MySQL tools
+
+---
+
+## Checking Extension Functions
+
+Verify extension functions work after installation:
+
+```sql
+-- Test a function directly
+SELECT complex_abs('(1.0,2.0)');
+```
+
+---
+
+## Extension Directory
+
+Check where VillageSQL looks for `.veb` files:
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+**List available extensions:**
+```bash
+ls -la /path/to/veb_dir/*.veb
+```
+
+### Configuring veb_dir
+
+To change the extension directory location, set `veb_dir` in your MySQL configuration file:
+
+**my.cnf / my.ini:**
+```ini
+[mysqld]
+veb_dir=/custom/path/to/extensions/
+```
+
+**Requirements:**
+- Path must be absolute (not relative)
+- Directory must exist before server start
+- MySQL user must have read permissions on the directory
+- Only one `veb_dir` is supported (cannot have multiple paths)
+- Changes require server restart to take effect
+
+**Verify after restart:**
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## Troubleshooting
+
+### Quick Reference
+
+| Issue | Quick Fix |
+|-------|-----------|
+| Extension not found | Verify `.veb` file exists in veb_dir with correct name |
+| Permission denied | Check permissions: `chmod 644 extension.veb` |
+| Cannot uninstall: types in use | Attempt `UNINSTALL EXTENSION`; the error identifies blocking columns by name |
+| Version mismatch | Restart server to clear cache |
+| Extension shows old behavior after update | `UNINSTALL` then `INSTALL`; clear `_expanded/` if needed |
+| Cannot compare types X and Y | Both sides must use the same custom type |
+| Unable to implicitly cast non-custom type | The literal or column being compared is not compatible with the custom type |
+
+### Extension Not Found
+
+**Error:** `Extension 'my_extension' not found`
+
+**Debug steps:**
+```bash
+# 1. Check veb_dir location
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# 2. List .veb files
+ls -la /path/to/veb_dir/
+
+# 3. Verify filename matches extension name
+# File: my_extension.veb
+# Install: INSTALL EXTENSION my_extension;
+
+# 4. Check permissions
+ls -l /path/to/veb_dir/my_extension.veb
+sudo chmod 644 /path/to/veb_dir/my_extension.veb
+```
+
+### Function Not Available After Install
+
+**Error:** `FUNCTION my_func does not exist`
+
+**Debug steps:**
+```sql
+-- 1. Verify extension installed
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+### Extension Shows Old Behavior After Update
+
+**Symptom:** After replacing a `.veb` file and reinstalling, the extension still
+runs old code.
+
+**Cause:** VillageSQL expands `.veb` files into `_expanded/` on first load. If you
+copy a new `.veb` without first running `UNINSTALL EXTENSION`, the server continues
+using the previously-expanded `.so` that is already loaded in memory.
+
+**Solution:** Always follow the full UNINSTALL → replace → INSTALL cycle:
+
+```sql
+UNINSTALL EXTENSION my_extension;
+```
+
+Then replace the `.veb` file in `veb_dir` and reinstall:
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+If the extension still shows old behavior, clear the expansion cache before reinstalling:
+
+```bash
+rm -rf /path/to/veb_dir/_expanded/my_extension/
+```
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+---
+
+### Cannot Uninstall Extension
+
+**Error:** `Cannot uninstall extension: types in use`
+
+**Solution:**
+
+```sql
+-- Attempt uninstall; the error identifies blocking columns by name
+UNINSTALL EXTENSION my_extension;
+-- If blocked: ERROR HY000: Cannot drop extension `my_extension` as 1 column(s) depend on it,
+--             e.g. mydb.mytable.my_column has type MYTYPE
+
+-- Drop or alter the identified column(s), then retry
+DROP TABLE mydb.mytable;
+-- OR
+ALTER TABLE mydb.mytable DROP COLUMN my_column;
+
+UNINSTALL EXTENSION my_extension;
+```
+
+### Library Loading Errors
+
+**Error:** `Cannot load library: undefined symbol`
+
+**Causes:**
+- Missing library dependencies
+- ABI compatibility mismatch
+- Incorrect MySQL version
+
+**Debug:**
+```bash
+# Check library dependencies (Linux)
+ldd /path/to/veb_dir/_expanded/my_extension/sha256/lib/my_extension.so
+
+# Check library dependencies (macOS)
+otool -L /path/to/veb_dir/_expanded/my_extension/sha256/lib/my_extension.so
+```
+
+### Extension Name Validation Errors
+
+**Error:** `Failed to load VEF extension 'extension_name'` with log message `Extension name mismatch`
+
+**Cause:** The extension name in `manifest.json` doesn't match the VEB filename or the name registered in the extension code.
+
+**Debug steps:**
+
+1. **Check VEB filename matches manifest:**
+   ```bash
+   # VEB filename: my_extension.veb
+   # manifest.json should have:
+   {
+     "name": "my_extension",  # Must match VEB filename (without .veb)
+     ...
+   }
+   ```
+
+2. **Verify manifest.json name field:**
+   ```bash
+   # Extract and check manifest from VEB
+   tar -xOf /path/to/veb_dir/my_extension.veb manifest.json | grep name
+   ```
+
+3. **Check extension registration in code:**
+   ```cpp
+   // In your extension source, these must all match:
+   VEF_GENERATE_ENTRY_POINTS(
+     make_extension("my_extension", "1.0.0")  // Must match manifest name
+       ...
+   )
+   ```
+
+**Solution:**
+
+All three names must be identical, using underscores (see [Extension Naming Conventions](/mysql-8.4/0.0.3/install#extension-naming-conventions)):
+- VEB filename: `my_extension.veb`
+- manifest.json: `"name": "my_extension"`
+- Extension code: `make_extension("my_extension", ...)`
+
+**Common mistakes:**
+- Using hyphens in manifest: `"name": "my-extension"` ❌
+- VEB filename doesn't match: `my-extension.veb` vs `"name": "my_extension"` ❌
+- Code registration differs: `make_extension("myextension", ...)` ❌
+
+**Correct example:**
+```json
+// manifest.json
+{
+  "name": "my_extension",
+  "version": "1.0.0"
+}
+```
+
+```cpp
+// extension.cc
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .func(...)
+)
+```
+
+```bash
+# VEB filename
+my_extension.veb
+```
+
+### Custom Type Comparison Errors
+
+**Error:** `Cannot compare types X and Y in =`
+
+**Cause:** Both sides of the comparison are custom types but from different types or extensions.
+
+```sql
+-- Example: comparing COMPLEX with UUID in a WHERE clause
+SELECT * FROM t WHERE complex_col = uuid_col;
+-- ERROR: Cannot compare types vsql_complex.COMPLEX and vsql_uuid.UUID in =
+```
+
+**Solution:** Ensure both sides of a comparison use the same custom type. If you need to compare across types, convert one side explicitly using the appropriate type conversion function.
+
+---
+
+**Error:** `Unable to implicitly cast a non-custom type during compare with a custom type in =`
+
+**Cause:** One side of the comparison is a custom type column and the other is a value (literal or column) that cannot be automatically converted to that type.
+
+```sql
+-- Example: comparing a custom type with an integer literal
+SELECT * FROM t WHERE complex_col = 42;
+-- ERROR: Unable to implicitly cast a non-custom type during compare...
+```
+
+**Solution:** String literals are automatically cast to the custom type using the type's encode function. For other types (integers, floats), use an explicit conversion function:
+
+```sql
+-- Use a string literal instead (auto-cast works)
+SELECT * FROM t WHERE complex_col = '(1.0,2.0)';
+
+-- Or use the type's from_string function explicitly
+SELECT * FROM t WHERE complex_col = complex_from_string('(1.0,2.0)');
+```
+
+---
+
+## Monitoring Extension Usage
+
+### Query Performance
+
+Track UDF execution times using performance_schema:
+
+```sql
+-- Enable statement instrumentation
+UPDATE performance_schema.setup_instruments
+SET ENABLED = 'YES', TIMED = 'YES'
+WHERE NAME LIKE '%statement%';
+
+-- Query UDF execution times
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR as executions,
+    ROUND(SUM_TIMER_WAIT/1000000000, 2) as total_ms,
+    ROUND(AVG_TIMER_WAIT/1000000000, 2) as avg_ms
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST_TEXT LIKE '%complex_%'
+ORDER BY total_ms DESC
+LIMIT 10;
+```
+
+### Custom Type Usage
+
+Track which tables use custom types:
+
+```sql
+-- Find all columns using custom extension types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY DATA_TYPE, TABLE_SCHEMA, TABLE_NAME;
+```
+
+---
+
+## Updating Extensions
+
+To update an extension to a newer version, use the manual update process:
+
+<Note>
+  **ALTER EXTENSION UPDATE** is not supported in v0.0.3 and is planned for a future release.
+</Note>
+
+### Manual Update Process
+
+1. **Uninstall the current version:**
+   ```sql
+   UNINSTALL EXTENSION extension_name;
+   ```
+
+2. **Replace the .veb file:**
+   ```bash
+   # Remove old .veb file
+   sudo rm /path/to/veb_dir/extension_name.veb
+
+   # Copy new .veb file
+   sudo cp new_extension_name.veb /path/to/veb_dir/
+   ```
+
+3. **Install the new version:**
+   ```sql
+   INSTALL EXTENSION extension_name;
+   ```
+
+4. **Verify the update:**
+   ```sql
+   SELECT EXTENSION_VERSION
+   FROM INFORMATION_SCHEMA.EXTENSIONS
+   WHERE EXTENSION_NAME = 'extension_name';
+   ```
+
+<Warning>
+  **Data Safety:** If tables use custom types from the extension, you must drop or alter those tables before uninstalling. Back up your data first.
+</Warning>
+
+**Example:**
+```sql
+-- Find columns using vsql_complex types before updating
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
+
+-- If columns exist, back up data and drop/alter them first
+-- Then proceed with update
+UNINSTALL EXTENSION vsql_complex;
+-- (replace .veb file)
+INSTALL EXTENSION vsql_complex;
+```
+
+---
+
+## Cleaning Up
+
+### Remove Orphaned Expansion Directories
+
+VillageSQL expands `.veb` files to `_expanded/{name}/{sha256}/`. Old versions accumulate over time.
+
+```bash
+# List expansion directories
+ls -la /path/to/veb_dir/_expanded/
+
+# Compare with installed extensions
+mysql -u root -p -e "SELECT EXTENSION_NAME FROM INFORMATION_SCHEMA.EXTENSIONS;"
+
+# Manually remove unused SHA256 directories
+rm -rf /path/to/veb_dir/_expanded/my_extension/old_sha256_hash/
+```
+
+<Note>
+  Server restart automatically cleans up orphaned expansion directories.
+</Note>
+
+---
+
+## Getting Help
+
+If you encounter issues not covered here:
+
+1. **Check Error Log:** Most extension errors are logged with details
+2. **Review Extension Docs:** Extension-specific troubleshooting may exist
+3. **Ask on Discord:** Join the [VillageSQL Discord](https://discord.gg/KSr6whd3Fr)
+4. **File an Issue:** Report bugs on [GitHub Issues](https://github.com/villagesql/villagesql-server/issues)
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="System Reference"
+    icon="book"
+    href="/mysql-8.4/0.0.3/reference"
+  >
+    Query system tables and views
+  </Card>
+  <Card
+    title="Uninstall Extensions"
+    icon="trash"
+    href="/mysql-8.4/0.0.3/uninstall"
+  >
+    Remove extensions safely
+  </Card>
+  <Card
+    title="Extension Architecture"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.3/architecture"
+  >
+    Understand the internals
+  </Card>
+</CardGroup>

@@ -2,7 +2,7 @@
 
 ## Workflow
 
-**All changes go to the dev branch** (e.g., `mysql-8.4/0.0.3-dev/`)
+**All changes go to the dev branch** (e.g., `mysql-8.4/0.0.4-dev/`)
 
 ### Cutting a Release
 
@@ -10,21 +10,21 @@ When releasing a new version:
 
 1. **Rename dev to version number**
    ```bash
-   mv mysql-8.4/0.0.3-dev mysql-8.4/0.0.3
+   mv mysql-8.4/0.0.4-dev mysql-8.4/0.0.4
    ```
 
 2. **Update docs.json**
-   - Rename version: `Development (0.0.3-dev)` → `Stable-alpha (0.0.3)`
-   - Add `"default": true` to new stable (0.0.3)
-   - Remove `"default": true` from old stable (0.0.2)
+   - Rename version: `Development (0.0.4-dev)` → `Stable-alpha (0.0.4)`
+   - Add `"default": true` to new stable (0.0.4)
+   - Remove `"default": true` from old stable (0.0.3)
 
 3. **Create new dev branch**
    ```bash
-   cp -r mysql-8.4/0.0.3 mysql-8.4/0.0.4-dev
+   cp -r mysql-8.4/0.0.4 mysql-8.4/0.0.5-dev
    ```
-   - Add `Development (0.0.4-dev)` entry to docs.json
+   - Add `Development (0.0.5-dev)` entry to docs.json
 
-4. **All future changes go to new dev branch** (`mysql-8.4/0.0.4-dev/`)
+4. **All future changes go to new dev branch** (`mysql-8.4/0.0.5-dev/`)
 
 ## Archive Policy
 
