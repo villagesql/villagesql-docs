@@ -1,8 +1,8 @@
 ---
 title: "Geolocation Lookups by IP in MySQL"
 sidebarTitle: "Looking Up IP Geolocation"
-description: "How to do IP geolocation lookups in MySQL — importing a GeoIP database and querying it with range checks, using VillageSQL's INET type for cleaner IPv4/IPv6 queries."
-keywords: "mysql ip geolocation, mysql geoip database, mysql maxmind mysql, mysql ip country lookup, mysql ip range query, mysql geolite2"
+description: "How to do IP geolocation lookups in MySQL — importing MaxMind GeoLite2 or an API-based data source, querying IP ranges for country and region, accuracy trade-offs, and using VillageSQL's INET type for unified IPv4/IPv6 lookups with sub-millisecond latency."
+keywords: "mysql ip geolocation, mysql geoip database, mysql maxmind, mysql ip country lookup, mysql ip range query, mysql geolite2, ip geolocation accuracy mysql, mysql ip lookup without plugin, mysql ipv6 geolocation, ip-api mysql"
 ---
 
 IP geolocation in MySQL works by importing a database that maps IP ranges to locations, then querying it with range checks. The standard approach stores IP ranges as integers and uses `BETWEEN`. VillageSQL's `INET` type makes the schema more expressive and handles IPv4 and IPv6 in the same table.
@@ -108,6 +108,35 @@ LIMIT 1;
 
 For pure IPv4 and maximum query speed, the `INT UNSIGNED` + `BETWEEN` approach is hard to beat. For schemas that need to handle both IPv4 and IPv6 in one table, `INET` with `inet_compare` is cleaner and avoids maintaining two parallel tables.
 
+## Comparing Geolocation Data Sources
+
+The query schema is only half the decision — the data source determines accuracy, freshness, and cost. Here's how the common options compare:
+
+| Data Source | Country accuracy | City accuracy | Latency | Cost | MySQL integration |
+|:---|:---|:---|:---|:---|:---|
+| MaxMind GeoLite2 (free) | ~98% | ~80% | In-process (SQL or `.mmdb`) | Free, registration required | Import CSV; update weekly |
+| MaxMind GeoIP2 (paid) | ~99.8% | ~85–90% | In-process | From $20/mo | Same import flow as GeoLite2 |
+| ip-api.com (free tier) | ~99% | ~83% | HTTP, ~30–100 ms | Free (45 req/min); paid removes limit | Application-layer HTTP call; results stored in MySQL |
+| ip-api.com (pro) | ~99% | ~83% | HTTP, ~30–100 ms | From $15/mo | Same; HTTPS + no rate limit |
+| ipinfo.io | ~99% | ~85% | HTTP, ~30–100 ms | Free (50k req/mo); paid tiers above | Application-layer; results can be cached in MySQL |
+
+**Country-level accuracy** figures are self-reported by providers and vary by region — Asia-Pacific and Latin American coverage tends to be lower than North America and Europe across all sources.
+
+**Which to pick:** MaxMind GeoLite2 is the standard starting point — it's free, ships as flat files you import once, and lookups run entirely inside MySQL with no external dependency. For city-level accuracy in production, GeoIP2 Precision is the upgrade path. API-based sources (ip-api.com, ipinfo.io) are convenient for low-volume use but add HTTP latency and a rate-limit dependency to every lookup.
+
+## When to Use Each Approach
+
+| Scenario | Recommended approach |
+|:---|:---|
+| Batch analytics on stored access logs | GeoLite2 in MySQL — join directly in SQL |
+| Real-time lookup on every HTTP request (high volume) | MaxMind `.mmdb` reader in application code — no SQL round-trip |
+| Low-volume enrichment (&lt;45 req/min), no DB import overhead | ip-api.com free tier via HTTP |
+| IPv4 only, maximum query speed | `INT UNSIGNED` + `BETWEEN` with GeoLite2 |
+| IPv4 + IPv6 in a single table | VillageSQL `INET` + `inet_compare` with GeoLite2 |
+| City, ASN, or ISP data needed | GeoIP2 Precision (paid) or ipinfo.io |
+| Air-gapped environment, no external API calls | MaxMind GeoLite2 (local import) |
+| Prototyping / testing with no setup | ip-api.com free tier |
+
 ## Importing GeoLite2 Data
 
 MaxMind GeoLite2 (free, requires registration) provides CSV files. For the range-based schema:
@@ -136,6 +165,14 @@ For high-volume lookups (every HTTP request), application-layer geolocation usin
 #### How do I keep the GeoIP database current?
 
 MaxMind updates GeoLite2 weekly. Script a periodic download and `TRUNCATE` + reload of the geolocation table. Alternatively, use MaxMind's mmdbinspect or a refresh script to apply delta updates.
+
+#### How accurate is IP geolocation in MySQL?
+
+Accuracy depends entirely on the data source, not the MySQL schema. At the country level, MaxMind GeoLite2 (free) is accurate for roughly 98% of IPv4 addresses. At the city level it drops to around 80%. For higher accuracy, MaxMind's paid GeoIP2 Precision product reaches ~99.8% country and ~85–90% city. No database is perfect — accuracy is typically lower for mobile networks, VPNs, and some Asia-Pacific ranges. The MySQL query approach has no effect on accuracy; you get exactly what the imported data says.
+
+#### Can MySQL look up IP geolocation without a plugin or external API?
+
+Yes. The standard approach — and what this guide covers — uses a GeoIP database (like MaxMind GeoLite2) imported into a regular MySQL table as integer ranges. Lookups are plain SQL `BETWEEN` queries. No plugin, no external API, no network call at query time. The only dependency is importing and periodically refreshing the flat CSV files from MaxMind. VillageSQL's `vsql_network_address` extension adds an `INET` type for cleaner IPv4/IPv6 handling, but it's not required for the basic approach.
 
 #### Can I join geolocation with my access logs in one query?
 
