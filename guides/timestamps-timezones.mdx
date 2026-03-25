@@ -1,0 +1,150 @@
+---
+title: "Timestamps and Time Zones in MySQL"
+sidebarTitle: "Handling Time Zones"
+description: "How MySQL handles DATETIME vs TIMESTAMP, time zone storage and conversion, and how to avoid common bugs when your application spans multiple time zones."
+keywords: "mysql timestamp timezone, mysql datetime vs timestamp, mysql utc, mysql time_zone, mysql convert timezone, mysql current_timestamp, mysql daylight saving"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Time zone bugs are among the hardest to debug — they appear and disappear based on server location, show up differently in dev vs production, and often only surface after a daylight saving transition. The root cause is almost always a mismatch between how MySQL stores time and how the application expects to read it.
+
+## DATETIME vs TIMESTAMP
+
+These two types look similar but behave differently at the critical moment — retrieval.
+
+| Type | Storage | Range | Time zone behavior |
+|:-----|:--------|:------|:-------------------|
+| `DATETIME` | 8 bytes | 1000-01-01 to 9999-12-31 | No conversion — stores and returns the literal value |
+| `TIMESTAMP` | 4 bytes | 1970-01-01 to 2038-01-19 | Stores UTC; converts to session `time_zone` on retrieval |
+
+`TIMESTAMP` automatically converts values:
+- On **INSERT/UPDATE**: converts from session `time_zone` to UTC for storage
+- On **SELECT**: converts from UTC back to session `time_zone` for display
+
+`DATETIME` makes no conversions. The value you write in is the value you get back.
+
+```sql
+SET time_zone = 'America/New_York';
+
+CREATE TABLE events (
+    ts  TIMESTAMP,
+    dt  DATETIME
+);
+
+INSERT INTO events VALUES ('2024-03-15 12:00:00', '2024-03-15 12:00:00');
+
+-- Switch to a different timezone and re-read
+SET time_zone = 'America/Los_Angeles';
+SELECT ts, dt FROM events;
+-- ts: 2024-03-15 09:00:00  (converted: UTC-8 vs UTC-5 = 3 hours earlier)
+-- dt: 2024-03-15 12:00:00  (unchanged)
+```
+
+## The 2038 Problem
+
+`TIMESTAMP` is stored as a 32-bit Unix timestamp. It can't represent dates after `2038-01-19 03:14:07 UTC`. Any application that stores future dates — reservations, subscriptions, scheduled events — should use `DATETIME` to avoid hitting this limit.
+
+```sql
+-- This will fail or behave unexpectedly near or after 2038
+expiry_date TIMESTAMP   -- wrong
+
+-- Use DATETIME for dates beyond 2038
+expiry_date DATETIME    -- correct
+```
+
+## Server and Session Time Zones
+
+MySQL has two independent time zone settings:
+
+```sql
+-- Server's global time zone (set at startup or in my.cnf)
+SELECT @@global.time_zone;
+
+-- Session time zone (can differ per connection)
+SELECT @@session.time_zone;
+```
+
+If `time_zone` shows `SYSTEM`, MySQL is using the operating system's time zone. This works until the OS changes (server migration, DST transition) — then your timestamps shift.
+
+**Best practice**: set the server to UTC explicitly, and handle display conversion in the application.
+
+```ini
+# my.cnf
+[mysqld]
+default-time-zone = '+00:00'
+```
+
+Or at runtime:
+```sql
+SET GLOBAL time_zone = '+00:00';
+SET SESSION time_zone = '+00:00';
+```
+
+## Named Time Zones
+
+`'+00:00'` and `'UTC'` are both valid, but named zones like `'America/New_York'` require the timezone tables to be loaded. If `CONVERT_TZ()` returns NULL or named zones fail, the tables are missing.
+
+```sql
+-- Check if named timezone tables are loaded
+SELECT COUNT(*) FROM mysql.time_zone_name;
+
+-- Load them (run from the OS shell)
+-- mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql
+```
+
+```sql
+-- Convert between time zones
+SELECT CONVERT_TZ('2024-03-15 12:00:00', 'America/New_York', 'UTC');
+-- Returns: 2024-03-15 16:00:00  (March 15 is EDT = UTC-4, so noon EDT = 16:00 UTC)
+```
+
+## AUTO_UPDATE Columns
+
+`TIMESTAMP` columns support automatic population on insert and update:
+
+```sql
+CREATE TABLE posts (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    title      VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+`CURRENT_TIMESTAMP` is evaluated in UTC if the session timezone is UTC, so `created_at` and `updated_at` are stored consistently regardless of who connects and from what timezone.
+
+You can do the same with `DATETIME` and `NOW()`:
+
+```sql
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+```
+
+`NOW()` returns the current date and time in the session's timezone — another reason to standardize on UTC for the session.
+
+## Frequently Asked Questions
+
+#### Should I store timestamps as UTC in DATETIME or use TIMESTAMP?
+
+If your dates stay within the 2038 ceiling, `TIMESTAMP` is cleaner — it handles UTC conversion automatically. For future dates beyond 2038 or for applications that need to store historical dates before 1970, use `DATETIME` and enforce UTC at the application layer by always converting to UTC before inserting.
+
+#### Why do timestamps shift after a server migration?
+
+The old server used `time_zone = SYSTEM` pointing to one OS timezone; the new server points to a different one (or UTC). `TIMESTAMP` values stored as UTC display correctly in both timezones, but if any values were stored assuming the system timezone rather than UTC, they'll shift. Audit with `SELECT @@global.time_zone` on both servers before migrating.
+
+#### How do I store just a date with no time component?
+
+Use `DATE`. It stores 3 bytes and has no time-of-day or timezone ambiguity. Operations like `WHERE date_col = '2024-03-15'` are unambiguous regardless of the session timezone.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| Timestamps shift by hours after deployment | Session or server `time_zone` differs between environments — standardize on UTC |
+| `CONVERT_TZ()` returns NULL | Named timezone tables not loaded — run `mysql_tzinfo_to_sql` |
+| Dates after 2038 fail to store | Use `DATETIME` instead of `TIMESTAMP` |
+| `TIMESTAMP` shows wrong time after DST change | Set `time_zone = '+00:00'` instead of `SYSTEM` to avoid OS DST dependence |
+| `updated_at` not updating automatically | Column needs `ON UPDATE CURRENT_TIMESTAMP` clause |

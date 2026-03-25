@@ -1,0 +1,189 @@
+---
+title: "MySQL Character Sets and Collations"
+sidebarTitle: "Choosing Character Sets"
+description: "How MySQL character sets and collations work: utf8mb4 vs utf8, choosing collations, setting character sets at database and column level, sorting behavior, and fixing charset problems."
+keywords: "mysql character set, mysql collation, mysql utf8mb4, mysql utf8 vs utf8mb4, mysql charset, mysql unicode, mysql collation comparison, mysql set charset, mysql character encoding"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL's character set controls how strings are stored (which bytes represent which characters). The collation controls how strings are compared and sorted. Getting these right at the start avoids corrupted data and broken sorts that are painful to fix later.
+
+## utf8mb4 — The Right Default
+
+Always use `utf8mb4`. MySQL's `utf8` (without the `mb4`) is a 3-byte encoding that cannot store 4-byte Unicode characters — which includes emoji, many Chinese characters, and various symbols. `utf8mb4` is the complete UTF-8 encoding.
+
+```sql
+-- Verify your database is using utf8mb4
+SHOW CREATE DATABASE myapp;
+-- Should show: DEFAULT CHARACTER SET utf8mb4
+```
+
+If you're on a legacy database using `utf8`, migrating to `utf8mb4` requires converting the database, tables, and columns.
+
+### Character set quick-reference
+
+| Character set | Use when | Avoid when | Migration cost if wrong |
+|:-------------|:---------|:-----------|:------------------------|
+| `utf8mb4` | Any new schema — handles all Unicode including emoji and modern CJK | Never avoid on new work | N/A — it's the right default |
+| `utf8` (legacy 3-byte) | Never — only reason to keep it is if you can't schedule a migration window | Storing emoji, supplementary CJK characters, or any 4-byte Unicode | Medium — `ALTER TABLE … CONVERT TO CHARACTER SET utf8mb4`; rebuilds every affected table |
+| `latin1` | Single-byte Western European text in a legacy schema; slightly smaller storage than `utf8mb4` for ASCII-only data | Any user-generated content, multilingual data, or anything touching the web | High — binary-safe conversion isn't automatic; data outside latin1 range corrupts silently |
+| `binary` / `BLOB` | Raw bytes — file contents, cryptographic hashes, packed binary formats | Text you'll search, sort, or display | Low — `BINARY` columns don't have charset semantics; converting to a text charset requires application-level decoding |
+
+The cost column is about the work required to fix a wrong choice later, not the performance cost of the charset itself. `latin1` is the trap: it accepts any byte value without error, so bad data gets in quietly and surfaces only when you try to display or convert it.
+
+## Collations
+
+The collation determines sort order and comparison behavior. Common choices:
+
+| Collation | Sort behavior | Case sensitive | Accent sensitive |
+|:----------|:-------------|:--------------|:----------------|
+| `utf8mb4_general_ci` | Approximate Unicode order | No | No |
+| `utf8mb4_unicode_ci` | Full Unicode algorithm | No | No |
+| `utf8mb4_0900_ai_ci` | Unicode 9.0, most accurate | No | No |
+| `utf8mb4_bin` | Binary (byte-by-byte) | Yes | Yes |
+| `utf8mb4_0900_as_cs` | Unicode 9.0 | Yes | Yes |
+
+`utf8mb4_0900_ai_ci` is the MySQL 8.0 default and the best general-purpose choice. It handles Unicode correctly, is case-insensitive (`ci`), and accent-insensitive (`ai`). Use `utf8mb4_bin` only when you need exact byte matching.
+
+`ci` = case-insensitive, `cs` = case-sensitive, `ai` = accent-insensitive, `as` = accent-sensitive.
+
+## Setting Character Sets
+
+**At database creation:**
+```sql
+CREATE DATABASE myapp
+    CHARACTER SET utf8mb4
+    COLLATION utf8mb4_0900_ai_ci;
+```
+
+**At table creation:**
+```sql
+CREATE TABLE users (
+    id   INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100)
+) CHARACTER SET utf8mb4 COLLATION utf8mb4_0900_ai_ci;
+```
+
+**At column level (overrides table default):**
+```sql
+CREATE TABLE products (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(100),
+    description TEXT CHARACTER SET utf8mb4 COLLATION utf8mb4_bin
+);
+```
+
+Column-level character sets are useful when one column needs case-sensitive matching while the rest of the table uses case-insensitive.
+
+**Change a column's character set:**
+```sql
+ALTER TABLE users
+MODIFY name VARCHAR(100) CHARACTER SET utf8mb4 COLLATION utf8mb4_0900_ai_ci;
+```
+
+**Convert an entire table:**
+```sql
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATION utf8mb4_0900_ai_ci;
+```
+
+`CONVERT TO` changes every column in one statement. It rebuilds the table, so it takes time proportional to table size.
+
+## Checking Character Sets
+
+```sql
+-- Database level
+SHOW CREATE DATABASE myapp;
+
+-- Table and column level
+SHOW CREATE TABLE users;
+
+-- Connection level
+SHOW VARIABLES LIKE 'character_set%';
+SHOW VARIABLES LIKE 'collation%';
+```
+
+Columns in the output of `SHOW CREATE TABLE` that don't show a charset are inheriting from the table default.
+
+## Connection Character Set
+
+The connection character set controls the encoding MySQL expects from the client and uses for string literals. Always set it explicitly:
+
+```sql
+SET NAMES utf8mb4;
+-- equivalent to:
+SET character_set_client = utf8mb4;
+SET character_set_results = utf8mb4;
+SET character_set_connection = utf8mb4;
+```
+
+Most drivers do this automatically when you set the charset in the connection string. In MySQL 8.0, connections default to `utf8mb4`, so this is less often needed than it was on MySQL 5.7.
+
+## Collation Effects on Queries
+
+Collation affects `WHERE`, `ORDER BY`, and uniqueness:
+
+```sql
+-- utf8mb4_0900_ai_ci: these three are equal
+SELECT * FROM users WHERE name = 'alice';  -- matches Alice, ALICE, alice
+
+-- utf8mb4_bin: exact match only
+SELECT * FROM users WHERE name COLLATE utf8mb4_bin = 'alice';  -- only 'alice'
+```
+
+To sort with a different collation than the column's default:
+
+```sql
+SELECT name FROM users ORDER BY name COLLATE utf8mb4_unicode_ci;
+```
+
+## Converting from utf8 to utf8mb4
+
+If your legacy database uses `utf8` (3-byte), convert it:
+
+```sql
+-- Convert one table
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATION utf8mb4_0900_ai_ci;
+
+-- Update the database default
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATION utf8mb4_0900_ai_ci;
+```
+
+Also update the server config to make `utf8mb4` the default for new connections:
+
+```ini
+[mysqld]
+character_set_server = utf8mb4
+collation_server = utf8mb4_0900_ai_ci
+
+[client]
+default-character-set = utf8mb4
+```
+
+Converting large tables takes time and rebuilds the table. Schedule it during a maintenance window or use an online schema change tool.
+
+## Frequently Asked Questions
+
+#### Why does `utf8` in MySQL not support emoji?
+
+MySQL's `utf8` is a non-standard 3-byte subset of UTF-8 that predates the 4-byte Unicode extension. Emoji (and many other modern Unicode characters) require 4 bytes. `utf8mb4` is the correct full implementation of UTF-8. The old `utf8` alias exists for backward compatibility only — never use it for new schemas.
+
+#### Does changing collation affect existing data?
+
+Changing collation doesn't change the stored bytes. It changes how those bytes are compared and sorted. However, unique indexes are enforced using the collation, so changing from `_bin` to `_ci` may reveal collisions (`Alice` and `alice` become equal) that must be resolved first.
+
+#### Which collation should I use?
+
+`utf8mb4_0900_ai_ci` for most use cases — it's the MySQL 8.0 default and handles Unicode well. Use `utf8mb4_bin` only when you need exact byte matching. Avoid `utf8mb4_general_ci` in new projects — it predates `_0900_ai_ci` and handles some Unicode edge cases incorrectly.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| Emoji stored as `????` | Column or connection is using `utf8` (3-byte) — convert to `utf8mb4` |
+| `Incorrect string value` error | Inserting characters the column's charset can't encode — convert the column to `utf8mb4` |
+| Sort order is wrong | Collation mismatch — check `SHOW CREATE TABLE` and set an explicit `COLLATE` in the `ORDER BY` |
+| Case-sensitive comparison not working | Column uses a `_ci` collation — use `COLLATE utf8mb4_bin` in the WHERE clause or change the column's collation |
+| `Illegal mix of collations` error | Comparing columns or literals with different collations — add `COLLATE` to make them match, or convert the column |

@@ -1,0 +1,195 @@
+---
+title: "MySQL JOINs Explained"
+sidebarTitle: "Writing JOINs"
+description: "How MySQL JOIN types work: INNER JOIN, LEFT JOIN, RIGHT JOIN, and CROSS JOIN — with examples, performance considerations, and common mistakes."
+keywords: "mysql join, mysql inner join, mysql left join, mysql right join, mysql join example, mysql join performance, mysql outer join, mysql join types"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+JOINs combine rows from two or more tables based on a related column. They're one of the most-used features in SQL and one of the most commonly misunderstood — especially when NULLs or missing rows are involved.
+
+## The Tables Used in This Guide
+
+```sql
+CREATE TABLE customers (
+    id    INT PRIMARY KEY AUTO_INCREMENT,
+    name  VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT,    -- nullable: orders without a customer
+    amount      DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+INSERT INTO orders VALUES
+    (1, 1, 99.00),   -- Alice's order
+    (2, 1, 45.00),   -- Alice's second order
+    (3, 2, 120.00),  -- Bob's order
+    (4, NULL, 15.00); -- order with no customer
+```
+
+## JOIN Types at a Glance
+
+| Type | Returns | Use when |
+|:-----|:--------|:---------|
+| `INNER JOIN` | Only rows with a match in both tables | You want results that exist on both sides |
+| `LEFT JOIN` | All rows from the left table; NULL for unmatched right rows | You want all left-side rows regardless of whether a match exists |
+| `RIGHT JOIN` | All rows from the right table; NULL for unmatched left rows | Same result as `LEFT JOIN` with tables swapped — most developers rewrite it that way |
+| `CROSS JOIN` | Every combination of left and right rows (Cartesian product) | Generating all possible pairs; no `ON` condition |
+
+## INNER JOIN — Only Matching Rows
+
+`INNER JOIN` (or just `JOIN`) returns rows where the join condition matches in both tables. Rows with no match in either table are excluded.
+
+```sql
+SELECT c.name, o.amount
+FROM customers c
+INNER JOIN orders o ON o.customer_id = c.id;
+```
+
+```
+name  | amount
+------+--------
+Alice | 99.00
+Alice | 45.00
+Bob   | 120.00
+```
+
+Carol has no orders — she's excluded. The order with `customer_id = NULL` is also excluded because `NULL` doesn't match any value. Only rows with a match on both sides appear. For a full explanation of how MySQL handles NULL comparisons, see [NULL in MySQL](/guides/null-in-mysql).
+
+## LEFT JOIN — All Rows from the Left Table
+
+`LEFT JOIN` returns all rows from the left table, plus any matching rows from the right table. When there's no match, the right-side columns are NULL.
+
+```sql
+SELECT c.name, o.amount
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id;
+```
+
+```
+name  | amount
+------+--------
+Alice | 99.00
+Alice | 45.00
+Bob   | 120.00
+Carol | NULL
+```
+
+Carol appears now with `NULL` for `amount`. This is the right JOIN to use when you want all rows from the primary table, whether or not related rows exist.
+
+**Finding rows with no match** — filter on a NULL right-side column:
+
+```sql
+-- Customers who have never placed an order
+SELECT c.name
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.id IS NULL;
+```
+
+```
+name
+------
+Carol
+```
+
+## RIGHT JOIN — All Rows from the Right Table
+
+`RIGHT JOIN` is the mirror of `LEFT JOIN`: all rows from the right table, NULLs for unmatched left-side columns. In practice, most developers rewrite `RIGHT JOIN` as a `LEFT JOIN` with the tables swapped — it's easier to read.
+
+```sql
+-- These are equivalent
+SELECT c.name, o.amount
+FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id;
+
+SELECT c.name, o.amount
+FROM orders o LEFT JOIN customers c ON o.customer_id = c.id;
+```
+
+Both return all orders, including the one with no customer:
+
+```
+name  | amount
+------+--------
+Alice | 99.00
+Alice | 45.00
+Bob   | 120.00
+NULL  | 15.00
+```
+
+## CROSS JOIN — Every Combination
+
+`CROSS JOIN` produces the Cartesian product: every row from the left table paired with every row from the right table. With 3 customers and 4 orders, you get 12 rows. There's no `ON` condition.
+
+```sql
+SELECT c.name, o.amount
+FROM customers c
+CROSS JOIN orders o;
+-- Returns 3 × 4 = 12 rows
+```
+
+Useful for generating combinations (e.g., all product-size pairings), not for querying related data.
+
+## JOIN Performance
+
+JOINs on large tables can be slow if the join columns aren't indexed.
+
+```sql
+-- Without an index on orders.customer_id, MySQL scans all orders for each customer
+SELECT c.name, COUNT(o.id) AS order_count
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.id;
+
+-- Add the index
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+```
+
+Always index the foreign key column on the "many" side of a one-to-many relationship. `EXPLAIN` shows the join order and which indexes are used — look for `type: ALL` on any joined table as a sign that an index is missing.
+
+## Frequently Asked Questions
+
+#### What's the difference between `JOIN` and `INNER JOIN`?
+Nothing. They're the same. `INNER JOIN` is the explicit form; `JOIN` is shorthand. Both return only matching rows.
+
+#### Why does adding a `WHERE` clause to a `LEFT JOIN` turn it into an `INNER JOIN`?
+When you filter on a column from the right table in the `WHERE` clause, rows where that column is NULL (the unmatched rows) are excluded. Put the condition in the `ON` clause instead if you want to keep unmatched rows:
+
+```sql
+-- This excludes customers with no orders — behaves like INNER JOIN
+SELECT c.name, o.amount
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 50;
+
+-- This keeps customers with no orders
+SELECT c.name, o.amount
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id AND o.amount > 50;
+```
+
+#### Does MySQL support FULL OUTER JOIN?
+No — MySQL doesn't have `FULL OUTER JOIN`. Emulate it with a `LEFT JOIN` and `RIGHT JOIN` combined with `UNION`:
+
+```sql
+SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+UNION
+SELECT c.name, o.amount FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id;
+```
+
+`UNION` deduplicates the result. If your data can have legitimately duplicate rows and you want to preserve them, use `UNION ALL` — but be aware it will also include rows that appear in both halves.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `LEFT JOIN` returns fewer rows than expected | A `WHERE` condition on the right table is filtering out NULL rows — move the condition to `ON` |
+| JOIN on large tables is slow | Add an index on the join column of the larger table |
+| Unexpected duplicate rows | The join is producing multiple matches — use `GROUP BY` or check whether the relationship is truly one-to-one |
+| `RIGHT JOIN` is confusing | Rewrite as `LEFT JOIN` with tables swapped — same result, easier to read |

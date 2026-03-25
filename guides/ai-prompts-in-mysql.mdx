@@ -1,0 +1,167 @@
+---
+title: "Running AI Models from MySQL Queries"
+sidebarTitle: "Running AI Prompts"
+description: "How to call AI language models directly from MySQL queries using VillageSQL's ai_prompt() function — enriching rows, classifying data, and batch-processing text."
+keywords: "mysql ai prompt, mysql call ai model, mysql ai_prompt function, mysql llm query, mysql anthropic openai, mysql ai text generation"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL doesn't have a way to call an AI model. You process your data in SQL, then move it to application code for any AI step, then bring results back. VillageSQL's `vsql_ai` extension adds `ai_prompt()` — a function that calls an AI model directly from a query, so enrichment, classification, and generation can happen where the data already lives.
+
+## The Problem: Context Switching Between SQL and AI
+
+A typical pattern without VillageSQL:
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, review_text FROM reviews WHERE ai_label IS NULL")
+
+# Call AI for each row
+for row in rows:
+    label = openai.chat(model="gpt-4o-mini", prompt=row["review_text"])
+    db.execute("UPDATE reviews SET ai_label = ? WHERE id = ?", label, row["id"])
+```
+
+This works but it's three round-trips per row: SELECT, AI call, UPDATE. For large tables the coordination overhead adds up, and the enrichment logic lives in application code rather than in the schema where the data lives.
+
+## With VillageSQL: ai_prompt() in SQL
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+`ai_prompt(provider, model, api_key, prompt)` makes an API call and returns the response as a string. Use it anywhere a scalar function works.
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+-- Enrich a single row
+SELECT review_text,
+       ai_prompt('anthropic', 'claude-haiku-4-5-20251001', @key,
+                 CONCAT('Classify this review as positive, negative, or neutral: ', review_text)
+       ) AS sentiment
+FROM reviews
+WHERE id = 1;
+```
+
+### Updating rows in bulk
+
+The most common use: backfill an enrichment column across existing rows.
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_label VARCHAR(50);
+
+SET @key = 'sk-ant-your-api-key';
+SET SESSION max_execution_time = 300000;  -- 5 minutes for bulk ops
+
+UPDATE reviews
+SET ai_label = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT('Classify as positive, negative, or neutral. Reply with one word only: ', review_text)
+)
+WHERE ai_label IS NULL
+LIMIT 100;  -- Process in batches to stay within rate limits
+```
+
+Run the UPDATE in a loop from your application until no more NULL rows remain.
+
+### Using prompt results in WHERE
+
+You can filter on AI output, though this calls the model for every row in the scan:
+
+```sql
+-- Flag reviews that need human review
+SELECT id, review_text FROM reviews
+WHERE ai_prompt('anthropic', 'claude-haiku-4-5-20251001', @key,
+    CONCAT('Does this review mention a refund request? Reply yes or no: ', review_text)
+) = 'yes'
+LIMIT 20;
+```
+
+For performance, prefer updating a stored column and querying that rather than calling `ai_prompt()` in a WHERE clause.
+
+### Building prompts from multiple columns
+
+Concatenate columns into the prompt to give the model full context:
+
+```sql
+UPDATE support_tickets
+SET ai_summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT(
+        'Summarize this support ticket in one sentence.\n',
+        'Subject: ', subject, '\n',
+        'Body: ', body
+    )
+)
+WHERE ai_summary IS NULL
+LIMIT 50;
+```
+
+## Performance and Rate Limits
+
+Each `ai_prompt()` call is an independent HTTPS request. For bulk operations:
+
+- **Set `max_execution_time`** — AI calls take 5–30 seconds each; a batch UPDATE over 100 rows takes minutes.
+- **Use LIMIT in UPDATE** — Process in batches of 50–100 rows to stay within provider rate limits.
+- **Store results** — Never call `ai_prompt()` in a SELECT without storing the result. Repeated SELECTs re-run the API call each time.
+
+```sql
+-- Batch loop pattern (run repeatedly until done)
+UPDATE reviews
+SET ai_label = ai_prompt('anthropic', 'claude-haiku-4-5-20251001', @key,
+    CONCAT('Label as positive, negative, or neutral. One word: ', review_text))
+WHERE ai_label IS NULL
+LIMIT 100;
+
+-- Check progress
+SELECT COUNT(*) AS remaining FROM reviews WHERE ai_label IS NULL;
+```
+
+## Choosing a Model
+
+| Model | Speed | Cost | Use when |
+|:---|:---|:---|:---|
+| `claude-haiku-4-5-20251001` | Fast | Low | Bulk classification, simple labeling |
+| `claude-sonnet-4-5-20250929` | Medium | Medium | Complex reasoning, nuanced output |
+| `gpt-4o-mini` | Fast | Low | OpenAI ecosystem, simple tasks |
+| `gemini-2.5-flash` | Fast | Low | Google ecosystem, balanced tasks |
+
+For classification and labeling tasks, use the fastest/cheapest model that gives acceptable accuracy. Reserve more capable models for tasks where output quality matters more than throughput.
+
+For setup and provider configuration, see [Connecting MySQL to AI APIs](/guides/ai-api-setup).
+
+## Frequently Asked Questions
+
+#### Can I use ai_prompt() in a DEFAULT expression?
+
+No — non-deterministic functions (which `ai_prompt()` is) can't be used in DEFAULT expressions or generated columns in MySQL.
+
+#### Can I use ai_prompt() in a stored procedure?
+
+Yes. Stored procedures, triggers, and functions can all call `ai_prompt()`, subject to the same timeout constraints. Be cautious with triggers — an AI call on every INSERT will make every write slow.
+
+#### How do I control the response format?
+
+Through the prompt. "Reply with one word: positive, negative, or neutral" gets predictable output for classification. "Return valid JSON with keys: category, confidence" gets structured output. The model follows instructions reliably when they're specific.
+
+#### Does ai_prompt() retry on failure?
+
+No. If the API call fails, it returns NULL. Implement retry logic in your application's batch loop.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION ai_prompt does not exist` | Run `INSTALL EXTENSION vsql_ai` |
+| Returns NULL | Bad API key, rate limit hit, or timeout — check `max_execution_time` |
+| UPDATE times out | Add `SET SESSION max_execution_time = 300000` and use LIMIT batches |
+| Model returns unexpected format | Tighten the prompt: specify exact output format and give examples |
+| Rate limit errors | Reduce batch size; add `SELECT SLEEP(1);` between UPDATE batches, or add a sleep in your application loop |

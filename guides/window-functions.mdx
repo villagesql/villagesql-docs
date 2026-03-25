@@ -1,0 +1,184 @@
+---
+title: "Window Functions in MySQL 8"
+sidebarTitle: "Using Window Functions"
+description: "How MySQL 8 window functions work: ROW_NUMBER, RANK, LAG, LEAD, running totals, and how they differ from GROUP BY aggregates."
+keywords: "mysql window functions, mysql row_number, mysql rank, mysql over clause, mysql partition by, mysql lag lead, mysql running total, mysql 8 analytics"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Window functions compute values across a set of rows related to the current row — without collapsing those rows into a single output row the way `GROUP BY` does. They were added in MySQL 8.0 and enable analytics queries that previously required subqueries or application-layer processing.
+
+## How Window Functions Differ from GROUP BY
+
+```sql
+-- GROUP BY: collapses rows — you lose the individual order details
+SELECT customer_id, SUM(amount) AS total
+FROM orders
+GROUP BY customer_id;
+
+-- Window function: adds a column without collapsing rows
+SELECT
+    id,
+    customer_id,
+    amount,
+    SUM(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM orders;
+```
+
+The second query returns one row per order, with each row also showing the total for that customer. `GROUP BY` can't do this — it removes the individual rows.
+
+## The OVER Clause
+
+Every window function uses an `OVER` clause that defines the window — the set of rows to compute over.
+
+```sql
+function() OVER (
+    PARTITION BY col    -- divide rows into groups (optional)
+    ORDER BY col        -- define row order within the window (required for ranking/offset functions)
+    ROWS BETWEEN ...    -- define the frame (optional)
+)
+```
+
+An empty `OVER()` means the window is the entire result set.
+
+## Ranking Functions
+
+```sql
+SELECT
+    name,
+    score,
+    ROW_NUMBER() OVER (ORDER BY score DESC) AS row_num,
+    RANK()       OVER (ORDER BY score DESC) AS rank,
+    DENSE_RANK() OVER (ORDER BY score DESC) AS dense_rank
+FROM leaderboard;
+```
+
+| Function | Behavior on ties |
+|:---------|:-----------------|
+| `ROW_NUMBER()` | Unique sequential number — ties get different numbers (arbitrary order) |
+| `RANK()` | Tied rows share a rank; next rank skips (1, 1, 3) |
+| `DENSE_RANK()` | Tied rows share a rank; next rank doesn't skip (1, 1, 2) |
+
+Example output:
+
+```
+name   | score | row_num | rank | dense_rank
+-------+-------+---------+------+-----------
+Alice  |   100 |       1 |    1 |          1
+Bob    |    95 |       2 |    2 |          2
+Carol  |    95 |       3 |    2 |          2
+Dave   |    90 |       4 |    4 |          3
+```
+
+## PARTITION BY: Per-Group Rankings
+
+Add `PARTITION BY` to rank within groups instead of across the whole result set:
+
+```sql
+-- Rank orders within each customer, newest first
+SELECT
+    customer_id,
+    id AS order_id,
+    created_at,
+    ROW_NUMBER() OVER (
+        PARTITION BY customer_id
+        ORDER BY created_at DESC
+    ) AS order_rank
+FROM orders;
+```
+
+To get each customer's most recent order:
+
+```sql
+SELECT customer_id, order_id, created_at
+FROM (
+    SELECT
+        customer_id,
+        id AS order_id,
+        created_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY created_at DESC
+        ) AS rn
+    FROM orders
+) ranked
+WHERE rn = 1;
+```
+
+## LAG and LEAD: Accessing Adjacent Rows
+
+`LAG` accesses a previous row; `LEAD` accesses a following row — without a self-join.
+
+```sql
+SELECT
+    date,
+    revenue,
+    LAG(revenue)  OVER (ORDER BY date) AS prev_day_revenue,
+    LEAD(revenue) OVER (ORDER BY date) AS next_day_revenue,
+    revenue - LAG(revenue) OVER (ORDER BY date) AS day_over_day_change
+FROM daily_revenue
+ORDER BY date;
+```
+
+Both functions accept an optional offset (default 1) and a default value for when no adjacent row exists:
+
+```sql
+LAG(revenue, 1, 0) OVER (ORDER BY date)  -- use 0 when there's no previous row
+```
+
+## Running Totals and Moving Averages
+
+Use `ROWS BETWEEN` to define a frame — the subset of rows to include in the calculation.
+
+```sql
+SELECT
+    date,
+    amount,
+    -- Running total (all rows from start to current)
+    SUM(amount) OVER (ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+    -- 7-day moving average
+    AVG(amount) OVER (ORDER BY date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving_avg_7d
+FROM daily_sales;
+```
+
+Common frame specifications:
+
+| Frame | Meaning |
+|:------|:--------|
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | From first row to current (running total) |
+| `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` | Current row plus 6 preceding (7-row window) |
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` | Entire partition |
+
+## Frequently Asked Questions
+
+#### Can I filter on a window function result in a WHERE clause?
+
+No — window functions are evaluated after `WHERE`. To filter on a window function result, wrap the query in a subquery or CTE:
+
+```sql
+SELECT * FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+    FROM orders
+) t
+WHERE rn = 1;
+```
+
+#### What's the difference between ROWS and RANGE in the frame clause?
+
+`ROWS` counts physical rows. `RANGE` groups rows with the same `ORDER BY` value together. For most use cases (running totals, moving averages), `ROWS` gives the expected behavior. `RANGE` can produce surprising results when there are ties in the order column.
+
+#### Do window functions work with indexes?
+
+Window functions don't use indexes for the window computation itself, but the query can still use indexes for the `WHERE` clause to reduce the rows being processed. Complex window queries benefit from [Reading EXPLAIN in MySQL](/guides/reading-explain) to understand the execution plan.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1064` on window function syntax | Window functions require MySQL 8.0 — check `SELECT VERSION()` |
+| Window function result in WHERE clause failing | Move the filter to an outer query or CTE — WHERE can't reference window functions |
+| `RANK()` skipping numbers unexpectedly | Expected behavior — use `DENSE_RANK()` if you don't want gaps |
+| Slow window function query | Add an index on the `PARTITION BY` and `ORDER BY` columns to speed up the sort |

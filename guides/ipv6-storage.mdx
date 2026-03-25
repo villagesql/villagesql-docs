@@ -1,0 +1,154 @@
+---
+title: "IPv6 Storage in MySQL"
+sidebarTitle: "Storing IPv6 Addresses"
+description: "How to store IPv6 addresses in MySQL — VARBINARY(16) with INET6_ATON, and how VillageSQL's INET type handles IPv4 and IPv6 in one unified column."
+keywords: "mysql ipv6 storage, mysql inet6_aton, mysql ipv6 column, mysql store ipv6 address, mysql ipv4 ipv6 unified, mysql varbinary ipv6"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+IPv4 fits in a 4-byte integer. IPv6 is 128 bits and needs 16 bytes of binary storage. MySQL provides `INET6_ATON()` and `INET6_NTOA()` for this, and they work — but mixing IPv4 and IPv6 in one column requires extra care. VillageSQL's `INET` type stores both families in one column with a consistent API.
+
+## MySQL's IPv6 Approach: VARBINARY(16)
+
+MySQL 5.6 added `INET6_ATON()` and `INET6_NTOA()` for binary IPv6 storage. `INET6_ATON()` handles both IPv4 and IPv6:
+
+```sql
+SELECT HEX(INET6_ATON('192.168.1.5'));      -- Returns 4-byte IPv4
+SELECT HEX(INET6_ATON('2001:db8::1'));      -- Returns 16-byte IPv6
+SELECT LENGTH(INET6_ATON('192.168.1.5'));   -- Returns 4
+SELECT LENGTH(INET6_ATON('2001:db8::1'));   -- Returns 16
+```
+
+Storing both families in one column:
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address VARBINARY(16),     -- 4 bytes for IPv4, 16 bytes for IPv6
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (INET6_ATON('192.168.1.5')),
+    (INET6_ATON('2001:db8::1'));
+
+SELECT INET6_NTOA(ip_address), accessed_at FROM access_log;
+```
+
+`INET6_NTOA()` returns IPv4 in dotted-decimal and IPv6 in compressed notation. The column `VARBINARY(16)` holds both. This is the standard approach and it works.
+
+The friction is in operations that need to know which family a row contains:
+
+```sql
+-- Filter only IPv6
+SELECT INET6_NTOA(ip_address) FROM access_log
+WHERE LENGTH(ip_address) = 16;
+
+-- No validation on insert — this silently stores NULL
+INSERT INTO access_log (ip_address) VALUES (INET6_ATON('not-an-ip'));
+```
+
+There's no built-in way to extract prefix length, netmask, or network address from a `VARBINARY` column.
+
+## With VillageSQL: Unified INET Type
+
+VillageSQL's `vsql_network_address` extension provides an `INET` type that stores both IPv4 and IPv6 natively. The same functions work for both families — no length checks or separate code paths needed.
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.5')),
+    (inet_from_string('2001:db8::1')),
+    (inet_from_string('::1')),            -- IPv6 loopback
+    (inet_from_string('fe80::1'));        -- link-local
+
+SELECT inet_to_string(ip_address), inet_family(ip_address) AS family
+FROM access_log;
+```
+
+### Working with IPv6 specifically
+
+IPv6 addresses are stored and retrieved in expanded notation:
+
+```sql
+-- Compressed input → expanded storage
+SELECT inet_to_string(inet_from_string('2001:db8::1'));
+-- Returns: 2001:0db8:0000:0000:0000:0000:0000:0001
+
+-- Extract just the address without prefix
+SELECT inet_host(inet_from_string('2001:db8::1/64'));
+-- Returns: 2001:0db8:0000:0000:0000:0000:0000:0001
+
+-- Get prefix length
+SELECT inet_masklen(inet_from_string('2001:db8::1/64'));
+-- Returns: 64
+
+-- Get network address
+SELECT cidr_to_string(inet_network(inet_from_string('2001:db8::1/64')));
+-- Returns: 2001:0db8:0000:0000:0000:0000:0000:0000/64
+
+-- Get netmask
+SELECT inet_to_string(inet_netmask(inet_from_string('2001:db8::1/64')));
+-- Returns: ffff:ffff:ffff:ffff:0000:0000:0000:0000
+```
+
+### Filtering by address family
+
+```sql
+-- Only IPv6 connections
+SELECT inet_to_string(ip_address), accessed_at
+FROM access_log
+WHERE inet_family(ip_address) = 6;
+
+-- Only IPv4 connections
+SELECT inet_to_string(ip_address), accessed_at
+FROM access_log
+WHERE inet_family(ip_address) = 4;
+```
+
+## MySQL vs VillageSQL for IPv6
+
+| Approach | Stores IPv6 | Family detection | Prefix support | Validates on insert |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(45)` | Yes | Manual string check | No | No |
+| `VARBINARY(16)` + `INET6_ATON` | Yes | `LENGTH() = 16` | No | No (returns NULL on bad input) |
+| `INET` (VillageSQL) | Yes | `inet_family() = 6` | Yes | Yes |
+
+## Frequently Asked Questions
+
+#### Does the INET type store IPv4 in IPv4-mapped IPv6 format (::ffff:x.x.x.x)?
+
+No — IPv4 addresses are stored as native IPv4, not as IPv4-mapped IPv6. `inet_family()` returns `4` for IPv4 addresses regardless of how they were written.
+
+#### Does INET handle IPv6 compressed notation like ::1?
+
+Yes. `inet_from_string('::1')` and `inet_from_string('fe80::1')` both parse correctly. Compressed notation is accepted on input; output is always the expanded form.
+
+#### Can I index an INET column for fast lookups?
+
+Yes — `CREATE INDEX idx_ip ON access_log(ip_address)` works. Equality lookups and range scans (for subnet queries) use the index. See [Querying by Subnet in MySQL](/guides/subnet-queries) for the pattern.
+
+#### Is VARBINARY(16) + INET6_ATON wrong?
+
+No — it's the correct MySQL-only approach. It's more compact than INET (4 or 16 bytes vs 7 or 19), but you lose built-in family detection, prefix handling, and validation. For schemas that need to work across both IPv4 and IPv6 with prefix-aware operations, `INET` is more ergonomic.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION inet_from_string does not exist` | Run `INSTALL EXTENSION vsql_network_address` |
+| IPv6 addresses display in expanded form | Expected — `2001:db8::1` stores as `2001:0db8:0000:0000:0000:0000:0000:0001` |
+| `inet_from_string()` returns NULL for a valid IPv6 | Check for typos; try the address in expanded form to isolate the issue |
+| `INET6_ATON` returns different values than `inet_from_string` | The underlying binary differs in size (4 vs 7 bytes for IPv4); they're not interchangeable |

@@ -1,0 +1,276 @@
+---
+title: "Stored Procedures in MySQL"
+sidebarTitle: "Writing Stored Procedures"
+description: "How MySQL stored procedures work: CREATE PROCEDURE syntax, IN/OUT/INOUT parameters, local variables, control flow, cursors, and when stored procedures help vs hurt."
+keywords: "mysql stored procedure, mysql create procedure, mysql stored procedure example, mysql procedure parameters, mysql procedure vs function, mysql call procedure, mysql delimiter"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A stored procedure is a named block of SQL that runs on the server. You call it once and it executes however many statements are inside. The code lives in the database, not in your application.
+
+## Creating a Stored Procedure
+
+MySQL uses `DELIMITER` to change the statement terminator so the `;` inside the procedure body doesn't end the `CREATE PROCEDURE` statement early.
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_active_users()
+BEGIN
+    SELECT id, name, email
+    FROM users
+    WHERE status = 'active'
+    ORDER BY name;
+END$$
+
+DELIMITER ;
+```
+
+Call it with `CALL`:
+
+```sql
+CALL get_active_users();
+```
+
+Drop it:
+
+```sql
+DROP PROCEDURE IF EXISTS get_active_users;
+```
+
+View its definition:
+
+```sql
+SHOW CREATE PROCEDURE get_active_users\G
+```
+
+## Parameters
+
+Procedures support three parameter modes:
+
+| Mode | Direction | Use case |
+|:-----|:----------|:---------|
+| `IN` | Caller → procedure | Pass a value in |
+| `OUT` | Procedure → caller | Return a value out |
+| `INOUT` | Both | Pass in and modify |
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_user_count(
+    IN  p_status  VARCHAR(20),
+    OUT p_count   INT
+)
+BEGIN
+    SELECT COUNT(*) INTO p_count
+    FROM users
+    WHERE status = p_status;
+END$$
+
+DELIMITER ;
+```
+
+Call it with a user-defined variable for `OUT` parameters:
+
+```sql
+CALL get_user_count('active', @count);
+SELECT @count;
+```
+
+## Local Variables
+
+Declare local variables with `DECLARE` at the top of the `BEGIN...END` block, before any other statements:
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE transfer_funds(
+    IN p_from_account INT,
+    IN p_to_account   INT,
+    IN p_amount       DECIMAL(10,2)
+)
+BEGIN
+    DECLARE v_balance DECIMAL(10,2);
+
+    SELECT balance INTO v_balance
+    FROM accounts
+    WHERE id = p_from_account;
+
+    IF v_balance < p_amount THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Insufficient funds';
+    END IF;
+
+    UPDATE accounts SET balance = balance - p_amount WHERE id = p_from_account;
+    UPDATE accounts SET balance = balance + p_amount WHERE id = p_to_account;
+END$$
+
+DELIMITER ;
+```
+
+## Control Flow
+
+MySQL procedures support standard control flow constructs:
+
+```sql
+-- IF...ELSEIF...ELSE
+IF v_count > 100 THEN
+    SET v_tier = 'high';
+ELSEIF v_count > 10 THEN
+    SET v_tier = 'medium';
+ELSE
+    SET v_tier = 'low';
+END IF;
+
+-- CASE
+CASE p_status
+    WHEN 'active'   THEN SET v_label = 'Active User';
+    WHEN 'inactive' THEN SET v_label = 'Inactive User';
+    ELSE                 SET v_label = 'Unknown';
+END CASE;
+
+-- WHILE loop
+WHILE v_i <= 10 DO
+    SET v_sum = v_sum + v_i;
+    SET v_i = v_i + 1;
+END WHILE;
+
+-- REPEAT...UNTIL
+REPEAT
+    SET v_i = v_i + 1;
+UNTIL v_i > 10
+END REPEAT;
+```
+
+## Error Handling
+
+Use `DECLARE ... HANDLER` to catch errors:
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE safe_insert(IN p_name VARCHAR(100))
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    INSERT INTO items (name) VALUES (p_name);
+    COMMIT;
+END$$
+
+DELIMITER ;
+```
+
+`EXIT HANDLER` stops the procedure when the condition fires. `CONTINUE HANDLER` lets the procedure keep running. `RESIGNAL` re-raises the error to the caller.
+
+Raise your own errors with `SIGNAL`:
+
+```sql
+SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT = 'Custom error message';
+```
+
+`45000` is the SQLSTATE for "unhandled user-defined exception."
+
+## Cursors
+
+Cursors iterate over a result set row by row inside a procedure. Use them when you can't express the logic as a set operation.
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE process_orders()
+BEGIN
+    DECLARE v_done    INT DEFAULT FALSE;
+    DECLARE v_id      INT;
+    DECLARE v_amount  DECIMAL(10,2);
+
+    DECLARE order_cursor CURSOR FOR
+        SELECT id, amount FROM orders WHERE status = 'pending';
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+    OPEN order_cursor;
+
+    read_loop: LOOP
+        FETCH order_cursor INTO v_id, v_amount;
+        IF v_done THEN
+            LEAVE read_loop;
+        END IF;
+        -- process each row
+        UPDATE orders SET status = 'processed' WHERE id = v_id;
+    END LOOP;
+
+    CLOSE order_cursor;
+END$$
+
+DELIMITER ;
+```
+
+The `NOT FOUND` handler sets `v_done` when the cursor runs out of rows. Always close cursors before the procedure ends.
+
+## Stored Procedures vs Functions
+
+| | Stored Procedure | Stored Function |
+|:--|:-----------------|:----------------|
+| Return value | Via OUT parameters or result sets | Single return value |
+| Call syntax | `CALL proc()` | `SELECT func()` — used in expressions |
+| Transactions | Can `START TRANSACTION`, `COMMIT`, `ROLLBACK` | Cannot modify transaction state |
+| Result sets | Can return multiple result sets | Cannot return result sets |
+| Use in SQL | Cannot be used in SELECT expressions | Can be used in SELECT, WHERE, etc. |
+
+Use a function when you need to embed the logic in a SQL expression. Use a procedure for everything else — multi-step processes, conditional logic, side effects.
+
+## When to Use Stored Procedures
+
+Stored procedures make sense when:
+- Enforcing business rules that must apply regardless of which application or user runs the query
+- Reducing round trips for multi-step operations (complex batch jobs, data migrations)
+- Granting users access to specific operations without exposing underlying tables (`GRANT EXECUTE ON PROCEDURE`)
+
+They hurt when:
+- The logic changes frequently — deployments require ALTER PROCEDURE or DROP/recreate
+- Debugging is needed — no debugger, only SIGNAL-based logging
+- Portability matters — stored procedure syntax is MySQL-specific
+
+## Frequently Asked Questions
+
+#### Can a stored procedure return a result set?
+
+Yes. Any `SELECT` inside a procedure that doesn't use `INTO` sends a result set to the caller:
+
+```sql
+CREATE PROCEDURE get_users()
+BEGIN
+    SELECT id, name FROM users;  -- this result set goes to the caller
+END;
+```
+
+Multiple `SELECT` statements inside one procedure send multiple result sets. Most clients handle this but some ORMs don't.
+
+#### How do I see all stored procedures in a database?
+
+```sql
+SHOW PROCEDURE STATUS WHERE Db = 'mydb';
+-- or
+SELECT routine_name, created, last_altered
+FROM information_schema.routines
+WHERE routine_type = 'PROCEDURE' AND routine_schema = 'mydb';
+```
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1064` on CREATE PROCEDURE | Missing `DELIMITER` change — the `;` inside the body ended the statement early; wrap with `DELIMITER $$ ... $$; DELIMITER ;` |
+| `ERROR 1172: Result consisted of more than one row` | A `SELECT ... INTO` returned multiple rows — add a `LIMIT 1` or fix the query to return a single row |
+| `OUT` parameter is NULL after CALL | The procedure didn't assign to it — check all code paths reach the `SET` or `SELECT INTO` for that parameter |
+| `ERROR 1193: Unknown system variable` | Used `SET @var` (session variable) where `DECLARE v_var` (local variable) was needed, or vice versa |
+| Procedure runs but returns no data | The result set `SELECT` is sending data through an extra layer (nested CALL) — bring the SELECT to the outermost procedure |

@@ -1,0 +1,178 @@
+---
+title: "MySQL Triggers"
+sidebarTitle: "Writing Triggers"
+description: "How MySQL triggers work: CREATE TRIGGER syntax, BEFORE vs AFTER, NEW and OLD row references, multiple triggers per event, and when triggers help vs hurt maintainability."
+keywords: "mysql triggers, mysql create trigger, mysql before after trigger, mysql trigger example, mysql NEW OLD trigger, mysql trigger insert update delete, mysql audit trigger"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A trigger is SQL that runs automatically when a row is inserted, updated, or deleted. MySQL fires triggers before or after the data change, giving you access to the row values being written.
+
+## Creating a Trigger
+
+```sql
+CREATE TRIGGER trigger_name
+    {BEFORE | AFTER} {INSERT | UPDATE | DELETE}
+    ON table_name
+    FOR EACH ROW
+BEGIN
+    -- trigger body
+END;
+```
+
+A practical example — log every price change:
+
+```sql
+CREATE TABLE price_history (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    product_id  INT,
+    old_price   DECIMAL(10,2),
+    new_price   DECIMAL(10,2),
+    changed_at  DATETIME DEFAULT NOW()
+);
+
+DELIMITER $$
+
+CREATE TRIGGER log_price_change
+    AFTER UPDATE ON products
+    FOR EACH ROW
+BEGIN
+    IF OLD.price <> NEW.price THEN
+        INSERT INTO price_history (product_id, old_price, new_price)
+        VALUES (NEW.id, OLD.price, NEW.price);
+    END IF;
+END$$
+
+DELIMITER ;
+```
+
+Drop a trigger:
+
+```sql
+DROP TRIGGER IF EXISTS log_price_change;
+```
+
+List all triggers in the current database:
+
+```sql
+SHOW TRIGGERS\G
+-- or
+SELECT trigger_name, event_manipulation, event_object_table, action_timing
+FROM information_schema.triggers
+WHERE trigger_schema = DATABASE();
+```
+
+## BEFORE vs AFTER
+
+| | BEFORE trigger | AFTER trigger |
+|:--|:--------------|:-------------|
+| Runs | Before the row is written | After the row is written |
+| Can modify `NEW` values | Yes — changes apply to the row | No — row already written |
+| Can see `OLD` values | Yes (UPDATE/DELETE) | Yes (UPDATE/DELETE) |
+| Use for | Validation, defaulting values, data normalization | Audit logging, cascading to other tables, notifications |
+
+A `BEFORE INSERT` trigger can set default values or reject bad data. An `AFTER INSERT` trigger can write audit records after the insert succeeds.
+
+## NEW and OLD References
+
+| Trigger type | `NEW` | `OLD` |
+|:-------------|:------|:------|
+| `INSERT` | New row values | Not available |
+| `UPDATE` | New values after update | Original values before update |
+| `DELETE` | Not available | Values of the deleted row |
+
+Modify `NEW` values in a `BEFORE` trigger to change what gets written:
+
+```sql
+CREATE TRIGGER normalize_email
+    BEFORE INSERT ON users
+    FOR EACH ROW
+BEGIN
+    SET NEW.email = LOWER(TRIM(NEW.email));
+END;
+```
+
+## Multiple Triggers Per Event
+
+MySQL 5.7+ supports multiple triggers on the same table and event. The `FOLLOWS` and `PRECEDES` keywords control execution order:
+
+```sql
+CREATE TRIGGER audit_insert
+    AFTER INSERT ON orders
+    FOR EACH ROW
+    FOLLOWS another_trigger
+BEGIN
+    INSERT INTO audit_log (action, table_name, row_id, happened_at)
+    VALUES ('INSERT', 'orders', NEW.id, NOW());
+END;
+```
+
+Without `FOLLOWS`/`PRECEDES`, MySQL assigns execution order based on creation time.
+
+## Raising Errors in Triggers
+
+Use `SIGNAL` to abort the operation and return an error to the caller:
+
+```sql
+CREATE TRIGGER enforce_minimum_price
+    BEFORE INSERT ON products
+    FOR EACH ROW
+BEGIN
+    IF NEW.price < 0.01 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Price must be at least $0.01';
+    END IF;
+END;
+```
+
+When a `BEFORE` trigger signals an error, the insert/update/delete is aborted — nothing is written.
+
+## Trigger Limitations
+
+MySQL triggers have several restrictions worth knowing:
+- Triggers cannot call stored procedures that return result sets
+- Triggers cannot use `COMMIT`, `ROLLBACK`, or `SAVEPOINT` directly (they participate in the surrounding transaction)
+- Triggers cannot reference the table they're defined on (no recursive trigger calls via direct queries on the same table in most contexts)
+- `AFTER` triggers cannot modify `NEW` values — the row is already written
+- MySQL does not support statement-level triggers (every trigger is `FOR EACH ROW`)
+
+## When to Use Triggers
+
+Triggers work well for:
+- Audit logging — capturing who changed what and when, regardless of application
+- Enforcing complex constraints that CHECK constraints can't express
+- Keeping derived data in sync (denormalized summary columns, audit timestamps)
+
+Avoid triggers when:
+- The logic is complex enough that debugging it requires tracing hidden side effects
+- Performance is critical — every trigger fires per row, on every affected statement
+- The trigger modifies data in a way that surprises application developers unaware of its existence
+
+Hidden triggers are a common source of "why did this row change?" confusion. If a trigger exists, document it prominently at the application level, not just in the database.
+
+## Frequently Asked Questions
+
+#### Do triggers fire during LOAD DATA INFILE?
+
+Yes. `INSERT` triggers fire for each row loaded by `LOAD DATA INFILE`. If your trigger does significant work, bulk-loading through LOAD DATA will be much slower than loading into a staging table first, then copying with INSERT...SELECT (which also fires triggers, but you can temporarily disable them with `SET @disable_trigger = TRUE` and a conditional check inside the trigger).
+
+#### Can triggers call stored procedures?
+
+Yes, with one exception: the called procedure cannot return a result set (a `SELECT` without `INTO`). If it does, MySQL returns an error. Procedures called from triggers can use `OUT` parameters and `SELECT...INTO`.
+
+#### Do triggers fire on REPLACE INTO?
+
+`REPLACE` executes as a DELETE + INSERT when there's a conflict. On conflict: `BEFORE DELETE`, `AFTER DELETE`, `BEFORE INSERT`, and `AFTER INSERT` triggers all fire on the target table. `ON DELETE CASCADE` rules on related tables do NOT fire from a REPLACE.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| Trigger not firing | Confirm the trigger exists: `SHOW TRIGGERS LIKE 'table_name'` — also verify the event (INSERT/UPDATE/DELETE) and timing (BEFORE/AFTER) match what you expect |
+| `ERROR 1442: Can't update table in stored function/trigger` | A trigger can't directly INSERT/UPDATE/DELETE the same table it's defined on in most contexts — write to a different table or use a stored procedure called after the DML |
+| AFTER trigger changes not persisting | `AFTER` triggers cannot modify `NEW` — switch to `BEFORE` if you need to alter the row being written |
+| Trigger slowing down bulk insert | Triggers fire per row — for bulk loads, consider disabling the trigger temporarily or loading into a staging table |
+| `SIGNAL` in trigger not surfacing to app | Some drivers swallow errors from triggers — check `SHOW WARNINGS` and verify your driver's error handling configuration |

@@ -1,0 +1,138 @@
+---
+title: "MySQL Views"
+sidebarTitle: "Creating Views"
+description: "How MySQL views work: creating and querying views, updatable views, WITH CHECK OPTION, view algorithms (MERGE vs TEMPTABLE), and when views help vs hurt."
+keywords: "mysql views, mysql create view, mysql updatable view, mysql view with check option, mysql view algorithm, mysql view vs table, mysql view performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A view is a named query stored in the database. Querying a view looks identical to querying a table, but the view's SELECT runs at query time — there's no data stored separately.
+
+## Creating and Querying Views
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Query it like a table
+SELECT * FROM active_customers WHERE email LIKE '%@example.com';
+```
+
+To see the underlying definition:
+
+```sql
+SHOW CREATE VIEW active_customers\G
+```
+
+To modify a view, use `CREATE OR REPLACE VIEW`:
+
+```sql
+CREATE OR REPLACE VIEW active_customers AS
+SELECT id, name, email, created_at
+FROM customers
+WHERE status = 'active';
+```
+
+To drop a view:
+
+```sql
+DROP VIEW active_customers;
+```
+
+## Updatable Views
+
+Some views support `INSERT`, `UPDATE`, and `DELETE` through the view. A view is updatable when it maps cleanly to a single underlying table:
+
+- Selects from a single table (no JOIN)
+- No `DISTINCT`
+- No aggregate functions (`SUM`, `COUNT`, etc.)
+- No `GROUP BY` or `HAVING`
+- No subqueries in the `WHERE` clause that reference the same table
+- No `UNION`
+
+```sql
+-- This view is updatable
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Update through the view
+UPDATE active_customers SET email = 'new@example.com' WHERE id = 42;
+```
+
+MySQL updates the underlying `customers` table. If the view filters rows, you can `UPDATE` a row to a value that makes it invisible through the view — the row still exists in the base table but disappears from the view.
+
+## WITH CHECK OPTION
+
+`WITH CHECK OPTION` prevents inserts and updates through a view that would make the row invisible through the view:
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active'
+WITH CHECK OPTION;
+
+-- Fails: setting status = 'inactive' would hide the row from the view
+UPDATE active_customers SET status = 'inactive' WHERE id = 42;
+-- ERROR 1369: CHECK OPTION failed 'mydb.active_customers'
+```
+
+Use `WITH CHECK OPTION` when a view represents a meaningful subset of data and you want to ensure that inserts and updates through it stay in that subset.
+
+## View Algorithms
+
+MySQL executes views using one of two algorithms:
+
+| Algorithm | Behavior | When MySQL chooses it |
+|:----------|:---------|:----------------------|
+| `MERGE` | Rewrites the outer query to inline the view's SELECT — no temp table | Simple views without aggregates, DISTINCT, GROUP BY, UNION |
+| `TEMPTABLE` | Materializes the view into a temp table first, then runs the outer query | Views with aggregates, DISTINCT, GROUP BY, UNION |
+
+`TEMPTABLE` means the entire view result is computed before the outer query runs — the optimizer can't push down `WHERE` conditions from the outer query into the view. For filtering to work efficiently on a `TEMPTABLE` view, the filter must be inside the view's own definition.
+
+Specify the algorithm explicitly to avoid surprises:
+
+```sql
+CREATE ALGORITHM=MERGE VIEW active_customers AS
+SELECT id, name, email FROM customers WHERE status = 'active';
+```
+
+If MySQL can't satisfy the requested algorithm, it uses `TEMPTABLE` instead.
+
+## Views Are Not Indexed
+
+A view has no indexes of its own. Queries against a `MERGE` view can use indexes from the underlying table. Queries against a `TEMPTABLE` view cannot — the temporary table has no indexes.
+
+For a frequently queried view result you need to index, the options are:
+- Ensure the view uses `MERGE` algorithm and index the underlying table columns
+- Replace the view with a real table that's populated by a job or trigger
+
+## Frequently Asked Questions
+
+#### When should I use a view?
+
+Views work well for access control (expose a subset of columns or rows to a user), simplifying a complex join that multiple queries use, and presenting a stable interface when the underlying schema may change. They're not a performance tool — they don't cache or store data.
+
+#### Can I join views?
+
+Yes. Joining two `MERGE` views is effectively joining the two underlying queries — MySQL rewrites the whole thing. Joining `TEMPTABLE` views is slower since each view materializes independently first. For complex joins, [CTEs in MySQL](/guides/ctes-in-mysql) often give more control over execution.
+
+#### Do views update automatically when the underlying table changes?
+
+The view definition is stored as SQL text. If you add a column to the base table, `SELECT *` from the view won't include it — you need to `CREATE OR REPLACE VIEW`. If you rename or drop a column the view references, the view becomes invalid and queries against it will error until you recreate it.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1369: CHECK OPTION failed` | The update would hide the row from the view — check the view's WHERE conditions |
+| View query slow despite indexes on base table | View may be using TEMPTABLE algorithm — check `EXPLAIN` for "DERIVED"; restructure or switch to CTE |
+| `UPDATE` through view updates wrong rows | View is not updatable due to JOIN or aggregation — update the base table directly |
+| `ERROR 1356: View references invalid table` | Underlying table was renamed or dropped — recreate the view |

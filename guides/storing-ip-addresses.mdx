@@ -1,0 +1,149 @@
+---
+title: "Storing IP Addresses in MySQL"
+sidebarTitle: "Storing IP Addresses"
+description: "How to store IP addresses in MySQL efficiently — why VARCHAR and INT fall short, and how VillageSQL's INET type handles IPv4 and IPv6 in one column."
+keywords: "mysql store ip address, mysql inet type, mysql ip address column, mysql ipv4 storage, mysql ip validation, mysql ip address best practice"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Most MySQL schemas store IP addresses as `VARCHAR(45)`. It works, but it wastes space, does nothing to validate the format, and sorts lexicographically instead of numerically — so `192.168.1.10` sorts before `192.168.1.9`. VillageSQL's `INET` type fixes all of this and handles IPv4 and IPv6 in the same column.
+
+## The MySQL Default: VARCHAR
+
+The straightforward approach:
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address VARCHAR(45),    -- fits IPv4 (15 chars) and IPv6 (39 chars)
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES ('192.168.1.5');
+```
+
+`VARCHAR(45)` stores whatever string you give it. There's no validation — `'not-an-ip'` inserts without error. Sorting doesn't follow numerical order, and comparing against a subnet requires string manipulation or conversion functions.
+
+## The Standard Workaround: INT UNSIGNED + INET_ATON
+
+For IPv4, MySQL's `INET_ATON()` converts a dotted-decimal string to a 4-byte integer. This is compact and sorts correctly:
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INT UNSIGNED,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address)
+VALUES (INET_ATON('192.168.1.5'));
+
+SELECT INET_NTOA(ip_address) AS ip FROM access_log;
+```
+
+This works well for IPv4-only schemas. The problem is IPv6: `INT UNSIGNED` can't hold a 128-bit address. You'd need `VARBINARY(16)` and `INET6_ATON()` / `INET6_NTOA()` for IPv6, meaning a schema change when IPv6 support is needed.
+
+## With VillageSQL: The INET Type
+
+VillageSQL's `vsql_network_address` extension adds a native `INET` type that stores both IPv4 and IPv6 addresses in a compact binary format — 7 bytes for IPv4, 19 bytes for IPv6 — with validation on insert.
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- IPv4 and IPv6 in the same column
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.5')),
+    (inet_from_string('10.0.0.1')),
+    (inet_from_string('2001:db8::1'));
+
+-- Read back as strings
+SELECT inet_to_string(ip_address), accessed_at FROM access_log;
+
+-- Sort by IP address numerically (not lexicographically)
+SELECT inet_to_string(ip_address) FROM access_log ORDER BY ip_address;
+```
+
+Invalid addresses are rejected at insert time — no application-layer validation needed.
+
+### Working with stored addresses
+
+```sql
+-- Extract address family
+SELECT inet_to_string(ip_address),
+       inet_family(ip_address) AS family   -- 4 or 6
+FROM access_log;
+
+-- Check if an address is IPv6
+SELECT * FROM access_log
+WHERE inet_family(ip_address) = 6;
+
+-- Store with a netmask (INET allows host bits)
+INSERT INTO access_log (ip_address)
+VALUES (inet_from_string('192.168.1.5/24'));
+
+SELECT inet_host(ip_address)    AS host_part,
+       inet_masklen(ip_address) AS prefix_len
+FROM access_log WHERE id = 1;
+```
+
+### Indexing
+
+```sql
+CREATE INDEX idx_ip ON access_log(ip_address);
+
+-- Equality lookups use the index
+SELECT * FROM access_log
+WHERE ip_address = inet_from_string('192.168.1.5');
+```
+
+## Choosing a Storage Approach
+
+| Approach | IPv6 support | Validates on insert | Sorts correctly | Storage |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(45)` | Yes | No | No (lexicographic) | 15–45 bytes |
+| `INT UNSIGNED` + `INET_ATON` | No | No | Yes (numeric) | 4 bytes |
+| `VARBINARY(16)` + `INET6_ATON` | Yes | No | Yes | 4 or 16 bytes |
+| `INET` (VillageSQL) | Yes | Yes | Yes | 7 or 19 bytes |
+
+For new schemas that need both IPv4 and IPv6 with built-in validation, `INET` is the cleanest option. For IPv4-only schemas with no VillageSQL dependency, `INT UNSIGNED` with `INET_ATON` / `INET_NTOA` is the established approach.
+
+For subnet queries against stored addresses, see [Querying by Subnet in MySQL](/guides/subnet-queries).
+
+## Frequently Asked Questions
+
+#### Can INET store addresses with a netmask, like 192.168.1.5/24?
+
+Yes. `INET` allows host bits — `192.168.1.5/24` is valid. If you want to enforce that host bits are zero (pure network addresses), use the `CIDR` type instead.
+
+#### Does INET validate the address on insert?
+
+Yes. `inet_from_string('not-an-ip')` returns NULL rather than storing garbage. If you pass NULL to an INET column with a NOT NULL constraint, the insert fails.
+
+#### How does ORDER BY ip_address sort mixed IPv4/IPv6?
+
+IPv4 addresses sort before IPv6 addresses. Within each family, addresses sort numerically. This matches PostgreSQL's INET sort order.
+
+#### Is INET the same as PostgreSQL's inet type?
+
+Functionally yes — same types (INET, CIDR, MACADDR, MACADDR8), same function naming conventions, same validation rules. The main difference is that VillageSQL provides functions rather than operators for comparisons and subnet checks.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION inet_from_string does not exist` | Run `INSTALL EXTENSION vsql_network_address` |
+| `inet_from_string()` returns NULL | The input string is not a valid IP address |
+| IPv6 addresses display in expanded form | Expected — `2001:db8::1` stores and retrieves as `2001:0db8:0000:0000:0000:0000:0000:0001` |
+| CIDR insert fails for `192.168.1.5/24` | CIDR requires host bits to be zero — use `192.168.1.0/24` or use INET instead |
+| Sorting by IP is wrong | Ensure you're sorting the INET column, not a `VARCHAR` copy |

@@ -1,0 +1,149 @@
+---
+title: "Choosing MySQL Data Types"
+sidebarTitle: "Choosing Data Types"
+description: "How to choose the right MySQL data type for your columns: integers, strings, dates, and JSON — with storage costs and performance trade-offs."
+keywords: "mysql data types, mysql varchar vs text, mysql int vs bigint, mysql datetime vs timestamp, mysql data type size, mysql column types, mysql json type"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+The data type you assign to a column affects storage size, index efficiency, and query behavior. Choosing a type that's larger than necessary wastes space in every row and in every index that includes that column. Choosing a type that's too small causes truncation errors or silent data loss.
+
+## Integer Types
+
+MySQL has five integer types. Pick the smallest one that fits your expected range.
+
+| Type | Storage | Range (signed) | Use when |
+|:-----|:--------|:---------------|:---------|
+| `TINYINT` | 1 byte | -128 to 127 | Flags, status codes, small enumerations |
+| `SMALLINT` | 2 bytes | -32,768 to 32,767 | Counts or IDs that won't exceed ~32K |
+| `MEDIUMINT` | 3 bytes | -8.3M to 8.3M | Mid-range IDs or counters |
+| `INT` | 4 bytes | -2.1B to 2.1B | Most IDs and counters |
+| `BIGINT` | 8 bytes | ±9.2 quintillion | Large IDs, Unix timestamps in milliseconds |
+
+`INT UNSIGNED` doubles the positive range to ~4.3B. Use `UNSIGNED` on primary keys and foreign keys that are always positive — it's free extra range.
+
+`BIGINT` is twice the storage of `INT`. Don't default to it for all IDs — `INT` handles over 2 billion rows, which is more than most tables ever reach.
+
+## String Types
+
+### VARCHAR vs CHAR
+
+`VARCHAR(n)` stores only as many bytes as the string contains (plus 1-2 bytes for length). `CHAR(n)` always stores exactly `n` bytes, padding shorter strings with spaces.
+
+| Type | Storage | Use when |
+|:-----|:--------|:---------|
+| `CHAR(n)` | Always n bytes | Fixed-length strings (country codes, status flags like 'Y'/'N', MD5 hashes) |
+| `VARCHAR(n)` | Actual length + 1-2 bytes | Variable-length strings (names, emails, URLs) |
+
+`CHAR` can be slightly faster for fixed-length values because no length prefix needs to be parsed. For anything variable, use `VARCHAR`.
+
+### VARCHAR vs TEXT
+
+```sql
+-- VARCHAR stores inline in the row (up to row size limit)
+name VARCHAR(255)
+
+-- TEXT stores off-page once it exceeds a threshold; inline storage is limited
+description TEXT
+```
+
+`VARCHAR` values up to the row size limit are stored inline in the clustered index page. `TEXT` (and `BLOB`) values are stored in overflow pages once they're large enough. This means:
+- `VARCHAR` columns are included in indexes directly
+- `TEXT` columns can't be fully indexed — you need a prefix length: `INDEX (description(100))`
+
+Use `VARCHAR` for strings you know are under a few hundred characters. Use `TEXT` for long content (articles, comments, HTML) where inline storage doesn't make sense.
+
+## Date and Time Types
+
+| Type | Storage | Range | Use when |
+|:-----|:--------|:------|:---------|
+| `DATE` | 3 bytes | 1000-01-01 to 9999-12-31 | Date only, no time |
+| `TIME` | 3 bytes | -838:59:59 to 838:59:59 | Duration or time of day |
+| `DATETIME` | 8 bytes | 1000-01-01 to 9999-12-31 | Timestamps with no timezone conversion |
+| `TIMESTAMP` | 4 bytes | 1970-01-01 to 2038-01-19 | Auto-updating timestamps; stored as UTC, displayed in session timezone |
+| `YEAR` | 1 byte | 1901 to 2155 | Year only |
+
+The key distinction between `DATETIME` and `TIMESTAMP`:
+
+- `TIMESTAMP` stores values as UTC and converts to the session's `time_zone` on retrieval. If your application operates in multiple timezones, `TIMESTAMP` handles the conversion automatically.
+- `DATETIME` stores the literal value with no timezone conversion — what you put in is what you get out.
+- `TIMESTAMP` has a 2038 limit (Unix timestamp overflow). For any date beyond 2038, use `DATETIME`.
+
+```sql
+-- TIMESTAMP auto-updates on insert and update
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+```
+
+For a full discussion of timezone handling, see [Timestamps and Time Zones in MySQL](/guides/timestamps-timezones).
+
+## Decimal and Floating Point
+
+| Type | Storage | Precision | Use when |
+|:-----|:--------|:----------|:---------|
+| `DECIMAL(p,s)` | Variable | Exact | Money, financial calculations — never use FLOAT for currency |
+| `FLOAT` | 4 bytes | ~7 significant digits | Scientific data where approximate values are acceptable |
+| `DOUBLE` | 8 bytes | ~15 significant digits | Higher-precision approximate values |
+
+`FLOAT` and `DOUBLE` use binary floating-point, which can't represent decimal fractions exactly. `0.1 + 0.2` in floating-point is `0.30000000000000004`. For money, always use `DECIMAL`.
+
+```sql
+-- Correct: exact decimal arithmetic
+price DECIMAL(10, 2)   -- up to 99,999,999.99
+
+-- Wrong: floating-point rounding errors will appear in financial calculations
+price FLOAT
+```
+
+## JSON
+
+`JSON` columns store validated JSON and provide path-based query operators.
+
+```sql
+-- Store structured data without a fixed schema
+CREATE TABLE events (
+    id      INT PRIMARY KEY AUTO_INCREMENT,
+    payload JSON NOT NULL
+);
+
+-- Extract a field
+SELECT payload->>'$.user_id' FROM events;
+
+-- Filter on a nested field
+SELECT * FROM events WHERE payload->>'$.event_type' = 'purchase';
+```
+
+`JSON` columns can't be indexed directly. To index a frequently-queried JSON field, use a generated column:
+
+```sql
+ALTER TABLE events
+    ADD COLUMN event_type VARCHAR(50) AS (payload->>'$.event_type') STORED,
+    ADD INDEX idx_event_type (event_type);
+```
+
+## Frequently Asked Questions
+
+#### Should I use INT or BIGINT for primary keys?
+
+`INT` handles 2.1 billion rows as a signed integer, 4.3 billion unsigned. For most tables, `INT UNSIGNED` is enough. Use `BIGINT` if you genuinely expect to exceed that, or if you're using UUID-style IDs that don't fit in 4 bytes.
+
+#### Can I use VARCHAR(255) everywhere to avoid thinking about it?
+
+You can, but longer `VARCHAR` declarations produce wider index keys, which increases index memory usage and reduces how many index entries fit per page. Declare the realistic maximum — `VARCHAR(100)` for a name field, not `VARCHAR(255)`. The actual storage cost matches the data length, but the index key length is fixed at the declared size.
+
+#### What's the practical difference between NULL and a default value?
+
+`NULL` means "unknown" — it propagates through expressions and is excluded from aggregate functions. A default value like `0` or `''` means "explicitly set to empty." Pick `NULL` for genuinely absent data; pick a default for "not yet set" scenarios where you want the column to have a sensible value immediately. Mixing them creates inconsistency in queries.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `Data too long for column` | Column type is too narrow — increase `VARCHAR` length or switch to `TEXT` |
+| Rounding errors in financial calculations | Replace `FLOAT`/`DOUBLE` with `DECIMAL(p,s)` |
+| `TIMESTAMP` shows wrong time | Session `time_zone` differs from expected — check `SELECT @@session.time_zone` |
+| Can't create index on TEXT column | Use a prefix index: `INDEX (col(100))`, or add a generated column |
+| INT primary key approaching limit | Alter to `BIGINT` or `INT UNSIGNED` before hitting the ceiling |

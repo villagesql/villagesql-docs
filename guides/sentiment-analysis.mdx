@@ -1,0 +1,158 @@
+---
+title: "Sentiment Analysis on MySQL Data"
+sidebarTitle: "Analyzing Sentiment"
+description: "How to run sentiment analysis on text stored in MySQL using VillageSQL's ai_prompt() — scoring reviews, support tickets, and feedback without leaving SQL."
+keywords: "mysql sentiment analysis, mysql ai sentiment, mysql review sentiment, mysql positive negative neutral, mysql text sentiment score, mysql ai_prompt sentiment"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Sentiment analysis tells you whether text expresses positive, negative, or neutral feeling. The most common use case is product reviews and support tickets — knowing at a glance whether a customer is happy or frustrated without reading every row. MySQL has no built-in sentiment function. VillageSQL's `ai_prompt()` adds one.
+
+## Standard Approach: Application-Layer Sentiment
+
+The typical setup runs sentiment scoring outside MySQL — pulling rows to a Python script that calls a sentiment library or an AI API, then writing scores back. This works, but it splits your data pipeline: some logic lives in SQL, some in Python, and a bulk re-score requires running a script.
+
+## With VillageSQL: Sentiment in SQL
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+Sentiment analysis is a classification task. The prompt specifies the scale and asks for a single-word result:
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE reviews ADD COLUMN sentiment VARCHAR(10);
+
+SET SESSION max_execution_time = 300000;
+
+UPDATE reviews
+SET sentiment = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT(
+        'What is the sentiment of this review? ',
+        'Reply with exactly one word: positive, negative, or neutral.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment IS NULL
+LIMIT 100;
+```
+
+Once labeled, query sentiment like any other column:
+
+```sql
+-- Sentiment distribution
+SELECT sentiment, COUNT(*) AS count
+FROM reviews
+GROUP BY sentiment
+ORDER BY count DESC;
+
+-- Recent negative reviews that need attention
+SELECT id, review_text, created_at
+FROM reviews
+WHERE sentiment = 'negative'
+  AND created_at > NOW() - INTERVAL 7 DAY
+ORDER BY created_at DESC;
+```
+
+### Adding a numeric score
+
+For trend analysis and averaging, ask for a 1–5 score instead of a label:
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_score TINYINT;
+
+UPDATE reviews
+SET sentiment_score = CAST(ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5-20251001',
+    @key,
+    CONCAT(
+        'Rate the sentiment of this review from 1 (very negative) to 5 (very positive). ',
+        'Reply with a single digit only.\n\n',
+        'Review: ', review_text
+    )
+) AS SIGNED)
+WHERE sentiment_score IS NULL
+LIMIT 100;
+
+-- Average sentiment over time
+SELECT DATE(created_at) AS day,
+       ROUND(AVG(sentiment_score), 2) AS avg_score,
+       COUNT(*) AS review_count
+FROM reviews
+WHERE sentiment_score IS NOT NULL
+GROUP BY DATE(created_at)
+ORDER BY day DESC;
+```
+
+### Aspect-based sentiment
+
+If you want sentiment broken down by topic — the product quality vs. shipping vs. customer service — ask for structured JSON output:
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_detail JSON;
+
+UPDATE reviews
+SET sentiment_detail = ai_prompt(
+    'anthropic',
+    'claude-sonnet-4-5-20250929',  -- better model for nuanced structured output
+    @key,
+    CONCAT(
+        'Analyze this review and return JSON with sentiment scores for each aspect. ',
+        'Keys: product_quality, shipping, customer_service. ',
+        'Values: positive, negative, neutral, or null if not mentioned. ',
+        'Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment_detail IS NULL
+LIMIT 50;
+
+SELECT
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.product_quality')) AS product,
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.shipping')) AS shipping,
+    review_text
+FROM reviews
+WHERE JSON_EXTRACT(sentiment_detail, '$.shipping') = '"negative"';
+```
+
+## Accuracy Notes
+
+Fast, cheap models (Claude Haiku, GPT-4o mini) are reliable for straightforward positive/negative/neutral classification. Nuanced cases — sarcasm, mixed reviews, domain-specific language — benefit from a more capable model. If accuracy matters, validate a sample of model outputs against human labels before running a full backfill.
+
+For setup and provider options, see [Connecting MySQL to AI APIs](/guides/ai-api-setup).
+
+## Frequently Asked Questions
+
+#### How is this different from text classification?
+
+Sentiment analysis is a specific classification task focused on emotional tone. [Classifying Text in MySQL with AI](/guides/text-classification) covers the general pattern; this guide shows sentiment-specific prompts and score-based output.
+
+#### Can I run sentiment analysis as rows are inserted?
+
+Yes via trigger, but each INSERT will take 5–30 seconds while the API call runs. Better to run sentiment scoring in a scheduled batch job.
+
+#### What about non-English text?
+
+Capable AI models handle many languages well. Specify the expected language in the prompt if accuracy degrades: "Rate the sentiment of this French review..."
+
+#### How do I handle NULL results?
+
+`ai_prompt()` returns NULL on failure. Run the UPDATE batch loop until no NULL rows remain, with rate-limit-aware pacing in your application.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION ai_prompt does not exist` | Run `INSTALL EXTENSION vsql_ai` |
+| Returns NULL | Check API key, `max_execution_time`, and model name |
+| Score column fills with 0 instead of NULL | `CAST('positive' AS SIGNED)` returns 0 — model returned non-numeric text. Tighten prompt: "Reply with a single digit only, no other text." |
+| Inconsistent labels | Add "Reply with exactly one word" to prompt; normalize with post-UPDATE query |

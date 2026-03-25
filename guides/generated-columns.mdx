@@ -1,0 +1,163 @@
+---
+title: "Generated Columns in MySQL"
+sidebarTitle: "Using Generated Columns"
+description: "How MySQL generated columns work: VIRTUAL vs STORED, expressions and indexing, functional index patterns, and when generated columns replace application-layer computation."
+keywords: "mysql generated column, mysql virtual column, mysql stored generated column, mysql computed column, mysql generated column index, mysql functional index, mysql as generated"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A generated column is a column whose value is derived from an expression rather than stored by the application. MySQL computes it automatically — you define the formula once in the schema, and MySQL keeps it consistent.
+
+## Syntax
+
+```sql
+column_name data_type [GENERATED ALWAYS] AS (expression) [VIRTUAL | STORED]
+```
+
+```sql
+CREATE TABLE orders (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    subtotal    DECIMAL(10,2) NOT NULL,
+    tax_rate    DECIMAL(5,4) NOT NULL,
+    tax_amount  DECIMAL(10,2) AS (subtotal * tax_rate) VIRTUAL,
+    total       DECIMAL(10,2) AS (subtotal + subtotal * tax_rate) STORED
+);
+```
+
+## VIRTUAL vs STORED
+
+| | VIRTUAL | STORED |
+|:--|:--------|:-------|
+| Storage | No disk storage — computed on read | Written to disk on INSERT/UPDATE |
+| Computation timing | Every SELECT | Every INSERT/UPDATE |
+| Disk space | Saves space | Uses space like a regular column |
+| Can be indexed | Yes (index stores the computed values) | Yes |
+| Can be a foreign key target | No | No |
+| Default | Yes — VIRTUAL is the default if omitted | Opt-in |
+
+Use `STORED` when the computation is expensive and you read the column far more than you write it. Use `VIRTUAL` (the default) when storage is a concern or writes happen frequently.
+
+## Expressions
+
+Generated column expressions can reference other columns in the same row. They cannot reference other generated columns or call non-deterministic functions.
+
+```sql
+CREATE TABLE users (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    first_name VARCHAR(50),
+    last_name  VARCHAR(50),
+    full_name  VARCHAR(101) AS (CONCAT(first_name, ' ', last_name)) VIRTUAL,
+    email      VARCHAR(100),
+    email_lower VARCHAR(100) AS (LOWER(email)) STORED
+);
+```
+
+Functions allowed in generated columns must be deterministic — same inputs always produce the same output. Disallowed: `NOW()`, `RAND()`, `UUID()`, subqueries, stored functions.
+
+Extracting fields from JSON is a common use case:
+
+```sql
+CREATE TABLE events (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    payload JSON,
+    user_id INT AS (payload->>'$.user_id') STORED,
+    action  VARCHAR(50) AS (payload->>'$.action') VIRTUAL
+);
+```
+
+## Indexing Generated Columns
+
+You can add an index on a generated column. For `VIRTUAL` columns, MySQL materializes the computed value into the index.
+
+```sql
+CREATE TABLE events (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    occurred_at DATETIME NOT NULL,
+    year_month  VARCHAR(7) AS (DATE_FORMAT(occurred_at, '%Y-%m')) VIRTUAL
+);
+
+-- Index the computed year_month
+ALTER TABLE events ADD INDEX idx_year_month (year_month);
+
+-- This query now uses the index
+SELECT * FROM events WHERE year_month = '2024-06';
+```
+
+This is also how to build a **functional index** — an index on a function of a column rather than the raw column value. MySQL 8.0.13+ supports functional indexes directly (`INDEX (LOWER(email))`), which internally creates a hidden generated column:
+
+```sql
+-- Functional index syntax (MySQL 8.0.13+)
+CREATE TABLE users (
+    id    INT PRIMARY KEY,
+    email VARCHAR(100),
+    INDEX idx_email_lower ((LOWER(email)))  -- note the double parentheses
+);
+
+-- Equivalent to:
+CREATE TABLE users (
+    id          INT PRIMARY KEY,
+    email       VARCHAR(100),
+    email_lower VARCHAR(100) AS (LOWER(email)) VIRTUAL,
+    INDEX idx_email_lower (email_lower)
+);
+```
+
+## Inserting and Updating
+
+You cannot assign a value to a generated column in an `INSERT` or `UPDATE`. The column value is always derived from the expression. You can write `DEFAULT` explicitly, but that's all:
+
+```sql
+-- Correct: omit the generated column entirely
+INSERT INTO orders (subtotal, tax_rate) VALUES (100.00, 0.08);
+
+-- Correct: DEFAULT is allowed
+INSERT INTO orders (subtotal, tax_rate, total) VALUES (100.00, 0.08, DEFAULT);
+
+-- Error: cannot assign a value to a generated column
+INSERT INTO orders (subtotal, tax_rate, total) VALUES (100.00, 0.08, 108.00);
+```
+
+## ALTER TABLE
+
+Add a generated column to an existing table:
+
+```sql
+ALTER TABLE orders
+ADD COLUMN discount_pct DECIMAL(5,2)
+    AS (CASE WHEN subtotal > 1000 THEN 0.10 ELSE 0.00 END) VIRTUAL;
+```
+
+Change a generated column's expression:
+
+```sql
+ALTER TABLE orders
+MODIFY COLUMN tax_amount DECIMAL(10,2)
+    AS (ROUND(subtotal * tax_rate, 2)) STORED;
+```
+
+## Frequently Asked Questions
+
+#### Can I use a generated column in a WHERE clause?
+
+Yes. For `VIRTUAL` columns without an index, MySQL computes the expression during the scan. For `STORED` columns or indexed `VIRTUAL` columns, the value is already materialized. Use `EXPLAIN` to verify whether the index is being used.
+
+#### Does a generated column update automatically when the source columns change?
+
+Yes. MySQL recomputes `VIRTUAL` generated columns on every read. `STORED` generated columns are recomputed and written on every `INSERT` or `UPDATE` that affects the columns in the expression.
+
+#### Can I use a generated column as a partition key?
+
+Yes, for `STORED` generated columns. `VIRTUAL` columns cannot be used as partition keys.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 3105: The value specified for generated column is not allowed` | You assigned an explicit value to a generated column in INSERT/UPDATE — omit it or use DEFAULT |
+| `ERROR 3106: 'Non-deterministic functions' is not allowed` | The expression uses `NOW()`, `RAND()`, `UUID()`, or a subquery — replace with deterministic alternatives |
+| Generated column not using index | Check `EXPLAIN` — the WHERE clause expression must exactly match the generated column's expression; `WHERE LOWER(email)` uses a `LOWER(email)` generated column index, but `WHERE LOWER(TRIM(email))` does not |
+| `STORED` column slowing down writes | Every INSERT/UPDATE recomputes and stores the expression — switch to `VIRTUAL` if read performance isn't the priority |
+| `ALTER TABLE` adding generated column is slow | MySQL rebuilds the table for `STORED` generated columns; `VIRTUAL` column additions are much faster (metadata-only in many cases) |

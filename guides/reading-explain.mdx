@@ -1,0 +1,150 @@
+---
+title: "Reading EXPLAIN in MySQL"
+sidebarTitle: "Reading EXPLAIN"
+description: "How to read MySQL EXPLAIN output: what each column means, how to spot full table scans, and how to use EXPLAIN to fix slow queries."
+keywords: "mysql explain output, mysql explain type, mysql explain rows, mysql explain key, mysql query plan, mysql optimize query, mysql explain analyze"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+When a query is slow, your first move is `EXPLAIN`. It shows you exactly how MySQL plans to execute the query — which indexes it uses, how many rows it expects to scan, and where it's doing expensive work. Once you can read it, you can fix almost any slow query.
+
+## Running EXPLAIN
+
+Put `EXPLAIN` in front of any `SELECT`:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+MySQL returns one row per table in the query. For joins, you get multiple rows — one per table involved.
+
+## The Columns That Matter
+
+A full `EXPLAIN` row looks like this:
+
+```
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |   100.00 | NULL        |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+```
+
+Most columns matter some of the time. These matter almost all of the time:
+
+### `type` — How MySQL scans the table
+
+This is the most important column. It tells you the access method, from fastest to slowest:
+
+| type | Meaning | When you see it |
+|:-----|:--------|:----------------|
+| `const` | Single row by primary key or unique index | `WHERE id = 5` |
+| `eq_ref` | One row per row from previous table | JOIN on primary key |
+| `ref` | Multiple rows from a non-unique index | `WHERE user_id = 42` |
+| `range` | Index range scan | `BETWEEN`, `>`, `<`, `IN` |
+| `index` | Full index scan | Scanning index left-to-right |
+| `ALL` | Full table scan | No usable index |
+
+**`ALL` is the one to fix.** It means MySQL is reading every row in the table. On a table with a million rows, that's a million reads for every query execution.
+
+### `key` — Which index MySQL chose
+
+`NULL` means no index was used. If `possible_keys` lists indexes but `key` is `NULL`, MySQL decided a full scan was cheaper — usually because the table is small or the query isn't selective enough.
+
+### `rows` — Estimated rows examined
+
+An estimate, not a guarantee. MySQL uses statistics to produce this number. A query with `rows: 1` is fast; `rows: 5000000` on a production table is a problem.
+
+### `Extra` — Additional execution details
+
+The `Extra` column holds important flags:
+
+| Extra value | Meaning |
+|:------------|:--------|
+| `Using index` | Covering index — no row lookups needed (fast) |
+| `Using where` | MySQL filters rows after reading them |
+| `Using filesort` | Sort can't use an index — extra sort step |
+| `Using temporary` | MySQL created a temp table (expensive on large sets) |
+| `Using index condition` | Index Condition Pushdown — filtering at the storage layer |
+
+`Using filesort` and `Using temporary` together on large tables are red flags.
+
+## A Worked Example
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- No indexes yet
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key  | rows    | Extra                          |
+|------|------|---------|--------------------------------|
+| ALL  | NULL | 1000000 | Using where; Using filesort    |
+```
+
+Two problems: full table scan (`ALL`) and a filesort. Fix both with a composite index (see [How MySQL Indexes Work](/guides/mysql-indexes) for index design principles):
+
+```sql
+CREATE INDEX idx_status_created ON orders (status, created_at);
+
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key                | rows | Extra |
+|------|--------------------|------|-------|
+| ref  | idx_status_created | 4200 | NULL  |
+```
+
+`rows` dropped from 1,000,000 to 4,200. `type` is now `ref` — an equality lookup on `status`. The filesort is gone because the index already orders rows by `created_at` within each `status` value.
+
+## EXPLAIN ANALYZE
+
+MySQL 8.0 added `EXPLAIN ANALYZE`, which actually executes the query and returns real timing alongside the estimates:
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
+-> Index lookup on orders using idx_user_id (user_id=42)
+   (cost=4.50 rows=12) (actual time=0.045..0.112 rows=11 loops=1)
+```
+
+`cost` and `rows` are the optimizer's estimates. `actual time` and `actual rows` are what really happened. A large gap between estimated and actual rows means stale statistics — run `ANALYZE TABLE orders` to update them.
+
+## Frequently Asked Questions
+
+#### What's the relationship between EXPLAIN and covering indexes?
+`Extra: Using index` means MySQL is using a covering index — it can answer the query entirely from the index without reading table rows. That's one of the most impactful optimizations available on read-heavy tables. See [Covering Indexes in MySQL](/guides/covering-indexes) for how to design them.
+
+#### My query has `type: index` — is that okay?
+Not really. `type: index` means MySQL scanned the entire index (instead of the table), which is faster than `ALL` but still a full scan. It appears when a query needs all rows but can satisfy it from the index. If you're hitting this on large tables, check whether a covering index or a `WHERE` clause could narrow the scan.
+
+#### Why does MySQL ignore the index I created?
+The optimizer chooses indexes based on statistics. If the table is small, MySQL may decide a full scan is cheaper. If the statistics are stale, it may underestimate how selective your index is. Run `ANALYZE TABLE` to refresh statistics, then re-check `EXPLAIN`.
+
+#### Can I use EXPLAIN on INSERT, UPDATE, and DELETE?
+Yes — `EXPLAIN` works on all DML statements in MySQL 8.0+. The output shows the access method for the rows being modified, which is useful when an UPDATE or DELETE is slow.
+
+If you need to identify which queries to EXPLAIN first, the [MySQL Slow Query Log](/guides/slow-query-log) captures the slowest queries on your server and ranks them by total time.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `type: ALL` on a large table | Add an index on the filtered column |
+| `Extra: Using filesort` | Add an index that covers both the `WHERE` and `ORDER BY` columns |
+| `Extra: Using temporary` | Rewrite the query to avoid `GROUP BY` on non-indexed columns, or add an index |
+| `key: NULL` despite an index existing | Run `ANALYZE TABLE` to update statistics; check if the index matches the query's column order |
+| Estimated `rows` far from actual | Run `ANALYZE TABLE` to refresh statistics |

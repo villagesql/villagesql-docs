@@ -1,0 +1,191 @@
+---
+title: "NULL in MySQL"
+sidebarTitle: "Working with NULL"
+description: "How NULL works in MySQL: three-valued logic, common pitfalls with comparisons and aggregates, and how indexes handle NULL values."
+keywords: "mysql null, mysql is null, mysql null comparison, mysql ifnull, mysql coalesce, mysql three valued logic, mysql null index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+NULL in MySQL doesn't mean zero, empty string, or false. It means unknown — and that distinction causes bugs that are hard to track down because the queries run without errors and return wrong results silently.
+
+## NULL Is Not a Value
+
+NULL represents the absence of a value. Comparing NULL to anything — including another NULL — doesn't return true or false. It returns NULL.
+
+```sql
+SELECT NULL = NULL;    -- NULL (not 1)
+SELECT NULL != NULL;   -- NULL (not 0)
+SELECT NULL = 0;       -- NULL
+SELECT NULL = '';      -- NULL
+SELECT 1 + NULL;       -- NULL
+SELECT 'hello' || NULL; -- NULL (concatenation with NULL is NULL)
+```
+
+This is three-valued logic: true, false, and unknown (NULL). Any comparison with NULL produces unknown, which MySQL treats as false in `WHERE` clauses. This means rows with NULL in a filtered column are silently excluded.
+
+```sql
+CREATE TABLE users (
+    id       INT PRIMARY KEY AUTO_INCREMENT,
+    email    VARCHAR(255),
+    referrer VARCHAR(255)  -- nullable
+);
+
+INSERT INTO users (email, referrer) VALUES
+    ('a@example.com', 'google'),
+    ('b@example.com', NULL),
+    ('c@example.com', 'twitter');
+
+-- This returns only 2 rows — the NULL row is silently excluded
+SELECT * FROM users WHERE referrer != 'google';
+```
+
+To include NULL rows, use `IS NULL` explicitly:
+
+```sql
+SELECT * FROM users WHERE referrer != 'google' OR referrer IS NULL;
+```
+
+## Testing for NULL
+
+Always use `IS NULL` and `IS NOT NULL`, never `= NULL` or `!= NULL`:
+
+```sql
+-- Wrong — always returns no rows
+SELECT * FROM users WHERE referrer = NULL;
+
+-- Correct
+SELECT * FROM users WHERE referrer IS NULL;
+SELECT * FROM users WHERE referrer IS NOT NULL;
+```
+
+MySQL also provides `<=>` (the NULL-safe equality operator), which treats two NULLs as equal:
+
+```sql
+SELECT NULL <=> NULL;  -- 1 (true)
+SELECT NULL <=> 0;     -- 0 (false)
+```
+
+This is useful in `WHERE` clauses when you want to match NULL-to-NULL, such as in queries comparing two potentially-null columns.
+
+## NULL in Aggregates
+
+Aggregate functions (`COUNT`, `SUM`, `AVG`, etc.) ignore NULL values — except `COUNT(*)`.
+
+```sql
+SELECT
+    COUNT(*)        AS total_rows,      -- counts all rows including NULLs
+    COUNT(referrer) AS has_referrer,    -- counts only non-NULL referrer values
+    AVG(referrer)   AS avg_referrer     -- ignores NULLs in the average
+FROM users;
+```
+
+```
+total_rows | has_referrer
+-----------+-------------
+3          | 2
+```
+
+`COUNT(*)` returns 3. `COUNT(referrer)` returns 2 — the NULL row is excluded. This is intentional behavior, but it surprises developers who expect `COUNT(column)` to equal `COUNT(*)`.
+
+## Handling NULL in Expressions
+
+Use `COALESCE` to substitute a default value when a column is NULL:
+
+```sql
+-- Returns the first non-NULL value in the list
+SELECT email, COALESCE(referrer, 'direct') AS source FROM users;
+```
+
+```
+email           | source
+----------------+---------
+a@example.com  | google
+b@example.com  | direct
+c@example.com  | twitter
+```
+
+`IFNULL(column, default)` is equivalent for the two-argument case:
+
+```sql
+SELECT email, IFNULL(referrer, 'direct') AS source FROM users;
+```
+
+`NULLIF(a, b)` returns NULL when `a = b`, otherwise returns `a`. Useful for avoiding division-by-zero:
+
+```sql
+SELECT total_revenue / NULLIF(order_count, 0) AS avg_order_value FROM stats;
+```
+
+| Function | Behavior | Use when |
+|:---------|:---------|:---------|
+| `COALESCE(a, b, ...)` | Returns the first non-NULL value in the list | You have multiple fallback options |
+| `IFNULL(a, b)` | Returns `b` if `a` is NULL, otherwise `a` | Single fallback value; simpler syntax than `COALESCE` for two arguments |
+| `NULLIF(a, b)` | Returns NULL if `a = b`, otherwise returns `a` | Suppressing a sentinel value (e.g., avoiding division by zero when count is 0) |
+
+NULL also affects JOIN behavior in non-obvious ways. A `LEFT JOIN` returns NULL for right-side columns when no match exists, and filtering on those NULL columns in `WHERE` silently converts it to an `INNER JOIN`. See [MySQL JOINs Explained](/guides/joins) for the ON vs. WHERE distinction.
+
+## NULL and Indexes
+
+MySQL indexes store NULL values. A `WHERE col IS NULL` query can use an index on `col`. However:
+
+- `NULL` values are not considered equal in a `UNIQUE` index — a unique column can contain multiple NULL values
+- In a composite index, NULL in any column position is indexed normally
+
+```sql
+CREATE TABLE sessions (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT,           -- nullable: anonymous sessions
+    token      VARCHAR(64) NOT NULL UNIQUE,
+    created_at DATETIME NOT NULL,
+    INDEX idx_user (user_id)  -- indexes NULL values too
+);
+
+-- This query can use idx_user
+SELECT * FROM sessions WHERE user_id IS NULL;
+```
+
+## Frequently Asked Questions
+
+#### Should I use NULL or empty string for optional text fields?
+Prefer NULL for genuinely absent data. Empty string (`''`) means "explicitly set to empty" and is distinct from "not provided." Mixing them creates inconsistency — `WHERE col IS NULL` and `WHERE col = ''` are different conditions. Pick one convention and apply it consistently.
+
+#### Why does `NOT IN` behave unexpectedly with NULLs?
+`NOT IN` with a subquery that returns any NULL always returns an empty result set:
+
+```sql
+-- If any value in category_ids is NULL, this returns no rows
+SELECT * FROM products WHERE category_id NOT IN (SELECT id FROM categories);
+```
+
+Use `NOT EXISTS` instead when the subquery might return NULLs:
+
+```sql
+SELECT * FROM products p
+WHERE NOT EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id);
+```
+
+#### Does `ORDER BY` sort NULLs?
+Yes. By default, MySQL sorts NULL values first in ascending order and last in descending order. MySQL doesn't support `NULLS FIRST` / `NULLS LAST` syntax (that's PostgreSQL). To control NULL placement, use a sort expression:
+
+```sql
+-- NULLs last in ascending order
+SELECT * FROM users ORDER BY referrer IS NULL, referrer ASC;
+
+-- NULLs first in ascending order (default behavior, but explicit)
+SELECT * FROM users ORDER BY referrer IS NULL DESC, referrer ASC;
+```
+
+`col IS NULL` evaluates to 0 for non-NULL values and 1 for NULL, so sorting by it ascending pushes NULLs to the end.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `WHERE col != 'value'` excludes NULL rows | Add `OR col IS NULL` to the condition |
+| `COUNT(column)` doesn't match `COUNT(*)` | Expected — `COUNT(column)` skips NULLs. Use `COUNT(*)` for total rows |
+| `NOT IN` subquery returns empty result | Subquery returns NULL — use `NOT EXISTS` instead |
+| `= NULL` in WHERE matches nothing | Replace with `IS NULL` |
+| UNIQUE column allows duplicate NULLs | Expected behavior — NULLs are not considered equal in unique indexes |

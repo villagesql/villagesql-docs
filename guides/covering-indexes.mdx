@@ -1,0 +1,127 @@
+---
+title: "Covering Indexes in MySQL"
+sidebarTitle: "Using Covering Indexes"
+description: "What covering indexes are in MySQL, how they eliminate row lookups, and how to design them for your most important queries."
+keywords: "mysql covering index, mysql using index, mysql index only scan, mysql composite index performance, mysql explain using index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A covering index is an index that contains every column a query needs. Understanding the basics of how indexes work first helps — [How MySQL Indexes Work](/guides/mysql-indexes) covers the B-tree structure, key length, and selectivity rules that apply here too. When MySQL can answer a query entirely from the index — without touching the actual table rows — it's called an index-only scan. On large tables, this is one of the biggest single-query optimizations available.
+
+## How Row Lookups Work (and Why They're Expensive)
+
+A regular index lookup is two steps:
+
+1. MySQL searches the index to find which rows match
+2. For each matching row, MySQL fetches the full row from the table (a "row lookup" or "back-to-table lookup")
+
+Step 2 is the expensive part. InnoDB's clustered index means the table data is physically sorted by primary key. When you look up rows by a secondary index, the primary key values are scattered — each row lookup is likely a random I/O on a different disk page. At scale, those random reads dominate query time.
+
+A covering index eliminates step 2 entirely.
+
+## Identifying a Covering Index in EXPLAIN
+
+`EXPLAIN` tells you when a covering index is in use: look for `Extra: Using index`. If you're not yet familiar with EXPLAIN output, [Reading EXPLAIN in MySQL](/guides/reading-explain) covers all the key columns.
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+CREATE INDEX idx_user_status_created ON orders (user_id, status, created_at);
+
+-- All three columns in the SELECT are in the index
+EXPLAIN SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------------+
+| type  | key                       | rows | Extra       |
++-------+---------------------------+------+-------------+
+| ref   | idx_user_status_created   |   12 | Using index |
++-------+---------------------------+------+-------------+
+```
+
+`Using index` — MySQL read only the index. No row lookups.
+
+Now add a column that's not in the index:
+
+```sql
+-- order_total is not in the index
+EXPLAIN SELECT user_id, status, created_at, order_total FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------+
+| type  | key                       | rows | Extra |
++-------+---------------------------+------+-------+
+| ref   | idx_user_status_created   |   12 | NULL  |
++-------+---------------------------+------+-------+
+```
+
+`Extra` is now empty — MySQL uses the index to find rows, then fetches the full row to get `order_total`. The row lookup is back.
+
+## Designing a Covering Index
+
+The goal is to include every column the query touches — in the `WHERE`, `ORDER BY`, `GROUP BY`, and `SELECT` list. Column order still follows the leftmost prefix rule for `WHERE` and `ORDER BY` filtering:
+
+```sql
+-- Query pattern:
+SELECT status, created_at FROM orders
+WHERE user_id = 42
+ORDER BY created_at;
+
+-- Covering index: equality column first, then sort column, then SELECT columns
+CREATE INDEX idx_covering ON orders (user_id, created_at, status);
+```
+
+- `user_id` first — the equality filter
+- `created_at` second — the sort column (index already ordered, no filesort)
+- `status` last — only in the `SELECT`, not in filtering or sorting
+
+The `SELECT` columns come last because they don't affect which rows are found or in what order — they're just along for the ride.
+
+## When Covering Indexes Are Worth It
+
+| Scenario | Worth it? |
+|:---------|:----------|
+| High-traffic query on a large table | Yes |
+| Narrow `SELECT` list (a few columns) | Yes |
+| Read-heavy workload | Yes |
+| Small table | No — row lookups are fast anyway |
+| `SELECT *` query | No — you can't cover all columns without indexing the whole table |
+| Write-heavy table | Evaluate — every `INSERT`/`UPDATE`/`DELETE` updates the index |
+
+```sql
+-- Not a candidate: SELECT * means no index can cover this
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Good candidate: narrow SELECT, high-traffic query
+SELECT order_id, status FROM orders WHERE user_id = 42 AND created_at > '2024-01-01';
+```
+
+## Frequently Asked Questions
+
+#### Does a covering index help with `SELECT *`?
+No. An index can only cover a query if it contains every column in the `SELECT` list. `SELECT *` selects all columns, so you'd need to index all columns — at that point you've essentially duplicated the table as an index, which isn't useful.
+
+#### Can a covering index still speed up `SELECT *` queries?
+Yes, partially. Even if MySQL has to do row lookups, the index narrows down which rows to fetch. The improvement comes from the `WHERE` filtering, not from eliminating row lookups.
+
+#### How do I know if a covering index would help?
+Run `EXPLAIN` and check `Extra`. If you see `Using index condition` or nothing (no `Using index`), and `rows` is large, a covering index might help. `EXPLAIN ANALYZE` shows actual vs. estimated row counts, which is useful for confirming the optimizer's choices.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `Extra` shows nothing instead of `Using index` | A column in the `SELECT` is not in the index — add it, or remove it from the query |
+| `Extra: Using index condition` instead of `Using index` | The index is used for filtering but not fully covering — add the remaining `SELECT` columns |
+| Index exists but `key` is `NULL` | Run `ANALYZE TABLE` to refresh statistics; check that the query's `WHERE` uses the leftmost index column |
+| Covering index slowing down writes | Expected trade-off — evaluate whether the read benefit outweighs the write cost for your workload |

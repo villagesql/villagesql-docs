@@ -1,0 +1,140 @@
+---
+title: "Schema Migrations in MySQL"
+sidebarTitle: "Running Migrations"
+description: "How to run MySQL schema migrations safely: ALTER TABLE behavior, online DDL, large table migrations, and how to use pt-online-schema-change or gh-ost."
+keywords: "mysql schema migration, mysql alter table, mysql online ddl, mysql alter table lock, pt-online-schema-change, gh-ost mysql, mysql add column production"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Schema changes on a live MySQL database range from trivial (adding a nullable column to a small table) to dangerous (modifying a column on a 500GB table that handles 50K writes per second). The difference is whether and how long MySQL locks the table.
+
+## How ALTER TABLE Works
+
+MySQL's `ALTER TABLE` has two modes depending on the operation and version:
+
+**Rebuilding DDL** (the old behavior): MySQL creates a new table with the new schema, copies all rows, swaps the tables, and drops the original. The table is locked for writes for the entire duration — minutes to hours on large tables.
+
+**Online DDL** (MySQL 5.6+): Many operations can run without blocking reads or writes. MySQL performs the change in-place or rebuilds the table in the background while allowing concurrent DML. To probe what a specific operation will do, add `ALGORITHM` and `LOCK` clauses explicitly — MySQL will reject the statement if it can't satisfy the requested constraints:
+
+```sql
+-- Fail fast if the operation would require any locking
+ALTER TABLE orders ADD COLUMN notes TEXT, LOCK=NONE;
+```
+
+## Online DDL Lock Modes
+
+The `ALGORITHM` and `LOCK` clauses control how MySQL executes the change:
+
+| ALGORITHM | Behavior |
+|:----------|:---------|
+| `INSTANT` | Changes only metadata — no table rebuild, no row reads. Available in MySQL 8.0 for some operations. |
+| `INPLACE` | Modifies the table in-place with minimal locking. Rows may not be rebuilt. |
+| `COPY` | Creates a new table, copies all rows. Slowest; required for some operations. |
+
+| LOCK | Behavior |
+|:-----|:---------|
+| `NONE` | No lock — reads and writes proceed normally during the change |
+| `SHARED` | Read lock — reads proceed, writes block |
+| `EXCLUSIVE` | Full lock — reads and writes block |
+
+```sql
+-- Request a specific algorithm; fails if MySQL can't do it that way
+ALTER TABLE orders
+    ADD COLUMN notes TEXT,
+    ALGORITHM=INSTANT;
+
+-- Fail if the operation would require a write lock
+ALTER TABLE orders
+    ADD COLUMN notes TEXT,
+    LOCK=NONE;
+```
+
+## What's Fast vs. What's Slow
+
+Operations that use `ALGORITHM=INSTANT` (MySQL 8.0) are nearly instantaneous regardless of table size:
+- Adding a nullable column at the end of the table
+- Adding/dropping a virtual generated column
+- Changing a column's default value
+
+Operations that require `ALGORITHM=COPY` block writes for the full duration:
+- Changing a column's data type
+- Converting character sets
+- Adding a full-text index on some versions
+
+Most index additions use `ALGORITHM=INPLACE, LOCK=NONE` — the table rebuild happens in the background and DML proceeds. Adding an index on a 100GB table takes time but doesn't block your application.
+
+## Large Table Migrations in Production
+
+For operations that require `ALGORITHM=COPY` on tables too large to lock, use an external tool:
+
+### pt-online-schema-change (Percona Toolkit)
+
+```bash
+pt-online-schema-change \
+  --alter "ADD COLUMN notes TEXT" \
+  --execute \
+  D=mydb,t=orders
+```
+
+`pt-osc` creates a shadow table, copies rows in batches, uses triggers to replicate ongoing writes, then swaps the tables. No application downtime.
+
+### gh-ost (GitHub)
+
+```bash
+gh-ost \
+  --user=root --host=localhost \
+  --database=mydb --table=orders \
+  --alter="ADD COLUMN notes TEXT" \
+  --execute
+```
+
+`gh-ost` uses the binary log instead of triggers, which is more reliable under high write load. It's the tool of choice for high-traffic tables.
+
+Both tools require the table to have a primary key.
+
+## Migration Tools and Version Control
+
+Track schema changes in version-controlled migration files. Common tools:
+
+| Tool | Language | Style |
+|:-----|:---------|:------|
+| Flyway | Java/any | SQL-based; versioned files |
+| Liquibase | Java/any | XML/YAML/SQL; change sets |
+| golang-migrate | Go | SQL-based; numbered files |
+| Alembic | Python | Python or SQL; auto-generates from models |
+
+Each tool maintains a migrations table in the database to track which migrations have run, so reruns are safe.
+
+## Frequently Asked Questions
+
+#### Can I add a column without locking the table?
+
+In MySQL 8.0, adding a nullable column at the end uses `ALGORITHM=INSTANT` and completes in milliseconds regardless of table size. In older versions or for other column positions, use `ALGORITHM=INPLACE, LOCK=NONE` — available for most column additions since MySQL 5.6. If neither works, use pt-osc or gh-ost.
+
+#### How do I check if an ALTER TABLE will lock my table?
+
+Add `ALGORITHM=INPLACE, LOCK=NONE` to the statement. MySQL will execute it without locking if it can, or return an error if it can't — either way you get a definitive answer without guessing:
+
+```sql
+-- If this succeeds, the index add won't lock the table
+ALTER TABLE orders ADD INDEX idx_customer (customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+Test on a copy of the table first when you're unsure about large tables in production.
+
+#### Should I run migrations inside a transaction?
+
+DDL statements (`ALTER TABLE`, `CREATE INDEX`, `DROP TABLE`) cause an implicit commit in MySQL — they can't be rolled back. Running them inside a `BEGIN`/`COMMIT` block doesn't protect you. Plan your rollback strategy at the application level (dual-write, feature flags) rather than relying on transaction rollback.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ALTER TABLE` blocking production traffic | Use `ALGORITHM=INSTANT` if available, or pt-osc/gh-ost for large tables |
+| `ERROR 1846: ALGORITHM=INSTANT is not supported` | Operation requires a table rebuild — use `ALGORITHM=INPLACE` or an online tool |
+| pt-osc failing with trigger errors | Table already has triggers — use gh-ost (binary log based, no triggers) |
+| Migration ran twice | Migration tool's tracking table out of sync — check the schema version table |
+| Long-running ALTER holding lock | Kill it with `KILL <query_id>` and use an online tool instead |

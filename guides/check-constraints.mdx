@@ -1,0 +1,145 @@
+---
+title: "CHECK Constraints in MySQL"
+sidebarTitle: "Using CHECK Constraints"
+description: "How MySQL CHECK constraints work: syntax, enforcement behavior, named constraints, disabling constraints, and how CHECK compares to triggers and application-level validation."
+keywords: "mysql check constraint, mysql check constraint example, mysql add check constraint, mysql constraint validation, mysql 8 check constraint, mysql create table check, mysql enforce data rules"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 8.0.16 added enforced `CHECK` constraints. Before that version, MySQL accepted the syntax but silently ignored it — a behavior that surprised many developers migrating from PostgreSQL.
+
+## Defining CHECK Constraints
+
+Add a `CHECK` constraint inline with the column or as a table-level constraint:
+
+```sql
+CREATE TABLE products (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    name     VARCHAR(100) NOT NULL,
+    price    DECIMAL(10,2) NOT NULL,
+    quantity INT NOT NULL,
+
+    -- Inline constraints
+    CONSTRAINT chk_price    CHECK (price > 0),
+    CONSTRAINT chk_quantity CHECK (quantity >= 0)
+);
+```
+
+Or inline with the column definition:
+
+```sql
+CREATE TABLE orders (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    status     VARCHAR(20) CHECK (status IN ('pending', 'shipped', 'delivered', 'cancelled')),
+    discount   DECIMAL(5,2) CHECK (discount BETWEEN 0 AND 100)
+);
+```
+
+Table-level constraints are necessary when the check expression spans multiple columns:
+
+```sql
+CREATE TABLE shipments (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    shipped_at   DATE,
+    delivered_at DATE,
+    CONSTRAINT chk_dates CHECK (delivered_at IS NULL OR delivered_at >= shipped_at)
+);
+```
+
+## Enforcement
+
+MySQL enforces `CHECK` constraints on `INSERT` and `UPDATE`. A violation returns `ERROR 3819 (HY000): Check constraint 'name' is violated.`:
+
+```sql
+INSERT INTO products (name, price, quantity) VALUES ('Widget', -5.00, 10);
+-- ERROR 3819 (HY000): Check constraint 'chk_price' is violated.
+```
+
+The error message includes the constraint name, which is why naming constraints is worth the extra typing.
+
+`CHECK` constraints are **not** evaluated on `DELETE`. They're also not re-evaluated when the constraint itself is added to an existing table — adding a constraint to a table with existing data that violates it will fail immediately.
+
+## Adding and Removing Constraints
+
+Add a constraint to an existing table:
+
+```sql
+ALTER TABLE products
+ADD CONSTRAINT chk_name_length CHECK (CHAR_LENGTH(name) >= 2);
+```
+
+Drop a named constraint:
+
+```sql
+ALTER TABLE products DROP CHECK chk_price;
+-- or the SQL standard syntax:
+ALTER TABLE products DROP CONSTRAINT chk_price;
+```
+
+List all constraints on a table:
+
+```sql
+SELECT cc.constraint_name, cc.check_clause
+FROM information_schema.check_constraints cc
+JOIN information_schema.table_constraints tc
+    ON tc.constraint_schema = cc.constraint_schema
+   AND tc.constraint_name   = cc.constraint_name
+WHERE cc.constraint_schema = DATABASE()
+  AND tc.table_name = 'products';
+```
+
+## Disabling Enforcement
+
+Disable a specific constraint without dropping it:
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price NOT ENFORCED;
+```
+
+Re-enable it:
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price ENFORCED;
+```
+
+`NOT ENFORCED` is useful during data migrations when you need to temporarily bypass validation. Re-enable enforcement when the migration is complete.
+
+## CHECK vs Triggers vs Application Validation
+
+| | CHECK constraint | Trigger | Application code |
+|:--|:----------------|:--------|:-----------------|
+| Enforced by | MySQL (always) | MySQL (always) | Application (only when app runs) |
+| Performance | Very low overhead | Per-row execution overhead | Round-trip cost |
+| Error visibility | SQL error with constraint name | SIGNAL required to surface error | Application-defined |
+| Cross-column checks | Yes | Yes | Yes |
+| Cross-table checks | No | Yes (can query other tables) | Yes |
+| Complexity | Simple expressions only | Arbitrary SQL logic | Arbitrary code |
+
+Use `CHECK` for simple, self-contained rules: valid ranges, allowed values, non-negative numbers, date ordering. Use a trigger when the rule requires querying other tables. Use application validation for rules involving external state (rate limits, availability checks).
+
+## Frequently Asked Questions
+
+#### Do CHECK constraints work on all storage engines?
+
+Yes. Unlike some MySQL features, `CHECK` constraints work on InnoDB, MyISAM, and other storage engines. However, MyISAM tables can have defined constraints that are syntactically valid but this storage engine does not have rollback, so a failed constraint on MyISAM can leave partial data. InnoDB handles violations cleanly with full rollback.
+
+#### Can CHECK constraints reference other tables?
+
+No. `CHECK` expressions are limited to the current row of the current table. Subqueries, stored functions, and references to other tables are not allowed in `CHECK` expressions. Use a trigger for cross-table validation.
+
+#### Were CHECK constraints always in MySQL?
+
+The syntax was accepted starting in MySQL 3.23, but constraints were silently ignored until MySQL 8.0.16. Code written before 8.0.16 may include `CHECK` clauses that did nothing. If you're migrating from a pre-8.0.16 schema, verify that existing `CHECK` clauses are actually valid and contain rules you want enforced.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 3819: Check constraint violated` | The INSERT or UPDATE value fails the constraint — check the constraint name in the error to identify which rule was violated |
+| `ALTER TABLE ADD CONSTRAINT` fails immediately | Existing rows in the table violate the constraint — fix the data first or use `NOT ENFORCED` during migration |
+| CHECK constraint defined but not being enforced | MySQL version is below 8.0.16 — upgrade or use triggers for enforcement |
+| Cannot drop a constraint | Use the constraint name (not the column name) with `DROP CHECK` or `DROP CONSTRAINT` |
+| Constraint name unknown | Query `information_schema.check_constraints` to find constraint names for the table |

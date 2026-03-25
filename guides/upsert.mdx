@@ -1,0 +1,125 @@
+---
+title: "UPSERT in MySQL"
+sidebarTitle: "Using UPSERT"
+description: "How to do UPSERT in MySQL: INSERT ... ON DUPLICATE KEY UPDATE, REPLACE INTO, INSERT IGNORE, when to use each, and the AUTO_INCREMENT side effects to know about."
+keywords: "mysql upsert, mysql insert on duplicate key update, mysql replace into, mysql insert ignore, mysql on duplicate key update, mysql upsert example, mysql insert or update"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL doesn't have an `UPSERT` keyword, but it has three ways to insert a row or handle a conflict: `INSERT ... ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, and `INSERT IGNORE`. They behave very differently — picking the wrong one can silently corrupt data.
+
+## INSERT ... ON DUPLICATE KEY UPDATE
+
+When the insert would violate a unique constraint (primary key or unique index), MySQL runs the `UPDATE` instead:
+
+```sql
+CREATE TABLE page_views (
+    page    VARCHAR(255) PRIMARY KEY,
+    views   INT NOT NULL DEFAULT 0,
+    last_at DATETIME
+);
+
+-- First call: inserts the row
+-- Subsequent calls: increments the counter
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW())
+ON DUPLICATE KEY UPDATE
+    views   = views + 1,
+    last_at = NOW();
+```
+
+To reference the value from the attempted insert (rather than the existing row), use row aliases (MySQL 8.0.19+):
+
+```sql
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW()) AS new
+ON DUPLICATE KEY UPDATE
+    views   = views + new.views,
+    last_at = new.last_at;
+```
+
+The older `VALUES(col)` syntax also works but is deprecated as of MySQL 8.0.20:
+
+```sql
+-- Deprecated — use row aliases instead
+ON DUPLICATE KEY UPDATE views = views + VALUES(views)
+```
+
+## REPLACE INTO
+
+`REPLACE` deletes the conflicting row and inserts a new one. It looks like an upsert but behaves like a delete + insert:
+
+```sql
+REPLACE INTO page_views (page, views, last_at)
+VALUES ('/home', 100, NOW());
+```
+
+This fires `BEFORE DELETE` and `AFTER DELETE` triggers on the target table and resets the `AUTO_INCREMENT` counter for the new row. It does NOT trigger `ON DELETE CASCADE` rules on related tables — foreign key cascades don't fire for REPLACE. Any columns not listed in the `REPLACE` get their default values — not the previous row's values.
+
+Use `REPLACE` only when you genuinely want to discard the old row entirely.
+
+## INSERT IGNORE
+
+`INSERT IGNORE` silently discards the row if any error occurs during the insert — including duplicate key, type errors, and constraint violations:
+
+```sql
+INSERT IGNORE INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW());
+```
+
+The problem with `INSERT IGNORE` is that it suppresses *all* errors, not just duplicates. A data type mismatch or a truncation warning becomes a silent no-op. Use it only when you genuinely don't care about the outcome.
+
+## Comparison
+
+| | `ON DUPLICATE KEY UPDATE` | `REPLACE INTO` | `INSERT IGNORE` |
+|:--|:--------------------------|:---------------|:----------------|
+| On conflict | Updates specified columns | Deletes + inserts | Discards the row |
+| Preserves existing values | Yes (you control what's updated) | No — unspecified columns reset to defaults | N/A (no update) |
+| Triggers fired | UPDATE triggers | DELETE + INSERT triggers on target table | No triggers on conflict |
+| Foreign key cascades | No | No (FK cascades don't fire for REPLACE) | No |
+| AUTO_INCREMENT | Increments on conflict | New increment for the inserted row | No increment |
+| Use when | You need to update specific fields | You want to fully replace the row | You want to silently skip duplicates |
+
+## AUTO_INCREMENT Side Effect
+
+`ON DUPLICATE KEY UPDATE` increments the `AUTO_INCREMENT` counter even when it takes the update path, not the insert path. Over time this creates gaps in the sequence:
+
+```sql
+SHOW CREATE TABLE page_views;  -- AUTO_INCREMENT value will jump past gaps
+```
+
+This is expected behavior. If your application depends on a gap-free sequence, use a separate counter table or handle sequence generation in the application.
+
+## Frequently Asked Questions
+
+#### Is ON DUPLICATE KEY UPDATE atomic?
+
+Yes — the insert attempt and the update happen in a single atomic operation. You don't need to wrap it in a transaction to avoid a race condition between checking existence and inserting.
+
+#### What if multiple unique indexes conflict?
+
+If an insert violates more than one unique constraint simultaneously, MySQL updates only one row — which one is undefined. Avoid designs where a single INSERT can conflict on multiple unique indexes. If your schema has overlapping unique constraints, test the behavior carefully.
+
+#### Can I use ON DUPLICATE KEY UPDATE with multi-row inserts?
+
+Yes:
+
+```sql
+INSERT INTO page_views (page, views)
+VALUES ('/home', 1), ('/about', 1), ('/contact', 1)
+ON DUPLICATE KEY UPDATE views = views + 1;
+```
+
+Each conflicting row triggers its own update. With row aliases, use `VALUES` for the multi-row case and `AS new` for the alias.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ON DUPLICATE KEY UPDATE` not triggering | The conflict column must be a PRIMARY KEY or UNIQUE index — regular indexes don't trigger it |
+| `REPLACE` clearing columns you didn't specify | Expected behavior — REPLACE is delete + insert; specify all columns or use ON DUPLICATE KEY UPDATE |
+| `INSERT IGNORE` hiding real errors | Remove IGNORE, reproduce the error, and fix the root cause — IGNORE masks all errors, not just duplicates |
+| AUTO_INCREMENT gaps growing large | Normal side effect of ON DUPLICATE KEY UPDATE; gaps in AUTO_INCREMENT are cosmetic and don't affect correctness |

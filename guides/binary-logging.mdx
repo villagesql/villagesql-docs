@@ -1,0 +1,201 @@
+---
+title: "MySQL Binary Logging"
+sidebarTitle: "Using Binary Logs"
+description: "How MySQL binary logging works: enabling binary logging, configuring ROW vs. STATEMENT vs. MIXED formats, reading binary log position for point-in-time recovery, setting up replication, and using binary logs for change data capture (CDC)."
+keywords: "mysql binary log, mysql binlog, mysql enable binary logging, mysql mysqlbinlog, mysql point in time recovery, mysql binlog format, mysql replication log, mysql binlog row format, mysql binary log position, mysql binlog row vs statement, mysql point in time recovery binlog, mysql change data capture, mysql cdc binlog, mysql replication setup"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+The MySQL binary log records every change made to the database — inserts, updates, deletes, schema changes. It's the foundation for replication and point-in-time recovery. Most production MySQL servers run with binary logging enabled.
+
+## Enabling Binary Logging
+
+Binary logging is enabled by default in MySQL 8.0. To verify:
+
+```sql
+SHOW VARIABLES LIKE 'log_bin';
+-- log_bin  ON
+```
+
+Configure it in `my.cnf` / `my.ini`:
+
+```ini
+[mysqld]
+log_bin = /var/log/mysql/mysql-bin
+binlog_format = ROW
+server_id = 1          -- required for replication; good practice to set always
+binlog_expire_logs_seconds = 604800  -- auto-purge logs older than 7 days
+max_binlog_size = 100M -- rotate to a new file when this size is reached
+```
+
+After `log_bin` is set, MySQL names binlog files as `mysql-bin.000001`, `mysql-bin.000002`, etc., with an index file (`mysql-bin.index`) listing them all.
+
+## Binary Log Formats
+
+MySQL supports three binlog formats:
+
+| Format | What's logged | Replication safety | Log size | Performance impact | Best for |
+|:-------|:-------------|:------------------|:---------|:------------------|:---------|
+| `ROW` | Actual before/after row data for each affected row | Safest — deterministic regardless of replica state | Largest (grows with data volume, especially bulk updates) | Highest write overhead on source | Production replication; PITR; CDC/change data capture |
+| `STATEMENT` | The SQL statement that caused the change | Unsafe for non-deterministic functions (`RAND()`, `UUID()`, `NOW()`) | Smallest | Lowest overhead | Read-heavy workloads where log size matters and all statements are deterministic |
+| `MIXED` | STATEMENT by default; switches to ROW for unsafe statements | Safe (ROW used when needed) | Medium | Medium | Legacy setups migrating from STATEMENT; not recommended for new deployments |
+
+`ROW` format is the recommended default. It replicates correctly even when non-deterministic functions like `RAND()` or `UUID()` are involved. The downside is larger log files — a single `UPDATE` touching millions of rows produces one statement in STATEMENT format but one row event per affected row in ROW format.
+
+### When to enable binary logging and which format to choose
+
+Binary logging is enabled by default in MySQL 8.0+. The question is usually which format to use and whether to leave it on at all.
+
+| Scenario | Recommendation |
+|:---------|:---------------|
+| Running any replica | Enable binary logging, use `ROW` format — it's required for Group Replication and recommended for standard replication |
+| Point-in-time recovery needed | Enable binary logging; format doesn't affect PITR capability, but `ROW` gives the most precise replay |
+| Change data capture (CDC) with Debezium, Kafka Connect, etc. | Enable binary logging, `ROW` format required — CDC tools read row-level events directly |
+| Standalone dev/test instance, no replication, no PITR | Disabling binary logging (`--skip-log-bin`) reduces write overhead and disk usage |
+| Very high write throughput, log size is a concern | Consider `binlog_row_image = MINIMAL` (logs only changed columns) rather than switching to STATEMENT |
+| Auditing or compliance | `ROW` format with `binlog_row_image = FULL` (the default) gives a complete before/after record |
+
+Check and change the format:
+
+```sql
+SHOW VARIABLES LIKE 'binlog_format';
+SET SESSION binlog_format = 'ROW';  -- change for current session
+```
+
+## Listing and Viewing Binary Logs
+
+List all binary log files:
+
+```sql
+SHOW BINARY LOGS;
+```
+
+Check the current binlog file and position:
+
+```sql
+SHOW BINARY LOG STATUS;
+```
+
+View the events in a binlog from SQL:
+
+```sql
+SHOW BINLOG EVENTS IN 'mysql-bin.000003' LIMIT 20;
+SHOW BINLOG EVENTS IN 'mysql-bin.000003' FROM 154 LIMIT 10;
+```
+
+## mysqlbinlog
+
+The `mysqlbinlog` tool decodes binary log files into human-readable SQL. It's used for point-in-time recovery and auditing:
+
+```bash
+# Read a local binlog file
+mysqlbinlog /var/log/mysql/mysql-bin.000003
+
+# Filter by time range
+mysqlbinlog --start-datetime="2024-06-15 10:00:00" \
+            --stop-datetime="2024-06-15 12:00:00" \
+            /var/log/mysql/mysql-bin.000003
+
+# Decode ROW format events (shows actual data changes)
+mysqlbinlog --verbose /var/log/mysql/mysql-bin.000003
+
+# Read directly from a running server
+mysqlbinlog --read-from-remote-server \
+            --host=127.0.0.1 --user=root --password \
+            mysql-bin.000003
+```
+
+## Point-in-Time Recovery
+
+Combining a full backup with binary logs lets you restore to any point in time after the backup was taken.
+
+**Typical workflow:**
+
+1. Take a full backup with `mysqldump --single-transaction --source-data`:
+
+```bash
+mysqldump --single-transaction --source-data=2 --all-databases \
+  -u root -p > backup.sql
+```
+
+`--source-data=2` writes the binlog filename and position as a comment in the dump. This is your recovery starting point.
+
+2. Restore the full backup:
+
+```bash
+mysql -u root -p < backup.sql
+```
+
+3. Find the binlog file and position from the dump:
+
+```bash
+head -50 backup.sql | grep "SOURCE_LOG_FILE"
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='mysql-bin.000003', SOURCE_LOG_POS=154;
+```
+
+4. Replay binlogs from that position up to just before the event you want to undo:
+
+```bash
+mysqlbinlog --start-position=154 \
+            --stop-datetime="2024-06-15 11:59:00" \
+            mysql-bin.000003 mysql-bin.000004 | mysql -u root -p
+```
+
+## Managing Binary Logs
+
+Manually purge old binary logs:
+
+```sql
+-- Purge all logs before a specific log file
+PURGE BINARY LOGS TO 'mysql-bin.000010';
+
+-- Purge all logs older than a date
+PURGE BINARY LOGS BEFORE '2024-06-01 00:00:00';
+```
+
+Auto-purge with `binlog_expire_logs_seconds` (MySQL 8.0+) or `expire_logs_days`:
+
+```sql
+SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';
+SET GLOBAL binlog_expire_logs_seconds = 604800;  -- 7 days in seconds
+```
+
+Never delete binlog files directly with `rm` — use `PURGE BINARY LOGS` so the index file stays consistent.
+
+## Frequently Asked Questions
+
+#### Does binary logging affect write performance?
+
+Yes, modestly. ROW format logging adds overhead proportional to the amount of data changed. For write-heavy workloads, the overhead is typically 5–15%. It's almost always worth it for the recovery and replication capabilities it enables.
+
+#### Can I skip binary logging for a specific session?
+
+```sql
+SET SESSION sql_log_bin = 0;
+-- ... operations that won't be logged ...
+SET SESSION sql_log_bin = 1;
+```
+
+This is useful for loading data on a replica that doesn't need to propagate further, or for bulk operations you want to exclude from point-in-time recovery scope. Requires the `BINLOG_ADMIN` or `SUPER` privilege.
+
+#### How do I know how much disk space my binary logs are using?
+
+```sql
+SHOW BINARY LOGS;
+-- Sum the File_size column
+```
+
+Or on disk: `du -sh /var/log/mysql/mysql-bin.*`
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| Binary log files filling up disk | Set `binlog_expire_logs_seconds` or run `PURGE BINARY LOGS BEFORE` — never `rm` the files directly |
+| `mysqlbinlog` output is unreadable for ROW format | Add `--verbose` (or `-v`) to decode row events into pseudo-SQL |
+| Point-in-time recovery missed some changes | Check that all binlog files in the range were included — gaps in the file list leave holes in the replay |
+| `ERROR: Binary logging not possible` in replication | Replica may need `log_bin` enabled and a unique `server_id` — both are required |
+| High replication lag | ROW format produces more data — check replica I/O and SQL thread lag with `SHOW REPLICA STATUS\G` |

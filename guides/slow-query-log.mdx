@@ -1,0 +1,135 @@
+---
+title: "The MySQL Slow Query Log"
+sidebarTitle: "Using the Slow Query Log"
+description: "How to enable and use MySQL's slow query log to find queries that need optimization, including log format, key fields, and mysqldumpslow."
+keywords: "mysql slow query log, mysql long_query_time, mysql enable slow query log, mysqldumpslow, mysql find slow queries, mysql query optimization"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+The slow query log is MySQL's built-in tool for finding queries that need attention. It captures any query that takes longer than a configurable threshold and writes it to a log file. If you don't know which queries to optimize, start here.
+
+## Enabling the Slow Query Log
+
+You can enable it at runtime without restarting the server:
+
+```sql
+-- Enable the log
+SET GLOBAL slow_query_log = 'ON';
+
+-- Log queries that take longer than 1 second
+SET GLOBAL long_query_time = 1;
+
+-- Check where the log file is being written
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+These settings apply immediately but reset on server restart. To make them permanent, add them to your `my.cnf` or `my.ini`:
+
+```ini
+[mysqld]
+slow_query_log = ON
+long_query_time = 1
+slow_query_log_file = /var/log/mysql/slow.log
+```
+
+## What Gets Logged
+
+A typical entry looks like this:
+
+```
+# Time: 2024-03-15T14:23:01.234567Z
+# User@Host: app_user[app_user] @ localhost []  Id: 142
+# Query_time: 4.521893  Lock_time: 0.000123  Rows_sent: 1  Rows_examined: 847293
+SET timestamp=1710509381;
+SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+The header fields that matter most:
+
+| Field | What it tells you |
+|:------|:-----------------|
+| `Query_time` | Total execution time in seconds |
+| `Lock_time` | Time spent waiting for locks (separate from execution) |
+| `Rows_sent` | Rows returned to the client |
+| `Rows_examined` | Rows MySQL read to produce the result |
+
+**The `Rows_examined` / `Rows_sent` ratio is the key signal.** If MySQL examined 847,293 rows to send back 1, it's scanning nearly the whole table to find one result. That's the query that needs an index.
+
+## Logging Queries Without Indexes
+
+A lower-overhead variant: log only queries that don't use any index, regardless of execution time.
+
+```sql
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+```
+
+This is useful for catching obvious missing-index problems before they become performance issues. On a busy server it can generate a lot of log entries, so combine it with `log_throttle_queries_not_using_indexes` to rate-limit:
+
+```sql
+-- Log at most 10 no-index queries per minute
+SET GLOBAL log_throttle_queries_not_using_indexes = 10;
+```
+
+## Analyzing the Log with mysqldumpslow
+
+For a busy server the slow query log grows quickly. `mysqldumpslow` aggregates similar queries and ranks them by total time, making it easy to find what to fix first:
+
+```bash
+# Top 10 queries by total execution time
+mysqldumpslow -s t -t 10 /var/log/mysql/slow.log
+
+# Top 10 by average execution time
+mysqldumpslow -s at -t 10 /var/log/mysql/slow.log
+
+# Top 10 queries that examined the most rows
+mysqldumpslow -s r -t 10 /var/log/mysql/slow.log
+```
+
+The output groups queries by their structure, replacing literal values with `N` and `S`:
+
+```
+Count: 523  Time=4.52s (2364s)  Lock=0.00s (0s)  Rows=1.0 (523), app_user@localhost
+  SELECT * FROM orders WHERE status = 'S' ORDER BY created_at LIMIT N
+```
+
+This query ran 523 times, averaged 4.52 seconds, totaling 2,364 seconds of server time. That's where to start.
+
+## Turning Slow Queries into EXPLAIN
+
+Once you've identified the expensive queries, run `EXPLAIN` on them to see the execution plan:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+Look for `type: ALL` (full table scan) and `Extra: Using filesort`. Both are fixable with indexes — see [How MySQL Indexes Work](/guides/mysql-indexes) and [Reading EXPLAIN in MySQL](/guides/reading-explain).
+
+## Frequently Asked Questions
+
+#### What should I set `long_query_time` to?
+Start at `1` second. Once you've addressed the worst queries, lower it to `0.1` to catch medium-severity issues. For performance-critical applications, `0.05` or lower is common. Setting it to `0` logs every query — useful for profiling a specific operation, not for production monitoring.
+
+#### Does enabling the slow query log affect performance?
+Minimally. The overhead is a small amount of I/O per logged query. On a busy production server with `long_query_time = 1`, only genuinely slow queries are written — the typical overhead is negligible. Logging every query (`long_query_time = 0`) has measurable overhead and should only be used temporarily.
+
+#### Can I query the slow log from SQL instead of reading the file?
+Yes. Enable the `performance_schema` slow log table or use the `mysql.slow_log` table if you've configured `log_output = TABLE`:
+
+```sql
+SET GLOBAL log_output = 'TABLE';
+SELECT * FROM mysql.slow_log ORDER BY start_time DESC LIMIT 10;
+```
+
+File output is generally preferred for production — the table approach adds write overhead on every logged query.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| Log file isn't being created | Check that MySQL has write permission to the log directory |
+| No entries despite slow queries | Confirm `slow_query_log = ON` with `SHOW VARIABLES LIKE 'slow_query_log'` |
+| Log growing too fast | Increase `long_query_time` or enable `log_throttle_queries_not_using_indexes` |
+| `mysqldumpslow` not found | It ships with MySQL — check your MySQL bin directory (`which mysqldumpslow` or look in `/usr/bin`) |

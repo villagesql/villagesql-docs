@@ -1,0 +1,162 @@
+---
+title: "Full-Text Search in MySQL"
+sidebarTitle: "Using Full-Text Search"
+description: "How MySQL full-text search works: FULLTEXT indexes, MATCH...AGAINST syntax, natural language vs boolean mode vs query expansion, and when to use full-text vs LIKE."
+keywords: "mysql full-text search, mysql fulltext index, mysql match against, mysql boolean mode search, mysql natural language search, mysql full text search example, mysql search text"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL's `LIKE '%keyword%'` works for small tables but can't use indexes — every row gets scanned. Full-text search gives you an indexed, ranked alternative for searching text columns.
+
+## Creating a FULLTEXT Index
+
+`FULLTEXT` indexes work on `CHAR`, `VARCHAR`, and `TEXT` columns, and only with `InnoDB` (MySQL 5.6+) or `MyISAM` tables.
+
+```sql
+CREATE TABLE articles (
+    id    INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(200),
+    body  TEXT,
+    FULLTEXT idx_ft (title, body)
+);
+```
+
+Add a `FULLTEXT` index to an existing table:
+
+```sql
+ALTER TABLE articles ADD FULLTEXT INDEX idx_ft (title, body);
+```
+
+A single `FULLTEXT` index can span multiple columns. Queries against that index search all indexed columns simultaneously.
+
+## Querying with MATCH...AGAINST
+
+Full-text queries use `MATCH(columns) AGAINST(expression)` syntax. The `MATCH` column list must exactly match the columns in the `FULLTEXT` index.
+
+```sql
+SELECT id, title,
+       MATCH(title, body) AGAINST('database performance') AS relevance
+FROM articles
+WHERE MATCH(title, body) AGAINST('database performance');
+```
+
+MySQL returns rows in descending relevance order when `MATCH...AGAINST` appears in the `WHERE` clause. The `AGAINST` expression returns a relevance score — 0 means no match.
+
+## Search Modes
+
+MySQL supports three search modes:
+
+| Mode | Syntax | Behavior |
+|:-----|:-------|:---------|
+| Natural language (default) | `AGAINST('phrase')` or `AGAINST('phrase' IN NATURAL LANGUAGE MODE)` | Ranks results by relevance; common words ignored |
+| Boolean mode | `AGAINST('phrase' IN BOOLEAN MODE)` | Supports operators (`+`, `-`, `*`, `""`); relevance scoring available but not automatic — add `ORDER BY MATCH...AGAINST` to rank |
+| Query expansion | `AGAINST('phrase' WITH QUERY EXPANSION)` | Two-pass: first finds matches, then expands with related terms from those results |
+
+### Natural Language Mode
+
+The default. MySQL uses a weighting scheme that effectively ignores extremely common words — terms appearing in nearly all rows contribute little to relevance scores. Common English stopwords (`the`, `is`, `at`) are filtered outright. Results are returned in descending relevance order when no explicit `ORDER BY` is present.
+
+```sql
+-- Returns rows matching 'index' or 'query', ranked by relevance
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('index query');
+```
+
+### Boolean Mode
+
+Boolean mode supports operators for precise control:
+
+```sql
+-- Must contain 'index', must not contain 'slow', 'performance' is optional
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('+index -slow performance' IN BOOLEAN MODE);
+```
+
+Common boolean operators:
+
+| Operator | Meaning | Example |
+|:---------|:--------|:--------|
+| `+` | Word must be present | `+index` |
+| `-` | Word must not be present | `-slow` |
+| `*` | Prefix wildcard | `perform*` |
+| `""` | Phrase match | `"query optimizer"` |
+| `>` `<` | Increase/decrease relevance | `>fast <slow` |
+| `()` | Grouping | `+(index query) -slow` |
+
+InnoDB tables require a `FULLTEXT` index on all columns in the `MATCH()` expression — without it, boolean mode queries on InnoDB return an error. (MyISAM permits boolean mode without a FULLTEXT index but will scan every row.)
+
+### Query Expansion
+
+Two-pass search. MySQL runs the initial query, takes the top matches, extracts additional terms from them, then re-runs the search with those terms added.
+
+```sql
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('database' WITH QUERY EXPANSION);
+```
+
+Useful when users search with single or vague terms. Can return surprising results if the top matches from the first pass are off-topic.
+
+## Full-Text Search vs LIKE
+
+| | FULLTEXT + MATCH...AGAINST | LIKE '%keyword%' |
+|:--|:--------------------------|:-----------------|
+| Index used | Yes — fast on large tables | No — full scan |
+| Relevance ranking | Yes (natural language mode) | No |
+| Partial word matching | With `*` operator | Yes (LIKE '%word%') |
+| Multiple columns | One MATCH per index | Requires OR conditions |
+| Requires FULLTEXT index | Yes (InnoDB requires it; MyISAM scans without it) | No |
+| Minimum word length | Yes (`innodb_ft_min_token_size` = 3) | None |
+| Short words (2 chars) | Filtered by default | Matched |
+
+Use `LIKE` for simple pattern matching on small tables, prefix searches (`LIKE 'prefix%'` with an index), or when you need arbitrary pattern matching. Use full-text when you're searching for words or phrases in text columns and need relevance ranking or better performance at scale.
+
+## Minimum Word Length
+
+InnoDB's default minimum token size is 3 characters (`innodb_ft_min_token_size`). Words shorter than 3 characters are not indexed. For two-character words, lower the minimum:
+
+```sql
+-- In my.cnf / my.ini
+[mysqld]
+innodb_ft_min_token_size = 2
+```
+
+`innodb_ft_min_token_size` is not a dynamic variable — it requires a server restart to take effect. After restarting, rebuild all `FULLTEXT` indexes:
+
+```sql
+OPTIMIZE TABLE articles;
+```
+
+## Frequently Asked Questions
+
+#### Why does my MATCH...AGAINST return no rows even though the word is in the table?
+
+Three common reasons: (1) The word is shorter than `innodb_ft_min_token_size` (default 3). (2) The word is in the stopword list. (3) The word appears in more than 50% of rows — natural language mode treats such words as too common to be useful. Use boolean mode to bypass the 50% threshold.
+
+#### Can I use full-text search with WHERE conditions?
+
+Yes. Combine `MATCH...AGAINST` with other `WHERE` conditions normally:
+
+```sql
+SELECT title FROM articles
+WHERE status = 'published'
+  AND MATCH(title, body) AGAINST('performance' IN BOOLEAN MODE);
+```
+
+MySQL can use the `FULLTEXT` index for the full-text portion and filter on other indexed columns separately.
+
+#### Does MySQL full-text search support multiple languages?
+
+MySQL has built-in stopword lists for several languages. For production multilingual search, you'll typically need to configure `innodb_ft_enable_stopword = OFF` and supply your own stopword table via `innodb_ft_server_stopword_table`, or use an external search engine (Elasticsearch, MeiliSearch).
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1214: The used table type doesn't support FULLTEXT indexes` | Only InnoDB (5.6+) and MyISAM support FULLTEXT — check `SHOW CREATE TABLE` for the storage engine |
+| `MATCH` column list mismatch error | The columns in `MATCH(...)` must exactly match the columns listed in the FULLTEXT index, in the same order |
+| Common word returns no results | Word may be in the stopword list or appear in >50% of rows — try boolean mode: `AGAINST('word' IN BOOLEAN MODE)` |
+| Short words not found | Word is below `innodb_ft_min_token_size` (default 3) — lower the setting, restart MySQL, then run `OPTIMIZE TABLE` to rebuild indexes |
+| Results after `INSERT` not appearing | InnoDB buffers FULLTEXT updates — run `SET GLOBAL innodb_optimize_fulltext_only=1; OPTIMIZE TABLE articles;` to flush |
