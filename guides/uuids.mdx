@@ -1,0 +1,125 @@
+---
+title: "UUIDs in MySQL"
+sidebarTitle: "Using UUIDs"
+description: "How to use UUIDs as primary keys in MySQL — storage strategies, performance tradeoffs, and UUID versions explained."
+keywords: "MySQL UUID primary key, uuid vs auto increment, uuid binary mysql, uuid v7 mysql, mysql uuid performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Auto-increment integers are simple until they're not: they leak row counts, fail across distributed systems, and break when you merge databases or shard. UUIDs solve all of that, but MySQL's default handling makes them slow to insert at scale. Here's why that happens and how to fix it.
+
+## The MySQL Default: UUID() as CHAR(36)
+
+MySQL's built-in `UUID()` function returns a v1 UUID as a 36-character string like `550e8400-e29b-41d4-a716-446655440000`. Storing that in a `CHAR(36)` column works, but it's inefficient:
+
+- 36 bytes instead of 16 for the same data
+- String comparison is slower than binary comparison
+- Random UUIDs cause B-tree page splits on every insert (more on this below)
+
+```sql
+-- This works but has problems at scale
+CREATE TABLE orders (
+    order_id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+    user_id  INT NOT NULL
+);
+```
+
+## The Standard Workaround: BINARY(16)
+
+MySQL 8.0 added `UUID_TO_BIN()` and `BIN_TO_UUID()` to convert between string and compact binary form. Using `BINARY(16)` cuts storage in half and speeds up comparisons:
+
+```sql
+CREATE TABLE orders (
+    order_id BINARY(16) PRIMARY KEY,
+    user_id  INT NOT NULL
+);
+
+-- Store: convert string UUID to binary
+INSERT INTO orders (order_id, user_id)
+VALUES (UUID_TO_BIN(UUID()), 101);
+
+-- Retrieve: convert back to readable format
+SELECT BIN_TO_UUID(order_id), user_id FROM orders;
+```
+
+`UUID_TO_BIN()` takes an optional second argument (`1`) that reorders the timestamp bits so v1 UUIDs sort chronologically — a partial fix for the insert performance problem.
+
+## The Remaining Problem: Random Inserts Fragment Indexes
+
+MySQL's InnoDB uses a clustered index, meaning rows are physically stored in primary key order. When you insert a row with a random UUID, InnoDB has to find where it goes in the middle of the index and potentially split a page to make room. Under sustained load, this causes write amplification and index fragmentation.
+
+UUID v7 fixes this by embedding a Unix timestamp in the high bits of the identifier. New UUIDs are always larger than existing ones, so inserts always append to the rightmost leaf of the index — no splits.
+
+## With VillageSQL: Native UUID Type and All Versions
+
+VillageSQL's `vsql_uuid` extension adds a native `UUID` column type with 16-byte binary storage and no manual conversion, plus generation functions for UUID v1 through v7.
+
+```sql
+INSTALL EXTENSION vsql_uuid;
+```
+
+```sql
+-- Native UUID type — no UUID_TO_BIN/BIN_TO_UUID needed
+CREATE TABLE orders (
+    order_id UUID PRIMARY KEY,
+    user_id  INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- UUID_V7 inserts always append to the index — no page splits
+INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 101);
+INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 102);
+
+-- Sorts chronologically by creation order
+SELECT user_id, created_at FROM orders ORDER BY order_id;
+
+-- Inspect the timestamp embedded in a v7 UUID (as datetime or Unix epoch)
+SELECT UUID_TIMESTAMP(order_id), UUID_EPOCH(order_id) FROM orders LIMIT 1;
+```
+
+### Choosing a UUID version
+
+| Version | Use when |
+|:---|:---|
+| `UUID_V4()` | You need random IDs and don't care about insert performance |
+| `UUID_V7()` | New rows, primary keys, high insert volume — recommended default |
+| `UUID_V6()` | Legacy v1 systems that need sortable output |
+| `UUID_V1()` | Compatibility with systems that expect v1 format |
+| `UUID_V3()` / `UUID_V5()` | Deterministic IDs derived from a name (v3 = MD5, v5 = SHA-1) |
+
+`UUID_VERSION(uuid)` returns the version number of any UUID — useful for validating IDs arriving from external systems. `UUID_COMPARE(uuid1, uuid2)` returns -1, 0, or 1 for explicit ordering logic. For a broader look at when to use UUIDs versus other primary key approaches, see [Choosing a Primary Key Strategy](/guides/primary-key-strategies).
+
+## UUID vs. Auto-Increment
+
+| | AUTO_INCREMENT | UUID (BINARY/native) |
+|:---|:---|:---|
+| **Distributed safe** | No — requires coordination | Yes |
+| **Leaks row count** | Yes | No |
+| **Storage** | 4–8 bytes | 16 bytes |
+| **Insert performance** | Fast (always appends) | Fast with v7, slow with v4 |
+| **Human readable** | Yes | No (binary) |
+| **Merge-safe** | No | Yes |
+
+For most single-database applications, `AUTO_INCREMENT` is fine. Reach for UUIDs when you need globally unique IDs across systems, when merging data from multiple sources, or when you don't want to expose sequential row counts.
+
+## Frequently Asked Questions
+
+#### Can I use UUID_V7 as a DEFAULT?
+Not currently. Non-deterministic functions can't be used in DEFAULT expressions in MySQL. Generate the UUID in your INSERT statement.
+
+#### Can I backfill existing rows with UUIDs?
+Yes. Add a `UUID` column, populate it with `UUID_V7()` in an UPDATE, then make it the primary key.
+
+#### Is UUID_V7 a standard?
+Yes — defined in RFC 9562, which supersedes RFC 4122.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION UUID_V7 does not exist` | Run `INSTALL EXTENSION vsql_uuid` |
+| `DEFAULT (UUID_V7())` rejected | Remove `DEFAULT`; call `UUID_V7()` in each INSERT |
+| `Extension 'vsql_uuid' is already installed` | Already loaded — no action needed |

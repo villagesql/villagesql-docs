@@ -26,6 +26,9 @@ When releasing a new version:
 
 4. **All future changes go to new dev branch** (`mysql-8.4/0.0.5-dev/`)
 
+5. **Update guides snippet link** in `snippets/villagesql-ad.mdx` — change the
+   `href` to point to the new stable quickstart (e.g., `/mysql-8.4/0.0.4/quickstart`)
+
 ## Archive Policy
 
 - Keep **10 versions** in dropdown
