@@ -1,0 +1,158 @@
+---
+title: "Sending Webhooks from Triggers"
+sidebarTitle: "HTTP Webhooks"
+description: "How to send HTTP webhooks from MySQL triggers using VillageSQL's vsql_http extension — push row changes to external services automatically on INSERT, UPDATE, or DELETE."
+keywords: "mysql webhook trigger, mysql http trigger, mysql after insert webhook, mysql push notification, vsql_http trigger"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Keeping external systems in sync with your database usually means polling — the external service periodically queries your API for changes, or your application code publishes events after every write. With VillageSQL's `vsql_http` extension, triggers can send HTTP requests directly, so external systems get notified the moment a row changes, with no application-layer event publishing required.
+
+## Setup
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+## Basic Webhook Trigger
+
+An `AFTER INSERT` trigger that POSTs a payload to a webhook endpoint:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',     'order.created',
+    'id',        NEW.id,
+    'customer',  NEW.customer_id,
+    'total',     NEW.total,
+    'status',    NEW.status
+  );
+  SET @ignored = vsql_http.http_post(
+    'https://hooks.example.com/orders',
+    'application/json',
+    @payload
+  );
+END$$
+DELIMITER ;
+```
+
+The result is assigned to `@ignored` — the trigger doesn't use the response, but the assignment suppresses the "result not used" warning. NULL means the connection failed; the trigger completes either way and the INSERT goes through.
+
+## Controlling Timeouts
+
+By default, `vsql_http` uses a 30-second timeout. A slow or unavailable webhook endpoint blocks the write for that long. Use `http_request()` with an options JSON to set a tighter deadline:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',    'order.created',
+    'id',       NEW.id,
+    'customer', NEW.customer_id,
+    'total',    NEW.total
+  );
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    NULL,
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+A 3-second timeout caps how long a webhook delay can hold up a write. The request either completes or gives up — the INSERT is not rolled back.
+
+## UPDATE and DELETE Triggers
+
+The same pattern works for updates and deletes. Use `OLD` to include the previous values:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_update
+  AFTER UPDATE ON orders
+  FOR EACH ROW
+BEGIN
+  IF NEW.status != OLD.status THEN
+    SET @payload = JSON_OBJECT(
+      'event',      'order.status_changed',
+      'id',         NEW.id,
+      'old_status', OLD.status,
+      'new_status', NEW.status
+    );
+    SET @ignored = vsql_http.http_request(
+      'POST',
+      'https://hooks.example.com/orders',
+      NULL,
+      @payload,
+      'application/json',
+      '{"timeout": 3}'
+    );
+  END IF;
+END$$
+DELIMITER ;
+```
+
+The `IF NEW.status != OLD.status` guard avoids firing the webhook on UPDATE statements that don't change the status — keeping webhook volume proportional to meaningful changes.
+
+## Authentication
+
+Pass API keys or bearer tokens in the `headers_json` argument of `http_request()`:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT('id', NEW.id, 'total', NEW.total);
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    '{"Authorization": "Bearer your-webhook-secret"}',
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+Store secrets in a configuration table and retrieve them into a variable at trigger time rather than hardcoding them in the trigger body.
+
+## Important Caveats
+
+**Triggers are synchronous.** The HTTP call blocks until it completes or times out. A webhook endpoint that's slow or down will hold up every write to that table. Always set a short timeout (2–5 seconds) and design the endpoint to respond immediately (queue the work, don't process it inline).
+
+**Failures are silent by default.** If the HTTP call returns NULL (connection failure), the trigger doesn't raise an error and the write succeeds. A non-2xx response also returns silently — `http_post()` returns JSON regardless of status code, and the trigger doesn't inspect it. If reliable delivery matters, use a transactional outbox pattern instead: write events to an `outbox` table in the same transaction, then deliver them with a separate process.
+
+**Triggers fire once per row.** `FOR EACH ROW` means a bulk `UPDATE orders SET status = 'shipped'` hits 1000 rows sends 1000 webhook calls. That can overload the endpoint and exhaust connection limits. For bulk operations, suppress the trigger or use the outbox pattern.
+
+**No retry logic.** A failed request stays failed. Build retry and dead-letter handling in the receiving system or the outbox process, not in the trigger.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| Writes become slow | Webhook endpoint is slow — set a short timeout in `http_request()` options |
+| Trigger body error on creation | Check `DELIMITER $$` is set before `CREATE TRIGGER` |
+| No webhook received | NULL return means connection failed — verify network access from server host |
+| Too many webhook calls on bulk UPDATE | Guard with `IF NEW.col != OLD.col` or suppress trigger for batch operations |
+
+## Next Steps
+
+- [Making HTTP requests from SQL](/guides/http-requests-in-mysql) — full function reference including response parsing
+- [Enriching rows with API data](/guides/rest-api-enrichment) — pull external data into your tables
+- [Triggers in MySQL](/guides/triggers) — general trigger patterns and BEFORE vs AFTER semantics
