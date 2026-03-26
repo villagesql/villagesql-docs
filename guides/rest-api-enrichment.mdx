@@ -1,0 +1,164 @@
+---
+title: "Enriching Rows with External API Data"
+sidebarTitle: "REST API Enrichment"
+description: "How to pull live data from external REST APIs into MySQL query results using VillageSQL's vsql_http extension."
+keywords: "mysql rest api, mysql api enrichment, mysql http query, mysql external data, vsql_http enrichment"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Some data doesn't live in your database — exchange rates, shipping status, geolocation lookups, third-party product details. The standard approach is to fetch it in application code and either cache it in a table or stitch it together with query results at the application layer. VillageSQL's `vsql_http` extension lets you pull that data directly from a query or store it in a column with a single UPDATE.
+
+## Setup
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+## Pattern 1: Store Enrichment in a Column
+
+The most common use: backfill a column with data fetched from an external API. Run an UPDATE that calls the API per row, store the result, then query the stored column.
+
+This example fetches a shipping status for each order:
+
+```sql
+ALTER TABLE orders ADD COLUMN shipping_status VARCHAR(100);
+
+UPDATE orders
+SET shipping_status = JSON_VALUE(
+  CONVERT(
+    vsql_http.http_get(
+      CONCAT('https://api.shipping.com/track/', tracking_number)
+    ) USING utf8mb4
+  ),
+  '$.content.status'
+)
+WHERE tracking_number IS NOT NULL
+  AND shipping_status IS NULL
+LIMIT 50;
+```
+
+Run this in a loop from your application until no rows with `shipping_status IS NULL` remain. Process in batches to stay within API rate limits.
+
+After backfilling, queries hit the stored column — no API call per query:
+
+```sql
+SELECT id, customer_id, shipping_status
+FROM orders
+WHERE shipping_status = 'delivered'
+ORDER BY updated_at DESC;
+```
+
+## Pattern 2: Live Lookup in a Query
+
+For data that changes too fast to cache — exchange rates, real-time pricing — you can call the API inline in the SELECT. Every row in the result triggers a request, so keep the result set small.
+
+```sql
+-- Fetch the current USD/EUR exchange rate and apply it to each row
+SET @rate_resp = CONVERT(
+  vsql_http.http_get('https://api.exchangerate.example.com/latest?base=USD')
+  USING utf8mb4
+);
+SET @eur_rate = CAST(JSON_VALUE(@rate_resp, '$.content.rates.EUR') AS DECIMAL(10,6));
+
+SELECT
+  id,
+  amount_usd,
+  ROUND(amount_usd * @eur_rate, 2) AS amount_eur
+FROM invoices
+WHERE currency = 'USD'
+LIMIT 100;
+```
+
+Fetch the shared value once into a variable, then use the variable in the query — don't call `http_get()` inside the SELECT expression unless each row genuinely needs a different API call.
+
+## Pattern 3: Conditional Enrichment
+
+Only fetch for rows that actually need it using WHERE to filter before calling the API:
+
+```sql
+-- Only enrich rows missing geocoordinates
+UPDATE locations
+SET
+  lat = CAST(JSON_VALUE(
+    CONVERT(
+      vsql_http.http_get(
+        CONCAT('https://api.geocode.example.com/json?address=',
+               vsql_http.url_encode(address))
+      ) USING utf8mb4
+    ),
+    '$.content.lat'
+  ) AS DECIMAL(10,7)),
+  lng = CAST(JSON_VALUE(
+    CONVERT(
+      vsql_http.http_get(
+        CONCAT('https://api.geocode.example.com/json?address=',
+               vsql_http.url_encode(address))
+      ) USING utf8mb4
+    ),
+    '$.content.lng'
+  ) AS DECIMAL(10,7))
+WHERE lat IS NULL
+  AND address IS NOT NULL
+LIMIT 25;
+```
+
+Note `url_encode()` wrapping the address — always encode user data before embedding it in a URL.
+
+## Handling API Errors
+
+All `vsql_http` functions return NULL on connection failure. Check the status code before using the content:
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_get('https://api.example.com/data/123') USING utf8mb4
+);
+
+SELECT
+  CASE
+    WHEN @resp IS NULL          THEN 'connection_failed'
+    WHEN JSON_VALUE(@resp, '$.status') = '200' THEN
+      JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content'))
+    WHEN JSON_VALUE(@resp, '$.status') = '404' THEN 'not_found'
+    ELSE CONCAT('error_', JSON_VALUE(@resp, '$.status'))
+  END AS result;
+```
+
+For bulk UPDATE loops, rows that get a NULL or non-200 response keep their column value NULL, so you can re-run the UPDATE to retry failed rows.
+
+## Performance Considerations
+
+**Each HTTP call is synchronous and blocks the query.** A batch of 50 rows each hitting a 200ms API takes 10 seconds minimum. Set `max_execution_time` accordingly:
+
+```sql
+SET SESSION max_execution_time = 120000;  -- 2 minutes
+
+UPDATE orders
+SET shipping_status = JSON_VALUE(
+  CONVERT(vsql_http.http_get(
+    CONCAT('https://api.shipping.com/track/', tracking_number)
+  ) USING utf8mb4),
+  '$.content.status'
+)
+WHERE shipping_status IS NULL
+LIMIT 50;
+```
+
+Prefer storing results over querying live — once a value is in a column, subsequent queries don't touch the network.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| UPDATE times out | Reduce LIMIT and set `max_execution_time` |
+| Returns NULL for all rows | API unreachable from server host; verify network access |
+| JSON extraction returns NULL | Response body large — use `JSON_UNQUOTE(JSON_EXTRACT(...))` |
+| URL parameters not encoding correctly | Wrap values with `vsql_http.url_encode()` |
+| Rate limit errors from API | Reduce LIMIT per batch; add `SELECT SLEEP(1)` between batches |
+
+## Next Steps
+
+- [Making HTTP requests from SQL](/guides/http-requests-in-mysql) — full function reference and response parsing
+- [Sending webhooks from triggers](/guides/http-webhooks) — push changes out instead of pulling data in

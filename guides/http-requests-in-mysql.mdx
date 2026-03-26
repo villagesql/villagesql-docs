@@ -1,0 +1,169 @@
+---
+title: "Making HTTP Requests from SQL"
+sidebarTitle: "HTTP Requests"
+description: "How to call external HTTP APIs directly from MySQL queries using VillageSQL's vsql_http extension — GET, POST, and parsing JSON responses."
+keywords: "mysql http request, mysql call api, mysql http_get, mysql http_post, mysql rest api, vsql_http"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL has no built-in way to make network requests. If you want to call an HTTP API, you pull the data out of the database, make the request in application code, and push results back. VillageSQL's `vsql_http` extension adds `http_get()`, `http_post()`, and the full range of HTTP methods directly to SQL — so you can call external APIs from the same place the data lives.
+
+## The Problem: Leaving the Database for Every API Call
+
+A typical pattern without VillageSQL:
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, tracking_number FROM shipments WHERE status IS NULL")
+
+# Call a shipping API for each row
+for row in rows:
+    resp = requests.get(f"https://api.shipping.com/track/{row['tracking_number']}")
+    status = resp.json()["status"]
+    db.execute("UPDATE shipments SET status = ? WHERE id = ?", status, row["id"])
+```
+
+This works but every row is three round-trips: SELECT, API call, UPDATE. The enrichment logic lives in application code instead of in the schema where the data lives.
+
+## With VillageSQL: HTTP from SQL
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+`http_get(url)` makes a GET request and returns a JSON string with the full response.
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_get('https://httpbin.org/get') USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status')       AS status,
+  JSON_VALUE(@resp, '$.content_type') AS content_type,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+Every function in `vsql_http` returns the same JSON shape:
+
+| Field | Description |
+|:---|:---|
+| `status` | HTTP status code as a string (`"200"`, `"404"`, etc.) |
+| `content_type` | Value of the `Content-Type` response header |
+| `headers` | Array of `[name, value]` pairs for all response headers |
+| `content` | Response body |
+
+### The charset conversion
+
+VEF STRING functions return binary charset. Before passing the result to `JSON_VALUE` or `JSON_EXTRACT`, wrap it with `CONVERT(... USING utf8mb4)`:
+
+```sql
+-- This throws an error — JSON_VALUE rejects binary charset
+-- ERROR 3144: Cannot create a JSON value from a string with CHARACTER SET 'binary'
+SELECT JSON_VALUE(vsql_http.http_get('https://httpbin.org/get'), '$.status');
+
+-- This works
+SELECT JSON_VALUE(
+  CONVERT(vsql_http.http_get('https://httpbin.org/get') USING utf8mb4),
+  '$.status'
+);
+```
+
+Assign to a variable with `CONVERT` once and reuse the variable to avoid repeating the cast.
+
+## POST Requests
+
+`http_post(url, content_type, body)` sends a POST with a body:
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_post(
+    'https://httpbin.org/post',
+    'application/json',
+    '{"name": "widget", "qty": 3}'
+  ) USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status') AS status,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+## Custom Headers and Other Methods
+
+`http_request(method, url, headers_json, body, content_type, options_json)` handles any method with custom headers:
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_request(
+    'GET',
+    'https://api.example.com/secure',
+    '{"Authorization": "Bearer mytoken", "Accept": "application/json"}',
+    NULL,
+    NULL,
+    NULL
+  ) USING utf8mb4
+);
+```
+
+The `headers_json` argument is a JSON object where keys are header names and values are header values.
+
+### All available functions
+
+| Function | Description |
+|:---|:---|
+| `http_get(url)` | GET request |
+| `http_post(url, content_type, body)` | POST with body |
+| `http_put(url, content_type, body)` | PUT with body |
+| `http_delete(url)` | DELETE request |
+| `http_patch(url, content_type, body)` | PATCH with body |
+| `http_request(method, url, headers_json, body, content_type, options_json)` | Any method, custom headers, options |
+| `url_encode(text)` | Percent-encode a string |
+| `url_decode(text)` | Decode a percent-encoded string |
+
+All functions return NULL on connection failure or NULL input.
+
+## URL Encoding
+
+`url_encode()` and `url_decode()` handle percent-encoding for query parameters:
+
+```sql
+SELECT vsql_http.url_encode('hello world & more');
+-- → hello%20world%20%26%20more
+
+-- Build a URL with encoded parameters
+SET @q = vsql_http.url_encode('SELECT * FROM users');
+SET @url = CONCAT('https://api.example.com/search?q=', @q);
+SET @resp = CONVERT(vsql_http.http_get(@url) USING utf8mb4);
+```
+
+## Known Limitations
+
+**256KB response cap** — Responses larger than 256KB are truncated. This covers typical API payloads used in SQL queries; it's not suited for large file downloads.
+
+**`JSON_VALUE` size limit** — `JSON_VALUE` returns NULL when the extracted value exceeds MySQL's internal size limit. For large response bodies, use `JSON_UNQUOTE(JSON_EXTRACT(...))` instead:
+
+```sql
+-- Use JSON_UNQUOTE + JSON_EXTRACT for large content fields
+SELECT JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+**Synchronous** — Every HTTP call blocks until it completes or times out. For bulk UPDATE operations, set `max_execution_time` to avoid hitting the default query timeout.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `FUNCTION http_get does not exist` | Run `INSTALL EXTENSION vsql_http` |
+| Returns NULL | Connection failed or NULL input — verify the URL and check network access from the server host |
+| `JSON_VALUE` returns NULL | Response body too large — use `JSON_UNQUOTE(JSON_EXTRACT(...))` |
+| Garbled JSON parsing | Forgot `CONVERT(... USING utf8mb4)` — wrap the function call |
+| Query times out | Set `SET SESSION max_execution_time = 30000` before the query |
+
+## Next Steps
+
+- [Enriching rows with API data](/guides/rest-api-enrichment) — pull live external data into query results
+- [Sending webhooks from triggers](/guides/http-webhooks) — push row changes to external services automatically
