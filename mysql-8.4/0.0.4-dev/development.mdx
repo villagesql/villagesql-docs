@@ -63,7 +63,7 @@ Extension functions are written in C++ and registered with VEF. Include a
 single header to access the full SDK:
 
 ```cpp
-#include <villagesql/extension.h>
+#include <villagesql/vsql.h>
 ```
 
 ### Typed Wrappers (Recommended)
@@ -157,9 +157,9 @@ that make it unsafe to continue (e.g., corrupt stored data).
 
 *Only needed if your extension defines a custom column type. If you're writing functions only, skip ahead to [Running Regression Tests](#running-regression-tests).*
 
-Custom types require four operations the engine calls internally:
-encode (string → binary), decode (binary → string), compare, and hash.
-Implement them against these C++ signatures (all defined in `func_builder.h`):
+Custom types require three operations the engine calls internally:
+encode (string to binary), decode (binary to string), and compare.
+Hash is optional. Implement them against these C++ signatures (all defined in `func_builder.h`):
 
 #### Fixed-Length Types
 
@@ -183,28 +183,45 @@ using TypeCompareFunc = int (*)(villagesql::Span<const unsigned char> a,
 using TypeHashFunc = size_t (*)(villagesql::Span<const unsigned char> data);
 ```
 
-Register each operation with `make_type_encode`, `make_type_decode`,
-`make_type_compare`, or `make_type_hash`, passing the function pointer and
-the type name constant. The type descriptor references them by name:
+Register these operations using `vsql::make_type<kTypeName>()`. The type name
+is passed as a non-type template parameter (NTTP) — a `static constexpr const char[]`
+array. The builder auto-generates VDF names in the `TYPE::method` format
+(e.g., `"MYTYPE::from_string"`) from this NTTP, so no manual string matching
+is required. Pass the built type object to `.type()` on the extension builder;
+separate `.func()` calls for type operations are not needed.
 
 ```cpp
-constexpr const char *MYTYPE = "mytype"; // replace with your type name
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(8)
+        .max_decode_buffer_length(64)
+        .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
+        .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
+        .compare<&my_compare>()      // auto: "MYTYPE::compare"
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
+        .intrinsic_default_str("0")  // string-literal intrinsic default
+        .build();
 
 VEF_GENERATE_ENTRY_POINTS(
     make_extension("my_ext", "1.0.0")
-        .type(make_type(MYTYPE)
-                  .persisted_length(8)
-                  .max_decode_buffer_length(64)
-                  .encode("mytype_encode")    // Name of the encode VDF
-                  .decode("mytype_decode")    // Name of the decode VDF
-                  .compare("mytype_compare")  // Name of the compare VDF
-                  .hash("mytype_hash")        // Optional: name of the hash VDF
-                  .build())
-        .func(make_type_encode<&my_encode>("mytype_encode", MYTYPE))
-        .func(make_type_decode<&my_decode>("mytype_decode", MYTYPE))
-        .func(make_type_compare<&my_compare>("mytype_compare", MYTYPE))
-        .func(make_type_hash<&my_hash>("mytype_hash", MYTYPE)))
+        .type(MYTYPE))
 ```
+
+`build()` fails at compile time if `from_string`, `to_string`, or `compare`
+is missing. Each template method checks the function pointer signature via
+`static_assert`.
+
+**Intrinsic default.** For a string-literal default value, use
+`.intrinsic_default_str("literal")`. For a VDF-based default that needs
+the params struct, use `.intrinsic_default_vdf("vdf_name")` and register
+the VDF separately with `make_intrinsic_default<&fn>()` (see the
+parameterized types example below).
 
 #### Parameterized Types
 
@@ -253,32 +270,42 @@ size_t mytype_hash(const MyTypeParams &params,
 }
 ```
 
-Register `.params<>()` on the type builder alongside the operation VDF names.
-Both are required: `.params<>()` binds the parse function at startup;
-`make_type_encode` (and the other `make_type_*` functions) detect `const P&`
-and route through the cache automatically.
+Register `.params<>()` on the type builder. Use `.int_to_params<&fn>()`
+to handle `MYTYPE(N)` integer syntax and `.resolve_params<&fn>()` to
+validate parameters and compute storage sizes. For a VDF-based intrinsic
+default, use `.intrinsic_default_vdf()` with the VDF name and register
+the VDF separately via `make_intrinsic_default<&fn>()`.
 
 ```cpp
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(-1)
+        .max_decode_buffer_length(16)
+        .params<MyTypeParams, &MyTypeParams::parse>()
+        .int_to_params<&mytype_int_to_params>()
+        .resolve_params<&mytype_resolve_params>()
+        .from_string<&mytype_encode>()
+        .to_string<&mytype_decode>()
+        .compare<&mytype_compare>()
+        .intrinsic_default_vdf("mytype_intrinsic_default")
+        .build();
+
+using namespace vsql;
+
 VEF_GENERATE_ENTRY_POINTS(
     make_extension("my_ext", "1.0.0")
-        .type(make_type(MYTYPE)
-                  .persisted_length(8)
-                  .max_decode_buffer_length(64)
-                  .encode("mytype_encode")
-                  .decode("mytype_decode")
-                  .compare("mytype_compare")
-                  .params<MyTypeParams, &MyTypeParams::parse>()
-                  .build())
-        .func(make_type_encode<&mytype_encode>("mytype_encode", MYTYPE))
-        .func(make_type_decode<&mytype_decode>("mytype_decode", MYTYPE))
-        .func(make_type_compare<&mytype_compare>("mytype_compare", MYTYPE)))
+        .type(MYTYPE)
+        .func(make_intrinsic_default<&mytype_default>(
+            "mytype_intrinsic_default", MYTYPE)))
 ```
 
 The parameterized variants — `TypeEncodeWithParamsFunc<P>`,
 `TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>`, and
 `TypeHashWithParamsFunc<P>` — are defined in `func_builder.h`.
-`make_type_encode`, `make_type_decode`, `make_type_compare`, and
-`make_type_hash` accept both fixed-length and variable-length forms.
+The `vsql::make_type` template methods detect `const P&` as the first
+argument and route through the params cache automatically.
 
 ## Running Regression Tests
 
