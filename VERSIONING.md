@@ -1,3 +1,7 @@
+---
+noindex: true
+---
+
 # Documentation Versioning Policy
 
 ## Workflow
@@ -18,15 +22,18 @@ When releasing a new version:
    - Add `"default": true` to new stable (0.0.4)
    - Remove `"default": true` from old stable (0.0.3)
 
-3. **Create new dev branch**
+3. **Noindex the old stable** — add `noindex: true` to frontmatter of every `.mdx`
+   file in the version that just lost `"default": true` (e.g. `mysql-8.4/0.0.3/`)
+
+4. **Create new dev branch**
    ```bash
    cp -r mysql-8.4/0.0.4 mysql-8.4/0.0.5-dev
    ```
    - Add `Development (0.0.5-dev)` entry to docs.json
 
-4. **All future changes go to new dev branch** (`mysql-8.4/0.0.5-dev/`)
+5. **All future changes go to new dev branch** (`mysql-8.4/0.0.5-dev/`)
 
-5. **Update guides snippet link** in `snippets/villagesql-ad.mdx` — change the
+6. **Update guides snippet link** in `snippets/villagesql-ad.mdx` — change the
    `href` to point to the new stable quickstart (e.g., `/mysql-8.4/0.0.4/quickstart`)
 
 ## Archive Policy
