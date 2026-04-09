@@ -154,12 +154,13 @@ The VEF SDK provides a C++ API for defining extensions using a fluent builder pa
 Create your main extension file (e.g., `src/extension.cc`) and include the VEF SDK:
 
 ```cpp
-#include <villagesql/extension.h>
-#include <villagesql/func_builder.h>
-#include <villagesql/type_builder.h>
+#include <villagesql/vsql.h>
 
 // Your implementation code here
 ```
+
+The `<villagesql/vsql.h>` header pulls in the type builder, function builder, and
+extension builder, and re-exports commonly used symbols into the `vsql` namespace.
 
 ### Define Your Extension
 
@@ -605,27 +606,44 @@ size_t hash_mytype(const unsigned char* data, size_t len) {
 
 ### Register the Type
 
-**Using VDF names** (VEF_PROTOCOL_2 required; see [VDF-Name Type Operations](#vdf-name-type-operations)):
+**Using the template-based API** (recommended):
+
+The `vsql::make_type<kName>()` template embeds encode, decode, compare, and hash
+operations directly in the type object. VDF names are auto-generated as
+`TYPE::from_string`, `TYPE::to_string`, `TYPE::compare`, and `TYPE::hash`
+at compile time. Separate `.func(make_type_encode<>(...))` calls are not needed.
 
 ```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Required for auto-generating VDF names at compile time.
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&mytype_from_string>()   // auto: "MYTYPE::from_string"
+        .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
+        .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
+        .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
+        .build();
+
 VEF_GENERATE_ENTRY_POINTS(
-  make_extension("my_extension", "1.0.0")
-    .type(make_type(MYTYPE)
-      .persisted_length(16)
-      .max_decode_buffer_length(64)
-      .encode("mytype_from_string")      // VDF name instead of &func
-      .decode("mytype_to_string")
-      .compare("mytype_compare")         // Enables ORDER BY and indexes
-      .hash("mytype_hash")              // Optional
-      .build())
-    .func(make_type_encode<&mytype_from_string>("mytype_from_string", MYTYPE))
-    .func(make_type_decode<&mytype_to_string>("mytype_to_string", MYTYPE))
-    .func(make_type_compare<&mytype_compare>("mytype_compare", MYTYPE))
-    .func(make_type_hash<&mytype_hash>("mytype_hash", MYTYPE))
+    make_extension("my_extension", "1.0.0")
+        .type(MYTYPE)
 );
 ```
 
-The named VDFs must also be registered with `.func()` in the same extension.
+`build()` fails to compile if `from_string`, `to_string`, or `compare` is missing.
+Each template method validates the function pointer signature with `static_assert`.
+
+The type name is passed as a non-type template parameter (NTTP). Declare it as a
+`static constexpr const char[]` array — the pointer identity is used to key
+independent VDF name buffers, so two types sharing a function pointer still get
+separate auto-generated names.
 
 **Using function pointers:**
 
@@ -648,18 +666,18 @@ VEF_GENERATE_ENTRY_POINTS(
 );
 ```
 
-### VDF-Name Type Operations
+### Type Operations Reference
 
-Each VDF named via `.encode()`, `.decode()`, `.compare()`, or `.hash()` must be registered with the matching `make_type_*` builder in the same extension:
+The template-based API auto-generates these SQL-callable VDFs:
 
-| Operation | Builder | VDF SQL Signature |
-|-----------|---------|-------------------|
-| `encode`  | `make_type_encode<&f>("name", TYPE)` | `(STRING) -> CUSTOM(this type)` |
-| `decode`  | `make_type_decode<&f>("name", TYPE)` | `(CUSTOM(this type)) -> STRING` |
-| `compare` | `make_type_compare<&f>("name", TYPE)` | `(CUSTOM(this type), CUSTOM(this type)) -> INT` |
-| `hash`    | `make_type_hash<&f>("name", TYPE)` | `(CUSTOM(this type)) -> INT` |
+| Builder Method | Auto-Generated VDF Name | VDF SQL Signature |
+|----------------|------------------------|-------------------|
+| `.from_string<&f>()` | `TYPE::from_string` | `(STRING) -> CUSTOM(this type)` |
+| `.to_string<&f>()` | `TYPE::to_string` | `(CUSTOM(this type)) -> STRING` |
+| `.compare<&f>()` | `TYPE::compare` | `(CUSTOM(this type), CUSTOM(this type)) -> INT` |
+| `.hash<&f>()` | `TYPE::hash` | `(CUSTOM(this type)) -> INT` |
 
-VDF-name operations use the `bool` return convention (`false` = success, `true` = error), same as function-pointer encode/decode. See [development.mdx — Type Operation Builders](/mysql-8.4/0.0.4-dev/development) for the full C++ signatures.
+These VDFs use the `bool` return convention (`false` = success, `true` = error). See [development.mdx — Type Operation Builders](/mysql-8.4/0.0.4-dev/development) for the full C++ signatures.
 
 ### ALTER TABLE and Custom Types
 
@@ -676,7 +694,28 @@ VDF-name operations use the `bool` return convention (`false` = success, `true` 
 
 ### Type Conversion Functions
 
-Expose your encode/decode functions as SQL functions for explicit type conversion:
+With the template-based API, encode and decode VDFs are embedded in the type object
+and registered automatically — no separate `.func()` calls are needed. The
+auto-generated VDFs are SQL-callable:
+
+```sql
+-- Convert string to custom type (calls MYTYPE::from_string)
+SELECT MYTYPE::from_string('(1.0,2.0)');
+
+-- Convert custom type to string (calls MYTYPE::to_string)
+SELECT MYTYPE::to_string(my_column) FROM my_table;
+
+-- Explicit conversion in INSERT
+INSERT INTO my_table (id, value)
+VALUES (1, MYTYPE::from_string('(3.0,4.0)'));
+```
+
+<Note>
+When using the template-based API, `.from_string<&fn>()` and `.to_string<&fn>()` on the type builder automatically create SQL-callable conversion functions. No separate `.func()` registration is required.
+</Note>
+
+If you are using the function-pointer API instead, register conversion functions
+explicitly:
 
 ```cpp
 VEF_GENERATE_ENTRY_POINTS(
@@ -688,32 +727,14 @@ VEF_GENERATE_ENTRY_POINTS(
       .decode(&decode_mytype)
       .compare(&compare_mytype)
       .build())
-    // String → Custom Type conversion
+    // String -> Custom Type conversion
     .func(make_func("mytype_from_string")
       .from_string<&encode_mytype>(MYTYPE))
-    // Custom Type → String conversion
+    // Custom Type -> String conversion
     .func(make_func("mytype_to_string")
       .to_string<&decode_mytype>(MYTYPE))
-    .build()
 );
 ```
-
-**Usage in SQL:**
-```sql
--- Convert string to custom type
-SELECT mytype_from_string('(1.0,2.0)');
-
--- Convert custom type to string
-SELECT mytype_to_string(my_column) FROM my_table;
-
--- Explicit conversion in INSERT
-INSERT INTO my_table (id, value)
-VALUES (1, mytype_from_string('(3.0,4.0)'));
-```
-
-<Note>
-The `.from_string<>()` and `.to_string<>()` builders automatically create SQL-callable conversion functions using your encode/decode implementations.
-</Note>
 
 ### Example: COMPLEX Type
 
