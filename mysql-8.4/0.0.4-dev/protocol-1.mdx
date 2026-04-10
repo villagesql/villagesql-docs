@@ -1,0 +1,99 @@
+---
+title: "Protocol 1 API"
+description: "Reference for the Protocol 1 function-pointer type API and raw ABI style — the original VEF interface, stable as of v0.0.1 and likely to be deprecated."
+---
+
+Protocol 1 is the original VEF interface. It is stable as of v0.0.1 and likely to be deprecated in a future release. New extensions should use the Protocol 2 API — the template-based type builders in the [Creating Extensions](/mysql-8.4/0.0.4-dev/create) and [Development](/mysql-8.4/0.0.4-dev/development) guides.
+
+This page exists for reference when working with existing extensions built against Protocol 1.
+
+## Function-Pointer Type API
+
+Protocol 1 custom types are registered using explicit function pointers instead of the `vsql::make_type<>` template. The function signatures differ from the Protocol 2 equivalents — they take raw pointers and lengths rather than `Span<>` and `std::string_view`.
+
+### Function Signatures
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+The bool return convention (`false` = success, `true` = error) is explained in [Part B of Critical API Contracts](/mysql-8.4/0.0.4-dev/create#part-b-encodedecode-return-convention).
+
+### Registration
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+Note that `make_type(MYTYPE)` (no template parameter) is the Protocol 1 form. The Protocol 2 form is `vsql::make_type<kMyTypeName>()` with a compile-time string NTTP.
+
+## Raw ABI Style (Functions)
+
+Protocol 1 VDF implementations can pass the raw C structs directly instead of using typed wrappers. This style is supported but [typed wrappers](/mysql-8.4/0.0.4-dev/development#typed-wrappers-recommended) are preferred for new code.
+
+```cpp
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+```
+
+Registration is identical to the typed wrapper approach — the builder detects the signature automatically.
+
+### Raw ABI Aggregate Approach
+
+For aggregates, the raw ABI exposes `prerun`, `postrun`, `clear`, and `accumulate` with their full C signatures. Prefer the [typed aggregate approach](/mysql-8.4/0.0.4-dev/development#aggregate-vdfs) for new code.
+
+```cpp
+make_func<&raw_result>("my_agg")
+    .returns(INT).param(INT)
+    .prerun<&my_prerun>()      // void(vef_context_t*, vef_prerun_args_t*, vef_prerun_result_t*)
+    .postrun<&my_postrun>()    // void(vef_context_t*, vef_postrun_args_t*, vef_postrun_result_t*)
+    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
+    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
+    .build()
+```
