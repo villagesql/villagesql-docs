@@ -1,0 +1,363 @@
+---
+title: "Creating Custom Types"
+description: "Define new column types for VillageSQL extensions — type operations, ALTER TABLE rules, conversion functions, and a complete COMPLEX type example."
+---
+
+<Warning>
+  Custom types use Protocol 2 APIs, which are under active development and
+  subject to change before the beta release.
+</Warning>
+
+Custom types let you define new column types — like `COMPLEX`, `UUID`, or
+`VECTOR` — that work with `ORDER BY`, indexes, and aggregate functions. This
+page is Step 4 of the [Creating Extensions](/mysql-8.4/0.0.4-dev/create)
+tutorial. Complete Steps 1–3 before continuing here.
+
+## Define Type Operations
+
+Every custom type needs encode, decode, and compare operations, and optionally a hash operation. There are two ways to provide these: **VDF names** (VEF_PROTOCOL_2 or later, recommended) or **function pointers**. For each operation, provide one or the other — not both.
+
+**VDF names** — reference VDFs from the same extension by name (see [VDF-Name Type Operations](#vdf-name-type-operations)):
+
+```cpp
+// Encode: string -> binary. false = success, true = error.
+// Set *length = SIZE_MAX to produce SQL NULL.
+bool mytype_from_string(std::string_view from,
+                        villagesql::Span<unsigned char> buf,
+                        size_t *length) { /* ... */ }
+
+// Decode: binary -> string. false = success, true = error.
+bool mytype_to_string(villagesql::Span<const unsigned char> data,
+                      villagesql::Span<char> out,
+                      size_t *out_len) { /* ... */ }
+
+// Compare: returns <0, 0, or >0.
+int mytype_compare(villagesql::Span<const unsigned char> a,
+                   villagesql::Span<const unsigned char> b) { /* ... */ }
+
+// Hash: returns hash code (optional).
+size_t mytype_hash(villagesql::Span<const unsigned char> data) { /* ... */ }
+```
+
+**Function pointers** (`false` = success, `true` = error — see [Encode/Decode Return Convention](/mysql-8.4/0.0.4-dev/extension-api-reference#part-b-encodedecode-return-convention)):
+
+```cpp
+// Encode: Convert string representation to binary
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'
+    // Write binary to 'buffer' and set *length to bytes written
+    // Return false on success, true on error (e.g., set *length = 0)
+}
+
+// Decode: Convert binary to string representation
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'
+    // Set *to_length to string length
+    // Return false on success, true on error
+}
+
+// Compare: enables ORDER BY and indexing (required)
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted)
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data
+}
+```
+
+## Register the Type
+
+**Using the template-based API** (recommended):
+
+The `vsql::make_type<kName>()` template embeds encode, decode, compare, and hash
+operations directly in the type object. VDF names are auto-generated as
+`TYPE::from_string`, `TYPE::to_string`, `TYPE::compare`, and `TYPE::hash`
+at compile time. Separate `.func(make_type_encode<>(...))` calls are not needed.
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Required for auto-generating VDF names at compile time.
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&mytype_from_string>()   // auto: "MYTYPE::from_string"
+        .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
+        .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
+        .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension("my_extension", "1.0.0")
+        .type(MYTYPE)
+);
+```
+
+`build()` fails to compile if `from_string`, `to_string`, or `compare` is missing.
+Each template method validates the function pointer signature with `static_assert`.
+
+The type name is passed as a non-type template parameter (NTTP). Declare it as a
+`static constexpr const char[]` array — the pointer identity is used to key
+independent VDF name buffers, so two types sharing a function pointer still get
+separate auto-generated names.
+
+**Using function pointers:**
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+## Type Operations Reference
+
+The template-based API auto-generates these SQL-callable VDFs:
+
+| Builder Method | Auto-Generated VDF Name | VDF SQL Signature |
+|----------------|------------------------|-------------------|
+| `.from_string<&f>()` | `TYPE::from_string` | `(STRING) -> CUSTOM(this type)` |
+| `.to_string<&f>()` | `TYPE::to_string` | `(CUSTOM(this type)) -> STRING` |
+| `.compare<&f>()` | `TYPE::compare` | `(CUSTOM(this type), CUSTOM(this type)) -> INT` |
+| `.hash<&f>()` | `TYPE::hash` | `(CUSTOM(this type)) -> INT` |
+
+These VDFs use the `bool` return convention (`false` = success, `true` = error). See [development.mdx — Type Operation Builders](/mysql-8.4/0.0.4-dev/development) for the full C++ signatures.
+
+## ALTER TABLE and Custom Types
+
+`ALTER TABLE ... MODIFY COLUMN` and `CHANGE COLUMN` enforce these rules when custom types are involved:
+
+| From | To | Result |
+|------|----|--------|
+| Non-custom | Custom | Error: `Cannot convert column 'col' to custom type 'MYTYPE'` |
+| Custom | String type | Allowed |
+| Custom | Non-string type | Error: `Cannot convert custom type column 'col' to non-string type` |
+| Custom | Different custom type | Error if incompatible: `Cannot convert between incompatible custom types 'A' and 'B'` |
+
+## Type Conversion Functions
+
+With the template-based API, encode and decode VDFs are embedded in the type object
+and registered automatically — no separate `.func()` calls are needed. The
+auto-generated VDFs are SQL-callable:
+
+```sql
+-- Convert string to custom type (calls MYTYPE::from_string)
+SELECT MYTYPE::from_string('(1.0,2.0)');
+
+-- Convert custom type to string (calls MYTYPE::to_string)
+SELECT MYTYPE::to_string(my_column) FROM my_table;
+
+-- Explicit conversion in INSERT
+INSERT INTO my_table (id, value)
+VALUES (1, MYTYPE::from_string('(3.0,4.0)'));
+```
+
+<Note>
+When using the template-based API, `.from_string<&fn>()` and `.to_string<&fn>()` on the type builder automatically create SQL-callable conversion functions. No separate `.func()` registration is required.
+</Note>
+
+**When explicit conversion is required.** VillageSQL implicitly converts a string
+literal to a custom type on direct column assignment, so
+`INSERT INTO t (val) VALUES ('(1.0,2.0)')` works without an explicit call. But
+expressions that resolve to `STRING` type — `CASE` expressions, `CONCAT`, and
+similar — are not implicitly coerced. Wrap them with `TYPE::from_string`:
+
+```sql
+UPDATE my_table
+SET val = MYTYPE::from_string(
+  CASE (pk MOD 2)
+    WHEN 0 THEN '(1.0,2.0)'
+    ELSE '(0.0,0.0)'
+  END
+);
+```
+
+
+If you are using the function-pointer API instead, register conversion functions
+explicitly:
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension("my_extension", "1.0.0")
+    .type(make_type(MYTYPE)
+      .persisted_length(16)
+      .max_decode_buffer_length(64)
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)
+      .build())
+    // String -> Custom Type conversion
+    .func(make_func("mytype_from_string")
+      .from_string<&encode_mytype>(MYTYPE))
+    // Custom Type -> String conversion
+    .func(make_func("mytype_to_string")
+      .to_string<&decode_mytype>(MYTYPE))
+);
+```
+
+## Example: COMPLEX Type
+
+Here's a complete example implementing a COMPLEX number type:
+
+```cpp
+#include <cstdio>
+#include <cstring>
+
+// Encode complex number from "(real,imag)" to 16 bytes
+bool encode_complex(std::string_view from,
+                    villagesql::Span<unsigned char> buf,
+                    size_t *length) {
+    if (buf.size() < 16) return true;
+
+    double real, imag;
+    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) return true;
+
+    memcpy(buf.data(), &real, 8);
+    memcpy(buf.data() + 8, &imag, 8);
+    *length = 16;
+    return false;
+}
+
+// Decode 16 bytes to "(real,imag)" string
+bool decode_complex(villagesql::Span<const unsigned char> data,
+                    villagesql::Span<char> out,
+                    size_t *out_len) {
+    if (data.size() < 16) return true;
+
+    double real, imag;
+    memcpy(&real, data.data(), 8);
+    memcpy(&imag, data.data() + 8, 8);
+
+    int len = snprintf(out.data(), out.size(), "(%.6f,%.6f)", real, imag);
+    if (len < 0 || len >= (int)out.size()) return true;
+
+    *out_len = len;
+    return false;
+}
+
+// Compare for ORDER BY: compare real part first, then imaginary
+int compare_complex(villagesql::Span<const unsigned char> a,
+                    villagesql::Span<const unsigned char> b) {
+    if (a.size() < 16 || b.size() < 16) return 0;
+
+    double a_real, a_imag, b_real, b_imag;
+    memcpy(&a_real, a.data(), 8);
+    memcpy(&a_imag, a.data() + 8, 8);
+    memcpy(&b_real, b.data(), 8);
+    memcpy(&b_imag, b.data() + 8, 8);
+
+    if (a_real < b_real) return -1;
+    if (a_real > b_real) return 1;
+    if (a_imag < b_imag) return -1;
+    if (a_imag > b_imag) return 1;
+    return 0;
+}
+```
+
+After defining these operations, users can create tables with your custom type:
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    frequency_response COMPLEX
+);
+
+INSERT INTO signals VALUES (1, '(50.0,10.0)', '(0.95,0.31)');
+
+-- ORDER BY works because we provided compare_complex!
+SELECT * FROM signals ORDER BY impedance;
+
+-- Prepared statements work with custom types
+PREPARE stmt FROM 'SELECT * FROM signals WHERE impedance = ?';
+SET @val = '(50.0,10.0)';
+EXECUTE stmt USING @val;
+
+-- Aggregate operations work with custom types
+SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
+       GROUP_CONCAT(impedance ORDER BY impedance) FROM signals;
+```
+
+## VDFs in Generated Columns
+
+VDFs can be used in generated column expressions. The VDF must be declared `.deterministic()` in the extension builder — the server blocks non-deterministic functions in this context.
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    -- Generated column computed by a VDF
+    magnitude DOUBLE GENERATED ALWAYS AS (complex_abs(impedance)) STORED
+);
+```
+
+<Note>
+`complex_abs` must be registered with `.deterministic()`. Traditional MySQL UDFs are not permitted in generated columns.
+</Note>
+
+See [vsql_complex Example](/mysql-8.4/0.0.4-dev/examples) for the complete implementation.
+
+## VDFs in Functional Indexes
+
+VDFs can be used in functional index expressions. The same `.deterministic()`
+requirement from generated columns applies here because MySQL implements
+functional indexes as hidden generated columns.
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    sig COMPLEX,
+    INDEX idx_magnitude ((COMPLEX_ABS(sig)))
+);
+```
+
+The optimizer uses the index when the same VDF expression appears in `WHERE`,
+`ORDER BY`, or `GROUP BY`. Cast the comparison value to the VDF's return type
+so the optimizer matches the expression:
+
+```sql
+SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+```
+
+## Next Steps
+
+When your type is defined, continue with Step 5 of the tutorial to build and install your extension.
+
+<CardGroup cols={2}>
+  <Card
+    title="Continue: Build Your Extension"
+    icon="hammer"
+    href="/mysql-8.4/0.0.4-dev/create#step-5-update-build-configuration"
+  >
+    Return to the tutorial to build and install your extension.
+  </Card>
+  <Card
+    title="Extension API Reference"
+    icon="book"
+    href="/mysql-8.4/0.0.4-dev/extension-api-reference"
+  >
+    VDF API contracts, null handling, buffer sizing, and advanced patterns.
+  </Card>
+</CardGroup>
