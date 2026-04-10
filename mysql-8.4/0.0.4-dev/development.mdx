@@ -5,8 +5,12 @@ description: "Writing extension functions and running tests for your VillageSQL 
 
 This guide covers writing VDF implementations and running regression tests for VillageSQL extensions.
 
+<Warning>
+VEF (Protocol 2) is under active development and not yet stable. APIs may change before the stable release.
+</Warning>
+
 <Note>
-  If you are contributing to the VillageSQL server itself (not building an extension), see [Clone and Build from Source](/mysql-8.4/0.0.4-dev/source), which covers the full server developer workflow including running tests with `mysql-test-run.pl` directly.
+  If you are contributing to the VillageSQL server itself (not building an extension), see [Build from Source](/mysql-8.4/0.0.4-dev/source), which covers the full server developer workflow including running tests with `mysql-test-run.pl` directly.
 </Note>
 
 ## Setting Up Your Environment
@@ -120,23 +124,6 @@ maximum capacity.
 You can use different styles across functions in the same extension — each
 function's style is determined by its own signature.
 
-### Raw ABI Style (Deprecated)
-
-Prefer [typed wrappers](#typed-wrappers-recommended) for new code.
-
-The raw ABI style passes pointers to the underlying C structs directly:
-
-```cpp
-void add_impl(vef_context_t* ctx,
-              vef_invalue_t* a, vef_invalue_t* b,
-              vef_vdf_result_t* result) {
-  result->int_value = a->int_value + b->int_value;
-  result->type = VEF_RESULT_VALUE;
-}
-```
-
-Registration is the same as with typed wrappers.
-
 ### VDF Return Codes
 
 Set `result->type` (or call the corresponding typed-wrapper method) to
@@ -214,21 +201,6 @@ using CountState = long long;
 void count_clear(CountState &s) { s = 0; }
 void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
 long long count_result(const CountState &s) { return s; }
-```
-
-#### Raw ABI Approach
-
-For full control, manage `prerun`/`postrun` yourself and use the raw ABI
-function pointer signatures directly:
-
-```cpp
-make_func<&raw_result>("my_agg")
-    .returns(INT).param(INT)
-    .prerun<&my_prerun>()      // void(vef_context_t*, vef_prerun_args_t*, vef_prerun_result_t*)
-    .postrun<&my_postrun>()    // void(vef_context_t*, vef_postrun_args_t*, vef_postrun_result_t*)
-    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
-    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
-    .build()
 ```
 
 ### VEF_GENERATE_REGISTRATION
@@ -441,6 +413,120 @@ The parameterized variants — `TypeEncodeWithParamsFunc<P>`,
 `TypeHashWithParamsFunc<P>` — are defined in `func_builder.h`.
 The `vsql::make_type` template methods detect `const P&` as the first
 argument and route through the params cache automatically.
+
+### Extension System Variables
+
+Extensions can declare MySQL component system variables so that users configure
+extension behavior through standard `SET` / `SELECT @@` SQL syntax. The server
+registers the variables on the extension's behalf at load time and unregisters
+them at unload time.
+
+System variables require Protocol 2 (`VEF_PROTOCOL_2`). The builder raises
+the extension's minimum protocol automatically when `.sys_var()` is called.
+
+#### Declaring Variables
+
+Chain `.sys_var()` on the extension builder, passing a descriptor created by
+one of the `make_sys_var_*` helpers. Each helper takes a name, a comment
+(shown in metadata tables), a pointer to a global in the extension's `.so`,
+a default value, and — for numeric types — min/max bounds.
+
+```cpp
+#include <villagesql/vsql.h>
+
+static long long g_max_items;
+static char *g_label;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension("my_ext", "0.0.1")
+        .sys_var(make_sys_var_int("max_items",
+                                  "Maximum number of items to process",
+                                  &g_max_items, 100, 0, 1000000))
+        .sys_var(make_sys_var_str("label",
+                                  "A label string",
+                                  &g_label, "default_label"))
+        .func(make_func<&some_impl>("some_func")
+                  .returns(INT).build())
+)
+```
+
+The four builder helpers and their signatures are:
+
+| Helper | Storage type | Extra parameters |
+|--------|-------------|-----------------|
+| `make_sys_var_bool` | `bool *` | `def_val` |
+| `make_sys_var_int` | `long long *` | `def_val`, `min_val`, `max_val` |
+| `make_sys_var_double` | `double *` | `def_val`, `min_val`, `max_val` |
+| `make_sys_var_str` | `char **` | `def_val` |
+
+All helpers also take `name` (variable name without extension prefix) and
+`comment` (description string) as their first two parameters.
+
+The storage pointer must remain valid for the lifetime of the extension.
+MySQL writes directly to this storage when the user sets the variable.
+
+#### Accessing Variables in SQL
+
+After `INSTALL EXTENSION my_ext`, variables are accessible using the extension
+name as a component prefix:
+
+```sql
+SELECT @@global.my_ext.max_items;
+SET GLOBAL my_ext.max_items = 500;
+SET GLOBAL my_ext.label = 'new_label';
+```
+
+#### Reading Variables in Extension Code
+
+For integer and boolean variables, read the global storage pointer directly.
+This is safe because MySQL updates the storage atomically for these types.
+
+```cpp
+void read_max_items_impl(IntResult out) {
+  out.set(g_max_items);
+}
+```
+
+#### Writing Variables from Extension Code
+
+Use `sys_var::set` to update a variable through MySQL so that locking, range
+validation, and persistence are handled by the server. The first argument is
+the extension name (component name), the second is the variable name, the
+third is the persistence scope, and the fourth is the new value as a string.
+
+```cpp
+void write_max_items_impl(IntArg value, IntResult out) {
+  if (value.is_null()) { out.set(1); return; }
+  out.set(
+    sys_var::set("my_ext", "max_items", nullptr, value.value()) ? 1 : 0
+  );
+}
+```
+
+`sys_var::set` returns `false` on success and `true` on error. The `scope`
+parameter controls persistence:
+
+| Scope | Behavior |
+|-------|----------|
+| `nullptr` | Update running value only (GLOBAL), not persisted. |
+| `"PERSIST"` | Update running value and write to `mysqld-auto.cnf`. |
+| `"PERSIST_ONLY"` | Write to `mysqld-auto.cnf` only; takes effect on next restart. |
+
+`sys_var::get` reads the global value of any system variable. Pass
+`"mysql_server"` as the component name to read built-in MySQL variables
+(e.g., `max_connections`).
+
+```cpp
+void *val;
+size_t val_len;
+bool err = sys_var::get("mysql_server", "max_connections", &val, &val_len);
+// err == false on success
+```
+
+<Warning>
+  Extension system variables are Protocol 2 APIs — under active development
+  and subject to change before the beta release.
+</Warning>
 
 ## Running Regression Tests
 
