@@ -84,8 +84,10 @@ parsed params struct (see [Parameterized Types](#parameterized-types)).
 **Result wrappers:** `IntResult`, `RealResult`, `StringResult`, `CustomResult`
 — each provides `set_null()`, `warning(msg)`, and `error(msg)`. Scalar
 results also provide `set(value)`. Buffer results provide `buffer()` and
-`set_length(len)`. For parameterized custom types, `CustomResultWith<P>`
-adds a `params()` accessor.
+`set_length(len)`. `StringResult` additionally provides
+`set(std::string_view)`, which copies up to `buffer().size()` bytes from the
+view and sets the length in one call. For parameterized custom types,
+`CustomResultWith<P>` adds a `params()` accessor.
 
 `error(msg)` sets the function result to a SQL error with the given message string. Use it for invalid input that should surface as an error to the caller, as opposed to `set_null()` which silently produces NULL. The message is truncated to fit the server's internal error buffer if necessary.
 
@@ -527,6 +529,57 @@ bool err = sys_var::get("mysql_server", "max_connections", &val, &val_len);
   Extension system variables are Protocol 2 APIs — under active development
   and subject to change before the beta release.
 </Warning>
+
+### Extension Status Variables
+
+Extensions can expose read-only counters and gauges as MySQL status variables,
+visible in `SHOW STATUS` / `SHOW GLOBAL STATUS` and
+`performance_schema.global_status`. The extension owns the storage and writes
+to it; the server reads it at query time.
+
+Status variables require Protocol 2 (`VEF_PROTOCOL_2`). The builder raises the
+extension's minimum protocol automatically when `.status_var()` is called.
+
+Chain `.status_var()` on the extension builder, passing a descriptor created
+by `make_status_var_int` (for `long long *`) or `make_status_var_double` (for
+`double *`). Each helper takes a name and a pointer to a global in the
+extension's `.so`. The storage pointer must remain valid for the lifetime of
+the extension.
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static long long g_add_calls = 0;
+
+void add_impl(IntArg a, IntArg b, IntResult out) {
+  g_add_calls++;
+  if (a.is_null() || b.is_null()) { out.set_null(); return; }
+  out.set(a.value() + b.value());
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&add_impl>("add")
+                  .returns(INT).param(INT).param(INT).build())
+        .status_var(make_status_var_int("add_calls", &g_add_calls)))
+```
+
+After `INSTALL EXTENSION my_ext`, the variable is visible with the extension
+name as a prefix:
+
+```sql
+SHOW GLOBAL STATUS LIKE 'my_ext%';
+```
+```
+Variable_name      Value
+my_ext.add_calls   0
+```
+
+Concurrent increments from multiple query threads using a non-atomic `++` may
+occasionally be lost; this is acceptable for an approximate call counter
+exposed via `SHOW STATUS`.
 
 ## Running Regression Tests
 
