@@ -1,0 +1,122 @@
+---
+title: "Multi-dimensional Range Queries in MySQL"
+sidebarTitle: "Multi-dimensional Queries"
+description: "How to store and query multi-dimensional data in MySQL using VillageSQL's vsql_cube extension — containment, overlap, and nearest-neighbor across multiple numeric attributes."
+keywords: "mysql multi-dimensional range query, mysql geometric type, mysql cube extension, mysql nearest neighbor, mysql n-dimensional search, vsql_cube"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  This guide requires VillageSQL 0.0.4 or later.
+</Note>
+
+MySQL has no built-in way to represent a point or region in n-dimensional space. You can chain AND conditions across multiple numeric columns, but that only handles containment — it doesn't extend to distance queries, and it doesn't let you treat a row's attributes as a unified geometric value. VillageSQL's `vsql_cube` extension adds a `cube` custom type that makes both kinds of queries natural.
+
+## The Problem
+
+Say you have a product catalog where each product has a price, an average rating, and a review count. A buyer wants products priced $50–$200, rated at least 3.5, with at least 50 reviews. That's a three-way AND:
+
+```sql
+-- Works for containment, but doesn't generalize
+SELECT name FROM products
+WHERE price BETWEEN 50 AND 200
+  AND rating BETWEEN 3.5 AND 5.0
+  AND reviews BETWEEN 50 AND 1000;
+```
+
+The AND chain finds matches. But if you want the 5 products most similar to a given one — closest in price, rating, and review count simultaneously — there's no natural SQL answer. You'd have to pull candidates into application code and compute distances there.
+
+## With VillageSQL: the cube type
+
+```sql
+INSTALL EXTENSION vsql_cube;
+```
+
+The `cube` type stores a point or box in n-dimensional space. A point is a location; a box is a region defined by two corner coordinates. Both live in a regular column.
+
+```sql
+CREATE TABLE products (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255),
+    attrs `cube`(3)
+);
+```
+
+`cube` is a MySQL reserved word, so backtick it in DDL. The dimension parameter (`3`) is required — bare `cube` without a number isn't supported.
+
+### Inserting data
+
+`cube_point_nd()` builds a point from a comma-separated string of coordinates:
+
+```sql
+INSERT INTO products (name, attrs) VALUES
+    ('Budget Widget',   cube_point_nd('29.99,4.1,320')),
+    ('Standard Widget', cube_point_nd('79.99,4.4,1250')),
+    ('Premium Widget',  cube_point_nd('149.99,4.7,890')),
+    ('Discount Widget', cube_point_nd('19.99,3.2,45')),
+    ('Pro Widget',      cube_point_nd('199.99,4.8,2100'));
+```
+
+The coordinates here are `(price, rating, review_count)` — one point per product.
+
+### Range queries with cube_contains
+
+Define your search region as a box. `cube_box_nd()` takes two comma-separated strings: the lower corner and the upper corner.
+
+```sql
+-- Products: $50–$200, rating 3.5–5.0, 50–2000 reviews
+SET @region = cube_box_nd('50.0,3.5,50', '200.0,5.0,2000');
+
+SELECT name FROM products
+WHERE cube_contains(@region, attrs);
+```
+
+`cube_contains(@region, attrs)` returns 1 when the product's point falls inside the box — equivalent to all three AND conditions at once, but also composable with distance queries.
+
+### Nearest-neighbor with cube_distance
+
+To find the most similar products to a given one, measure Euclidean distance in attribute space:
+
+```sql
+-- 3 products most similar to Standard Widget (79.99, 4.4, 1250)
+SET @target = cube_point_nd('79.99,4.4,1250');
+
+SELECT name,
+       ROUND(cube_distance(attrs, @target), 2) AS distance
+FROM products
+WHERE name != 'Standard Widget'
+ORDER BY cube_distance(attrs, @target)
+LIMIT 3;
+```
+
+A note on scaling: price is in the hundreds, rating is 0–5, and review count can be in the thousands. Raw Euclidean distance will be dominated by review count. Normalize all three dimensions to a common scale (e.g., 0–1) before inserting if you want balanced similarity scoring.
+
+### Checking overlap
+
+`cube_overlaps()` returns 1 if two boxes share any space — useful for checking whether a product qualifies for any of several promotion bands:
+
+```sql
+SET @promo_a = cube_box_nd('0.0,4.5,500', '100.0,5.0,9999');
+SET @promo_b = cube_box_nd('100.0,4.0,100', '300.0,5.0,9999');
+
+SELECT name FROM products
+WHERE cube_overlaps(@promo_a, attrs) OR cube_overlaps(@promo_b, attrs);
+```
+
+## Troubleshooting
+
+| Error | Fix |
+|---|---|
+| `ERROR: Function 'cube_point_nd' does not exist` | Run `INSTALL EXTENSION vsql_cube` |
+| Column type `cube` not recognized | Confirm you are running VillageSQL 0.0.4 or later |
+| Column declaration rejected | Backtick `cube` in DDL: `` `cube`(N) `` |
+| Distance results look wrong | Normalize coordinates — raw Euclidean distance is skewed by the largest-scale dimension |
+
+## See also
+
+- [Generating Vector Embeddings in MySQL](/guides/vector-embeddings) — AI-generated vectors as another approach to multi-dimensional similarity
+- [How to implement full-text search in MySQL](/guides/full-text-search) — keyword-based search as an alternative for text data
+- [How to pick the right column type for your data](/guides/choosing-data-types) — when to reach for cube vs. standard column types
