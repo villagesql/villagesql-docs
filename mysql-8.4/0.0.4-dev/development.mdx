@@ -143,11 +143,15 @@ that make it unsafe to continue (e.g., corrupt stored data).
 ### Aggregate VDFs
 
 Aggregate VDFs accumulate state across rows within each `GROUP BY` group and
-return a single result per group, like SQL `SUM` or `COUNT`. A function becomes
-an aggregate when both `clear` and `accumulate` are set on its descriptor. The
-main `vdf` function pointer then changes role: instead of being called per row,
-it becomes the result function, called once per group after all rows have been
-accumulated to produce the final output value.
+return a single result per group, like SQL `SUM` or `COUNT`. Use
+`make_aggregate_func<State, &result_fn>("name")` to register one. The State
+type is the per-group accumulation buffer; `prerun` and `postrun` are
+auto-generated to allocate and delete it.
+
+The result function must have the signature `void(const State&, ResultWrapper)`
+where `ResultWrapper` is one of `IntResult`, `RealResult`, `StringResult`,
+`CustomResult`, or `CustomResultWith<P>`. Call `out.set(value)` to return a
+value or `out.set_null()` to return SQL NULL.
 
 Both `clear` and `accumulate` must be set together, or both must be absent.
 Setting exactly one is an error. The builder enforces this at compile time (via
@@ -155,12 +159,6 @@ Setting exactly one is an error. The builder enforces this at compile time (via
 constraint exists because the three callbacks form an indivisible contract:
 `clear` resets state, `accumulate` folds rows, and the result function reads the
 final state.
-
-#### Typed Approach (Recommended)
-
-Define a state type, then write `clear`, `accumulate`, and `result` functions
-using C++ types. Use `.state<T>()` to auto-generate `prerun` (`new T{}`) and
-`postrun` (`delete T`) automatically. `T` is stored in `args->user_data`.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -175,32 +173,33 @@ void my_clear(SumState &s) { s = std::nullopt; }
 void my_acc(SumState &s, IntArg v) {
   if (!v.is_null()) s = s.value_or(0) + v.value();
 }
-// Returns std::optional<T>: nullopt maps to SQL NULL.
-std::optional<long long> my_result(const SumState &s) { return s; }
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
 
 // Registration:
-// make_func<&my_result>("my_sum")
+// make_aggregate_func<SumState, &my_result>("my_sum")
 //     .returns(INT)
 //     .param(INT)
-//     .state<SumState>()
 //     .clear<&my_clear>()
 //     .accumulate<&my_acc>()
 //     .build()
 ```
 
 How the builder methods work:
-- `.state<T>()` generates `prerun` and `postrun` automatically. `T` is stored in `args->user_data`.
+- `make_aggregate_func<State, &result_fn>()` auto-generates `prerun` and `postrun` (value-initializes and deletes `State`).
 - `.clear<&fn>()` wraps `void(State&)` → `vef_vdf_clear_func_t`
 - `.accumulate<&fn>()` wraps `void(State&, TypedArgs...)` → `vef_vdf_accumulate_func_t`. `TypedArgs` are deduced from the function signature (`IntArg`, `StringArg`, etc.).
-- The `make_func` template parameter (the result function) can return `T` directly (never NULL) or `std::optional<T>` (nullopt → SQL NULL).
+- The `ResultWrapper` type (`IntResult`, `RealResult`, etc.) is deduced from the result function signature.
 
-For results that are never NULL, use a plain state type and return directly:
+For a counter that never returns NULL, use a plain state type:
 
 ```cpp
 using CountState = long long;
 void count_clear(CountState &s) { s = 0; }
 void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
-long long count_result(const CountState &s) { return s; }
+void count_result(const CountState &s, IntResult out) { out.set(s); }
 ```
 
 ### VEF_GENERATE_REGISTRATION
