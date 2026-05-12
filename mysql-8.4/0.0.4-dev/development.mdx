@@ -112,8 +112,8 @@ using namespace vsql;
 
 void rot13_impl(CustomArg in, CustomResult out) {
   if (in.is_null()) { out.set_null(); return; }
-  auto src = in.value();   // villagesql::Span<const unsigned char>
-  auto dst = out.buffer(); // villagesql::Span<unsigned char>
+  auto src = in.value();   // vsql::Span<const unsigned char>
+  auto dst = out.buffer(); // vsql::Span<unsigned char>
   for (size_t i = 0; i < src.size(); i++) { dst[i] = transform(src[i]); }
   out.set_length(src.size());
 }
@@ -233,23 +233,23 @@ Hash is optional. Implement them against these C++ signatures (all defined in `f
 #### Fixed-Length Types
 
 ```cpp
-// Encode: string -> binary. false = success, true = error.
-// Set *length = SIZE_MAX to produce SQL NULL.
-using TypeEncodeFunc = bool (*)(std::string_view from,
-                                villagesql::Span<unsigned char> buf,
-                                size_t *length);
+// Encode: string -> binary. Write the encoded bytes via out.buffer() and
+// out.set_length(n); call out.set_null() for SQL NULL, out.warning(msg) for
+// recoverable bad input, or out.error(msg) to abort the statement. Returning
+// without calling any of these surfaces a default warning.
+using TypeEncodeFunc = void (*)(std::string_view from, vsql::CustomResult out);
 
 // Decode: binary -> string. false = success, true = error.
-using TypeDecodeFunc = bool (*)(villagesql::Span<const unsigned char> data,
-                                villagesql::Span<char> out,
+using TypeDecodeFunc = bool (*)(vsql::Span<const unsigned char> data,
+                                vsql::Span<char> out,
                                 size_t *out_len);
 
 // Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
-using TypeCompareFunc = int (*)(villagesql::Span<const unsigned char> a,
-                                villagesql::Span<const unsigned char> b);
+using TypeCompareFunc = int (*)(vsql::Span<const unsigned char> a,
+                                vsql::Span<const unsigned char> b);
 
 // Hash: returns hash code (used for hash joins).
-using TypeHashFunc = size_t (*)(villagesql::Span<const unsigned char> data);
+using TypeHashFunc = size_t (*)(vsql::Span<const unsigned char> data);
 ```
 
 Register these operations using `vsql::make_type<kTypeName>()`. The type name
@@ -350,31 +350,32 @@ struct MyTypeParams {
   }
 };
 
-bool mytype_encode(const MyTypeParams &params, std::string_view from,
-                   villagesql::Span<unsigned char> buf, size_t *length) {
-  size_t bytes = (size_t)params.dimension * 4;
-  if (buf.size() < bytes) return true;
+void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
+                   std::string_view from, vsql::CustomResult out) {
+  const MyTypeParams &p = params.value();  // is_known() is always true at runtime
+  size_t bytes = (size_t)p.dimension * 4;
+  auto buf = out.buffer();
+  if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
   // ... parse from, write to buf ...
-  *length = bytes;
-  return false;  // success
+  out.set_length(bytes);
 }
 
 bool mytype_decode(const MyTypeParams &params,
-                   villagesql::Span<const unsigned char> data,
-                   villagesql::Span<char> out, size_t *out_len) {
+                   vsql::Span<const unsigned char> data,
+                   vsql::Span<char> out, size_t *out_len) {
   // ... read params.dimension floats from data, format into out ...
   *out_len = bytes_written;
   return false;  // success
 }
 
 int mytype_compare(const MyTypeParams &params,
-                   villagesql::Span<const unsigned char> a,
-                   villagesql::Span<const unsigned char> b) {
+                   vsql::Span<const unsigned char> a,
+                   vsql::Span<const unsigned char> b) {
   // Returns -1, 0, or 1.
 }
 
 size_t mytype_hash(const MyTypeParams &params,
-                   villagesql::Span<const unsigned char> data) {
+                   vsql::Span<const unsigned char> data) {
   // Returns hash code.
 }
 
@@ -395,7 +396,7 @@ bool mytype_int_to_params_fn(int64_t value,
 // Validates parameters and computes storage sizes.
 // Signature: ResolveTypeParamsFunc from vsql/func_builder.h.
 bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
-                              villagesql::ResolvedTypeParams *result,
+                              vsql::ResolvedTypeParams *result,
                               char *error_msg) {
   int64_t dim = std::stoll(params.at("dimension"));
   result->persisted_length = dim * 4;
@@ -438,8 +439,11 @@ VEF_GENERATE_ENTRY_POINTS(
 The parameterized variants — `TypeEncodeWithParamsFunc<P>`,
 `TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>`, and
 `TypeHashWithParamsFunc<P>` — are defined in `func_builder.h`.
-The `vsql::make_type` template methods detect `const P&` as the first
-argument and route through the params cache automatically.
+The `vsql::make_type` template methods detect the params argument as the
+first argument and route through the params cache automatically. Encode
+functions take `vsql::MaybeParams<P> &` as the first argument; `is_known()`
+is always true at runtime, and `value()` returns `const P&`. Decode,
+compare, and hash variants continue to take `const P&` directly.
 
 ### Extension System Variables
 
@@ -607,6 +611,12 @@ my_ext.add_calls   0
 Concurrent increments from multiple query threads using a non-atomic `++` may
 occasionally be lost; this is acceptable for an approximate call counter
 exposed via `SHOW STATUS`.
+
+### Keyring Access
+
+Keyring access is a preview capability — see
+[Preview Capabilities](/mysql-8.4/0.0.4-dev/preview-capabilities#keyring-access)
+for the full API reference, result codes, and a complete example.
 
 ### Inspecting Extension Registration Metadata
 
