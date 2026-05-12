@@ -1,0 +1,272 @@
+---
+title: "Preview Capabilities"
+description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the keyring and ping capabilities, and registration patterns."
+---
+
+Preview capabilities are server-provided features exposed to extensions before
+their APIs are finalized. An extension that declares a preview capability
+requires `vsql_allow_preview_extensions = ON` to install (see
+[Enabling the Preview Tier](#enabling-the-preview-tier)) — extensions that
+don't use preview capabilities install normally regardless of this setting.
+
+<Warning>
+Preview capability APIs are not stable. An extension built against a preview
+capability may fail to load after a server update. When a capability
+stabilizes, its header moves to a versioned stable SDK path.
+</Warning>
+
+## Enabling the Preview Tier
+
+Set `vsql_allow_preview_extensions = ON` with `SET PERSIST` before installing
+any extension that uses a preview capability:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+```
+
+`SET GLOBAL` is rejected for this variable — the server requires `SET PERSIST`
+so the setting survives restart. Extensions with preview capabilities are
+loaded at startup, so the variable must be ON when the server starts.
+
+To disable:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = OFF;
+```
+
+This fails if any extension using a preview capability is currently installed.
+Uninstall those extensions first, then turn the setting off.
+
+## Capability Index
+
+| Capability | Header | Status |
+|---|---|---|
+| `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
+| `vsql::preview::ping` | `<villagesql/preview/ping.h>` | Preview |
+
+`storage_api.h` is in `villagesql/preview/` but is part of the type builder,
+not the capability system — see
+[Extension API Reference](/mysql-8.4/0.0.4-dev/extension-api-reference#experimental-apis).
+
+## Registration Pattern
+
+To use a preview capability, declare a capability object by value at file
+scope and pass it by reference to `.with()` inside `make_extension()`. The
+server populates the object's `abi` pointer during registration:
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(g_keyring))
+```
+
+`.with(capability)` tells the server which capabilities the extension
+requires. If `vsql_allow_preview_extensions` is OFF when the extension is
+installed, the server rejects the install with an error naming the capability.
+
+## Keyring Access {#keyring-access}
+
+The keyring capability (`vsql::preview::keyring`) lets extensions read and
+write secrets stored in the MySQL keyring component. Extensions use it for
+things like API keys, encryption keys, or other secrets that shouldn't live
+in SQL tables.
+
+The capability name `VEF_PREVIEW_KEYRING_NAME` is `"vsql::preview::keyring"`.
+
+A keyring component must be installed on the MySQL server for reads and
+writes to succeed. Without one, operations return
+`KeyringCapability::Status::UNAVAILABLE`.
+
+### Status Values
+
+`KeyringCapability::Status` is a scoped enum returned by `read()` (inside
+`ReadResult`) and `write()`:
+
+| Status | Meaning |
+|---|---|
+| `Status::OK` | Operation succeeded. |
+| `Status::NOT_FOUND` | The key does not exist (read only). |
+| `Status::UNAVAILABLE` | No keyring component is installed. |
+| `Status::ERROR` | Other failure. |
+
+### Declaring the Capability
+
+Include the header, declare a capability object at file scope, and pass it
+to `.with()`:
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_keyring))
+```
+
+The `g_keyring` object is populated by the server at load time. To check
+whether the capability vtable was bound before calling its methods, compare
+`g_keyring.abi` against `nullptr`. A non-null `abi` means the capability is
+available; the read/write functions still report `Status::UNAVAILABLE` at
+runtime if no keyring component is installed.
+
+### Reading and Writing
+
+```cpp
+struct KeyringCapability::ReadResult {
+  KeyringCapability::Status status;
+  std::string value;
+};
+
+[[nodiscard]] KeyringCapability::ReadResult
+KeyringCapability::read(std::string_view data_id,
+                        std::string_view auth_id = {}) const;
+
+[[nodiscard]] KeyringCapability::Status
+KeyringCapability::write(std::string_view data_id,
+                         std::string_view auth_id,
+                         std::string_view data) const;
+```
+
+`data_id` is the key identifier. `auth_id` is the owning user — pass an
+empty string (or omit it on `read`, which defaults to `{}`) to read or write
+internal keys not associated with a specific user.
+
+`read` returns a `ReadResult` by value. Bind it with structured bindings:
+
+```cpp
+auto [status, value] = g_keyring.read("my_secret");
+if (status == KeyringCapability::Status::OK) {
+  // value contains the secret bytes
+}
+```
+
+On any status other than `Status::OK`, `value` is empty.
+
+`write` returns `Status` directly and stores `data` under `data_id` /
+`auth_id`.
+
+### Complete Example
+
+This is a simplified version of the `vsql_keyring_reader` test extension
+that ships with the server. It registers 2 VDFs: `keyring_read` and
+`keyring_store`.
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+void keyring_read(StringArg data_id, StringArg auth_id, StringResult out) {
+  if (data_id.is_null()) { out.set_null(); return; }
+
+  const auto [status, value] =
+      g_keyring.read(data_id.value(), auth_id.is_null() ? "" : auth_id.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  if (status != KeyringCapability::Status::OK) { out.set_null(); return; }
+
+  auto buf = out.buffer();
+  size_t len = std::min(value.size(), buf.size());
+  memcpy(buf.data(), value.data(), len);
+  out.set_length(len);
+}
+
+void keyring_store(StringArg data_id, StringArg auth_id, StringArg value,
+                   IntResult out) {
+  if (data_id.is_null() || value.is_null()) { out.set(1); return; }
+
+  KeyringCapability::Status status = g_keyring.write(
+      data_id.value(), auth_id.is_null() ? "" : auth_id.value(), value.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  out.set(status == KeyringCapability::Status::OK ? 0 : 1);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&keyring_read>("keyring_read")
+                  .returns(STRING).param(STRING).param(STRING).build())
+        .func(make_func<&keyring_store>("keyring_store")
+                  .returns(INT).param(STRING).param(STRING).param(STRING).build())
+        .with(g_keyring))
+```
+
+## Ping {#ping}
+
+The ping capability (`vsql::preview::ping`) is a trivial capability used to
+exercise and test the preview capability registration system end-to-end. The
+server provides a single `ping()` function that returns a monotonically
+incrementing counter.
+
+The capability name `VEF_PREVIEW_PING_NAME` is `"vsql::preview::ping"`.
+
+### Declaring the Capability
+
+Include the header, declare a `PingCapability` at file scope, and pass it to
+`.with()`:
+
+```cpp
+#include <villagesql/preview/ping.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_ping::PingCapability g_ping;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_ping))
+```
+
+To check whether the capability vtable was bound before calling `ping()`,
+compare `g_ping.abi` against `nullptr`.
+
+### Calling ping()
+
+```cpp
+long long PingCapability::ping() const;
+```
+
+`ping()` returns a monotonically incrementing counter from the server. It is
+intended to verify that the capability system is wired up correctly; it is
+not a timestamp.
+
+### Complete Example
+
+This is the `vsql_preview_ping_test` extension that ships with the server.
+It registers a single VDF `ping()` that returns the server-provided counter
+value.
+
+```cpp
+#include <villagesql/preview/ping.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static vsql::preview_ping::PingCapability g_ping;
+
+static void ping_impl(IntResult out) { out.set(g_ping.ping()); }
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&ping_impl>("ping").returns(INT).build())
+        .with(g_ping))
+```
