@@ -334,17 +334,25 @@ const char *mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
 
 Variable-length types need the column's declared parameters at encode,
 decode, compare, and hash time to determine allocation sizes and layout.
-Define a params struct with a parse function, register it on the type builder
-with `.params<P, &ParseFunc>()`, and use `const P&` as the first argument of
-your type operation functions. The SDK caches the parse result per unique
-parameter combination, so the parse function runs at most once per type
-instantiation.
+Define a params struct with a parse function and an inverse `to_strings`
+function, register both on the type builder with
+`.params<P, &ParseFunc, &ToStringsFunc>()`, and use `const P&` as the first
+argument of your type operation functions. The SDK caches the parse result
+per unique parameter combination, so the parse function runs at most once
+per type instantiation. The `to_strings` function is the inverse of `parse`:
+it writes a typed `P` back into the canonical key/value string form so the
+server can publish inferred params (for example, from constant-string
+inference at fix-fields time) in the same shape `parse` consumes.
 
 ```cpp
 struct MyTypeParams {
   int64_t dimension;
   static MyTypeParams parse(const std::map<std::string, std::string> &p) {
     return {.dimension = stoll(p.at("dimension"))};
+  }
+  static void to_strings(const MyTypeParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
   }
 };
 
@@ -405,18 +413,27 @@ bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
 
 Register `.params<>()` on the type builder. Use `.int_to_params<&mytype_int_to_params_fn>()`
 to handle `MYTYPE(N)` integer syntax and `.resolve_params<&mytype_resolve_params_fn>()` to
-validate parameters and compute storage sizes. For a VDF-based intrinsic
-default, use `.intrinsic_default_vdf()` with the VDF name and register
-the VDF separately via `make_intrinsic_default<&mytype_default>()`.
+validate parameters and compute storage sizes. Call `.max_persisted_length(N)` with an
+upper bound on the persisted byte size across all valid parameterizations; the server
+uses this only on the fix-fields-time constant-string inference path, where it has not
+yet inferred the params and so cannot consult `resolve_params` to size the encode buffer.
+For a VDF-based intrinsic default, use `.intrinsic_default_vdf()` with the VDF name and
+register the VDF separately via `make_intrinsic_default<&mytype_default>()`.
 
 ```cpp
 static constexpr const char kMyTypeName[] = "MYTYPE";
+
+// Maximum valid dimension for MYTYPE.
+constexpr int64_t kMyTypeMaxDimension = 1024;  // your max valid dimension
+// Upper bound on MYTYPE's persisted byte size across all valid params.
+constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
 
 constexpr auto MYTYPE =
     vsql::make_type<kMyTypeName>()
         .persisted_length(-1)
         .max_decode_buffer_length(16)
-        .params<MyTypeParams, &MyTypeParams::parse>()
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
         .int_to_params<&mytype_int_to_params_fn>()
         .resolve_params<&mytype_resolve_params_fn>()
         .from_string<&mytype_encode>()
@@ -436,7 +453,9 @@ VEF_GENERATE_ENTRY_POINTS(
 
 The parameterized variants — `TypeEncodeWithParamsFunc<P>`,
 `TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>`, and
-`TypeHashWithParamsFunc<P>` — are defined in `func_builder.h`.
+`TypeHashWithParamsFunc<P>` — together with `ParamsToStringsFunc<P>`
+(`void fn(const P&, std::map<std::string,std::string>&)`) are defined in
+`func_builder.h`.
 The `vsql::make_type` template methods detect the params argument as the
 first argument and route through the params cache automatically. Encode
 functions take `vsql::MaybeParams<P> &` as the first argument; `is_known()`
