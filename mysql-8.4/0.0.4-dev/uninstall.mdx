@@ -6,17 +6,22 @@ description: "Remove VillageSQL extensions safely"
 ## Command Syntax
 
 ```sql
-UNINSTALL EXTENSION extension_name;
+UNINSTALL EXTENSION extension_name [VERSION 'version'];
 ```
 
+When `VERSION` is supplied, the server compares it against the installed
+extension's version and aborts if they differ. Omit the clause to uninstall
+whatever version is currently installed.
+
 <Warning>
-  You must remove all columns and variables that use types from the extension before uninstalling. The uninstall process will then remove all functions and types provided by the extension.
+  You must remove all columns, stored procedure parameters, and DECLARE variables that use types from the extension before uninstalling. The uninstall process will then remove all functions and types provided by the extension.
 </Warning>
 
 ## Prerequisites
 
 - Administrative access to VillageSQL
 - No tables using custom types from the extension
+- No stored procedures with parameters or DECLARE variables using custom types from the extension
 - Backup of data if extension stores custom data
 
 ## Uninstall Steps
@@ -30,7 +35,7 @@ If columns depend on it, the error message identifies exactly which ones:
 UNINSTALL EXTENSION vsql_complex;
 ```
 
-**If the extension has dependencies**, you will see an error like:
+**If the extension has column dependencies**, you will see an error like:
 ```
 ERROR HY000: Cannot drop extension `vsql_complex` as 1 column(s) depend on it,
 e.g. mydb.signals.impedance has type COMPLEX
@@ -46,10 +51,40 @@ DROP TABLE mydb.signals;
 ALTER TABLE mydb.signals DROP COLUMN impedance;
 ```
 
+**If a stored procedure uses a custom type from the extension**, you will see an error like:
+```
+ERROR 3219 (HY000): Cannot uninstall extension 'vsql_complex': stored procedure mydb.transform_signal uses custom type COMPLEX
+```
+
+Drop or alter the stored procedure to remove the typed parameter or variable, then retry:
+
+```sql
+-- Option 1: Drop the stored procedure
+DROP PROCEDURE mydb.transform_signal;
+
+-- Option 2: Recreate the procedure without the custom type parameter
+-- (replace the custom type with a compatible built-in type or remove the parameter)
+```
+
 ### 2. Uninstall the Extension
 
 ```sql
 UNINSTALL EXTENSION vsql_complex;
+```
+
+To guard against uninstalling an unexpected version — useful in CI or after a
+rolling upgrade — include the `VERSION` clause:
+
+```sql
+UNINSTALL EXTENSION vsql_complex VERSION '1.2.0';
+```
+
+If `1.2.0` is not the installed version, the server returns an error and leaves
+the extension in place:
+
+```
+ERROR 3219 (HY000): Cannot uninstall extension 'vsql_complex': installed
+version is '0.0.1' but VERSION '1.2.0' was specified
 ```
 
 **What this removes:**
@@ -57,6 +92,7 @@ UNINSTALL EXTENSION vsql_complex;
 - ✅ Custom type definitions registered by the extension
 - ✅ Extension registration record
 - ✅ Custom column metadata for the extension
+- ✅ Persisted system variables (`SET PERSIST`) for the extension from `mysqld-auto.cnf`
 
 **What this does NOT remove:**
 - ❌ The `.veb` file remains in `veb_dir`
@@ -65,6 +101,14 @@ UNINSTALL EXTENSION vsql_complex;
 
 <Note>
 Expansion directories in `_expanded/{extension}/{sha256}/` are cleaned up automatically on server restart.
+</Note>
+
+<Note>
+  `UNINSTALL EXTENSION` also removes any persisted system variables belonging to the
+  extension from `mysqld-auto.cnf`. If you previously ran
+  `SET PERSIST extensionname.varname = value`, that entry is deleted automatically
+  during uninstall. Persisted values are **not** removed during server shutdown —
+  they survive a restart cycle so the extension can read them on next load.
 </Note>
 
 ### 3. Verify Uninstall
@@ -84,6 +128,8 @@ SELECT complex_abs('(1.0,2.0)');
 | Error | Cause | Solution |
 |-------|-------|----------|
 | `Cannot drop extension \`name\` as N column(s) depend on it, e.g. db.table.col has type TYPE` | Tables have columns using the extension's custom types | Drop or alter the identified columns, then retry |
+| `Cannot uninstall extension 'name': stored procedure db.sp uses custom type TYPE` | A stored procedure has a parameter or DECLARE variable using the extension's custom type | Drop or alter the stored procedure to remove the custom type usage, then retry |
+| `Cannot uninstall extension 'name': installed version is 'X' but VERSION 'Y' was specified` | The `VERSION` clause was specified but doesn't match the installed version | Re-run without `VERSION`, or use the version shown in `SELECT EXTENSION_VERSION FROM INFORMATION_SCHEMA.EXTENSIONS` |
 | `Extension not found` | Extension not installed | Verify with `SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS` |
 
 ## Optional: Remove .veb File
