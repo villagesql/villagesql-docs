@@ -3,10 +3,10 @@ title: "Development"
 description: "Writing extension functions and running tests for your VillageSQL extension."
 ---
 
-This guide covers writing VDF implementations and running regression tests for VillageSQL extensions.
+This guide covers writing VDF implementations and running regression tests for VillageSQL extensions. It is the companion to [Creating Extensions](/mysql-8.4/0.0.4-dev/create), which covers the end-to-end build steps.
 
 <Warning>
-VEF (Protocol 2) is under active development and not yet stable. APIs may change before the stable release.
+VEF (Protocol 2) APIs are still evolving. Extension rebuilds may be required when upgrading to a new server version.
 </Warning>
 
 <Note>
@@ -110,8 +110,8 @@ using namespace vsql;
 
 void rot13_impl(CustomArg in, CustomResult out) {
   if (in.is_null()) { out.set_null(); return; }
-  auto src = in.value();   // villagesql::Span<const unsigned char>
-  auto dst = out.buffer(); // villagesql::Span<unsigned char>
+  auto src = in.value();   // vsql::Span<const unsigned char>
+  auto dst = out.buffer(); // vsql::Span<unsigned char>
   for (size_t i = 0; i < src.size(); i++) { dst[i] = transform(src[i]); }
   out.set_length(src.size());
 }
@@ -223,26 +223,28 @@ VEF_GENERATE_REGISTRATION(
 
 Custom types require three operations the engine calls internally:
 encode (string to binary), decode (binary to string), and compare.
-Hash is optional. Implement them against these C++ signatures (all defined in `func_builder.h`):
+Hash is optional. Implement them against these C++ signatures (all defined in `vsql/func_builder.h`):
 
 #### Fixed-Length Types
 
 ```cpp
-// Encode: string -> custom binary. Report outcome via out.set_length(n),
-// out.set_null(), out.warning(msg), or out.error(msg).
-using TypeEncodeFunc = void (*)(std::string_view from, CustomResult out);
+// Encode: string -> binary. Write the encoded bytes via out.buffer() and
+// out.set_length(n); call out.set_null() for SQL NULL, out.warning(msg) for
+// recoverable bad input, or out.error(msg) to abort the statement. Returning
+// without calling any of these surfaces a default warning.
+using TypeEncodeFunc = void (*)(std::string_view from, vsql::CustomResult out);
 
 // Decode: binary -> string. false = success, true = error.
-using TypeDecodeFunc = bool (*)(villagesql::Span<const unsigned char> data,
-                                villagesql::Span<char> out,
+using TypeDecodeFunc = bool (*)(vsql::Span<const unsigned char> data,
+                                vsql::Span<char> out,
                                 size_t *out_len);
 
 // Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
-using TypeCompareFunc = int (*)(villagesql::Span<const unsigned char> a,
-                                villagesql::Span<const unsigned char> b);
+using TypeCompareFunc = int (*)(vsql::Span<const unsigned char> a,
+                                vsql::Span<const unsigned char> b);
 
 // Hash: returns hash code (used for hash joins).
-using TypeHashFunc = size_t (*)(villagesql::Span<const unsigned char> data);
+using TypeHashFunc = size_t (*)(vsql::Span<const unsigned char> data);
 ```
 
 Register these operations using `vsql::make_type<kTypeName>()`. The type name
@@ -251,6 +253,16 @@ array. The builder auto-generates VDF names in the `TYPE::method` format
 (e.g., `"MYTYPE::from_string"`) from this NTTP, so no manual string matching
 is required. Pass the built type object to `.type()` on the extension builder;
 separate `.func()` calls for type operations are not needed.
+
+<Warning>
+The type name must be a `static constexpr const char[]` variable — a string literal cannot be used as a non-type template parameter. Passing `"MYTYPE"` directly produces a compiler error like:
+
+```
+error: '"MYTYPE"' is not a valid template argument for type 'const char*'
+```
+
+Declare the name as a named array as shown below.
+</Warning>
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -295,33 +307,34 @@ shown in the fixed-length example above with `.intrinsic_default_str("0")`).
 **VDF-based: `.intrinsic_default_vdf()` + `make_intrinsic_default`**
 
 When the default value depends on type parameters, implement a function
-against one of these signatures (defined in `func_builder.h`):
+against one of these signatures (defined in `vsql/func_builder.h`):
+
+<Warning>
+  **Breaking change** (`baa54d31100`): `IntrinsicDefaultFunc` and
+  `IntrinsicDefaultWithParamsFunc` return `std::string` instead of `const char*`.
+  Update any existing intrinsic default implementations to return `std::string` directly.
+</Warning>
 
 ```cpp
 // Fixed (no type parameters):
-using IntrinsicDefaultFunc = const char *(*)(char *error_msg);
+using IntrinsicDefaultFunc = std::string (*)(char *error_msg);
 
 // Parameterized (receives cached parsed params):
 template <typename P>
-using IntrinsicDefaultWithParamsFunc = const char *(*)(const P &,
+using IntrinsicDefaultWithParamsFunc = std::string (*)(const P &,
                                                        char *error_msg);
 ```
 
-Return a `const char*` string representation of the default value, or
-`nullptr` on error after writing a message to `error_msg`. Register with
+Return a `std::string` representation of the default value. On error,
+write a message to `error_msg` and return any value (the SDK checks
+`error_msg[0] != '\0'` to detect errors). Register with
 `make_intrinsic_default<&fn>("vdf_name")` (one argument: the VDF name) and
 reference that name on the type builder with `.intrinsic_default_vdf()`.
 The parameterized types example below shows the full registration pattern.
 
-**Lifetime requirement.** The returned `const char*` must remain valid until
-the next call on the same thread. A `static thread_local std::string` whose
-`.c_str()` is returned is the standard pattern:
-
 ```cpp
-const char *mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
-  static thread_local std::string buf;
-  buf = /* build string representation based on p */;
-  return buf.c_str();
+std::string mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
+  return /* build string representation based on p */;
 }
 ```
 
@@ -329,11 +342,14 @@ const char *mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
 
 Variable-length types need the column's declared parameters at encode,
 decode, compare, and hash time to determine allocation sizes and layout.
-Define a params struct with a parse function, register it on the type builder
-with `.params<P, &ParseFunc>()`, and use `const P&` as the first argument of
-your type operation functions. The SDK caches the parse result per unique
-parameter combination, so the parse function runs at most once per type
-instantiation.
+Define a params struct with a parse function and an inverse `to_strings`
+function, register both on the type builder with
+`.params<P, &ParseFunc, &ToStringsFunc>()`, and use `const P&` as the first
+argument of your type operation functions. The SDK caches the parse result
+per unique parameter combination, so the parse function runs at most once
+per type instantiation. The `to_strings` function is the inverse of `parse`:
+it writes a typed `P` back into the canonical key/value string form so the
+server can publish inferred params in the same shape `parse` consumes.
 
 ```cpp
 struct MyTypeParams {
@@ -341,33 +357,38 @@ struct MyTypeParams {
   static MyTypeParams parse(const std::map<std::string, std::string> &p) {
     return {.dimension = stoll(p.at("dimension"))};
   }
+  static void to_strings(const MyTypeParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
+  }
 };
 
-void mytype_encode(vsql::MaybeParams<MyTypeParams> &params, std::string_view from,
-                   vsql::CustomResult out) {
-  size_t bytes = (size_t)params.value().dimension * 4;
-  auto dst = out.buffer();
-  if (dst.size() < bytes) { out.error("buffer too small"); return; }
-  // ... parse from, write to dst ...
+void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
+                   std::string_view from, vsql::CustomResult out) {
+  const MyTypeParams &p = params.value();  // is_known() is always true at runtime
+  size_t bytes = (size_t)p.dimension * 4;
+  auto buf = out.buffer();
+  if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
+  // ... parse from, write to buf ...
   out.set_length(bytes);
 }
 
 bool mytype_decode(const MyTypeParams &params,
-                   villagesql::Span<const unsigned char> data,
-                   villagesql::Span<char> out, size_t *out_len) {
+                   vsql::Span<const unsigned char> data,
+                   vsql::Span<char> out, size_t *out_len) {
   // ... read params.dimension floats from data, format into out ...
   *out_len = bytes_written;
   return false;  // success
 }
 
 int mytype_compare(const MyTypeParams &params,
-                   villagesql::Span<const unsigned char> a,
-                   villagesql::Span<const unsigned char> b) {
+                   vsql::Span<const unsigned char> a,
+                   vsql::Span<const unsigned char> b) {
   // Returns -1, 0, or 1.
 }
 
 size_t mytype_hash(const MyTypeParams &params,
-                   villagesql::Span<const unsigned char> data) {
+                   vsql::Span<const unsigned char> data) {
   // Returns hash code.
 }
 
@@ -388,7 +409,7 @@ bool mytype_int_to_params_fn(int64_t value,
 // Validates parameters and computes storage sizes.
 // Signature: ResolveTypeParamsFunc from vsql/func_builder.h.
 bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
-                              villagesql::ResolvedTypeParams *result,
+                              vsql::ResolvedTypeParams *result,
                               char *error_msg) {
   int64_t dim = std::stoll(params.at("dimension"));
   result->persisted_length = dim * 4;
@@ -399,18 +420,27 @@ bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
 
 Register `.params<>()` on the type builder. Use `.int_to_params<&mytype_int_to_params_fn>()`
 to handle `MYTYPE(N)` integer syntax and `.resolve_params<&mytype_resolve_params_fn>()` to
-validate parameters and compute storage sizes. For a VDF-based intrinsic
-default, use `.intrinsic_default_vdf()` with the VDF name and register
-the VDF separately via `make_intrinsic_default<&mytype_default>()`.
+validate parameters and compute storage sizes. Call `.max_persisted_length(N)` with an
+upper bound on the persisted byte size across all valid parameterizations; the server
+uses this only on the type parameter inference path, where it has not yet inferred
+the params and so cannot consult `resolve_params` to size the encode buffer.
+For a VDF-based intrinsic default, use `.intrinsic_default_vdf()` with the VDF name and
+register the VDF separately via `make_intrinsic_default<&mytype_default>()`.
 
 ```cpp
 static constexpr const char kMyTypeName[] = "MYTYPE";
+
+// Maximum valid dimension for MYTYPE.
+constexpr int64_t kMyTypeMaxDimension = 1024;  // your max valid dimension
+// Upper bound on MYTYPE's persisted byte size across all valid params.
+constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
 
 constexpr auto MYTYPE =
     vsql::make_type<kMyTypeName>()
         .persisted_length(-1)
         .max_decode_buffer_length(16)
-        .params<MyTypeParams, &MyTypeParams::parse>()
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
         .int_to_params<&mytype_int_to_params_fn>()
         .resolve_params<&mytype_resolve_params_fn>()
         .from_string<&mytype_encode>()
@@ -430,9 +460,31 @@ VEF_GENERATE_ENTRY_POINTS(
 
 The parameterized variants — `TypeEncodeWithParamsFunc<P>`,
 `TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>`, and
-`TypeHashWithParamsFunc<P>` — are defined in `func_builder.h`.
-The `vsql::make_type` template methods detect `const P&` as the first
-argument and route through the params cache automatically.
+`TypeHashWithParamsFunc<P>` — together with `ParamsToStringsFunc<P>`
+(`void fn(const P&, std::map<std::string,std::string>&)`) are defined in
+`vsql/func_builder.h`.
+The `vsql::make_type` template methods detect the params argument as the
+first argument and route through the params cache automatically. Encode
+functions take `vsql::MaybeParams<P> &` as the first argument; `is_known()`
+is always true at runtime, and `value()` returns `const P&`. Decode,
+compare, and hash variants continue to take `const P&` directly.
+
+#### Custom Types in Stored Procedures
+
+Custom extension types can be used as stored procedure parameter types and
+in `DECLARE` variable declarations. The server resolves the custom type at
+routine execution time using the installed extension's type metadata.
+
+```sql
+DELIMITER //
+CREATE PROCEDURE insert_complex(IN val COMPLEX)
+BEGIN
+  DECLARE tmp COMPLEX;
+  SET tmp = val;
+  INSERT INTO t1 VALUES (tmp);
+END //
+DELIMITER ;
+```
 
 ### Extension System Variables
 
@@ -550,6 +602,12 @@ bool err = sys_var::get("mysql_server", "max_connections", &val, &val_len);
   and subject to change before the beta release.
 </Warning>
 
+### Keyring Access
+
+Keyring access is a preview capability — see
+[Preview Capabilities](/mysql-8.4/0.0.4-dev/preview-capabilities#keyring-access)
+for the full API reference, result codes, and a complete example.
+
 ### Inspecting Extension Registration Metadata
 
 `INFORMATION_SCHEMA.EXTENSION_REGISTRATION` exposes the in-memory VEF
@@ -647,3 +705,9 @@ To run a test with extra debug information:
 cd $BUILD_HOME
 ./mysql-test/mysql-test-run.pl --verbose --suite=/path/to/your/extension/test my_new_test
 ```
+
+## See Also
+
+- [Creating Extensions](/mysql-8.4/0.0.4-dev/create) — end-to-end build steps, CMake setup, and installation
+- [Extension API Reference](/mysql-8.4/0.0.4-dev/extension-api-reference) — VDF contracts, null handling, and buffer sizing
+- [Extension Architecture](/mysql-8.4/0.0.4-dev/architecture) — lifecycle, Victionary caching, performance patterns, and security model
