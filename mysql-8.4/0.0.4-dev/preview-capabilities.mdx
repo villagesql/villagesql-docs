@@ -45,6 +45,7 @@ Uninstall those extensions first, then turn the setting off.
 | `vsql::preview::ping` | `<villagesql/preview/ping.h>` | Preview |
 | `vsql::preview::status_var` | `<villagesql/preview/status_var.h>` | Preview |
 | `vsql::preview::sys_var` | `<villagesql/preview/sys_var.h>` | Preview |
+| `vsql::preview::thread_worker` | `<villagesql/preview/thread_worker.h>` | Preview |
 
 ## Registration Pattern
 
@@ -269,6 +270,7 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(g_ping))
 ```
 
+<<<<<<< HEAD
 ## Status Variables {#status-variables}
 
 The status_var capability (`vsql::preview::status_var`) lets an extension
@@ -354,3 +356,148 @@ The `scope` argument to `set()` controls persistence: `nullptr` updates the
 running value only, `"PERSIST"` updates the running value and persists it to
 `mysqld-auto.cnf`, and `"PERSIST_ONLY"` persists without changing the running
 value.
+=======
+## Thread Worker {#thread-worker}
+
+The thread worker capability (`vsql::preview::thread_worker`) lets an
+extension run a background thread driven by the server. The thread is started
+and stopped via a control system variable that the server registers at
+extension load; the server invokes the extension's work function on a periodic
+timer, on file-descriptor readiness, or in response to enable/disable events.
+
+The capability name `VEF_PREVIEW_THREAD_WORKER_NAME` is
+`"vsql::preview::thread_worker"`.
+
+### Declaring the Capability
+
+Include the header, declare a `ThreadWorkerCapability` instantiated on your
+work function at file scope, and pass it to `.with()`:
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"suffix"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+The work function is supplied as a non-type template argument
+(`ThreadWorkerCapability<&my_work>`), so it must be a function with the
+signature shown below. The first constructor argument is the thread-name
+suffix; the optional second argument overrides the control sys var name.
+
+### Work Function Signature
+
+```c
+typedef vef_next_wakeup_t (*vef_work_fn_t)(vef_wakeup_reason_t reason,
+                                           struct vef_thread_handle_t *thread,
+                                           void *arg);
+```
+
+`reason` indicates why the server called the function. `thread` is the
+server-owned handle for this worker (NULL on the initial `VEF_WAKEUP_ENABLE`
+call — see below). `arg` is the opaque pointer registered on the descriptor;
+it is passed through unchanged.
+
+### Wakeup Lifecycle
+
+The server calls the work function with one of four reasons:
+
+| Reason | Meaning |
+|---|---|
+| `VEF_WAKEUP_ENABLE` | Worker was just enabled (control sys var flipped ON). The return value sets the initial `poll_fd` and `sleep_ms`. |
+| `VEF_WAKEUP_PERIODIC` | Periodic timer fired (`sleep_ms` elapsed). |
+| `VEF_WAKEUP_POLL_FD` | A watched file descriptor became readable. |
+| `VEF_WAKEUP_DISABLE` | Worker disabled (control sys var OFF) or server shutting down. The return value is ignored. |
+
+The `thread` parameter is NULL when the reason is `VEF_WAKEUP_ENABLE`, because
+the thread handle does not exist yet at that point. For the other three
+reasons, `thread` is non-null.
+
+### Wakeup Return Value
+
+```c
+typedef struct {
+  unsigned int sleep_ms;
+  int poll_fd;
+} vef_next_wakeup_t;
+```
+
+The work function returns a `vef_next_wakeup_t` to update the next wakeup
+configuration. A zero value in either field means "keep the current setting"
+— return a value-initialized struct (`return {};`) to leave both unchanged.
+
+To set a new poll file descriptor, return its value (must be greater than
+zero). To clear an existing poll file descriptor, return `-1` in `poll_fd`.
+
+The return value is ignored when the reason is `VEF_WAKEUP_DISABLE`.
+
+### Thread Name and Control Variable
+
+Two fields on the descriptor control naming:
+
+- `suffix` — the thread-name suffix. The server prepends the extension name,
+  producing thread names like `my_ext/monitor`.
+- `var_name` — optional. When non-null, the server registers this exact name
+  as the control system variable. When null, the server uses the default
+  pattern `{suffix}_enabled`.
+
+The control variable is a server-registered system variable. Enable the worker
+with `SET GLOBAL {suffix}_enabled = ON`; set it `OFF` to stop it.
+
+### Complete Example
+
+A minimal extension with a single periodic worker that increments a
+heartbeat counter on each timer tick.
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+#include <atomic>
+
+static std::atomic<unsigned long long> g_heartbeat{0};
+
+static vef_next_wakeup_t heartbeat_work(vef_wakeup_reason_t reason,
+                                        struct vef_thread_handle_t *thread,
+                                        void *arg) {
+  switch (reason) {
+    case VEF_WAKEUP_ENABLE:
+      return {1000, 0};  // tick every 1000 ms, no poll fd
+    case VEF_WAKEUP_PERIODIC:
+      g_heartbeat.fetch_add(1, std::memory_order_relaxed);
+      return {};  // keep current sleep_ms and poll_fd
+    case VEF_WAKEUP_POLL_FD:
+      return {};  // not used in this example
+    case VEF_WAKEUP_DISABLE:
+      return {};  // ignored
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&heartbeat_work>
+    g_worker{"heartbeat"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+With this extension installed (and `vsql_allow_preview_extensions = ON`), the
+server registers a `heartbeat_enabled` system variable. Enable the worker with:
+
+```sql
+SET GLOBAL heartbeat_enabled = ON;
+```
+>>>>>>> origin/main

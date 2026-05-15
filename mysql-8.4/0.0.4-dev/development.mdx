@@ -3,10 +3,10 @@ title: "Development"
 description: "Writing extension functions and running tests for your VillageSQL extension."
 ---
 
-This guide covers writing VDF implementations and running regression tests for VillageSQL extensions.
+This guide covers writing VDF implementations and running regression tests for VillageSQL extensions. It is the companion to [Creating Extensions](/mysql-8.4/0.0.4-dev/create), which covers the end-to-end build steps.
 
 <Warning>
-VEF (Protocol 2) is under active development and not yet stable. APIs may change before the stable release.
+VEF (Protocol 2) APIs are still evolving. Extension rebuilds may be required when upgrading to a new server version.
 </Warning>
 
 <Note>
@@ -145,24 +145,20 @@ that make it unsafe to continue (e.g., corrupt stored data).
 ### Aggregate VDFs
 
 Aggregate VDFs accumulate state across rows within each `GROUP BY` group and
-return a single result per group, like SQL `SUM` or `COUNT`. A function becomes
-an aggregate when both `clear` and `accumulate` are set on its descriptor. The
-main `vdf` function pointer then changes role: instead of being called per row,
-it becomes the result function, called once per group after all rows have been
-accumulated to produce the final output value.
+return a single result per group, like SQL `SUM` or `COUNT`. Use
+`make_aggregate_func<State, &result_fn>("name")` to register one. The State
+type is the per-group accumulation buffer; `prerun` and `postrun` are
+auto-generated to allocate and delete it.
 
-Both `clear` and `accumulate` must be set together, or both must be absent.
-Setting exactly one is an error. The builder enforces this at compile time (via
-`build()`), and the server validates it again at `INSTALL EXTENSION` time. This
-constraint exists because the three callbacks form an indivisible contract:
-`clear` resets state, `accumulate` folds rows, and the result function reads the
-final state.
+The result function must have the signature `void(const State&, ResultWrapper)`
+where `ResultWrapper` is one of `IntResult`, `RealResult`, `StringResult`,
+`CustomResult`, or `CustomResultWith<P>`. Call `out.set(value)` to return a
+value or `out.set_null()` to return SQL NULL.
 
-#### Typed Approach (Recommended)
-
-Define a state type, then write `clear`, `accumulate`, and `result` functions
-using C++ types. Use `.state<T>()` to auto-generate `prerun` (`new T{}`) and
-`postrun` (`delete T`) automatically. `T` is stored in `args->user_data`.
+Both `.clear<>()` and `.accumulate<>()` are required. The builder enforces
+this at compile time (via `build()`), and the server validates it again at
+`INSTALL EXTENSION` time — `clear` resets state, `accumulate` folds rows, and
+the result function reads the final state.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -177,32 +173,33 @@ void my_clear(SumState &s) { s = std::nullopt; }
 void my_acc(SumState &s, IntArg v) {
   if (!v.is_null()) s = s.value_or(0) + v.value();
 }
-// Returns std::optional<T>: nullopt maps to SQL NULL.
-std::optional<long long> my_result(const SumState &s) { return s; }
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
 
 // Registration:
-// make_func<&my_result>("my_sum")
+// make_aggregate_func<SumState, &my_result>("my_sum")
 //     .returns(INT)
 //     .param(INT)
-//     .state<SumState>()
 //     .clear<&my_clear>()
 //     .accumulate<&my_acc>()
 //     .build()
 ```
 
 How the builder methods work:
-- `.state<T>()` generates `prerun` and `postrun` automatically. `T` is stored in `args->user_data`.
+- `make_aggregate_func<State, &result_fn>()` auto-generates `prerun` and `postrun` (value-initializes and deletes `State`).
 - `.clear<&fn>()` wraps `void(State&)` → `vef_vdf_clear_func_t`
 - `.accumulate<&fn>()` wraps `void(State&, TypedArgs...)` → `vef_vdf_accumulate_func_t`. `TypedArgs` are deduced from the function signature (`IntArg`, `StringArg`, etc.).
-- The `make_func` template parameter (the result function) can return `T` directly (never NULL) or `std::optional<T>` (nullopt → SQL NULL).
+- The `ResultWrapper` type (`IntResult`, `RealResult`, etc.) is deduced from the result function signature.
 
-For results that are never NULL, use a plain state type and return directly:
+For a counter that never returns NULL, use a plain state type:
 
 ```cpp
 using CountState = long long;
 void count_clear(CountState &s) { s = 0; }
 void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
-long long count_result(const CountState &s) { return s; }
+void count_result(const CountState &s, IntResult out) { out.set(s); }
 ```
 
 ### VEF_GENERATE_REGISTRATION
@@ -228,7 +225,7 @@ VEF_GENERATE_REGISTRATION(
 
 Custom types require three operations the engine calls internally:
 encode (string to binary), decode (binary to string), and compare.
-Hash is optional. Implement them against these C++ signatures (all defined in `func_builder.h`):
+Hash is optional. Implement them against these C++ signatures (all defined in `vsql/func_builder.h`):
 
 #### Fixed-Length Types
 
@@ -258,6 +255,16 @@ array. The builder auto-generates VDF names in the `TYPE::method` format
 (e.g., `"MYTYPE::from_string"`) from this NTTP, so no manual string matching
 is required. Pass the built type object to `.type()` on the extension builder;
 separate `.func()` calls for type operations are not needed.
+
+<Warning>
+The type name must be a `static constexpr const char[]` variable — a string literal cannot be used as a non-type template parameter. Passing `"MYTYPE"` directly produces a compiler error like:
+
+```
+error: '"MYTYPE"' is not a valid template argument for type 'const char*'
+```
+
+Declare the name as a named array as shown below.
+</Warning>
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -302,33 +309,34 @@ shown in the fixed-length example above with `.intrinsic_default_str("0")`).
 **VDF-based: `.intrinsic_default_vdf()` + `make_intrinsic_default`**
 
 When the default value depends on type parameters, implement a function
-against one of these signatures (defined in `func_builder.h`):
+against one of these signatures (defined in `vsql/func_builder.h`):
+
+<Warning>
+  **Breaking change** (`baa54d31100`): `IntrinsicDefaultFunc` and
+  `IntrinsicDefaultWithParamsFunc` return `std::string` instead of `const char*`.
+  Update any existing intrinsic default implementations to return `std::string` directly.
+</Warning>
 
 ```cpp
 // Fixed (no type parameters):
-using IntrinsicDefaultFunc = const char *(*)(char *error_msg);
+using IntrinsicDefaultFunc = std::string (*)(char *error_msg);
 
 // Parameterized (receives cached parsed params):
 template <typename P>
-using IntrinsicDefaultWithParamsFunc = const char *(*)(const P &,
+using IntrinsicDefaultWithParamsFunc = std::string (*)(const P &,
                                                        char *error_msg);
 ```
 
-Return a `const char*` string representation of the default value, or
-`nullptr` on error after writing a message to `error_msg`. Register with
+Return a `std::string` representation of the default value. On error,
+write a message to `error_msg` and return any value (the SDK checks
+`error_msg[0] != '\0'` to detect errors). Register with
 `make_intrinsic_default<&fn>("vdf_name")` (one argument: the VDF name) and
 reference that name on the type builder with `.intrinsic_default_vdf()`.
 The parameterized types example below shows the full registration pattern.
 
-**Lifetime requirement.** The returned `const char*` must remain valid until
-the next call on the same thread. A `static thread_local std::string` whose
-`.c_str()` is returned is the standard pattern:
-
 ```cpp
-const char *mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
-  static thread_local std::string buf;
-  buf = /* build string representation based on p */;
-  return buf.c_str();
+std::string mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
+  return /* build string representation based on p */;
 }
 ```
 
@@ -336,17 +344,24 @@ const char *mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
 
 Variable-length types need the column's declared parameters at encode,
 decode, compare, and hash time to determine allocation sizes and layout.
-Define a params struct with a parse function, register it on the type builder
-with `.params<P, &ParseFunc>()`, and use `const P&` as the first argument of
-your type operation functions. The SDK caches the parse result per unique
-parameter combination, so the parse function runs at most once per type
-instantiation.
+Define a params struct with a parse function and an inverse `to_strings`
+function, register both on the type builder with
+`.params<P, &ParseFunc, &ToStringsFunc>()`, and use `const P&` as the first
+argument of your type operation functions. The SDK caches the parse result
+per unique parameter combination, so the parse function runs at most once
+per type instantiation. The `to_strings` function is the inverse of `parse`:
+it writes a typed `P` back into the canonical key/value string form so the
+server can publish inferred params in the same shape `parse` consumes.
 
 ```cpp
 struct MyTypeParams {
   int64_t dimension;
   static MyTypeParams parse(const std::map<std::string, std::string> &p) {
     return {.dimension = stoll(p.at("dimension"))};
+  }
+  static void to_strings(const MyTypeParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
   }
 };
 
@@ -404,18 +419,27 @@ bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
 
 Register `.params<>()` on the type builder. Use `.int_to_params<&mytype_int_to_params_fn>()`
 to handle `MYTYPE(N)` integer syntax and `.resolve_params<&mytype_resolve_params_fn>()` to
-validate parameters and compute storage sizes. For a VDF-based intrinsic
-default, use `.intrinsic_default_vdf()` with the VDF name and register
-the VDF separately via `make_intrinsic_default<&mytype_default>()`.
+validate parameters and compute storage sizes. Call `.max_persisted_length(N)` with an
+upper bound on the persisted byte size across all valid parameterizations; the server
+uses this only on the type parameter inference path, where it has not yet inferred
+the params and so cannot consult `resolve_params` to size the encode buffer.
+For a VDF-based intrinsic default, use `.intrinsic_default_vdf()` with the VDF name and
+register the VDF separately via `make_intrinsic_default<&mytype_default>()`.
 
 ```cpp
 static constexpr const char kMyTypeName[] = "MYTYPE";
+
+// Maximum valid dimension for MYTYPE.
+constexpr int64_t kMyTypeMaxDimension = 1024;  // your max valid dimension
+// Upper bound on MYTYPE's persisted byte size across all valid params.
+constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
 
 constexpr auto MYTYPE =
     vsql::make_type<kMyTypeName>()
         .persisted_length(-1)
         .max_decode_buffer_length(16)
-        .params<MyTypeParams, &MyTypeParams::parse>()
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
         .int_to_params<&mytype_int_to_params_fn>()
         .resolve_params<&mytype_resolve_params_fn>()
         .from_string<&mytype_encode>()
@@ -435,13 +459,32 @@ VEF_GENERATE_ENTRY_POINTS(
 
 The parameterized variants — `TypeEncodeWithParamsFunc<P>`,
 `TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>`, and
-`TypeHashWithParamsFunc<P>` — are defined in `func_builder.h`.
+`TypeHashWithParamsFunc<P>` — together with `ParamsToStringsFunc<P>`
+(`void fn(const P&, std::map<std::string,std::string>&)`) are defined in
+`vsql/func_builder.h`.
 The `vsql::make_type` template methods detect the params argument and route
 through the params cache automatically. Encode functions take
 `vsql::MaybeParams<P> &` as the first argument; `is_known()` is always true
 at runtime, and `value()` returns `const P&`. Decode, compare, and hash
 variants take `vsql::CustomArgWith<P>`, whose `params()` accessor returns
 `const P&`.
+
+#### Custom Types in Stored Procedures
+
+Custom extension types can be used as stored procedure parameter types and
+in `DECLARE` variable declarations. The server resolves the custom type at
+routine execution time using the installed extension's type metadata.
+
+```sql
+DELIMITER //
+CREATE PROCEDURE insert_complex(IN val COMPLEX)
+BEGIN
+  DECLARE tmp COMPLEX;
+  SET tmp = val;
+  INSERT INTO t1 VALUES (tmp);
+END //
+DELIMITER ;
+```
 
 ### Extension System Variables
 
@@ -719,3 +762,9 @@ To run a test with extra debug information:
 cd $BUILD_HOME
 ./mysql-test/mysql-test-run.pl --verbose --suite=/path/to/your/extension/test my_new_test
 ```
+
+## See Also
+
+- [Creating Extensions](/mysql-8.4/0.0.4-dev/create) — end-to-end build steps, CMake setup, and installation
+- [Extension API Reference](/mysql-8.4/0.0.4-dev/extension-api-reference) — VDF contracts, null handling, and buffer sizing
+- [Extension Architecture](/mysql-8.4/0.0.4-dev/architecture) — lifecycle, Victionary caching, performance patterns, and security model
