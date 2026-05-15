@@ -1,6 +1,6 @@
 ---
 title: "Preview Capabilities"
-description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the keyring and ping capabilities, and registration patterns."
+description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the keyring, ping, status_var, and sys_var capabilities, and registration patterns."
 ---
 
 Preview capabilities are server-provided features exposed to extensions before
@@ -43,6 +43,8 @@ Uninstall those extensions first, then turn the setting off.
 |---|---|---|
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
 | `vsql::preview::ping` | `<villagesql/preview/ping.h>` | Preview |
+| `vsql::preview::status_var` | `<villagesql/preview/status_var.h>` | Preview |
+| `vsql::preview::sys_var` | `<villagesql/preview/sys_var.h>` | Preview |
 
 `storage_api.h` is in `villagesql/preview/` but is part of the type builder,
 not the capability system — see
@@ -270,3 +272,89 @@ VEF_GENERATE_ENTRY_POINTS(
         .func(make_func<&ping_impl>("ping").returns(INT).build())
         .with(g_ping))
 ```
+
+## Status Variables {#status-variables}
+
+The status_var capability (`vsql::preview::status_var`) lets an extension
+expose `long long` and `double` counters as MySQL status variables. The
+extension owns the storage and writes to it; the server reads through the
+pointers each time the status variable is queried.
+
+Build the capability with `vsql::preview_status_var::make_capability()`, passing
+a braced list of descriptors from `make_int(name, value_ptr)` or
+`make_double(name, value_ptr)`. The template deduces the count from the
+braced list, so no explicit size is required.
+
+### Complete Example
+
+```cpp
+#include <villagesql/preview/status_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_status_var;
+
+static long long g_hits   = 0;
+static long long g_misses = 0;
+
+static auto g_status_vars = sv::make_capability({
+    sv::make_int("ext_hits",   &g_hits),
+    sv::make_int("ext_misses", &g_misses)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_status_vars))
+```
+
+`make_int` requires a `long long *`; `make_double` requires a `double *`.
+Those are the only two types supported.
+
+## System Variables {#system-variables}
+
+The sys_var capability (`vsql::preview::sys_var`) lets an extension register
+MySQL system variables backed by extension-owned storage. Four types are
+supported: `BOOL` (`bool *`), `INT` (`long long *`), `DOUBLE` (`double *`),
+and `STR` (`char **`). `INT` and `DOUBLE` descriptors also carry `min_val`
+and `max_val` bounds; all descriptors carry a default value and a comment.
+
+Build the capability with `vsql::preview_sys_var::make_capability()` and the
+matching factory functions `make_bool`, `make_int`, `make_double`, and
+`make_str`. The capability object also exposes `get()` and `set()` for
+programmatic access from extension code. Both return `false` on success.
+
+To react to value changes, chain `.on_change<&fn>()` on a descriptor. The
+callback receives a `sv::SysVarChange` with `var_name()` and typed accessors
+(`as_int()`, `as_real()`, `as_str()`).
+
+### Complete Example
+
+```cpp
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_sys_var;
+
+static bool      g_enabled   = true;
+static long long g_threshold = 1000;
+static double    g_ratio     = 1.0;
+static char     *g_log_file  = nullptr;
+
+static void on_threshold_change(sv::SysVarChange c) {
+  // c.var_name() identifies the variable; c.as_int() returns the new value
+}
+
+static auto g_sys_vars = sv::make_capability({
+    sv::make_bool  ("enabled",      "Enable feature",  &g_enabled,   true),
+    sv::make_int   ("threshold_ms", "Threshold in ms", &g_threshold, 1000, 0, 3600000)
+        .on_change<&on_threshold_change>(),
+    sv::make_double("ratio",        "Ratio",           &g_ratio,     1.0, 0.0, 10.0),
+    sv::make_str   ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log")});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_sys_vars))
+```
+
+The `scope` argument to `set()` controls persistence: `nullptr` updates the
+running value only, `"PERSIST"` updates the running value and persists it to
+`mysqld-auto.cnf`, and `"PERSIST_ONLY"` persists without changing the running
+value.
