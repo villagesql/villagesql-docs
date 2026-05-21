@@ -1,6 +1,6 @@
 ---
 title: "Preview Capabilities"
-description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the keyring, ping, status_var, and sys_var capabilities, and registration patterns."
+description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the keyring, status_var, sys_var, thread_worker, and sql_query capabilities, and registration patterns."
 ---
 
 Preview capabilities are server-provided features exposed to extensions before
@@ -50,7 +50,7 @@ Uninstall those extensions first, then turn the setting off.
 | Capability | Header | Status |
 |---|---|---|
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
-| `vsql::preview::ping` | `<villagesql/preview/ping.h>` | Preview |
+| `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | Preview |
 | `vsql::preview::status_var` | `<villagesql/preview/status_var.h>` | Preview |
 | `vsql::preview::sys_var` | `<villagesql/preview/sys_var.h>` | Preview |
 | `vsql::preview::thread_worker` | `<villagesql/preview/thread_worker.h>` | Preview |
@@ -78,6 +78,22 @@ VEF_GENERATE_ENTRY_POINTS(
 `.with(capability)` tells the server which capabilities the extension
 requires. If `vsql_allow_preview_extensions` is OFF when the extension is
 installed, the server rejects the install with an error naming the capability.
+
+<Warning>
+Every capability object declared in an extension must be passed to `.with()`
+exactly once. At load time, the server cross-checks every declared capability
+instance against what `.with()` received and fails `INSTALL EXTENSION` if the
+rule is violated:
+
+- **Declared but never passed to `.with()`:**
+  `capability '<Type>' was declared but never passed to .with(); every CapabilityBase-derived static must be registered via .with(cap) in the extension builder`
+- **Same instance passed to `.with()` more than once:**
+  `capability '<Type>' passed to .with() more than once`
+- **Object passed to `.with()` is not a capability:**
+  `.with() received an object that does not inherit vsql::detail::CapabilityBase; not a registered capability`
+
+The full error surfaces as: `Failed to load VEF extension '<name>': vef_register returned an error: <message above>`.
+</Warning>
 
 ## Keyring Access {#keyring-access}
 
@@ -122,11 +138,10 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(g_keyring))
 ```
 
-The `g_keyring` object is populated by the server at load time. To check
-whether the capability vtable was bound before calling its methods, compare
-`g_keyring.abi` against `nullptr`. A non-null `abi` means the capability is
-available; the read/write functions still report `Status::UNAVAILABLE` at
-runtime if no keyring component is installed.
+The `g_keyring` object is populated by the server at load time. The
+`read()` and `write()` methods return `Status::UNAVAILABLE` at runtime
+when no keyring component is installed — check that status on each call
+rather than gating on a separate availability probe.
 
 ### Reading and Writing
 
@@ -216,66 +231,6 @@ VEF_GENERATE_ENTRY_POINTS(
         .func(make_func<&keyring_store>("keyring_store")
                   .returns(INT).param(STRING).param(STRING).param(STRING).build())
         .with(g_keyring))
-```
-
-## Ping {#ping}
-
-The ping capability (`vsql::preview::ping`) is a trivial capability used to
-exercise and test the preview capability registration system end-to-end. The
-server provides a single `ping()` function that returns a monotonically
-incrementing counter.
-
-The capability name `VEF_PREVIEW_PING_NAME` is `"vsql::preview::ping"`.
-
-### Declaring the Capability
-
-Include the header, declare a `PingCapability` at file scope, and pass it to
-`.with()`:
-
-```cpp
-#include <villagesql/preview/ping.h>
-#include <villagesql/vsql.h>
-
-static vsql::preview_ping::PingCapability g_ping;
-
-VEF_GENERATE_ENTRY_POINTS(
-    make_extension()
-        .with(g_ping))
-```
-
-To check whether the capability vtable was bound before calling `ping()`,
-compare `g_ping.abi` against `nullptr`.
-
-### Calling ping()
-
-```cpp
-long long PingCapability::ping() const;
-```
-
-`ping()` returns a monotonically incrementing counter from the server. It is
-intended to verify that the capability system is wired up correctly; it is
-not a timestamp.
-
-### Complete Example
-
-This is the `vsql_preview_ping_test` extension that ships with the server.
-It registers a single VDF `ping()` that returns the server-provided counter
-value.
-
-```cpp
-#include <villagesql/preview/ping.h>
-#include <villagesql/vsql.h>
-
-using namespace vsql;
-
-static vsql::preview_ping::PingCapability g_ping;
-
-static void ping_impl(IntResult out) { out.set(g_ping.ping()); }
-
-VEF_GENERATE_ENTRY_POINTS(
-    make_extension()
-        .func(make_func<&ping_impl>("ping").returns(INT).build())
-        .with(g_ping))
 ```
 
 ## Status Variables {#status-variables}
@@ -504,4 +459,201 @@ server registers a `heartbeat_enabled` system variable. Enable the worker with:
 
 ```sql
 SET GLOBAL heartbeat_enabled = ON;
+```
+
+## SQL Query {#sql-query}
+
+The sql_query capability (`vsql::preview::sql_query`) lets an extension
+execute SQL statements from a background thread. Queries run inside the
+server through the capability vtable — extensions do not link against any
+MySQL client library.
+
+The capability name `VEF_PREVIEW_SQL_QUERY_NAME` is
+`"vsql::preview::sql_query"`.
+
+<Warning>
+A SQL session must be opened from a thread-worker callback using that
+callback's `vef_thread_handle_t *`. `open()` is not valid from VDFs or from
+arbitrary extension-created threads — it requires the worker session
+context.
+</Warning>
+
+### Declaring the Capability
+
+Include the header, declare a `SqlQueryCapability` at file scope, and pass it
+to `.with()`. It is typically registered alongside a `ThreadWorkerCapability`,
+since sessions are opened from the worker callback:
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
+
+`g_sql.open(handle)` returns a `Session`. Check it with `operator bool` before
+use; an invalid `Session` indicates the capability vtable was not bound or the
+server could not allocate a session. The `Session` is move-only and closes
+itself on destruction.
+
+### Executing Queries
+
+A `Session` produces a `SqlQuery` via `session.sql(sv)`. The query can be run
+in two modes:
+
+- `execute()` — runs the statement and buffers the full result set in a
+  `Result`. Iterate rows by calling `next()` at the caller's pace.
+- `for_each(fn)` — runs the statement and invokes `fn` once per row as rows
+  are produced, without buffering. The returned `Result` carries diagnostics
+  only (no rows).
+
+Both return a `Result`. A non-null `Result` does not mean the statement
+succeeded — call `has_error()` to find out.
+
+Buffered (`execute`):
+
+```cpp
+auto result = session.sql("SELECT id, name FROM t").execute();
+if (result.has_error()) {
+  // result.error().message holds the server error string.
+  return {};
+}
+while (result.next()) {
+  long long id          = result.column_int(0);
+  std::string_view name = result.column_str(1);
+  // ...
+}
+```
+
+`column_str()` returns a `string_view` that is valid only until the next
+`next()` call or until `Result` is destroyed. Copy it if a longer lifetime is
+needed. A `string_view` with `data() == nullptr` indicates SQL NULL.
+
+Streaming (`for_each`):
+
+```cpp
+auto status = session.sql("SELECT 1").for_each(
+    [](const auto &row) {
+      // row.column_int(0), row.column_str(1), etc.
+    });
+if (status.has_error()) {
+  // status.error().message
+}
+```
+
+The `Row` passed to the callback is valid only for the duration of the call —
+do not store references to it across rows. The `Result` returned by
+`for_each` holds no buffered rows; `next()` on it will not yield data. Use it
+only for `has_error()`, `error()`, `warning_count()`, and `warning(i)`.
+
+### Diagnostics
+
+Both `execute()` and `for_each()` surface diagnostics through the returned
+`Result`. A diagnostic is one `Diag`:
+
+```cpp
+struct Diag {
+  uint32_t errno_;
+  vef_sql_diag_severity_t severity;   // NOTE | WARNING | ERROR
+  std::string_view sqlstate;          // 5-char SQLSTATE
+  std::string_view message;           // may be empty
+};
+```
+
+| Field | Meaning |
+|---|---|
+| `errno_` | MySQL error number. `0` on a default-constructed `Diag` returned when there is no error. |
+| `severity` | `VEF_SQL_DIAG_NOTE`, `VEF_SQL_DIAG_WARNING`, or `VEF_SQL_DIAG_ERROR`. |
+| `sqlstate` | 5-character SQLSTATE. |
+| `message` | Server-supplied diagnostic message; may be empty. |
+
+`Result` exposes:
+
+```cpp
+bool         Result::has_error() const;
+Diag         Result::error() const;
+unsigned int Result::warning_count() const;
+Diag         Result::warning(unsigned int i) const;
+```
+
+`error()` returns a default-constructed `Diag` (`errno_ == 0`) when the
+statement succeeded. `warning(i)` returns a default-constructed `Diag` when
+`i >= warning_count()`.
+
+The `sqlstate` and `message` views point into storage owned by the `Result`
+and become invalid when the `Result` is destroyed — copy them if they need to
+outlive it.
+
+### Complete Example
+
+A worker that runs one buffered query and one streaming query on each tick,
+logging diagnostics from both:
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t sql_demo_work(vef_wakeup_reason_t reason,
+                                       struct vef_thread_handle_t *thread,
+                                       void *arg) {
+  if (reason == VEF_WAKEUP_ENABLE) return {5000, 0};
+  if (reason != VEF_WAKEUP_PERIODIC) return {};
+
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+
+  // Buffered: read a small result set.
+  auto rs = session.sql("SELECT id, name FROM mydb.t LIMIT 10").execute();
+  if (rs.has_error()) {
+    auto e = rs.error();
+    // Log e.errno_, e.sqlstate, e.message somewhere extension-owned.
+  } else {
+    while (rs.next()) {
+      long long id          = rs.column_int(0);
+      std::string_view name = rs.column_str(1);
+      (void)id; (void)name;
+    }
+  }
+
+  // Streaming: process rows without buffering.
+  auto status = session.sql("SELECT v FROM mydb.t").for_each(
+      [](const auto &row) {
+        long long v = row.column_int(0);
+        (void)v;
+      });
+  for (unsigned i = 0; i < status.warning_count(); ++i) {
+    auto w = status.warning(i);
+    (void)w;
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&sql_demo_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
 ```
