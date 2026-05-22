@@ -209,6 +209,123 @@ void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
 void count_result(const CountState &s, IntResult out) { out.set(s); }
 ```
 
+### Per-Statement State (Prerun and Postrun)
+
+Some VDFs need state that spans every row a single query touches — a call
+counter, a cached result, an open resource. Allocate it in a **prerun** hook,
+access it from the VDF body, and release it in a **postrun** hook. Both hooks
+run once per statement; the VDF body runs once per row.
+
+Register them with `.prerun<&Hook>()` and `.postrun<&Hook>()`. The required
+signatures are:
+
+| Hook | Required signature |
+|------|--------------------|
+| Prerun | `void(vsql::PrerunArgs, vsql::PrerunResult)` |
+| Postrun | `void(vsql::PostrunArgs)` |
+
+Raw ABI signatures are rejected at compile time. Use `PrerunResult::set_user_data(void*)` to stash state; use `PostrunArgs::delete_state<T>()` to release it. If prerun calls `set_user_data(new T{})`, postrun **must** call `delete_state<T>()` — the SDK does not auto-free.
+
+`PrerunArgs::type_at(i)` exposes the declared SQL type of each argument before any rows are read; the predicates `is_int()`, `is_real()`, `is_str()`, `is_custom()` on the returned `PrerunArgType` mirror the column types. Use this in prerun to validate argument types or call `PrerunResult::request_buffer_size(n)` to size the result buffer.
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+struct CallCounter { long long n = 0; };
+
+void ba_call_index_prerun(PrerunArgs, PrerunResult out) {
+  out.set_user_data(new CallCounter{});
+}
+
+void ba_call_index(CallCounter &state, IntResult out) {
+  state.n++;
+  out.set(state.n);
+}
+
+void ba_call_index_postrun(PostrunArgs args) {
+  args.delete_state<CallCounter>();
+}
+
+// Registration:
+// make_func<&ba_call_index>("ba_call_index")
+//     .returns(INT).param()
+//     .prerun<&ba_call_index_prerun>()
+//     .postrun<&ba_call_index_postrun>()
+//     .build()
+```
+
+### Varargs VDFs
+
+A **varargs** VDF accepts any number of arguments of any SQL type. Declare one
+with `.varargs()` on the func builder, which is mutually exclusive with
+`.param()` and `.param(TYPE)`. The body receives a `vsql::VarArgs` argument
+instead of the usual fixed-arity wrappers.
+
+<Warning>
+Varargs registration requires VEF Protocol 2. Older servers reject the
+extension at install time.
+</Warning>
+
+The framework cannot validate argument count or types for varargs VDFs. Pair
+every varargs registration with a prerun hook that calls `PrerunResult::error()`
+on invalid input or `PrerunResult::request_buffer_size(n)` to size the result
+buffer.
+
+Iterate over arguments with range-for. Each `AnyArg` element requires a type
+check before reading its value:
+
+| Predicate | Accessor | Return type |
+|-----------|----------|-------------|
+| `is_int()` | `as_int()` | `long long` |
+| `is_real()` | `as_real()` | `double` |
+| `is_str()` | `as_str()` | `std::string_view` |
+| `is_custom()` | `as_custom()` | `vsql::Span<const unsigned char>` |
+
+Check `is_null()` before any accessor — all four are undefined on a null argument.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+constexpr size_t kBytearrayLen = 4;
+
+void ba_concat_all_prerun(PrerunArgs args, PrerunResult out) {
+  if (args.size() == 0) {
+    out.error("ba_concat_all requires at least one argument");
+    return;
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    auto t = args.type_at(i);
+    if (!t.is_custom() && !t.is_str()) {
+      out.error("ba_concat_all: argument " + std::to_string(i) +
+                " must be BYTEARRAY");
+      return;
+    }
+  }
+  out.request_buffer_size(args.size() * kBytearrayLen);
+}
+
+void ba_concat_all(VarArgs args, StringResult out) {
+  auto dst = out.buffer();
+  size_t off = 0;
+  for (auto a : args) {
+    if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
+    auto bytes = a.as_custom();
+    std::memcpy(dst.data() + off, bytes.data(), bytes.size());
+    off += bytes.size();
+  }
+  out.set_length(off);
+}
+
+// Registration:
+// make_func<&ba_concat_all>("ba_concat_all")
+//     .returns(STRING).varargs()
+//     .prerun<&ba_concat_all_prerun>()
+//     .build()
+```
+
 ### VEF_GENERATE_REGISTRATION
 
 `VEF_GENERATE_REGISTRATION` creates an internal `_vef_do_register()` helper
