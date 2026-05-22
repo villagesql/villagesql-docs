@@ -89,6 +89,13 @@ results also provide `set(value)`. Buffer results provide `buffer()` and
 view and sets the length in one call. For parameterized custom types,
 `CustomResultWith<P>` adds a `params()` accessor.
 
+**Span type:** `value()` and `buffer()` on the byte-oriented wrappers
+return a `vsql::Span<T>` — a non-owning view over a contiguous run of `T`
+with `data()`, `size()`, `empty()`, `begin()`/`end()`, and `operator[]`.
+Under C++20 it is an alias for `std::span<T>`; under C++17 the SDK provides
+a minimal compatible implementation, so the same code compiles in either
+standard. It is available through `<villagesql/vsql.h>`.
+
 `error(msg)` sets the function result to a SQL error with the given message string. Use it for invalid input that should surface as an error to the caller, as opposed to `set_null()` which silently produces NULL. The message is truncated to fit the server's internal error buffer if necessary.
 
 **Scalar example** — add two integers:
@@ -202,6 +209,123 @@ void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
 void count_result(const CountState &s, IntResult out) { out.set(s); }
 ```
 
+### Per-Statement State (Prerun and Postrun)
+
+Some VDFs need state that spans every row a single query touches — a call
+counter, a cached result, an open resource. Allocate it in a **prerun** hook,
+access it from the VDF body, and release it in a **postrun** hook. Both hooks
+run once per statement; the VDF body runs once per row.
+
+Register them with `.prerun<&Hook>()` and `.postrun<&Hook>()`. The required
+signatures are:
+
+| Hook | Required signature |
+|------|--------------------|
+| Prerun | `void(vsql::PrerunArgs, vsql::PrerunResult)` |
+| Postrun | `void(vsql::PostrunArgs)` |
+
+Raw ABI signatures are rejected at compile time. Use `PrerunResult::set_user_data(void*)` to stash state; use `PostrunArgs::delete_state<T>()` to release it. If prerun calls `set_user_data(new T{})`, postrun **must** call `delete_state<T>()` — the SDK does not auto-free.
+
+`PrerunArgs::type_at(i)` exposes the declared SQL type of each argument before any rows are read; the predicates `is_int()`, `is_real()`, `is_str()`, `is_custom()` on the returned `PrerunArgType` mirror the column types. Use this in prerun to validate argument types or call `PrerunResult::request_buffer_size(n)` to size the result buffer.
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+struct CallCounter { long long n = 0; };
+
+void ba_call_index_prerun(PrerunArgs, PrerunResult out) {
+  out.set_user_data(new CallCounter{});
+}
+
+void ba_call_index(CallCounter &state, IntResult out) {
+  state.n++;
+  out.set(state.n);
+}
+
+void ba_call_index_postrun(PostrunArgs args) {
+  args.delete_state<CallCounter>();
+}
+
+// Registration:
+// make_func<&ba_call_index>("ba_call_index")
+//     .returns(INT).no_params()
+//     .prerun<&ba_call_index_prerun>()
+//     .postrun<&ba_call_index_postrun>()
+//     .build()
+```
+
+### Varargs VDFs
+
+A **varargs** VDF accepts any number of arguments of any SQL type. Declare one
+with `.varargs()` on the func builder, which is mutually exclusive with
+`.no_params()` and `.param(TYPE)`. The body receives a `vsql::VarArgs` argument
+instead of the usual fixed-arity wrappers.
+
+<Warning>
+Varargs registration requires VEF Protocol 3. Older servers reject the
+extension at install time.
+</Warning>
+
+The framework cannot validate argument count or types for varargs VDFs. Pair
+every varargs registration with a prerun hook that calls `PrerunResult::error()`
+on invalid input or `PrerunResult::request_buffer_size(n)` to size the result
+buffer.
+
+Iterate over arguments with range-for. Each `AnyArg` element requires a type
+check before reading its value:
+
+| Predicate | Accessor | Return type |
+|-----------|----------|-------------|
+| `is_int()` | `as_int()` | `long long` |
+| `is_real()` | `as_real()` | `double` |
+| `is_str()` | `as_str()` | `std::string_view` |
+| `is_custom()` | `as_custom()` | `vsql::Span<const unsigned char>` |
+
+Check `is_null()` before any accessor — all four are undefined on a null argument.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+constexpr size_t kBytearrayLen = 4;
+
+void ba_concat_all_prerun(PrerunArgs args, PrerunResult out) {
+  if (args.size() == 0) {
+    out.error("ba_concat_all requires at least one argument");
+    return;
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    auto t = args.type_at(i);
+    if (!t.is_custom() && !t.is_str()) {
+      out.error("ba_concat_all: argument " + std::to_string(i) +
+                " must be BYTEARRAY");
+      return;
+    }
+  }
+  out.request_buffer_size(args.size() * kBytearrayLen);
+}
+
+void ba_concat_all(VarArgs args, StringResult out) {
+  auto dst = out.buffer();
+  size_t off = 0;
+  for (auto a : args) {
+    if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
+    auto bytes = a.as_custom();
+    std::memcpy(dst.data() + off, bytes.data(), bytes.size());
+    off += bytes.size();
+  }
+  out.set_length(off);
+}
+
+// Registration:
+// make_func<&ba_concat_all>("ba_concat_all")
+//     .returns(STRING).varargs()
+//     .prerun<&ba_concat_all_prerun>()
+//     .build()
+```
+
 ### VEF_GENERATE_REGISTRATION
 
 `VEF_GENERATE_REGISTRATION` creates an internal `_vef_do_register()` helper
@@ -225,7 +349,7 @@ VEF_GENERATE_REGISTRATION(
 
 Custom types require three operations the engine calls internally:
 encode (string to binary), decode (binary to string), and compare.
-Hash is optional. Implement them against these C++ signatures (all defined in `vsql/func_builder.h`):
+Hash is optional. Implement them against these C++ signatures (all available via `<villagesql/vsql.h>`):
 
 #### Fixed-Length Types
 
@@ -309,7 +433,7 @@ shown in the fixed-length example above with `.intrinsic_default_str("0")`).
 **VDF-based: `.intrinsic_default_vdf()` + `make_intrinsic_default`**
 
 When the default value depends on type parameters, implement a function
-against one of these signatures (defined in `vsql/func_builder.h`):
+against one of these signatures (available via `<villagesql/vsql.h>`):
 
 <Warning>
   **Breaking change** (`baa54d31100`): `IntrinsicDefaultFunc` and
@@ -392,7 +516,7 @@ size_t mytype_hash(vsql::CustomArgWith<MyTypeParams> in) {
 }
 
 // Converts MYTYPE(N) integer syntax to a parameter map.
-// Signature: IntToTypeParamsFunc from vsql/func_builder.h.
+// Signature: IntToTypeParamsFunc from <villagesql/vsql.h>.
 bool mytype_int_to_params_fn(int64_t value,
                              std::map<std::string, std::string> &params,
                              char *error_msg) {
@@ -406,7 +530,7 @@ bool mytype_int_to_params_fn(int64_t value,
 }
 
 // Validates parameters and computes storage sizes.
-// Signature: ResolveTypeParamsFunc from vsql/func_builder.h.
+// Signature: ResolveTypeParamsFunc from <villagesql/vsql.h>.
 bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
                               vsql::ResolvedTypeParams *result,
                               char *error_msg) {
@@ -460,8 +584,8 @@ VEF_GENERATE_ENTRY_POINTS(
 The parameterized variants — `TypeEncodeWithParamsFunc<P>`,
 `TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>`, and
 `TypeHashWithParamsFunc<P>` — together with `ParamsToStringsFunc<P>`
-(`void fn(const P&, std::map<std::string,std::string>&)`) are defined in
-`vsql/func_builder.h`.
+(`void fn(const P&, std::map<std::string,std::string>&)`) are available via
+`<villagesql/vsql.h>`.
 The `vsql::make_type` template methods detect the params argument and route
 through the params cache automatically. Encode functions take
 `vsql::MaybeParams<P> &` as the first argument; `is_known()` is always true
