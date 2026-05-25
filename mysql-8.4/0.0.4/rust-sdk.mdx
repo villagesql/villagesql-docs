@@ -1,0 +1,222 @@
+---
+title: "Building Extensions in Rust"
+description: "Get started with the VillageSQL Rust SDK — write extension functions in safe Rust, package them as VEB files, and install them in VillageSQL."
+---
+
+<Warning>
+The Rust SDK is at version 0.0.1 and is not yet published to crates.io. Getting started requires a local clone of the SDK repo and a `path` dependency in your `Cargo.toml`.
+</Warning>
+
+<Note>
+If you prefer C++, see [Creating Extensions](/mysql-8.4/0.0.4/create) for the C++ SDK walkthrough.
+</Note>
+
+VillageSQL extensions can be written in Rust using the `vsql` crate. The SDK handles all FFI marshaling — you work in ordinary Rust types and the `extension!` macro generates the C entry points the server calls at load time.
+
+## Prerequisites
+
+You need:
+
+- **Rust stable toolchain** — install at [rustup.rs](https://rustup.rs)
+- **cargo-vsql** — the Cargo subcommand for packaging, installing, and testing extensions
+- **VillageSQL build directory** — set `VillageSQL_BUILD_DIR` to your server build path for `cargo vsql install` and `cargo vsql test`
+
+Install `cargo-vsql` from the SDK repo:
+
+```bash
+git clone https://github.com/villagesql/vsql-rust-sdk
+cd vsql-rust-sdk
+cargo install --path cargo-vsql
+```
+
+Verify it's available:
+
+```bash
+cargo vsql --help
+```
+
+## Create a new crate
+
+Create a new Rust library crate:
+
+```bash
+cargo new --lib vsql_rot13
+cd vsql_rot13
+```
+
+Edit `Cargo.toml` to set the crate type and add the `vsql` dependency:
+
+```toml
+[package]
+name = "vsql_rot13"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vsql = { path = "/path/to/vsql-rust-sdk/vsql" }
+```
+
+The `cdylib` crate type tells Cargo to produce a shared library (`.so` on Linux, `.dylib` on macOS) that the server can load.
+
+## Write your first function
+
+Replace `src/lib.rs` with a complete extension:
+
+```rust
+use vsql::{InValue, VdfReturn};
+
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("vsql_rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+vsql::extension! {
+    funcs: [
+        vsql::func!(rot13_impl, "vsql_rot13", [vsql::Type::String] -> vsql::Type::String),
+    ]
+}
+```
+
+The `func!` macro wires `rot13_impl` to the SQL name `vsql_rot13` with a `STRING -> STRING` signature.
+
+The function signature is `fn(&[InValue]) -> VdfReturn`. `InValue` is an enum over the SQL types the server passes in. `VdfReturn` is what you send back. Check `args.first()` to handle both the NULL case and the wrong-type case before touching the value.
+
+If your function always returns the same output for the same inputs, declare it deterministic — the optimizer can then cache results for identical inputs:
+
+```rust
+vsql::func!(rot13_impl, "vsql_rot13", [vsql::Type::String] -> vsql::Type::String, deterministic: true)
+```
+
+## Add manifest.json
+
+Create `manifest.json` in the crate root (alongside `Cargo.toml`):
+
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "ROT-13 encoding for VillageSQL",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+The server reads this at install time. The `name` field must match what you pass to `INSTALL EXTENSION`.
+
+## Build and install
+
+Package the extension into a `.veb` file:
+
+```bash
+cargo vsql package
+```
+
+This produces `dist/vsql_rot13.veb`. To package and copy the VEB directly to your VillageSQL build directory:
+
+```bash
+export VillageSQL_BUILD_DIR=/path/to/villagesql/build
+cargo vsql install
+```
+
+You should see the VEB copied to the extensions directory. Verify it's there:
+
+```bash
+ls "$VillageSQL_BUILD_DIR/lib/veb/"
+# vsql_rot13.veb
+```
+
+## Test
+
+Write a test file in `mysql-test/t/rot13_basic.test`:
+
+```sql
+INSTALL EXTENSION 'vsql_rot13';
+SELECT vsql_rot13('Hello');
+SELECT vsql_rot13('');
+SELECT vsql_rot13(NULL);
+UNINSTALL EXTENSION 'vsql_rot13';
+```
+
+Generate the expected results:
+
+```bash
+cargo vsql test --record
+```
+
+Run the suite:
+
+```bash
+cargo vsql test
+```
+
+After modifying your function's behavior, re-run `cargo vsql test --record` to update the expected results, then `cargo vsql test` to confirm.
+
+## Install in SQL
+
+Once the VEB is in the extensions directory, install it:
+
+```sql
+INSTALL EXTENSION 'vsql_rot13';
+```
+
+Verify:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'vsql_rot13';
+```
+
+Call it:
+
+```sql
+SELECT vsql_rot13('Hello, World!');
+-- → Uryyb, Jbeyq!
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Custom Types in Rust"
+    icon="shapes"
+    href="/mysql-8.4/0.0.4/rust-custom-types"
+  >
+    Define new column types with binary storage, ordering, and hashing.
+  </Card>
+  <Card
+    title="Rust API Reference"
+    icon="book"
+    href="/mysql-8.4/0.0.4/rust-api-reference"
+  >
+    InValue, VdfReturn, extension!, func!, and custom_type! — all fields.
+  </Card>
+  <Card
+    title="C++ SDK (Creating Extensions)"
+    icon="code"
+    href="/mysql-8.4/0.0.4/create"
+  >
+    The C++ path — typed wrappers, builder API, and CMake setup.
+  </Card>
+  <Card
+    title="Extension Architecture"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.4/architecture"
+  >
+    How VEB files load, lifecycle hooks, and symbol isolation.
+  </Card>
+</CardGroup>
