@@ -49,9 +49,11 @@ Uninstall those extensions first, then turn the setting off.
 
 | Capability | Header | Status |
 |---|---|---|
+| `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview |
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
 | `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | Preview |
 | `vsql::preview::status_var` | `<villagesql/preview/status_var.h>` | Preview |
+| `vsql::preview::storage` | `<villagesql/preview/storage_builder.h>` | Preview |
 | `vsql::preview::sys_var` | `<villagesql/preview/sys_var.h>` | Preview |
 | `vsql::preview::thread_worker` | `<villagesql/preview/thread_worker.h>` | Preview |
 
@@ -657,3 +659,193 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(g_worker)
         .with(g_sql))
 ```
+
+## Column Storage {#column-storage}
+
+Column storage lets an extension register a custom binary on-disk layout
+directly with InnoDB for one of its custom types, instead of routing the
+type's bytes through the row's VARBINARY payload. Use it when your type
+needs an on-disk shape VARBINARY cannot express — for example, a packed
+array of floats that must live in dedicated pages. This is a capability
+feature: it enables new storage layouts, not a tuning knob for existing ones.
+
+<Warning>
+  Column storage is a preview ABI — under active development and may change
+  between releases. It currently covers row-level persistence only; indexing
+  over custom-stored columns is not yet available.
+</Warning>
+
+### Declaring the Capabilities
+
+Two preview capabilities work together:
+
+- `vsql::preview::storage` — opens access to InnoDB storage infrastructure
+  (mini-transactions, segments, pages). Declare a `StorageCapability` at file
+  scope.
+- `vsql::preview::column_store` — binds a per-type storage implementation to
+  one of the extension's custom types. Declare a `ColumnStoreCapability` at
+  file scope using `make_column_store<Ctx>(TYPE).…build()`.
+
+Both must be passed to `.with()` on `make_extension()`:
+
+```cpp
+#include <villagesql/preview/storage_builder.h>
+#include <villagesql/preview/storage_api.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+struct MyCtx { /* per-column state, arena-allocated by the server */ };
+
+static auto STORAGE = StorageCapability{};
+
+static constexpr auto kMyStorage =
+    make_column_store<MyCtx>(MY_TYPE)
+        .create<&MyStorage::create>()
+        .drop<&MyStorage::drop>()
+        .load<&MyStorage::load>()
+        .insert<&MyStorage::insert>()
+        .select<&MyStorage::select>()
+        .mark_delete<&MyStorage::mark_delete>()
+        .purge<&MyStorage::purge>()
+        .build();
+
+static auto COLUMN_STORE = ColumnStoreCapability().column_store(kMyStorage);
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STORAGE)
+        .with(COLUMN_STORE)
+        .type(MY_TYPE))
+```
+
+`make_column_store<MyCtx>(MY_TYPE)` ties the implementation to one custom
+type registered on the same extension. All seven slots are required at
+`build()` time because each maps to a distinct point in the column lifecycle
+that InnoDB will reach during normal operation.
+
+### The Seven Storage Functions
+
+Every function takes `Column::StorageCtx<MyCtx>*`, whose `user()` accessor
+returns the extension's per-column state and whose `arena()` provides
+server-managed allocation. Every function returns `false` on success and
+`true` on error, writing a message into `error_msg` (capacity
+`error_msg_len`) so failures surface to the SQL client.
+
+```cpp
+// CREATE TABLE / ALTER TABLE ADD COLUMN.
+// col_len is the type's persisted length. Allocate per-column state in the
+// server-provided arena and reserve segments here so root references
+// survive restart.
+bool create(Column::StorageCtx<MyCtx>*, Space::Ref, Segment::TrxRef,
+            uint32_t col_len, char* error_msg, uint32_t error_msg_len);
+
+// DROP TABLE / ALTER TABLE DROP COLUMN.
+// Release any segments reserved in create(). Arena memory is freed by the
+// server after this call returns.
+bool drop(Column::StorageCtx<MyCtx>*, Segment::TrxRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// Called when the server reattaches to existing storage (e.g. after restart).
+// Use Column::StorageRef to recover root references previously persisted in
+// the StorageCtx.
+bool load(Column::StorageCtx<MyCtx>*, Column::StorageRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// INSERT. col_data is the encoded value; rowid_prefix identifies the owning
+// row. Write into your storage layout and return a Column::Ref the server
+// stores in the row payload in place of the value bytes.
+bool insert(Column::StorageCtx<MyCtx>*, MtrCtx::Ref, Segment::TrxRef,
+            Column::Data col_data, Column::Data rowid_prefix,
+            Column::Ref* col_ref, char* error_msg, uint32_t error_msg_len);
+
+// SELECT. Given the Column::Ref produced by insert, populate col_data and
+// rowid_prefix, and report the writing transaction and delete-mark status.
+bool select(Column::StorageCtx<MyCtx>*, MtrCtx::Ref, Column::Ref,
+            Column::Data* col_data, Column::Data* rowid_prefix,
+            Segment::TrxRef*, bool* delete_marked,
+            char* error_msg, uint32_t error_msg_len);
+
+// DELETE (in-transaction). Set or clear the delete-mark flag. The actual
+// bytes must remain readable until purge() runs.
+bool mark_delete(Column::StorageCtx<MyCtx>*, MtrCtx::Ref, Segment::TrxRef,
+                 Column::Ref, bool delete_mark,
+                 char* error_msg, uint32_t error_msg_len);
+
+// InnoDB purge. Reclaim storage for entries whose deleting transaction is
+// no longer visible to any active snapshot.
+bool purge(Column::StorageCtx<MyCtx>*, MtrCtx::Ref, Segment::TrxRef,
+           Column::Ref, char* error_msg, uint32_t error_msg_len);
+```
+
+`mark_delete` and `purge` are distinct because InnoDB MVCC requires deleted
+rows to remain readable by older snapshots until purge runs.
+
+### Per-Column Context and the Arena
+
+`create` is the only place to install the extension's `MyCtx`. Construct it
+through the server's arena so its lifetime is tied to the column:
+
+```cpp
+bool MyStorage::create(Column::StorageCtx<MyCtx>* ctx,
+                       Space::Ref space, Segment::TrxRef trx,
+                       uint32_t col_len,
+                       char* error_msg, uint32_t error_msg_len) {
+    MyCtx* my = ctx->arena().construct<MyCtx>(/* args */);
+    // ctx->user() returns my from this point on.
+    return false;  // false = success
+}
+```
+
+Do not allocate the context with `new` — the server owns the arena and frees
+it on column teardown.
+
+### InnoDB Access Utilities
+
+Include `<villagesql/preview/storage_api.h>` for the InnoDB primitives.
+All page reads and writes must occur inside a mini-transaction:
+
+```cpp
+MtrCtx mtr;
+MtrCtx::Ref mtr_ref = mtr.start();
+// ... page operations ...
+mtr.commit();
+```
+
+Committing the mini-transaction releases page latches and writes the redo log
+records that make changes durable.
+
+**Segments** are reserved at `create` time. Persist the root page reference
+into the `StorageCtx` so `load` can recover it after restart:
+
+```cpp
+Segment::PageRef root;
+Segment::create(space, /* num_segments */ 1, trx, root);
+ctx->set_ref(static_cast<Column::StorageRef>(root));
+```
+
+**Pages** are read with a shared latch and written with an exclusive one.
+Pass `mtr_ref` to write calls so InnoDB logs the change:
+
+```cpp
+Page page;
+
+// Read
+page.load(space, page_num, Page::Latch::SHARED, mtr_ref);
+uint32_t v = page.read_integer_4(Page::HEADER_SIZE + offset);
+
+// Write
+page.load(space, page_num, Page::Latch::EXCLUSIVE, mtr_ref);
+page.write_integer_4(Page::HEADER_SIZE + offset, v, mtr_ref);
+```
+
+Page layout constants:
+
+| Constant | Value | Notes |
+|---|---|---|
+| `Page::HEADER_SIZE` | `38` | Extension data begins at this offset. |
+| `Page::TRAILER_SIZE` | `8` | Do not write past `page_size - TRAILER_SIZE`. |
+| `Page::get_size(space)` | runtime | Use instead of hard-coding 16384. |
+
+Reading or writing inside the header or trailer regions corrupts the page —
+InnoDB uses those byte ranges for its own bookkeeping and checksum.
