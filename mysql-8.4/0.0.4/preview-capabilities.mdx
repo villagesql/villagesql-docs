@@ -783,22 +783,49 @@ rows to remain readable by older snapshots until purge runs.
 
 ### Per-Column Context and the Arena
 
-`create` is the only place to install the extension's `MyCtx`. Construct it
-through the server's arena so its lifetime is tied to the column:
+The SDK default-constructs `MyCtx` before calling either `create` or `load` —
+`ctx->user()` is already populated when your function is entered. `MyCtx` must
+be default-constructible; the SDK calls `T()` with no arguments.
+
+Use `ctx->user()` directly to initialize state. Do not call
+`ctx->arena().construct<MyCtx>()` — that allocates a second, unused instance
+and `ctx->user()` does not point to it.
 
 ```cpp
 bool MyStorage::create(Column::StorageCtx<MyCtx>* ctx,
                        Space::Ref space, Segment::TrxRef trx,
                        uint32_t col_len,
                        char* error_msg, uint32_t error_msg_len) {
-    MyCtx* my = ctx->arena().construct<MyCtx>(/* args */);
-    // ctx->user() returns my from this point on.
-    return false;  // false = success
+  Segment::PageRef root;
+  if (Segment::create(space, 1, trx, root) != Error::SUCCESS) {
+    snprintf(error_msg, error_msg_len, "%s", last_error().data());
+    return true;
+  }
+
+  // Storage reference is persisted across restarts; load() receives this
+  // value as storage_ref.
+  ctx->set_ref(static_cast<Column::StorageRef>(root));
+  ctx->user()->col_len = col_len;
+  return false;
 }
 ```
 
-Do not allocate the context with `new` — the server owns the arena and frees
-it on column teardown.
+`load` follows the same pattern — `ctx->user()` is pre-populated and
+`storage_ref` carries the value stored by `ctx->set_ref()` in `create`:
+
+```cpp
+bool MyStorage::load(Column::StorageCtx<MyCtx>* ctx,
+                     Column::StorageRef storage_ref,
+                     char* error_msg, uint32_t error_msg_len) {
+  ctx->user()->root = static_cast<Segment::PageRef>(storage_ref);
+  return false;
+}
+```
+
+Use `ctx->arena()` only to allocate auxiliary objects that are too large or
+dynamic to embed directly in `MyCtx`. The SDK destroys the arena — and calls
+`~MyCtx()` — automatically after `drop` returns, regardless of whether `drop`
+succeeds.
 
 ### InnoDB Access Utilities
 
