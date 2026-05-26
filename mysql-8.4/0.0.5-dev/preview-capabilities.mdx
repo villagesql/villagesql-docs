@@ -693,9 +693,15 @@ Both must be passed to `.with()` on `make_extension()`:
 #include <villagesql/preview/storage_api.h>
 #include <villagesql/vsql.h>
 
-using namespace vsql;
+namespace storage = vsql::preview_storage;
+using vsql::preview_storage_builder::ColumnStoreCapability;
+using vsql::preview_storage_builder::make_column_store;
+using vsql::preview_storage_builder::StorageCapability;
 
-struct MyCtx { /* per-column state; SDK default-constructs before calling create or load */ };
+struct MyCtx {
+  storage::Space::Ref space = 0;
+  storage::Segment::PageRef root_page = storage::Page::INVALID_REF;
+};
 
 static auto STORAGE = StorageCapability{};
 
@@ -712,6 +718,8 @@ static constexpr auto kMyStorage =
 
 static auto COLUMN_STORE = ColumnStoreCapability().column_store(kMyStorage);
 
+using namespace vsql;
+
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()
         .with(STORAGE)
@@ -726,56 +734,57 @@ that InnoDB will reach during normal operation.
 
 ### The Seven Storage Functions
 
-Every function takes `Column::StorageCtx<MyCtx>*`, whose `user()` accessor
-returns the extension's per-column state and whose `arena()` provides
-server-managed allocation. Every function returns `false` on success and
-`true` on error, writing a message into `error_msg` (capacity
+Every function takes `storage::Column::StorageCtx<MyCtx>*`, whose `user()`
+accessor returns the extension's per-column state and whose `arena()` provides
+server-managed allocation for auxiliary objects. Every function returns `false`
+on success and `true` on error, writing a message into `error_msg` (capacity
 `error_msg_len`) so failures surface to the SQL client.
 
 ```cpp
 // CREATE TABLE / ALTER TABLE ADD COLUMN.
-// col_len is the type's persisted length. Allocate per-column state in the
-// server-provided arena and reserve segments here so root references
-// survive restart.
-bool create(Column::StorageCtx<MyCtx>*, Space::Ref, Segment::TrxRef,
-            uint32_t col_len, char* error_msg, uint32_t error_msg_len);
+// col_len is the type's persisted length. Reserve segments here and store
+// space + root_page in ctx->user() so DML functions can reach them.
+bool create(storage::Column::StorageCtx<MyCtx>*, storage::Space::Ref,
+            storage::Segment::TrxRef, uint32_t col_len,
+            char* error_msg, uint32_t error_msg_len);
 
 // DROP TABLE / ALTER TABLE DROP COLUMN.
 // Release any segments reserved in create(). Arena memory is freed by the
 // server after this call returns.
-bool drop(Column::StorageCtx<MyCtx>*, Segment::TrxRef,
+bool drop(storage::Column::StorageCtx<MyCtx>*, storage::Segment::TrxRef,
           char* error_msg, uint32_t error_msg_len);
 
 // Called when the server reattaches to existing storage (e.g. after restart).
-// Use Column::StorageRef to recover root references previously persisted in
-// the StorageCtx.
-bool load(Column::StorageCtx<MyCtx>*, Column::StorageRef,
+// Recover space and root_page from the StorageRef set in create().
+bool load(storage::Column::StorageCtx<MyCtx>*, storage::Column::StorageRef,
           char* error_msg, uint32_t error_msg_len);
 
 // INSERT. col_data is the encoded value; rowid_prefix identifies the owning
 // row. Write into your storage layout and return a Column::Ref the server
 // stores in the row payload in place of the value bytes.
-bool insert(Column::StorageCtx<MyCtx>*, MtrCtx::Ref, Segment::TrxRef,
-            Column::Data col_data, Column::Data rowid_prefix,
-            Column::Ref* col_ref, char* error_msg, uint32_t error_msg_len);
+bool insert(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Segment::TrxRef, storage::Column::Data col_data,
+            storage::Column::Data rowid_prefix, storage::Column::Ref* col_ref,
+            char* error_msg, uint32_t error_msg_len);
 
 // SELECT. Given the Column::Ref produced by insert, populate col_data and
 // rowid_prefix, and report the writing transaction and delete-mark status.
-bool select(Column::StorageCtx<MyCtx>*, MtrCtx::Ref, Column::Ref,
-            Column::Data* col_data, Column::Data* rowid_prefix,
-            Segment::TrxRef*, bool* delete_marked,
-            char* error_msg, uint32_t error_msg_len);
+bool select(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Column::Ref, storage::Column::Data* col_data,
+            storage::Column::Data* rowid_prefix, storage::Segment::TrxRef*,
+            bool* delete_marked, char* error_msg, uint32_t error_msg_len);
 
 // DELETE (in-transaction). Set or clear the delete-mark flag. The actual
 // bytes must remain readable until purge() runs.
-bool mark_delete(Column::StorageCtx<MyCtx>*, MtrCtx::Ref, Segment::TrxRef,
-                 Column::Ref, bool delete_mark,
-                 char* error_msg, uint32_t error_msg_len);
+bool mark_delete(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+                 storage::Segment::TrxRef, storage::Column::Ref,
+                 bool delete_mark, char* error_msg, uint32_t error_msg_len);
 
 // InnoDB purge. Reclaim storage for entries whose deleting transaction is
 // no longer visible to any active snapshot.
-bool purge(Column::StorageCtx<MyCtx>*, MtrCtx::Ref, Segment::TrxRef,
-           Column::Ref, char* error_msg, uint32_t error_msg_len);
+bool purge(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+           storage::Segment::TrxRef, storage::Column::Ref,
+           char* error_msg, uint32_t error_msg_len);
 ```
 
 `mark_delete` and `purge` are distinct because InnoDB MVCC requires deleted
@@ -792,32 +801,37 @@ Use `ctx->user()` directly to initialize state. Do not call
 and `ctx->user()` does not point to it.
 
 ```cpp
-bool MyStorage::create(Column::StorageCtx<MyCtx>* ctx,
-                       Space::Ref space, Segment::TrxRef trx,
+bool MyStorage::create(storage::Column::StorageCtx<MyCtx>* ctx,
+                       storage::Space::Ref space, storage::Segment::TrxRef trx,
                        uint32_t col_len,
                        char* error_msg, uint32_t error_msg_len) {
-  Segment::PageRef root;
-  if (Segment::create(space, 1, trx, root) != Error::SUCCESS) {
-    snprintf(error_msg, error_msg_len, "%s", last_error().data());
+  storage::Segment::PageRef root;
+  if (storage::Segment::create(space, 1, trx, root) != storage::Error::SUCCESS) {
+    snprintf(error_msg, error_msg_len, "%s", storage::last_error().data());
     return true;
   }
 
-  // Storage reference is persisted across restarts; load() receives this
-  // value as storage_ref.
-  ctx->set_ref(static_cast<Column::StorageRef>(root));
-  ctx->user()->col_len = col_len;
+  ctx->user()->space = space;
+  ctx->user()->root_page = root;
+  // Encode space and root into StorageRef so load() can recover both.
+  ctx->set_ref((static_cast<storage::Column::StorageRef>(space) << 32) |
+               static_cast<storage::Column::StorageRef>(root));
   return false;
 }
 ```
 
 `load` follows the same pattern — `ctx->user()` is pre-populated and
-`storage_ref` carries the value stored by `ctx->set_ref()` in `create`:
+`storage_ref` carries the packed value stored by `ctx->set_ref()` in `create`:
 
 ```cpp
-bool MyStorage::load(Column::StorageCtx<MyCtx>* ctx,
-                     Column::StorageRef storage_ref,
+bool MyStorage::load(storage::Column::StorageCtx<MyCtx>* ctx,
+                     storage::Column::StorageRef storage_ref,
                      char* error_msg, uint32_t error_msg_len) {
-  ctx->user()->root = static_cast<Segment::PageRef>(storage_ref);
+  ctx->user()->space =
+      static_cast<storage::Space::Ref>(storage_ref >> 32);
+  ctx->user()->root_page =
+      static_cast<storage::Segment::PageRef>(storage_ref & 0xFFFFFFFF);
+  ctx->set_ref(storage_ref);
   return false;
 }
 ```
@@ -833,8 +847,9 @@ Include `<villagesql/preview/storage_api.h>` for the InnoDB primitives.
 All page reads and writes must occur inside a mini-transaction:
 
 ```cpp
-MtrCtx mtr;
-MtrCtx::Ref mtr_ref = mtr.start();
+storage::MtrCtx mtr;
+storage::MtrCtx::Ref mtr_ref = mtr.start();
+if (mtr_ref == nullptr) { /* OOM — handle error */ return true; }
 // ... page operations ...
 mtr.commit();
 ```
@@ -842,37 +857,42 @@ mtr.commit();
 Committing the mini-transaction releases page latches and writes the redo log
 records that make changes durable.
 
-**Segments** are reserved at `create` time. Persist the root page reference
-into the `StorageCtx` so `load` can recover it after restart:
+**Segments** are reserved at `create` time — see the `create` and `load`
+examples in Per-Column Context above for the complete setup pattern. During
+DML operations, get a segment reference from the root page to allocate new
+pages:
 
 ```cpp
-Segment::PageRef root;
-Segment::create(space, /* num_segments */ 1, trx, root);
-ctx->set_ref(static_cast<Column::StorageRef>(root));
+storage::Page root;
+root.load(ctx->user()->space, ctx->user()->root_page,
+          storage::Page::Latch::EXCLUSIVE, mtr_ref);
+storage::Segment::Ref seg = storage::Segment::get_header(root, 0);
+storage::Page data_page;
+data_page.load_new(seg, mtr_ref);  // allocates a fresh page
 ```
 
 **Pages** are read with a shared latch and written with an exclusive one.
 Pass `mtr_ref` to write calls so InnoDB logs the change:
 
 ```cpp
-Page page;
+storage::Page page;
 
 // Read
-page.load(space, page_num, Page::Latch::SHARED, mtr_ref);
-uint32_t v = page.read_integer_4(Page::HEADER_SIZE + offset);
+page.load(ctx->user()->space, page_num, storage::Page::Latch::SHARED, mtr_ref);
+uint32_t v = page.read_integer_4(storage::Page::HEADER_SIZE + offset);
 
 // Write
-page.load(space, page_num, Page::Latch::EXCLUSIVE, mtr_ref);
-page.write_integer_4(Page::HEADER_SIZE + offset, v, mtr_ref);
+page.load(ctx->user()->space, page_num, storage::Page::Latch::EXCLUSIVE, mtr_ref);
+page.write_integer_4(storage::Page::HEADER_SIZE + offset, v, mtr_ref);
 ```
 
 Page layout constants:
 
 | Constant | Value | Notes |
 |---|---|---|
-| `Page::HEADER_SIZE` | `38` | Extension data begins at this offset. |
-| `Page::TRAILER_SIZE` | `8` | Do not write past `page_size - TRAILER_SIZE`. |
-| `Page::get_size(space)` | runtime | Use instead of hard-coding 16384. |
+| `storage::Page::HEADER_SIZE` | `38` | Extension data begins at this offset. |
+| `storage::Page::TRAILER_SIZE` | `8` | Do not write past `page_size - TRAILER_SIZE`. |
+| `storage::Page::get_size(space)` | runtime | Use instead of hard-coding 16384. |
 
 Reading or writing inside the header or trailer regions corrupts the page —
 InnoDB uses those byte ranges for its own bookkeeping and checksum.
