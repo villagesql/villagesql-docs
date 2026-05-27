@@ -4,9 +4,10 @@ description: "Define new column types for VillageSQL extensions — type operati
 ---
 
 <Warning>
-  Custom types use VEF Protocol 3 (stable as of v0.0.4); the current SDK
-  declares Protocol 4, which is under development. Extensions built against
-  the old Protocol 2 are rejected by the server and must be rebuilt.
+  Custom types use VEF Protocol 3, stable as of v0.0.4. Protocol 4 is under
+  development and is available only via opt-in dev ABI headers
+  (`-DVSQL_USE_DEV_ABI=ON`). Extensions built against the old Protocol 2 are
+  rejected by the server and must be rebuilt.
 </Warning>
 
 Custom types let you define new column types — like `COMPLEX`, `UUID`, or
@@ -154,50 +155,47 @@ Here's a complete example implementing a COMPLEX number type:
 ```cpp
 #include <cstdio>
 #include <cstring>
+#include <villagesql/vsql.h>
 
-// Encode complex number from "(real,imag)" to 16 bytes
-bool encode_complex(std::string_view from,
-                    vsql::Span<unsigned char> buf,
-                    size_t *length) {
-    if (buf.size() < 16) return true;
+using namespace vsql;
 
+// Encode: "(real,imag)" string -> 16 bytes little-endian
+void encode_complex(std::string_view from, CustomResult out) {
+    auto buf = out.buffer();
+    if (buf.size() < 16) return;
     double real, imag;
-    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) return true;
-
+    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+        out.warning("invalid complex format: expected (real,imag)");
+        return;
+    }
     memcpy(buf.data(), &real, 8);
     memcpy(buf.data() + 8, &imag, 8);
-    *length = 16;
-    return false;
+    out.set_length(16);
 }
 
-// Decode 16 bytes to "(real,imag)" string
-bool decode_complex(vsql::Span<const unsigned char> data,
-                    vsql::Span<char> out,
-                    size_t *out_len) {
-    if (data.size() < 16) return true;
-
+// Decode: 16 bytes -> "(real,imag)" string
+void decode_complex(CustomArg in, StringResult out) {
+    auto data = in.value();
+    if (data.size() < 16) return;
     double real, imag;
     memcpy(&real, data.data(), 8);
     memcpy(&imag, data.data() + 8, 8);
-
-    int len = snprintf(out.data(), out.size(), "(%.6f,%.6f)", real, imag);
-    if (len < 0 || len >= (int)out.size()) return true;
-
-    *out_len = len;
-    return false;
+    auto buf = out.buffer();
+    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
+    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
+    out.set_length(static_cast<size_t>(len));
 }
 
-// Compare for ORDER BY: compare real part first, then imaginary
-int compare_complex(vsql::Span<const unsigned char> a,
-                    vsql::Span<const unsigned char> b) {
-    if (a.size() < 16 || b.size() < 16) return 0;
-
+// Compare for ORDER BY: real part first, then imaginary
+int compare_complex(CustomArg a, CustomArg b) {
+    auto da = a.value();
+    auto db = b.value();
+    if (da.size() < 16 || db.size() < 16) return 0;
     double a_real, a_imag, b_real, b_imag;
-    memcpy(&a_real, a.data(), 8);
-    memcpy(&a_imag, a.data() + 8, 8);
-    memcpy(&b_real, b.data(), 8);
-    memcpy(&b_imag, b.data() + 8, 8);
-
+    memcpy(&a_real, da.data(), 8);
+    memcpy(&a_imag, da.data() + 8, 8);
+    memcpy(&b_real, db.data(), 8);
+    memcpy(&b_imag, db.data() + 8, 8);
     if (a_real < b_real) return -1;
     if (a_real > b_real) return 1;
     if (a_imag < b_imag) return -1;
