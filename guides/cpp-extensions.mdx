@@ -1,0 +1,184 @@
+---
+title: "Writing C++ Extensions"
+sidebarTitle: "Writing C++ Extensions"
+description: "How to write a VillageSQL extension in C++ — when to choose C++, CMake setup, typed wrappers, building, and testing."
+keywords: "villagesql extension c++, vef sdk, vdf c++, custom sql function c++, vsql extension template"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+VillageSQL extensions are shared libraries that the server loads at runtime. The VEF SDK gives you typed C++ wrappers so you can write extension functions without touching raw FFI. This guide walks through building a minimal extension from scratch.
+
+## When to Choose C++
+
+C++ is the right choice when:
+
+- Your team already has a C++ codebase and wants to keep the extension in the same language
+- You need custom types with precise binary layouts (the C++ type builder is the most complete API)
+- You're working with existing C++ libraries that you want to expose as SQL functions
+
+If you prefer Rust and don't have C++ requirements, see [Writing Rust Extensions](/guides/rust-extensions).
+
+## Prerequisites
+
+Before writing extension code, you need a VillageSQL build — extensions link against the server's SDK headers and build tree.
+
+You also need:
+
+- **C++17 compiler** — GCC 8+, Clang 8+, or MSVC 2019+
+- **CMake 3.18+** — the extension template uses CMake
+
+Follow the [Build from Source](/mysql-8.4/0.0.4/source) guide first if you haven't built the server yet.
+
+## CMake Setup
+
+The fastest way to start is with the [vsql-extension-template](https://github.com/villagesql/vsql-extension-template). Fork it or clone it:
+
+```bash
+git clone https://github.com/villagesql/vsql-extension-template my-extension
+cd my-extension
+```
+
+The template's `CMakeLists.txt` handles the VEF build setup for you — copy the template and adapt it rather than writing CMake from scratch. Configure the build directory with `-DVillageSQL_BUILD_DIR`:
+
+```bash
+mkdir build && cd build
+cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+make
+```
+
+`-DVillageSQL_BUILD_DIR` tells CMake where your VillageSQL build lives so it can find the SDK headers. This produces a `.veb` file in the build output. See [Creating Extensions](/mysql-8.4/0.0.4/create) and the [vsql-extension-template](https://github.com/villagesql/vsql-extension-template) for the full CMake setup.
+
+## A Minimal VDF in C++
+
+Include the VEF SDK header and use the builder API to register your function. Here's a complete extension implementing a string reversal function:
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+void my_reverse_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();   // std::string_view
+    auto buf = out.buffer();   // Span<char>
+
+    if (sv.size() > buf.size()) {
+        out.error("my_reverse: input exceeds buffer size");
+        return;
+    }
+
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = sv[sv.size() - 1 - i];
+    }
+    out.set_length(sv.size());
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&my_reverse_impl>("my_reverse")
+            .returns(STRING)
+            .param(STRING)
+            .build())
+)
+```
+
+A few things to notice:
+
+- Include `<villagesql/vsql.h>`, not `<villagesql/extension.h>` (that's the old V1 header)
+- Typed argument wrappers (`StringArg`, `IntArg`, `RealArg`) check nulls and expose typed values — no raw pointer arithmetic
+- `out.set_null()`, `out.warning(msg)`, and `out.error(msg)` are the three non-success returns
+- `VEF_GENERATE_ENTRY_POINTS` takes a `make_extension()` builder, not a raw struct
+
+For functions returning integers or reals:
+
+```cpp
+void count_vowels_impl(StringArg input, IntResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    long long count = 0;
+    for (char c : input.value()) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    out.set(count);
+}
+```
+
+To declare a function deterministic — same inputs always produce the same output — add `.deterministic()` to the builder chain:
+
+```cpp
+.func(make_func<&my_reverse_impl>("my_reverse")
+    .returns(STRING)
+    .param(STRING)
+    .deterministic()
+    .build())
+```
+
+Deterministic functions can be used in generated columns and functional indexes. Only add `.deterministic()` when it's actually true.
+
+## Building
+
+After the cmake configure step from the CMake setup section above, build and install:
+
+```bash
+make
+make install
+```
+
+`make install` copies the `.veb` file to your VillageSQL extensions directory.
+
+## Installing and Testing
+
+Connect to VillageSQL and install the extension:
+
+```sql
+INSTALL EXTENSION 'my_extension';
+```
+
+Verify it loaded:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+Call your function:
+
+```sql
+SELECT my_reverse('Hello, World!');
+-- → !dlroW ,olleH
+```
+
+For automated testing, write a MySQL Test Framework suite in `mysql-test/t/`:
+
+```sql
+-- mysql-test/t/basic.test
+INSTALL EXTENSION 'my_extension';
+SELECT my_reverse('abc');
+SELECT my_reverse('');
+SELECT my_reverse(NULL);
+UNINSTALL EXTENSION 'my_extension';
+```
+
+Generate expected results and run:
+
+```bash
+cd /path/to/villagesql/build/mysql-test
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test --record
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test
+```
+
+## See also
+
+- [Creating Extensions](/mysql-8.4/0.0.4/create) — full C++ SDK reference: typed wrappers, custom types, aggregates, system variables
+- [Extension API Reference](/mysql-8.4/0.0.4/extension-api-reference) — VDF contracts, null handling, buffer sizing, error semantics
+- [Writing Rust Extensions](/guides/rust-extensions) — the Rust path for the same task
