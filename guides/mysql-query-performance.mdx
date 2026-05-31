@@ -1,0 +1,184 @@
+---
+title: "Why Is My MySQL Query Slow?"
+sidebarTitle: "Query Performance"
+description: "Diagnose and fix slow MySQL queries using EXPLAIN, the slow query log, and the most common causes: missing indexes, bad index selection, and N+1 patterns."
+keywords: "mysql slow query, mysql query optimization, mysql explain, mysql missing index, mysql performance tuning, mysql query slow"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Slow queries almost always come down to a handful of common causes: a missing index, the wrong index, a query written in a way that prevents index use, functions applied to indexed columns, N+1 patterns, or contention from other queries running at the same time. Most of them are diagnosable with two commands: `EXPLAIN` and the slow query log. Start there.
+
+## Step 1: Read EXPLAIN
+
+Run `EXPLAIN` before the query you want to investigate:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE customer_id = 42;
+```
+
+You'll get output like this:
+
+```
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 843201 |    10.00 | Using where |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+```
+
+Five columns do most of the diagnostic work:
+
+**`possible_keys`** — the indexes MySQL considered for this query. `NULL` means no relevant indexes exist on the columns in your `WHERE` clause.
+
+**`key`** — the index MySQL actually chose. If `possible_keys` lists candidates but `key` is `NULL`, MySQL decided a full table scan was cheaper — usually a sign the statistics are stale or the table is small enough that the optimizer skipped the index.
+
+**`type`** — the access method MySQL used. This is the most important column. `ALL` means a full table scan: MySQL read every row to find the ones that match. On a table with 800,000 rows, that's 800,000 row reads for a query that might return 1. `ref` or `eq_ref` means MySQL used an index lookup, which is what you want.
+
+**`key`** — which index MySQL chose. `NULL` means no index was used (see `possible_keys` above).
+
+**`rows`** — MySQL's estimate of how many rows it'll examine. A high number relative to the number of rows you expect back is a signal that something is off.
+
+**`Extra`** — supplementary information. `Using filesort` means MySQL had to sort the result set in memory or on disk because no index covered the `ORDER BY`. `Using temporary` means MySQL built a temporary table, which happens with certain `GROUP BY` and `DISTINCT` queries. Both are warning signs on large tables.
+
+Once you've read the estimates, use `EXPLAIN ANALYZE` to see what actually happened at execution time:
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 42;
+```
+
+`EXPLAIN ANALYZE` runs the query and reports actual row counts and timing alongside the estimates. If the estimate says 800,000 rows and the actual says 800,000 rows, the estimate was right and the scan is real. If the actual is much lower, the optimizer may have made a poor choice based on stale statistics.
+
+## Step 2: The Most Common Causes
+
+### Missing index
+
+The query in the example above scans the full `orders` table because there's no index on `customer_id`. The fix is direct:
+
+```sql
+ALTER TABLE orders ADD INDEX idx_customer_id (customer_id);
+```
+
+After adding the index, re-run `EXPLAIN`. The `type` column should change from `ALL` to `ref`, and `key` should show your new index name.
+
+### Wrong index
+
+MySQL sometimes picks an index that isn't the best choice. `EXPLAIN` tells you which one it chose. To test whether a different index would do better, use `FORCE INDEX`:
+
+```sql
+EXPLAIN SELECT * FROM orders FORCE INDEX (idx_created_at) WHERE customer_id = 42;
+```
+
+If the forced index produces a lower `rows` estimate, consider whether the statistics on the original index are stale. `ANALYZE TABLE orders` recalculates them. If MySQL consistently picks the wrong index, you may also have an index that's no longer useful — dropping it removes it from consideration.
+
+### Leading column problem
+
+A composite index on `(customer_id, status, created_at)` is efficient when your query filters on `customer_id` or on `customer_id` and `status` together. It can't be used efficiently if your query filters only on `status` or only on `created_at`, because the index is sorted by `customer_id` first.
+
+```sql
+-- Uses the composite index efficiently
+SELECT * FROM orders WHERE customer_id = 42 AND status = 'pending';
+
+-- Can't use the composite index — status isn't the leading column
+SELECT * FROM orders WHERE status = 'pending';
+```
+
+If you need to filter on `status` alone, add a separate index on `status`.
+
+### SELECT *
+
+Naming only the columns you need isn't just good style — it affects performance. When MySQL can satisfy a query entirely from an index (a covering index), it never touches the actual table rows. `SELECT *` breaks that: it forces MySQL to look up each matching row in the table to retrieve columns that aren't in the index.
+
+```sql
+-- May require a table row lookup for each match
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Can use a covering index on (customer_id, status, total)
+SELECT status, total FROM orders WHERE customer_id = 42;
+```
+
+### Functions on indexed columns
+
+Wrapping an indexed column in a function usually prevents index use. MySQL can't use a B-tree index to answer "which rows have a `created_at` where `YEAR()` returns 2024" because the index stores raw timestamps, not computed years.
+
+```sql
+-- Can't use an index on created_at
+WHERE YEAR(created_at) = 2024
+
+-- Can use an index on created_at
+WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31 23:59:59'
+```
+
+The same issue applies to `LOWER()`, `DATE()`, arithmetic on columns, and anything else that transforms the value before comparison.
+
+### N+1 queries
+
+Sometimes the problem isn't a single slow query — it's hundreds of fast ones. A common pattern: fetch a list of orders, then run a separate query for each order to get the customer name. With 200 orders, that's 201 queries. Each one is fast, but together they add seconds.
+
+The fix is to pull the data in one query with a `JOIN`:
+
+```sql
+SELECT o.id, o.total, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE o.created_at > '2024-01-01';
+```
+
+## Step 3: Enable the Slow Query Log
+
+Set this up once and leave it running — it captures queries that exceed a time threshold in the background, surfacing problems you didn't know existed. Enable it at runtime:
+
+```sql
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 1;  -- log queries taking more than 1 second
+```
+
+Check where the log file is being written:
+
+```sql
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+To summarize the log and see which queries appear most often or take the most total time, use `mysqldumpslow`:
+
+```bash
+mysqldumpslow -s t /path/to/slow-query.log
+```
+
+Lowering `long_query_time` to 0.1 or 0.5 catches queries that are fast individually but add up across many calls.
+
+## Step 4: Check SHOW PROCESSLIST
+
+Use this when something is actively slow — a query that's been running too long, or an application that's hanging right now. `SHOW PROCESSLIST` shows every active connection and how long each query has been running:
+
+```sql
+SHOW PROCESSLIST;
+```
+
+A query stuck in `Waiting for table metadata lock` or `Waiting for lock` state isn't slow because of a bad plan — it's blocked by another query holding a lock. For more detail on lock contention, check:
+
+```sql
+SHOW ENGINE INNODB STATUS;
+```
+
+The `TRANSACTIONS` section shows which transactions are waiting and which ones are holding locks.
+
+## Quick Reference
+
+| Symptom | Likely cause | Fix |
+|:--------|:------------|:----|
+| `EXPLAIN` shows `type: ALL` | Missing index | Add index on `WHERE` columns |
+| `Extra: Using filesort` | No index for `ORDER BY` | Add index covering sort columns |
+| `Extra: Using temporary` | Complex `GROUP BY` or `DISTINCT` | Review query or add index |
+| Query fast on small table, slow on large | Full table scan | Add index |
+| Many fast queries adding up | N+1 pattern | Rewrite with `JOIN` |
+| Query slow only sometimes | Lock contention | Check `SHOW PROCESSLIST` and `INNODB STATUS` |
+
+## See also
+
+- [How MySQL indexes work](/guides/mysql-indexes) — the mental model behind index selection and B-tree structure
+- [Covering indexes](/guides/covering-indexes) — how to write queries that never leave the index
+- [Reading EXPLAIN output](/guides/reading-explain) — a deeper look at every column in the EXPLAIN plan
+- [Using the slow query log](/guides/slow-query-log) — configuration, rotation, and analysis with `mysqldumpslow`
