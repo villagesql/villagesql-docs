@@ -1,0 +1,359 @@
+---
+title: 확장 아키텍처
+description: VillageSQL의 확장 시스템이 내부적으로 어떻게 작동하는지
+---
+
+VillageSQL의 확장 아키텍처를 이해하면 확장 개발 시 문제 진단 및 성능 최적화에 도움이 됩니다.
+
+---
+
+## 용어
+
+- **VEB** (VillageSQL Extension Bundle) - `.veb` 파일 형식, 매니페스트, 라이브러리, 메타데이터를 포함하는 tar 아카이브
+- **VEF** (VillageSQL Extension Framework) - 확장 개발을 위한 C++ 및 Rust SDK
+- **VDF** (VillageSQL Defined Function) - `VEF_GENERATE_ENTRY_POINTS()`를 사용해 VEF SDK로 등록된 함수
+
+---
+
+## VDF 함수 검색
+
+VDF는 정규화된 및 비정규화된 함수 호출을 모두 지원합니다:
+
+```sql
+-- Unqualified lookup
+SELECT complex_abs(value) FROM table;
+
+-- Qualified lookup
+SELECT vsql_complex.complex_abs(value) FROM table;
+```
+
+**비정규화 함수 호출의 해결 순서:**
+1. 시스템 함수 (내장 MySQL)
+2. VDF (확장 함수) - 정확히 하나의 이름을 가진 함수가 존재할 때만
+3. 저장 함수 (`CREATE FUNCTION`으로 생성)
+
+**성능:** 핫 코드 경로에서 정규화된 호출(`extension_name.function_name()`)을 사용하여 해결 체인을 건너뛰고 직접 확장 함수를 호출하세요.
+
+---
+
+## VEB 파일 형식
+
+VillageSQL 확장은 `.veb` (VillageSQL Extension Bundle) 파일로 배포되며, tar 아카이브로 구성됩니다:
+
+```
+extension_name.veb (tar archive)
+├── manifest.json       # Extension metadata (required)
+└── lib/
+    └── extension.so    # Compiled shared library (required)
+```
+
+### manifest.json 스키마
+
+```json
+{
+  "name": "extension_name",          // Required: lowercase_with_underscores
+  "version": "1.0.0",                // Required: semantic version
+  "description": "Brief description",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+- **name:** SQL에서 사용되는 확장 이름과 일치해야 함 (소문자_밑줄)
+- **version:** 세미식별 버전 (MAJOR.MINOR.PATCH)
+- **description, author, license:** 선택적 메타데이터
+
+## 확장 수명 주기
+
+### 설치 흐름
+
+```
+INSTALL EXTENSION name
+    ↓
+1. Validate .veb exists in veb_dir
+    ↓
+2. Calculate SHA256 hash of .veb
+    ↓
+3. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
+    ↓
+4. Parse and validate manifest.json
+    ↓
+5. Load .so library (dlopen with RTLD_LOCAL)
+    ↓
+6. Call vef_register() entry point
+    ↓
+7. Register VDFs and custom types
+    ↓
+8. Persist registration and update cache
+    ↓
+Success
+```
+
+**롤백:** 단계 중 하나가 실패하면 모든 변경 사항이 취소되고 `.so`가 언로드됩니다.
+
+**심볼 격리:** 확장은 `RTLD_LOCAL` 플래그로 로드되어, 한 확장의 심볼이 다른 확장의 심볼과 충돌하지 않습니다. 이는 여러 확장이 공통 라이브러리 이름이나 함수 이름을 사용할 때 이름 충돌을 방지합니다.
+
+<Note>
+`veb_dir` 시스템 변수는 `.veb` 확장 파일이 저장된 디렉터리를 가리킵니다.
+</Note>
+
+### 제거 흐름
+
+```
+UNINSTALL EXTENSION name
+    ↓
+1. Check for column dependencies
+    ↓
+2. Call vef_unregister() cleanup hook
+    ↓
+3. Drop registered VDFs
+    ↓
+4. Drop custom types
+    ↓
+5. Remove extension registration and update cache
+    ↓
+6. Unload .so library (dlclose)
+    ↓
+7. Keep .veb_expansion_cache directory (for reinstall)
+    ↓
+Success
+```
+
+**의존성 방지:** 테이블 열이 확장의 사용자 정의 유형을 사용하면 제거할 수 없습니다.
+
+---
+
+## 확장 디렉터리 구조
+
+VillageSQL은 .veb 파일을 MySQL 데이터 디렉터리에 확장하여 여러 버전을 지원합니다:
+
+```
+datadir/
+└── .veb_expansion_cache/
+    └── extension_name/
+        ├── abc123.../              # SHA256 of v1.0.0 .veb
+        │   ├── manifest.json
+        │   └── lib/extension.so
+        └── def456.../              # SHA256 of v2.0.0 .veb
+            ├── manifest.json
+            └── lib/extension.so
+```
+
+**SHA256 디렉터리 이유:**
+- 오버라이드 없이 새 버전 테스트
+- 롤백 가능
+- "동일한 버전, 다른 코드" 방지
+
+**정리:** 서버 재시작 시 고립된 SHA256 디렉터리가 제거됩니다.
+
+---
+
+## Victionary 캐시 계층
+
+VictionaryClient는 O(log n) 검색을 위한 시스템 메타데이터의 메모리 캐시를 유지합니다.
+
+### 캐시 테이블
+
+```cpp
+SystemTableMap<ExtensionEntry> m_extensions;
+SystemTableMap<CustomTypeEntry> m_types;
+SystemTableMap<CustomColumnEntry> m_columns;
+SystemTableMap<PropertyEntry> m_properties;
+```
+
+### 캐시 작업
+
+| 작업 | 잠금 | 성능 |
+|------|------|------|
+| 읽기 (유형 해결) | 읽기 잠금 | O(log n) 맵 검색 |
+| 쓰기 (확장 설치) | 쓰기 잠금 | O(log n) 삽입 + 디스크 I/O |
+| 서버 시작 | N/A | 전체 테이블 스캔 메모리 로드 |
+
+**캐시 무효화:** DDL 작업 (INSTALL/UNINSTALL EXTENSION) 중 자동으로 발생합니다.
+
+**메모리 오버헤드:** 항목당 약 100바이트.
+
+---
+
+## 사용자 정의 유형 시스템
+
+### 유형 해결
+
+```cpp
+CREATE TABLE t (col COMPLEX)
+    ↓
+1. Parser encounters COMPLEX
+    ↓
+2. PT_custom_type::create()
+    ↓
+3. ResolveTypeToContext(extension_name, type_name)
+    ↓
+4. VictionaryClient::lookup_type() → O(log n)
+    ↓
+5. Find TypeDescriptor in cache
+    ↓
+6. Create Field with implementation_type
+```
+
+### 구현 유형
+
+사용자 정의 유형은 MySQL 저장 유형과 매핑됩니다:
+
+| 사용자 정의 유형 | MySQL 구현 | 바이트 |
+|----------------|------------|--------|
+| COMPLEX        | MYSQL_TYPE_VARCHAR | 16 |
+| UUID           | MYSQL_TYPE_VARCHAR | 16 |
+| INET6          | MYSQL_TYPE_VARCHAR | 16 |
+| JSON_SCHEMA    | MYSQL_TYPE_BLOB    | 변수 |
+
+---
+
+## 동시성 및 트랜잭션 동작
+
+### 스레드 안전 모델
+
+확장 함수는 행별 실행 모델로 호출됩니다:
+
+- **행별 고립 실행:** 각 함수 호출에 고유한 결과 버퍼가 할당됩니다 (디자인상 스레드 안전)
+- **Prerun/Postrun 훅:** 문장별 설정/정리, SQL 문장당 한 번 호출
+- **보장된 고립 없음:** 여러 연결이 동시에 함수를 호출할 수 있음
+- **최선의 실천:** 글로벌 상태를 피하고, 함수 매개변수와 반환 값 사용
+
+<Warning>
+VillageSQL은 확장 함수에 대한 스레드 고립을 보장하지 않습니다. 글로벌 변수나 공유 상태를 사용하는 경우, 멀티스레드 보호를 위해 뮤텍스나 잠금을 사용하세요.
+</Warning>
+
+### 트랜잭션 동작
+
+확장 함수는 다음 최선의 실천을 따르세요:
+- 가능하면 상태less로 설계
+- 파일 쓰기, 외부 API 호출과 같은 영구적 부작용 피하기
+- Prerun/Postrun 상태 사용 시 정리 처리 적절히 수행
+
+---
+
+## 성능 고려 사항
+
+**최적화:** 비용이 많이 드는 문장별 설정을 행별 작업 반복 대신 prerun 훅으로 캐시하세요.
+
+### 사용자 정의 유형 성능
+
+```sql
+-- Slow: VDF call per row
+SELECT * FROM signals WHERE complex_abs(impedance) > 100;
+
+-- Fast: Computed column with index
+ALTER TABLE signals
+ADD COLUMN impedance_magnitude DOUBLE AS (complex_abs(impedance)) STORED,
+ADD INDEX(impedance_magnitude);
+
+SELECT * FROM signals WHERE impedance_magnitude > 100;
+```
+
+---
+
+## 보안 및 디버깅
+
+### 보안 모델
+
+**신뢰 모델:** 확장은 전체 서버 권한으로 실행됩니다.
+
+- 사전 격리 또는 권한 시스템 없음
+- 확장은 모든 파일 읽기, 네트워크 접근, 코드 실행 가능
+- **신뢰 영향:** 신뢰할 수 있는 소스에서만 확장 설치
+
+**설치 보안:** `villagesql_extension_installer` 사용자로 실행 (컨텍스트 전환).
+
+<Accordion title="확장 디버깅">
+
+**세부 로깅 활성화:**
+```bash
+mysqld --log-error-verbosity=3
+```
+
+**GDB 디버깅:**
+```bash
+gdb -p $(pidof mysqld)
+(gdb) break my_func_init
+(gdb) continue
+```
+
+**의존성 확인:**
+```bash
+# Linux
+ldd /path/to/extension.so
+
+# macOS
+otool -L /path/to/extension.so
+```
+
+**흔한 오류:**
+- **정의되지 않은 심볼:** `extern "C"` 링크 확인
+- **공유 객체 열기 불가:** 라이브러리 의존성 확인
+- **VDF 호출 시 충돌:** NULL 포인터 처리 확인
+
+</Accordion>
+
+---
+
+## 스키마 검증
+
+서버 시작 시, SchemaManager는 시스템 테이블 스키마를 검증합니다:
+
+```cpp
+1. Open each VillageSQL system table
+2. Check column count and names
+3. Validate column types
+4. Verify primary keys
+5. Check indexes
+```
+
+**실패 시나리오:**
+- 테이블 누락 → `villagesql_schema.sql`에서 생성
+- 잘못된 스키마 → 오류 발생 및 시작 거부
+- 버전 불일치 → 업그레이드 스크립트 실행
+
+**서버 버전:**
+```sql
+SELECT VERSION();
+```
+
+소스 빌드에는 git 커밋 해시가 포함됩니다:
+```
+8.4.9-villagesql-0.0.4
+```
+
+---
+
+## 다음 단계
+
+<CardGroup cols={2}>
+  <Card
+    title="확장 생성"
+    icon="code"
+    href="/mysql-8.4/0.0.4/create"
+  >
+    첫 번째 확장을 빌드하세요
+  </Card>
+  <Card
+    title="시스템 참조"
+    icon="book"
+    href="/mysql-8.4/0.0.4/reference"
+  >
+    시스템 테이블 및 뷰
+  </Card>
+  <Card
+    title="예제"
+    icon="lightbulb"
+    href="/mysql-8.4/0.0.4/examples"
+  >
+    vsql_complex 구현 분석
+  </Card>
+  <Card
+    title="확장 관리"
+    icon="sliders"
+    href="/mysql-8.4/0.0.4/managing"
+  >
+    모니터링 및 문제 해결
+  </Card>
+</CardGroup>

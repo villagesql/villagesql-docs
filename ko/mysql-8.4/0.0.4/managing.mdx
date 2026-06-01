@@ -1,0 +1,494 @@
+---
+title: 확장 관리
+description: VillageSQL 확장 모니터링, 문제 해결 및 관리
+---
+
+## 설치된 확장 보기
+
+INFORMATION_SCHEMA 뷰를 사용하여 설치된 확장을 쿼리합니다:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+**출력:**
+```
++------------------+-------------------+
+| EXTENSION_NAME   | EXTENSION_VERSION |
++------------------+-------------------+
+| vsql_complex     | 0.0.1             |
+| vsql_uuid        | 0.0.3             |
++------------------+-------------------+
+```
+
+**사용법:**
+- 인터랙티브 세션과 스크립트 모두에서 사용 가능
+- MySQL 도구와 호환되는 표준 SQL 인터페이스
+
+---
+
+## 확장 함수 확인
+
+설치 후 확장 함수가 정상 작동하는지 확인합니다:
+
+```sql
+-- Test a function directly
+SELECT complex_abs('(1.0,2.0)');
+```
+
+---
+
+## 확장 디렉터리
+
+VillageSQL이 `.veb` 파일을 찾는 위치를 확인합니다:
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+**사용 가능한 확장 목록:**
+```bash
+ls -la /path/to/veb_dir/*.veb
+```
+
+### veb_dir 구성
+
+확장 디렉터리 위치를 변경하려면 MySQL 구성 파일에 `veb_dir`을 설정합니다:
+
+**my.cnf / my.ini:**
+```ini
+[mysqld]
+veb_dir=/custom/path/to/extensions/
+```
+
+**요구 사항:**
+- 경로는 절대 경로여야 함(상대 경로 불가)
+- 서버 시작 전 디렉터리가 존재해야 함
+- MySQL 사용자에게 디렉터리 읽기 권한이 있어야 함
+- 하나의 `veb_dir`만 지원됨(여러 경로 불가)
+- 변경 사항은 서버 재시작 후 적용됨
+
+**재시작 후 확인:**
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## 문제 해결
+
+### 빠른 참조
+
+| 문제 | 빠른 해결 방법 |
+|--|--|
+| 확장을 찾을 수 없음 | `veb_dir`에 정확한 이름의 `.veb` 파일이 존재하는지 확인 |
+| 권한 거부 | 권한 확인: `chmod 644 extension.veb` |
+| 제거 불가: 유형 사용 중 | `UNINSTALL EXTENSION` 시도; 오류가 차단하는 열 이름을 식별 |
+| 버전 불일치 | 서버 재시작으로 캐시 클리어 |
+| 업데이트 후 확장이 오래된 동작 보여줌 | `UNINSTALL` 후 `INSTALL`; 필요 시 `.veb_expansion_cache/` 클리어 |
+| 유형 X와 Y 비교 불가 | 양쪽 모두 동일한 사용자 정의 유형 사용해야 함 |
+| 사용자 정의 유형이 아닌 유형 암시적 변환 불가 | 비교 중인 리터럴 또는 열이 사용자 정의 유형과 호환되지 않음 |
+
+### 확장을 찾을 수 없음
+
+**오류:** `Extension 'my_extension' not found`
+
+**디버그 단계:**
+```bash
+# 1. Check veb_dir location
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# 2. List .veb files
+ls -la /path/to/veb_dir/
+
+# 3. Verify filename matches extension name
+# File: my_extension.veb
+# Install: INSTALL EXTENSION my_extension;
+
+# 4. Check permissions
+ls -l /path/to/veb_dir/my_extension.veb
+sudo chmod 644 /path/to/veb_dir/my_extension.veb
+```
+
+### 설치 후 함수 사용 불가
+
+**오류:** `FUNCTION my_func does not exist`
+
+**디버그 단계:**
+```sql
+-- 1. Verify extension installed
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+### 업데이트 후 확장이 오래된 동작 보여줌
+
+**현상:** `.veb` 파일을 교체하고 재설치한 후 확장이 여전히 오래된 코드 실행
+
+**원인:** VillageSQL은 `.veb` 파일을 처음 로드할 때 `{datadir}/.veb_expansion_cache/`에 전개합니다. `UNINSTALL EXTENSION`을 실행하지 않고 새 `.veb`를 복사하면 서버는 이미 메모리에 로드된 이전 확장된 `.so`를 계속 사용합니다.
+
+**해결 방법:** 항상 `UNINSTALL → 교체 → INSTALL` 순서를 따르세요:
+
+```sql
+UNINSTALL EXTENSION my_extension;
+```
+
+그런 다음 `veb_dir`의 `.veb` 파일을 교체하고 재설치합니다:
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+확장이 여전히 오래된 동작을 보인다면 재설치 전 확장 캐시를 클리어하세요:
+
+```bash
+rm -rf {datadir}/.veb_expansion_cache/my_extension/
+```
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+---
+
+### 확장 제거 불가
+
+**오류:** `Cannot uninstall extension: types in use`
+
+**해결 방법:**
+
+```sql
+-- Attempt uninstall; the error identifies blocking columns by name
+UNINSTALL EXTENSION my_extension;
+-- If blocked: ERROR HY000: Cannot drop extension `my_extension` as 1 column(s) depend on it,
+--             e.g. mydb.mytable.my_column has type MYTYPE
+
+-- Drop or alter the identified column(s), then retry
+DROP TABLE mydb.mytable;
+-- OR
+ALTER TABLE mydb.mytable DROP COLUMN my_column;
+
+UNINSTALL EXTENSION my_extension;
+```
+
+### 라이브러리 로딩 오류
+
+**오류:** `Cannot load library: undefined symbol`
+
+**원인:**
+- 라이브러리 종속성 누락
+- ABI 호환성 불일치
+- 잘못된 MySQL 버전
+
+**디버그:**
+```bash
+# Check library dependencies (Linux)
+ldd {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+
+# Check library dependencies (macOS)
+otool -L {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+```
+
+### 확장 이름 검증 오류
+
+**오류:** `Failed to load VEF extension 'extension_name'` 및 로그 메시지 `Extension name mismatch`
+
+**원인:** `manifest.json`의 확장 이름이 VEB 파일 이름과 일치하지 않음.
+
+**디버그 단계:**
+
+1. **VEB 파일 이름이 매니페스트와 일치하는지 확인:**
+   ```bash
+   # VEB filename: my_extension.veb
+   # manifest.json should have:
+   {
+     "name": "my_extension",  # Must match VEB filename (without .veb)
+     ...
+   }
+   ```
+
+2. **manifest.json의 name 필드 확인:**
+   ```bash
+   # Extract and check manifest from VEB
+   tar -xOf /path/to/veb_dir/my_extension.veb manifest.json | grep name
+   ```
+
+**해결 방법:**
+
+두 이름은 정확히 동일해야 하며 밑줄 사용(참고: [확장 이름 규칙](/mysql-8.4/0.0.4/install#extension-naming-conventions)):
+- VEB 파일 이름: `my_extension.veb`
+- manifest.json: `"name": "my_extension"`
+
+**흔한 실수:**
+- 매니페스트에 하이픈 사용: `"name": "my-extension"` ❌
+- VEB 파일 이름 불일치: `my-extension.veb` 대 `"name": "my_extension"` ❌
+
+**올바른 예시:**
+```json
+// manifest.json
+{
+  "name": "my_extension",
+  "version": "1.0.0"
+}
+```
+
+```cpp
+// extension.cc
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(...)
+)
+```
+
+```bash
+# VEB filename
+my_extension.veb
+```
+
+### 사용자 정의 유형 비교 오류
+
+**오류:** `Cannot compare types X and Y in =`
+
+**원인:** 비교 양쪽 모두 사용자 정의 유형이지만 다른 유형 또는 확장에서 옴.
+
+```sql
+-- Example: comparing COMPLEX with UUID in a WHERE clause
+SELECT * FROM t WHERE complex_col = uuid_col;
+-- ERROR: Cannot compare types vsql_complex.COMPLEX and vsql_uuid.UUID in =
+```
+
+**해결 방법:** 비교 양쪽 모두 동일한 사용자 정의 유형을 사용해야 합니다. 다른 유형 간 비교가 필요하면 적절한 유형 변환 함수를 사용해 명시적으로 변환하세요.
+
+---
+
+**오류:** `Unable to implicitly cast a non-custom type during compare with a custom type in =`
+
+**원인:** 비교의 한쪽은 사용자 정의 유형 열이고 다른 쪽은 해당 유형으로 자동 변환할 수 없는 값(리터럴 또는 열).
+
+```sql
+-- Example: comparing a custom type with an integer literal
+SELECT * FROM t WHERE complex_col = 42;
+-- ERROR: Unable to implicitly cast a non-custom type during compare...
+```
+
+**해결 방법:** 문자열 리터럴은 유형의 encode 함수를 사용해 자동으로 사용자 정의 유형으로 변환됩니다. 다른 유형(정수, 부동소수점)의 경우 명시적 변환 함수 사용:
+
+```sql
+-- Use a string literal instead (auto-cast works)
+SELECT * FROM t WHERE complex_col = '(1.0,2.0)';
+
+-- Or use the type's from_string method explicitly
+SELECT * FROM t WHERE complex_col = COMPLEX::from_string('(1.0,2.0)');
+```
+
+---
+
+## 확장 사용 모니터링
+
+### 쿼리 성능
+
+performance_schema를 사용해 VDF 실행 시간 추적:
+
+```sql
+-- Enable statement instrumentation
+UPDATE performance_schema.setup_instruments
+SET ENABLED = 'YES', TIMED = 'YES'
+WHERE NAME LIKE '%statement%';
+
+-- Query VDF execution times
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR as executions,
+    ROUND(SUM_TIMER_WAIT/1000000000, 2) as total_ms,
+    ROUND(AVG_TIMER_WAIT/1000000000, 2) as avg_ms
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST_TEXT LIKE '%complex_%'
+ORDER BY total_ms DESC
+LIMIT 10;
+```
+
+### 사용자 정의 유형 사용
+
+사용자 정의 유형을 사용하는 테이블 추적:
+
+```sql
+-- Find all columns using custom extension types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY DATA_TYPE, TABLE_SCHEMA, TABLE_NAME;
+```
+
+---
+
+## 확장 업데이트
+
+새로운 버전으로 확장을 업데이트하려면 수동 업데이트 프로세스를 사용합니다:
+
+<Note>
+  **ALTER EXTENSION UPDATE**은 아직 지원되지 않으며 향후 릴리스에서 계획됨.
+</Note>
+
+### 수동 업데이트 프로세스
+
+1. **현재 버전 제거:**
+   ```sql
+   UNINSTALL EXTENSION extension_name;
+   ```
+
+2. **.veb 파일 교체:**
+   ```bash
+   # Remove old .veb file
+   sudo rm /path/to/veb_dir/extension_name.veb
+
+   # Copy new .veb file
+   sudo cp new_extension_name.veb /path/to/veb_dir/
+   ```
+
+3. **새 버전 설치:**
+   ```sql
+   INSTALL EXTENSION extension_name;
+   ```
+
+4. **업데이트 확인:**
+   ```sql
+   SELECT EXTENSION_VERSION
+   FROM INFORMATION_SCHEMA.EXTENSIONS
+   WHERE EXTENSION_NAME = 'extension_name';
+   ```
+
+<Warning>
+  **데이터 안전성:** 테이블이 확장의 사용자 정의 유형을 사용하는 경우, 제거 전에 해당 테이블을 삭제하거나 수정해야 합니다. 먼저 데이터를 백업하세요.
+</Warning>
+
+**예시:**
+```sql
+-- Find columns using vsql_complex types before updating
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
+
+-- If columns exist, back up data and drop/alter them first
+-- Then proceed with update
+UNINSTALL EXTENSION vsql_complex;
+-- (replace .veb file)
+INSTALL EXTENSION vsql_complex;
+```
+
+---
+
+## 정리
+
+### 고립된 확장 디렉터리 제거
+
+VillageSQL은 `.veb` 파일을 `{datadir}/.veb_expansion_cache/{name}/{sha256}/`로 전개합니다. 오래된 버전이 시간이 지나 누적됩니다.
+
+```bash
+# List expansion directories (replace {datadir} with your actual datadir path)
+ls -la {datadir}/.veb_expansion_cache/
+
+# Compare with installed extensions
+mysql -u root -p -e "SELECT EXTENSION_NAME FROM INFORMATION_SCHEMA.EXTENSIONS;"
+
+# Find the actual SHA256 directory name for a specific extension
+ls {datadir}/.veb_expansion_cache/my_extension/
+
+# Remove the unused SHA256 directory using the name shown above
+rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
+```
+
+<Note>
+  서버 재시작 시 고립된 확장 디렉터리 자동 정리.
+</Note>
+
+---
+
+## 복제
+
+사용자 정의 유형은 ROW 형식의 binlog를 요구합니다. STATEMENT 및 MIXED 모드는 사용자 정의 유형 열을 가진 테이블에 지원되지 않습니다. INSERT, UPDATE, DELETE, ALTER TABLE 작업은 ROW 형식에서 정상적으로 복제됩니다.
+
+`INSTALL EXTENSION`은 복제되지 않습니다 — 각 서버가 자체 확장을 관리합니다. 복제 시작 전에 모든 복제본에 동일한 버전으로 확장을 설치하세요. 서버는 정확한 버전 일치를 강제하며, 버전 불일치 시 복제가 중단됩니다.
+
+복제본이 인식하지 못하는 사용자 정의 유형을 만나면 DDL 문(statement)에서 복제가 중단됩니다 — `CREATE TABLE` 또는 `ALTER TABLE`에서 종속 DML이 적용되기 전에 중단됩니다. 올바른 확장 버전을 설치한 후 재시작합니다:
+
+```sql
+INSTALL EXTENSION my_extension;
+START REPLICA SQL_THREAD;
+```
+
+`mysqldump`은 출력에 완전한 정의된 사용자 정의 유형 이름을 유지합니다. 확장이 대상 서버에 설치된 경우 로직 복원이 정상적으로 작동합니다.
+
+<Warning>
+Clone 플러그인, XtraBackup, InnoDB 클러스터/그룹 복제와의 동작은 아직 테스트되지 않았습니다. 프로덕션에서 의존하기 전에 복원 경로를 테스트하세요.
+</Warning>
+
+---
+
+## Docker와 확장 사용
+
+VillageSQL을 Docker에서 실행할 때, 호스트에서 `.veb` 파일을 추가할 수 있도록 로컬 디렉터리를 `veb_dir`로 마운트합니다.
+
+**Docker Compose 예시:**
+
+```yaml
+services:
+  villagesql:
+    image: villagesql/server:stable
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./extensions:/usr/lib/veb
+    command: --veb_dir=/usr/lib/veb
+```
+
+호스트의 `./extensions/`에 `.veb` 파일을 복사한 후 SQL에서 설치합니다:
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+실행 중인 서버가 사용하는 디렉터리 확인:
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## 도움 요청
+
+이 문서에 포함되지 않은 문제에 직면했을 때:
+
+1. **오류 로그 확인:** 대부분의 확장 오류는 세부 정보와 함께 로깅됨
+2. **확장 문서 검토:** 확장별 문제 해결 방법이 있을 수 있음
+3. **Discord에서 문의:** [VillageSQL Discord](https://discord.gg/KSr6whd3Fr)에 가입
+4. **이슈 제출:** [GitHub Issues](https://github.com/villagesql/villagesql-server/issues)에서 버그 보고
+
+---
+
+## 다음 단계
+
+<CardGroup cols={2}>
+  <Card
+    title="시스템 참조"
+    icon="book"
+    href="/mysql-8.4/0.0.4/reference"
+  >
+    시스템 테이블 및 뷰 쿼리
+  </Card>
+  <Card
+    title="확장 제거"
+    icon="trash"
+    href="/mysql-8.4/0.0.4/uninstall"
+  >
+    확장 안전하게 제거
+  </Card>
+  <Card
+    title="확장 아키텍처"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.4/architecture"
+  >
+    내부 구조 이해
+  </Card>
+</CardGroup>
