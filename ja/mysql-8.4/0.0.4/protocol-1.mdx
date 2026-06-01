@@ -1,0 +1,98 @@
+---
+title: "プロトコル1 API"
+description: "プロトコル1の関数ポインタ型APIおよびローバイナリABIスタイル（元のVEFインターフェイス）のリファレンス。v0.0.1時点で安定しており、0.0.5以降は廃止されます。"
+---
+
+プロトコル1は元のVEFインターフェイスです。v0.0.1時点で安定しており、0.0.5以降は廃止されます。新規拡張機能はプロトコル3 API — [拡張機能の作成](/mysql-8.4/0.0.4/create)および[開発](/mysql-8.4/0.0.4/development)ガイドに記載のテンプレートベースの型ビルダーを使用すべきです。
+
+このページは、プロトコル1に準拠して構築された既存の拡張機能を扱う際のリファレンスとして存在します。
+
+## 関数ポインタ型API
+
+プロトコル1のカスタム型は、`vsql::make_type<>`テンプレートではなく明示的な関数ポインタを使用して登録されます。関数シグネチャはプロトコル3の同等物とは異なります — `Arg`および`Result`オブジェクトではなく、ローバイナリポインタと長さを引数に取ります。
+
+### 関数シグネチャ
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+### 登録
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()`（コンパイル時文字列NTTPを伴う）が推奨形式です。`make_type(MYTYPE)`（テンプレートパラメータなし）はプロトコル1形式です — そのサポートは0.0.5以降廃止されます。
+
+## ローバイナリABIスタイル（関数）
+
+プロトコル1のVDF実装は、型ラッパーを使用する代わりにローバイナリC構造体を直接渡すことができます。このスタイルは0.0.5以降廃止されます — 新規コードには[型ラッパー](/mysql-8.4/0.0.4/development#typed-wrappers-recommended)を使用してください。
+
+```cpp
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+```
+
+登録方法は型ラッパー方式と同一です — ビルダーはシグネチャを自動的に検出します。
+
+### プロトコル1での集約登録
+
+集約の場合、`.clear<>()`および`.accumulate<>()`はローバイナリABI関数ポインタシグネチャを受け付けます。`.prerun<>()`および`.postrun<>()`は受け付けません — ビルダーはプロトコル1拡張機能においても型付きシグネチャ（`void(PrerunArgs, PrerunResult)`および`void(PostrunArgs)`）を必要とします。新規コードには[型付き集約アプローチ](/mysql-8.4/0.0.4/development#aggregate-vdfs)を使用してください。
+
+```cpp
+make_func<&raw_result>("my_agg")
+    .returns(INT).param(INT)
+    // prerun/postrun require typed signatures even in Protocol 1 mode:
+    .prerun<&my_prerun>()      // void(vsql::PrerunArgs, vsql::PrerunResult)
+    .postrun<&my_postrun>()    // void(vsql::PostrunArgs)
+    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
+    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
+    .build()
+```

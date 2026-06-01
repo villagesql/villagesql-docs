@@ -1,0 +1,494 @@
+---
+title: 拡張機能の管理
+description: VillageSQLの拡張機能をモニタリング、トラブルシューティング、管理する
+---
+
+## インストール済み拡張機能の表示
+
+INFORMATION_SCHEMAビューを使用してインストール済みの拡張機能をクエリします：
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+**出力:**
+```
++------------------+-------------------+
+| EXTENSION_NAME   | EXTENSION_VERSION |
++------------------+-------------------+
+| vsql_complex     | 0.0.1             |
+| vsql_uuid        | 0.0.3             |
++------------------+-------------------+
+```
+
+**使用方法:**
+- インタラクティブセッションおよびスクリプトの両方で使用可能
+- MySQLツールと互換性のある標準SQLインターフェイス
+
+---
+
+## 拡張機能関数の確認
+
+インストール後に拡張機能関数が正常に動作することを検証します：
+
+```sql
+-- Test a function directly
+SELECT complex_abs('(1.0,2.0)');
+```
+
+---
+
+## 拡張機能ディレクトリ
+
+VillageSQLが`.veb`ファイルを検索する場所を確認します：
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+**利用可能な拡張機能のリスト:**
+```bash
+ls -la /path/to/veb_dir/*.veb
+```
+
+### veb_dirの設定
+
+拡張機能ディレクトリの場所を変更するには、MySQL構成ファイルに`veb_dir`を設定します：
+
+**my.cnf / my.ini:**
+```ini
+[mysqld]
+veb_dir=/custom/path/to/extensions/
+```
+
+**要件:**
+- パスは絶対パス（相対パスではない）でなければならない
+- ディレクトリはサーバー起動前に存在している必要がある
+- MySQLユーザーはディレクトリの読み取り権限を持っている必要がある
+- 1つの`veb_dir`のみがサポートされる（複数のパスは不可）
+- 変更はサーバー再起動が必要
+
+**再起動後の確認:**
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## トラブルシューティング
+
+### クイックリファレンス
+
+| 問題 | クイックフィックス |
+|--|-------|
+| 拡張機能が見つからない | `.veb`ファイルがveb_dirに存在し、正しい名前であることを確認 |
+| パーミッション denied | パーミッションを確認: `chmod 644 extension.veb` |
+| 削除できない: 使用中の型 | `UNINSTALL EXTENSION`を試みる；エラーでブロッキングカラム名が特定される |
+| バージョン不一致 | サーバーを再起動してキャッシュをクリア |
+| 更新後に古い動作が表示される | `UNINSTALL`の後に`INSTALL`を実行；必要に応じて`.veb_expansion_cache/`をクリア |
+| 型XとYを比較できない | 両側とも同じカスタム型を使用する必要がある |
+| 非カスタム型を暗黙的にキャストできない | 比較対象のリテラルまたはカラムがカスタム型と互換性がない |
+
+### 拡張機能が見つからない
+
+**エラー:** `Extension 'my_extension' not found`
+
+**デバッグ手順:**
+```bash
+# 1. Check veb_dir location
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# 2. List .veb files
+ls -la /path/to/veb_dir/
+
+# 3. Verify filename matches extension name
+# File: my_extension.veb
+# Install: INSTALL EXTENSION my_extension;
+
+# 4. Check permissions
+ls -l /path/to/veb_dir/my_extension.veb
+sudo chmod 644 /path/to/veb_dir/my_extension.veb
+```
+
+### インストール後に関数が利用できない
+
+**エラー:** `FUNCTION my_func does not exist`
+
+**デバッグ手順:**
+```sql
+-- 1. Verify extension installed
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+### 更新後に古い動作が表示される
+
+**症状:** `.veb`ファイルを置き換えて再インストールした後も、拡張機能は古いコードを実行し続ける。
+
+**原因:** VillageSQLは`.veb`ファイルを最初の読み込み時に`{datadir}/.veb_expansion_cache/`に展開します。`UNINSTALL EXTENSION`を実行せずに新しい`.veb`をコピーすると、サーバーはメモリにロード済みの以前の展開済み`.so`を引き続き使用します。
+
+**解決策:** 常に完全なUNINSTALL → 置き換え → INSTALLのサイクルを実行します：
+
+```sql
+UNINSTALL EXTENSION my_extension;
+```
+
+その後、`.veb`ファイルを`veb_dir`に置き換えて再インストールします：
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+拡張機能がまだ古い動作を示す場合は、再インストール前に展開キャッシュをクリアします：
+
+```bash
+rm -rf {datadir}/.veb_expansion_cache/my_extension/
+```
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+---
+
+### 拡張機能の削除ができない
+
+**エラー:** `Cannot uninstall extension: types in use`
+
+**解決策:**
+
+```sql
+-- Attempt uninstall; the error identifies blocking columns by name
+UNINSTALL EXTENSION my_extension;
+-- If blocked: ERROR HY000: Cannot drop extension `my_extension` as 1 column(s) depend on it,
+--             e.g. mydb.mytable.my_column has type MYTYPE
+
+-- Drop or alter the identified column(s), then retry
+DROP TABLE mydb.mytable;
+-- OR
+ALTER TABLE mydb.mytable DROP COLUMN my_column;
+
+UNINSTALL EXTENSION my_extension;
+```
+
+### ライブラリロードエラー
+
+**エラー:** `Cannot load library: undefined symbol`
+
+**原因:**
+- ライブラリ依存関係が欠落
+- ABI互換性の不一致
+- 間違ったMySQLバージョン
+
+**デバッグ:**
+```bash
+# Check library dependencies (Linux)
+ldd {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+
+# Check library dependencies (macOS)
+otool -L {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+```
+
+### 拡張機能名の検証エラー
+
+**エラー:** `Failed to load VEF extension 'extension_name'`でログメッセージ`Extension name mismatch`
+
+**原因:** `manifest.json`内の拡張機能名がVEBファイル名と一致していない。
+
+**デバッグ手順:**
+
+1. **VEBファイル名がマニフェストと一致するか確認:**
+   ```bash
+   # VEB filename: my_extension.veb
+   # manifest.json should have:
+   {
+     "name": "my_extension",  # Must match VEB filename (without .veb)
+     ...
+   }
+   ```
+
+2. **manifest.jsonのnameフィールドを確認:**
+   ```bash
+   # Extract and check manifest from VEB
+   tar -xOf /path/to/veb_dir/my_extension.veb manifest.json | grep name
+   ```
+
+**解決策:**
+
+両方の名前はアンダースコアを使用して完全に同一でなければなりません（[拡張機能命名規則](/mysql-8.4/0.0.4/install#extension-naming-conventions)を参照）：
+- VEBファイル名: `my_extension.veb`
+- manifest.json: `"name": "my_extension"`
+
+**一般的なミス:**
+- マニフェストでハイフンを使用: `"name": "my-extension"` ❌
+- VEBファイル名が一致しない: `my-extension.veb` vs `"name": "my_extension"` ❌
+
+**正しい例:**
+```json
+// manifest.json
+{
+  "name": "my_extension",
+  "version": "1.0.0"
+}
+```
+
+```cpp
+// extension.cc
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(...)
+)
+```
+
+```bash
+# VEB filename
+my_extension.veb
+```
+
+### カスタム型比較エラー
+
+**エラー:** `Cannot compare types X and Y in =`
+
+**原因:** 比較の両側がカスタム型だが、異なる型または拡張機能から来ている。
+
+```sql
+-- Example: comparing COMPLEX with UUID in a WHERE clause
+SELECT * FROM t WHERE complex_col = uuid_col;
+-- ERROR: Cannot compare types vsql_complex.COMPLEX and vsql_uuid.UUID in =
+```
+
+**解決策:** 比較の両側が同じカスタム型を使用することを確認してください。異なる型間で比較する必要がある場合は、適切な型変換関数を使用して明示的に変換します。
+
+---
+
+**エラー:** `Unable to implicitly cast a non-custom type during compare with a custom type in =`
+
+**原因:** 比較の片側がカスタム型カラムで、もう片側がその型に自動的に変換できない値（リテラルまたはカラム）です。
+
+```sql
+-- Example: comparing a custom type with an integer literal
+SELECT * FROM t WHERE complex_col = 42;
+-- ERROR: Unable to implicitly cast a non-custom type during compare...
+```
+
+**解決策:** 文字列リテラルはカスタム型のencode関数を使用して暗黙的にキャストされます。他の型（整数、浮動小数点）の場合は明示的な変換関数を使用します：
+
+```sql
+-- Use a string literal instead (auto-cast works)
+SELECT * FROM t WHERE complex_col = '(1.0,2.0)';
+
+-- Or use the type's from_string method explicitly
+SELECT * FROM t WHERE complex_col = COMPLEX::from_string('(1.0,2.0)');
+```
+
+---
+
+## 拡張機能使用状況のモニタリング
+
+### クエリパフォーマンス
+
+performance_schemaを使用してVDF実行時間を追跡します：
+
+```sql
+-- Enable statement instrumentation
+UPDATE performance_schema.setup_instruments
+SET ENABLED = 'YES', TIMED = 'YES'
+WHERE NAME LIKE '%statement%';
+
+-- Query VDF execution times
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR as executions,
+    ROUND(SUM_TIMER_WAIT/1000000000, 2) as total_ms,
+    ROUND(AVG_TIMER_WAIT/1000000000, 2) as avg_ms
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST_TEXT LIKE '%complex_%'
+ORDER BY total_ms DESC
+LIMIT 10;
+```
+
+### カスタム型の使用状況
+
+どのテーブルがカスタム型を使用しているかを追跡します：
+
+```sql
+-- Find all columns using custom extension types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY DATA_TYPE, TABLE_SCHEMA, TABLE_NAME;
+```
+
+---
+
+## 拡張機能の更新
+
+新しいバージョンに拡張機能を更新するには、手動更新プロセスを使用します：
+
+<Note>
+  **ALTER EXTENSION UPDATE** はまだサポートされておらず、今後のリリースで計画されています。
+</Note>
+
+### 手動更新プロセス
+
+1. **現在のバージョンをアンインストール:**
+   ```sql
+   UNINSTALL EXTENSION extension_name;
+   ```
+
+2. **.vebファイルを置き換え:**
+   ```bash
+   # Remove old .veb file
+   sudo rm /path/to/veb_dir/extension_name.veb
+
+   # Copy new .veb file
+   sudo cp new_extension_name.veb /path/to/veb_dir/
+   ```
+
+3. **新しいバージョンをインストール:**
+   ```sql
+   INSTALL EXTENSION extension_name;
+   ```
+
+4. **更新を確認:**
+   ```sql
+   SELECT EXTENSION_VERSION
+   FROM INFORMATION_SCHEMA.EXTENSIONS
+   WHERE EXTENSION_NAME = 'extension_name';
+   ```
+
+<Warning>
+  **データセーフティ:** テーブルが拡張機能のカスタム型を使用している場合、アンインストールする前にそのテーブルを削除または変更する必要があります。まずデータをバックアップしてください。
+</Warning>
+
+**例:**
+```sql
+-- Find columns using vsql_complex types before updating
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
+
+-- If columns exist, back up data and drop/alter them first
+-- Then proceed with update
+UNINSTALL EXTENSION vsql_complex;
+-- (replace .veb file)
+INSTALL EXTENSION vsql_complex;
+```
+
+---
+
+## クリーンアップ
+
+### 孤児の展開ディレクトリの削除
+
+VillageSQLは`.veb`ファイルを`{datadir}/.veb_expansion_cache/{name}/{sha256}/`に展開します。古いバージョンは時間とともに蓄積されます。
+
+```bash
+# List expansion directories (replace {datadir} with your actual datadir path)
+ls -la {datadir}/.veb_expansion_cache/
+
+# Compare with installed extensions
+mysql -u root -p -e "SELECT EXTENSION_NAME FROM INFORMATION_SCHEMA.EXTENSIONS;"
+
+# Find the actual SHA256 directory name for a specific extension
+ls {datadir}/.veb_expansion_cache/my_extension/
+
+# Remove the unused SHA256 directory using the name shown above
+rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
+```
+
+<Note>
+  サーバー再起動時に自動的に孤児の展開ディレクトリがクリーンアップされます。
+</Note>
+
+---
+
+## レプリケーション
+
+カスタム型にはROW形式のbinlogが必要です。STATEMENTおよびMIXEDモードでは、カスタム型カラムを持つテーブルではサポートされていません。カスタム型カラムに対するINSERT、UPDATE、DELETE、ALTER TABLE操作はすべてROW形式で正しくレプリケートされます。
+
+`INSTALL EXTENSION`はレプリケートされません — 各サーバーが独自の拡張機能を管理します。レプリケーションを開始する前に、すべてのレプリカにソースと同じバージョンの拡張機能をインストールしてください。サーバーは正確なバージョン一致を強制します；バージョン不一致はレプリケーションを停止します。
+
+レプリカが認識できないカスタム型に遭遇すると、レプリケーションはDDLステートメント（`CREATE TABLE`または`ALTER TABLE`）で停止し、依存するDMLが適用される前に停止します。正しい拡張機能バージョンをインストールし、次に再開します：
+
+```sql
+INSTALL EXTENSION my_extension;
+START REPLICA SQL_THREAD;
+```
+
+`mysqldump`は出力で完全修飾カスタム型名を保持します。拡張機能がターゲットサーバーにインストールされていれば、ダンプのインポート前にロジカルレストアが正常に動作します。
+
+<Warning>
+Cloneプラグイン、XtraBackup、InnoDB Cluster / Group Replicationとの動作はまだテストされていません。本番環境で信頼する前に、復元パスをテストしてください。
+</Warning>
+
+---
+
+## Dockerでの拡張機能の使用
+
+VillageSQLをDockerで実行する際は、ローカルディレクトリを`veb_dir`としてマウントし、コンテナを再ビルドせずにホストから`.veb`ファイルを追加できます。
+
+**Docker Composeの例:**
+
+```yaml
+services:
+  villagesql:
+    image: villagesql/server:stable
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./extensions:/usr/lib/veb
+    command: --veb_dir=/usr/lib/veb
+```
+
+ホストの`.veb`ファイルを`./extensions/`にコピーし、SQLからインストールします：
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+実行中のサーバーが使用しているディレクトリを確認するには：
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## ヘルプの取得
+
+ここに記載されていない問題に遭遇した場合:
+
+1. **エラーログを確認:** 拡張機能エラーのほとんどは詳細をログに記録しています
+2. **拡張機能ドキュメントを確認:** 拡張機能固有のトラブルシューティングが存在する可能性があります
+3. **Discordで質問:** [VillageSQL Discord](https://discord.gg/KSr6whd3Fr) に参加
+4. **Issueを報告:** [GitHub Issues](https://github.com/villagesql/villagesql-server/issues) でバグを報告
+
+---
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card
+    title="システムリファレンス"
+    icon="book"
+    href="/mysql-8.4/0.0.4/reference"
+  >
+    システムテーブルおよびビューをクエリ
+  </Card>
+  <Card
+    title="拡張機能のアンインストール"
+    icon="trash"
+    href="/mysql-8.4/0.0.4/uninstall"
+  >
+    拡張機能を安全に削除
+  </Card>
+  <Card
+    title="拡張機能アーキテクチャ"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.4/architecture"
+  >
+    内部構造を理解
+  </Card>
+</CardGroup>

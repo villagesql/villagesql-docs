@@ -1,0 +1,337 @@
+---
+title: "拡張機能APIリファレンス"
+description: "VDF API契約、NULL処理、バッファサイズ、エンコード/デコード規約、プリラン/ポストランフック、およびVillageSQL拡張機能のSQL機能互換性。"
+---
+
+このページは拡張機能作成者向けのリファレンスです。ステップバイステップのチュートリアルについては、[拡張機能の作成](/mysql-8.4/0.0.4/create)を参照してください。カスタムカラムタイプについては、[カスタムタイプの作成](/mysql-8.4/0.0.4/custom-types)を参照してください。
+
+## VDF関数契約
+
+これらの契約は、VDF実装関数がVEFランタイムとどのように相互作用するかを規定しています。`make_func<>`経由で登録されるすべての関数は、これらの契約に従わなければなりません。以下の参照される型は、`#include <villagesql/vsql.h>`を介して利用可能です。
+
+### Part A: VDF関数契約
+
+**1. VDF実装関数は`void`です — 値を返しません。**
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    // ... compute result ...
+    return;  // always void -- no return value
+}
+```
+
+成功、NULL、警告、またはエラーを伝えるには、結果ラッパー上で終端メソッドを1つ呼び出します：`out.set(...)` / `out.set_length(n)`、`out.set_null()`、`out.warning(msg)`、または`out.error(msg)`。
+
+**2. `result->type`を4つの結果定数のうち1つに正確に設定します。**
+
+`vef_return_value_type_t`には4つの定数があります：
+
+| 定数 | 値 | 意味 |
+|------|-------|-------|
+| `VEF_RESULT_VALUE` | 0 | 成功 — 出力は適切なユニオンフィールドにあります |
+| `VEF_RESULT_NULL` | 1 | 結果はSQL NULLです |
+| `VEF_RESULT_WARNING` | 2 | 行レベルの警告 — 実行は継続され、この行の結果はNULLとなり、SQL警告が追加されます。厳密モードでは、INSERT/UPDATE時にエラーに昇格します。 |
+| `VEF_RESULT_ERROR` | 3 | 致命的エラー — 文の実行が中止され、メッセージは`result->error_msg`にあります |
+
+型固有のバリエーションはありません。`VEF_RESULT_VALUE`は文字列、整数、実数、カスタム型を問わず単一の成功定数です。出力型は、関数が受け取る結果ラッパー（`StringResult`、`IntResult`、`RealResult`、`CustomResult`）によって決定されます。
+
+**3. `input.value()`を呼び出す前に`input.is_null()`をチェックします。**
+
+`is_null()`がtrueを返す場合、`value()`を呼び出すことは未定義の動作です。
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+    // Safe to call input.value() -> std::string_view
+}
+```
+
+**4. 文字列結果の場合、`out.buffer()`に書き込み、`out.set_length(n)`を呼び出します。書き込み前に`out.buffer().size()`をチェックします。**
+
+- `out.buffer()`はサーバー管理バッファ上の`Span<char>`を返します。
+- `out.set_length(n)`は書き込まれたバイト数を記録します。
+- `out.buffer().size()`は最大容量です。常に書き込み前にチェックします。
+
+```cpp
+void upper_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    if (sv.size() > buf.size()) {
+        out.error("Input length exceeds buffer size");
+        return;
+    }
+
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = toupper(sv[i]);
+    }
+    out.set_length(sv.size());
+}
+```
+
+**5. エラーメッセージを`out.error(msg)`に渡します。必要に応じて`VEF_MAX_ERROR_LEN`（512バイト）に切り詰められます。**
+
+`out.error(msg)`は`std::string_view`を受け取ります。メッセージをサーバー管理バッファにコピーし、1回の呼び出しで結果状態をエラーに設定します。
+
+```cpp
+// Correct — error goes through out.error()
+out.error("Invalid input: expected positive integer");
+return;
+```
+
+## ラッパー関数の実装
+
+実装関数は型指定された引数および結果ラッパーを使用します：
+
+```cpp
+#include <villagesql/vsql.h>
+#include <algorithm>
+
+using namespace vsql;
+
+// String reverse implementation
+void my_reverse_impl(StringArg input, StringResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = sv[sv.size() - 1 - i];
+    }
+    out.set_length(sv.size());
+}
+
+// Count vowels implementation
+void count_vowels_impl(StringArg input, IntResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    long long count = 0;
+    for (char c : input.value()) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    out.set(count);
+}
+```
+
+## NULL値の処理
+
+NULLをチェックするには`is_null()`を使用し、NULLを返すには`set_null()`を呼び出します：
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    // ... write into buf.data(), up to buf.size() bytes ...
+
+    out.set_length(output_length);
+}
+```
+
+**NULL処理オプション:**
+- **入力NULLチェック:** `input.is_null()`
+- **NULLを返す:** `out.set_null()`
+- **値を返す:** `out.set(v)`（数値/カスタム）または`out.set_length(n)`（文字列の場合、`out.buffer()`に書き込み後）
+- **警告を返す:** `out.warning(msg)` — この行の結果をNULLにし、SQL警告を追加して実行を継続します；厳密モードではINSERT/UPDATE時にエラーに昇格します。`out.set()`と併用せず、代わりに呼び出します。
+- **エラーを返す:** `out.error(msg)` — 文の実行を中止します
+
+## エラーハンドリング
+
+検証失敗や無効な入力時のカスタムメッセージでエラーを返します：
+
+```cpp
+void validate_age_impl(IntArg age_input, IntResult out) {
+    if (age_input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    long long age = age_input.value();
+
+    if (age < 0 || age > 150) {
+        out.error("Age must be between 0 and 150");
+        return;
+    }
+
+    out.set(age);
+}
+```
+
+**結果タイプ:**
+- `VEF_RESULT_VALUE` - 成功（`out.set(v)` / `out.set_length(n)`）
+- `VEF_RESULT_NULL` - NULL値（`out.set_null()`）
+- `VEF_RESULT_WARNING` - 行レベルの警告（NULLを返し、SQL警告を追加して実行を継続；厳密モードではINSERT/UPDATE時にエラーに昇格）（`out.warning(msg)`）
+- `VEF_RESULT_ERROR` - 致命的エラー、文の実行を中止（`out.error(msg)`）
+
+## プリラン/ポストランによる文ごとの状態
+
+プリランおよびポストランフックは型指定されたラッパーを使用します。必要なシグネチャは次の通りです：
+
+```cpp
+void my_prerun(vsql::PrerunArgs args, vsql::PrerunResult out);
+void my_postrun(vsql::PostrunArgs args);
+```
+
+Raw ABIシグネチャ（`vef_prerun_args_t*` / `vef_postrun_args_t*`）は、`static_assert`で`.prerun<&Hook>()`および`.postrun<&Hook>()`でコンパイル時に拒否されます。
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+struct CallCounter { long long n = 0; };
+
+void my_prerun(PrerunArgs, PrerunResult out) {
+    out.set_user_data(new CallCounter{});
+}
+
+void my_func_impl(CallCounter& state, IntResult out) {
+    state.n++;
+    out.set(state.n);
+}
+
+void my_postrun(PostrunArgs args) {
+    args.delete_state<CallCounter>();
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(make_func<&my_func_impl>("my_func")
+      .returns(INT).no_params()
+      .prerun<&my_prerun>()
+      .postrun<&my_postrun>()
+      .build())
+);
+```
+
+`PrerunArgs`および`PostrunArgs`のメソッド詳細については、開発ガイドの[文ごとの状態（プリランおよびポストラン）](/mysql-8.4/0.0.4/development#per-statement-state-prerun-and-postrun)を参照してください。
+
+<Note>
+**ほとんどの拡張機能はプリラン/ポストランフックを必要としません。** VEF SDKは、型チェックや結果バッファサイズの管理など一般的なケースを自動的に処理します — 文字列を返すVDFおよびカスタム型を返すVDFの両方において、VDF本体が実行される前に結果バッファが解決された戻り型に合わせて拡大されます。開く接続など、行ごとに実行すべきでない高コストの文ごとのセットアップが必要な場合のみ、プリラン/ポストランを使用してください。
+
+ご使用のシナリオでプリラン/ポストランが必要な場合、[VillageSQL Discord](https://discord.gg/KSr6whd3Fr)でシナリオを共有してください — チームがSDKサポートを追加して自動的に処理できる可能性があります。
+</Note>
+
+## 集計関数
+
+組み込み集計関数COUNT(DISTINCT)、MIN、MAX、GROUP_CONCATは、カスタム型と即座に互換性があります。MINおよびMAXには、型に登録された比較関数が必要です。
+
+カスタム集計VDFもサポートされています。`make_aggregate_func<State, &result_fn>("name")`で登録し、`.returns()`、`.param()`、`.clear<>()`、`.accumulate<>()`を呼び出す前にチェーンします。`.clear<>()`および`.accumulate<>()`の両方が必須です。ビルダーアプリケーションプログラミングインターフェイス（API）およびコールバックシグネチャについては、[集計VDF](/mysql-8.4/0.0.4/development#aggregate-vdfs)を参照してください。
+
+**カスタム型との組み込み集計操作:**
+```sql
+-- COUNT(DISTINCT) works with custom types
+SELECT COUNT(DISTINCT impedance) FROM signals;
+
+-- MIN and MAX work with custom types (requires compare function)
+SELECT MIN(impedance), MAX(impedance) FROM signals;
+
+-- GROUP_CONCAT works with custom types
+SELECT GROUP_CONCAT(impedance ORDER BY impedance SEPARATOR ', ') FROM signals;
+```
+
+拡張機能関数は行ごとの実行モデルで呼び出されます：
+
+- 各関数呼び出しは、独自の結果バッファで1行を処理します（スレッドセーフ）
+- `prerun`/`postrun`が文ごとのセットアップ/終了を提供します
+- **グローバル状態を避ける** — 関数パラメータおよび戻り値を使用してください
+- グローバル状態が必要な場合、ミューテックス/ロックで保護してください
+
+**ベストプラクティス:** 単純さと安全性のために、関数をステートレスに設計してください。
+
+## ウィンドウ関数
+
+以下のウィンドウ関数はカスタム型と互換性があります：
+
+```sql
+SELECT
+    id,
+    impedance,
+    LAG(impedance)  OVER (ORDER BY id) AS prev_impedance,
+    LEAD(impedance) OVER (ORDER BY id) AS next_impedance
+FROM signals;
+
+SELECT
+    id,
+    impedance,
+    FIRST_VALUE(impedance) OVER w AS first_impedance,
+    LAST_VALUE(impedance)  OVER w AS last_impedance,
+    NTH_VALUE(impedance, 2) OVER w AS second_impedance
+FROM signals
+WINDOW w AS (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
+```
+
+## 一時テーブル
+
+カスタム型は一時テーブルで動作します。`CREATE TEMPORARY TABLE`、`INSERT`、`ALTER TABLE`は、永続テーブルと同様に動作します。
+
+```sql
+CREATE TEMPORARY TABLE tmp_signals (
+    id        INT PRIMARY KEY,
+    impedance COMPLEX
+);
+
+INSERT INTO tmp_signals VALUES (1, '(10,5)'), (2, '(20,0)');
+SELECT id, impedance FROM tmp_signals;
+```
+
+## プレビューAPI
+
+一部のVEF機能は、SDKのincludeツリー下の`villagesql/preview/`でオプトインヘッダーとして利用可能です。ABIおよびAPIはまだ開発中であり、通知なしに変更される可能性があります。
+
+オプトインするには、拡張機能ソースにincludeを追加します。例：
+
+```cpp
+#include <villagesql/preview/keyring.h>        // vsql::preview_keyring::KeyringCapability
+#include <villagesql/preview/thread_worker.h>  // vsql::preview_thread_worker::ThreadWorkerCapability
+#include <villagesql/preview/sql_query.h>      // vsql::preview_sql_query::SqlQueryCapability
+```
+
+これらのヘッダーのうちどれも`<villagesql/vsql.h>`によってインクルードされません。オプトインする際は、直接インクルードする必要があります。
+
+`vsql::preview`下のネームスペースレイアウトは機能ごとに異なります — 単一の汎用パターンはありません。キーリングAPIは`vsql::preview_keyring::KeyringCapability`を使用し、スレッドワーカーAPIは`vsql::preview_thread_worker::ThreadWorkerCapability`を使用し、SQLクエリAPIは`vsql::preview_sql_query::SqlQueryCapability`を使用し、バックグラウンドワーカースレッドハンドル（`vef_thread_handle_t *`）から開く必要があります。各ヘッダーの正確なネームスペースおよびクラス名については、ヘッダーを確認してください。
+
+完全なプレビューAPIドキュメントについては、[プレビュー機能](/mysql-8.4/0.0.4/preview-capabilities)を参照してください。
+
+<Warning>
+プレビューヘッダーは安定していません。これらのヘッダーを使用してビルドされた拡張機能は、サーバーが更新されると動作しなくなる可能性があります。機能が安定化すると、そのヘッダーはバージョン化された安定SDKパスに移動されます。
+</Warning>
+
+## トリガー
+
+トリガーはカスタム型カラムを持つテーブルで発火します。トリガー本体は`NEW`および`OLD`から非カスタム型カラムを参照できます。トリガー本体内でカスタム型カラム値にアクセスすることはまだサポートされていません。
+
+```sql
+CREATE TABLE signals (
+    id        INT PRIMARY KEY,
+    impedance COMPLEX,
+    label     VARCHAR(50)
+);
+CREATE TABLE signal_log (
+    id        INT,
+    label     VARCHAR(50),
+    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER signals_after_insert
+AFTER INSERT ON signals
+FOR EACH ROW
+    INSERT INTO signal_log (id, label) VALUES (NEW.id, NEW.label);
+
+INSERT INTO signals VALUES (1, '(10,5)', 'sensor_a');
+SELECT id, label FROM signal_log;
+```

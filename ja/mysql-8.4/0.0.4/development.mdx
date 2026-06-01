@@ -1,0 +1,641 @@
+---
+title: "開発"
+description: "VillageSQL拡張機能の関数を書くおよびテストを実行する方法。"
+---
+
+このガイドでは、VDF実装を書く方法とVillageSQL拡張機能の回帰テストを実行する方法をカバーしています。これは[拡張機能の作成](/mysql-8.4/0.0.4/create)の補足であり、エンドツーエンドのビルド手順について説明しています。
+
+<Warning>
+VEFプロトコル3はv0.0.4時点で安定しています。プロトコル4は開発中であり、オプトインの開発ABIヘッダー（`-DVSQL_USE_DEV_ABI=ON`）を介してのみ利用可能です。古いプロトコル2でビルドされた拡張機能はサーバーによって拒否され、再ビルドが必要です。
+</Warning>
+
+<Note>
+  VillageSQLサーバー自体の貢献（拡張機能のビルドではない）の場合、[ソースからビルド](/mysql-8.4/0.0.4/source)を参照してください。これは、`mysql-test-run.pl`を直接実行してテストを実行する含む、フルサーバー開発ワークフローをカバーしています。
+</Note>
+
+## 開発環境の設定
+
+拡張機能を開発およびテストするには、ビルド済みのVillageSQLサーバーが必要です。サーバーバイナリをコンパイルするには、[ソースからクローンおよびビルド](/mysql-8.4/0.0.4/source)ガイドに従ってください。
+
+ビルドが完了したら、`villagesql` CLIを使用してローカル開発サーバーインスタンスを管理します。すべてのコマンドはVillageSQLがインストールされたディレクトリから実行してください。
+
+### ローカル開発サーバーの起動
+
+サーバーインスタンスを初期化して起動します：
+
+```bash
+./villagesql init    # initialize database and seed bundled extensions
+./villagesql start   # start the server (default port 3307)
+./villagesql status  # check the server is running
+./villagesql connect # open a mysql shell
+./villagesql stop    # stop the server
+```
+
+初期化時にrootパスワードを設定するには：
+
+```bash
+./villagesql init --password
+./villagesql start
+```
+
+複数の独立したインスタンスを管理するには、コマンドの前に`--dir <path>`を指定するか、現在の作業ディレクトリにサーバーディレクトリを作成するには`--here`を使用します：
+
+```bash
+./villagesql --here init
+./villagesql --here start
+```
+
+### 拡張機能ファイルの管理
+
+SQL経由で拡張機能をインストールする前に、`.veb`ファイルがサーバー上に存在している必要があります。CLIはサーバーの`lib/veb/`ディレクトリを管理します：
+
+```bash
+./villagesql veb add /path/to/my_extension.veb  # copy a .veb to the server
+./villagesql veb ls                              # list available .veb files
+./villagesql veb rm my_extension                # remove a .veb file
+```
+
+`init`前に`lib/veb/`に配置された`.veb`ファイルは自動的にシードされます。ファイルを追加した後、SQL経由で拡張機能をインストールします：
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+## 拡張機能関数の作成
+
+拡張機能関数はC++で書かれ、VEFに登録されます。フルSDKにアクセスするには単一のヘッダーをインクルードします：
+
+```cpp
+#include <villagesql/vsql.h>
+```
+
+### タイプセーフなラッパー（推奨）
+
+タイプセーフなラッパーは、VDFパラメータおよび結果の型安全なインターフェイスを提供します。フレームワークは関数シグネチャ内のラッパー型を検出し、自動的に適応します。`make_func`登録構文は変更されません。
+
+**入力ラッパー:** `IntArg`, `RealArg`, `StringArg`, `CustomArg` — 各々`is_null()`および`value()`を提供します。パラメータ化されたカスタム型の場合、`CustomArgWith<P>`は`params()`アクセサを追加し、キャッシュされたパース済みパラメータ構造体を返します（[パラメータ化型](#parameterized-types)を参照）。
+
+**結果ラッパー:** `IntResult`, `RealResult`, `StringResult`, `CustomResult` — 各々`set_null()`, `warning(msg)`, `error(msg)`を提供します。スカラー結果は`set(value)`を提供します。バッファ結果は`buffer()`および`set_length(len)`を提供します。`StringResult`はさらに`set(std::string_view)`を提供し、ビューから最大`buffer().size()`バイトをコピーし、1回の呼び出しで長さを設定します。パラメータ化されたカスタム型の場合、`CustomResultWith<P>`は`params()`アクセサを追加します。
+
+**スパン型:** `value()`および`buffer()`はバイト指向ラッパーで`vsql::Span<T>`を返します — `data()`, `size()`, `empty()`, `begin()`/`end()`, `operator[]`を備えた連続した`T`の所有権を持たないビューです。C++20では`std::span<T>`のエイリアス、C++17ではSDKが最小限の互換実装を提供するため、どちらの標準でも同じコードがコンパイルされます。`<villagesql/vsql.h>`から利用可能です。
+
+`warning(msg)`は行に対してSQL NULLを返し、SQL警告を追加します。厳密モード（`STRICT_TRANS_TABLES`）では、MySQLはINSERT/UPDATEで警告をステートメントエラーに昇格させるため、厳密コンテキストでは`error(msg)`と同様に動作します。パースできない文字列などの回復可能な不良入力に使用します。破損した格納データや安全でない継続を避ける条件に`error(msg)`を使用します。両方のメッセージは必要に応じてサーバーの内部エラーバッファに収まるように切り詰められます。
+
+**スカラー例** — 2つの整数を加算：
+
+```cpp
+using namespace vsql;
+
+void add_impl(IntArg a, IntArg b, IntResult out) {
+  if (a.is_null() || b.is_null()) { out.set_null(); return; }
+  out.set(a.value() + b.value());
+}
+
+// Registration is unchanged:
+make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build();
+```
+
+**バイナリ例** — カスタム型バッファをインプレースで変換：
+
+```cpp
+using namespace vsql;
+
+void rot13_impl(CustomArg in, CustomResult out) {
+  if (in.is_null()) { out.set_null(); return; }
+  auto src = in.value();   // vsql::Span<const unsigned char>
+  auto dst = out.buffer(); // vsql::Span<unsigned char>
+  for (size_t i = 0; i < src.size(); i++) { dst[i] = transform(src[i]); }
+  out.set_length(src.size());
+}
+```
+
+`StringResult`および`CustomResult`の場合、`buffer()`に書き込み、`set_length()`で書き込まれたバイト数を呼び出します。`buffer().size()`は最大容量です。
+
+VDFがカスタム型を返す場合（`returns(CUSTOM(MYTYPE))`）、サーバーは結果バッファを解決された戻り型の`persisted_length`にサイズ設定します — 拡張機能作者はこのケースで関数ビルダーに`.buffer_size(...)`を宣言する必要がありません。`prerun`がバッファをさらに拡大する場合、そのサイズが保持されます。これにより、例えば`SVECTOR::from_string('[…1024 floats…]')`が広いベクトルをエンコードする際、結果ラッパーがメモリ不足になることを防ぎます。
+
+同じ拡張機能内の関数で異なるスタイルを使用できます — 各関数のスタイルはそのシグネチャによって決定されます。
+
+### アグリゲートVDF
+
+アグリゲートVDFは、各`GROUP BY`グループ内で行を跨いで状態を蓄積し、グループごとに1つの結果を返します。SQLの`SUM`や`COUNT`に似ています。`make_aggregate_func<State, &result_fn>("name")`を使用して登録します。State型はグループごとの蓄積バッファです。`prerun`および`postrun`は自動生成され、状態を割り当ておよび解放します。
+
+結果関数は`void(const State&, ResultWrapper)`のシグネチャを持つ必要があります。`ResultWrapper`は`IntResult`, `RealResult`, `StringResult`, `CustomResult`, `CustomResultWith<P>`のいずれかです。`out.set(value)`で値を返すか、`out.set_null()`でSQL NULLを返します。
+
+`.clear<>()`および`.accumulate<>()`は必須です。ビルダーはコンパイル時に（`build()`経由）強制し、サーバーは`INSTALL EXTENSION`時に再度検証します — `clear`は状態をリセットし、`accumulate`は行を畳み込み、結果関数は最終状態を読み取ります。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <optional>
+
+using namespace vsql;
+
+// State type: nullopt means no non-NULL rows seen yet.
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+// Registration:
+// make_aggregate_func<SumState, &my_result>("my_sum")
+//     .returns(INT)
+//     .param(INT)
+//     .clear<&my_clear>()
+//     .accumulate<&my_acc>()
+//     .build()
+```
+
+ビルダーのメソッドの動作：
+- `make_aggregate_func<State, &result_fn>()`は`prerun`および`postrun`を自動生成（`State`を値初期化および削除）。
+- `.clear<&fn>()`は`void(State&)`を`vef_vdf_clear_func_t`にラップ。
+- `.accumulate<&fn>()`は`void(State&, TypedArgs...)`を`vef_vdf_accumulate_func_t`にラップ。`TypedArgs`は関数シグネチャから推論されます（`IntArg`, `StringArg`など）。
+- `ResultWrapper`型（`IntResult`, `RealResult`など）は結果関数シグネチャから推論されます。
+
+カウンターが常にNULLを返さない場合、単純な状態型を使用します：
+
+```cpp
+using CountState = long long;
+void count_clear(CountState &s) { s = 0; }
+void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
+void count_result(const CountState &s, IntResult out) { out.set(s); }
+```
+
+### 1文ごとの状態（PrerunおよびPostrun）
+
+一部のVDFは、1つのクエリが扱うすべての行を跨ぐ状態（コールカウンター、キャッシュされた結果、オープンリソース）が必要です。**Prerun**フックで割り当て、VDF本体からアクセスし、**Postrun**フックで解放します。両フックは1文ごとに1回実行され、VDF本体は行ごとに1回実行されます。
+
+`.prerun<&Hook>()`および`.postrun<&Hook>()`で登録します。必要なシグネチャは：
+
+| フック | 必要なシグネチャ |
+|------|--------------------|
+| Prerun | `void(vsql::PrerunArgs, vsql::PrerunResult)` |
+| Postrun | `void(vsql::PostrunArgs)` |
+
+Raw ABIシグネチャはコンパイル時に拒否されます。`PrerunResult::set_user_data(void*)`で状態をスタックし、`PostrunArgs::delete_state<T>()`で解放します。Prerunで`set_user_data(new T{})`を呼び出した場合、Postrunは**必ず**`delete_state<T>()`を呼び出す必要があります — SDKは自動解放しません。
+
+`PrerunArgs::type_at(i)`は行が読み込まれる前に各引数の宣言されたSQL型を公開します。`PrerunArgType`の`is_int()`, `is_real()`, `is_str()`, `is_custom()`は列型をミラーします。この情報をPrerunで引数型を検証するか、`PrerunResult::request_buffer_size(n)`で結果バッファのサイズを指定します。
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+struct CallCounter { long long n = 0; };
+
+void ba_call_index_prerun(PrerunArgs, PrerunResult out) {
+  out.set_user_data(new CallCounter{});
+}
+
+void ba_call_index(CallCounter &state, IntResult out) {
+  state.n++;
+  out.set(state.n);
+}
+
+void ba_call_index_postrun(PostrunArgs args) {
+  args.delete_state<CallCounter>();
+}
+
+// Registration:
+// make_func<&ba_call_index>("ba_call_index")
+//     .returns(INT).no_params()
+//     .prerun<&ba_call_index_prerun>()
+//     .postrun<&ba_call_index_postrun>()
+//     .build()
+```
+
+### Varargs VDF
+
+**Varargs** VDFは任意の数の任意のSQL型の引数を受け付けます。`.varargs()`を関数ビルダーに指定して宣言します（`.no_params()`および`.param(TYPE)`と排他的）。本体は通常の固定引数ラッパーではなく`vsql::VarArgs`引数を受け取ります。
+
+<Warning>
+Varargs登録にはVEFプロトコル3が必要です。古いサーバーはインストール時に拡張機能を拒否します。
+</Warning>
+
+フレームワークはVarargs VDFの引数数および型を検証できません。Varargs登録には必ずPrerunフックを付けて、無効な入力で`PrerunResult::error()`を呼び出すか、結果バッファのサイズを指定する`PrerunResult::request_buffer_size(n)`を呼び出します。
+
+引数をrange-forで反復します。各`AnyArg`要素は値を読み取る前に型チェックが必要です：
+
+| プーディケート | アクセサ | 返り値型 |
+|-----------|----------|-------------|
+| `is_int()` | `as_int()` | `long long` |
+| `is_real()` | `as_real()` | `double` |
+| `is_str()` | `as_str()` | `std::string_view` |
+| `is_custom()` | `as_custom()` | `vsql::Span<const unsigned char>` |
+
+アクセサを使用する前に`is_null()`をチェックしてください — null引数では4つすべてが未定義です。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+constexpr size_t kBytearrayLen = 4;
+
+void ba_concat_all_prerun(PrerunArgs args, PrerunResult out) {
+  if (args.size() == 0) {
+    out.error("ba_concat_all requires at least one argument");
+    return;
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    auto t = args.type_at(i);
+    if (!t.is_custom() && !t.is_str()) {
+      out.error("ba_concat_all: argument " + std::to_string(i) +
+                " must be BYTEARRAY");
+      return;
+    }
+  }
+  out.request_buffer_size(args.size() * kBytearrayLen);
+}
+
+void ba_concat_all(VarArgs args, StringResult out) {
+  auto dst = out.buffer();
+  size_t off = 0;
+  for (auto a : args) {
+    if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
+    auto bytes = a.as_custom();
+    std::memcpy(dst.data() + off, bytes.data(), bytes.size());
+    off += bytes.size();
+  }
+  out.set_length(off);
+}
+
+// Registration:
+// make_func<&ba_concat_all>("ba_concat_all")
+//     .returns(STRING).varargs()
+//     .prerun<&ba_concat_all_prerun>()
+//     .build()
+```
+
+### VEF_GENERATE_REGISTRATION
+
+`VEF_GENERATE_REGISTRATION`は内部の`_vef_do_register()`ヘルパーを作成し、拡張機能登録を実行しますが、`extern "C"`エントリポイントを定義しません。テストビルドで登録後に記述子を修正する必要がある場合に使用します。通常の拡張機能には`VEF_GENERATE_ENTRY_POINTS`を使用してください。
+
+```cpp
+VEF_GENERATE_REGISTRATION(
+    make_extension()
+        .func(make_func<&my_impl>("my_func").returns(INT).build()))
+
+// Then define your own extern "C" vef_register/vef_unregister that call
+// _vef_do_register() and optionally modify the result.
+```
+
+### タイプ操作ビルダー
+
+*拡張機能がカスタムカラム型を定義する場合のみ必要です。関数のみを書いている場合は、[回帰テストの実行](#running-regression-tests)に進んでください。*
+
+カスタム型にはエンコード（文字列→バイナリ）、デコード（バイナリ→文字列）、比較の3つの操作が必要です。ハッシュはオプションです。これらをC++シグネチャで実装します（すべて`<villagesql/vsql.h>`から利用可能）：
+
+#### 固定長型
+
+```cpp
+// Encode: string -> binary. Write the encoded bytes via out.buffer() and
+// out.set_length(n); call out.set_null() for SQL NULL, out.warning(msg) for
+// recoverable bad input, or out.error(msg) to abort the statement. Returning
+// without calling any of these surfaces a default warning.
+using TypeEncodeFunc = void (*)(std::string_view from, vsql::CustomResult out);
+
+// Decode: binary -> string. Report the outcome by calling
+// out.set_length(n), out.set(sv), out.set_null(), out.warning(msg), or
+// out.error(msg). If none is called the wrapper falls back to a default
+// "failed to decode value" ERROR.
+using TypeDecodeFunc = void (*)(vsql::CustomArg in, vsql::StringResult out);
+
+// Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
+using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
+
+// Hash: returns hash code (used for hash joins).
+using TypeHashFunc = size_t (*)(vsql::CustomArg in);
+```
+
+これらの操作を`vsql::make_type<kTypeName>()`で登録します。型名は非型テンプレートパラメータ（NTTP）として渡されます — `static constexpr const char[]`配列。ビルダーはNTTPから`TYPE::method`形式（例: `"MYTYPE::from_string"`）のVDF名を自動生成するため、手動の文字列マッチングは必要ありません。ビルトされた型オブジェクトを拡張機能ビルダーの`.type()`に渡します。型操作用の別々の`.func()`呼び出しは必要ありません。
+
+<Warning>
+型名は`static constexpr const char[]`変数でなければなりません — 文字列リテラルは非型テンプレートパラメータとして使用できません。`"MYTYPE"`を直接渡すと、コンパイラエラーが発生します：
+
+```
+error: '"MYTYPE"' is not a valid template argument for type 'const char*'
+```
+
+以下の例のように名前付き配列を宣言してください。
+</Warning>
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(8)
+        .max_decode_buffer_length(64)
+        .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
+        .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
+        .compare<&my_compare>()      // auto: "MYTYPE::compare"
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
+        .intrinsic_default_str("0")  // string-literal intrinsic default
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE))
+```
+
+`build()`は`from_string`, `to_string`, `compare`が欠けている場合、コンパイル時に失敗します。各テンプレートメソッドは`static_assert`で関数ポインタシグネチャをチェックします。
+
+#### 組み込みデフォルト
+
+`NOT NULL`のカスタム型カラムが`IGNORE`モード（例: `INSERT IGNORE`または`UPDATE IGNORE`）で`NULL`を受け取ると、サーバーはエラーを発生させず、組み込みデフォルトを使用してフォールバック値を生成します。組み込みデフォルトは文字列表現を提供し、サーバーは型の`from_string`関数を使用してバイナリに変換します。
+
+<Note>
+`.intrinsic_default_str()`および`.intrinsic_default_vdf()`の両方を省略した場合、サーバーは`from_string("")`をフォールバックとして呼び出します。これは型が**初めて使用される時**（テーブル作成時）に発生し、`INSTALL EXTENSION`時ではありません。エンコード関数が空文字列を拒否する場合（または誤ったバイト数にエンコードする場合）、型初期化が失敗し、SQLクライアントでエラーが表示されます：
+
+```
+Type 'MYTYPE' failed to initialize: from_string VDF encoded intrinsic
+default input '' to N bytes, expected persisted_length=M
+```
+
+固定長型の場合、デフォルト文字列は正確に`persisted_length`バイトにエンコードされる必要があります。空文字列が有効な入力でない型には明示的なデフォルトを設定してください。
+</Note>
+
+**文字列リテラル: `.intrinsic_default_str()`**
+
+定数デフォルトの場合、型ビルダーに文字列を直接渡します（固定長例の`.intrinsic_default_str("0")`を参照）。
+
+**VDFベース: `.intrinsic_default_vdf()` + `make_intrinsic_default`**
+
+デフォルト値が型パラメータに依存する場合、以下のシグネチャの関数を実装します（`<villagesql/vsql.h>`から利用可能）：
+
+<Warning>
+  **破壊的変更**: `IntrinsicDefaultFunc`および`IntrinsicDefaultWithParamsFunc`は`const char*`ではなく`std::string`を返します。既存の組み込みデフォルト実装を`std::string`を直接返すように更新してください。
+</Warning>
+
+```cpp
+// Fixed (no type parameters):
+using IntrinsicDefaultFunc = std::string (*)(char *error_msg);
+
+// Parameterized (receives cached parsed params):
+template <typename P>
+using IntrinsicDefaultWithParamsFunc = std::string (*)(const P &,
+                                                       char *error_msg);
+```
+
+デフォルト値の`std::string`表現を返します。エラー時は`error_msg`にメッセージを書き込み、任意の値を返します（SDKは`error_msg[0] != '\0'`をチェックしてエラーを検出します）。`make_intrinsic_default<&fn>("vdf_name")`（1つの引数：VDF名）で登録し、型ビルダーで`.intrinsic_default_vdf()`で参照します。パラメータ化型の例は完全な登録パターンを示しています。
+
+```cpp
+std::string mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
+  return /* build string representation based on p */;
+}
+```
+
+#### パラメータ化型
+
+可変長型は、エンコード、デコード、比較、ハッシュ時にカラムの宣言されたパラメータが必要です。パラメータ構造体を定義し、パース関数と逆の`to_strings`関数を実装し、型ビルダーに`.params<P, &ParseFunc, &ToStringsFunc>()`で登録します。型操作関数の最初の引数として`const P&`を使用します。SDKはパラメータのユニーク組み合わせごとにパース結果をキャッシュするため、パース関数は型インスタンス化ごとに最大1回実行されます。`to_strings`関数は`parse`の逆で、型の`P`を標準的なキー/値文字列形式に変換し、サーバーが`parse`が消費する形式で推論されたパラメータを公開できます。
+
+```cpp
+struct MyTypeParams {
+  int64_t dimension;
+  static MyTypeParams parse(const std::map<std::string, std::string> &p) {
+    return {.dimension = stoll(p.at("dimension"))};
+  }
+  static void to_strings(const MyTypeParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
+  }
+};
+
+void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
+                   std::string_view from, vsql::CustomResult out) {
+  const MyTypeParams &p = params.value();  // is_known() is always true at runtime
+  size_t bytes = (size_t)p.dimension * 4;
+  auto buf = out.buffer();
+  if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
+  // ... parse from, write to buf ...
+  out.set_length(bytes);
+}
+
+void mytype_decode(vsql::CustomArgWith<MyTypeParams> in,
+                   vsql::StringResult out) {
+  const MyTypeParams &p = in.params();
+  // ... read p.dimension floats from in.value(), write to out.buffer() ...
+  out.set_length(bytes_written);
+}
+
+int mytype_compare(vsql::CustomArgWith<MyTypeParams> a,
+                   vsql::CustomArgWith<MyTypeParams> b) {
+  // Returns -1, 0, or 1.
+}
+
+size_t mytype_hash(vsql::CustomArgWith<MyTypeParams> in) {
+  // Returns hash code.
+}
+
+// Converts MYTYPE(N) integer syntax to a parameter map.
+// Signature: IntToTypeParamsFunc from <villagesql/vsql.h>.
+bool mytype_int_to_params_fn(int64_t value,
+                             std::map<std::string, std::string> &params,
+                             char *error_msg) {
+  if (value <= 0) {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: dimension must be a positive integer");
+    return true;
+  }
+  params["dimension"] = std::to_string(value);
+  return false;  // success
+}
+
+// Validates parameters and computes storage sizes.
+// Signature: ResolveTypeParamsFunc from <villagesql/vsql.h>.
+bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
+                              vsql::ResolvedTypeParams *result,
+                              char *error_msg) {
+  int64_t dim = std::stoll(params.at("dimension"));
+  result->persisted_length = dim * 4;
+  result->max_decode_buffer_length = 64;
+  return false;  // success
+}
+```
+
+型ビルダーに`.params<>()`を登録します。`.int_to_params<&mytype_int_to_params_fn>()`で`MYTYPE(N)`整数構文を処理し、`.resolve_params<&mytype_resolve_params_fn>()`でパラメータを検証し、ストレージサイズを計算します。`.max_persisted_length(N)`で、すべての有効なパラメータ化で最大の永続バイトサイズを指定します。サーバーはこの値を型パラメータ推論パスでのみ使用し、まだパラメータを推論していないため`resolve_params`を参照してエンコードバッファのサイズを決定できません。VDFベースの組み込みデフォルトには`.intrinsic_default_vdf()`とVDF名を使用し、`make_intrinsic_default<&mytype_default>()`で別途VDFを登録します。
+
+```cpp
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+// Maximum valid dimension for MYTYPE.
+constexpr int64_t kMyTypeMaxDimension = 1024;  // your max valid dimension
+// Upper bound on MYTYPE's persisted byte size across all valid params.
+constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(-1)
+        .max_decode_buffer_length(16)
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
+        .int_to_params<&mytype_int_to_params_fn>()
+        .resolve_params<&mytype_resolve_params_fn>()
+        .from_string<&mytype_encode>()
+        .to_string<&mytype_decode>()
+        .compare<&mytype_compare>()
+        .intrinsic_default_vdf("mytype_intrinsic_default")
+        .build();
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE)
+        .func(make_intrinsic_default<&mytype_default>(
+            "mytype_intrinsic_default")))
+```
+
+パラメータ化バリアント — `TypeEncodeWithParamsFunc<P>`, `TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>`, `TypeHashWithParamsFunc<P>`、および`ParamsToStringsFunc<P>`（`void fn(const P&, std::map<std::string,std::string>&)`）は`<villagesql/vsql.h>`から利用可能です。`vsql::make_type`テンプレートメソッドはパラメータ引数を検出し、自動的にパラメータキャッシュ経由でルーティングします。エンコード関数は最初の引数として`vsql::MaybeParams<P> &`を受け取ります。`is_known()`は実行時に常にtrueで、`value()`は`const P&`を返します。デコード、比較、ハッシュバリアントは`vsql::CustomArgWith<P>`を受け取り、`params()`アクセサは`const P&`を返します。
+
+#### ストアドプロシージャでのカスタム型
+
+カスタム拡張型は、ストアドプロシージャのパラメータ型および`DECLARE`変数宣言で使用できます。サーバーはインストールされた拡張機能の型メタデータを使用して、ルーチン実行時にカスタム型を解決します。
+
+```sql
+DELIMITER //
+CREATE PROCEDURE insert_complex(IN val COMPLEX)
+BEGIN
+  DECLARE tmp COMPLEX;
+  SET tmp = val;
+  INSERT INTO t1 VALUES (tmp);
+END //
+DELIMITER ;
+```
+
+### 拡張機能システム変数
+
+拡張機能システム変数はプレビュー機能です — 完全なAPIリファレンス、ファクトリ関数、SQLアクセス、完全な例については、[プレビュー機能](/mysql-8.4/0.0.4/preview-capabilities#system-variables)を参照してください。
+
+### 拡張機能ステータス変数
+
+拡張機能ステータス変数はプレビュー機能です — 完全なAPIリファレンス、ファクトリ関数、SQLアクセス、完全な例については、[プレビュー機能](/mysql-8.4/0.0.4/preview-capabilities#status-variables)を参照してください。
+
+### キーリングアクセス
+
+キーリングアクセスはプレビュー機能です — 完全なAPIリファレンス、結果コード、完全な例については、[プレビュー機能](/mysql-8.4/0.0.4/preview-capabilities#keyring-access)を参照してください。
+
+### カラムストレージ
+
+カラムストレージはプレビュー機能です — 完全なAPIリファレンスおよび完全な例については、[プレビュー機能](/mysql-8.4/0.0.4/preview-capabilities#column-storage)を参照してください。
+
+### 拡張機能登録メタデータの検査
+
+`INFORMATION_SCHEMA.EXTENSION_REGISTRATION`は、ロードされた各拡張機能のメモリ内VEF登録構造体をJSONドキュメントとして公開します。`INSTALL EXTENSION`後にサーバーが拡張機能の関数、型、システム変数を正しく解析したかどうかを検証するために使用します。
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL, REGISTRATION_JSON
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION
+WHERE EXTENSION_NAME = 'my_ext';
+```
+
+| 列 | 型 | 説明 |
+|--------|------|-------------|
+| `EXTENSION_NAME` | `VARCHAR(64)` | インストールされた拡張機能の名前。 |
+| `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | 拡張機能とサーバー間でネゴシエートされたVEFプロトコルバージョン。 |
+| `REGISTRATION_JSON` | `TEXT` | `vef_registration_t`構造体のJSONシリアライズ、`funcs`および`types`配列を含む。 |
+
+## 回帰テストの実行
+
+VillageSQLビルドディレクトリからMySQLテストランナーを使用して拡張機能の回帰テストを実行します。
+
+### 全テストの実行
+
+拡張機能のすべてのテストを実行するには：
+
+```bash
+cd $BUILD_HOME
+./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/test --parallel=auto
+```
+
+### 個別のテストの実行
+
+単一のテストケースを実行するには、スイートパスとテスト名を指定します：
+
+```bash
+cd $BUILD_HOME
+./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/test my_test_name
+```
+
+## 新しいテストの作成
+
+新しい機能を追加するかバグを修正する際、対応する回帰テストを追加する必要があります。
+
+### テストの場所
+
+拡張機能テストは、VillageSQLサーバーの`mysql-test/suite/`ツリーではなく、拡張機能自身のリポジトリの`test/`ディレクトリに配置されます。
+
+- テストファイルは`.test`で終了し、`test/t/`に配置されます。
+- 期待される結果ファイルは`.result`で終了し、`test/r/`に配置されます。
+
+例: 拡張機能名が`my_extension`の場合：
+- `test/t/my_new_test.test`
+- `test/r/my_new_test.result`
+
+### テストファイルの規約
+
+一般的な拡張機能テストは、拡張機能のインストール、SQLの実行、アンインストールを含みます：
+
+```sql
+# Description of the test
+
+INSTALL EXTENSION my_extension;
+
+# ... Your Test Code Here ...
+CREATE TABLE t1 (val MYTYPE);
+INSERT INTO t1 VALUES ('some_value');
+SELECT * FROM t1;
+DROP TABLE t1;
+
+UNINSTALL EXTENSION my_extension;
+```
+
+テスト出力にテストランナーのテンポラリディレクトリからのパスが含まれる場合、`.test`ファイル内に以下のディレクティブを追加して正規化します — これがないと、記録された結果に絶対パスが含まれ、他のマシンで動作しない可能性があります：
+
+```sql
+--replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
+```
+
+### テストを追加する手順
+
+1.  **`.test`ファイル**を拡張機能の`test/t/`ディレクトリに作成します。
+2.  **空の`.result`ファイル**を拡張機能の`test/r/`ディレクトリに作成します。
+3.  **`--record`でテストを実行**して期待される出力を生成します：
+    ```bash
+    cd $BUILD_HOME
+    ./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/test --record my_new_test
+    ```
+4.  **生成された`.result`ファイルの出力を確認**して、期待どおりの結果であることを確認します。
+
+## テストのデバッグ
+
+テストが失敗した場合、テストフレームワークは詳細なログを提供します。
+
+-   **テスト出力:** `mysql-test/var/log/mysqltest.log`（結合）または`mysql-test/var/log/<test_name>/`（テストごとのディレクトリ）を確認。
+-   **サーバーエラーログ:** `mysql-test/var/log/mysqld.1.err`を確認。VillageSQL固有のログメッセージ（`LogVSQL()`経由で出力）は、サーバーが`--log-error-verbosity=3`で実行されている場合にのみ表示されます。
+-   **差分:** フレームワークは実際の出力と期待される`.result`ファイルとの差分を出力します。
+
+テストに追加のデバッグ情報を含めて実行するには：
+
+```bash
+cd $BUILD_HOME
+./mysql-test/mysql-test-run.pl --verbose --suite=/path/to/your/extension/test my_new_test
+
+# To surface LogVSQL() messages in the error log:
+./mysql-test/mysql-test-run.pl --mysqld=--log-error-verbosity=3 \
+    --suite=/path/to/your/extension/test my_new_test
+```
+
+## 参照
+
+- [拡張機能の作成](/mysql-8.4/0.0.4/create) — エンドツーエンドのビルド手順、CMake設定、インストール
+- [拡張機能APIリファレンス](/mysql-8.4/0.0.4/extension-api-reference) — VDF契約、NULL処理、バッファサイズ
+- [拡張機能アーキテクチャ](/mysql-8.4/0.0.4/architecture) — ライフサイクル、Victionaryキャッシュ、パフォーマンスパターン、セキュリティモデル
