@@ -1,0 +1,98 @@
+---
+title: "协议1 API"
+description: "协议1函数指针类型API和原始ABI风格的参考——原始VEF接口，自v0.0.1起稳定，并将在0.0.5之后弃用。"
+---
+
+协议1是原始的VEF接口。它在v0.0.1时稳定，并将在0.0.5之后弃用。新扩展应使用协议3API——[创建扩展](/mysql-8.4/0.0.4/create)和[开发](/mysql-8.4/0.0.4/development)指南中描述的基于模板的类型构建器。
+
+本页面用于参考现有基于协议1构建的扩展。
+
+## 函数指针类型API
+
+协议1自定义类型使用显式函数指针注册，而非`vsql::make_type<>`模板。函数签名与协议3等效项不同——它们接受原始指针和长度，而非`Arg`和`Result`对象。
+
+### 函数签名
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+### 注册
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()`（带编译时字符串NTTP）是首选形式。`make_type(MYTYPE)`（无模板参数）是协议1形式——其支持将在0.0.5之后弃用。
+
+## 原始ABI风格（函数）
+
+协议1的VDF实现可直接传递原始C结构体，而非使用类型化包装器。此风格将在0.0.5之后弃用——所有新代码应使用[类型化包装器](/mysql-8.4/0.0.4/development#typed-wrappers-recommended)。
+
+```cpp
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+```
+
+注册方式与类型化包装器方法完全相同——构建器会自动检测签名。
+
+### 协议1中的聚合注册
+
+对于聚合函数，`.clear<>()`和`.accumulate<>()`接受原始ABI函数指针签名。`.prerun<>()`和`.postrun<>()`则不接受——构建器即使对协议1扩展也要求类型化签名（`void(PrerunArgs, PrerunResult)`和`void(PostrunArgs)`）。所有新代码应使用[类型化聚合方法](/mysql-8.4/0.0.4/development#aggregate-vdfs)。
+
+```cpp
+make_func<&raw_result>("my_agg")
+    .returns(INT).param(INT)
+    // prerun/postrun require typed signatures even in Protocol 1 mode:
+    .prerun<&my_prerun>()      // void(vsql::PrerunArgs, vsql::PrerunResult)
+    .postrun<&my_postrun>()    // void(vsql::PostrunArgs)
+    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
+    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
+    .build()
+```

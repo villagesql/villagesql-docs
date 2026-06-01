@@ -1,0 +1,249 @@
+---
+title: "Rust 中的自定义类型"
+description: "在 VillageSQL Rust SDK 中定义新列类型 — 使用 custom_type! 宏实现二进制布局、编码、解码、比较、哈希和算术函数。"
+---
+
+<Warning>
+Rust SDK 当前版本为 0.1.0，尚未发布到 crates.io。开始使用需要克隆 SDK 仓库的本地副本，并在 `Cargo.toml` 中添加 `path` 依赖。
+</Warning>
+
+自定义类型允许您定义新的列类型（如 `RATIONAL`、`VECTOR` 或 `INET`），这些类型可与 `ORDER BY`、索引和聚合函数一起使用。Rust SDK 通过 `custom_type!` 宏支持此功能。
+
+本页假设您已阅读 [Rust 中构建扩展](/mysql-8.4/0.0.4/rust-sdk)。设置（Cargo.toml、manifest.json、cargo-vsql）保持一致。
+
+## 何时使用自定义类型
+
+当满足以下条件时使用自定义类型：
+
+- 您需要标准 SQL 类型无法表达的二进制磁盘布局（压缩浮点数、固定宽度整数、二进制标识符）
+- 您的类型具有与字典序字符串排序不同的排序语义
+- 您希望服务器能正确索引和哈希值，以支持 `ORDER BY`、`COUNT(DISTINCT)` 和集合操作
+
+如果您只需要 SQL 可调用函数，且数据能舒适地放入 `STRING`、`INT` 或 `REAL` 列中，则无需自定义类型。
+
+## custom_type! 宏
+
+每个自定义类型需要 4 个回调函数（编码、解码、比较、哈希）和一个默认值。以下是完整的宏签名：
+
+```rust
+vsql::custom_type!(
+    type_name: "type_name_in_sql",
+    persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: your_encode_fn,
+    decode: your_decode_fn,
+    compare: your_compare_fn,
+    hash: your_hash_fn,
+    default: "a_valid_string_literal",
+)
+```
+
+| 字段 | 类型 | 描述 |
+|---|---|---|
+| `type_name` | 字符串字面量 | SQL 类型名称。SQL 中不区分大小写。 |
+| `persisted_length` | `usize` | 磁盘存储的固定字节长度。 |
+| `max_decode_buffer_length` | `usize` | 解码后字符串表示的最大字节长度。 |
+| `encode` | fn | 在 INSERT 时将 `&str` 转换为二进制字节。 |
+| `decode` | fn | 将二进制字节转换回 `String` 以供显示。 |
+| `compare` | fn | 为 `ORDER BY`、`MIN`、`MAX` 返回 `Ordering`。 |
+| `hash` | fn | 为 `COUNT(DISTINCT)` 和集合操作返回 `usize` 哈希值。可选但推荐。 |
+| `default` | 字符串字面量 | 服务器初始化时可编码的有效字符串。必须编码为恰好 `persisted_length` 字节。可选但推荐。 |
+
+`type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode` 和 `compare` 为必填项。`hash` 和 `default` 为可选但推荐项 —— `hash` 对于 `COUNT(DISTINCT)` 和集合操作的正确性至关重要，`default` 用于类型初始化验证。
+
+## 接收和返回二进制值
+
+接收或返回自定义类型的函数处理原始字节。
+
+**输入** — `InValue::Custom(b)` 携带存储的二进制数据作为 `&[u8]`：
+
+```rust
+fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::Custom(b)) => {
+            let numer = read_i64(b, 0);
+            VdfReturn::int(numer)
+        }
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("rational_numer: expected a RATIONAL argument"),
+    }
+}
+```
+
+**输出** — `VdfReturn::Binary(bytes)` 将二进制字节发送回服务器：
+
+```rust
+fn rational_add_impl(args: &[InValue]) -> VdfReturn {
+    match (args.get(0), args.get(1)) {
+        (Some(InValue::Custom(a)), Some(InValue::Custom(b))) => {
+            let result = add_rationals(a, b);
+            VdfReturn::Binary(result)
+        }
+        _ => VdfReturn::null(),
+    }
+}
+```
+
+在 `func!` 声明中引用自定义类型时，使用 `vsql::custom!("type_name")`：
+
+```rust
+vsql::func!(
+    rational_add_impl,
+    "rational_add",
+    [vsql::custom!("rational"), vsql::custom!("rational")] -> vsql::custom!("rational"),
+    deterministic: true
+)
+```
+
+## 示例：有理数类型
+
+SDK 仓库中的 `examples/vsql_rational` 是实现 `RATIONAL` 类型的完整扩展。它以小端字节序存储 16 字节的 `i64` 值对（分子、分母），并提供算术函数。
+
+以下是核心的编码、解码、比较和哈希实现：
+
+```rust
+use vsql::{InValue, VdfReturn};
+
+// Binary layout: [numerator: i64 LE][denominator: i64 LE] — 16 bytes total.
+// Always stored in reduced form (GCD = 1) with a positive denominator.
+const BYTES: usize = 16;
+
+fn to_bytes(num: i64, den: i64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(BYTES);
+    v.extend_from_slice(&num.to_le_bytes());
+    v.extend_from_slice(&den.to_le_bytes());
+    v
+}
+
+fn from_bytes(b: &[u8]) -> (i64, i64) {
+    let num = i64::from_le_bytes(b[..8].try_into().unwrap());
+    let den = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    (num, den)
+}
+
+// encode: "3/4" -> 16 bytes
+pub fn rational_encode(s: &str) -> Result<Vec<u8>, String> {
+    let (num_s, den_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("rational: expected 'n/d', got {:?}", s))?;
+    let num: i64 = num_s.trim().parse()
+        .map_err(|e| format!("rational numerator: {}", e))?;
+    let den: i64 = den_s.trim().parse()
+        .map_err(|e| format!("rational denominator: {}", e))?;
+    let (n, d) = normalize(num as i128, den as i128)
+        .ok_or_else(|| "rational: zero or overflowing denominator".to_string())?;
+    Ok(to_bytes(n, d))
+}
+
+// decode: 16 bytes -> "3/4"
+pub fn rational_decode(b: &[u8]) -> Result<String, String> {
+    if b.len() < BYTES {
+        return Err(format!("rational: expected {} bytes, got {}", BYTES, b.len()));
+    }
+    let (n, d) = from_bytes(b);
+    Ok(format!("{}/{}", n, d))
+}
+
+// compare: for ORDER BY, MIN, MAX
+pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (n1, d1) = from_bytes(a);
+    let (n2, d2) = from_bytes(b);
+    // cross-multiply (denominators are always positive)
+    let lhs = (n1 as i128) * (d2 as i128);
+    let rhs = (n2 as i128) * (d1 as i128);
+    lhs.cmp(&rhs)
+}
+
+// hash: for COUNT(DISTINCT) and set operations
+pub fn rational_hash(b: &[u8]) -> usize {
+    // FNV-1a over the 16 bytes
+    let mut h: usize = 0xcbf29ce484222325u64 as usize;
+    for &byte in b {
+        h ^= byte as usize;
+        h = h.wrapping_mul(0x100000001b3u64 as usize);
+    }
+    h
+}
+```
+
+`custom_type!` 注册和算术 VDF（`rational_add`、`rational_sub` 等）位于完整源码 `examples/vsql_rational/src/lib.rs` 中。
+
+安装扩展后：
+
+```sql
+INSTALL EXTENSION 'vsql_rational';
+
+CREATE TABLE fractions (
+    id   INT PRIMARY KEY,
+    val  RATIONAL
+);
+
+INSERT INTO fractions VALUES (1, '1/2'), (2, '3/4'), (3, '1/4');
+
+-- ORDER BY uses rational_compare
+SELECT val FROM fractions ORDER BY val;
+-- → 1/4, 1/2, 3/4
+
+-- Arithmetic with rational_add
+SELECT rational_add('1/3', '1/6');
+-- → 1/2
+
+-- Extract numerator and denominator
+SELECT rational_numer(val), rational_denom(val) FROM fractions;
+
+-- Convert to floating-point approximation
+SELECT rational_to_real('1/3');
+-- → 0.3333333333333333
+```
+
+`rational_to_real(r RATIONAL) -> REAL` 通过分子除以分母将 `RATIONAL` 值转换为 64 位浮点近似值。当需要近似十进制用于显示或比较，但不想在列中存储有损表示时非常有用。
+
+## 包含类型的 extension! 块
+
+在注册函数和类型时，`extension!` 块包含两个部分：
+
+```rust
+vsql::extension! {
+    funcs: [
+        // VDFs declared with func!
+    ],
+    types: [
+        // Custom types declared with custom_type!
+    ]
+}
+```
+
+若为空，可省略任一部分。仅类型扩展省略 `funcs:`；仅函数扩展省略 `types:`。
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card
+    title="Rust API 参考"
+    icon="book"
+    href="/mysql-8.4/0.0.4/rust-api-reference"
+  >
+    InValue、VdfReturn 和所有宏的完整参考。
+  </Card>
+  <Card
+    title="Rust 中构建扩展"
+    icon="wrench"
+    href="/mysql-8.4/0.0.4/rust-sdk"
+  >
+    入门指南 — Cargo 设置、首个函数、打包和测试。
+  </Card>
+  <Card
+    title="C++ 自定义类型"
+    icon="shapes"
+    href="/mysql-8.4/0.0.4/custom-types"
+  >
+    C++ 中的自定义类型 — `make_type<>`、编码/解码/比较/哈希、ALTER TABLE 规则。
+  </Card>
+  <Card
+    title="扩展架构"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.4/architecture"
+  >
+    自定义类型如何解析、缓存和存储。
+  </Card>
+</CardGroup>

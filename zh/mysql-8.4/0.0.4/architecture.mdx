@@ -1,0 +1,359 @@
+---
+title: 扩展架构
+description: VillageSQL 扩展系统内部工作原理
+---
+
+理解 VillageSQL 的扩展架构有助于在构建扩展时调试问题和优化性能。
+
+---
+
+## 术语
+
+- **VEB** (VillageSQL 扩展包) - `.veb` 文件格式，一个包含清单、库和元数据的 tar 归档文件
+- **VEF** (VillageSQL 扩展框架) - 用于编写扩展的 C++ 和 Rust SDK
+- **VDF** (VillageSQL 定义函数) - 通过 VEF SDK 使用 `VEF_GENERATE_ENTRY_POINTS()` 注册的函数
+
+---
+
+## VDF 函数查找
+
+VDF 支持带限定和不带限定的函数调用：
+
+```sql
+-- Unqualified lookup
+SELECT complex_abs(value) FROM table;
+
+-- Qualified lookup
+SELECT vsql_complex.complex_abs(value) FROM table;
+```
+
+**不带限定函数调用的解析顺序：**
+1. 系统函数（内置 MySQL）
+2. VDF（扩展函数）- 仅当恰好存在一个同名函数时
+3. 存储函数（使用 `CREATE FUNCTION` 创建）
+
+**性能：** 对于热点代码路径，使用限定调用（`extension_name.function_name()`）跳过解析链，直接调用扩展函数。
+
+---
+
+## VEB 文件格式
+
+VillageSQL 扩展以 `.veb`（VillageSQL 扩展包）文件分发 - 包含以下内容的 tar 归档文件：
+
+```
+extension_name.veb (tar archive)
+├── manifest.json       # Extension metadata (required)
+└── lib/
+    └── extension.so    # Compiled shared library (required)
+```
+
+### manifest.json Schema
+
+```json
+{
+  "name": "extension_name",          // Required: lowercase_with_underscores
+  "version": "1.0.0",                // Required: semantic version
+  "description": "Brief description",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+- **name:** 必须匹配 SQL 中使用的扩展名称（小写_下划线格式）
+- **version:** 语义化版本（MAJOR.MINOR.PATCH）
+- **description, author, license:** 可选元数据
+
+## 扩展生命周期
+
+### 安装流程
+
+```
+INSTALL EXTENSION name
+    ↓
+1. Validate .veb exists in veb_dir
+    ↓
+2. Calculate SHA256 hash of .veb
+    ↓
+3. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
+    ↓
+4. Parse and validate manifest.json
+    ↓
+5. Load .so library (dlopen with RTLD_LOCAL)
+    ↓
+6. Call vef_register() entry point
+    ↓
+7. Register VDFs and custom types
+    ↓
+8. Persist registration and update cache
+    ↓
+Success
+```
+
+**回滚：** 如果任何步骤失败，所有更改将被撤销，`.so` 文件将被卸载。
+
+**符号隔离：** 扩展以 `RTLD_LOCAL` 标志加载，确保一个扩展的符号不会与其他扩展的符号冲突。这防止了多个扩展使用常见库名称或函数名称时的命名冲突。
+
+<Note>
+`veb_dir` 系统变量指向 `.veb` 扩展文件存储的目录。
+</Note>
+
+### 卸载流程
+
+```
+UNINSTALL EXTENSION name
+    ↓
+1. Check for column dependencies
+    ↓
+2. Call vef_unregister() cleanup hook
+    ↓
+3. Drop registered VDFs
+    ↓
+4. Drop custom types
+    ↓
+5. Remove extension registration and update cache
+    ↓
+6. Unload .so library (dlclose)
+    ↓
+7. Keep .veb_expansion_cache directory (for reinstall)
+    ↓
+Success
+```
+
+**依赖预防：** 如果表列使用扩展的自定义类型，则无法卸载。
+
+---
+
+## 扩展目录结构
+
+VillageSQL 将 `.veb` 文件展开到 MySQL 数据目录中以支持多版本：
+
+```
+datadir/
+└── .veb_expansion_cache/
+    └── extension_name/
+        ├── abc123.../              # SHA256 of v1.0.0 .veb
+        │   ├── manifest.json
+        │   └── lib/extension.so
+        └── def456.../              # SHA256 of v2.0.0 .veb
+            ├── manifest.json
+            └── lib/extension.so
+```
+
+**为什么使用 SHA256 目录？**
+- 测试新版本时无需覆盖
+- 支持回滚
+- 防止“相同版本，不同代码”
+
+**清理：** 服务器重启时会移除孤立的 SHA256 目录。
+
+---
+
+## Victionary 缓存层
+
+VictionaryClient 维护系统元数据的内存缓存，实现 O(log n) 查找。
+
+### 缓存表
+
+```cpp
+SystemTableMap<ExtensionEntry> m_extensions;
+SystemTableMap<CustomTypeEntry> m_types;
+SystemTableMap<CustomColumnEntry> m_columns;
+SystemTableMap<PropertyEntry> m_properties;
+```
+
+### 缓存操作
+
+| 操作 | 锁定 | 性能 |
+|------|------|------|
+| 读取（解析类型） | 读锁 | O(log n) 映射查找 |
+| 写入（安装扩展） | 写锁 | O(log n) 插入 + 磁盘 I/O |
+| 服务器启动 | 无 | 完整表扫描加载到内存 |
+
+**缓存失效：** DDL 操作（INSTALL/UNINSTALL EXTENSION）期间自动失效。
+
+**内存开销：** 每个条目约 100 字节。
+
+---
+
+## 自定义类型系统
+
+### 类型解析
+
+```cpp
+CREATE TABLE t (col COMPLEX)
+    ↓
+1. Parser encounters COMPLEX
+    ↓
+2. PT_custom_type::create()
+    ↓
+3. ResolveTypeToContext(extension_name, type_name)
+    ↓
+4. VictionaryClient::lookup_type() → O(log n)
+    ↓
+5. Find TypeDescriptor in cache
+    ↓
+6. Create Field with implementation_type
+```
+
+### 实现类型
+
+自定义类型映射到 MySQL 存储类型：
+
+| 自定义类型 | MySQL 实现 | 字节 |
+|------------|------------|------|
+| COMPLEX    | MYSQL_TYPE_VARCHAR | 16 |
+| UUID       | MYSQL_TYPE_VARCHAR | 16 |
+| INET6      | MYSQL_TYPE_VARCHAR | 16 |
+| JSON_SCHEMA| MYSQL_TYPE_BLOB    | 可变 |
+
+---
+
+## 并发与事务行为
+
+### 线程安全模型
+
+扩展函数以每行执行模型调用：
+
+- **每行隔离执行：** 每个函数调用获得自己的结果缓冲区（设计为线程安全）
+- **预运行/后运行钩子：** 每语句设置/清理，每个 SQL 语句调用一次
+- **无保证隔离：** 多个连接可能并发调用您的函数
+- **最佳实践：** 避免全局状态；使用函数参数和返回值
+
+<Warning>
+VillageSQL 不保证扩展函数的线程隔离。如果使用全局变量或共享状态，请使用互斥锁或锁保护。
+</Warning>
+
+### 事务行为
+
+扩展函数应遵循以下最佳实践：
+- 尽可能设计为无状态函数
+- 避免在函数中进行持久化副作用（文件写入、外部 API 调用）
+- 如果使用预运行/后运行状态，请适当处理清理
+
+---
+
+## 性能考虑
+
+**优化：** 使用预运行钩子缓存昂贵的每语句设置，而非每行重复工作。
+
+### 自定义类型性能
+
+```sql
+-- Slow: VDF call per row
+SELECT * FROM signals WHERE complex_abs(impedance) > 100;
+
+-- Fast: Computed column with index
+ALTER TABLE signals
+ADD COLUMN impedance_magnitude DOUBLE AS (complex_abs(impedance)) STORED,
+ADD INDEX(impedance_magnitude);
+
+SELECT * FROM signals WHERE impedance_magnitude > 100;
+```
+
+---
+
+## 安全与调试
+
+### 安全模型
+
+**信任模型：** 扩展以完整服务器权限运行。
+
+- 无沙箱或权限系统
+- 扩展可读取任何文件、访问网络、执行代码
+- **信任影响：** 仅从可信来源安装扩展
+
+**安装安全：** 以 `villagesql_extension_installer` 用户运行（上下文切换）。
+
+<Accordion title="调试扩展">
+
+**启用详细日志：**
+```bash
+mysqld --log-error-verbosity=3
+```
+
+**GDB 调试：**
+```bash
+gdb -p $(pidof mysqld)
+(gdb) break my_func_init
+(gdb) continue
+```
+
+**检查依赖：**
+```bash
+# Linux
+ldd /path/to/extension.so
+
+# macOS
+otool -L /path/to/extension.so
+```
+
+**常见错误：**
+- **未定义符号：** 检查 `extern "C"` 链接
+- **无法打开共享对象：** 检查库依赖
+- **VDF 调用崩溃：** 检查空指针处理
+
+</Accordion>
+
+---
+
+## 模式验证
+
+服务器启动时，SchemaManager 验证系统表模式：
+
+```cpp
+1. Open each VillageSQL system table
+2. Check column count and names
+3. Validate column types
+4. Verify primary keys
+5. Check indexes
+```
+
+**失败场景：**
+- 缺失表 → 从 villagesql_schema.sql 创建
+- 模式错误 → 报错并拒绝启动
+- 版本不匹配 → 运行升级脚本
+
+**服务器版本：**
+```sql
+SELECT VERSION();
+```
+
+源码构建包含 git 提交哈希：
+```
+8.4.9-villagesql-0.0.4
+```
+
+---
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card
+    title="创建扩展"
+    icon="code"
+    href="/mysql-8.4/0.0.4/create"
+  >
+    构建您的第一个扩展
+  </Card>
+  <Card
+    title="系统参考"
+    icon="book"
+    href="/mysql-8.4/0.0.4/reference"
+  >
+    系统表和视图
+  </Card>
+  <Card
+    title="示例"
+    icon="lightbulb"
+    href="/mysql-8.4/0.0.4/examples"
+  >
+    研究 vsql_complex 实现
+  </Card>
+  <Card
+    title="管理扩展"
+    icon="sliders"
+    href="/mysql-8.4/0.0.4/managing"
+  >
+    监控和故障排除
+  </Card>
+</CardGroup>

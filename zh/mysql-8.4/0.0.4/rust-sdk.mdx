@@ -1,0 +1,234 @@
+---
+title: "使用 Rust 构建扩展"
+description: "开始使用 VillageSQL Rust SDK — 用安全的 Rust 编写扩展函数，打包为 VEB 文件，并在 VillageSQL 中安装。"
+---
+
+<Warning>
+Rust SDK 当前版本为 0.1.0，尚未发布到 crates.io。开始使用需要克隆 SDK 仓库的本地副本，并在 `Cargo.toml` 中添加 `path` 依赖。
+</Warning>
+
+<Note>
+如果您更喜欢 C++，请参阅 [创建扩展](/mysql-8.4/0.0.4/create) 以获取 C++ SDK 入门指南。
+</Note>
+
+VillageSQL 扩展可以使用 `vsql` crate 用 Rust 编写。SDK 处理所有 FFI 序列化 —— 您可以使用普通的 Rust 类型工作，`extension!` 宏会生成服务器在加载时调用的 C 入口点。
+
+## 先决条件
+
+您需要：
+
+- **Rust 稳定工具链** —— 通过 [rustup.rs](https://rustup.rs) 安装
+- **cargo-vsql** —— 用于打包、安装和测试扩展的 Cargo 子命令
+- **VillageSQL 构建目录** —— 通过设置 `VillageSQL_BUILD_DIR` 为服务器构建路径，以便执行 `cargo vsql install` 和 `cargo vsql test`
+
+从 SDK 仓库安装 `cargo-vsql`：
+
+```bash
+git clone https://github.com/villagesql/vsql-rust-sdk
+cd vsql-rust-sdk
+cargo install --path cargo-vsql
+```
+
+验证其可用性：
+
+```bash
+cargo vsql --help
+```
+
+## 创建新 crate
+
+创建新的 Rust 库 crate：
+
+```bash
+cargo new --lib vsql_rot13
+cd vsql_rot13
+```
+
+编辑 `Cargo.toml` 设置 crate 类型并添加 `vsql` 依赖：
+
+```toml
+[package]
+name = "vsql_rot13"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vsql = { path = "/path/to/vsql-rust-sdk/vsql" }
+```
+
+`cdylib` crate 类型告知 Cargo 生成共享库（Linux 上为 `.so`，macOS 上为 `.dylib`），服务器可加载该库。
+
+若偏好 Git 依赖而非路径依赖，可使用：
+
+```toml
+vsql = { git = "https://github.com/villagesql/vsql-rust-sdk" }
+```
+
+此方式锁定到默认分支的最新提交。使用 `rev = "..."` 可锁定特定提交。
+
+## 编写首个函数
+
+将 `src/lib.rs` 替换为完整扩展：
+
+```rust
+use vsql::{InValue, VdfReturn};
+
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("vsql_rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+vsql::extension! {
+    funcs: [
+        vsql::func!(rot13_impl, "vsql_rot13", [vsql::Type::String] -> vsql::Type::String),
+    ]
+}
+```
+
+`func!` 宏将 `rot13_impl` 与 SQL 名称 `vsql_rot13` 关联，并指定 `STRING -> STRING` 签名。
+
+函数签名为 `fn(&[InValue]) -> VdfReturn`。`InValue` 是服务器传入的 SQL 类型的枚举。`VdfReturn` 是您返回的内容。在访问值前，需通过 `args.first()` 处理 NULL 和类型错误情况。
+
+若函数对相同输入始终返回相同输出，请声明为确定性（deterministic）—— 优化器可缓存相同输入的结果：
+
+```rust
+vsql::func!(rot13_impl, "vsql_rot13", [vsql::Type::String] -> vsql::Type::String, deterministic: true)
+```
+
+## 添加 manifest.json
+
+在 crate 根目录（与 `Cargo.toml` 同级）创建 `manifest.json`：
+
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "ROT-13 encoding for VillageSQL",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+服务器在安装时读取此文件。`name` 字段必须与您传递给 `INSTALL EXTENSION` 的名称匹配。
+
+## 构建与安装
+
+<Note>
+请从扩展目录（包含 `Cargo.toml` 和 `manifest.json` 的目录）内执行 `cargo vsql package`、`cargo vsql install` 和 `cargo vsql test`，而非工作区根目录。
+</Note>
+
+将扩展打包为 `.veb` 文件：
+
+```bash
+cargo vsql package
+```
+
+这将生成 `dist/vsql_rot13.veb`。要直接将 VEB 打包并复制到 VillageSQL 构建目录：
+
+```bash
+export VillageSQL_BUILD_DIR=/path/to/villagesql/build
+cargo vsql install
+```
+
+您应能看到 VEB 被复制到扩展目录。验证其存在：
+
+```bash
+ls "$VillageSQL_BUILD_DIR/veb_output_directory/"
+# vsql_rot13.veb
+```
+
+## 测试
+
+在 `mysql-test/t/rot13_basic.test` 中编写测试文件：
+
+```sql
+INSTALL EXTENSION 'vsql_rot13';
+SELECT vsql_rot13('Hello');
+SELECT vsql_rot13('');
+SELECT vsql_rot13(NULL);
+UNINSTALL EXTENSION 'vsql_rot13';
+```
+
+生成预期结果：
+
+```bash
+cargo vsql test --record
+```
+
+运行测试套件：
+
+```bash
+cargo vsql test
+```
+
+修改函数行为后，重新运行 `cargo vsql test --record` 更新预期结果，再运行 `cargo vsql test` 确认。
+
+## 在 SQL 中安装
+
+当 VEB 位于扩展目录后，进行安装：
+
+```sql
+INSTALL EXTENSION 'vsql_rot13';
+```
+
+验证：
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'vsql_rot13';
+```
+
+调用：
+
+```sql
+SELECT vsql_rot13('Hello, World!');
+-- → Uryyb, Jbeyq!
+```
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card
+    title="Rust 中的自定义类型"
+    icon="shapes"
+    href="/mysql-8.4/0.0.4/rust-custom-types"
+  >
+    使用二进制存储、排序和哈希定义新列类型。
+  </Card>
+  <Card
+    title="Rust API 参考"
+    icon="book"
+    href="/mysql-8.4/0.0.4/rust-api-reference"
+  >
+    InValue、VdfReturn、extension!、func! 和 custom_type! —— 所有字段。
+  </Card>
+  <Card
+    title="C++ SDK（创建扩展）"
+    icon="code"
+    href="/mysql-8.4/0.0.4/create"
+  >
+    C++ 路径 —— 类型化包装器、构建 API 和 CMake 配置。
+  </Card>
+  <Card
+    title="扩展架构"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.4/architecture"
+  >
+    VEB 文件加载方式、生命周期钩子和符号隔离。
+  </Card>
+</CardGroup>

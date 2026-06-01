@@ -1,0 +1,494 @@
+---
+title: 管理扩展
+description: 监控、排查和管理 VillageSQL 扩展
+---
+
+## 查看已安装的扩展
+
+使用 INFORMATION_SCHEMA 视图查询已安装的扩展：
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+**输出:**
+```
++------------------+-------------------+
+| EXTENSION_NAME   | EXTENSION_VERSION |
++------------------+-------------------+
+| vsql_complex     | 0.0.1             |
+| vsql_uuid        | 0.0.3             |
++------------------+-------------------+
+```
+
+**用法:**
+- 既可用于交互式会话也可用于脚本
+- 与 MySQL 工具兼容的标准 SQL 接口
+
+---
+
+## 检查扩展函数
+
+验证安装后扩展函数是否正常工作：
+
+```sql
+-- Test a function directly
+SELECT complex_abs('(1.0,2.0)');
+```
+
+---
+
+## 扩展目录
+
+检查 VillageSQL 查找 `.veb` 文件的位置：
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+**列出可用扩展:**
+```bash
+ls -la /path/to/veb_dir/*.veb
+```
+
+### 配置 veb_dir
+
+要更改扩展目录位置，请在 MySQL 配置文件中设置 `veb_dir`：
+
+**my.cnf / my.ini:**
+```ini
+[mysqld]
+veb_dir=/custom/path/to/extensions/
+```
+
+**要求:**
+- 路径必须是绝对路径（不能是相对路径）
+- 服务器启动前目录必须存在
+- MySQL 用户必须对目录有读取权限
+- 仅支持一个 `veb_dir`（不能有多个路径）
+- 更改需要重启服务器才能生效
+
+**重启后验证:**
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## 排查问题
+
+### 快速参考
+
+| 问题 | 快速修复 |
+|--|--|
+| 扩展未找到 | 验证 `.veb` 文件是否存在于 veb_dir 中且名称正确 |
+| 权限被拒绝 | 检查权限：`chmod 644 extension.veb` |
+| 无法卸载：类型正在使用中 | 尝试 `UNINSTALL EXTENSION`；错误会标识被阻塞的列名称 |
+| 版本不匹配 | 重启服务器以清除缓存 |
+| 更新后扩展显示旧行为 | `UNINSTALL` 后再 `INSTALL`；如需清除 `.veb_expansion_cache/` |
+| 无法比较类型 X 和 Y | 两边必须使用相同自定义类型 |
+| 无法隐式转换非自定义类型 | 被比较的字面量或列与自定义类型不兼容 |
+
+### 扩展未找到
+
+**错误:** `Extension 'my_extension' not found`
+
+**调试步骤:**
+```bash
+# 1. Check veb_dir location
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# 2. List .veb files
+ls -la /path/to/veb_dir/
+
+# 3. Verify filename matches extension name
+# File: my_extension.veb
+# Install: INSTALL EXTENSION my_extension;
+
+# 4. Check permissions
+ls -l /path/to/veb_dir/my_extension.veb
+sudo chmod 644 /path/to/veb_dir/my_extension.veb
+```
+
+### 安装后函数不可用
+
+**错误:** `FUNCTION my_func does not exist`
+
+**调试步骤:**
+```sql
+-- 1. Verify extension installed
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+### 更新后扩展显示旧行为
+
+**症状:** 替换 `.veb` 文件并重新安装后，扩展仍运行旧代码。
+
+**原因:** VillageSQL 在首次加载时将 `.veb` 文件展开到 `{datadir}/.veb_expansion_cache/`。如果您复制新 `.veb` 文件但未先运行 `UNINSTALL EXTENSION`，服务器将继续使用已加载在内存中的先前展开的 `.so` 文件。
+
+**解决方案:** 始终遵循完整的 UNINSTALL → 替换 → INSTALL 流程：
+
+```sql
+UNINSTALL EXTENSION my_extension;
+```
+
+然后替换 `veb_dir` 中的 `.veb` 文件并重新安装：
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+如果扩展仍显示旧行为，请在重新安装前清除展开缓存：
+
+```bash
+rm -rf {datadir}/.veb_expansion_cache/my_extension/
+```
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+---
+
+### 无法卸载扩展
+
+**错误:** `Cannot uninstall extension: types in use`
+
+**解决方案:**
+
+```sql
+-- Attempt uninstall; the error identifies blocking columns by name
+UNINSTALL EXTENSION my_extension;
+-- If blocked: ERROR HY000: Cannot drop extension `my_extension` as 1 column(s) depend on it,
+--             e.g. mydb.mytable.my_column has type MYTYPE
+
+-- Drop or alter the identified column(s), then retry
+DROP TABLE mydb.mytable;
+-- OR
+ALTER TABLE mydb.mytable DROP COLUMN my_column;
+
+UNINSTALL EXTENSION my_extension;
+```
+
+### 库加载错误
+
+**错误:** `Cannot load library: undefined symbol`
+
+**原因:**
+- 缺少库依赖
+- ABI 兼容性不匹配
+- MySQL 版本不正确
+
+**调试:**
+```bash
+# Check library dependencies (Linux)
+ldd {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+
+# Check library dependencies (macOS)
+otool -L {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+```
+
+### 扩展名称验证错误
+
+**错误:** `Failed to load VEF extension 'extension_name'` 伴随日志消息 `Extension name mismatch`
+
+**原因:** `manifest.json` 中的扩展名称与 VEB 文件名不匹配。
+
+**调试步骤:**
+
+1. **检查 VEB 文件名与清单匹配:**
+   ```bash
+   # VEB filename: my_extension.veb
+   # manifest.json should have:
+   {
+     "name": "my_extension",  # Must match VEB filename (without .veb)
+     ...
+   }
+   ```
+
+2. **验证 manifest.json 中的 name 字段:**
+   ```bash
+   # Extract and check manifest from VEB
+   tar -xOf /path/to/veb_dir/my_extension.veb manifest.json | grep name
+   ```
+
+**解决方案:**
+
+两个名称必须完全相同，使用下划线（参见 [扩展命名约定](/mysql-8.4/0.0.4/install#extension-naming-conventions)）：
+- VEB 文件名: `my_extension.veb`
+- manifest.json: `"name": "my_extension"`
+
+**常见错误:**
+- 在清单中使用连字符: `"name": "my-extension"` ❌
+- VEB 文件名不匹配: `my-extension.veb` 与 `"name": "my_extension"` ❌
+
+**正确示例:**
+```json
+// manifest.json
+{
+  "name": "my_extension",
+  "version": "1.0.0"
+}
+```
+
+```cpp
+// extension.cc
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(...)
+)
+```
+
+```bash
+# VEB filename
+my_extension.veb
+```
+
+### 自定义类型比较错误
+
+**错误:** `Cannot compare types X and Y in =`
+
+**原因:** 比较两边都是自定义类型，但来自不同类型或扩展。
+
+```sql
+-- Example: comparing COMPLEX with UUID in a WHERE clause
+SELECT * FROM t WHERE complex_col = uuid_col;
+-- ERROR: Cannot compare types vsql_complex.COMPLEX and vsql_uuid.UUID in =
+```
+
+**解决方案:** 确保比较两边使用相同自定义类型。如需跨类型比较，使用适当的类型转换函数显式转换其中一边。
+
+---
+
+**错误:** `Unable to implicitly cast a non-custom type during compare with a custom type in =`
+
+**原因:** 比较一边是自定义类型列，另一边是无法自动转换为该类型的值（字面量或列）。
+
+```sql
+-- Example: comparing a custom type with an integer literal
+SELECT * FROM t WHERE complex_col = 42;
+-- ERROR: Unable to implicitly cast a non-custom type during compare...
+```
+
+**解决方案:** 字符串字面量会自动使用类型编码函数转换为自定义类型。对于其他类型（整数、浮点数），使用显式转换函数：
+
+```sql
+-- Use a string literal instead (auto-cast works)
+SELECT * FROM t WHERE complex_col = '(1.0,2.0)';
+
+-- Or use the type's from_string method explicitly
+SELECT * FROM t WHERE complex_col = COMPLEX::from_string('(1.0,2.0)');
+```
+
+---
+
+## 监控扩展使用
+
+### 查询性能
+
+使用 performance_schema 跟踪 VDF 执行时间：
+
+```sql
+-- Enable statement instrumentation
+UPDATE performance_schema.setup_instruments
+SET ENABLED = 'YES', TIMED = 'YES'
+WHERE NAME LIKE '%statement%';
+
+-- Query VDF execution times
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR as executions,
+    ROUND(SUM_TIMER_WAIT/1000000000, 2) as total_ms,
+    ROUND(AVG_TIMER_WAIT/1000000000, 2) as avg_ms
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST_TEXT LIKE '%complex_%'
+ORDER BY total_ms DESC
+LIMIT 10;
+```
+
+### 自定义类型使用
+
+跟踪哪些表使用自定义类型：
+
+```sql
+-- Find all columns using custom extension types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY DATA_TYPE, TABLE_SCHEMA, TABLE_NAME;
+```
+
+---
+
+## 更新扩展
+
+要将扩展更新到新版本，请使用手动更新流程：
+
+<Note>
+  **ALTER EXTENSION UPDATE** 目前不支持，计划在后续版本中添加。
+</Note>
+
+### 手动更新流程
+
+1. **卸载当前版本:**
+   ```sql
+   UNINSTALL EXTENSION extension_name;
+   ```
+
+2. **替换 .veb 文件:**
+   ```bash
+   # Remove old .veb file
+   sudo rm /path/to/veb_dir/extension_name.veb
+
+   # Copy new .veb file
+   sudo cp new_extension_name.veb /path/to/veb_dir/
+   ```
+
+3. **安装新版本:**
+   ```sql
+   INSTALL EXTENSION extension_name;
+   ```
+
+4. **验证更新:**
+   ```sql
+   SELECT EXTENSION_VERSION
+   FROM INFORMATION_SCHEMA.EXTENSIONS
+   WHERE EXTENSION_NAME = 'extension_name';
+   ```
+
+<Warning>
+  **数据安全:** 如果表使用扩展的自定义类型，卸载前必须删除或修改这些表。请先备份数据。
+</Warning>
+
+**示例:**
+```sql
+-- Find columns using vsql_complex types before updating
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
+
+-- If columns exist, back up data and drop/alter them first
+-- Then proceed with update
+UNINSTALL EXTENSION vsql_complex;
+-- (replace .veb file)
+INSTALL EXTENSION vsql_complex;
+```
+
+---
+
+## 清理
+
+### 移除孤立的展开目录
+
+VillageSQL 将 `.veb` 文件展开到 `{datadir}/.veb_expansion_cache/{name}/{sha256}/`。旧版本会随时间累积。
+
+```bash
+# List expansion directories (replace {datadir} with your actual datadir path)
+ls -la {datadir}/.veb_expansion_cache/
+
+# Compare with installed extensions
+mysql -u root -p -e "SELECT EXTENSION_NAME FROM INFORMATION_SCHEMA.EXTENSIONS;"
+
+# Find the actual SHA256 directory name for a specific extension
+ls {datadir}/.veb_expansion_cache/my_extension/
+
+# Remove the unused SHA256 directory using the name shown above
+rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
+```
+
+<Note>
+  服务器重启会自动清理孤立的展开目录。
+</Note>
+
+---
+
+## 复制
+
+自定义类型需要 ROW 格式的 binlog。STATEMENT 和 MIXED 模式不支持包含自定义类型列的表。在 ROW 格式下，自定义类型列上的 INSERT、UPDATE、DELETE 和 ALTER TABLE 操作均可正确复制。
+
+`INSTALL EXTENSION` 不会被复制——每个服务器独立管理其扩展。在复制开始前，需在每个副本上安装相同版本的扩展。服务器强制精确版本匹配；版本不匹配会停止复制。
+
+如果副本遇到无法识别的自定义类型，复制会在 DDL 语句处停止——在 `CREATE TABLE` 或 `ALTER TABLE` 时，于任何依赖 DML 应用前。安装正确版本的扩展后，继续操作：
+
+```sql
+INSTALL EXTENSION my_extension;
+START REPLICA SQL_THREAD;
+```
+
+`mysqldump` 会保留输出中的完全限定自定义类型名称。只要目标服务器在导入前安装了扩展，逻辑恢复即可正常工作。
+
+<Warning>
+  与 Clone 插件、XtraBackup 以及 InnoDB Cluster / Group Replication 的行为尚未测试。请在生产环境中依赖前测试恢复路径。
+</Warning>
+
+---
+
+## 在 Docker 中使用扩展
+
+在 Docker 中运行 VillageSQL 时，将本地目录挂载为 `veb_dir`，以便从主机添加 `.veb` 文件而无需重建容器。
+
+**Docker Compose 示例:**
+
+```yaml
+services:
+  villagesql:
+    image: villagesql/server:stable
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./extensions:/usr/lib/veb
+    command: --veb_dir=/usr/lib/veb
+```
+
+将 `.veb` 文件复制到主机的 `./extensions/`，然后从 SQL 安装：
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+验证运行服务器使用的目录：
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## 获取帮助
+
+如遇到此处未涵盖的问题：
+
+1. **检查错误日志:** 大多数扩展错误会记录详细信息
+2. **查阅扩展文档:** 可能存在特定扩展的排查指南
+3. **在 Discord 提问:** 加入 [VillageSQL Discord](https://discord.gg/KSr6whd3Fr)
+4. **提交问题:** 在 [GitHub Issues](https://github.com/villagesql/villagesql-server/issues) 报告错误
+
+---
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card
+    title="系统参考"
+    icon="book"
+    href="/mysql-8.4/0.0.4/reference"
+  >
+    查询系统表和视图
+  </Card>
+  <Card
+    title="卸载扩展"
+    icon="trash"
+    href="/mysql-8.4/0.0.4/uninstall"
+  >
+    安全移除扩展
+  </Card>
+  <Card
+    title="扩展架构"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.4/architecture"
+  >
+    理解内部机制
+  </Card>
+</CardGroup>

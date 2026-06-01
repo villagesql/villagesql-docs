@@ -1,0 +1,337 @@
+---
+title: "扩展 API 参考"
+description: "VDF API 合约、空值处理、缓冲区大小、编码/解码约定、预运行/后运行钩子以及 VillageSQL 扩展的 SQL 功能兼容性。"
+---
+
+本页面是为扩展作者提供的参考。如需逐步教程，请参阅[创建扩展](/mysql-8.4/0.0.4/create)。如需自定义列类型，请参阅[创建自定义类型](/mysql-8.4/0.0.4/custom-types)。
+
+## VDF 函数合约
+
+这些合约规定了 VDF 实现函数如何与 VEF 运行时交互。通过 `make_func<>` 注册的每个函数都必须遵循它们。以下引用的类型可通过 `#include <villagesql/vsql.h>` 获取。
+
+### 第一部分：VDF 函数合约
+
+**1. VDF 实现函数为 `void` — 它们从不返回值。**
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    // ... compute result ...
+    return;  // always void -- no return value
+}
+```
+
+通过在结果包装器上调用终端方法来传递成功、空值、警告或错误：`out.set(...)` / `out.set_length(n)`、`out.set_null()`、`out.warning(msg)` 或 `out.error(msg)`。
+
+**2. 将 `result->type` 设置为四个结果常量中的一个。**
+
+`vef_return_value_type_t` 中存在四个常量：
+
+| 常量 | 值 | 含义 |
+|------|-------|-------|
+| `VEF_RESULT_VALUE` | 0 | 成功 — 输出位于适当的联合字段中 |
+| `VEF_RESULT_NULL` | 1 | 结果为 SQL NULL |
+| `VEF_RESULT_WARNING` | 2 | 行级警告 — 执行继续，此行返回 NULL，并添加 SQL 警告。在严格模式下，MySQL 会在 INSERT/UPDATE 时将其提升为错误。 |
+| `VEF_RESULT_ERROR` | 3 | 致命错误 — 语句执行中止；消息位于 `result->error_msg` |
+
+不存在类型特定的变体。`VEF_RESULT_VALUE` 是字符串、整数、实数和自定义类型共用的单一成功常量。输出类型由函数接收的结果包装器类型决定（`StringResult`、`IntResult`、`RealResult`、`CustomResult`）。
+
+**3. 在调用 `input.value()` 之前检查 `input.is_null()`。**
+
+如果 `is_null()` 返回 true，则调用 `value()` 是未定义行为。
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+    // Safe to call input.value() -> std::string_view
+}
+```
+
+**4. 对于字符串结果，写入 `out.buffer()` 并调用 `out.set_length(n)`。写入前检查 `out.buffer().size()`。**
+
+- `out.buffer()` 返回服务器管理缓冲区上的 `Span<char>`。
+- `out.set_length(n)` 记录写入的字节数。
+- `out.buffer().size()` 是最大容量。写入前始终检查它。
+
+```cpp
+void upper_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    if (sv.size() > buf.size()) {
+        out.error("Input length exceeds buffer size");
+        return;
+    }
+
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = toupper(sv[i]);
+    }
+    out.set_length(sv.size());
+}
+```
+
+**5. 将错误消息传递给 `out.error(msg)`。如需，消息会被截断至 `VEF_MAX_ERROR_LEN`（512 字节）。**
+
+`out.error(msg)` 接受 `std::string_view`。它将消息复制到服务器管理缓冲区，并在一次调用中将结果状态设置为错误。
+
+```cpp
+// Correct — error goes through out.error()
+out.error("Invalid input: expected positive integer");
+return;
+```
+
+## 实现包装函数
+
+实现函数使用类型化的参数和结果包装器：
+
+```cpp
+#include <villagesql/vsql.h>
+#include <algorithm>
+
+using namespace vsql;
+
+// String reverse implementation
+void my_reverse_impl(StringArg input, StringResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = sv[sv.size() - 1 - i];
+    }
+    out.set_length(sv.size());
+}
+
+// Count vowels implementation
+void count_vowels_impl(StringArg input, IntResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    long long count = 0;
+    for (char c : input.value()) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    out.set(count);
+}
+```
+
+## 空值处理
+
+通过 `is_null()` 检查空值，并通过调用 `set_null()` 返回空值：
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    // ... write into buf.data(), up to buf.size() bytes ...
+
+    out.set_length(output_length);
+}
+```
+
+**空值处理选项：**
+- **输入空值检查：** `input.is_null()`
+- **返回空值：** `out.set_null()`
+- **返回值：** `out.set(v)`（数值/自定义类型）或写入 `out.buffer()` 后调用 `out.set_length(n)`（字符串）
+- **返回警告：** `out.warning(msg)` — 此行返回 NULL，添加 SQL 警告，继续执行；在严格模式下，MySQL 会在 INSERT/UPDATE 时将其提升为错误。应替代 `out.set()` 调用，而非额外添加。
+- **返回错误：** `out.error(msg)` — 中止语句执行
+
+## 错误处理
+
+通过自定义消息返回验证失败或无效输入的错误：
+
+```cpp
+void validate_age_impl(IntArg age_input, IntResult out) {
+    if (age_input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    long long age = age_input.value();
+
+    if (age < 0 || age > 150) {
+        out.error("Age must be between 0 and 150");
+        return;
+    }
+
+    out.set(age);
+}
+```
+
+**结果类型：**
+- `VEF_RESULT_VALUE` - 成功（`out.set(v)` / `out.set_length(n)`）
+- `VEF_RESULT_NULL` - 空值（`out.set_null()`）
+- `VEF_RESULT_WARNING` - 行级警告（返回 NULL，添加 SQL 警告，继续执行；严格模式在 INSERT/UPDATE 时提升为错误）（`out.warning(msg)`）
+- `VEF_RESULT_ERROR` - 致命错误，中止语句执行（`out.error(msg)`）
+
+## 语句级状态与预运行/后运行钩子
+
+预运行和后运行钩子使用类型化包装器。所需签名如下：
+
+```cpp
+void my_prerun(vsql::PrerunArgs args, vsql::PrerunResult out);
+void my_postrun(vsql::PostrunArgs args);
+```
+
+原始 ABI 签名（`vef_prerun_args_t*` / `vef_postrun_args_t*`）会被 `.prerun<&Hook>()` 和 `.postrun<&Hook>()` 中的 `static_assert` 在编译时拒绝。
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+struct CallCounter { long long n = 0; };
+
+void my_prerun(PrerunArgs, PrerunResult out) {
+    out.set_user_data(new CallCounter{});
+}
+
+void my_func_impl(CallCounter& state, IntResult out) {
+    state.n++;
+    out.set(state.n);
+}
+
+void my_postrun(PostrunArgs args) {
+    args.delete_state<CallCounter>();
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(make_func<&my_func_impl>("my_func")
+      .returns(INT).no_params()
+      .prerun<&my_prerun>()
+      .postrun<&my_postrun>()
+      .build())
+);
+```
+
+有关 `PrerunArgs` 和 `PostrunArgs` 方法详情，请参阅开发指南中的[语句级状态（预运行和后运行）](/mysql-8.4/0.0.4/development#per-statement-state-prerun-and-postrun)。
+
+<Note>
+**大多数扩展不需要预运行/后运行钩子。** VEF SDK 会自动处理常见情况，如类型检查和结果缓冲区大小调整 —— 对于返回 STRING 和 CUSTOM 的 VDF，结果缓冲区会在 VDF 主体运行前调整至适合解析后的返回类型。仅当需要昂贵的语句级设置（如打开连接）且不应按行发生时，才使用预运行/后运行钩子。
+
+如果您发现需要为用例使用预运行/后运行钩子，请在[VillageSQL Discord](https://discord.gg/KSr6whd3Fr)上分享您的场景 —— 团队可能会添加 SDK 支持以自动处理。
+</Note>
+
+## 聚合函数
+
+内置聚合函数 COUNT(DISTINCT)、MIN、MAX 和 GROUP_CONCAT 无需额外配置即可与自定义类型配合使用。MIN 和 MAX 需要为类型注册比较函数。
+
+也支持自定义聚合 VDF。通过 `make_aggregate_func<State, &result_fn>("name")` 注册，然后在调用 `.build()` 前链式调用 `.returns()`、`.param()`、`.clear<>()` 和 `.accumulate<>()`。`.clear<>()` 和 `.accumulate<>()` 均为必需。有关构建器 API 和回调签名，请参阅[聚合 VDF](/mysql-8.4/0.0.4/development#aggregate-vdfs)。
+
+**与自定义类型配合使用的内置聚合操作：**
+```sql
+-- COUNT(DISTINCT) works with custom types
+SELECT COUNT(DISTINCT impedance) FROM signals;
+
+-- MIN and MAX work with custom types (requires compare function)
+SELECT MIN(impedance), MAX(impedance) FROM signals;
+
+-- GROUP_CONCAT works with custom types
+SELECT GROUP_CONCAT(impedance ORDER BY impedance SEPARATOR ', ') FROM signals;
+```
+
+扩展函数以逐行执行模型调用：
+
+- 每个函数调用处理一行，使用其自己的结果缓冲区（线程安全）
+- `prerun`/`postrun` 提供语句级设置/清理
+- **避免全局状态** - 改用函数参数和返回值
+- 如必须使用全局状态，请用互斥锁保护
+
+**最佳实践：** 设计无状态函数以简化和确保安全。
+
+## 窗口函数
+
+以下窗口函数与自定义类型配合使用：
+
+```sql
+SELECT
+    id,
+    impedance,
+    LAG(impedance)  OVER (ORDER BY id) AS prev_impedance,
+    LEAD(impedance) OVER (ORDER BY id) AS next_impedance
+FROM signals;
+
+SELECT
+    id,
+    impedance,
+    FIRST_VALUE(impedance) OVER w AS first_impedance,
+    LAST_VALUE(impedance)  OVER w AS last_impedance,
+    NTH_VALUE(impedance, 2) OVER w AS second_impedance
+FROM signals
+WINDOW w AS (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
+```
+
+## 临时表
+
+自定义类型可在临时表中使用。`CREATE TEMPORARY TABLE`、`INSERT` 和 `ALTER TABLE` 的行为与永久表相同。
+
+```sql
+CREATE TEMPORARY TABLE tmp_signals (
+    id        INT PRIMARY KEY,
+    impedance COMPLEX
+);
+
+INSERT INTO tmp_signals VALUES (1, '(10,5)'), (2, '(20,0)');
+SELECT id, impedance FROM tmp_signals;
+```
+
+## 预览 API
+
+VEF 的某些功能可通过 SDK include 树中 `villagesql/preview/` 下的可选头文件使用。ABI 和 API 仍在积极开发中，可能随时变更。
+
+要启用，请将头文件包含到扩展源代码中。例如：
+
+```cpp
+#include <villagesql/preview/keyring.h>        // vsql::preview_keyring::KeyringCapability
+#include <villagesql/preview/thread_worker.h>  // vsql::preview_thread_worker::ThreadWorkerCapability
+#include <villagesql/preview/sql_query.h>      // vsql::preview_sql_query::SqlQueryCapability
+```
+
+这些头文件不会被 `<villagesql/vsql.h>` 引入；启用时必须直接包含。
+
+`vsql::preview` 下的命名空间布局按功能划分 —— 不存在统一模式。密钥环 API 使用 `vsql::preview_keyring::KeyringCapability`；线程工作器 API 使用 `vsql::preview_thread_worker::ThreadWorkerCapability`；SQL 查询 API 使用 `vsql::preview_sql_query::SqlQueryCapability`，必须从后台工作线程句柄（`vef_thread_handle_t *`）打开。请查阅每个头文件以获取其定义的确切命名空间和类名。
+
+有关完整预览 API 文档，请参阅[预览功能](/mysql-8.4/0.0.4/preview-capabilities)。
+
+<Warning>
+预览头文件不稳定。基于它们构建的扩展可能在服务器更新时中断。当功能稳定后，其头文件将移至版本化的稳定 SDK 路径。
+</Warning>
+
+## 触发器
+
+触发器在包含自定义类型列的表上触发。触发器主体可引用 `NEW` 和 `OLD` 中的非自定义类型列。在触发器主体内访问自定义类型列值尚未受支持。
+
+```sql
+CREATE TABLE signals (
+    id        INT PRIMARY KEY,
+    impedance COMPLEX,
+    label     VARCHAR(50)
+);
+CREATE TABLE signal_log (
+    id        INT,
+    label     VARCHAR(50),
+    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER signals_after_insert
+AFTER INSERT ON signals
+FOR EACH ROW
+    INSERT INTO signal_log (id, label) VALUES (NEW.id, NEW.label);
+
+INSERT INTO signals VALUES (1, '(10,5)', 'sensor_a');
+SELECT id, label FROM signal_log;
+```
