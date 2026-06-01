@@ -1,0 +1,234 @@
+---
+title: "Rustで拡張機能を構築する"
+description: "VillageSQLのRust SDKを使用して、安全なRustで拡張機能関数を記述し、VEBファイルとしてパッケージ化し、VillageSQLにインストールします。"
+---
+
+<Warning>
+Rust SDKはバージョン0.1.0にあり、まだcrates.ioに公開されていません。開始にはSDKリポジトリのローカルクローンと、`Cargo.toml`内の`path`依存関係が必要です。
+</Warning>
+
+<Note>
+C++を好む場合は、[拡張機能の作成](/mysql-8.4/0.0.4/create)を参照してください。
+</Note>
+
+VillageSQLの拡張機能は、`vsql`クレートを使用してRustで記述できます。SDKはすべてのFFIマーシャリングを処理します — 通常のRust型で作業し、`extension!`マクロがサーバーがロード時に呼び出すCエントリポイントを生成します。
+
+## 前提条件
+
+次が必要です：
+
+- **Rustの安定版ツールチェーン** — [rustup.rs](https://rustup.rs)でインストール
+- **cargo-vsql** — 拡張機能のパッケージ化、インストール、テスト用のCargoサブコマンド
+- **VillageSQLのビルドディレクトリ** — `cargo vsql install`および`cargo vsql test`用にサーバーのビルドパスを`VillageSQL_BUILD_DIR`に設定
+
+SDKリポジトリから`cargo-vsql`をインストールします：
+
+```bash
+git clone https://github.com/villagesql/vsql-rust-sdk
+cd vsql-rust-sdk
+cargo install --path cargo-vsql
+```
+
+利用可能か確認します：
+
+```bash
+cargo vsql --help
+```
+
+## 新しいクレートを作成する
+
+新しいRustライブラリクレートを作成します：
+
+```bash
+cargo new --lib vsql_rot13
+cd vsql_rot13
+```
+
+`Cargo.toml`を編集してクレートタイプを設定し、`vsql`依存関係を追加します：
+
+```toml
+[package]
+name = "vsql_rot13"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vsql = { path = "/path/to/vsql-rust-sdk/vsql" }
+```
+
+`cdylib`クレートタイプはCargoに共有ライブラリ（Linuxでは`.so`、macOSでは`.dylib`）を生成するよう指示します。サーバーがロードできるようにします。
+
+パス依存関係よりもGit依存関係を好む場合は、次のように使用できます：
+
+```toml
+vsql = { git = "https://github.com/villagesql/vsql-rust-sdk" }
+```
+
+これによりデフォルトブランチの最新コミットにピン止めされます。特定のコミットにロックするには`rev = "..."`を使用します。
+
+## 最初の関数を書く
+
+`src/lib.rs`を完全な拡張機能に置き換えます：
+
+```rust
+use vsql::{InValue, VdfReturn};
+
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("vsql_rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+vsql::extension! {
+    funcs: [
+        vsql::func!(rot13_impl, "vsql_rot13", [vsql::Type::String] -> vsql::Type::String),
+    ]
+}
+```
+
+`func!`マクロは`rot13_impl`をSQL名`vsql_rot13`に接続し、`STRING -> STRING`シグネチャで動作します。
+
+関数シグネチャは`fn(&[InValue]) -> VdfReturn`です。`InValue`はサーバーが渡すSQL型の列挙型です。`VdfReturn`は返送するものです。`args.first()`を確認して、値に触れる前にNULLケースと不正な型ケースを処理します。
+
+関数が同じ入力に対して常に同じ出力を返す場合、決定論的と宣言します — これにより最適化ツールは同一入力の結果をキャッシュできます：
+
+```rust
+vsql::func!(rot13_impl, "vsql_rot13", [vsql::Type::String] -> vsql::Type::String, deterministic: true)
+```
+
+## manifest.jsonを追加する
+
+クレートルート（`Cargo.toml`と同じ場所）に`manifest.json`を作成します：
+
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "ROT-13 encoding for VillageSQL",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+サーバーはインストール時にこれを読み取ります。`name`フィールドは`INSTALL EXTENSION`に渡すものと一致する必要があります。
+
+## ビルドとインストール
+
+<Note>
+`Cargo.toml`および`manifest.json`が存在する拡張機能ディレクトリ内で、`cargo vsql package`、`cargo vsql install`、`cargo vsql test`を実行します。ワークスペースルートではなく。
+</Note>
+
+拡張機能を`.veb`ファイルにパッケージ化します：
+
+```bash
+cargo vsql package
+```
+
+これにより`dist/vsql_rot13.veb`が生成されます。VEBを直接VillageSQLビルドディレクトリにパッケージ化してコピーするには：
+
+```bash
+export VillageSQL_BUILD_DIR=/path/to/villagesql/build
+cargo vsql install
+```
+
+VEBが拡張機能ディレクトリにコピーされているはずです。存在を確認します：
+
+```bash
+ls "$VillageSQL_BUILD_DIR/veb_output_directory/"
+# vsql_rot13.veb
+```
+
+## テスト
+
+`mysql-test/t/rot13_basic.test`にテストファイルを記述します：
+
+```sql
+INSTALL EXTENSION 'vsql_rot13';
+SELECT vsql_rot13('Hello');
+SELECT vsql_rot13('');
+SELECT vsql_rot13(NULL);
+UNINSTALL EXTENSION 'vsql_rot13';
+```
+
+期待される結果を生成します：
+
+```bash
+cargo vsql test --record
+```
+
+スイートを実行します：
+
+```bash
+cargo vsql test
+```
+
+関数の動作を変更した後、期待される結果を更新するために`cargo vsql test --record`を再実行し、確認するために`cargo vsql test`を実行します。
+
+## SQLでインストール
+
+VEBが拡張機能ディレクトリにある場合、インストールします：
+
+```sql
+INSTALL EXTENSION 'vsql_rot13';
+```
+
+確認します：
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'vsql_rot13';
+```
+
+呼び出します：
+
+```sql
+SELECT vsql_rot13('Hello, World!');
+-- → Uryyb, Jbeyq!
+```
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card
+    title="Rustでのカスタム型"
+    icon="shapes"
+    href="/mysql-8.4/0.0.4/rust-custom-types"
+  >
+    バイナリストレージ、順序付け、ハッシュを備えた新しいカラム型を定義します。
+  </Card>
+  <Card
+    title="Rust APIリファレンス"
+    icon="book"
+    href="/mysql-8.4/0.0.4/rust-api-reference"
+  >
+    InValue、VdfReturn、extension!、func!、およびcustom_type! — すべてのフィールド。
+  </Card>
+  <Card
+    title="C++ SDK（拡張機能の作成）"
+    icon="code"
+    href="/mysql-8.4/0.0.4/create"
+  >
+    C++のパス — タイプ化されたラッパー、ビルダーアプリケーション、CMake設定。
+  </Card>
+  <Card
+    title="拡張機能アーキテクチャ"
+    icon="sitemap"
+    href="/mysql-8.4/0.0.4/architecture"
+  >
+    VEBファイルのロード方法、ライフサイクルフック、シンボルの隔離。
+  </Card>
+</CardGroup>

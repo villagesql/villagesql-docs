@@ -1,0 +1,271 @@
+---
+title: "カスタム型の作成"
+description: "VillageSQL拡張機能用の新しいカラム型を定義します — 型操作、ALTER TABLEルール、変換関数、完全なCOMPLEX型の例を含みます。"
+---
+
+<Warning>
+  カスタム型はVEFプロトコル3を使用します。これはv0.0.4以降安定しています。プロトコル4は開発中であり、オプトインのdev ABIヘッダー（`-DVSQL_USE_DEV_ABI=ON`）を介してのみ利用可能です。古いプロトコル2で構築された拡張機能はサーバーによって拒否され、再ビルドが必要です。
+</Warning>
+
+カスタム型を使用すると、`COMPLEX`、`UUID`、`VECTOR`などの新しいカラム型を定義でき、`ORDER BY`、インデックス、集約関数と連携します。このページは[拡張機能の作成](/mysql-8.4/0.0.4/create)チュートリアルのステップ4です。ここに進む前に、ステップ1～3を完了してください。
+
+## 型操作の定義
+
+カスタム型にはエンコード、デコード、比較操作が必要で、オプションでハッシュ操作を実装します。これらのシグネチャに準拠し、ビルダーオブジェクトを`vsql::make_type<>()`に渡して実装してください。
+
+```cpp
+// Encode: string -> binary. Write to out.buffer() and call out.set_length(n).
+void mytype_from_string(std::string_view from, vsql::CustomResult out) { /* ... */ }
+
+// Decode: binary -> string. Write to out.buffer() and call out.set_length(n).
+void mytype_to_string(vsql::CustomArg in, vsql::StringResult out) { /* ... */ }
+
+// Compare: returns <0, 0, or >0.
+int mytype_compare(vsql::CustomArg a, vsql::CustomArg b) { /* ... */ }
+
+// Hash: returns hash code (optional).
+size_t mytype_hash(vsql::CustomArg in) { /* ... */ }
+```
+
+<Note>
+  `from_string` VDF（カスタム型を返すもの）の場合、サーバーはVDFを呼び出す前に出力バッファを少なくとも型の`persisted_length`値の大きさにサイズ設定します。したがって、`buf.size() >= persisted_length`はエントリ時に保証されます。これは固定幅型とパラメータ化型（`persisted_length`は呼び出し時の型コンテキストから解決される）の両方に適用されます。別途バッファサイズのリクエストは必要ありません。
+</Note>
+
+生のバイナリアクセスは`vsql::Span<T>`を介して行われます。これは`T`の連続したシーケンスを参照する所有権を持たないビューです。`in.value()`は`vsql::Span<const unsigned char>`を返し、`out.buffer()`は`vsql::Span<unsigned char>`を返します。C++20以降では`vsql::Span<T>`は`std::span<T>`のエイリアスです。C++17ではSDKが同じ`data()`、`size()`、`empty()`、インデックス、イテレータの表面を備えた最小限のソース互換性のフォールバックを提供します。`#include <villagesql/vsql.h>`を介して利用可能です。
+
+## 型の登録
+
+`vsql::make_type<kName>()`テンプレートは、エンコード、デコード、比較、ハッシュ操作を直接型オブジェクトに埋め込みます。VDF名はコンパイル時に`TYPE::from_string`、`TYPE::to_string`、`TYPE::compare`、`TYPE::hash`として自動生成されます。別途の`.func(make_type_encode<>(...))`呼び出しは必要ありません。
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Required for auto-generating VDF names at compile time.
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&mytype_from_string>()   // auto: "MYTYPE::from_string"
+        .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
+        .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
+        .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
+        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Development guide
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE)
+);
+```
+
+`build()`は`from_string`、`to_string`、`compare`が欠落している場合にコンパイルエラーになります。各テンプレートメソッドは`static_assert`で関数ポインタのシグネチャを検証します。
+
+型名は非型テンプレートパラメータ（NTTP）として渡されます。`static constexpr const char[]`配列として宣言してください。ポインタのアイデンティティが独立したVDF名バッファのキーとして使用されるため、同じ関数ポインタを使用する2つの型でも、別々の自動生成名が割り当てられます。
+
+## 型操作リファレンス
+
+テンプレートベースのAPIは以下のSQL呼び出し可能なVDFを自動生成します：
+
+| ビルダーメソッド | 自動生成VDF名 | VDF SQLシグネチャ |
+|------|------|-------------|
+| `.from_string<&f>()` | `TYPE::from_string` | `(STRING) -> CUSTOM(this type)` |
+| `.to_string<&f>()` | `TYPE::to_string` | `(CUSTOM(this type)) -> STRING` |
+| `.compare<&f>()` | `TYPE::compare` | `(CUSTOM(this type), CUSTOM(this type)) -> INT` |
+| `.hash<&f>()` | `TYPE::hash` | `(CUSTOM(this type)) -> INT` |
+
+完全なC++シグネチャについては[型操作ビルダー](/mysql-8.4/0.0.4/development#type-operation-builders)を参照してください。
+
+## ALTER TABLEとカスタム型
+
+`ALTER TABLE ... MODIFY COLUMN`と`CHANGE COLUMN`はカスタム型が関与する際、以下のルールを強制します：
+
+| 从 | To | Result |
+|------|----|--------|
+| 非カスタム型 | カスタム型 | エラー: `Cannot convert column 'col' to custom type 'MYTYPE'` |
+| カスタム型 | 文字列型 | 許可 |
+| カスタム型 | 非文字列型 | エラー: `Cannot convert custom type column 'col' to non-string type` |
+| カスタム型 | 異なるカスタム型 | 不適合の場合エラー: `Cannot convert between incompatible custom types 'A' and 'B'` |
+
+## 型変換関数
+
+テンプレートベースのAPIでは、エンコードおよびデコードVDFは型オブジェクトに埋め込まれ、自動的に登録されます。別途の`.func()`呼び出しは必要ありません。自動生成されたVDFはSQL呼び出し可能です：
+
+```sql
+-- Convert string to custom type (calls MYTYPE::from_string)
+SELECT MYTYPE::from_string('(1.0,2.0)');
+
+-- Convert custom type to string (calls MYTYPE::to_string)
+SELECT MYTYPE::to_string(my_column) FROM my_table;
+
+-- Explicit conversion in INSERT
+INSERT INTO my_table (id, value)
+VALUES (1, MYTYPE::from_string('(3.0,4.0)'));
+```
+
+**明示的な変換が必要な場合。** VillageSQLは直接カラム代入時に文字列リテラルをカスタム型に暗黙的に変換するため、`INSERT INTO t (val) VALUES ('(1.0,2.0)')`は明示的な呼び出しなしで動作します。ただし、`STRING`型に解決される式（`CASE`式、`CONCAT`など）は暗黙的なキャストが行われません。`TYPE::from_string`で囲んでください：
+
+```sql
+UPDATE my_table
+SET val = MYTYPE::from_string(
+  CASE (pk MOD 2)
+    WHEN 0 THEN '(1.0,2.0)'
+    ELSE '(0.0,0.0)'
+  END
+);
+```
+
+## 例: COMPLEX型
+
+以下はCOMPLEX数値型を実装する完全な例です：
+
+```cpp
+#include <cstdio>
+#include <cstring>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Encode: "(real,imag)" string -> 16 bytes little-endian
+void encode_complex(std::string_view from, CustomResult out) {
+    auto buf = out.buffer();
+    if (buf.size() < 16) return;
+    double real, imag;
+    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+        out.warning("invalid complex format: expected (real,imag)");
+        return;
+    }
+    memcpy(buf.data(), &real, 8);
+    memcpy(buf.data() + 8, &imag, 8);
+    out.set_length(16);
+}
+
+// Decode: 16 bytes -> "(real,imag)" string
+void decode_complex(CustomArg in, StringResult out) {
+    auto data = in.value();
+    if (data.size() < 16) return;
+    double real, imag;
+    memcpy(&real, data.data(), 8);
+    memcpy(&imag, data.data() + 8, 8);
+    auto buf = out.buffer();
+    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
+    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
+    out.set_length(static_cast<size_t>(len));
+}
+
+// Compare for ORDER BY: real part first, then imaginary
+int compare_complex(CustomArg a, CustomArg b) {
+    auto da = a.value();
+    auto db = b.value();
+    if (da.size() < 16 || db.size() < 16) return 0;
+    double a_real, a_imag, b_real, b_imag;
+    memcpy(&a_real, da.data(), 8);
+    memcpy(&a_imag, da.data() + 8, 8);
+    memcpy(&b_real, db.data(), 8);
+    memcpy(&b_imag, db.data() + 8, 8);
+    if (a_real < b_real) return -1;
+    if (a_real > b_real) return 1;
+    if (a_imag < b_imag) return -1;
+    if (a_imag > b_imag) return 1;
+    return 0;
+}
+```
+
+これらの操作を定義した後、ユーザーはカスタム型を使用してテーブルを作成できます：
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    frequency_response COMPLEX
+);
+
+INSERT INTO signals VALUES (1, '(50.0,10.0)', '(0.95,0.31)');
+
+-- ORDER BY works because we provided compare_complex!
+SELECT * FROM signals ORDER BY impedance;
+
+-- Prepared statements work with custom types
+PREPARE stmt FROM 'SELECT * FROM signals WHERE impedance = ?';
+SET @val = '(50.0,10.0)';
+EXECUTE stmt USING @val;
+
+-- Aggregate operations work with custom types
+SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
+       GROUP_CONCAT(impedance ORDER BY impedance) FROM signals;
+```
+
+## 生成カラムでのVDF
+
+VDFは生成カラム式で使用できます。VDFは拡張機能ビルダーで`.deterministic()`として宣言されている必要があります。サーバーはこのコンテキストで非決定的関数をブロックします。
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    -- Generated column computed by a VDF
+    magnitude DOUBLE GENERATED ALWAYS AS (complex_abs(impedance)) STORED
+);
+```
+
+<Note>
+  `complex_abs`は`.deterministic()`で登録される必要があります。従来のMySQL UDFは生成カラムで許可されません。
+</Note>
+
+完全な実装については[vsql_complex例](/mysql-8.4/0.0.4/examples)を参照してください。
+
+## 機能インデックスでのVDF
+
+VDFは機能インデックス式で使用できます。生成カラムと同じ`.deterministic()`要件が適用されます。MySQLは機能インデックスを隠し生成カラムとして実装するためです。
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    sig COMPLEX,
+    INDEX idx_magnitude ((COMPLEX_ABS(sig)))
+);
+```
+
+オプティマイザは、同じVDF式が`WHERE`、`ORDER BY`、または`GROUP BY`に出現する場合にインデックスを使用します。比較値をVDFの戻り型にキャストして、オプティマイザが式を一致させられるようにします：
+
+```sql
+SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+```
+
+## 次のステップ
+
+型が定義され次第、チュートリアルのステップ5に進み、拡張機能をビルドおよびインストールしてください。
+
+<CardGroup cols={2}>
+  <Card
+    title="継続: 拡張機能のビルド"
+    icon="hammer"
+    href="/mysql-8.4/0.0.4/create#step-5-update-build-configuration"
+  >
+    チュートリアルに戻り、拡張機能をビルドおよびインストールします。
+  </Card>
+  <Card
+    title="パラメータ化型"
+    icon="sliders"
+    href="/mysql-8.4/0.0.4/development#parameterized-types"
+  >
+    VECTOR(1536)などパラメータを取る型 — 次元対応のエンコード、デコード、ストレージサイズ。
+  </Card>
+  <Card
+    title="拡張機能APIリファレンス"
+    icon="book"
+    href="/mysql-8.4/0.0.4/extension-api-reference"
+  >
+    VDF API契約、null処理、バッファサイズ、高度なパターン。
+  </Card>
+  <Card
+    title="レプリケーション"
+    icon="arrow-right-left"
+    href="/mysql-8.4/0.0.4/managing#replication"
+  >
+    ROW形式要件、拡張機能インストール順序、レプリケーション設定でのバージョン一致。
+  </Card>
+</CardGroup>

@@ -1,0 +1,174 @@
+---
+title: "Rust SDK API リファレンス"
+description: "VillageSQL Rust SDK の完全なリファレンス — InValue、VdfReturn、extension!、func!、custom_type!、custom!、および manifest.json フィールド。"
+---
+
+<Note>
+Rust SDK はバージョン 0.1.0 であり、まだ crates.io に公開されていません。開始には SDK リポジトリのローカルクローンと、`Cargo.toml` での `path` 依存関係が必要です。
+</Note>
+
+このページは `vsql` クレート API のリファレンスです。開始チュートリアルについては [Rust での拡張機能の構築](/mysql-8.4/0.0.4/rust-sdk) を参照してください。カスタムタイプについては [Rust でのカスタムタイプ](/mysql-8.4/0.0.4/rust-custom-types) を参照してください。
+
+## InValue
+
+`InValue` はサーバーが各関数引数に渡す列挙型です。関数は `args: &[InValue]` を受け取り、値を使用する前に各引数をチェックする必要があります。
+
+```rust
+pub enum InValue<'a> {
+    String(&'a str),
+    Real(f64),
+    Int(i64),
+    Null,
+    Custom(&'a [u8]),
+}
+```
+
+| バリアント | Rustの型 | 対応するSQL型 |
+|---|---|---|
+| `String(&str)` | UTF-8文字列スライス | `STRING` / `VARCHAR` / `TEXT` |
+| `Real(f64)` | 64ビット浮動小数点数 | `REAL` / `DOUBLE` / `FLOAT` |
+| `Int(i64)` | 64ビット符号付き整数 | `INT` / `BIGINT` / `TINYINT` |
+| `Null` | — | SQL `NULL` 任意の型 |
+| `Custom(&[u8])` | 生バイナリバイト | `custom_type!` で登録されたカスタム型 |
+
+常に `Null` を明示的にマッチさせる必要があります。`.unwrap()` を呼び出すか、値のバリアントのみでパターンマッチングするのはバグです — SQL NULL はエラーではなく通常の入力です。
+
+## VdfReturn
+
+`VdfReturn` は関数がサーバーに返すものです。関連する関数で構築します：
+
+| コンストラクタ | SQLの効果 |
+|---|---|
+| `VdfReturn::null()` | この行で SQL NULL を返す |
+| `VdfReturn::string(s)` | `String` 値を返す；`s` は `impl Into<String>` |
+| `VdfReturn::real(v)` | `f64` 値を返す |
+| `VdfReturn::int(v)` | `i64` 値を返す |
+| `VdfReturn::binary(bytes)` | カスタム型カラムのバイナリバイトを返す；`bytes` は `Vec<u8>` |
+| `VdfReturn::warning(msg)` | この行で NULL を返し、SQL警告を追加、実行を継続 |
+| `VdfReturn::error(msg)` | 致命的エラーでステートメントを中止 |
+
+**警告 vs エラー：**
+
+結果セットの残りを継続できるユーザー入力検証の失敗には `warning` を使用します。厳密モードでは、MySQL は `INSERT` および `UPDATE` で警告をエラーに昇格させます。不安全な状況（破損した格納データ、内部不変条件違反など）では `error` を使用します。致命的エラーはステートメント全体を中止します。
+
+```rust
+fn validate_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::Int(n)) if *n >= 0 => VdfReturn::int(*n),
+        Some(InValue::Int(_)) => VdfReturn::warning("value must be non-negative"),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("validate: expected an INT argument"),
+    }
+}
+```
+
+## extension! マクロ
+
+`extension!` はサーバーが VEB ファイルをロードする際に呼び出す VEF エントリポイントを生成します。クレート内で正確に1回出現する必要があります。
+
+```rust
+vsql::extension! {
+    funcs: [
+        // One or more vsql::func!(...) declarations
+    ],
+    types: [
+        // One or more vsql::custom_type!(...) declarations
+    ]
+}
+```
+
+両方のセクションはオプションです。純粋関数の拡張では `types:` を省略し、型のみの拡張では `funcs:` を省略します。空の `extension!` ブロック（関数も型もなし）は有効ですが、何も実行しない拡張を生成します。
+
+## func! マクロ
+
+`func!` は SQL 呼び出し可能な関数を宣言します。位置引数：
+
+```rust
+vsql::func!(rust_fn, "sql_name", [param_types] -> return_type)
+vsql::func!(rust_fn, "sql_name", [param_types] -> return_type, deterministic: true)
+```
+
+| 引数 | 説明 |
+|---|---|
+| `rust_fn` | VDF を実装する Rust 関数。シグネチャ：`fn(&[InValue]) -> VdfReturn`。 |
+| `"sql_name"` | 文字列リテラルとしての SQL 関数名。ユーザーが SQL から呼び出す名前です。 |
+| `[param_types]` | `vsql::Type::*` または `vsql::custom!("name")` 値のカンマ区切りリスト。0引数関数には `[]` を使用します。 |
+| `return_type` | `vsql::Type::*` または `vsql::custom!("name")`。 |
+| `deterministic: true` | オプション。関数が決定的であることを宣言 — 同じ入力は常に同じ出力を生成し、副作用なし。最適化は同一入力の結果をキャッシュできます。真である場合のみ設定します。 |
+
+`func!` で使用する型定数：
+
+| `vsql::Type::*` | SQL型 |
+|---|---|
+| `vsql::Type::String` | `STRING` |
+| `vsql::Type::Real` | `REAL` |
+| `vsql::Type::Int` | `INT` |
+
+## custom_type! マクロ
+
+`custom_type!` は新しいカラム型を登録します。`type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、`compare` は必須です。`hash` および `default` はオプションですが推奨されます。
+
+```rust
+vsql::custom_type!(
+    type_name: "sql_type_name",
+    persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: encode_fn,
+    decode: decode_fn,
+    compare: compare_fn,
+    hash: hash_fn,
+    default: "default_string",
+)
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `type_name` | `&str` リテラル | タイプの SQL 名。SQL では大文字小文字を区別しません。インストール済みのすべての拡張機能で一意である必要があります。 |
+| `persisted_length` | `usize` | ディスクストレージ用の固定バイト長。すべてのエンコード値は正確にこのバイト数を生成する必要があります。 |
+| `max_decode_buffer_length` | `usize` | 解読後の文字列の最大バイト長。`decode` を呼び出す前に出力バッファをサイズ設定するために使用されます。 |
+| `encode` | `fn(&str) -> Result<Vec<u8>, String>` | `INSERT` 時に呼び出されます。SQL 文字列リテラルをバイナリに変換します。入力を拒否するには `Err(msg)` を返します。 |
+| `decode` | `fn(&[u8]) -> Result<String, String>` | 値を表示するために呼び出されます。バイナリを文字列に戻します。 |
+| `compare` | `fn(&[u8], &[u8]) -> std::cmp::Ordering` | `ORDER BY`、`MIN`、`MAX` で呼び出されます。`Less`、`Equal`、`Greater` を返します。 |
+| `hash` | `fn(&[u8]) -> usize` | オプション。`COUNT(DISTINCT)` およびセット演算で呼び出されます。比較 `Equal` の値は同じハッシュ値を生成する必要があります。インデックスカラムには推奨されます。 |
+| `default` | `&str` リテラル | オプション。サーバーが型初期化時にエンコードする有効な文字列。コールバックが動作することを検証するために使用されます。正確に `persisted_length` バイトにエンコードされる必要があります。 |
+
+`default` フィールドはカラムのデフォルト値ではありません — これは起動プローブです。サーバーは拡張機能をロードする際に `encode(default)` を呼び出し、コールバックが動作することを検証します。`encode` がデフォルトで `Err` を返す場合、拡張機能のロードに失敗します。
+
+## custom! マクロ
+
+`vsql::custom!("type_name")` は `func!` 宣言内でカスタム型の名前を参照します：
+
+```rust
+vsql::func!(
+    my_fn,
+    "my_sql_func",
+    [vsql::custom!("mytype")] -> vsql::custom!("mytype"),
+    deterministic: true
+)
+```
+
+`vsql::Type::*` がパラメータリストまたは戻り値位置に現れる場所で使用できます。文字列は対応する `custom_type!` で宣言された `type_name` と一致する必要があります。
+
+## manifest.json フィールド
+
+すべての拡張機能には `manifest.json` と `Cargo.toml` が必要です：
+
+```json
+{
+  "name": "vsql_my_extension",
+  "version": "0.1.0",
+  "description": "Brief description of what the extension does",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+| フィールド | 必須 | フォーマット | 説明 |
+|---|---|---|---|
+| `name` | はい | 小文字、数字、`_`、`-` | 拡張機能識別子。`INSTALL EXTENSION` 名と一致する必要があります。アンダースコアを使用 — ハイフンは SQL でバッククォート引用が必要です。 |
+| `version` | はい | MAJOR.MINOR.PATCH | セマンティックバージョン。 |
+| `description` | いいえ | 文字列 | `INFORMATION_SCHEMA.EXTENSIONS` に表示されます。 |
+| `author` | いいえ | 文字列 | 作者名または組織名。 |
+| `license` | いいえ | 文字列 | ライセンス識別子。オープンソース拡張機能には `GPL-2.0` が推奨されます。 |
+
+`name` 検証ルール：先頭が英字、末尾が英字または数字、最大64文字。無効なマニフェストは `INSTALL EXTENSION` に失敗を引き起こします。
