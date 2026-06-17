@@ -1,64 +1,46 @@
 ---
 title: How Extensions and the ABI Behave
-description: The boundary between the VillageSQL Extension Framework and extensions, with verified behavior across crash recovery, binary log format, and schema operations.
+description: "This page covers the VillageSQL extension ABI: what the server owns, what extensions own, and how that division plays out across crash recovery, replication, restore, and schema operations."
 ---
 
-An extension's job ends at the bytes it produces. Everything that happens to those bytes after — crash recovery, replication, schema operations, backups — is the server's job, and it handles them the way MySQL always has. This document describes that boundary: what the VillageSQL Extension Framework (VEF) does, what extensions do, and how the resulting system behaves in operation.
+The VillageSQL Extension Framework (VEF) calls extension code at prescribed places in the MySQL server code. Everything that happens to the extension's output — crash recovery, replication, schema operations, backups — is handled by the server the same way it handles any built-in column type. This document describes that boundary: what the VEF does, what extensions do, and how the resulting system behaves in operation.
+
+Examples throughout this page use the [vsql-uuid](https://github.com/villagesql/vsql-uuid) extension to illustrate how data flows.
 
 ## The ABI boundary
 
-VillageSQL extensions interact with the server through a binary interface that separates what each side owns.
+VillageSQL extensions interact with the server through a binary interface (ABI) with a clear separation of ownership between the extension and server.
 
 **The server owns:**
 - Storage: InnoDB reads and writes bytes; it doesn't interpret them
-- Schema: column type metadata, `persisted_length`, and which extension registered each type are stored in Victionary (the VillageSQL system tables) and persist across restarts
+- Schema: column type metadata and which extension registered each type are stored in the VillageSQL system tables and persist across restarts
 - Recovery, replication, and backups: these operate on raw bytes, the same as any built-in column type
-- Extension registration: names, versions, and function/type registrations are reloaded from Victionary at startup
+- Extension registration: names, versions, and function/type registrations are reloaded from the VillageSQL system tables at startup
 
 **The extension owns:**
 - Binary format: the `from_string` encode function defines what gets written to disk; `to_string` reads it back during output
 - Business rules: validation, comparison, hashing, and error handling
 - State: extensions don't persist anything outside the bytes the server stores for them
 
-InnoDB doesn't need to understand a UUID or a CIDR range to crash-recover it — it needs the bytes, the length, and the knowledge that they belong to a particular column.
-
 For the full binary interface — structs, function pointer typedefs, and protocol versioning — see [`villagesql/sdk/include/villagesql/abi/types.h`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/sdk/include/villagesql/abi/types.h) in the server repository.
 
 ## How custom types are stored
 
-When you declare a column as `UUID` (from vsql-uuid), the server stores 16 bytes per row. The `persisted_length` field in `vef_type_desc_t` is fixed at registration. The human-readable string `d7d665f3-bb13-4c2f-b10f-d2126eb40cba` exists only during input (encode) and output (decode). On disk, in the redo log, and in the binary log: raw bytes.
-
-The `intrinsic_default_str` field in `vef_type_desc_t` — the nil UUID `00000000-0000-0000-0000-000000000000` in vsql-uuid's case — is the type's default value. It's what the server passes to `from_string` at table initialization, and what fills a `NOT NULL` column during `INSERT IGNORE` when no value is provided. Every custom type must declare one, because the server calls `from_string` on it at startup.
+When you declare a column as `UUID` (as an example from vsql-uuid), the server stores a fixed-length block of raw bytes per row. The human-readable form — like `d7d665f3-bb13-4c2f-b10f-d2126eb40cba` — exists only at the boundaries: `from_string` encodes it to binary on write, and `to_string` decodes it back on read. Everything in between — storage, redo log, crash recovery, binary log — operates on those bytes without interpreting them.
 
 ## Crash recovery
 
-After a crash and restart, extensions re-register automatically. The server reads Victionary, finds the registered extensions, and loads each one — validating the VEB's manifest in `veb_dir`, then loading the extension's `.so` from `.veb_expansion_cache/{name}/{sha256}/` (re-expanding from the VEB if the cached `.so` is missing). No manual intervention is needed.
+After a crash and restart, extensions re-register automatically. No manual intervention is needed.
 
-Row data survives through InnoDB's normal crash recovery. The extension's binary format is never special-cased — InnoDB treats a 16-byte UUID column the same way it treats a 16-byte `BINARY(16)` column.
+Row data survives through InnoDB's normal crash recovery. The extension's binary format is never special-cased — InnoDB handles a UUID column no differently from a `BINARY(16)` column.
 
-Verified on `8.4.9-villagesql-0.0.5-dev-2066685c001` via SIGKILL followed by restart:
-
-```sql
--- Before crash:
-SELECT id, label FROM t1;
--- d7d665f3-bb13-4c2f-b10f-d2126eb40cba | alpha
--- 977838d0-77d1-4f96-bd72-71ffcd63c9f1 | beta
-
--- (kill -9 mysqld; restart)
-
--- After restart (InnoDB crash recovery):
-SELECT id, label FROM t1;
--- d7d665f3-bb13-4c2f-b10f-d2126eb40cba | alpha
--- 977838d0-77d1-4f96-bd72-71ffcd63c9f1 | beta
-```
-
-Extension registration is also fully restored: `INFORMATION_SCHEMA.EXTENSION_REGISTRATION` shows the same registration JSON after restart as before the crash.
+After a SIGKILL and restart, UUID rows survived InnoDB crash recovery intact, and `INFORMATION_SCHEMA.EXTENSION_REGISTRATION` showed the same registration JSON as before the crash.
 
 ## Binary log format
 
-In row-format replication (the default), custom type values travel as raw binary in the binary log — the same bytes that are stored on disk. There is no re-encoding step: the extension's `from_string` is not called when writing the binlog, and `to_string` is invoked only when a client reads the value back.
+In row-format replication (the default), custom type values travel as raw binary in the binary log. There is no re-encoding step: the extension's `from_string` is not called when writing the binlog, and `to_string` is called only when a client reads the value back.
 
-A row-level binary log entry for a UUID column looks like this (verified via `mysqlbinlog` on `8.4.9-villagesql-0.0.5-dev-2066685c001`):
+A row-level binary log entry for a UUID column looks like this:
 
 ```
 ### INSERT INTO `abi_test`.`t1`
@@ -67,34 +49,17 @@ A row-level binary log entry for a UUID column looks like this (verified via `my
 ###   @2='alpha'
 ```
 
-Those 16 raw bytes flow through the binary log. Any tool that decodes extension-typed binlog events — replication consumers, change-data-capture, dump utilities — needs the extension installed to call `to_string`.
+Those 16 raw bytes flow through the binary log. Any tool that reads those binlog events — replication consumers, CDC pipelines, dump utilities — needs the extension installed to decode the values.
 
-## Point-in-time restore
+## Restore
 
-PITR follows from the two pieces above. Physical backup tools (XtraBackup, snapshots) capture the raw InnoDB pages containing binary-encoded values; logical backup tools (`mysqldump`) round-trip values through `to_string` on export and `from_string` on import. Applying binary logs on top replays the same raw byte writes either way, and the restored server re-registers extensions from Victionary at startup, just as it does after a crash.
+Restoring a VillageSQL server works the same way as crash recovery: the server starts up, reads its extension registrations, and loads each extension automatically. No special handling is needed for extension-typed columns — the raw bytes are in the backup, and the extensions decode them on demand.
 
-The operational requirement: VEB files must be present in `veb_dir` on the target server. Victionary records which extension was registered and at what version, but it doesn't carry the VEB itself. If the VEB file is missing on restore, the extension won't load and queries against columns of that type will fail. Include `veb_dir` in your backup process alongside the data directory.
+The one thing to think about is to ensure the VEB files are restored alongside the data. Extensions aren't stored inside the database — they live as `.veb` files in `veb_dir` on disk. When the server starts on the restored instance, it looks for those files. If they're missing, the extension won't load and queries against columns of that type will fail. Back up `veb_dir` alongside your data directory.
 
 ## Schema operations
 
-`ALTER TABLE` on tables with extension-typed columns behaves exactly as it does for built-in types. Adding or modifying *other* columns doesn't touch the binary data of the extension-typed column. The server tracks the column's extension binding in its schema metadata, and that binding survives the table rebuild.
-
-Verified on `8.4.9-villagesql-0.0.5-dev-2066685c001`:
-
-```sql
-ALTER TABLE t1 ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
--- UUID values unaffected
-
-ALTER TABLE t1 MODIFY COLUMN label VARCHAR(128);
--- UUID values unaffected
-```
-
-`SHOW CREATE TABLE` reflects the extension-qualified type name after schema operations and across restarts:
-
-```sql
-SHOW CREATE TABLE t1\G
--- `id` vsql_uuid.uuid DEFAULT NULL
-```
+`ALTER TABLE` on tables with extension-typed columns behaves exactly as it does for built-in types. The server tracks the column's extension binding in its schema metadata, and that binding survives the table rebuild. Adding or modifying other columns on a table with a vsql-uuid `id` column leaves the UUID data intact.
 
 ## Known limitations
 
@@ -108,13 +73,13 @@ UNINSTALL EXTENSION vsql_uuid;
 INSTALL EXTENSION vsql_uuid;  -- picks up the new VEB
 ```
 
-The server blocks `UNINSTALL EXTENSION` while any column depends on the type (verified on `8.4.9-villagesql-0.0.5-dev-2066685c001`):
+The server blocks `UNINSTALL EXTENSION` while any column depends on the type:
 
 ```
 ERROR 3219 (HY000): Cannot drop extension `vsql_uuid` as 1 column(s) depend on it,
 e.g. abi_test.t1.id has type uuid
 ```
 
-Replacing the VEB file on disk is not a supported upgrade path. The server pins the VEB's SHA256 at install time, so a swapped VEB will either be ignored (the recorded SHA still hits in the expansion cache at `.veb_expansion_cache/{name}/{sha256}/`) or rejected at startup with a SHA256 mismatch. Use `UNINSTALL EXTENSION` / `INSTALL EXTENSION` to update.
+Replacing the VEB file on disk is not a supported upgrade path — the server validates the VEB at install time and will reject a swapped file. Use `UNINSTALL EXTENSION` / `INSTALL EXTENSION` to update.
 
-In-place extension upgrades without data loss are tracked in [#11](https://github.com/villagesql/villagesql-server/issues/11) and [#12](https://github.com/villagesql/villagesql-server/issues/12).
+In-place extension upgrades without data loss are tracked in [#11](https://github.com/villagesql/villagesql-server/issues/11).
