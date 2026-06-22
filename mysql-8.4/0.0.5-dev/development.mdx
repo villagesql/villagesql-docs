@@ -1,65 +1,13 @@
 ---
 title: "C++ Development"
-description: "Writing extension functions and running tests for your VillageSQL extension in C++."
+description: "VDF authoring depth for C++ extensions — argument and result types, aggregates, prerun/postrun, varargs, and registration."
 ---
 
-This guide covers writing C++ VDF implementations and running regression tests for VillageSQL extensions. It is the companion to [Creating Extensions in C++](/mysql-8.4/0.0.5-dev/create), which covers the end-to-end build steps.
+This guide is the deep reference for writing C++ VDF implementations. It is the companion to [Creating Extensions in C++](/mysql-8.4/0.0.5-dev/create), which covers the end-to-end build steps, and [C++ Testing](/mysql-8.4/0.0.5-dev/testing), which covers the test-and-iterate loop.
 
 <Warning>
 VEF Protocol 3 is stable as of v0.0.4. Protocol 4 is under development and is available only via opt-in dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`). Extensions built against the old Protocol 2 are rejected by the server and must be rebuilt.
 </Warning>
-
-<Note>
-  If you are contributing to the VillageSQL server itself (not building an extension), see [Build from Source](/mysql-8.4/0.0.5-dev/source), which covers the full server developer workflow including running tests with `mysql-test-run.pl` directly.
-</Note>
-
-## Setting Up Your Environment
-
-To develop and test extensions, you need a built VillageSQL server. Follow the [Clone and Build from Source](/mysql-8.4/0.0.5-dev/source) guide to compile the server binaries.
-
-Once you have a build, use the `villagesql` CLI to manage a local dev server instance. Run all commands from the directory where VillageSQL was installed.
-
-### Starting a Local Dev Server
-
-Initialize and start a server instance:
-
-```bash
-./villagesql init    # initialize database and seed bundled extensions
-./villagesql start   # start the server (default port 3307)
-./villagesql status  # check the server is running
-./villagesql connect # open a mysql shell
-./villagesql stop    # stop the server
-```
-
-To set a root password on init:
-
-```bash
-./villagesql init --password
-./villagesql start
-```
-
-Pass `--dir <path>` before any command to manage multiple independent instances, or use `--here` to create a server directory in the current working directory:
-
-```bash
-./villagesql --here init
-./villagesql --here start
-```
-
-### Managing Extension Files
-
-Before installing an extension via SQL, its `.veb` file must be present on the server. The CLI manages the server's `lib/veb/` directory:
-
-```bash
-./villagesql veb add /path/to/my_extension.veb  # copy a .veb to the server
-./villagesql veb ls                              # list available .veb files
-./villagesql veb rm my_extension                # remove a .veb file
-```
-
-`.veb` files placed in `lib/veb/` before `init` are seeded automatically. After adding a file, install the extension via SQL:
-
-```sql
-INSTALL EXTENSION my_extension;
-```
 
 ## Writing Extension Functions
 
@@ -70,18 +18,18 @@ single header to access the full SDK:
 #include <villagesql/vsql.h>
 ```
 
-### Typed Wrappers (Recommended)
+## Argument and Result Types
 
-Typed wrappers provide a type-safe interface for VDF parameters and results.
-The framework detects wrapper types in your function signature and adapts
+VDF parameters and results are passed as type-safe argument and result types.
+The framework detects them from your function signature and adapts
 automatically — the `make_func` registration syntax is unchanged.
 
-**Input wrappers:** `IntArg`, `RealArg`, `StringArg`, `CustomArg` — each
+**Argument types:** `IntArg`, `RealArg`, `StringArg`, `CustomArg` — each
 provides `is_null()` and `value()`. For parameterized custom types,
 `CustomArgWith<P>` adds a `params()` accessor that returns the cached
-parsed params struct (see [Parameterized Types](#parameterized-types)).
+parsed params struct (see [Parameterized Types](/mysql-8.4/0.0.5-dev/type-operations#parameterized-types)).
 
-**Result wrappers:** `IntResult`, `RealResult`, `StringResult`, `CustomResult`
+**Result types:** `IntResult`, `RealResult`, `StringResult`, `CustomResult`
 — each provides `set_null()`, `warning(msg)`, and `error(msg)`. Scalar
 results also provide `set(value)`. Buffer results provide `buffer()` and
 `set_length(len)`. `StringResult` additionally provides
@@ -89,12 +37,12 @@ results also provide `set(value)`. Buffer results provide `buffer()` and
 view and sets the length in one call. For parameterized custom types,
 `CustomResultWith<P>` adds a `params()` accessor.
 
-**Span type:** `value()` and `buffer()` on the byte-oriented wrappers
-return a `vsql::Span<T>` — a non-owning view over a contiguous run of `T`
-with `data()`, `size()`, `empty()`, `begin()`/`end()`, and `operator[]`.
-Under C++20 it is an alias for `std::span<T>`; under C++17 the SDK provides
-a minimal compatible implementation, so the same code compiles in either
-standard. It is available through `<villagesql/vsql.h>`.
+**Span type:** `value()` and `buffer()` on the byte-oriented argument and
+result types return a `vsql::Span<T>` — a non-owning view over a contiguous
+run of `T` with `data()`, `size()`, `empty()`, `begin()`/`end()`, and
+`operator[]`. Under C++20 it is an alias for `std::span<T>`; under C++17 this
+SDK provides a minimal compatible implementation, so the same code compiles in
+either standard. It is available through `<villagesql/vsql.h>`.
 
 `warning(msg)` returns SQL NULL for the row and appends a SQL warning. In strict mode (`STRICT_TRANS_TABLES`), MySQL promotes it to a statement error on INSERT/UPDATE, so it behaves like `error(msg)` in strict contexts. Use it for recoverable bad input, such as an unparseable string in an encode function. Use `error(msg)` for corrupt stored data or any condition where continuing is unsafe. The message for both is truncated to fit the server's internal error buffer if necessary.
 
@@ -136,12 +84,12 @@ automatically — extension authors do not need to declare `.buffer_size(...)`
 on the function builder for this case. If `prerun` grows the buffer further,
 that larger size is preserved. This is what lets, for example,
 `SVECTOR::from_string('[…1024 floats…]')` encode a wide vector without the
-result wrapper running out of room.
+result buffer running out of room.
 
 You can use different styles across functions in the same extension — each
 function's style is determined by its own signature.
 
-### Aggregate VDFs
+## Aggregate VDFs
 
 Aggregate VDFs accumulate state across rows within each `GROUP BY` group and
 return a single result per group, like SQL `SUM` or `COUNT`. Use
@@ -149,8 +97,8 @@ return a single result per group, like SQL `SUM` or `COUNT`. Use
 type is the per-group accumulation buffer; `prerun` and `postrun` are
 auto-generated to allocate and delete it.
 
-The result function must have the signature `void(const State&, ResultWrapper)`
-where `ResultWrapper` is one of `IntResult`, `RealResult`, `StringResult`,
+The result function must have the signature `void(const State&, ResultType)`
+where `ResultType` is one of `IntResult`, `RealResult`, `StringResult`,
 `CustomResult`, or `CustomResultWith<P>`. Call `out.set(value)` to return a
 value or `out.set_null()` to return SQL NULL.
 
@@ -188,9 +136,9 @@ void my_result(const SumState &s, IntResult out) {
 
 How the builder methods work:
 - `make_aggregate_func<State, &result_fn>()` auto-generates `prerun` and `postrun` (value-initializes and deletes `State`).
-- `.clear<&fn>()` wraps `void(State&)` → `vef_vdf_clear_func_t`
-- `.accumulate<&fn>()` wraps `void(State&, TypedArgs...)` → `vef_vdf_accumulate_func_t`. `TypedArgs` are deduced from the function signature (`IntArg`, `StringArg`, etc.).
-- The `ResultWrapper` type (`IntResult`, `RealResult`, etc.) is deduced from the result function signature.
+- `.clear<&fn>()` registers your `void(State&)` reset function.
+- `.accumulate<&fn>()` registers your `void(State&, TypedArgs...)` fold function. `TypedArgs` are deduced from the function signature (`IntArg`, `StringArg`, etc.).
+- The result type (`IntResult`, `RealResult`, etc.) is deduced from the result function signature.
 
 For a counter that never returns NULL, use a plain state type:
 
@@ -201,7 +149,7 @@ void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
 void count_result(const CountState &s, IntResult out) { out.set(s); }
 ```
 
-### Per-Statement State (Prerun and Postrun)
+## Per-Statement State (Prerun and Postrun)
 
 Some VDFs need state that spans every row a single query touches — a call
 counter, a cached result, an open resource. Allocate it in a **prerun** hook,
@@ -216,7 +164,7 @@ signatures are:
 | Prerun | `void(vsql::PrerunArgs, vsql::PrerunResult)` |
 | Postrun | `void(vsql::PostrunArgs)` |
 
-Raw ABI signatures are rejected at compile time. Use `PrerunResult::set_user_data(void*)` to stash state; use `PostrunArgs::delete_state<T>()` to release it. If prerun calls `set_user_data(new T{})`, postrun **must** call `delete_state<T>()` — the SDK does not auto-free.
+Use `PrerunResult::set_user_data(void*)` to stash state; use `PostrunArgs::delete_state<T>()` to release it. If prerun calls `set_user_data(new T{})`, postrun **must** call `delete_state<T>()` — the SDK does not auto-free.
 
 `PrerunArgs::type_at(i)` exposes the declared SQL type of each argument before any rows are read; the predicates `is_int()`, `is_real()`, `is_str()`, `is_custom()` on the returned `PrerunArgType` mirror the column types. Use this in prerun to validate argument types or call `PrerunResult::request_buffer_size(n)` to size the result buffer.
 
@@ -247,12 +195,12 @@ void ba_call_index_postrun(PostrunArgs args) {
 //     .build()
 ```
 
-### Varargs VDFs
+## Varargs VDFs
 
 A **varargs** VDF accepts any number of arguments of any SQL type. Declare one
 with `.varargs()` on the func builder, which is mutually exclusive with
 `.no_params()` and `.param(TYPE)`. The body receives a `vsql::VarArgs` argument
-instead of the usual fixed-arity wrappers.
+instead of the usual fixed-arity argument types.
 
 <Warning>
 Varargs registration requires VEF Protocol 3. Older servers reject the
@@ -318,7 +266,7 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .build()
 ```
 
-### VEF_GENERATE_REGISTRATION
+## VEF_GENERATE_REGISTRATION
 
 `VEF_GENERATE_REGISTRATION` creates an internal `_vef_do_register()` helper
 that performs extension registration but does not define the `extern "C"` entry
@@ -335,317 +283,20 @@ VEF_GENERATE_REGISTRATION(
 // _vef_do_register() and optionally modify the result.
 ```
 
-### Type Operation Builders
+## Custom Type Operations
 
-*Only needed if your extension defines a custom column type. If you're writing functions only, skip ahead to [Running Regression Tests](#running-regression-tests).*
+For the full type operation builder reference — encode, decode, compare, hash, intrinsic defaults, and parameterized types — see [Type Operations](/mysql-8.4/0.0.5-dev/type-operations).
 
-Custom types require three operations the engine calls internally:
-encode (string to binary), decode (binary to string), and compare.
-Hash is optional. Implement them against these C++ signatures (all available via `<villagesql/vsql.h>`):
+## Preview Capabilities
 
-#### Fixed-Length Types
+The following VEF capabilities are available as opt-in preview headers. ABI and API are still under active development; see [Preview Capabilities](/mysql-8.4/0.0.5-dev/preview-capabilities) for the full reference.
 
-```cpp
-// Encode: string -> binary. Write the encoded bytes via out.buffer() and
-// out.set_length(n); call out.set_null() for SQL NULL, out.warning(msg) for
-// recoverable bad input, or out.error(msg) to abort the statement. Returning
-// without calling any of these surfaces a default warning.
-using TypeEncodeFunc = void (*)(std::string_view from, vsql::CustomResult out);
+- **Extension system variables** — [Preview Capabilities → System Variables](/mysql-8.4/0.0.5-dev/preview-capabilities#system-variables)
+- **Extension status variables** — [Preview Capabilities → Status Variables](/mysql-8.4/0.0.5-dev/preview-capabilities#status-variables)
+- **Keyring access** — [Preview Capabilities → Keyring Access](/mysql-8.4/0.0.5-dev/preview-capabilities#keyring-access)
+- **Column storage** — [Preview Capabilities → Column Storage](/mysql-8.4/0.0.5-dev/preview-capabilities#column-storage)
 
-// Decode: binary -> string. Report the outcome by calling
-// out.set_length(n), out.set(sv), out.set_null(), out.warning(msg), or
-// out.error(msg). If none is called the wrapper falls back to a default
-// "failed to decode value" ERROR.
-using TypeDecodeFunc = void (*)(vsql::CustomArg in, vsql::StringResult out);
-
-// Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
-using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
-
-// Hash: returns hash code (used for hash joins).
-using TypeHashFunc = size_t (*)(vsql::CustomArg in);
-```
-
-Register these operations using `vsql::make_type<kTypeName>()`. The type name
-is passed as a non-type template parameter (NTTP) — a `static constexpr const char[]`
-array. The builder auto-generates VDF names in the `TYPE::method` format
-(e.g., `"MYTYPE::from_string"`) from this NTTP, so no manual string matching
-is required. Pass the built type object to `.type()` on the extension builder;
-separate `.func()` calls for type operations are not needed.
-
-<Warning>
-The type name must be a `static constexpr const char[]` variable — a string literal cannot be used as a non-type template parameter. Passing `"MYTYPE"` directly produces a compiler error like:
-
-```
-error: '"MYTYPE"' is not a valid template argument for type 'const char*'
-```
-
-Declare the name as a named array as shown below.
-</Warning>
-
-```cpp
-#include <villagesql/vsql.h>
-
-using namespace vsql;
-
-static constexpr const char kMyTypeName[] = "MYTYPE";
-
-constexpr auto MYTYPE =
-    vsql::make_type<kMyTypeName>()
-        .persisted_length(8)
-        .max_decode_buffer_length(64)
-        .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
-        .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
-        .compare<&my_compare>()      // auto: "MYTYPE::compare"
-        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
-        .intrinsic_default_str("0")  // string-literal intrinsic default
-        .build();
-
-VEF_GENERATE_ENTRY_POINTS(
-    make_extension()
-        .type(MYTYPE))
-```
-
-`build()` fails at compile time if `from_string`, `to_string`, or `compare`
-is missing. Each template method checks the function pointer signature via
-`static_assert`.
-
-#### Intrinsic Default
-
-When a `NOT NULL` custom-type column receives `NULL` under `IGNORE` mode
-(e.g., `INSERT IGNORE` or `UPDATE IGNORE`), the server calls the intrinsic
-default to produce a fallback value rather than raising an error. The
-intrinsic default provides a string representation; the server converts it
-to binary using the type's `from_string` function.
-
-<Note>
-If you omit both `.intrinsic_default_str()` and `.intrinsic_default_vdf()`,
-the server calls `from_string("")` as a fallback. This happens when the type
-is **first used** (at table creation), not at `INSTALL EXTENSION`. If your
-encode function rejects empty string — or encodes it to the wrong number of
-bytes — type initialization fails with an error visible in the SQL client:
-
-```
-Type 'MYTYPE' failed to initialize: from_string VDF encoded intrinsic
-default input '' to N bytes, expected persisted_length=M
-```
-
-For fixed-length types, the default string must encode to exactly
-`persisted_length` bytes. Set an explicit default for any type where
-empty string is not a valid input.
-</Note>
-
-**String literal: `.intrinsic_default_str()`**
-
-For a constant default, pass the string directly on the type builder (as
-shown in the fixed-length example above with `.intrinsic_default_str("0")`).
-
-**VDF-based: `.intrinsic_default_vdf()` + `make_intrinsic_default`**
-
-When the default value depends on type parameters, implement a function
-against one of these signatures (available via `<villagesql/vsql.h>`):
-
-<Warning>
-  **Breaking change**: `IntrinsicDefaultFunc` and
-  `IntrinsicDefaultWithParamsFunc` return `std::string` instead of `const char*`.
-  Update any existing intrinsic default implementations to return `std::string` directly.
-</Warning>
-
-```cpp
-// Fixed (no type parameters):
-using IntrinsicDefaultFunc = std::string (*)(char *error_msg);
-
-// Parameterized (receives cached parsed params):
-template <typename P>
-using IntrinsicDefaultWithParamsFunc = std::string (*)(const P &,
-                                                       char *error_msg);
-```
-
-Return a `std::string` representation of the default value. On error,
-write a message to `error_msg` and return any value (the SDK checks
-`error_msg[0] != '\0'` to detect errors). Register with
-`make_intrinsic_default<&fn>("vdf_name")` (one argument: the VDF name) and
-reference that name on the type builder with `.intrinsic_default_vdf()`.
-The parameterized types example below shows the full registration pattern.
-
-```cpp
-std::string mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
-  return /* build string representation based on p */;
-}
-```
-
-#### Parameterized Types
-
-Variable-length types need the column's declared parameters at encode,
-decode, compare, and hash time to determine allocation sizes and layout.
-Define a params struct with a parse function and an inverse `to_strings`
-function, register both on the type builder with
-`.params<P, &ParseFunc, &ToStringsFunc>()`, and use `const P&` as the first
-argument of your type operation functions. The SDK caches the parse result
-per unique parameter combination, so the parse function runs at most once
-per type instantiation. The `to_strings` function is the inverse of `parse`:
-it writes a typed `P` back into the canonical key/value string form so the
-server can publish inferred params in the same shape `parse` consumes.
-
-```cpp
-struct MyTypeParams {
-  int64_t dimension;
-  static MyTypeParams parse(const std::map<std::string, std::string> &p) {
-    return {.dimension = stoll(p.at("dimension"))};
-  }
-  static void to_strings(const MyTypeParams &p,
-                         std::map<std::string, std::string> &out) {
-    out["dimension"] = std::to_string(p.dimension);
-  }
-};
-
-void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
-                   std::string_view from, vsql::CustomResult out) {
-  const MyTypeParams &p = params.value();  // is_known() is always true at runtime
-  size_t bytes = (size_t)p.dimension * 4;
-  auto buf = out.buffer();
-  if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
-  // ... parse from, write to buf ...
-  out.set_length(bytes);
-}
-
-void mytype_decode(vsql::CustomArgWith<MyTypeParams> in,
-                   vsql::StringResult out) {
-  const MyTypeParams &p = in.params();
-  // ... read p.dimension floats from in.value(), write to out.buffer() ...
-  out.set_length(bytes_written);
-}
-
-int mytype_compare(vsql::CustomArgWith<MyTypeParams> a,
-                   vsql::CustomArgWith<MyTypeParams> b) {
-  // Returns -1, 0, or 1.
-}
-
-size_t mytype_hash(vsql::CustomArgWith<MyTypeParams> in) {
-  // Returns hash code.
-}
-
-// Converts MYTYPE(N) integer syntax to a parameter map.
-// Signature: IntToTypeParamsFunc from <villagesql/vsql.h>.
-bool mytype_int_to_params_fn(int64_t value,
-                             std::map<std::string, std::string> &params,
-                             char *error_msg) {
-  if (value <= 0) {
-    snprintf(error_msg, VEF_MAX_ERROR_LEN,
-             "MYTYPE: dimension must be a positive integer");
-    return true;
-  }
-  params["dimension"] = std::to_string(value);
-  return false;  // success
-}
-
-// Validates parameters and computes storage sizes.
-// Signature: ResolveTypeParamsFunc from <villagesql/vsql.h>.
-bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
-                              vsql::ResolvedTypeParams *result,
-                              char *error_msg) {
-  int64_t dim = std::stoll(params.at("dimension"));
-  result->persisted_length = dim * 4;
-  result->max_decode_buffer_length = 64;
-  return false;  // success
-}
-```
-
-Register `.params<>()` on the type builder. Use `.int_to_params<&mytype_int_to_params_fn>()`
-to handle `MYTYPE(N)` integer syntax and `.resolve_params<&mytype_resolve_params_fn>()` to
-validate parameters and compute storage sizes. Call `.max_persisted_length(N)` with an
-upper bound on the persisted byte size across all valid parameterizations; the server
-uses this only on the type parameter inference path, where it has not yet inferred
-the params and so cannot consult `resolve_params` to size the encode buffer.
-For a VDF-based intrinsic default, use `.intrinsic_default_vdf()` with the VDF name and
-register the VDF separately via `make_intrinsic_default<&mytype_default>()`.
-
-```cpp
-static constexpr const char kMyTypeName[] = "MYTYPE";
-
-// Maximum valid dimension for MYTYPE.
-constexpr int64_t kMyTypeMaxDimension = 1024;  // your max valid dimension
-// Upper bound on MYTYPE's persisted byte size across all valid params.
-constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
-
-constexpr auto MYTYPE =
-    vsql::make_type<kMyTypeName>()
-        .persisted_length(-1)
-        .max_decode_buffer_length(16)
-        .max_persisted_length(kMyTypeMaxPersistedLength)
-        .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
-        .int_to_params<&mytype_int_to_params_fn>()
-        .resolve_params<&mytype_resolve_params_fn>()
-        .from_string<&mytype_encode>()
-        .to_string<&mytype_decode>()
-        .compare<&mytype_compare>()
-        .intrinsic_default_vdf("mytype_intrinsic_default")
-        .build();
-
-using namespace vsql;
-
-VEF_GENERATE_ENTRY_POINTS(
-    make_extension()
-        .type(MYTYPE)
-        .func(make_intrinsic_default<&mytype_default>(
-            "mytype_intrinsic_default")))
-```
-
-The parameterized variants — `TypeEncodeWithParamsFunc<P>`,
-`TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>`, and
-`TypeHashWithParamsFunc<P>` — together with `ParamsToStringsFunc<P>`
-(`void fn(const P&, std::map<std::string,std::string>&)`) are available via
-`<villagesql/vsql.h>`.
-The `vsql::make_type` template methods detect the params argument and route
-through the params cache automatically. Encode functions take
-`vsql::MaybeParams<P> &` as the first argument; `is_known()` is always true
-at runtime, and `value()` returns `const P&`. Decode, compare, and hash
-variants take `vsql::CustomArgWith<P>`, whose `params()` accessor returns
-`const P&`.
-
-#### Custom Types in Stored Procedures
-
-Custom extension types can be used as stored procedure parameter types and
-in `DECLARE` variable declarations. The server resolves the custom type at
-routine execution time using the installed extension's type metadata.
-
-```sql
-DELIMITER //
-CREATE PROCEDURE insert_complex(IN val COMPLEX)
-BEGIN
-  DECLARE tmp COMPLEX;
-  SET tmp = val;
-  INSERT INTO t1 VALUES (tmp);
-END //
-DELIMITER ;
-```
-
-### Extension System Variables
-
-Extension system variables are a preview capability — see
-[Preview Capabilities](/mysql-8.4/0.0.5-dev/preview-capabilities#system-variables)
-for the full API reference, factory functions, SQL access, and a complete
-example.
-
-### Extension Status Variables
-
-Extension status variables are a preview capability — see
-[Preview Capabilities](/mysql-8.4/0.0.5-dev/preview-capabilities#status-variables)
-for the full API reference, factory functions, SQL access, and a complete
-example.
-
-### Keyring Access
-
-Keyring access is a preview capability — see
-[Preview Capabilities](/mysql-8.4/0.0.5-dev/preview-capabilities#keyring-access)
-for the full API reference, result codes, and a complete example.
-
-### Column Storage
-
-Column storage is a preview capability — see
-[Preview Capabilities](/mysql-8.4/0.0.5-dev/preview-capabilities#column-storage)
-for the full API reference and a complete example.
-
-### Inspecting Extension Registration Metadata
+## Inspecting Extension Registration Metadata
 
 `INFORMATION_SCHEMA.EXTENSION_REGISTRATION` exposes the in-memory VEF
 registration struct for each loaded extension as a JSON document. Use it to
@@ -664,99 +315,10 @@ WHERE EXTENSION_NAME = 'my_ext';
 | `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | VEF protocol version negotiated between the extension and the server. |
 | `REGISTRATION_JSON` | `TEXT` | JSON serialization of the `vef_registration_t` struct, including `funcs` and `types` arrays. |
 
-## Running Regression Tests
-
-Run extension regression tests using the MySQL Test Runner from your VillageSQL build directory.
-
-### Running the Full Suite
-
-To run all tests for your extension:
-
-```bash
-cd $BUILD_HOME
-./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/test --parallel=auto
-```
-
-### Running Individual Tests
-
-To run a single test case, specify the suite path and test name:
-
-```bash
-cd $BUILD_HOME
-./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/test my_test_name
-```
-
-## Creating New Tests
-
-When adding new features or fixing bugs, you should add corresponding regression tests.
-
-### Test Location
-
-Extension tests live in the extension's own repository under a `test/` directory — not in the VillageSQL server's `mysql-test/suite/` tree.
-
-- Test files end with `.test` and go in `test/t/`.
-- Expected result files end with `.result` and go in `test/r/`.
-
-For example, for an extension named `my_extension`:
-- `test/t/my_new_test.test`
-- `test/r/my_new_test.result`
-
-### Test File Conventions
-
-A typical extension test installs the extension, runs SQL, and uninstalls:
-
-```sql
-# Description of the test
-
-INSTALL EXTENSION my_extension;
-
-# ... Your Test Code Here ...
-CREATE TABLE t1 (val MYTYPE);
-INSERT INTO t1 VALUES ('some_value');
-SELECT * FROM t1;
-DROP TABLE t1;
-
-UNINSTALL EXTENSION my_extension;
-```
-
-When your test output includes paths from the test runner's temp directory, add this directive inside your `.test` file to normalize them — without it, recorded results contain absolute paths that break on other machines:
-
-```sql
---replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
-```
-
-### Steps to Add a Test
-
-1.  **Create the `.test` file** in your extension's `test/t/` directory.
-2.  **Create an empty `.result` file** in your extension's `test/r/` directory.
-3.  **Run the test with `--record`** to generate the expected output:
-    ```bash
-    cd $BUILD_HOME
-    ./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/test --record my_new_test
-    ```
-4.  **Verify the output** in the generated `.result` file to ensure it matches your expectations.
-
-## Debugging Tests
-
-If a test fails, the test framework provides detailed logs.
-
--   **Test output:** Check `mysql-test/var/log/mysqltest.log` (combined) or `mysql-test/var/log/<test_name>/` (per-test directory).
--   **Server error log:** Check `mysql-test/var/log/mysqld.1.err`. VillageSQL-specific log messages (emitted via `LogVSQL()`) only appear when the server runs with `--log-error-verbosity=3`.
--   **Diff:** The framework outputs a diff between the actual output and the expected `.result` file.
-
-To run a test with extra debug information:
-
-```bash
-cd $BUILD_HOME
-./mysql-test/mysql-test-run.pl --verbose --suite=/path/to/your/extension/test my_new_test
-
-# To surface LogVSQL() messages in the error log:
-./mysql-test/mysql-test-run.pl --mysqld=--log-error-verbosity=3 \
-    --suite=/path/to/your/extension/test my_new_test
-```
-
 ## See Also
 
 - [Creating Extensions in C++](/mysql-8.4/0.0.5-dev/create) — end-to-end build steps, CMake setup, and installation
+- [C++ Testing](/mysql-8.4/0.0.5-dev/testing) — local dev server, MTR, and debugging failures
+- [Type Operations](/mysql-8.4/0.0.5-dev/type-operations) — encode, decode, compare, hash, parameterized types
 - [C++ API Reference](/mysql-8.4/0.0.5-dev/extension-api-reference) — VDF contracts, null handling, and buffer sizing
 - [Extension Architecture](/mysql-8.4/0.0.5-dev/architecture) — lifecycle, Victionary caching, performance patterns, and security model
