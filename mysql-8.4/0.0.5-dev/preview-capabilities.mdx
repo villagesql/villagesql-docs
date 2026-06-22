@@ -1,6 +1,6 @@
 ---
 title: "Preview Capabilities"
-description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the keyring, status_var, sys_var, thread_worker, and sql_query capabilities, and registration patterns."
+description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the keyring, status_var, sys_var, thread_worker, sql_query, and statement_event capabilities, and registration patterns."
 ---
 
 Preview capabilities are server-provided features exposed to extensions before
@@ -52,6 +52,7 @@ Uninstall those extensions first, then turn the setting off.
 | `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview |
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
 | `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | Preview |
+| `vsql::preview::statement_event` | `<villagesql/preview/statement_event.h>` | Preview |
 | `vsql::preview::status_var` | `<villagesql/preview/status_var.h>` | Preview |
 | `vsql::preview::storage` | `<villagesql/preview/storage_builder.h>` | Preview |
 | `vsql::preview::sys_var` | `<villagesql/preview/sys_var.h>` | Preview |
@@ -949,3 +950,171 @@ Page layout constants:
 
 Reading or writing inside the header or trailer regions corrupts the page —
 InnoDB uses those byte ranges for its own bookkeeping and checksum.
+
+## Statement Events
+
+The statement event capability (`vsql::preview::statement_event`) runs an
+extension-provided handler after each query finishes executing. The server
+invokes the handler synchronously on the query's own thread and passes
+execution metadata — the query text, timing, row counts, connection identity,
+and optimizer quality indicators. Use it for slow-query logging, auditing, or
+metrics collection.
+
+The capability name `VEF_PREVIEW_STATEMENT_EVENT_NAME` is
+`"vsql::preview::statement_event"`.
+
+### Declaring the Capability
+
+Declare a `StatementEventCapability`, instantiated on the firing phase and your
+handler function, at file scope and pass it to `.with()`:
+
+```cpp
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/vsql.h>
+
+namespace se = vsql::preview_statement_event;
+
+static void on_statement(const se::StatementEventArgs &args,
+                         se::StatementEventResult &result) {
+  // inspect args; optionally write an advisory message via result
+}
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &on_statement>
+    g_statement_event;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_statement_event))
+```
+
+The first template argument is the firing phase, a `vef_statement_event_phase_t`
+value. `VEF_STATEMENT_EVENT_POSTEXECUTE` fires after a query finishes executing,
+on success or failure, and is the only phase implemented in this version. The
+other `vef_statement_event_phase_t` values are reserved; declaring a handler for
+one of them causes the server to reject `INSTALL EXTENSION`.
+
+### Handler Arguments
+
+`StatementEventArgs` is a read-only view of the completed query; at the
+POSTEXECUTE phase every field is populated. Selected accessors:
+
+| Accessor | Meaning |
+|---|---|
+| `query()` | Query text, as a `string_view`. |
+| `query_time_secs()` | Wall-clock execution time, in seconds. |
+| `lock_time_secs()` | Time spent waiting on locks, in seconds. |
+| `rows_sent()`, `rows_examined()`, `rows_affected()` | Row counters. |
+| `user()`, `client_ip()`, `connection_id()` | Connection identity. |
+| `schema()` | Default schema, or `NULL` if none is selected. |
+| `status()` | `0` on success, otherwise the MySQL error code. |
+| `digest_text()` | Normalized query form, for grouping similar queries. |
+| `no_index_used()` | `true` when the query ran without a usable index. |
+
+String accessors such as `query()`, `sqlstate()`, and `error_message()` point
+into storage that is valid only for the duration of the handler call — copy the
+bytes if you need them after the handler returns.
+
+`StatementEventResult::error_msg(fmt, ...)` writes a printf-formatted message.
+At the POSTEXECUTE phase the message is advisory: the server logs it but does
+not propagate it to the client.
+
+### Complete Example
+
+A condensed form of the
+[`vsql_slow_query_log`](https://github.com/villagesql/villagesql-server/tree/main/villagesql/test-extensions/vsql-slow-query-log)
+test extension that ships with the server. It logs each query whose execution
+time exceeds a threshold, combining the statement event capability with
+[system variables](#system-variables) for runtime configuration:
+
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+namespace sv = vsql::preview_sys_var;
+namespace se = vsql::preview_statement_event;
+
+static bool g_enabled;
+static long long g_threshold_ms;
+static char *g_log_filename;
+static std::mutex g_log_mutex;
+
+static void slow_query_hook(const se::StatementEventArgs &args,
+                            se::StatementEventResult &result) {
+  if (!g_enabled) return;
+  if (args.query_time_secs() * 1000.0 < static_cast<double>(g_threshold_ms))
+    return;
+
+  time_t now = static_cast<time_t>(args.query_start_utime() / 1000000);
+  char ts[32];
+  struct tm tm_utc;
+  gmtime_r(&now, &tm_utc);
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+  std::lock_guard<std::mutex> lock(g_log_mutex);
+  FILE *f = fopen(g_log_filename, "a");
+  if (f == nullptr) {
+    result.error_msg("failed to open '%s': %s", g_log_filename,
+                     strerror(errno));
+    return;
+  }
+
+  fprintf(f, "# Time: %s\n", ts);
+  fprintf(f, "# User@Host: %s @ %s  Id: %lu\n", args.user() ? args.user() : "",
+          args.client_ip() ? args.client_ip() : "", args.connection_id());
+  fprintf(f,
+          "# Schema: %s  Query_time: %.6f  Lock_time: %.6f"
+          "  Rows_sent: %llu  Rows_examined: %llu\n",
+          args.schema() ? args.schema() : "", args.query_time_secs(),
+          args.lock_time_secs(), (unsigned long long)args.rows_sent(),
+          (unsigned long long)args.rows_examined());
+  fprintf(f, "SET timestamp=%llu;\n", (unsigned long long)now);
+  auto q = args.query();
+  fprintf(f, "%.*s;\n", (int)q.size(), q.data());
+  fclose(f);
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled", "Enable the slow query log", &g_enabled, false),
+    sv::make_int("threshold_ms", "Minimum execution time to log, in ms",
+                 &g_threshold_ms, 1000, 0, 3600000),
+    sv::make_str("log_file", "Path to the slow query log file",
+                 &g_log_filename, "/tmp/vsql_slow_query.log")});
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &slow_query_hook>
+    STATEMENT_EVENT;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension().with(SYS_VARS).with(STATEMENT_EVENT))
+```
+
+### Enabling from SQL
+
+With the preview tier enabled (see
+[Enabling the Preview Tier](#enabling-the-preview-tier)), install the extension
+and configure it through its system variables:
+
+```sql
+INSTALL EXTENSION vsql_slow_query_log;
+SET GLOBAL vsql_slow_query_log.enabled = ON;
+SET GLOBAL vsql_slow_query_log.threshold_ms = 500;
+```
+
+Each query slower than the threshold is appended to the configured log file:
+
+```
+# Time: 2026-06-22T22:53:44Z
+# User@Host: root @   Id: 27
+# Schema:   Query_time: 0.605084  Lock_time: 0.000000  Rows_sent: 1  Rows_examined: 1
+SET timestamp=1782168824;
+SELECT SLEEP(0.6);
+```
