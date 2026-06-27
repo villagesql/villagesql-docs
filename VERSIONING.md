@@ -36,6 +36,13 @@ When releasing a new version:
 6. **Update guides snippet link** in `snippets/villagesql-ad.mdx` — change the
    `href` to point to the new stable quickstart (e.g., `/mysql-8.4/0.0.4/quickstart`)
 
+7. **Update root `index.mdx`** — two places reference the stable version number:
+   - Quickstart card `href` (e.g., `/mysql-8.4/0.0.4/quickstart`)
+   - "Built-in Extensions" section text (e.g., "VillageSQL Server 0.0.4 includes...")
+
+8. **Update `extensions/index.mdx` Warning** — the install script link references
+   the stable quickstart (e.g., `/mysql-8.4/0.0.4/quickstart`)
+
 ## Archive Policy
 
 - Keep **10 versions** in dropdown
