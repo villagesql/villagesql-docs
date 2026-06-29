@@ -1,0 +1,201 @@
+---
+title: "Testing Network-Dependent Extensions"
+description: "Write reliable MTR tests for extensions that spawn HTTP servers or external listeners, using OS-assigned ports and a foreground launcher."
+audience: extension-author
+---
+
+Some extensions need to communicate with an external HTTP server or other network listener during tests — for example, an extension that makes outbound HTTP requests needs a local echo server to receive them. This page covers how to structure those tests so they run reliably under `--parallel=auto` and across operating systems.
+
+The patterns here apply equally to C++ and Rust extensions — both use MTR as the test runner via `cargo vsql test`.
+
+## Why hardcoded ports fail
+
+Two failure modes make hardcoded ports unreliable in MTR:
+
+**Port conflicts under `--parallel`.** MTR assigns each worker a port range around its `@@port` value. A fixed port outside that range (say, `18777`) may collide with another worker's reserved block or with a system service — causing intermittent `EADDRINUSE` that only reproduces at high parallelism.
+
+**OS-level changes.** New runner images and OS versions periodically reserve or restrict ports that previously worked. A port that passes locally and in CI today may silently fail to bind tomorrow.
+
+The solution in both cases is the same: bind to port `0` and let the OS assign an available port, then communicate the actual port back to the test.
+
+## Pattern A: Server-integrated listener
+
+Use this when the network listener runs inside the MySQL process — for example, an extension that embeds an HTTP server.
+
+**In the extension**, expose the bound port as a status variable after binding:
+
+```cpp
+// After calling bind() with port 0:
+vsql_my_http_port = server.actual_port();  // exposed as vsql_my_ext.http_port
+```
+
+**In the test**, use MTR's `wait_condition.inc` to poll the status variable until it is non-zero, then capture the port into an MTR variable. Re-read after any `UNINSTALL EXTENSION` / `INSTALL EXTENSION` cycle — an ephemeral port changes on every bind.
+
+```sql
+--disable_query_log
+let $wait_timeout= 10;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_my_ext.http_port';
+--source include/wait_condition.inc
+--let $my_port = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_my_ext.http_port'`
+--enable_query_log
+
+--eval SET @url = CONCAT('http://127.0.0.1:', $my_port, '/endpoint');
+SELECT my_extension.fetch(@url);
+```
+
+## Pattern B: External process listener
+
+Use this when the listener is a standalone process — a Python helper server, a mock API, or any external program that MTR does not control directly.
+
+<Note>
+  This pattern requires `python3` on `PATH`. GitHub-hosted runners include it; verify availability on self-hosted runners before using.
+</Note>
+
+### The foreground launcher
+
+Rather than backgrounding the server with `--exec ... &` and polling a port, use a foreground launcher script that:
+
+1. Starts the server in a subprocess with `start_new_session=True`
+2. Blocks until the server has bound and written a readiness file
+3. Exits, allowing MTR to continue
+
+MTR blocks on foreground `--exec` calls, so this guarantees the server is ready before any SQL runs — no separate poller or sleep needed.
+
+**`launcher.py`** — write this with `--write_file`:
+
+```python
+import os, subprocess, sys, time
+
+_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Start the server subprocess detached from this process
+proc = subprocess.Popen(
+    [sys.executable, os.path.join(_dir, 'echo_server.py')],
+    start_new_session=True,
+    stdout=open(os.path.join(_dir, 'echo_server.log'), 'w'),
+    stderr=subprocess.STDOUT,
+)
+
+# Write PID for cleanup
+with open(os.path.join(_dir, 'echo_server.pid'), 'w') as f:
+    f.write(str(proc.pid))
+
+# Block until readiness file appears and is non-empty.
+# Check content, not just existence — the file is created before the write
+# completes and an empty read would produce a broken MTR include.
+port_inc = os.path.join(_dir, 'echo_port.inc')
+for _ in range(40):
+    try:
+        if open(port_inc).read().strip():
+            sys.exit(0)
+    except OSError:
+        pass
+    time.sleep(0.25)
+
+# Timed out — print server log for diagnosis
+with open(os.path.join(_dir, 'echo_server.log')) as f:
+    sys.stderr.write(f.read())
+sys.exit(1)
+```
+
+**`echo_server.py`** — the actual server, writing its port before serving:
+
+```python
+import http.server, json, os, signal
+
+signal.alarm(60)  # self-terminate if orphaned by a killed MTR job
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def handle_any(self):
+        n = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(n).decode() if n else ''
+        self.send_response(200)
+        payload = json.dumps({'method': self.command, 'body': body}).encode()
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(payload))
+        self.end_headers()
+        self.wfile.write(payload)
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = handle_any
+    def log_message(self, *args): pass
+
+_dir = os.path.dirname(os.path.abspath(__file__))
+srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+port = srv.server_address[1]
+
+# Write atomically via rename — the launcher reads content, not just existence,
+# so the file must be complete before it becomes visible.
+tmp = os.path.join(_dir, 'echo_port.tmp')
+inc = os.path.join(_dir, 'echo_port.inc')
+with open(tmp, 'w') as f:
+    f.write('let $echo_port = %d;\n' % port)
+os.rename(tmp, inc)
+
+srv.serve_forever()
+```
+
+### In the test
+
+Start the launcher (foreground — MTR blocks until it exits), then source the port file:
+
+```sql
+--write_file $MYSQLTEST_VARDIR/tmp/echo_server.py
+# ... (echo_server.py contents)
+EOF
+
+--write_file $MYSQLTEST_VARDIR/tmp/launcher.py
+# ... (launcher.py contents)
+EOF
+
+--exec python3 $MYSQLTEST_VARDIR/tmp/launcher.py
+--disable_query_log
+--source $MYSQLTEST_VARDIR/tmp/echo_port.inc
+--eval SET @echo_url = CONCAT('http://127.0.0.1:', $echo_port, '/');
+--enable_query_log
+```
+
+## Keeping the port out of the result file
+
+The result file records the SQL as written. If a URL contains the ephemeral port number, the result file would contain a different value on every run and the test would always fail on record/replay.
+
+Source the port file and set the MySQL session variable together under `--disable_query_log` so neither the `let` assignment nor the ephemeral port appears in the output. Use the session variable everywhere a URL is needed:
+
+```sql
+--disable_query_log
+--source $MYSQLTEST_VARDIR/tmp/echo_port.inc
+--eval SET @echo_url = CONCAT('http://127.0.0.1:', $echo_port, '/');
+--enable_query_log
+
+# All queries reference @echo_url — the port never appears in the result file
+SELECT JSON_VALUE(CONVERT(my_ext.http_get(@echo_url) USING utf8mb4), '$.status') AS status;
+```
+
+## Process management
+
+**Log helper output — never discard it.** The launcher pattern above writes the server's stderr to `echo_server.log` and prints it on failure. Discarding helper output makes flakes unexplainable in CI artifacts.
+
+**Kill by PID, not by name.** On Linux, `pkill -f echo_server.py` can match the MTR process itself via `/proc/cmdline`. Use the PID file written by the launcher:
+
+```sql
+--exec sh -c 'kill $(cat $MYSQLTEST_VARDIR/tmp/echo_server.pid) 2>/dev/null || true'
+```
+
+**Remove all temp files before the test ends.** MTR's check-testcase flags any file left in `$MYSQLTEST_VARDIR/tmp/` as dirty state and fails the test:
+
+```sql
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.py
+--remove_file $MYSQLTEST_VARDIR/tmp/launcher.py
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.log
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.pid
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_port.inc
+```
+
+For a complete, tested implementation of Pattern B see `vsql-http/mysql-test/t/vsql_http_requests.test` — it covers the full test lifecycle from `--write_file` through cleanup.
+
+## See also
+
+- [C++ Testing](/mysql-8.4/0.0.5-dev/testing) — MTR setup, running suites, recording results, and debugging failures
+- [Creating Extensions in C++](/mysql-8.4/0.0.5-dev/create) — end-to-end build steps and CMake setup
+- [C++ Development](/mysql-8.4/0.0.5-dev/development) — VDF authoring, argument types, and result handling
