@@ -86,9 +86,12 @@ be a little warmer. Nothing needs hype.
 - **Headings in sentence case.** "Create a custom type," not "Create A Custom
   Type." Capitalize only the first word and proper nouns (SQL keywords, product
   names, type names like `TVECTOR`).
-- **Don't use custom heading anchors.** The `## Heading {#my-id}` syntax breaks
-  the Mintlify build (acorn parse error). Mintlify generates anchors from
-  heading text automatically.
+- **Custom heading anchors are fine for stable links.** Mintlify supports
+  `## Heading {#my-id}` to pin an anchor that survives heading-text edits. Use
+  it when a heading is linked to often, and in translated pages so that
+  English-slug cross-references keep resolving against a translated heading.
+  (`mint a11y` reports an acorn parse error on these — a known false positive
+  in that tool's parser, not a build failure; `mint validate` passes.)
 - **Lists:** numbered for sequences and ordered steps, bulleted for everything
   else. Keep items parallel in grammar.
 - **Tables** for anything with two or more attributes per row (options, types,
@@ -312,7 +315,7 @@ A quick checklist. Most of these map to a section above.
 - [ ] Frontmatter present: `title`, `description` (and `audience` on versioned pages)
 - [ ] Right page type, and it does one job (§2)
 - [ ] Second person, present tense, active voice (§3)
-- [ ] Sentence-case headings; no `{#custom-id}` anchors (§4)
+- [ ] Sentence-case headings; `{#custom-id}` anchors only for stable or translated links (§4)
 - [ ] Code blocks tagged with a language; placeholders in `UPPER_SNAKE_CASE` (§5)
 - [ ] Terminology correct; framings match §6
 - [ ] **Every example run against a live server; output matches** (§10)
