@@ -204,6 +204,7 @@ VEF_GENERATE_ENTRY_POINTS(
 - `.returns(type)` - Set return type (STRING, INT, REAL, or custom type name)
 - `.param(type)` - Add parameter (maximum 8 parameters)
 - `.buffer_size(size_t)` - Request specific output buffer size for STRING/CUSTOM returns
+- `.max_result_length(uint64_t)` - Size the result column for a STRING return so a materialized result isn't truncated at the argument width. STRING only; call `.returns(STRING)` first. Requires Protocol 4 (dev ABI).
 - `.deterministic(bool = true)` - Declare that this function always returns the same output for the same inputs and has no side effects. Default is non-deterministic.
 - `.prerun<func>()` - Set per-statement setup function (optional)
 - `.postrun<func>()` - Set per-statement cleanup function (optional)
@@ -286,7 +287,9 @@ make_func<&large_result_impl>("large_result")
   .build()
 ```
 
-Check available buffer space before writing:
+When you build the value yourself with `buffer()` and `set_length()`, the buffer
+is fixed at `buffer().size()` bytes — writing past it overflows memory, so guard
+against it:
 
 ```cpp
 void large_result_impl(StringArg input, StringResult out) {
@@ -304,8 +307,27 @@ void large_result_impl(StringArg input, StringResult out) {
 }
 ```
 
+For STRING results, `out.set(sv)` follows a snprintf-style overflow contract: it
+copies as many bytes as fit and reports the value's full size via `set_length`.
+When the reported size exceeds the buffer, the server grows the result buffer and
+re-invokes the function, so a STRING value larger than the requested buffer is no
+longer truncated.
+
+That contract applies at row time. A *materialized* STRING result — in a
+GROUP BY/DISTINCT temp table, `CREATE TABLE ... SELECT`, or UNION — still
+truncates at the argument width unless the function declares
+`.max_result_length(n)`, which sizes the result column (in characters, capped at
+`MAX_BLOB_WIDTH`):
+
+```cpp
+make_func<&large_result_impl>("large_result")
+  .returns(STRING)
+  .max_result_length(65536)
+  .build()
+```
+
 <Note>
-Request sufficient buffer size via `.buffer_size()` based on your function's maximum output size.
+Request sufficient buffer size via `.buffer_size()` based on your function's maximum output size. Sizing the buffer correctly avoids the cost of a grow-and-retry round trip.
 </Note>
 
 <Note>
