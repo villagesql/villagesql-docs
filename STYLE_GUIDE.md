@@ -1,7 +1,7 @@
 # VillageSQL Documentation Style Guide
 
-This guide is how we write the VillageSQL docs. It exists so that anyone — an
-external contributor, a VillageSQL engineer, or an AI agent — can add a page
+This guide covers how to write the VillageSQL docs. It exists so that anyone (an
+external contributor, a VillageSQL engineer, or an AI agent) can add a page
 that reads like the rest of the site and holds up to review.
 
 It covers **how to write** (voice, formatting, terminology, accuracy). For
@@ -9,63 +9,56 @@ It covers **how to write** (voice, formatting, terminology, accuracy). For
 [CONTRIBUTING.md](./CONTRIBUTING.md). For the release/version mechanics, see
 [VERSIONING.md](./VERSIONING.md).
 
-If you only read one thing: **every claim in the docs must be true of the
-running server.** VillageSQL is a MySQL-compatible database — a wrong example
-doesn't just confuse, it breaks someone's production query. Accuracy is the
-first rule, and everything else serves it.
-
----
+The most important rule: **every claim in the docs must be true of, and reproducible on, the
+running server.**
 
 ## 1. Core principles
 
-1. **Accuracy over everything.** Never document a feature, path, flag, or
+1. **Accuracy.** Never document a feature, path, flag, or
    output you haven't verified. If you can't trace a claim to a merged change
    or a live server result, it doesn't ship. See [§10](#10-accuracy-and-verification).
 2. **Upstream consistency.** If a feature behaves exactly like upstream MySQL,
-   don't re-document it — link to the [MySQL documentation](https://dev.mysql.com/doc/).
-   We write custom docs only for VillageSQL extensions, deviations, and additions.
+   don't re-document it; link to the [MySQL documentation](https://dev.mysql.com/doc/).
+   We write custom docs only for the VillageSQL Extension Framework (VEF), extensions, and server deviations and additions from upstream.
 3. **Single source of truth.** State each fact in one canonical place and link
    to it. Before removing something as "duplicate," cite the exact file and
    heading where the real copy lives. If you can't cite it, it stays.
-4. **Just enough.** Document what a reader needs to succeed — no more, no less.
+4. **Just enough.** Document what a reader needs to succeed, no more, no less.
    Make content evergreen where you can.
 5. **Serve both readers.** Human developers read to understand; AI agents read
    to execute. Write so both succeed. See [§9](#9-writing-for-humans-and-agents).
 
----
-
 ## 2. Choose the right page type
-
 Before writing, decide what kind of page you're creating. Mixing a tutorial, a
 reference table, and a design essay on one page is the most common way docs go
 wrong. VillageSQL organizes content along the lines of the
 [Diátaxis](https://diataxis.fr/) framework:
 
-| Page type | Answers | Lives in | Shape |
+| Page type | Answers | Example page | Shape |
 |---|---|---|---|
-| **Guide / how-to** | "How do I accomplish X?" | `guides/` | Task-focused steps for a competent user solving a real problem |
-| **Tutorial** | "Teach me by doing" | `guides/`, quickstarts | Guided lesson that ends in a working result |
-| **Reference** | "What are the exact facts?" | `mysql-8.4/<version>/` | Accurate, complete, dry — functions, types, syntax, options |
-| **Explanation** | "Why does it work this way?" | `mysql-8.4/<version>/` (e.g. `architecture.mdx`) | Background, rationale, mental models |
+| **Guide / how-to** | "How do I accomplish X?" | `guides/encrypting-columns.mdx` | Task-focused steps for a competent user solving a real problem |
+| **Tutorial** | "Teach me by doing" | `mysql-8.4/<version>/quickstart.mdx` | Guided lesson that ends in a working result |
+| **Reference** | "What are the exact facts?" | `mysql-8.4/<version>/extension-api-reference.mdx` | Accurate, complete, dry: functions, signatures, types, options |
+| **Explanation** | "Why does it work this way?" | `mysql-8.4/<version>/extensions-or-plugins.mdx` | Background, rationale, mental models |
 
-Keep the modes separate. A reference page states facts; it doesn't teach. A
-guide walks a path; it doesn't enumerate every option. If a page is trying to
-do two jobs, split it.
-
----
+Keep the modes separate. Reference and explanation often live side by side in
+the same version directory; the difference is the content, not the folder.
+`extension-api-reference.mdx` lists what every SDK function does; `architecture.mdx`
+and `extensions-or-plugins.mdx` explain *why* VEF is built the way it is. A
+reference page states facts; it doesn't teach. A guide walks a path; it doesn't
+enumerate every option. If a page is trying to do two jobs, split it.
 
 ## 3. Voice and tone
 
-Write like a sharp, helpful human — clear, direct, and welcoming. Not stiff,
+Write like a sharp, helpful human: clear, direct, and welcoming. Not stiff,
 not chatty, not salesy.
-
 - **Second person.** Address the reader as "you." ("You install the extension
   with…") Don't narrate as "we" or "the user" in reference and how-to content.
 - **Present tense.** "The server returns a warning," not "will return."
 - **Active voice.** Name who does the action. "VillageSQL parses the type
   parameters," not "the type parameters are parsed."
 - **Condition before instruction.** "To list installed extensions, query
-  `INFORMATION_SCHEMA.EXTENSIONS`." — the goal first, then the action.
+  `INFORMATION_SCHEMA.EXTENSIONS`." The goal comes first, then the action.
 - **Contractions are fine.** "don't," "can't," "you'll" read naturally.
 - **Lead concrete, then abstract.** Show the example, then explain the mechanism.
 - **Be specific.** Name the function, the error code, the exact output. Vague
@@ -75,13 +68,12 @@ not chatty, not salesy.
 - **Define terms on first use.** Don't assume the reader has read another page.
 
 ### Words and phrases to avoid
-
 | Avoid | Why | Use instead |
 |---|---|---|
 | just, simply, easy, easily | Condescending; what's easy for you may not be for the reader | Omit, or state the actual steps |
 | leverage, utilize, harness | Corporate filler | use |
 | robust, seamless, powerful, game-changer, cutting-edge | Marketing adjectives that carry no information | State the concrete capability |
-| It's important to note that…, It's worth noting… | Throat-clearing | Just state the point |
+| It's important to note that…, It's worth noting… | Throat-clearing | State the point directly |
 | in order to | Wordy | to |
 | Furthermore, Moreover, Additionally | Mechanical transitions | A natural connector, or a new sentence |
 | currently, at the moment, new, soon | Time-relative words that rot | State the version it applies to |
@@ -90,10 +82,7 @@ not chatty, not salesy.
 Match energy to the topic. Reference docs are calm and factual. A quickstart can
 be a little warmer. Nothing needs hype.
 
----
-
 ## 4. Formatting
-
 - **Headings in sentence case.** "Create a custom type," not "Create A Custom
   Type." Capitalize only the first word and proper nouns (SQL keywords, product
   names, type names like `TVECTOR`).
@@ -104,22 +93,19 @@ be a little warmer. Nothing needs hype.
   else. Keep items parallel in grammar.
 - **Tables** for anything with two or more attributes per row (options, types,
   comparisons).
-- **Admonitions** — use Mintlify's `<Note>`, `<Info>`, `<Warning>`, `<Tip>`,
+- **Admonitions.** Use Mintlify's `<Note>`, `<Info>`, `<Warning>`, `<Tip>`,
   and `<CardGroup>`/`<Card>` components to set off asides and navigation. Don't
   overuse them; a page that is all callouts has none.
 - **Em dashes:** avoid them. A comma, colon, period, or parentheses is almost
   always clearer.
-- **Bold sparingly** — one or two genuinely key phrases per section, not as
+- **Bold sparingly.** One or two genuinely key phrases per section, not
   decoration.
 - **No horizontal rules (`---`) inside body content.** Use headings and
   whitespace to separate sections. (The `---` fences around YAML frontmatter are
   required and are not affected by this.)
 - **Numbers as digits** ("3 parameters," not "three parameters").
 
----
-
 ## 5. Code, CLI, and SQL
-
 - **Always tag the language** on fenced code blocks (` ```sql `, ` ```bash `,
   ` ```json `, ` ```cpp `, ` ```rust `). Untagged blocks lose syntax
   highlighting.
@@ -128,7 +114,7 @@ be a little warmer. Nothing needs hype.
 - **Copy-paste ready.** A reader should be able to copy a command and run it
   without editing anything that isn't a clearly marked placeholder.
 - **Placeholders in `UPPER_SNAKE_CASE`.** Follow each with a lowercase
-  description of what to substitute — e.g. replace `EXTENSION_NAME` with the
+  description of what to substitute. For example, replace `EXTENSION_NAME` with the
   name of the extension you're installing.
 - **Show expected output** when it helps the reader confirm success. Trim
   irrelevant rows; use `...` to mark omitted output.
@@ -136,7 +122,7 @@ be a little warmer. Nothing needs hype.
   - Uppercase keywords (`SELECT`, `INSTALL EXTENSION`, `INFORMATION_SCHEMA`),
     lowercase identifiers.
   - Extension names in `INSTALL EXTENSION` are **identifiers, not strings**:
-    `INSTALL EXTENSION vsql_uuid;` — the quoted form
+    `INSTALL EXTENSION vsql_uuid;`. The quoted form
     (`INSTALL EXTENSION 'vsql_uuid';`) is a syntax error. `VERSION 'x.y.z'` is
     a string literal and keeps its quotes.
   - When syntax is version-specific, say which version it applies to.
@@ -147,32 +133,29 @@ be a little warmer. Nothing needs hype.
 - **Don't document `villagesql.*` internal tables.** They are restricted from
   user connections (Error 3554).
 
----
-
 ## 6. Terminology
-
 Use these terms exactly. Getting them wrong is a factual error, not a style nit.
 
 | Term | Meaning | Notes |
 |---|---|---|
 | **VEF** | VillageSQL Extension Framework | The system for building extensions in C++ or Rust |
 | **VEB** | VillageSQL Extension Bundle | The `.veb` package file. Names use underscores: `vsql_ai.veb` |
-| **VDF** | VillageSQL Defined Function | A function registered through VEF — not a MySQL UDF |
-| **Victionary** | VillageSQL's metadata/registry layer | — |
+| **VDF** | VillageSQL Defined Function | A function registered through VEF, not a MySQL UDF |
+| **Victionary** | VillageSQL's metadata/registry layer |  |
 | **extension** | An installable VEF package | Install with `INSTALL EXTENSION name;` (unquoted identifier) |
 
 **Product and identifier casing:** *VillageSQL* (one word, camel-cased S-Q-L),
 *MySQL*, *InnoDB*. Type names as the server spells them: `TVECTOR(3)`,
 `VECTOR(1536)`. SQL keywords uppercase.
 
-**Framings to get right** (these have been corrected before — don't reintroduce
+**Framings to get right** (these have been corrected before, so don't reintroduce
 the wrong version):
 
 - **Type parameters** (the `1536` in `VECTOR(1536)`): the engine parses and
   persists them and passes them to the extension, which interprets them. Do
-  **not** call this "semantic type awareness" — the engine doesn't compute
+  **not** call this "semantic type awareness"; the engine doesn't compute
   meaning from parameters on its own.
-- **Column Storage ABI:** a **capability** feature — it lets extensions define a
+- **Column Storage ABI:** a **capability** feature that lets extensions define a
   custom on-disk layout instead of routing through `VARBINARY`. Don't frame it
   as a performance optimization.
 - **tvector:** a test/example vector type shipped as a *separate installable
@@ -182,12 +165,7 @@ the wrong version):
   not "the feature ships." Anything still in progress (for example, features not
   yet merged) must not be documented as available. See [§10](#10-accuracy-and-verification).
 
-When in doubt about a definition, check the running server or ask — don't guess.
-
----
-
 ## 7. Frontmatter
-
 Every `.mdx` file starts with YAML frontmatter. Missing frontmatter is a build
 and review failure.
 
@@ -215,25 +193,23 @@ audience: extension-author    # writing C++/Rust extensions with the SDK
 audience: server-contributor  # working on VillageSQL server internals
 ```
 
-Set `audience` *before* you write the body — it forces the question "who is this
+Set `audience` *before* you write the body; it forces the question "who is this
 for?" up front. On **extension-author** pages, keep raw C ABI internals out of
 the prose (raw typedefs like `vef_invalue_t`, raw result constants like
 `VEF_RESULT_*`, `result->type` field access); those belong on the protocol
 reference page only. A maintainer CI check (`freshness.py --check-docs`) enforces
 the audience field and the raw-ABI rule.
 
----
-
 ## 8. Files, structure, and versioning
 
 ```
 villagesql-docs/
-├── docs.json              # navigation, theme, version dropdown — register new pages here
+├── docs.json              # navigation, theme, version dropdown; register new pages here
 ├── index.mdx              # docs landing page
 ├── guides/                # how-to guides and tutorials (see also: keywords, cross-links)
 ├── mysql-8.4/
 │   ├── 0.0.4/             # current stable
-│   ├── 0.0.5-dev/         # active development — most edits go here
+│   ├── 0.0.5-dev/         # active development, most edits go here
 │   └── 0.0.1 … 0.0.3/     # archived stable versions
 ├── extensions/
 ├── snippets/              # reusable MDX fragments
@@ -249,17 +225,14 @@ villagesql-docs/
   changing an older version's page to reference a newer API, confirm that API
   existed when that version was released.
 - **Stable and dev are not duplicate content.** They start identical and diverge
-  as features land. Don't `noindex` current stable or dev — noindexing older
+  as features land. Don't `noindex` current stable or dev; noindexing older
   archived versions is handled by the maintainer release workflow, not by
   contributors.
 - **Breaking changes:** when a real breaking change lands, add a
   `breaking-changes.mdx` to that version and link to it from affected pages with
   a `<Warning>`. Don't pre-create it.
 
----
-
 ## 9. Writing for humans and agents
-
 VillageSQL docs are read by people *and* by AI agents executing tasks. The two
 fail differently: humans get confused by missing context; agents fail on
 ambiguity and missing prerequisites.
@@ -269,7 +242,7 @@ gets the command first; the human gets the "why" at the end.
 
 - **State prerequisites before the commands, never after.**
 - **No ambiguous pronouns in procedural steps.** Name the file, the table, the
-  variable — not "it" or "this."
+  variable, not "it" or "this."
 - **Make success verifiable.** Say what the reader should see: the output, the
   exit code, the row that appears.
 - **Commands are complete.** No undefined placeholders, no "…and so on."
@@ -280,10 +253,7 @@ A quick test: could an agent with no prior context follow this page top to
 bottom and succeed? Could a human skim it and understand *why*? If either
 answer is no, revise.
 
----
-
 ## 10. Accuracy and verification
-
 This is the rule that makes the docs trustworthy. Treat documented behavior as
 an assertion that must match the product.
 
@@ -297,7 +267,7 @@ an assertion that must match the product.
 
 - Run **every** statement, function call, and command in the page against a
   current VillageSQL server and confirm the real output matches what the page
-  shows. If your local build is stale, rebuild first — never test docs against
+  shows. If your local build is stale, rebuild first; never test docs against
   an out-of-date server.
 - "Simulate the docs" means *write a test*, not render the markdown. The proof
   is a live server result.
@@ -319,14 +289,10 @@ the page:
 ```
 
 One row per verifiable claim. Use `file:line` for code-backed claims and "live
-query" for runtime-verified ones. This is the industry "docs-as-tests" practice
-— it isn't a local quirk, and it's non-negotiable for anything that describes
+query" for runtime-verified ones. This is the industry "docs-as-tests" practice. It isn't a local quirk, and it's non-negotiable for anything that describes
 server behavior.
 
----
-
 ## 11. Links, cross-linking, and accessibility
-
 - **Internal links are relative** (`/guides/ai-prompts-in-mysql`), never
   absolute URLs. Absolute links to our own site break in preview and
   translation.
@@ -334,16 +300,13 @@ server behavior.
   ("see the [custom types reference](…)"), never "click here" or "read more."
   The link text should make sense read on its own.
 - **Guides cross-link.** End a guide with a `## See also` section listing 2–4
-  related guides, one line each on why they're relevant — and add the reciprocal
+  related guides, one line each on why they're relevant. Add the reciprocal
   link from those guides back. Related guides form topical clusters
   (performance, security, AI/embeddings, networking, and so on).
 - **Alt text on every meaningful image**, describing what it shows in a sentence.
   Purely decorative images get empty alt text.
 
----
-
 ## 12. Before you submit
-
 A quick checklist. Most of these map to a section above.
 
 - [ ] Frontmatter present: `title`, `description` (and `audience` on versioned pages)
@@ -359,16 +322,3 @@ A quick checklist. Most of these map to a section above.
 - [ ] Edits went to the dev version unless correcting a released one (§8)
 - [ ] Upstream-identical behavior links to MySQL docs instead of duplicating (§1)
 - [ ] Verification table included in the PR (§10)
-
----
-
-## Lineage
-
-This guide adapts widely used documentation standards to VillageSQL:
-
-- [Google Developer Documentation Style Guide](https://developers.google.com/style) — voice, sentence-case headings, code and placeholder conventions, accessibility
-- [Diátaxis](https://diataxis.fr/) — the four documentation types (§2)
-- [Docs as Tests](https://www.docsastests.com/) — verifying documented behavior against the product (§10)
-
-For prose beyond the docs (blog posts, release notes, announcements), the
-VillageSQL voice standard applies in addition to this guide.

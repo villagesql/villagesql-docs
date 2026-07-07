@@ -36,14 +36,7 @@ Our docs are powered by **Mintlify**. To ensure your formatting looks correct:
 
 Before writing, read the [**Documentation Style Guide**](./STYLE_GUIDE.md). It
 covers voice, formatting, terminology, code and SQL conventions, frontmatter,
-versioning, and — most importantly — how to verify that every example is true
+versioning, and, most importantly, how to verify that every example is true
 of the running server.
-
-The essentials:
-
-* **Tone:** Helpful, professional, and welcoming. Write in the second person
-  ("you"), present tense, and active voice.
-* **Components:** Take advantage of Mintlify's [reusable components](https://mintlify.com/docs/components/alerts) like `<Info>`, `<Warning>`, and `<Note>` to highlight key points.
-* **Code Blocks:** Always specify the language for syntax highlighting (e.g., ```sql), and test every example against a live server before submitting.
 
 **Thank you for helping build the village!**
