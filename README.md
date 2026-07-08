@@ -10,10 +10,14 @@ VillageSQL is the innovation platform for MySQL and a new path for MySQL in the 
 - UUID
 - Cryptographic functions
 - SQL-based LLM prompting
+- HTTP client functions
+- N-dimensional cube type
+- A real boolean type
+- An embedded REST API server
 
 ## Documentation Site
 
-View the documentation at [docs.villagesql.com](https://villagesql.com/docs)
+View the documentation at [villagesql.com/docs](https://villagesql.com/docs)
 
 ## Development
 
