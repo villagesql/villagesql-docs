@@ -1,0 +1,148 @@
+---
+title: "Trigram Similarity Search in MySQL"
+sidebarTitle: "Trigram Similarity"
+description: "How to find similar strings in MySQL using VillageSQL's vsql_trgm extension — similarity scoring, fuzzy matching, and word-level similarity based on the trigram model."
+keywords: "mysql trigram similarity, mysql fuzzy search, mysql similar strings, mysql pg_trgm, vsql_trgm, mysql text similarity"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  This guide requires VillageSQL 0.0.4 or later.
+</Note>
+
+MySQL's built-in string functions — `LIKE`, `SOUNDEX`, `LEVENSHTEIN` — cover basic matching, but none of them give you a continuous similarity score you can sort or threshold on. VillageSQL's `vsql_trgm` extension adds trigram-based similarity: a number between 0 and 1 that measures how alike two strings are, so you can rank results and filter by similarity in a single query.
+
+## How trigrams work
+
+A trigram is a group of 3 consecutive characters. `vsql_trgm` lowercases the input, splits it on non-alphanumeric characters, pads each word with two leading spaces and one trailing space, then slides a 3-character window across each padded word. Similarity is how many trigrams the two inputs share, divided by the larger of the two trigram set sizes.
+
+```
+"cat" → pad to "  cat " → ["  c", " ca", "cat", "at "]
+"car" → pad to "  car " → ["  c", " ca", "car", "ar "]
+shared: 2 of 4 → similarity 0.5
+```
+
+Two things to know about multi-word strings: they are **lowercased** before processing, so `"Cat"` and `"cat"` produce the same trigrams. They are also **split on non-alphanumeric characters**, so each word is padded and trigrammed independently — `"hello world"` produces trigrams from `"  hello "` and `"  world "` separately, not from a single padded string. There is no `"o w"` or `" wo"` trigram.
+
+Similarity ranges from 0 (nothing in common) to 1 (identical).
+
+## Getting started
+
+```sql
+INSTALL EXTENSION vsql_trgm;
+```
+
+## Core functions
+
+### trgm_similarity — continuous score
+
+```sql
+SELECT vsql_trgm.trgm_similarity('adidas', 'adidos');   -- 0.5714...
+SELECT vsql_trgm.trgm_similarity('cat', 'dog');          -- 0
+SELECT vsql_trgm.trgm_similarity('mysql', 'mysql');      -- 1
+```
+
+All functions return NULL when any argument is NULL.
+
+### trgm_similar — threshold check
+
+Returns 1 if similarity is at or above 0.3 (the PostgreSQL default), 0 otherwise:
+
+```sql
+SELECT vsql_trgm.trgm_similar('cat', 'car');   -- 1
+SELECT vsql_trgm.trgm_similar('cat', 'dog');   -- 0
+```
+
+For a custom threshold:
+
+```sql
+SELECT vsql_trgm.trgm_similar_threshold('cat', 'car', 0.6);  -- 0
+SELECT vsql_trgm.trgm_similar_threshold('cat', 'car', 0.4);  -- 1
+```
+
+### trgm_distance — complement of similarity
+
+`1 - similarity`. Useful for ORDER BY when you want closest first:
+
+```sql
+SELECT vsql_trgm.trgm_distance('mysql', 'mysqk');  -- ~0.33
+```
+
+## Finding near-matches in a table
+
+The most common use: find rows that resemble a search term.
+
+```sql
+SELECT
+    name,
+    vsql_trgm.trgm_similarity(name, 'adidas') AS score
+FROM products
+WHERE vsql_trgm.trgm_similarity(name, 'adidas') > 0.3
+ORDER BY score DESC
+LIMIT 10;
+```
+
+This handles typos, alternate spellings, and partial matches — cases where `LIKE '%adidas%'` would miss.
+
+## Word similarity
+
+`trgm_word_similarity` finds the best match between a query string and any contiguous substring of the target. This is useful when the search term might be a word inside a longer string.
+
+```sql
+-- Find products whose name contains something close to "widget"
+SELECT name, vsql_trgm.trgm_word_similarity('widget', name) AS score
+FROM products
+WHERE vsql_trgm.trgm_word_similar('widget', name) = 1
+ORDER BY score DESC;
+```
+
+`trgm_strict_word_similarity` is a stricter variant that requires the match to align with word boundaries.
+
+| Function | Threshold |
+|---|---|
+| `trgm_word_similar(a, b)` | 0.6 |
+| `trgm_strict_word_similar(a, b)` | 0.5 |
+
+## Inspecting trigrams
+
+`trgm_show` returns the sorted trigram set for a string as a JSON array:
+
+```sql
+SELECT vsql_trgm.trgm_show('cat');
+-- '["  c"," ca","at ","cat"]'
+```
+
+This is useful for debugging why two strings score the way they do.
+
+## Function reference
+
+| Function | Returns | Notes |
+|---|---|---|
+| `trgm_similarity(a, b)` | REAL | 0–1 similarity score |
+| `trgm_distance(a, b)` | REAL | 1 − similarity |
+| `trgm_similar(a, b)` | INT | 1 if similarity ≥ 0.3 |
+| `trgm_similar_threshold(a, b, t)` | INT | 1 if similarity ≥ t |
+| `trgm_word_similarity(a, b)` | REAL | best substring match score |
+| `trgm_word_distance(a, b)` | REAL | 1 − word_similarity |
+| `trgm_word_similar(a, b)` | INT | 1 if word_similarity ≥ 0.6 |
+| `trgm_strict_word_similarity(a, b)` | REAL | word-boundary-aligned score |
+| `trgm_strict_word_distance(a, b)` | REAL | 1 − strict_word_similarity |
+| `trgm_strict_word_similar(a, b)` | INT | 1 if strict_word_similarity ≥ 0.5 |
+| `trgm_show(text)` | TEXT | JSON array of trigrams |
+
+## Known limitations
+
+**No index acceleration.** VEF does not expose a custom index API, so `WHERE trgm_similarity(col, 'term') > 0.3` requires a full table scan. For large tables, pre-filter with `LIKE` or full-text search to reduce the candidate set, then re-score with `trgm_similarity`.
+
+**No session-level threshold.** PostgreSQL's `set_limit()` / `show_limit()` cannot be implemented in VEF (VEF functions are stateless). Use `trgm_similar_threshold(a, b, t)` to pass the threshold explicitly.
+
+**No array return.** `trgm_show` returns a JSON string rather than a native array type.
+
+## See also
+
+- [How to implement full-text search in MySQL](/guides/full-text-search)
+- [How to match names phonetically and by edit distance in MySQL](/guides/fuzzy-string-matching)
+- [How to manipulate and transform strings in SQL](/guides/string-functions)

@@ -1,4 +1,5 @@
 ---
+audience: extension-author
 title: Managing Extensions
 description: Monitor, troubleshoot, and manage VillageSQL extensions
 ---
@@ -325,11 +326,165 @@ ORDER BY DATA_TYPE, TABLE_SCHEMA, TABLE_NAME;
 
 ## Updating Extensions
 
-To update an extension to a newer version, use the manual update process:
+To change an installed extension to a different version, use `ALTER EXTENSION`.
+It validates the new version against your existing data and applies the change
+the next time the server restarts. A manual uninstall and reinstall remains
+available as an alternative.
 
-<Note>
-  **ALTER EXTENSION UPDATE** is not yet supported and is planned for a future release.
-</Note>
+### Changing an Extension Version
+
+`ALTER EXTENSION` changes an installed extension to a different version,
+applied at the next server restart:
+
+```sql
+ALTER EXTENSION update_test VERSION '1.2.0' AT RESTART;
+```
+
+VillageSQL resolves the target version on disk and runs a compatibility
+precheck before accepting the change. The target VEB must exist in the
+extension directory as `<name>-<version>.veb` (here, `update_test-1.2.0.veb`);
+a missing file is rejected:
+
+```
+ERROR 3219 (HY000): VEB file not found: update_test-9.9.9.veb
+```
+
+The precheck looks for known incompatibilities that would break stored data —
+for example a change to a custom type's persisted length:
+
+```
+ERROR 3219 (HY000): Cannot update extension 'update_test': type 'COUNTER'
+persisted_length changed from 4 to 8 -- existing stored data would be corrupted
+```
+
+Once accepted, the change applies at the next restart. Until then,
+`INFORMATION_SCHEMA.EXTENSIONS` reports the current version alongside the
+target it will change to:
+
+```sql
+SELECT EXTENSION_NAME, EXTENSION_VERSION, PENDING_VERSION
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'update_test';
+```
+
+```
++----------------+-------------------+-----------------+
+| EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION |
++----------------+-------------------+-----------------+
+| update_test    | 1.0.0             | 1.2.0           |
++----------------+-------------------+-----------------+
+```
+
+`INFORMATION_SCHEMA.EXTENSIONS` reports a scheduled change in four columns:
+
+| Column | Meaning |
+|--------|---------|
+| `PENDING_VERSION` | Version the extension will change to at the next restart, or `NULL` |
+| `PENDING_REQUESTED_AT` | When the change was requested |
+| `PENDING_LAST_ERROR` | Message from a failed change, or `NULL` |
+| `PENDING_LAST_ERROR_AT` | When that failure was recorded, or `NULL` |
+
+One scheduled change is tracked at a time:
+
+- **Cancel a scheduled change** by requesting the current version again:
+  ```sql
+  ALTER EXTENSION update_test VERSION '1.0.0' AT RESTART;
+  -- Note: Cleared pending update for extension 'update_test'
+  --       (target matches current version '1.0.0')
+  ```
+- **Requesting the current version when nothing is scheduled** does nothing:
+  ```sql
+  ALTER EXTENSION update_test VERSION '1.0.0' AT RESTART;
+  -- Note: Extension 'update_test' is already at version '1.0.0'
+  ```
+- **A different target is refused while a change is scheduled** — cancel the
+  existing one first:
+  ```
+  ERROR 3219 (HY000): Extension 'update_test' already has a pending update;
+  clear it with ALTER EXTENSION update_test VERSION '1.0.0' AT RESTART before
+  queueing a different version
+  ```
+
+The `AT RESTART` clause applies the change during the next server startup.
+
+### Recovering from a Pending Version Change at Startup
+
+A scheduled version change is applied during the next server startup. If a
+pending action can't be applied, the server can fail to start while persisting
+its pending-update decisions. Use `--villagesql-skip-extension-updates` when a
+queued `ALTER EXTENSION ... AT RESTART` is blocking startup and you need the
+server up before you can clear it.
+
+`--villagesql-skip-extension-updates` is a `mysqld` startup flag. When set, the
+server bypasses processing of pending `ALTER EXTENSION ... AT RESTART` actions:
+each extension loads at its currently-installed version, and its pending action
+is left intact on disk. The flag mutates nothing itself — it only skips applying
+the pending actions for that one startup.
+
+When the flag is set and at least one extension has a pending action, the server
+logs a single warning at startup naming how many were bypassed:
+
+```text
+--villagesql-skip-extension-updates is set: bypassing N pending extension update(s). Extensions load at their currently-installed version. Query INFORMATION_SCHEMA.EXTENSIONS to see the pending actions; clear each via ALTER EXTENSION <name> VERSION '<current>' AT RESTART, then restart without the flag.
+```
+
+<Steps>
+  <Step title="Start the server with the flag">
+    In production, pass it as a normal `mysqld` command-line option or add it
+    under `[mysqld]` in `my.cnf`:
+
+    ```bash
+    mysqld --villagesql-skip-extension-updates
+    ```
+
+    In the dev harness, pass it through with `--`:
+
+    ```bash
+    ./villagesql start -- --villagesql-skip-extension-updates
+    ```
+
+    **Success signal:** the server starts, and the error log contains the
+    `bypassing N pending extension update(s)` warning shown above.
+  </Step>
+  <Step title="Identify the pending actions">
+    ```sql
+    SELECT EXTENSION_NAME, EXTENSION_VERSION, PENDING_VERSION, PENDING_LAST_ERROR
+    FROM INFORMATION_SCHEMA.EXTENSIONS
+    WHERE PENDING_VERSION IS NOT NULL;
+    ```
+
+    ```text
+    +--------------+-------------------+-----------------+--------------------+
+    | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_LAST_ERROR |
+    +--------------+-------------------+-----------------+--------------------+
+    | my_extension   | 1.0.0             | 2.0.0           | NULL               |
+    +--------------+-------------------+-----------------+--------------------+
+    ```
+
+    **Success signal:** each row's `PENDING_VERSION` is the target you need to
+    clear; `PENDING_LAST_ERROR` shows why it failed to apply.
+  </Step>
+  <Step title="Clear each pending action">
+    For every extension returned above, request its current version to cancel
+    the queued change (the cancel mechanism described under
+    [Changing an Extension Version](#changing-an-extension-version)):
+
+    ```sql
+    ALTER EXTENSION my_extension VERSION '1.0.0' AT RESTART;
+    ```
+
+    **Success signal:** a `Cleared pending update for extension '<name>'
+    (target matches current version '<current>')` note is returned, and
+    re-running the previous query shows `PENDING_VERSION` is `NULL`.
+  </Step>
+  <Step title="Restart without the flag">
+    Restart the server normally, omitting `--villagesql-skip-extension-updates`.
+
+    **Success signal:** the server starts and the
+    `bypassing N pending extension update(s)` warning no longer appears in the
+    log.
+  </Step>
+</Steps>
 
 ### Manual Update Process
 

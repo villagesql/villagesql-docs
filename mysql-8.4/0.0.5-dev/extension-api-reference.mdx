@@ -1,4 +1,5 @@
 ---
+audience: extension-author
 title: "C++ API Reference"
 description: "VDF API contracts, null handling, buffer sizing, encode/decode conventions, prerun/postrun hooks, and SQL feature compatibility for VillageSQL extensions."
 ---
@@ -10,7 +11,7 @@ see [Custom Types in C++](/mysql-8.4/0.0.5-dev/custom-types).
 <Note>
   Curious why the API looks the way it does? Read [Happy Path, Escape Hatch,
   and the Space Between](https://villagesql.com/blog/escape-hatch/) for the
-  design philosophy behind the typed wrappers and lower-level hooks like
+  design philosophy behind the typed argument/result API and lower-level hooks like
   `prerun()` and varargs.
 </Note>
 
@@ -20,38 +21,20 @@ These contracts govern how VDF implementation functions interact with the
 VEF runtime. Every function registered via `make_func<>` must follow them.
 The types referenced below are available via `#include <villagesql/vsql.h>`.
 
-### Part A: VDF Function Contracts
-
-**1. VDF implementation functions are `void` -- they never return a value.**
+**1. VDF implementation functions are `void` — they never return a value.**
 
 ```cpp
 void my_func_impl(StringArg input, StringResult out) {
     // ... compute result ...
-    return;  // always void -- no return value
+    return;  // always void — no return value
 }
 ```
 
 Communicate success, NULL, warning, or error by calling one terminal method on
-the result wrapper: `out.set(...)` / `out.set_length(n)`, `out.set_null()`,
+the result type: `out.set(...)` / `out.set_length(n)`, `out.set_null()`,
 `out.warning(msg)`, or `out.error(msg)`.
 
-**2. Set `result->type` to exactly one of the four result constants.**
-
-Four constants exist in `vef_return_value_type_t`:
-
-| Constant | Value | Meaning |
-|----------|-------|---------|
-| `VEF_RESULT_VALUE` | 0 | Success -- the output is in the appropriate union field |
-| `VEF_RESULT_NULL` | 1 | The result is SQL NULL |
-| `VEF_RESULT_WARNING` | 2 | Row-level warning -- execution continues, NULL is returned for this row, and a SQL warning is added. In strict mode, MySQL promotes this to an error on INSERT/UPDATE. |
-| `VEF_RESULT_ERROR` | 3 | Fatal error -- statement execution is aborted; message is in `result->error_msg` |
-
-There are no type-specific variants. `VEF_RESULT_VALUE` is the single success
-constant for strings, integers, reals, and custom types alike. The output type
-is determined by which result wrapper your function takes (`StringResult`,
-`IntResult`, `RealResult`, `CustomResult`).
-
-**3. Check `input.is_null()` before calling `input.value()`.**
+**2. Check `input.is_null()` before calling `input.value()`.**
 
 If `is_null()` returns true, calling `value()` is undefined behavior.
 
@@ -65,7 +48,7 @@ void my_func_impl(StringArg input, StringResult out) {
 }
 ```
 
-**4. For string results, write into `out.buffer()` and call `out.set_length(n)`. Check `out.buffer().size()` before writing.**
+**3. For string results, write into `out.buffer()` and call `out.set_length(n)`. Check `out.buffer().size()` before writing.**
 
 - `out.buffer()` returns a `Span<char>` over the server-managed buffer.
 - `out.set_length(n)` records how many bytes were written.
@@ -92,7 +75,7 @@ void upper_impl(StringArg input, StringResult out) {
 }
 ```
 
-**5. Pass error messages to `out.error(msg)`. The message is truncated to `VEF_MAX_ERROR_LEN` (512 bytes) if necessary.**
+**4. Pass error messages to `out.error(msg)`. The message is truncated to `VEF_MAX_ERROR_LEN` (512 bytes) if necessary.**
 
 `out.error(msg)` accepts a `std::string_view`. It copies the message into a
 server-managed buffer and sets the result state to error in one call.
@@ -103,9 +86,9 @@ out.error("Invalid input: expected positive integer");
 return;
 ```
 
-## Implement Wrapper Functions
+## Implement Functions
 
-Implementation functions use typed argument and result wrappers:
+Implementation functions use typed argument and result types:
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -143,22 +126,7 @@ void count_vowels_impl(StringArg input, IntResult out) {
 
 ## Handling NULL Values
 
-Check for NULL via `is_null()` and return NULL by calling `set_null()`:
-
-```cpp
-void my_func_impl(StringArg input, StringResult out) {
-    if (input.is_null()) {
-        out.set_null();
-        return;
-    }
-
-    auto sv = input.value();
-    auto buf = out.buffer();
-    // ... write into buf.data(), up to buf.size() bytes ...
-
-    out.set_length(output_length);
-}
-```
+Check for NULL via `is_null()` and return NULL by calling `set_null()`.
 
 **NULL handling options:**
 - **Input NULL check:** `input.is_null()`
@@ -189,51 +157,13 @@ void validate_age_impl(IntArg age_input, IntResult out) {
 }
 ```
 
-**Result types:**
-- `VEF_RESULT_VALUE` - Success (`out.set(v)` / `out.set_length(n)`)
-- `VEF_RESULT_NULL` - NULL value (`out.set_null()`)
-- `VEF_RESULT_WARNING` - Row-level warning (returns NULL, adds SQL warning, continues execution; strict mode promotes to error on INSERT/UPDATE) (`out.warning(msg)`)
-- `VEF_RESULT_ERROR` - Fatal error, aborts statement execution (`out.error(msg)`)
-
 ## Per-Statement State with Prerun/Postrun
 
-Prerun and postrun hooks use typed wrappers. The required signatures are:
+Register hooks with `.prerun<>()` and `.postrun<>()`. The required signatures are:
 
 ```cpp
 void my_prerun(vsql::PrerunArgs args, vsql::PrerunResult out);
 void my_postrun(vsql::PostrunArgs args);
-```
-
-Raw ABI signatures (`vef_prerun_args_t*` / `vef_postrun_args_t*`) are rejected
-at compile time by `static_assert` in `.prerun<&Hook>()` and `.postrun<&Hook>()`.
-
-```cpp
-#include <villagesql/vsql.h>
-using namespace vsql;
-
-struct CallCounter { long long n = 0; };
-
-void my_prerun(PrerunArgs, PrerunResult out) {
-    out.set_user_data(new CallCounter{});
-}
-
-void my_func_impl(CallCounter& state, IntResult out) {
-    state.n++;
-    out.set(state.n);
-}
-
-void my_postrun(PostrunArgs args) {
-    args.delete_state<CallCounter>();
-}
-
-VEF_GENERATE_ENTRY_POINTS(
-  make_extension()
-    .func(make_func<&my_func_impl>("my_func")
-      .returns(INT).no_params()
-      .prerun<&my_prerun>()
-      .postrun<&my_postrun>()
-      .build())
-);
 ```
 
 For `PrerunArgs` and `PostrunArgs` method details, see
