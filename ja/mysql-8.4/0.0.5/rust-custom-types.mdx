@@ -1,0 +1,255 @@
+---
+audience: extension-author
+title: "Rustにおけるカスタム型"
+description: "VillageSQL Rust SDKで新しいカラム型を定義します。カスタム型マクロ`custom_type!`を使用して、バイナリレイアウト、エンコード、デコード、比較、ハッシュ、および算術関数を定義します。"
+---
+
+<Warning>
+  Rust SDKはアルファ版です。リリース間で破壊的なAPI変更が発生する可能性が
+  あります。関数のみの拡張機能とカスタム型（エンコード、デコード、比較、
+  ハッシュ）はサポートされています。集計、`prerun()`、`VarArgs`、システム
+  変数とステータス変数、キーリングアクセス、およびカラムストレージABIは
+  現在C++でのみ利用可能です。これらのいずれかが必要な場合は、
+  [C++ SDK](/ja/mysql-8.4/0.0.5/create)を使用してください。
+</Warning>
+
+カスタム型を使用すると、`ORDER BY`、インデックス、および集計関数で機能する`RATIONAL`、`VECTOR`、または`INET`のような新しいカラム型を定義できます。Rust SDKは、`custom_type!`マクロを通じてこれをサポートしています。
+
+このページでは、まず[Rustでの拡張機能の構築](/ja/mysql-8.4/0.0.5/rust-sdk)を完了していることを前提としています。セットアップ（Cargo.toml、manifest.json、cargo-vsql）は同じです。
+
+## カスタム型を使用するタイミング
+
+次のいずれかの条件に該当する場合に、カスタム型を使用します。
+
+- 標準のSQL型では表現できないバイナリのオンディスクレイアウトが必要な場合（パックされた浮動小数点数、固定幅の整数、バイナリ識別子）
+- 型に、辞書順の文字列の順序とは異なる独自の順序セマンティクスがある場合
+- サーバーが、`ORDER BY`、`COUNT(DISTINCT)`、およびセット操作に対して値を正しくインデックス化およびハッシュすることを希望する場合
+
+SQLで呼び出すことができる関数のみが必要で、データが`STRING`、`INT`、または`REAL`カラムに問題なく収まる場合は、カスタム型は必要ありません。
+
+## `custom_type!`マクロ
+
+すべてのカスタム型には、4つのコールバック（エンコード、デコード、比較、ハッシュ）とデフォルト値が必要です。完全なマクロのシグネチャは次のとおりです。
+
+```rust
+villagesql::custom_type!(
+    type_name: "type_name_in_sql",
+    persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: your_encode_fn,
+    decode: your_decode_fn,
+    compare: your_compare_fn,
+    hash: your_hash_fn,
+    default: "a_valid_string_literal",
+)
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `type_name` | 文字列リテラル | SQLの型名。SQLでは大文字と小文字が区別されません。 |
+| `persisted_length` | `usize` | オンディスクストレージの固定バイト長。 |
+| `max_decode_buffer_length` | `usize` | デコードされた文字列表現の最大バイト長。 |
+| `encode` | 関数 | `INSERT`時に`&str`をバイナリバイトに変換します。 |
+| `decode` | 関数 | 表示用にバイナリバイトを`String`に変換します。 |
+| `compare` | 関数 | `ORDER BY`、`MIN`、`MAX`の`Ordering`を返します。 |
+| `hash` | 関数 | `COUNT(DISTINCT)`およびセット操作の`usize`ハッシュを返します。オプションですが、インデックス化されたカラムには推奨されます。 |
+| `default` | 文字列リテラル | サーバーが型初期化時にエンコードできる有効な文字列。正確に`persisted_length`バイトにエンコードする必要があります。オプションですが、推奨されます。 |
+
+`type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、および`compare`は必須です。`hash`と`default`はオプションですが、推奨されます。`hash`は、正しい`COUNT(DISTINCT)`およびセット操作に必要であり、`default`は、型初期化の検証に必要です。
+
+## バイナリ値の受信と返却
+
+カスタム型を受け取るか返す関数は、生のバイトで動作します。
+
+**入力** — `InValue::Custom(b)`は、保存されたバイナリを`&[u8]`として渡します。
+
+```rust
+fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::Custom(b)) => {
+            let numer = read_i64(b, 0);
+            VdfReturn::int(numer)
+        }
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("rational_numer: expected a RATIONAL argument"),
+    }
+}
+```
+
+**出力** — `VdfReturn::Binary(bytes)`は、バイナリバイトをサーバーに返します。
+
+```rust
+fn rational_add_impl(args: &[InValue]) -> VdfReturn {
+    match (args.get(0), args.get(1)) {
+        (Some(InValue::Custom(a)), Some(InValue::Custom(b))) => {
+            let result = add_rationals(a, b);
+            VdfReturn::Binary(result)
+        }
+        _ => VdfReturn::null(),
+    }
+}
+```
+
+`func!`宣言でカスタム型を参照するには、`villagesql::custom!("type_name")`を使用します。
+
+```rust
+villagesql::func!(
+    rational_add_impl,
+    "rational_add",
+    [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
+    deterministic: true
+)
+```
+
+## 例：有理数型
+
+SDKリポジトリの`examples/vsql_rational`は、`RATIONAL`型を実装する動作する拡張機能です。有理数を、リトルエンディアンのバイト順で16バイトのペア（分子、分母）として格納し、算術関数を提供します。
+
+エンコード、デコード、比較、およびハッシュの実装のコアは次のとおりです。
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+// Binary layout: [numerator: i64 LE][denominator: i64 LE] — 16 bytes total.
+// Always stored in reduced form (GCD = 1) with a positive denominator.
+const BYTES: usize = 16;
+
+fn to_bytes(num: i64, den: i64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(BYTES);
+    v.extend_from_slice(&num.to_le_bytes());
+    v.extend_from_slice(&den.to_le_bytes());
+    v
+}
+
+fn from_bytes(b: &[u8]) -> (i64, i64) {
+    let num = i64::from_le_bytes(b[..8].try_into().unwrap());
+    let den = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    (num, den)
+}
+
+// encode: "3/4" -> 16 bytes
+pub fn rational_encode(s: &str) -> Result<Vec<u8>, String> {
+    let (num_s, den_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("rational: expected 'n/d', got {:?}", s))?;
+    let num: i64 = num_s.trim().parse()
+        .map_err(|e| format!("rational numerator: {}", e))?;
+    let den: i64 = den_s.trim().parse()
+        .map_err(|e| format!("rational denominator: {}", e))?;
+    let (n, d) = normalize(num as i128, den as i128)
+        .ok_or_else(|| "rational: zero or overflowing denominator".to_string())?;
+    Ok(to_bytes(n, d))
+}
+
+// decode: 16 bytes -> "3/4"
+pub fn rational_decode(b: &[u8]) -> Result<String, String> {
+    if b.len() < BYTES {
+        return Err(format!("rational: expected {} bytes, got {}", BYTES, b.len()));
+    }
+    let (n, d) = from_bytes(b);
+    Ok(format!("{}/{}", n, d))
+}
+
+// compare: for ORDER BY, MIN, MAX
+pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (n1, d1) = from_bytes(a);
+    let (n2, d2) = from_bytes(b);
+    // cross-multiply (denominators are always positive)
+    let lhs = (n1 as i128) * (d2 as i128);
+    let rhs = (n2 as i128) * (d1 as i128);
+    lhs.cmp(&rhs)
+}
+
+// hash: for COUNT(DISTINCT) and set operations
+pub fn rational_hash(b: &[u8]) -> usize {
+    // FNV-1a over the 16 bytes
+    let mut h: usize = 0xcbf29ce484222325u64 as usize;
+    for &byte in b {
+        h ^= byte as usize;
+        h = h.wrapping_mul(0x100000001b3u64 as usize);
+    }
+    h
+}
+```
+
+`custom_type!`登録と算術VDF（`rational_add`、`rational_sub`など）は、`examples/vsql_rational/src/lib.rs`の完全なソースにあります。
+
+拡張機能がインストールされている場合：
+
+```sql
+INSTALL EXTENSION vsql_rational;
+
+CREATE TABLE fractions (
+    id   INT PRIMARY KEY,
+    val  RATIONAL
+);
+
+INSERT INTO fractions VALUES (1, '1/2'), (2, '3/4'), (3, '1/4');
+
+-- ORDER BY uses rational_compare
+SELECT val FROM fractions ORDER BY val;
+-- → 1/4, 1/2, 3/4
+
+-- Arithmetic with rational_add
+SELECT rational_add('1/3', '1/6');
+-- → 1/2
+
+-- Extract numerator and denominator
+SELECT rational_numer(val), rational_denom(val) FROM fractions;
+
+-- Convert to floating-point approximation
+SELECT rational_to_real('1/3');
+-- → 0.3333333333333333
+```
+
+`rational_to_real(r RATIONAL) -> REAL`は、分子を分母で割ることによって、`RATIONAL`値を64ビット浮動小数点近似に変換します。表示または比較のために近似的な10進数が必要で、その値をカラムに精度が落ちる表現として保存したくない場合に便利です。
+
+## 型を含む`extension!`ブロック
+
+関数と型を両方登録する場合、`extension!`ブロックには2つのセクションがあります。
+
+```rust
+villagesql::extension! {
+    funcs: [
+        // VDFs declared with func!
+    ],
+    types: [
+        // Custom types declared with custom_type!
+    ]
+}
+```
+
+どちらかのセクションは、空の場合は省略できます。型のみの拡張機能は`funcs:`を省略します。関数のみの拡張機能は`types:`を省略します。
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card
+    title="Rust APIリファレンス"
+    icon="book"
+    href="/ja/mysql-8.4/0.0.5/rust-api-reference"
+  >
+    `InValue`、`VdfReturn`、およびすべてのマクロの完全なリファレンス。
+  </Card>
+  <Card
+    title="Rustで拡張機能を構築する"
+    icon="wrench"
+    href="/ja/mysql-8.4/0.0.5/rust-sdk"
+  >
+    はじめに — Cargoのセットアップ、最初の関数、パッケージング、およびテスト。
+  </Card>
+  <Card
+    title="C++カスタム型"
+    icon="shapes"
+    href="/ja/mysql-8.4/0.0.5/custom-types"
+  >
+    C++のカスタム型 — `make_type<>`、エンコード/デコード/比較/ハッシュ、`ALTER TABLE`ルール。
+  </Card>
+  <Card
+    title="拡張機能のアーキテクチャ"
+    icon="sitemap"
+    href="/ja/mysql-8.4/0.0.5/architecture"
+  >
+    カスタム型が解決、キャッシュ、および保存される方法。
+  </Card>
+</CardGroup>

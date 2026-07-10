@@ -1,0 +1,401 @@
+---
+audience: extension-author
+title: "유형 연산"
+description: "C++ 유형 연산 빌더에 대한 심층 참조 — 인코딩, 디코딩, 비교, 해시, 내장 기본값 및 매개변수화 유형."
+---
+
+이 페이지는 C++ 유형 연산 빌더에 대한 참조입니다. 사용자 정의 유형에 대한 튜토리얼 수준의 소개는 [C++에서 사용자 정의 유형 만들기](/ko/mysql-8.4/0.0.5/custom-types)를 참조하세요.
+
+사용자 정의 유형은 엔진이 내부적으로 호출하는 세 가지 연산을 필요로 합니다: 인코딩(문자열에서 바이너리로), 디코딩(바이너리에서 문자열로), 비교. 해시는 선택 사항입니다. 다음 C++ 서명에 맞춰 구현하세요(모두 `<villagesql/vsql.h>`를 통해 사용 가능):
+
+## 고정 길이 유형
+
+```cpp
+// Encode: string -> binary. Write the encoded bytes via out.buffer() and
+// out.set_length(n); call out.set_null() for SQL NULL, out.warning(msg) for
+// recoverable bad input, or out.error(msg) to abort the statement. Returning
+// without calling any of these surfaces a default warning.
+using TypeEncodeFunc = void (*)(std::string_view from, vsql::CustomResult out);
+
+// Decode: binary -> string. Report the outcome by calling
+// out.set_length(n), out.set(sv), out.set_null(), out.warning(msg), or
+// out.error(msg). If none is called the SDK falls back to a default
+// "failed to decode value" ERROR.
+using TypeDecodeFunc = void (*)(vsql::CustomArg in, vsql::StringResult out);
+
+// Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
+using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
+
+// Hash: returns hash code (used for hash joins).
+using TypeHashFunc = size_t (*)(vsql::CustomArg in);
+```
+
+이러한 연산은 `vsql::make_type<kTypeName>()`을 사용해 등록합니다. 유형 이름은
+비유형 템플릿 매개변수(NTTP) — `static constexpr const char[]` 배열 — 로 전달됩니다.
+빌더는 이 NTTP로부터 `TYPE::method` 형식(예: `"MYTYPE::from_string"`)의 VDF 이름을
+자동 생성하므로, 수동으로 문자열을 일치시킬 필요가 없습니다. 빌드된 유형 객체를
+확장 빌더의 `.type()`에 전달하세요. 유형 연산을 위한 별도의 `.func()` 호출은 필요하지 않습니다.
+
+<Warning>
+유형 이름은 반드시 `static constexpr const char[]` 변수여야 합니다 — 문자열 리터럴은 비유형 템플릿 매개변수로 사용할 수 없습니다. `"MYTYPE"`을 직접 전달하면 다음과 같은 컴파일러 오류가 발생합니다:
+
+```
+error: '"MYTYPE"' is not a valid template argument for type 'const char*'
+```
+
+아래와 같이 이름을 명명된 배열로 선언하세요.
+</Warning>
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(8)
+        .max_decode_buffer_length(64)
+        .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
+        .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
+        .compare<&my_compare>()      // auto: "MYTYPE::compare"
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
+        .intrinsic_default_str("0")  // string-literal intrinsic default
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE))
+```
+
+`from_string`, `to_string`, `compare` 중 하나가 누락되면 `build()`가 컴파일 타임에
+실패합니다. 각 템플릿 메서드는 `static_assert`로 함수 포인터 서명을 검증합니다.
+
+## 내장 기본값 {#intrinsic-default}
+
+`NOT NULL` 사용자 정의 유형 컬럼이 `IGNORE` 모드에서 `NULL`을 받을 때
+(예: `INSERT IGNORE` 또는 `UPDATE IGNORE`), 서버는 오류를 발생시키는 대신
+내장 기본값을 호출해 대체 값을 생성합니다. 내장 기본값은 문자열 표현을
+제공하며, 서버는 유형의 `from_string` 함수를 사용해 이를 바이너리로 변환합니다.
+
+<Note>
+`.intrinsic_default_str()`과 `.intrinsic_default_vdf()`를 모두 생략하면,
+서버는 대체 방안으로 `from_string("")`을 호출합니다. 이는 유형이 `INSTALL EXTENSION` 시점이 아니라
+**처음 사용될 때**(테이블 생성 시) 발생합니다. 인코딩 함수가 빈 문자열을 거부하거나 —
+잘못된 바이트 수로 인코딩하면 — 유형 초기화가 실패하며 SQL 클라이언트에 다음과 같은 오류가 표시됩니다:
+
+```
+Type 'MYTYPE' failed to initialize: from_string VDF encoded intrinsic
+default input '' to N bytes, expected persisted_length=M
+```
+
+고정 길이 유형의 경우, 기본 문자열은 정확히 `persisted_length` 바이트로 인코딩되어야 합니다.
+빈 문자열이 유효한 입력이 아닌 모든 유형에 대해 명시적 기본값을 설정하세요.
+</Note>
+
+**문자열 리터럴: `.intrinsic_default_str()`**
+
+상수 기본값의 경우, 유형 빌더에 문자열을 직접 전달하세요(위 고정 길이 예제에서
+`.intrinsic_default_str("0")`으로 표시된 것처럼).
+
+**VDF 기반: `.intrinsic_default_vdf()` + `make_intrinsic_default`**
+
+기본값이 유형 매개변수에 의존할 때는, 다음 서명 중 하나에 맞춰 함수를
+구현하세요(`<villagesql/vsql.h>`를 통해 사용 가능):
+
+<Warning>
+  **호환성 파괴 변경**: `IntrinsicDefaultFunc`과
+  `IntrinsicDefaultWithParamsFunc`은 `const char*` 대신 `std::string`을 반환합니다.
+  기존 내장 기본값 구현을 `std::string`을 직접 반환하도록 업데이트하세요.
+</Warning>
+
+```cpp
+// Fixed (no type parameters):
+using IntrinsicDefaultFunc = std::string (*)(char *error_msg);
+
+// Parameterized (receives cached parsed params):
+template <typename P>
+using IntrinsicDefaultWithParamsFunc = std::string (*)(const P &,
+                                                       char *error_msg);
+```
+
+기본값의 `std::string` 표현을 반환하세요. 오류 시에는 `error_msg`에 메시지를
+작성하고 아무 값이나 반환하세요(SDK는 `error_msg[0] != '\0'`을 확인해 오류를 감지합니다).
+`make_intrinsic_default<&fn>("vdf_name")`(인수 하나: VDF 이름)으로 등록하고,
+유형 빌더의 `.intrinsic_default_vdf()`로 그 이름을 참조하세요.
+아래 매개변수화 유형 예제에서 전체 등록 패턴을 보여줍니다.
+
+```cpp
+std::string mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
+  return /* build string representation based on p */;
+}
+```
+
+## 매개변수화 유형 {#parameterized-types}
+
+매개변수화 유형은 할당 크기와 레이아웃을 결정하기 위해 인코딩, 디코딩,
+비교, 해시 시점에 컬럼의 선언된 매개변수를 필요로 합니다. 파싱 함수와
+역방향 `to_strings` 함수를 가진 params 구조체를 정의하고, `.params<P, &ParseFunc, &ToStringsFunc>()`로
+유형 빌더에 둘 다 등록한 뒤, 유형 연산 함수의 첫 번째 인수로 `const P&`를 사용하세요.
+SDK는 고유한 매개변수 조합별로 파싱 결과를 캐시하므로, 파싱 함수는 유형 인스턴스화당
+최대 한 번만 실행됩니다. `to_strings` 함수는 `parse`의 역함수입니다:
+이는 타입이 지정된 `P`를 표준 키/값 문자열 형식으로 다시 작성하여 서버가
+추론된 매개변수를 `parse`가 소비하는 것과 동일한 형태로 게시할 수 있도록 합니다.
+
+```cpp
+struct MyTypeParams {
+  int64_t dimension;
+  static MyTypeParams parse(const std::map<std::string, std::string> &p) {
+    return {.dimension = stoll(p.at("dimension"))};
+  }
+  static void to_strings(const MyTypeParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
+  }
+};
+
+void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
+                   std::string_view from, vsql::CustomResult out) {
+  const MyTypeParams &p = params.value();  // is_known() is always true at runtime
+  size_t bytes = (size_t)p.dimension * 4;
+  auto buf = out.buffer();
+  if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
+  // ... parse from, write to buf ...
+  out.set_length(bytes);
+}
+
+void mytype_decode(vsql::CustomArgWith<MyTypeParams> in,
+                   vsql::StringResult out) {
+  const MyTypeParams &p = in.params();
+  // ... read p.dimension floats from in.value(), write to out.buffer() ...
+  out.set_length(bytes_written);
+}
+
+int mytype_compare(vsql::CustomArgWith<MyTypeParams> a,
+                   vsql::CustomArgWith<MyTypeParams> b) {
+  // Returns -1, 0, or 1.
+}
+
+size_t mytype_hash(vsql::CustomArgWith<MyTypeParams> in) {
+  // Returns hash code.
+}
+
+// Converts MYTYPE(N) integer syntax to a parameter map.
+// Signature: IntToTypeParamsFunc from <villagesql/vsql.h>.
+bool mytype_int_to_params_fn(int64_t value,
+                             std::map<std::string, std::string> &params,
+                             char *error_msg) {
+  if (value <= 0) {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: dimension must be a positive integer");
+    return true;
+  }
+  params["dimension"] = std::to_string(value);
+  return false;  // success
+}
+
+// Validates parameters and computes storage sizes.
+// Signature: ResolveTypeParamsFunc from <villagesql/vsql.h>.
+bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
+                              vsql::ResolvedTypeParams *result,
+                              char *error_msg) {
+  int64_t dim = std::stoll(params.at("dimension"));
+  result->persisted_length = dim * 4;
+  result->max_decode_buffer_length = 64;
+  return false;  // success
+}
+```
+
+유형 빌더에 `.params<>()`를 등록하세요. `MYTYPE(N)` 정수 구문을 처리하려면
+`.int_to_params<&mytype_int_to_params_fn>()`을, 매개변수를 검증하고 저장 크기를
+계산하려면 `.resolve_params<&mytype_resolve_params_fn>()`을 사용하세요. 모든 유효한
+매개변수화에 걸친 저장 바이트 크기의 상한값으로 `.max_persisted_length(N)`을 호출하세요.
+서버는 이를 유형 매개변수 추론 경로에서만 사용하는데, 이 경로에서는 아직 매개변수를
+추론하지 않아 인코딩 버퍼 크기를 조정하기 위해 `resolve_params`를 참조할 수 없기 때문입니다.
+VDF 기반 내장 기본값의 경우, `.intrinsic_default_vdf()`에 VDF 이름을 사용하고
+`make_intrinsic_default<&mytype_default>()`을 통해 VDF를 별도로 등록하세요.
+
+<Warning>
+`.max_persisted_length()`는 VEF 프로토콜 3 이상을 필요로 합니다. 이를 사용하는 유형은
+프로토콜 3 이전 서버에서 로드될 수 없습니다.
+</Warning>
+
+```cpp
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+// Maximum valid dimension for MYTYPE.
+constexpr int64_t kMyTypeMaxDimension = 1024;  // your max valid dimension
+// Upper bound on MYTYPE's persisted byte size across all valid params.
+constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .variable_length_type()  // Protocol 4; use instead of persisted_length(-1)
+        .max_decode_buffer_length(16)
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
+        .int_to_params<&mytype_int_to_params_fn>()
+        .resolve_params<&mytype_resolve_params_fn>()
+        .from_string<&mytype_encode>()
+        .to_string<&mytype_decode>()
+        .compare<&mytype_compare>()
+        .intrinsic_default_vdf("mytype_intrinsic_default")
+        .build();
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE)
+        .func(make_intrinsic_default<&mytype_default>(
+            "mytype_intrinsic_default")))
+```
+
+매개변수화 변형 — `TypeEncodeWithParamsFunc<P>`,
+`TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>`,
+`TypeHashWithParamsFunc<P>` — 는 `ParamsToStringsFunc<P>`
+(`void fn(const P&, std::map<std::string,std::string>&)`)와 함께
+`<villagesql/vsql.h>`를 통해 사용 가능합니다.
+`vsql::make_type` 템플릿 메서드는 params 인수를 감지해 자동으로 params 캐시를
+통해 라우팅합니다. 인코딩 함수는 첫 번째 인수로 `vsql::MaybeParams<P> &`를
+받습니다. `is_known()`은 런타임에 항상 true이며, `value()`는 `const P&`를 반환합니다.
+디코딩, 비교, 해시 변형은 `vsql::CustomArgWith<P>`를 받으며, 그 `params()`
+접근자는 `const P&`를 반환합니다.
+
+**SQL에서 매개변수 제공.** 두 가지 구문이 `resolve_params`에 도달합니다:
+
+- **정수** — `MYTYPE(N)`. 서버는 `N`을 `int_to_params`를 통해 라우팅해
+  매개변수 맵을 구성합니다. `.int_to_params<>()`가 필요합니다.
+- **문자열** — `MYTYPE('key=value,...')`. 서버는 문자열을 정규화하고
+  `resolve_params`를 직접 호출합니다. `int_to_params`는 관여하지 않습니다.
+  `.resolve_params<>()`가 등록되어 있으면 언제든 사용 가능합니다 — 추가 빌더 호출이 필요하지 않습니다.
+
+`.resolve_params<>()`만 등록하는 유형은 문자열 형식을 허용하고
+`MYTYPE(N)`을 거부합니다. `SHOW CREATE TABLE`은 작성된 형식을 그대로 보존합니다.
+
+```sql
+CREATE TABLE t (v ext.MYTYPE(8));              -- integer form (.int_to_params)
+CREATE TABLE t2 (v ext.MYTYPE('dimension=8')); -- string form (.resolve_params only)
+```
+
+<Note>
+`int_to_params`가 생성하고 `resolve_params`가 소비하는 직렬화된 `key=value,...`
+매개변수 문자열은 `VEF_MAX_TYPE_PARAMS_STRING_LEN`(1024바이트)으로 제한됩니다.
+표준 문자열이 그 한도를 초과하는 매개변수화는 조용히 잘리는 대신 정의된 오류로
+거부됩니다 — 단일 유형에 대한 매개변수 이름과 값의 합계를 1024바이트 이내로 유지하세요.
+</Note>
+
+### 매개변수 재작성 및 기본값 제공
+
+`resolve_params`에는 두 번째 변형(mutating overload)이 있습니다: 매개변수 맵을
+비상수 참조로 받아 유형이 이를 재작성할 수 있게 합니다 — 일반적으로 작성자가 생략한
+기본값을 채우기 위해서입니다. 동일한 방식으로 등록하세요(`.resolve_params<&fn>()`은
+두 형식 중 하나를 허용합니다. 하나만 등록하세요):
+
+```cpp
+bool mytype_resolve_params_fn(std::map<std::string, std::string> &params,
+                              vsql::ResolvedTypeParams *result, char *error_msg) {
+  if (params.find("dimension") == params.end())
+    params["dimension"] = "128";                 // supply a default
+  int64_t dim = std::stoll(params.at("dimension"));
+  result->persisted_length = dim * 4;
+  result->max_decode_buffer_length = 64;
+  return false;                                  // success
+}
+```
+
+재작성된 맵은 서버가 지속시키고 `SHOW CREATE TABLE`이 출력하는 표준 매개변수
+문자열이 되므로, 재작성은 멱등적이어야 합니다. **맨** 선언(`MYTYPE`, 길이나 매개변수 없음)은
+이제 이를 건너뛰는 대신 빈 맵으로 `resolve_params`를 호출하므로, 기본값을 제공하는
+유형은 모든 컬럼에 명시적 매개변수를 부여합니다 — `vsql_bitfield_test`의 `BITFIELD`는
+맨 컬럼을 `max_number_of_bits=4096`으로 해석합니다:
+
+```sql
+INSTALL EXTENSION vsql_bitfield_test;
+CREATE TABLE bits (id INT PRIMARY KEY, b vsql_bitfield_test.BITFIELD);
+SHOW CREATE TABLE bits;   -- b persists as BITFIELD('max_number_of_bits=4096')
+```
+
+## 가변 길이 유형
+
+가변 길이 사용자 정의 유형은 단일 고정 크기를 사용하는 대신 값별로 저장되는
+크기를 결정합니다. 유형 빌더에서 `.variable_length_type()`을 호출해 선언하며,
+이는 유형의 `variable_length` 플래그를 설정합니다.
+
+<Warning>
+`.variable_length_type()`은 유형에 필요한 프로토콜을 VEF 프로토콜 4로 높입니다.
+서버는 `variable_length` 플래그를 프로토콜 4 이상에서만 읽습니다. opt-in 방식의
+개발용 ABI 헤더(`-DVSQL_USE_DEV_ABI=ON`)로 빌드하세요. 이전 서버는
+플래그를 읽지 않습니다.
+</Warning>
+
+가변 길이 유형은 반드시 `.max_persisted_length(N)`도 호출해야 합니다. 이를 생략하면
+`build()`가 컴파일 타임에 실패합니다 — 서버는 백킹 필드에 버퍼를 할당하기 위해
+상한값이 필요합니다.
+
+`.variable_length_type()`은 단조적입니다: 프로토콜 3 설정자
+(`max_persisted_length()`, `params()`, `int_to_params()`) 앞이나 뒤에 호출해도
+프로토콜 요구 사항을 프로토콜 4 아래로 낮추지 않습니다.
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+static constexpr const char kMyTypeName[] = "MYTYPE";
+constexpr int64_t kMyTypeMaxPersistedLength = 4096;
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .variable_length_type()  // per-value sizing; requires Protocol 4
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .max_decode_buffer_length(64)
+        .from_string<&my_encode>()
+        .to_string<&my_decode>()
+        .compare<&my_compare>()
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE))
+```
+
+<Note>
+모든 사용자 정의 유형과 마찬가지로, 가변 길이 유형은 사용 가능한
+[내장 기본값](#intrinsic-default)을 생성해야 합니다. 기본값은 필드의 최대 용량에
+인코딩되며, 1에서 `max_persisted_length` 바이트 사이의 비어 있지 않은 모든 결과가
+허용됩니다. 빈 문자열 인코딩이 **0** 바이트를 생성하는 유형 — 예를 들어 빈 배열이나
+비트 집합 — 은 사용 가능한 기본값이 없으므로, 비어 있지 않은 값으로 인코딩되는
+명시적 기본값을 선언하세요:
+
+```cpp
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .intrinsic_default_str("[0]")  // empty "[]" would encode to zero bytes
+```
+
+그렇지 않으면 유형은 `NOT NULL` 컬럼이 처음 이를 참조할 때, `CREATE TABLE` 시점에
+초기화에 실패합니다 — `from_string("")`을 인코딩할 수 없는 고정 길이 유형과 동일합니다.
+</Note>
+
+## 저장 프로시저에서의 사용자 정의 유형
+
+사용자 정의 확장 유형은 저장 프로시저 매개변수 유형 및 `DECLARE` 변수 선언에서
+사용할 수 있습니다. 서버는 설치된 확장의 유형 메타데이터를 사용해 루틴 실행 시점에
+사용자 정의 유형을 해석합니다.
+
+```sql
+DELIMITER //
+CREATE PROCEDURE insert_complex(IN val COMPLEX)
+BEGIN
+  DECLARE tmp COMPLEX;
+  SET tmp = val;
+  INSERT INTO t1 VALUES (tmp);
+END //
+DELIMITER ;
+```
+
+## 참고 자료
+
+- [C++에서 사용자 정의 유형 만들기](/ko/mysql-8.4/0.0.5/custom-types) — 사용자 정의 유형에 대한 튜토리얼 소개
+- [C++ API 참조](/ko/mysql-8.4/0.0.5/extension-api-reference) — VDF 계약, null 처리 및 버퍼 크기 조정
+- [C++ 개발](/ko/mysql-8.4/0.0.5/development) — VDF 작성 심화, 인수 및 결과 유형, 집계, 가변 인수

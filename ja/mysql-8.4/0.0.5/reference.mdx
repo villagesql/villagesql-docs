@@ -1,0 +1,299 @@
+---
+audience: extension-author
+title: システムリファレンス
+description: 拡張メタデータとサーバーの状態を照会するためのVillageSQLシステムビューと変数
+---
+
+以下の標準SQLインターフェースを使用して、拡張メタデータとサーバーの状態を照会します。
+
+---
+
+## システムビュー
+
+### INFORMATION_SCHEMA.EXTENSIONS
+
+現在インストールされているVillageSQL拡張の一覧を表示します。
+
+<Note>
+`INSTALL EXTENSION` と `UNINSTALL EXTENSION` はVillageSQLのSQL拡張機能です。
+これらは標準的なMySQL 8.4の構文には含まれていません。
+</Note>
+
+**既知の列：**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `EXTENSION_NAME` | varchar | インストールされた拡張機能の名前 |
+| `EXTENSION_VERSION` | varchar | 拡張機能から報告されたバージョン文字列 |
+| `PENDING_VERSION` | text | 次回の再起動時に拡張機能が変更されるバージョン、または `NULL` |
+| `PENDING_REQUESTED_AT` | text | 保留中のバージョン変更が要求された日時、または `NULL` |
+| `PENDING_LAST_ERROR` | text | 失敗したバージョン変更からのメッセージ、または `NULL` |
+| `PENDING_LAST_ERROR_AT` | text | その失敗が記録された日時、または `NULL` |
+
+**例：**
+```sql
+-- Install an extension (VillageSQL-specific syntax)
+INSTALL EXTENSION vsql_complex;
+
+-- List all installed extensions
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+
+-- Check a specific extension's version
+SELECT EXTENSION_VERSION
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_complex';
+```
+
+**出力例**（実際のバージョン文字列はインストールされた拡張機能に依存します）：
+```
++------------------+-------------------+
+| EXTENSION_NAME   | EXTENSION_VERSION |
++------------------+-------------------+
+| vsql_complex     | 0.0.1             |
+| vsql_uuid        | 0.2.1             |
++------------------+-------------------+
+```
+
+`EXTENSION_NAME` の値は小文字で、`make_extension()` に渡された名前と一致します。
+
+このビューは現在のインストール状態を反映します。
+
+4つの `PENDING_*` 列は、スケジュールされた `ALTER EXTENSION ... AT RESTART`
+のバージョン変更を追跡します。ワークフローについては [拡張機能の管理](/ja/mysql-8.4/0.0.5/managing) を参照してください。
+
+---
+
+### INFORMATION_SCHEMA.COLUMNS (Custom Types)
+
+カスタム拡張型を使用する列は、標準的な
+`INFORMATION_SCHEMA.COLUMNS` ビューで確認できます。カスタム型は
+`DATA_TYPE` および `COLUMN_TYPE` 列に
+`extension_name.type_name` 形式で表示されます
+（例：`vsql_complex.COMPLEX`）。
+
+**例：**
+```sql
+-- Find all columns using custom extension types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY TABLE_SCHEMA, TABLE_NAME;
+
+-- Find columns using a specific extension's types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
+```
+
+**出力例：**
+```
++--------------+------------+-------------+---------------------+
+| TABLE_SCHEMA | TABLE_NAME | COLUMN_NAME | DATA_TYPE           |
++--------------+------------+-------------+---------------------+
+| mydb         | signals    | impedance   | vsql_complex.COMPLEX|
+| mydb         | signals    | frequency   | vsql_complex.COMPLEX|
++--------------+------------+-------------+---------------------+
+```
+
+---
+
+### INFORMATION_SCHEMA.EXTENSION_REGISTRATION
+
+読み込まれた各拡張機能のメモリ内VEF登録構造体をJSONドキュメントとして公開します。`INSTALL EXTENSION` 実行後に、サーバーが拡張機能の関数、型、システム変数を正しくパースしたことを確認するために使用します。
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL, REGISTRATION_JSON
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION
+WHERE EXTENSION_NAME = 'vsql_complex';
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `EXTENSION_NAME` | `VARCHAR(64)` | インストールされた拡張機能の名前。 |
+| `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | 拡張機能とサーバー間でネゴシエートされたVEFプロトコルバージョン。 |
+| `REGISTRATION_JSON` | `longtext` | `funcs` および `types` 配列を含む `vef_registration_t` 構造体のJSONシリアライズ。 |
+
+---
+
+## 一般的なクエリ
+
+### 拡張機能の依存関係の検索
+
+アンインストールする前に、特定の拡張機能の型を使用している列を特定します：
+
+```sql
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
+```
+
+### すべての拡張機能とそのカスタム型列の一覧表示
+
+```sql
+-- All installed extensions
+SELECT EXTENSION_NAME, EXTENSION_VERSION
+FROM INFORMATION_SCHEMA.EXTENSIONS
+ORDER BY EXTENSION_NAME;
+
+-- All columns using custom types across all extensions
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY DATA_TYPE, TABLE_SCHEMA, TABLE_NAME;
+```
+
+### 拡張機能の型を使用しているテーブルの検索
+
+```sql
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%'
+ORDER BY TABLE_SCHEMA, TABLE_NAME;
+```
+
+---
+
+## システム変数
+
+### veb_dir
+
+実行時に読み取り専用です。サーバーが `.veb` 拡張バンドルファイルを検索するディレクトリのパスを示します。`[mysqld]` セクションの `my.cnf` で設定します。サーバーの再起動なしでは変更できません。
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+**スコープ：** グローバル、実行時に読み取り専用。`my.cnf` で設定：
+
+```ini
+[mysqld]
+veb_dir=/path/to/extensions/
+```
+
+サポートされるのは単一のディレクトリのみです。配置とトラブルシューティングについては、[拡張機能の管理](/ja/mysql-8.4/0.0.5/managing) を参照してください。
+
+---
+
+### villagesql_server_version
+
+読み取り専用のグローバル変数です。サーバーバイナリにコンパイルされたVillageSQLバージョン文字列を返します。フォーマットは
+`{codebase}_{major}.{minor}.{patch}[-prerelease]` であり、`codebase` はこのビルドの派生元となる上流フォークを指します（ここでは `mysql-8.4`）。これは内部メタデータカタログにスタンプされたバージョンを同じ `{codebase}_{version}` 形式で報告する `villagesql_schema_version` とは別物です。
+
+```sql
+SELECT @@villagesql_server_version;
+-- Example output: mysql-8.4_0.0.5
+
+-- Show all VillageSQL system variables at once
+SHOW VARIABLES LIKE 'villagesql_%';
+```
+
+**スコープ：** グローバル、読み取り専用。実行時に設定できません。
+
+---
+
+### villagesql_vef_server_protocol
+
+読み取り専用のグローバル変数です。このサーバービルドでサポートされている最高のVEFプロトコルバージョンを返します。拡張機能の作成者は、登録時に利用可能なABI機能を確認するために、この値を `types.h` のプロトコル定数と比較できます。
+
+```sql
+SELECT @@villagesql_vef_server_protocol;
+```
+
+| Property | Value |
+|----------|-------|
+| **スコープ** | グローバル |
+| **アクセス** | 読み取り専用 |
+| **型** | 符号なし整数 (`0`–`255`) |
+| **現在の値** | `4` (`VEF_PROTOCOL_4`) |
+
+**プロトコル V4 が追加する機能**
+
+`VEF_PROTOCOL_4` 以上をネゴシエートした拡張機能は、`vef_type_desc_t` の
+`variable_length` フィールドにアクセスできるようになります。`true` に設定すると、
+型の永続化サイズは単一の固定フットプリントではなく、値ごとに決定されます。可変長型は
+上限として `max_persisted_length` も宣言する必要があります。このフラグを設定するには、
+`TypeBuilder` の `variable_length_type()` ビルダーメソッドを使用してください。`variable_length` を
+直接書き込まないでください。このフィールドは、ネゴシエートされたプロトコルが
+`VEF_PROTOCOL_4` 以上の場合にのみサーバーによって読み取られます。
+
+`VEF_PROTOCOL_4` は `vef_func_desc_t` の `max_result_length` フィールドも追加します。
+関数は `STRING` 結果の最大長（文字数）を宣言できるため、マテリアライズされた結果
+（GROUP BY/DISTINCT の一時テーブル、`CREATE TABLE ... SELECT`、UNION）が引数の幅で
+切り詰められることなく、完全な値を保持します。`0` の場合は引数の幅にフォールバックします。
+これは STRING 専用で、`VEF_MAX_RESULT_LENGTH`（16 MiB / 16777216 バイト）を上限とします。
+これより大きい宣言値はこの上限に制限されます。`FuncBuilder` の `max_result_length()`
+ビルダーメソッドで設定します。
+
+プロトコル V4 は活発に開発が進められています。オプトインする拡張機能は
+`-DVSQL_USE_DEV_ABI=ON` を付けてビルドする必要があり、安定化する前に
+ABI が変更されることを想定しておく必要があります。
+
+`vef_type_desc_t` と `vef_func_desc_t` の完全な定義については `abi/types.h` を、
+`variable_length_type()` については `type_builder.h` を、`max_result_length()`
+については `func_builder.h` を参照してください。
+
+この値はコンパイル時の定数 `vef_server_protocol_version`
+を反映しており、実行時に変更することはできません。
+
+---
+
+### villagesql_build_info
+
+読み取り専用のグローバル変数です。このサーバーバイナリがどのようにビルドされたかに関するメタデータ（ソースコミット、ワークツリーの状態、およびビルド環境）を含む JSON オブジェクトを返します。
+
+```sql
+SELECT @@villagesql_build_info;
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `git_sha` | string | 40文字のソースコミットSHA全体、利用できない場合は `"unknown"` |
+| `is_dirty` | bool | ビルド時にワークツリーに未コミットの変更があった場合は `true` |
+| `files_added` | integer | ビルド時に追加または未追跡だったファイル |
+| `files_deleted` | integer | ビルド時に削除されたファイル |
+| `files_modified` | integer | ビルド時に変更されたファイル |
+| `build_timestamp` | string | ISO-8601 UTC タイムスタンプ、例：`"2026-06-17T12:34:56Z"` |
+| `build_host` | string | ビルドマシンのホスト名 |
+| `build_os` | string | ホストのオペレーティングシステム：`"linux"` または `"macos"` |
+| `build_arch` | string | ホストのCPUアーキテクチャ：`"x86_64"`、`"aarch64"`、または `"arm64"` |
+
+**スコープ：** グローバル、読み取り専用。実行時に設定できません。
+
+クリーンなリリースビルドでは `is_dirty: false` となり、3つのファイル数フィールドはすべてゼロになります。
+変更されたワークツリーからのビルドでは、`files_added`、`files_deleted`、または
+`files_modified` にゼロ以外の数が表示されます。
+
+---
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card
+    title="拡張機能の管理"
+    icon="sliders"
+    href="/ja/mysql-8.4/0.0.5/managing"
+  >
+    拡張機能の監視とトラブルシューティング
+  </Card>
+  <Card
+    title="拡張機能のインストール"
+    icon="download"
+    href="/ja/mysql-8.4/0.0.5/install"
+  >
+    新しい拡張機能の追加
+  </Card>
+  <Card
+    title="拡張機能のアーキテクチャ"
+    icon="sitemap"
+    href="/ja/mysql-8.4/0.0.5/architecture"
+  >
+    内部構造の理解
+  </Card>
+  <Card
+    title="利用可能な拡張機能"
+    icon="list"
+    href="/ja/extensions"
+  >
+    拡張機能カタログの閲覧
+  </Card>
+</CardGroup>

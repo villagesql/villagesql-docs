@@ -1,0 +1,272 @@
+---
+audience: extension-author
+title: "C++에서 사용자 정의 유형 만들기"
+description: "C++에서 VillageSQL 확장용 새 열 유형 정의 — 유형 연산, ALTER TABLE 규칙, 변환 함수 및 완전한 COMPLEX 유형 예제."
+---
+
+<Warning>
+  사용자 정의 유형은 VEF 프로토콜 3을 사용하며, v0.0.4부터 안정화되었습니다. 프로토콜 4는 개발 중이며, 개발용 ABI 헤더를 opt-in 방식으로만 사용 가능합니다(`-DVSQL_USE_DEV_ABI=ON`). 이전 프로토콜 2로 빌드된 확장은 서버에서 거부되며 재빌드가 필요합니다.
+</Warning>
+
+사용자 정의 유형을 통해 `COMPLEX`, `UUID`, `VECTOR`와 같은 새 열 유형을 정의할 수 있습니다. 이 유형들은 `ORDER BY`, 인덱스, 집계 함수와 함께 작동합니다. 이 페이지는 [C++에서 확장 만들기](/ko/mysql-8.4/0.0.5/create) 튜토리얼의 4단계입니다. 계속하기 전에 1~3단계를 완료하세요.
+
+## 유형 연산 정의
+
+사용자 정의 유형은 인코딩, 디코딩, 비교 연산을 필요로 하며, 선택적으로 해시 연산을 포함할 수 있습니다. 이 서명에 맞춰 구현하고 `vsql::make_type<>()`에 빌더 객체를 전달하세요:
+
+```cpp
+// Encode: string -> binary. Write to out.buffer() and call out.set_length(n).
+void mytype_from_string(std::string_view from, vsql::CustomResult out) { /* ... */ }
+
+// Decode: binary -> string. Write to out.buffer() and call out.set_length(n).
+void mytype_to_string(vsql::CustomArg in, vsql::StringResult out) { /* ... */ }
+
+// Compare: returns <0, 0, or >0.
+int mytype_compare(vsql::CustomArg a, vsql::CustomArg b) { /* ... */ }
+
+// Hash: returns hash code (optional).
+size_t mytype_hash(vsql::CustomArg in) { /* ... */ }
+```
+
+<Note>
+`from_string` VDF(문자열을 사용자 정의 유형으로 변환하는 함수)의 경우, 서버는 VDF를 호출하기 전에 출력 버퍼를 유형의 `persisted_length` 값 이상으로 크기 조정합니다. 따라서 `buf.size() >= persisted_length`가 호출 시 보장됩니다. 이는 고정 폭 유형과 매개변수화 유형(해당 유형 컨텍스트에서 `persisted_length`가 호출 시 해석됨) 모두에 적용됩니다. 별도의 버퍼 크기 요청이 필요하지 않습니다.
+</Note>
+
+원시 바이너리 접근은 `vsql::Span<T>`를 통해 이루어집니다. 이는 `T`의 연속된 시퀀스를 가리키는 소유하지 않는 뷰로, `in.value()`는 `vsql::Span<const unsigned char>`를 반환하고 `out.buffer()`는 `vsql::Span<unsigned char>`를 반환합니다. C++20 이상에서는 `vsql::Span<T>`가 `std::span<T>`의 별칭이며, C++17에서는 동일한 `data()`, `size()`, `empty()`, 인덱싱, 반복자 인터페이스를 제공하는 최소한의 소스 호환 대체 구현이 C++ SDK에 포함됩니다. `#include <villagesql/vsql.h>`를 통해 사용할 수 있습니다.
+
+## 유형 등록
+
+`vsql::make_type<kName>()` 템플릿은 인코딩, 디코딩, 비교, 해시 연산을 유형 객체 내부에 직접 포함합니다. VDF 이름은 컴파일 타임에 `TYPE::from_string`, `TYPE::to_string`, `TYPE::compare`, `TYPE::hash`로 자동 생성됩니다. 별도의 `.func(make_type_encode<>(...))` 호출이 필요하지 않습니다.
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Required for auto-generating VDF names at compile time.
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&mytype_from_string>()   // auto: "MYTYPE::from_string"
+        .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
+        .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
+        .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
+        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Development guide
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE)
+);
+```
+
+`from_string`, `to_string`, `compare` 중 하나가 누락되면 `build()`가 컴파일 오류를 발생시킵니다. 각 템플릿 메서드는 `static_assert`로 함수 포인터 서명을 검증합니다.
+
+유형 이름은 비유형 템플릿 매개변수(NTTP)로 전달됩니다. `static constexpr const char[]` 배열로 선언하세요. 포인터의 식별 정보(identity)가 독립된 VDF 이름 버퍼의 키로 사용되므로, 동일한 함수 포인터를 공유하는 두 유형도 별도의 자동 생성 이름을 갖습니다.
+
+## 유형 연산 참조
+
+템플릿 기반 API는 다음 SQL 호출 가능한 VDF를 자동 생성합니다:
+
+| 빌더 메서드 | 자동 생성된 VDF 이름 | VDF SQL 서명 |
+|------|------|-------------|
+| `.from_string<&f>()` | `TYPE::from_string` | `(STRING) -> CUSTOM(this type)` |
+| `.to_string<&f>()` | `TYPE::to_string` | `(CUSTOM(this type)) -> STRING` |
+| `.compare<&f>()` | `TYPE::compare` | `(CUSTOM(this type), CUSTOM(this type)) -> INT` |
+| `.hash<&f>()` | `TYPE::hash` | `(CUSTOM(this type)) -> INT` |
+
+전체 C++ 서명은 [유형 연산](/ko/mysql-8.4/0.0.5/type-operations)을 참조하세요.
+
+## ALTER TABLE 및 사용자 정의 유형
+
+사용자 정의 유형이 포함된 `ALTER TABLE ... MODIFY COLUMN` 및 `CHANGE COLUMN`은 다음 규칙을 적용합니다:
+
+| 원본 | 대상 | 결과 |
+|------|----|------|
+| 비사용자 정의 유형 | 사용자 정의 유형 | 오류: `Cannot convert column 'col' to custom type 'MYTYPE'` |
+| 사용자 정의 유형 | 문자열 유형 | 허용 |
+| 사용자 정의 유형 | 비문자열 유형 | 오류: `Cannot convert custom type column 'col' to non-string type` |
+| 사용자 정의 유형 | 다른 사용자 정의 유형 | 호환되지 않을 경우 오류: `Cannot convert between incompatible custom types 'A' and 'B'` |
+
+## 유형 변환 함수
+
+템플릿 기반 API에서는 인코딩 및 디코딩 VDF가 유형 객체 내부에 포함되어 자동 등록되므로 별도의 `.func()` 호출이 필요하지 않습니다. 자동 생성된 VDF는 SQL에서 호출 가능합니다:
+
+```sql
+-- Convert string to custom type (calls MYTYPE::from_string)
+SELECT MYTYPE::from_string('(1.0,2.0)');
+
+-- Convert custom type to string (calls MYTYPE::to_string)
+SELECT MYTYPE::to_string(my_column) FROM my_table;
+
+-- Explicit conversion in INSERT
+INSERT INTO my_table (id, value)
+VALUES (1, MYTYPE::from_string('(3.0,4.0)'));
+```
+
+**명시적 변환이 필요한 경우.** VillageSQL은 직접 컬럼 할당 시 문자열 리터럴을 사용자 정의 유형으로 암시적으로 변환하므로, `INSERT INTO t (val) VALUES ('(1.0,2.0)')`와 같이 명시적 호출 없이도 작동합니다. 그러나 `STRING` 유형으로 평가되는 표현식(`CASE` 표현식, `CONCAT` 등)은 암시적으로 변환되지 않습니다. 이를 `TYPE::from_string`으로 감싸야 합니다:
+
+```sql
+UPDATE my_table
+SET val = MYTYPE::from_string(
+  CASE (pk MOD 2)
+    WHEN 0 THEN '(1.0,2.0)'
+    ELSE '(0.0,0.0)'
+  END
+);
+```
+
+## 예제: COMPLEX 유형
+
+다음은 COMPLEX 숫자 유형을 구현한 완전한 예제입니다:
+
+```cpp
+#include <cstdio>
+#include <cstring>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Encode: "(real,imag)" string -> 16 bytes little-endian
+void encode_complex(std::string_view from, CustomResult out) {
+    auto buf = out.buffer();
+    if (buf.size() < 16) return;
+    double real, imag;
+    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+        out.warning("invalid complex format: expected (real,imag)");
+        return;
+    }
+    memcpy(buf.data(), &real, 8);
+    memcpy(buf.data() + 8, &imag, 8);
+    out.set_length(16);
+}
+
+// Decode: 16 bytes -> "(real,imag)" string
+void decode_complex(CustomArg in, StringResult out) {
+    auto data = in.value();
+    if (data.size() < 16) return;
+    double real, imag;
+    memcpy(&real, data.data(), 8);
+    memcpy(&imag, data.data() + 8, 8);
+    auto buf = out.buffer();
+    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
+    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
+    out.set_length(static_cast<size_t>(len));
+}
+
+// Compare for ORDER BY: real part first, then imaginary
+int compare_complex(CustomArg a, CustomArg b) {
+    auto da = a.value();
+    auto db = b.value();
+    if (da.size() < 16 || db.size() < 16) return 0;
+    double a_real, a_imag, b_real, b_imag;
+    memcpy(&a_real, da.data(), 8);
+    memcpy(&a_imag, da.data() + 8, 8);
+    memcpy(&b_real, db.data(), 8);
+    memcpy(&b_imag, db.data() + 8, 8);
+    if (a_real < b_real) return -1;
+    if (a_real > b_real) return 1;
+    if (a_imag < b_imag) return -1;
+    if (a_imag > b_imag) return 1;
+    return 0;
+}
+```
+
+이러한 연산을 정의한 후 사용자는 사용자 정의 유형을 사용해 테이블을 생성할 수 있습니다:
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    frequency_response COMPLEX
+);
+
+INSERT INTO signals VALUES (1, '(50.0,10.0)', '(0.95,0.31)');
+
+-- ORDER BY works because we provided compare_complex!
+SELECT * FROM signals ORDER BY impedance;
+
+-- Prepared statements work with custom types
+PREPARE stmt FROM 'SELECT * FROM signals WHERE impedance = ?';
+SET @val = '(50.0,10.0)';
+EXECUTE stmt USING @val;
+
+-- Aggregate operations work with custom types
+SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
+       GROUP_CONCAT(impedance ORDER BY impedance) FROM signals;
+```
+
+## 생성된 컬럼에서의 VDF
+
+VDF는 생성된 컬럼 표현식에서 사용할 수 있습니다. VDF는 확장 빌더에서 `.deterministic()`으로 선언되어야 합니다. 서버는 이 컨텍스트에서 비결정적 함수를 차단합니다.
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    -- Generated column computed by a VDF
+    magnitude DOUBLE GENERATED ALWAYS AS (complex_abs(impedance)) STORED
+);
+```
+
+<Note>
+`complex_abs`는 `.deterministic()`으로 등록되어야 합니다. 전통적인 MySQL UDF는 생성된 컬럼에서 허용되지 않습니다.
+</Note>
+
+완전한 구현은 [vsql_complex 예제](/ko/mysql-8.4/0.0.5/examples)를 참조하세요.
+
+## 함수형 인덱스에서의 VDF
+
+VDF는 함수형 인덱스 표현식에서 사용할 수 있습니다. 생성된 컬럼과 동일한 `.deterministic()` 요구 사항이 적용됩니다. MySQL은 함수형 인덱스를 숨겨진 생성된 컬럼으로 구현하기 때문입니다.
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    sig COMPLEX,
+    INDEX idx_magnitude ((COMPLEX_ABS(sig)))
+);
+```
+
+최적화 도구는 동일한 VDF 표현식이 `WHERE`, `ORDER BY`, `GROUP BY`에 나타날 때 인덱스를 사용합니다. 비교 값을 VDF의 반환 유형으로 캐스팅하여 최적화 도구가 표현식을 일치시킬 수 있도록 해야 합니다:
+
+```sql
+SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+```
+
+## 다음 단계
+
+유형이 정의되면, 확장을 빌드하고 설치하기 위해 튜토리얼의 5단계로 계속 진행하세요.
+
+<CardGroup cols={2}>
+  <Card
+    title="계속: 확장 빌드"
+    icon="hammer"
+    href="/ko/mysql-8.4/0.0.5/create#step-5-update-build-configuration"
+  >
+    확장을 빌드하고 설치하기 위해 튜토리얼로 돌아가세요.
+  </Card>
+  <Card
+    title="매개변수화 유형"
+    icon="sliders"
+    href="/ko/mysql-8.4/0.0.5/type-operations#parameterized-types"
+  >
+    VECTOR(1536)과 같이 매개변수를 받는 유형 — 차원 인식 인코딩, 디코딩 및 저장 크기 조정.
+  </Card>
+  <Card
+    title="확장 API 참조"
+    icon="book"
+    href="/ko/mysql-8.4/0.0.5/extension-api-reference"
+  >
+    VDF API 계약, null 처리, 버퍼 크기 조정 및 고급 패턴.
+  </Card>
+  <Card
+    title="복제"
+    icon="arrow-right-left"
+    href="/ko/mysql-8.4/0.0.5/managing#replication"
+  >
+    ROW 형식 요구 사항, 확장 설치 순서 및 복제 설정에서의 버전 일치.
+  </Card>
+</CardGroup>

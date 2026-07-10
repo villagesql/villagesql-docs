@@ -1,0 +1,201 @@
+---
+title: "네트워크 의존 확장 테스트하기"
+description: "OS가 할당하는 포트와 포그라운드 런처를 사용하여, HTTP 서버나 외부 리스너를 생성하는 확장에 대해 안정적인 MTR 테스트를 작성하세요."
+audience: extension-author
+---
+
+일부 확장은 테스트 중에 외부 HTTP 서버나 다른 네트워크 리스너와 통신해야 합니다 — 예를 들어, 아웃바운드 HTTP 요청을 보내는 확장은 이를 수신할 로컬 에코 서버가 필요합니다. 이 페이지에서는 이러한 테스트가 `--parallel=auto` 아래에서 그리고 여러 운영 체제에 걸쳐 안정적으로 실행되도록 구성하는 방법을 다룹니다.
+
+여기 나오는 패턴은 C++ 확장과 Rust 확장에 동일하게 적용됩니다 — 둘 다 `cargo vsql test`를 통해 MTR을 테스트 러너로 사용합니다.
+
+## 하드코딩된 포트가 실패하는 이유
+
+두 가지 실패 모드가 MTR에서 하드코딩된 포트를 불안정하게 만듭니다:
+
+**`--parallel` 아래에서의 포트 충돌.** MTR은 각 워커에 `@@port` 값을 중심으로 한 포트 범위를 할당합니다. 그 범위를 벗어난 고정 포트(예: `18777`)는 다른 워커의 예약된 블록이나 시스템 서비스와 충돌할 수 있습니다 — 이는 높은 병렬성에서만 재현되는 간헐적인 `EADDRINUSE`를 유발합니다.
+
+**OS 수준의 변경.** 새로운 러너 이미지와 OS 버전은 이전에 동작하던 포트를 주기적으로 예약하거나 제한합니다. 오늘 로컬과 CI에서 통과하는 포트가 내일은 조용히 바인딩에 실패할 수 있습니다.
+
+두 경우 모두 해결책은 동일합니다: 포트 `0`에 바인딩하여 OS가 사용 가능한 포트를 할당하게 한 다음, 실제 포트를 테스트에 다시 전달하는 것입니다.
+
+## 패턴 A: 서버 통합 리스너
+
+네트워크 리스너가 MySQL 프로세스 안에서 실행될 때 이 방법을 사용하세요 — 예를 들어, HTTP 서버를 내장하는 확장의 경우입니다.
+
+**확장에서**, 바인딩 후 바인딩된 포트를 상태 변수로 노출하세요:
+
+```cpp
+// After calling bind() with port 0:
+vsql_my_http_port = server.actual_port();  // exposed as vsql_my_ext.http_port
+```
+
+**테스트에서**, MTR의 `wait_condition.inc`를 사용하여 상태 변수가 0이 아닐 때까지 폴링한 다음, 포트를 MTR 변수로 캡처하세요. `UNINSTALL EXTENSION` / `INSTALL EXTENSION` 주기가 있을 때마다 다시 읽으세요 — 임시 포트는 바인딩할 때마다 변경됩니다.
+
+```sql
+--disable_query_log
+let $wait_timeout= 10;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_my_ext.http_port';
+--source include/wait_condition.inc
+--let $my_port = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_my_ext.http_port'`
+--enable_query_log
+
+--eval SET @url = CONCAT('http://127.0.0.1:', $my_port, '/endpoint');
+SELECT my_extension.fetch(@url);
+```
+
+## 패턴 B: 외부 프로세스 리스너
+
+리스너가 독립 실행형 프로세스일 때 이 방법을 사용하세요 — Python 헬퍼 서버, 모의 API, 또는 MTR이 직접 제어하지 않는 임의의 외부 프로그램입니다.
+
+<Note>
+  이 패턴은 `PATH`에 `python3`가 있어야 합니다. GitHub 호스팅 러너에는 포함되어 있습니다. 자체 호스팅 러너에서는 사용하기 전에 사용 가능 여부를 확인하세요.
+</Note>
+
+### 포그라운드 런처
+
+`--exec ... &`로 서버를 백그라운드에서 실행하고 포트를 폴링하는 대신, 다음을 수행하는 포그라운드 런처 스크립트를 사용하세요:
+
+1. `start_new_session=True`로 서버를 서브프로세스에서 시작합니다
+2. 서버가 바인딩하고 준비 완료 파일을 작성할 때까지 블록합니다
+3. 종료하여 MTR이 계속 진행하도록 합니다
+
+MTR은 포그라운드 `--exec` 호출에서 블록하므로, 이는 어떤 SQL이 실행되기 전에 서버가 준비되었음을 보장합니다 — 별도의 폴러나 sleep이 필요 없습니다.
+
+**`launcher.py`** — `--write_file`로 작성하세요:
+
+```python
+import os, subprocess, sys, time
+
+_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Start the server subprocess detached from this process
+proc = subprocess.Popen(
+    [sys.executable, os.path.join(_dir, 'echo_server.py')],
+    start_new_session=True,
+    stdout=open(os.path.join(_dir, 'echo_server.log'), 'w'),
+    stderr=subprocess.STDOUT,
+)
+
+# Write PID for cleanup
+with open(os.path.join(_dir, 'echo_server.pid'), 'w') as f:
+    f.write(str(proc.pid))
+
+# Block until readiness file appears and is non-empty.
+# Check content, not just existence — the file is created before the write
+# completes and an empty read would produce a broken MTR include.
+port_inc = os.path.join(_dir, 'echo_port.inc')
+for _ in range(40):
+    try:
+        if open(port_inc).read().strip():
+            sys.exit(0)
+    except OSError:
+        pass
+    time.sleep(0.25)
+
+# Timed out — print server log for diagnosis
+with open(os.path.join(_dir, 'echo_server.log')) as f:
+    sys.stderr.write(f.read())
+sys.exit(1)
+```
+
+**`echo_server.py`** — 서빙하기 전에 포트를 작성하는 실제 서버입니다:
+
+```python
+import http.server, json, os, signal
+
+signal.alarm(60)  # self-terminate if orphaned by a killed MTR job
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def handle_any(self):
+        n = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(n).decode() if n else ''
+        self.send_response(200)
+        payload = json.dumps({'method': self.command, 'body': body}).encode()
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(payload))
+        self.end_headers()
+        self.wfile.write(payload)
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = handle_any
+    def log_message(self, *args): pass
+
+_dir = os.path.dirname(os.path.abspath(__file__))
+srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+port = srv.server_address[1]
+
+# Write atomically via rename — the launcher reads content, not just existence,
+# so the file must be complete before it becomes visible.
+tmp = os.path.join(_dir, 'echo_port.tmp')
+inc = os.path.join(_dir, 'echo_port.inc')
+with open(tmp, 'w') as f:
+    f.write('let $echo_port = %d;\n' % port)
+os.rename(tmp, inc)
+
+srv.serve_forever()
+```
+
+### 테스트에서
+
+런처를 시작한 다음(포그라운드 — MTR은 종료될 때까지 블록합니다), 포트 파일을 소스로 가져오세요:
+
+```sql
+--write_file $MYSQLTEST_VARDIR/tmp/echo_server.py
+# ... (echo_server.py contents)
+EOF
+
+--write_file $MYSQLTEST_VARDIR/tmp/launcher.py
+# ... (launcher.py contents)
+EOF
+
+--exec python3 $MYSQLTEST_VARDIR/tmp/launcher.py
+--disable_query_log
+--source $MYSQLTEST_VARDIR/tmp/echo_port.inc
+--eval SET @echo_url = CONCAT('http://127.0.0.1:', $echo_port, '/');
+--enable_query_log
+```
+
+## 포트를 결과 파일에서 제외하기
+
+결과 파일은 작성된 대로 SQL을 기록합니다. URL에 임시 포트 번호가 포함되어 있으면, 결과 파일에는 실행할 때마다 다른 값이 들어가고 테스트는 항상 기록/재생에서 실패하게 됩니다.
+
+포트 파일을 소스로 가져오고 MySQL 세션 변수를 `--disable_query_log` 아래에서 함께 설정하여, `let` 할당과 임시 포트 어느 것도 출력에 나타나지 않도록 하세요. URL이 필요한 모든 곳에서 세션 변수를 사용하세요:
+
+```sql
+--disable_query_log
+--source $MYSQLTEST_VARDIR/tmp/echo_port.inc
+--eval SET @echo_url = CONCAT('http://127.0.0.1:', $echo_port, '/');
+--enable_query_log
+
+# All queries reference @echo_url — the port never appears in the result file
+SELECT JSON_VALUE(CONVERT(my_ext.http_get(@echo_url) USING utf8mb4), '$.status') AS status;
+```
+
+## 프로세스 관리
+
+**헬퍼 출력을 로깅하세요 — 절대 버리지 마세요.** 위의 런처 패턴은 서버의 stderr를 `echo_server.log`에 작성하고 실패 시 이를 출력합니다. 헬퍼 출력을 버리면 CI 아티팩트에서 플레이크를 설명할 수 없게 됩니다.
+
+**이름이 아니라 PID로 종료하세요.** Linux에서 `pkill -f echo_server.py`는 `/proc/cmdline`을 통해 MTR 프로세스 자체와 일치할 수 있습니다. 런처가 작성한 PID 파일을 사용하세요:
+
+```sql
+--exec sh -c 'kill $(cat $MYSQLTEST_VARDIR/tmp/echo_server.pid) 2>/dev/null || true'
+```
+
+**테스트가 끝나기 전에 모든 임시 파일을 제거하세요.** MTR의 check-testcase는 `$MYSQLTEST_VARDIR/tmp/`에 남겨진 파일을 더티 상태로 표시하고 테스트를 실패시킵니다:
+
+```sql
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.py
+--remove_file $MYSQLTEST_VARDIR/tmp/launcher.py
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.log
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.pid
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_port.inc
+```
+
+패턴 B의 완전하고 테스트된 구현은 `vsql-http/mysql-test/t/vsql_http_requests.test`를 참조하세요 — `--write_file`부터 정리까지 전체 테스트 생명 주기를 다룹니다.
+
+## 참고
+
+- [C++ 테스트](/ko/mysql-8.4/0.0.5/testing) — MTR 설정, 스위트 실행, 결과 기록, 실패 디버깅
+- [C++로 확장 만들기](/ko/mysql-8.4/0.0.5/create) — 엔드투엔드 빌드 단계 및 CMake 설정
+- [C++ 개발](/ko/mysql-8.4/0.0.5/development) — VDF 작성, 인수 유형, 결과 처리

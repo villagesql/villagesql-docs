@@ -1,0 +1,287 @@
+---
+audience: extension-author
+title: "C++ API リファレンス"
+description: "VillageSQL 拡張機能の VDF API コントラクト、NULL 値の処理、バッファーのサイズ設定、エンコード/デコードの規則、プリラン/ポストラン フック、および SQL 機能との互換性。"
+---
+
+このページは、C++ 拡張機能の作成者向けのリファレンスです。ステップバイステップのチュートリアルについては、[C++ での拡張機能の作成](/ja/mysql-8.4/0.0.5/create) を参照してください。カスタム列タイプについては、[C++ でのカスタムタイプ](/ja/mysql-8.4/0.0.5/custom-types) を参照してください。
+
+<Note>
+  API がこのような形になっている理由が気になりますか？型付き引数/結果 API や
+  `prerun()`、可変長引数などの低レベルフックの背後にある設計思想については、
+  [Happy Path, Escape Hatch,
+  and the Space Between](https://villagesql.com/blog/escape-hatch/) を参照してください。
+</Note>
+
+## VDF 関数コントラクト
+
+これらのコントラクトは、VDF 実装関数が VEF ランタイムとどのように連携するかを規定します。`make_func<>` を使用して登録されたすべての関数は、これらに従う必要があります。以下に参照されている型は、`#include <villagesql/vsql.h>` を介して利用できます。
+
+**1. VDF 実装関数は `void` 型であり、値を返しません。**
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    // ... compute result ...
+    return;  // always void — no return value
+}
+```
+
+成功、NULL、警告、またはエラーは、結果型のいずれかの終端メソッドを呼び出すことによって伝達されます: `out.set(...)` / `out.set_length(n)`、`out.set_null()`、`out.warning(msg)`、または `out.error(msg)`。
+
+**2. `input.value()` を呼び出す前に、`input.is_null()` を確認します。**
+
+`is_null()` が true を返す場合、`value()` を呼び出すと未定義の動作になります。
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+    // Safe to call input.value() -> std::string_view
+}
+```
+
+**3. 文字列結果の場合、`out.buffer()` に書き込み、`out.set_length(n)` を呼び出します。書き込む前に、`out.buffer().size()` を確認します。**
+
+- `out.buffer()` は、サーバーが管理するバッファーに対する `Span<char>` を返します。
+- `out.set_length(n)` は、書き込まれたバイト数を記録します。
+- `out.buffer().size()` は、最大容量です。書き込む前に必ず確認してください。
+
+```cpp
+void upper_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    if (sv.size() > buf.size()) {
+        out.error("Input length exceeds buffer size");
+        return;
+    }
+
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = toupper(sv[i]);
+    }
+    out.set_length(sv.size());
+}
+```
+
+**4. エラーメッセージを `out.error(msg)` に渡します。メッセージは、必要に応じて `VEF_MAX_ERROR_LEN` (512 バイト) に切り捨てられます。**
+
+`out.error(msg)` は `std::string_view` を受け入れます。メッセージをサーバーが管理するバッファーにコピーし、結果の状態を 1 回の呼び出しでエラーに設定します。
+
+```cpp
+// Correct — error goes through out.error()
+out.error("Invalid input: expected positive integer");
+return;
+```
+
+## 関数の実装
+
+実装関数は、型付きの引数と結果型を使用します。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <algorithm>
+
+using namespace vsql;
+
+// String reverse implementation
+void my_reverse_impl(StringArg input, StringResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = sv[sv.size() - 1 - i];
+    }
+    out.set_length(sv.size());
+}
+
+// Count vowels implementation
+void count_vowels_impl(StringArg input, IntResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    long long count = 0;
+    for (char c : input.value()) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    out.set(count);
+}
+```
+
+## NULL 値の処理
+
+`is_null()` を使用して NULL をチェックし、`set_null()` を呼び出して NULL を返します。
+
+**NULL 値の処理オプション:**
+- **入力 NULL チェック:** `input.is_null()`
+- **NULL 値を返す:** `out.set_null()`
+- **戻り値:** `out.set(v)` (数値/カスタム) または、文字列の場合、`out.buffer()` に書き込んだ後に `out.set_length(n)`
+- **警告を返す:** `out.warning(msg)` — この行に対して NULL を返し、SQL 警告を追加し、実行を継続します。厳密モードでは、MySQL は INSERT/UPDATE でこれをエラーに昇格させます。`out.set()` の代わりとして呼び出し、併用（同時呼び出し）はしないでください。
+- **エラーを返す:** `out.error(msg)` — ステートメントの実行を中止します。
+
+## エラー処理
+
+検証の失敗または無効な入力に対して、カスタムメッセージを使用してエラーを返します。
+
+```cpp
+void validate_age_impl(IntArg age_input, IntResult out) {
+    if (age_input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    long long age = age_input.value();
+
+    if (age < 0 || age > 150) {
+        out.error("Age must be between 0 and 150");
+        return;
+    }
+
+    out.set(age);
+}
+```
+
+## プリラン/ポストランによるステートメントごとの状態
+
+フックは `.prerun<>()` および `.postrun<>()` を使用して登録します。必要なシグネチャは次のとおりです。
+
+```cpp
+void my_prerun(vsql::PrerunArgs args, vsql::PrerunResult out);
+void my_postrun(vsql::PostrunArgs args);
+```
+
+`PrerunArgs` および `PostrunArgs` メソッドの詳細については、Development ガイドの
+[ステートメントごとの状態](/ja/mysql-8.4/0.0.5/development#per-statement-state-prerun-and-postrun)
+を参照してください。
+
+<Note>
+**ほとんどの拡張機能では、プリラン/ポストラン フックは必要ありません。** C++ SDK は、
+型チェックや結果バッファーのサイズ設定など、一般的なケースを自動的に処理します。
+STRING を返す VDF と CUSTOM を返す VDF の両方について、VDF 本体が実行される前に、
+結果バッファーは解決された戻り値の型に合わせて拡張されます。プリラン/ポストランは、
+行ごとに発生するべきではない、コストの高いステートメントごとのセットアップ (接続のオープンなど)
+が必要な場合にのみ使用してください。
+
+プリラン/ポストランをユースケースで使用する必要がある場合は、
+[VillageSQL Discord](https://discord.gg/KSr6whd3Fr) でシナリオを共有してください。
+チームは、C++ SDK サポートを追加して、これを自動的に処理できるようにする場合があります。
+</Note>
+
+## 集計関数
+
+組み込みの集計関数 COUNT(DISTINCT)、MIN、MAX、および GROUP_CONCAT は、カスタム型でもすぐに使用できます。MIN および MAX には、型に登録された比較関数が必要です。
+
+カスタム集計 VDF もサポートされています。`make_aggregate_func<State, &result_fn>("name")` を使用して登録し、`.returns()`、`.param()`、`.clear<>()`、および `.accumulate<>()` をチェーンしてから、`.build()` を呼び出します。`.clear<>()` と `.accumulate<>()` の両方が必要です。ビルダー API とコールバックのシグネチャについては、[集計 VDF](/ja/mysql-8.4/0.0.5/development#aggregate-vdfs) を参照してください。
+
+**カスタム型を使用した組み込みの集計操作:**
+```sql
+-- COUNT(DISTINCT) works with custom types
+SELECT COUNT(DISTINCT impedance) FROM signals;
+
+-- MIN and MAX work with custom types (requires compare function)
+SELECT MIN(impedance), MAX(impedance) FROM signals;
+
+-- GROUP_CONCAT works with custom types
+SELECT GROUP_CONCAT(impedance ORDER BY impedance SEPARATOR ', ') FROM signals;
+```
+
+拡張機能の関数は、1 行ごとの実行モデルで呼び出されます。
+
+- 各関数呼び出しは、独自の結果バッファー (スレッドセーフ) を持つ 1 行を処理します。
+- `prerun`/`postrun` は、ステートメントごとのセットアップ/ティアダウンを提供します。
+- **グローバル状態を避けてください** - 関数パラメーターと戻り値を使用します。
+- グローバル状態を使用する必要がある場合は、ミューテックス/ロックで保護します。
+
+**ベストプラクティス:** シンプルさと安全性のために、ステートレスな関数を設計します。
+
+## ウィンドウ関数
+
+次のウィンドウ関数は、カスタム型で動作します。
+
+```sql
+SELECT
+    id,
+    impedance,
+    LAG(impedance)  OVER (ORDER BY id) AS prev_impedance,
+    LEAD(impedance) OVER (ORDER BY id) AS next_impedance
+FROM signals;
+
+SELECT
+    id,
+    impedance,
+    FIRST_VALUE(impedance) OVER w AS first_impedance,
+    LAST_VALUE(impedance)  OVER w AS last_impedance,
+    NTH_VALUE(impedance, 2) OVER w AS second_impedance
+FROM signals
+WINDOW w AS (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
+```
+
+## 一時テーブル
+
+カスタム型は、一時テーブルで動作します。`CREATE TEMPORARY TABLE`、`INSERT`、および `ALTER TABLE` は、永続テーブルと同じように動作します。
+
+```sql
+CREATE TEMPORARY TABLE tmp_signals (
+    id        INT PRIMARY KEY,
+    impedance COMPLEX
+);
+
+INSERT INTO tmp_signals VALUES (1, '(10,5)'), (2, '(20,0)');
+SELECT id, impedance FROM tmp_signals;
+```
+
+## プレビュー API
+
+一部の VEF 機能は、C++ SDK インクルードツリーの `villagesql/preview/` の下にあるオプトインヘッダーとして利用できます。ABI と API はまだ積極的に開発されており、予告なしに変更される可能性があります。
+
+オプトインするには、拡張機能のソースにインクルードを追加します。たとえば、次のとおりです。
+
+```cpp
+#include <villagesql/preview/keyring.h>        // vsql::preview_keyring::KeyringCapability
+#include <villagesql/preview/thread_worker.h>  // vsql::preview_thread_worker::ThreadWorkerCapability
+#include <villagesql/preview/sql_query.h>      // vsql::preview_sql_query::SqlQueryCapability
+```
+
+これらのヘッダーはいずれも `<villagesql/vsql.h>` によって取り込まれません。オプトインする場合は、これを直接インクルードする必要があります。
+
+`vsql::preview` の下の名前空間レイアウトは、機能ごとです。単一の普遍的なパターンはありません。キーリング API は `vsql::preview_keyring::KeyringCapability` を使用します。スレッドワーカー API は `vsql::preview_thread_worker::ThreadWorkerCapability` を使用します。SQL クエリ API は `vsql::preview_sql_query::SqlQueryCapability` を使用し、バックグラウンドワーカー スレッドハンドル (`vef_thread_handle_t *`) からオープン（開始）する必要があります。各ヘッダーを確認して、定義されている正確な名前空間とクラス名を確認してください。
+
+完全なプレビュー API ドキュメントについては、[プレビュー機能](/ja/mysql-8.4/0.0.5/preview-capabilities) を参照してください。
+
+<Warning>
+プレビューヘッダーは安定していません。それらを使用してビルドされた拡張機能は、サーバーが更新されたときに動作しなくなる可能性があります。機能が安定すると、そのヘッダーはバージョン指定された安定した C++ SDK パスに移動します。
+</Warning>
+
+## トリガー
+
+トリガーは、カスタム型の列を持つテーブルで発動します。トリガー本体は、`NEW` および `OLD` からのカスタム型以外の列を参照できます。トリガー本体内でカスタム型の列の値にアクセスすることは、まだサポートされていません。
+
+```sql
+CREATE TABLE signals (
+    id        INT PRIMARY KEY,
+    impedance COMPLEX,
+    label     VARCHAR(50)
+);
+CREATE TABLE signal_log (
+    id        INT,
+    label     VARCHAR(50),
+    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER signals_after_insert
+AFTER INSERT ON signals
+FOR EACH ROW
+    INSERT INTO signal_log (id, label) VALUES (NEW.id, NEW.label);
+
+INSERT INTO signals VALUES (1, '(10,5)', 'sensor_a');
+SELECT id, label FROM signal_log;
+```

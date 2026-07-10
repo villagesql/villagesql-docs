@@ -1,0 +1,327 @@
+---
+audience: extension-author
+title: 拡張機能のアーキテクチャ
+description: VillageSQL の拡張機能システムが内部でどのように動作するか
+---
+
+VillageSQL の拡張機能アーキテクチャを理解することで、拡張機能の作成時に問題のデバッグやパフォーマンスの最適化が行いやすくなります。
+
+拡張機能の作成プロセスはシンプルです。対応する SDK を使用して C++ または Rust の関数を書き、共有ライブラリにコンパイルし、マニフェストと共に `.veb` ファイルにパッケージ化します。`INSTALL EXTENSION` を実行すると、VillageSQL はライブラリを読み込み、登録コードを呼び出し、関数を即座に SQL として利用可能にします。これはサーバーに組み込まれているかのように、あらゆるクエリから呼び出すことができます。サーバーの再起動は不要です。このページの残りの部分では、このプロセスの各ステップがどのように動作するかを説明します。
+
+## 用語
+
+- **VEB** (VillageSQL Extension Bundle) - マニフェスト、ライブラリ、メタデータを含む tar アーカイブ形式の `.veb` ファイル
+- **VEF** (VillageSQL Extension Framework) - 拡張機能の作成に使用する C++ および Rust 用 SDK
+- **VDF** (VillageSQL Defined Function) - VEF 経由で登録される関数 — C++ では `VEF_GENERATE_ENTRY_POINTS()`、Rust では `extension!` マクロを使用
+
+---
+
+## VDF 関数の検索
+
+VDF は修飾付きおよび修飾なしの関数呼び出しの両方をサポートします：
+
+```sql
+-- Unqualified lookup
+SELECT complex_abs(value) FROM table;
+
+-- Qualified lookup
+SELECT vsql_complex.complex_abs(value) FROM table;
+```
+
+**解決順序：**
+1. システム関数（MySQL 組み込み）
+2. UDF（`CREATE FUNCTION ... SONAME` による従来の MySQL ユーザー定義関数）
+3. VDF（拡張機能関数）- その名前の関数がちょうど 1 つ存在する場合のみ
+4. ストアド関数（`CREATE FUNCTION` で作成）
+
+複数の拡張機能が同じ名前の関数を登録している場合、修飾なしの呼び出しは曖昧になるため、完全修飾名（`extension_name.function_name()`）を使用する必要があります。
+
+**パフォーマンス：** ホットパスでは、解決チェーンをスキップして拡張機能関数を直接呼び出すため、修飾付き呼び出し（`extension_name.function_name()`）を使用してください。
+
+---
+
+## VEB ファイル形式
+
+VillageSQL の拡張機能は `.veb`（VillageSQL Extension Bundle）ファイルとして配布されます。これは以下を含む tar アーカイブです：
+
+```
+extension_name.veb (tar archive)
+├── manifest.json       # Extension metadata (required)
+└── lib/
+    └── extension.so    # Compiled shared library (required)
+```
+
+### manifest.json スキーマ
+
+```json
+{
+  "name": "extension_name",          // Required: lowercase_with_underscores
+  "version": "1.0.0",                // Required: semantic version
+  "description": "Brief description",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+- **name:** SQL で使用される拡張機能名（lowercase_with_underscores）と一致する必要があります
+- **version:** セマンティックバージョニング（MAJOR.MINOR.PATCH）
+- **description, author, license:** オプションのメタデータ
+
+## 拡張機能のライフサイクル
+
+### インストールフロー
+
+```
+INSTALL EXTENSION name
+    ↓
+1. Validate .veb exists in veb_dir
+    ↓
+2. Calculate SHA256 hash of .veb
+    ↓
+3. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
+    ↓
+4. Parse and validate manifest.json
+    ↓
+5. Load .so library (dlopen with RTLD_LOCAL)
+    ↓
+6. Call vef_register() entry point
+    ↓
+7. Register VDFs and custom types
+    ↓
+8. Persist registration and update cache
+    ↓
+Success
+```
+
+**ロールバック：** どのステップでも失敗した場合、すべての変更が取り消され、`.so` がアンロードされます。
+
+**シンボルの分離：** 拡張機能は `RTLD_LOCAL` フラグで読み込まれ、ある拡張機能のシンボルが他の拡張機能のシンボルと競合しないようにします。これにより、複数の拡張機能が共通のライブラリ名や関数名を使用した場合でも、名前衝突を防ぎます。
+
+<Note>
+`veb_dir` システム変数は、`.veb` 拡張機能ファイルが保存されるディレクトリを指します。
+</Note>
+
+### アンインストールフロー
+
+```
+UNINSTALL EXTENSION name
+    ↓
+1. Check for column dependencies
+    ↓
+2. Call vef_unregister() cleanup hook
+    ↓
+3. Drop registered VDFs
+    ↓
+4. Drop custom types
+    ↓
+5. Remove extension registration and update cache
+    ↓
+6. Unload .so library (dlclose)
+    ↓
+7. Keep .veb_expansion_cache directory (for reinstall)
+    ↓
+Success
+```
+
+**依存関係の防止：** テーブルの列が拡張機能のカスタム型を使用している場合、アンインストールできません。
+
+---
+
+## 展開ディレクトリ構造
+
+VillageSQL は複数のバージョンをサポートするために、`.veb` ファイルを MySQL データディレクトリに展開します：
+
+```
+datadir/
+└── .veb_expansion_cache/
+    └── extension_name/
+        ├── abc123.../              # SHA256 of v1.0.0 .veb
+        │   ├── manifest.json
+        │   └── lib/extension.so
+        └── def456.../              # SHA256 of v2.0.0 .veb
+            ├── manifest.json
+            └── lib/extension.so
+```
+
+**なぜ SHA256 ディレクトリなのか？**
+- 上書きせずに新しいバージョンをテストできる
+- ロールバックを可能にする
+- 「同じバージョン、異なるコード」を防ぐ
+
+**クリーンアップ：** 孤立した SHA256 ディレクトリはサーバー再起動時に削除されます。
+
+---
+
+## Victionary キャッシュレイヤー
+
+VictionaryClient は、O(log n) の検索のためにシステムメタデータのインメモリキャッシュを維持します。
+
+### キャッシュ操作
+
+| 操作 | ロック | パフォーマンス |
+|-----------|---------|-------------|
+| 読み取り（型解決） | 読み取りロック | O(log n) マップ検索 |
+| 書き込み（拡張機能インストール） | 書き込みロック | O(log n) 挿入 + ディスク I/O |
+| サーバー起動 | N/A | 全テーブルスキャンをメモリに読み込み |
+
+**キャッシュ無効化：** DDL 操作（INSTALL/UNINSTALL EXTENSION）中に自動実行されます。
+
+**メモリオーバーヘッド：** エントリあたり約 100 バイト。
+
+---
+
+## カスタム型システム
+
+### 型解決
+
+```cpp
+CREATE TABLE t (col COMPLEX)
+    ↓
+1. Parser encounters COMPLEX
+    ↓
+2. PT_custom_type::create()
+    ↓
+3. ResolveTypeDescriptor(extension_name, type_name)
+    ↓
+4. VictionaryClient::type_descriptors().get_prefix_committed() → O(log n)
+    ↓
+5. Find TypeDescriptor in cache
+    ↓
+6. AcquireOrCreateTypeContext(descriptor, parameters, mem_root)
+    ↓
+7. Create Field with implementation_type
+```
+
+### 実装型
+
+カスタム型は MySQL のストレージ型にマッピングされます：
+
+| カスタム型 | MySQL 実装 | バイト数 |
+|-------------|---------------------|-------|
+| COMPLEX     | MYSQL_TYPE_VARCHAR  | 16 |
+| UUID        | MYSQL_TYPE_VARCHAR  | 16 |
+| INET6       | MYSQL_TYPE_VARCHAR  | 16 |
+| JSON_SCHEMA | MYSQL_TYPE_BLOB     | 可変 |
+
+---
+
+## 並行処理とトランザクションの動作
+
+### スレッドセーフティモデル
+
+拡張機能関数は行ごとの実行モデルで呼び出されます：
+
+- **行ごとの分離実行：** 各関数呼び出しには独自の結果バッファが割り当てられます（設計上スレッドセーフ）
+- **Prerun/Postrun フック：** ステートメントごとのセットアップ/クリーンアップ、SQL ステートメントごとに 1 回呼び出されます
+- **分離の保証なし：** 複数の接続が同時にあなたの関数を呼び出す可能性があります
+- **ベストプラクティス：** グローバル状態を避け、関数のパラメータと戻り値を使用してください
+
+<Warning>
+VillageSQL は拡張機能関数のスレッド分離を保証しません。グローバル変数や共有状態を使用する場合は、ミューテックスやロックで保護してください。
+</Warning>
+
+### トランザクションの動作
+
+拡張機能関数は以下のベストプラクティスに従う必要があります：
+- 可能な限りステートレスな関数を設計する
+- 関数内で永続的な副作用（ファイル書き込み、外部 API 呼び出し）を避ける
+- Prerun/postrun 状態を使用する場合は、適切にクリーンアップを処理する
+
+---
+
+## パフォーマンスの考慮事項
+
+**最適化：** 行ごとに作業を繰り返すのではなく、Prerun フックを使用して高コストなステートメントごとのセットアップをキャッシュしてください。
+
+### カスタム型のパフォーマンス
+
+```sql
+-- Slow: VDF call per row
+SELECT * FROM signals WHERE complex_abs(impedance) > 100;
+
+-- Fast: Computed column with index
+ALTER TABLE signals
+ADD COLUMN impedance_magnitude DOUBLE AS (complex_abs(impedance)) STORED,
+ADD INDEX(impedance_magnitude);
+
+SELECT * FROM signals WHERE impedance_magnitude > 100;
+```
+
+---
+
+## セキュリティとデバッグ
+
+### セキュリティモデル
+
+**信頼モデル：** 拡張機能はサーバーのフル権限で実行されます。
+
+- サンドボックス化や権限システムはありません
+- 拡張機能は任意のファイルの読み取り、ネットワークへのアクセス、コードの実行が可能です
+- **信頼に関する影響：** 信頼できるソースからの拡張機能のみをインストールしてください
+
+**インストールのセキュリティ：** `villagesql_extension_installer` ユーザーとして実行されます（コンテキストスイッチ）。
+
+<Accordion title="拡張機能のデバッグ">
+
+**詳細ログの有効化：**
+```bash
+mysqld --log-error-verbosity=3
+```
+
+**GDB デバッグ：**
+```bash
+gdb -p $(pidof mysqld)
+(gdb) break my_func_init
+(gdb) continue
+```
+
+**依存関係の確認：**
+```bash
+# Linux
+ldd /path/to/extension.so
+
+# macOS
+otool -L /path/to/extension.so
+```
+
+**一般的なエラー：**
+- **未定義のシンボル：** `ldd`（Linux）または `otool -L`（macOS）でライブラリの依存関係を確認してください
+- **共有オブジェクトを開けません：** ライブラリの依存関係が存在し、正しくリンクされているか確認してください
+- **VDF 呼び出し時のクラッシュ：** NULL ポインタの処理を確認してください
+
+</Accordion>
+
+---
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card
+    title="拡張機能の作成"
+    icon="code"
+    href="/ja/mysql-8.4/0.0.5/create"
+  >
+    最初の拡張機能を作成する
+  </Card>
+  <Card
+    title="システムリファレンス"
+    icon="book"
+    href="/ja/mysql-8.4/0.0.5/reference"
+  >
+    システムテーブルとビュー
+  </Card>
+  <Card
+    title="実装例"
+    icon="lightbulb"
+    href="/ja/mysql-8.4/0.0.5/examples"
+  >
+    vsql_complex の実装を学ぶ
+  </Card>
+  <Card
+    title="拡張機能の管理"
+    icon="sliders"
+    href="/ja/mysql-8.4/0.0.5/managing"
+  >
+    モニタリングとトラブルシューティング
+  </Card>
+</CardGroup>

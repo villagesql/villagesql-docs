@@ -1,0 +1,340 @@
+---
+audience: extension-author
+title: "类型操作"
+description: "C++ 类型操作构建器的深度参考——编码、解码、比较、哈希、内部默认值和参数化类型。"
+---
+
+本页是 C++ 类型操作构建器的参考。有关自定义类型的入门级介绍，请参阅 [C++ 中的自定义类型](/zh/mysql-8.4/0.0.5/custom-types)。
+
+自定义类型需要引擎在内部调用的三个操作：编码（字符串到二进制）、解码（二进制到字符串）和比较。哈希是可选的。请针对以下这些 C++ 签名实现它们（全部通过 `<villagesql/vsql.h>` 提供）：
+
+## Fixed-Length Types
+
+```cpp
+// Encode: string -> binary. Write the encoded bytes via out.buffer() and
+// out.set_length(n); call out.set_null() for SQL NULL, out.warning(msg) for
+// recoverable bad input, or out.error(msg) to abort the statement. Returning
+// without calling any of these surfaces a default warning.
+using TypeEncodeFunc = void (*)(std::string_view from, vsql::CustomResult out);
+
+// Decode: binary -> string. Report the outcome by calling
+// out.set_length(n), out.set(sv), out.set_null(), out.warning(msg), or
+// out.error(msg). If none is called the SDK falls back to a default
+// "failed to decode value" ERROR.
+using TypeDecodeFunc = void (*)(vsql::CustomArg in, vsql::StringResult out);
+
+// Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
+using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
+
+// Hash: returns hash code (used for hash joins).
+using TypeHashFunc = size_t (*)(vsql::CustomArg in);
+```
+
+使用 `vsql::make_type<kTypeName>()` 注册这些操作。类型名称作为非类型模板参数 (NTTP) 传递——一个 `static constexpr const char[]`
+数组。构建器会根据这个 NTTP 以 `TYPE::method` 格式（例如 `"MYTYPE::from_string"`）自动生成 VDF 名称，因此无需手动匹配字符串。将构建好的类型对象传递给扩展构建器上的 `.type()`；类型操作不需要单独的 `.func()` 调用。
+
+<Warning>
+类型名称必须是 `static constexpr const char[]` 变量——字符串字面量不能用作非类型模板参数。直接传递 `"MYTYPE"` 会产生类似以下的编译器错误：
+
+```
+error: '"MYTYPE"' is not a valid template argument for type 'const char*'
+```
+
+如下所示，请将名称声明为具名数组。
+</Warning>
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(8)
+        .max_decode_buffer_length(64)
+        .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
+        .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
+        .compare<&my_compare>()      // auto: "MYTYPE::compare"
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
+        .intrinsic_default_str("0")  // string-literal intrinsic default
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE))
+```
+
+如果缺少 `from_string`、`to_string` 或 `compare`，`build()` 将在编译时失败。每个模板方法都通过 `static_assert` 检查函数指针签名。
+
+## Intrinsic Default {#intrinsic-default}
+
+当 `NOT NULL` 自定义类型列在 `IGNORE` 模式下接收到 `NULL` 时（例如 `INSERT IGNORE` 或 `UPDATE IGNORE`），服务器会调用内部默认值来生成一个回退值，而不是引发错误。内部默认值提供一个字符串表示；服务器使用该类型的 `from_string` 函数将其转换为二进制。
+
+<Note>
+如果您同时省略 `.intrinsic_default_str()` 和 `.intrinsic_default_vdf()`，服务器会调用 `from_string("")` 作为回退。这发生在该类型**首次使用**时（在创建表时），而不是在 `INSTALL EXTENSION` 时。如果您的编码函数拒绝空字符串——或者将其编码为错误的字节数——类型初始化将失败，并在 SQL 客户端中显示一个错误：
+
+```
+Type 'MYTYPE' failed to initialize: from_string VDF encoded intrinsic
+default input '' to N bytes, expected persisted_length=M
+```
+
+对于固定长度类型，默认字符串必须编码为恰好 `persisted_length` 个字节。对于任何空字符串不是有效输入的类型，请设置一个显式默认值。
+</Note>
+
+**字符串字面量：`.intrinsic_default_str()`**
+
+对于常量默认值，请直接在类型构建器上传递字符串（如上面固定长度示例中的 `.intrinsic_default_str("0")` 所示）。
+
+**基于 VDF：`.intrinsic_default_vdf()` + `make_intrinsic_default`**
+
+当默认值依赖于类型参数时，请针对以下签名之一实现一个函数（通过 `<villagesql/vsql.h>` 提供）：
+
+<Warning>
+  **重大变更**：`IntrinsicDefaultFunc` 和
+  `IntrinsicDefaultWithParamsFunc` 现在返回 `std::string` 而不是 `const char*`。
+  请更新任何现有的内部默认值实现，使其直接返回 `std::string`。
+</Warning>
+
+```cpp
+// Fixed (no type parameters):
+using IntrinsicDefaultFunc = std::string (*)(char *error_msg);
+
+// Parameterized (receives cached parsed params):
+template <typename P>
+using IntrinsicDefaultWithParamsFunc = std::string (*)(const P &,
+                                                       char *error_msg);
+```
+
+返回默认值的 `std::string` 表示。出错时，向 `error_msg` 写入一条消息并返回任意值（SDK 通过检查 `error_msg[0] != '\0'` 来检测错误）。使用 `make_intrinsic_default<&fn>("vdf_name")`（一个参数：VDF 名称）进行注册，并在类型构建器上通过 `.intrinsic_default_vdf()` 引用该名称。下面的参数化类型示例展示了完整的注册模式。
+
+```cpp
+std::string mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
+  return /* build string representation based on p */;
+}
+```
+
+## Parameterized Types {#parameterized-types}
+
+参数化类型需要在编码、解码、比较和哈希时获取列声明的参数，以确定分配大小和布局。定义一个带有解析函数和逆向 `to_strings` 函数的参数结构体，在类型构建器上通过 `.params<P, &ParseFunc, &ToStringsFunc>()` 注册两者，并将 `const P&` 用作类型操作函数的第一个参数。SDK 会为每个唯一的参数组合缓存解析结果，因此解析函数每个类型实例化最多运行一次。`to_strings` 函数是 `parse` 的逆函数：它将一个类型化的 `P` 写回规范的键/值字符串形式，以便服务器可以按照 `parse` 消费的相同形状发布推断出的参数。
+
+```cpp
+struct MyTypeParams {
+  int64_t dimension;
+  static MyTypeParams parse(const std::map<std::string, std::string> &p) {
+    return {.dimension = stoll(p.at("dimension"))};
+  }
+  static void to_strings(const MyTypeParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
+  }
+};
+
+void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
+                   std::string_view from, vsql::CustomResult out) {
+  const MyTypeParams &p = params.value();  // is_known() is always true at runtime
+  size_t bytes = (size_t)p.dimension * 4;
+  auto buf = out.buffer();
+  if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
+  // ... parse from, write to buf ...
+  out.set_length(bytes);
+}
+
+void mytype_decode(vsql::CustomArgWith<MyTypeParams> in,
+                   vsql::StringResult out) {
+  const MyTypeParams &p = in.params();
+  // ... read p.dimension floats from in.value(), write to out.buffer() ...
+  out.set_length(bytes_written);
+}
+
+int mytype_compare(vsql::CustomArgWith<MyTypeParams> a,
+                   vsql::CustomArgWith<MyTypeParams> b) {
+  // Returns -1, 0, or 1.
+}
+
+size_t mytype_hash(vsql::CustomArgWith<MyTypeParams> in) {
+  // Returns hash code.
+}
+
+// Converts MYTYPE(N) integer syntax to a parameter map.
+// Signature: IntToTypeParamsFunc from <villagesql/vsql.h>.
+bool mytype_int_to_params_fn(int64_t value,
+                             std::map<std::string, std::string> &params,
+                             char *error_msg) {
+  if (value <= 0) {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: dimension must be a positive integer");
+    return true;
+  }
+  params["dimension"] = std::to_string(value);
+  return false;  // success
+}
+
+// Validates parameters and computes storage sizes.
+// Signature: ResolveTypeParamsFunc from <villagesql/vsql.h>.
+bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
+                              vsql::ResolvedTypeParams *result,
+                              char *error_msg) {
+  int64_t dim = std::stoll(params.at("dimension"));
+  result->persisted_length = dim * 4;
+  result->max_decode_buffer_length = 64;
+  return false;  // success
+}
+```
+
+在类型构建器上注册 `.params<>()`。使用 `.int_to_params<&mytype_int_to_params_fn>()`
+处理 `MYTYPE(N)` 整数语法，使用 `.resolve_params<&mytype_resolve_params_fn>()` 来验证参数并计算存储大小。调用 `.max_persisted_length(N)` 并传入所有有效参数化下持久化字节大小的上界；服务器仅在类型参数推断路径上使用它，此时它尚未推断出参数，因此无法查询 `resolve_params` 来确定编码缓冲区的大小。对于基于 VDF 的内部默认值，请使用带有 VDF 名称的 `.intrinsic_default_vdf()`，并通过 `make_intrinsic_default<&mytype_default>()` 单独注册该 VDF。
+
+<Warning>
+`.max_persisted_length()` 需要 VEF 协议 3 或更高版本。使用它的类型无法被协议 3 之前的服务器加载。
+</Warning>
+
+```cpp
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+// Maximum valid dimension for MYTYPE.
+constexpr int64_t kMyTypeMaxDimension = 1024;  // your max valid dimension
+// Upper bound on MYTYPE's persisted byte size across all valid params.
+constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .variable_length_type()  // Protocol 4; use instead of persisted_length(-1)
+        .max_decode_buffer_length(16)
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
+        .int_to_params<&mytype_int_to_params_fn>()
+        .resolve_params<&mytype_resolve_params_fn>()
+        .from_string<&mytype_encode>()
+        .to_string<&mytype_decode>()
+        .compare<&mytype_compare>()
+        .intrinsic_default_vdf("mytype_intrinsic_default")
+        .build();
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE)
+        .func(make_intrinsic_default<&mytype_default>(
+            "mytype_intrinsic_default")))
+```
+
+参数化变体——`TypeEncodeWithParamsFunc<P>`、
+`TypeDecodeWithParamsFunc<P>`、`TypeCompareWithParamsFunc<P>` 和
+`TypeHashWithParamsFunc<P>`——以及 `ParamsToStringsFunc<P>`
+(`void fn(const P&, std::map<std::string,std::string>&)`) 均通过
+`<villagesql/vsql.h>` 提供。
+`vsql::make_type` 模板方法会检测 params 参数并自动通过 params 缓存进行路由。编码函数将
+`vsql::MaybeParams<P> &` 作为第一个参数；`is_known()` 在运行时始终为 true，`value()` 返回 `const P&`。解码、比较和哈希变体接受
+`vsql::CustomArgWith<P>`，其 `params()` 访问器返回 `const P&`。
+
+**在 SQL 中提供参数。** 有两种语法可以到达 `resolve_params`：
+
+- **整数**——`MYTYPE(N)`。服务器将 `N` 通过 `int_to_params` 路由以构建参数映射。需要 `.int_to_params<>()`。
+- **字符串**——`MYTYPE('key=value,...')`。服务器规范化该字符串并直接调用 `resolve_params`；不涉及 `int_to_params`。只要注册了 `.resolve_params<>()` 即可使用——无需额外的构建器调用。
+
+仅注册了 `.resolve_params<>()` 的类型接受字符串形式并拒绝 `MYTYPE(N)`。`SHOW CREATE TABLE` 会保留写入时所用的形式。
+
+```sql
+CREATE TABLE t (v ext.MYTYPE(8));              -- integer form (.int_to_params)
+CREATE TABLE t2 (v ext.MYTYPE('dimension=8')); -- string form (.resolve_params only)
+```
+
+<Note>
+`int_to_params` 生成并由 `resolve_params` 消费的序列化 `key=value,...` 参数字符串上限为 `VEF_MAX_TYPE_PARAMS_STRING_LEN`
+(1024 字节)。如果某个参数化配置的规范字符串会超过该限制，将被拒绝并返回一个明确定义的错误，而不是被静默截断——请将单个类型的参数名称与值的组合保持在 1024 字节以内。
+</Note>
+
+### Rewriting parameters and supplying defaults
+
+`resolve_params` 有第二个可变的重载：它以非常量引用的方式接收参数映射，以便类型可以重写它——通常是为了填充作者省略的默认值。以相同的方式注册它（`.resolve_params<&fn>()` 接受任一形式；只注册其中一个）：
+
+```cpp
+bool mytype_resolve_params_fn(std::map<std::string, std::string> &params,
+                              vsql::ResolvedTypeParams *result, char *error_msg) {
+  if (params.find("dimension") == params.end())
+    params["dimension"] = "128";                 // supply a default
+  int64_t dim = std::stoll(params.at("dimension"));
+  result->persisted_length = dim * 4;
+  result->max_decode_buffer_length = 64;
+  return false;                                  // success
+}
+```
+
+重写后的映射会成为服务器持久化并由 `SHOW CREATE TABLE` 打印的规范参数字符串，因此重写必须是幂等的。**裸**声明（`MYTYPE`，无长度或参数）现在会以一个空映射调用 `resolve_params`，而不是跳过它，因此提供默认值的类型会为每一列都赋予显式参数——`vsql_bitfield_test` 的 `BITFIELD` 会将一个裸列解析为 `max_number_of_bits=4096`：
+
+```sql
+INSTALL EXTENSION vsql_bitfield_test;
+CREATE TABLE bits (id INT PRIMARY KEY, b vsql_bitfield_test.BITFIELD);
+SHOW CREATE TABLE bits;   -- b persists as BITFIELD('max_number_of_bits=4096')
+```
+
+## Variable-Length Types
+
+可变长度自定义类型按每个值决定其持久化大小，而不是使用单一的固定占用空间。通过在类型构建器上调用 `.variable_length_type()` 来声明一个可变长度类型，该调用会设置类型的 `variable_length` 标志。
+
+<Warning>
+`.variable_length_type()` 将类型所需的协议提升至 VEF 协议 4。服务器仅在协议 4 或更高版本读取 `variable_length` 标志。请针对选择加入的开发 ABI 标头进行构建 (`-DVSQL_USE_DEV_ABI=ON`)；旧版服务器不会读取该标志。
+</Warning>
+
+可变长度类型还必须调用 `.max_persisted_length(N)`。如果省略它，`build()` 将在编译时失败——服务器需要这个上界来为底层字段分配缓冲区。
+
+`.variable_length_type()` 是单调的：在协议 3 的设置器（`max_persisted_length()`、`params()`、`int_to_params()`）之前或之后调用它，都不会将协议要求降回到协议 4 以下。
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+static constexpr const char kMyTypeName[] = "MYTYPE";
+constexpr int64_t kMyTypeMaxPersistedLength = 4096;
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .variable_length_type()  // per-value sizing; requires Protocol 4
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .max_decode_buffer_length(64)
+        .from_string<&my_encode>()
+        .to_string<&my_decode>()
+        .compare<&my_compare>()
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE))
+```
+
+<Note>
+与每个自定义类型一样，可变长度类型必须生成一个可用的
+[内部默认值](#intrinsic-default)。默认值被编码到字段的最大容量中，并且任何 1 到
+`max_persisted_length` 字节之间的非空结果都会被接受。空字符串编码会生成**零**字节的类型——比如空数组或空位集——没有可用的默认值，因此请声明一个显式默认值，使其编码为非空值：
+
+```cpp
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .intrinsic_default_str("[0]")  // empty "[]" would encode to zero bytes
+```
+
+否则，当一个 `NOT NULL` 列首次引用该类型时（在 `CREATE TABLE` 处），该类型将无法初始化——这与无法编码 `from_string("")` 的固定长度类型相同。
+</Note>
+
+## Custom Types in Stored Procedures
+
+自定义扩展类型可用作存储过程的参数类型，也可用于 `DECLARE` 变量声明中。服务器在例程执行时使用已安装扩展的类型元数据来解析自定义类型。
+
+```sql
+DELIMITER //
+CREATE PROCEDURE insert_complex(IN val COMPLEX)
+BEGIN
+  DECLARE tmp COMPLEX;
+  SET tmp = val;
+  INSERT INTO t1 VALUES (tmp);
+END //
+DELIMITER ;
+```
+
+## See Also
+
+- [C++ 中的自定义类型](/zh/mysql-8.4/0.0.5/custom-types) — 自定义类型的入门介绍
+- [C++ API 参考](/zh/mysql-8.4/0.0.5/extension-api-reference) — VDF 契约、空值处理和缓冲区大小调整
+- [C++ 开发](/zh/mysql-8.4/0.0.5/development) — VDF 编写深度、参数和结果类型、聚合、可变参数

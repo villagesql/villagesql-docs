@@ -1,0 +1,190 @@
+---
+audience: extension-author
+title: "Rust API Reference"
+description: "VillageSQL Rust SDK의 완전한 참조 — InValue, VdfReturn, extension!, func!, custom_type!, custom!, manifest.json 필드."
+---
+
+<Warning>
+  Rust SDK는 알파 단계입니다 — 릴리스 간에 호환성이 깨지는 API 변경이
+  발생할 수 있습니다. 함수 전용 확장과 사용자 정의 타입(encode, decode,
+  compare, hash)이 지원됩니다. 집계, `prerun()`, `VarArgs`, 시스템 및
+  상태 변수, 키링 접근, 그리고 열 저장소 ABI는 현재 C++ 전용입니다 —
+  이 중 어느 것이든 필요하다면 [C++ SDK](/ko/mysql-8.4/0.0.5/create)를
+  사용하세요.
+</Warning>
+
+이 페이지는 `villagesql` 크레이트 API에 대한 참조입니다. 시작하기 가이드는 [Rust로 확장 빌드](/ko/mysql-8.4/0.0.5/rust-sdk)를 참조하세요. 사용자 정의 타입에 대해서는 [Rust에서 사용자 정의 타입](/ko/mysql-8.4/0.0.5/rust-custom-types)을 참조하세요.
+
+## InValue
+
+`InValue`는 서버가 각 함수 인수에 대해 전달하는 열거형입니다. 함수는 `args: &[InValue]`를 받으며, 값을 사용하기 전에 각 인수를 확인해야 합니다.
+
+```rust
+pub enum InValue<'a> {
+    String(&'a str),
+    Real(f64),
+    Int(i64),
+    Null,
+    Custom(&'a [u8]),
+}
+```
+
+| 배리언트(Variant) | Rust 타입 | 해당 SQL 타입 |
+|---|---|---|
+| `String(&str)` | UTF-8 문자열 슬라이스 | `STRING` / `VARCHAR` / `TEXT` |
+| `Real(f64)` | 64비트 부동소수점 | `REAL` / `DOUBLE` / `FLOAT` |
+| `Int(i64)` | 64비트 부호 있는 정수 | `INT` / `BIGINT` / `TINYINT` |
+| `Null` | — | 모든 타입의 SQL `NULL` |
+| `Custom(&[u8])` | 원시 바이너리 바이트 | `custom_type!`을 통해 등록된 사용자 정의 타입 |
+
+항상 `Null`을 명시적으로 매치해야 합니다. `.unwrap()`을 호출하거나 값 배리언트만 패턴 매칭하는 것은 버그입니다 — SQL NULL은 오류가 아닌 정상적인 입력입니다.
+
+## VdfReturn
+
+`VdfReturn`은 함수가 서버에 반환하는 것입니다. 연관 함수 중 하나로 구성합니다:
+
+| 생성자 | SQL 효과 |
+|---|---|
+| `VdfReturn::null()` | 이 행에 SQL NULL을 반환합니다 |
+| `VdfReturn::string(s)` | `String` 값을 반환합니다; `s`는 `impl Into<String>`입니다 |
+| `VdfReturn::real(v)` | `f64` 값을 반환합니다 |
+| `VdfReturn::int(v)` | `i64` 값을 반환합니다 |
+| `VdfReturn::binary(bytes)` | 사용자 정의 타입 열에 대한 바이너리 바이트를 반환합니다; `bytes`는 `Vec<u8>`입니다 |
+| `VdfReturn::warning(msg)` | 이 행에 NULL을 반환하고 SQL 경고를 추가합니다(실행은 계속됩니다) |
+| `VdfReturn::error(msg)` | 치명적 오류로 문을 중단합니다 |
+
+**경고 vs 오류:**
+
+사용자 입력 검증 실패 시 결과 집합의 나머지 부분을 계속 처리하는 것이 합리적인 경우 `warning`을 사용하세요. 엄격 모드에서는 MySQL이 `INSERT` 및 `UPDATE`에서 경고를 오류로 승격시킵니다. 데이터가 손상되거나 내부 불변 조건 위반과 같은 안전하지 않은 상황에서는 `error`를 사용하세요. 치명적 오류는 전체 문을 중단합니다.
+
+```rust
+fn validate_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::Int(n)) if *n >= 0 => VdfReturn::int(*n),
+        Some(InValue::Int(_)) => VdfReturn::warning("value must be non-negative"),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("validate: expected an INT argument"),
+    }
+}
+```
+
+## extension! 매크로
+
+`extension!`은 서버가 VEB 파일을 로드할 때 호출하는 VEF 엔트리 포인트를 생성합니다. 이는 크레이트 내에서 정확히 한 번만 나타나야 합니다.
+
+```rust
+villagesql::extension! {
+    funcs: [
+        // One or more villagesql::func!(...) declarations
+    ],
+    types: [
+        // One or more villagesql::custom_type!(...) declarations
+    ]
+}
+```
+
+두 섹션 모두 선택 사항입니다. 순수 함수 확장은 `types:`를 생략하고, 타입만 있는 확장은 `funcs:`를 생략합니다. 빈 `extension!` 블록(함수 없음, 타입 없음)은 유효하지만 아무 작업도 하지 않는 확장을 생성합니다.
+
+## func! 매크로
+
+`func!`는 SQL 호출 가능한 함수를 선언합니다. 네 가지 형태(매개변수 없음, `buffer_size`만, `deterministic`만, 둘 다):
+
+```rust
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N, deterministic: true)
+```
+
+<Note>
+  `buffer_size` 매개변수는 `villagesql` 크레이트 **0.0.2 이상**을
+  요구합니다. 현재 [crates.io](https://crates.io/crates/villagesql) 릴리스
+  (`0.0.1`)는 이를 노출하지 않습니다 — `0.0.2`가 출시되기 전까지는
+  `buffer_size` 없는 형태를 사용하세요.
+</Note>
+
+| 인수 | 설명 |
+|---|---|
+| `rust_fn` | VDF를 구현하는 Rust 함수입니다. 서명: `fn(&[InValue]) -> VdfReturn`. |
+| `"sql_name"` | SQL 함수 이름을 문자열 리터럴로 지정합니다. 사용자가 SQL에서 호출할 때 사용하는 이름입니다. |
+| `[param_types]` | `,`로 구분된 `villagesql::Type::*` 또는 `villagesql::custom!("name")` 값 목록입니다. 0개 인수 함수에는 `[]`를 사용합니다. |
+| `return_type` | `villagesql::Type::*` 또는 `villagesql::custom!("name")`입니다. |
+| `buffer_size: N` | 선택 사항입니다. 문자열/바이너리 반환값에 대한 결과 버퍼의 바이트 크기입니다. 서버 기본값(256바이트)을 사용하려면 `0`을 사용하세요. 함수가 `buffer_size`보다 큰 문자열 또는 바이너리 값을 반환하면, 함수는 잘라내지 않고 오류를 발생시킵니다 — 더 큰 결과를 처리하려면 더 큰 `buffer_size`를 선언하세요. |
+| `deterministic: true` | 선택 사항입니다. 함수가 결정적임을 선언합니다 — 동일한 입력은 항상 동일한 출력을 생성하며, 부작용이 없습니다. 최적화 도구는 동일한 입력에 대한 결과를 캐시할 수 있습니다. 이 값이 참일 때만 설정하세요. |
+
+**타입 상수** (`func!`에서 사용):
+
+| `villagesql::Type::*` | SQL 타입 |
+|---|---|
+| `villagesql::Type::String` | `STRING` |
+| `villagesql::Type::Real` | `REAL` |
+| `villagesql::Type::Int` | `INT` |
+
+## custom_type! 매크로
+
+`custom_type!`은 새로운 열 타입을 등록합니다. `type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`는 필수이며, `hash`와 `default`는 선택적이지만 권장됩니다.
+
+```rust
+villagesql::custom_type!(
+    type_name: "sql_type_name",
+    persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: encode_fn,
+    decode: decode_fn,
+    compare: compare_fn,
+    hash: hash_fn,
+    default: "default_string",
+)
+```
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `type_name` | `&str` 리터럴 | 타입에 대한 SQL 이름입니다. SQL에서 대소문자 구분이 없습니다. 모든 설치된 확장 프로그램 간에 고유해야 합니다. |
+| `persisted_length` | `usize` | 디스크에 저장할 때 고정된 바이트 길이입니다. 모든 인코딩된 값은 정확히 이 길이의 바이트를 생성해야 합니다. |
+| `max_decode_buffer_length` | `usize` | 디코딩된 문자열의 최대 바이트 길이입니다. `decode` 호출 전 출력 버퍼 크기를 결정하는 데 사용됩니다. |
+| `encode` | `fn(&str) -> Result<Vec<u8>, String>` | `INSERT` 시 호출됩니다. SQL 문자열 리터럴을 바이너리로 변환합니다. 입력을 거부하려면 `Err(msg)`를 반환하세요. |
+| `decode` | `fn(&[u8]) -> Result<String, String>` | 값 표시 시 호출됩니다. 바이너리를 문자열로 변환합니다. |
+| `compare` | `fn(&[u8], &[u8]) -> std::cmp::Ordering` | `ORDER BY`, `MIN`, `MAX`에 호출됩니다. `Less`, `Equal`, 또는 `Greater`를 반환합니다. |
+| `hash` | `fn(&[u8]) -> usize` | 선택 사항입니다. `COUNT(DISTINCT)` 및 집합 연산에 호출됩니다. 비교 결과가 `Equal`인 값은 동일한 해시 값을 가져야 합니다. 인덱스 열에 권장됩니다. |
+| `default` | `&str` 리터럴 | 선택 사항입니다. 서버가 타입 초기화 시 인코딩하여 콜백이 작동하는지 검증하는 데 사용하는 유효한 문자열입니다. 정확히 `persisted_length` 바이트로 인코딩되어야 합니다. |
+
+`default` 필드는 열 기본값이 아닙니다 — 시작 확인입니다. 서버는 확장 프로그램을 로드할 때 `encode(default)`를 호출하여 콜백이 작동하는지 확인합니다. `encode`가 기본값에 대해 `Err`를 반환하면 확장 프로그램이 로드되지 않습니다.
+
+## custom! 매크로
+
+`villagesql::custom!("type_name")`은 `func!` 선언에서 사용자 정의 타입의 이름을 참조합니다:
+
+```rust
+villagesql::func!(
+    my_fn,
+    "my_sql_func",
+    [villagesql::custom!("mytype")] -> villagesql::custom!("mytype"),
+    deterministic: true
+)
+```
+
+`villagesql::Type::*`이 매개변수 목록이나 반환 타입 위치에 나타나는 곳이라면 어디서든 사용할 수 있습니다. 문자열은 해당 `custom_type!`에서 선언된 `type_name`과 일치해야 합니다.
+
+## manifest.json 필드
+
+모든 확장 프로그램은 `Cargo.toml`과 함께 `manifest.json`이 필요합니다:
+
+```json
+{
+  "name": "vsql_my_extension",
+  "version": "0.1.0",
+  "description": "Brief description of what the extension does",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+| 필드 | 필수 | 형식 | 설명 |
+|---|---|---|---|
+| `name` | 예 | 소문자, 숫자, `_`, `-` | 확장 프로그램 식별자입니다. `INSTALL EXTENSION` 이름과 일치해야 합니다. 밑줄을 사용하세요 — 대시는 SQL에서 백틱으로 인용해야 합니다. |
+| `version` | 예 | MAJOR.MINOR.PATCH | 시맨틱 버전입니다. |
+| `description` | 아니요 | String | `INFORMATION_SCHEMA.EXTENSIONS`에 표시됩니다. |
+| `author` | 아니요 | String | 저자 이름 또는 조직입니다. |
+| `license` | 아니요 | String | 라이선스 식별자입니다. 오픈소스 확장 프로그램에는 `GPL-2.0`이 권장됩니다. |
+
+`name` 검증 규칙: 첫 글자는 알파벳, 마지막 글자는 알파벳 또는 숫자여야 하며, 최대 64자입니다. 유효하지 않은 매니페스트는 `INSTALL EXTENSION`을 실패시킵니다.

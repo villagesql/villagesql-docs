@@ -1,0 +1,961 @@
+---
+audience: extension-author
+title: "预览功能"
+description: "预览功能使扩展程序能够访问仍在稳定中的服务器功能。本页涵盖启用预览层、密钥环、status_var、sys_var、thread_worker、sql_query 和 statement_event 功能，以及注册模式。"
+---
+
+预览功能是服务器提供的功能，在最终确定其 API 之前，会将其暴露给扩展程序。声明了预览功能的扩展程序需要 `vsql_allow_preview_extensions = ON` 才能安装（请参阅[启用预览层](#启用预览层)）——不使用预览功能的扩展程序无论此设置如何都会正常安装。
+
+<Warning>
+预览功能 API 并不稳定。基于预览功能构建的扩展程序在服务器更新后可能无法加载。当某个功能稳定后，其头文件将移动到版本化的稳定 C++ SDK 路径。
+</Warning>
+
+## 启用预览层
+
+在安装任何使用预览功能的扩展程序之前，使用 `SET PERSIST` 设置 `vsql_allow_preview_extensions = ON`：
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+```
+
+对于此变量，`SET GLOBAL` 会被拒绝——服务器需要 `SET PERSIST`，以便设置在重启后仍然有效。具有预览功能的扩展程序在启动时加载，因此在服务器启动时，该变量必须为 ON。
+
+如果您直接启动 mysqld（例如，从安装脚本中启动服务器），请在命令行中传递该标志，而不是使用 `mysqld-auto.cnf`（因为此时 `mysqld-auto.cnf` 尚未存在，无法保存持久化值）：
+
+```bash
+mysqld --vsql_allow_preview_extensions=ON
+```
+
+要禁用：
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = OFF;
+```
+
+如果当前安装了任何使用预览功能的扩展程序，则此操作将失败。首先卸载这些扩展程序，然后关闭该设置。
+
+## 功能索引
+
+| 功能 | 头文件 | 状态 |
+|---|---|---|
+| `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | 预览 |
+| `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | 预览 |
+| `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | 预览 |
+| `vsql::preview::statement_event` | `<villagesql/preview/statement_event.h>` | 预览 |
+| `vsql::preview::status_var` | `<villagesql/preview/status_var.h>` | 预览 |
+| `vsql::preview::storage` | `<villagesql/preview/storage_builder.h>` | 预览 |
+| `vsql::preview::sys_var` | `<villagesql/preview/sys_var.h>` | 预览 |
+| `vsql::preview::thread_worker` | `<villagesql/preview/thread_worker.h>` | 预览 |
+
+## 注册模式
+
+要使用预览功能，请在文件范围内声明一个功能对象，并将其按引用传递给 `make_extension()` 中的 `.with()`。服务器将在注册期间填充对象的 `abi` 指针：
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(g_keyring))
+```
+
+`.with(capability)` 告诉服务器扩展程序需要哪些功能。如果扩展程序在安装时 `vsql_allow_preview_extensions` 为 OFF，则服务器会拒绝安装，并显示一个包含功能名称的错误。
+
+<Warning>
+扩展程序中声明的每个功能对象都必须精确地传递给 `.with()` 一次。在加载时，服务器会交叉检查每个声明的功能实例与 `.with()` 接收到的内容，如果违反了该规则，则 `INSTALL EXTENSION` 将失败：
+
+- **已声明但从未传递给 `.with()`：**
+  `capability '<Type>' was declared but never passed to .with(); every CapabilityBase-derived static must be registered via .with(cap) in the extension builder`
+- **同一实例多次传递给 `.with()`：**
+  `capability '<Type>' passed to .with() more than once`
+- **传递给 `.with()` 的对象不是功能：**
+  `.with() received an object that does not inherit vsql::detail::CapabilityBase; not a registered capability`
+
+完整的错误消息为：`Failed to load VEF extension '<name>': vef_register returned an error: <message above>`。
+</Warning>
+
+## 密钥环访问 {#keyring-access}
+
+密钥环功能 (`vsql::preview::keyring`) 允许扩展程序读取和写入存储在 MySQL 密钥环组件中的密钥。扩展程序可将其用于 API 密钥、加密密钥或其他不应存储在 SQL 表中的密钥。
+
+功能名称 `VEF_PREVIEW_KEYRING_NAME` 为 `"vsql::preview::keyring"`。
+
+为了使读取和写入成功，必须在 MySQL 服务器上安装密钥环组件。如果没有，则操作将返回 `KeyringCapability::Status::UNAVAILABLE`。
+
+### 状态值
+
+`KeyringCapability::Status` 是一个作用域枚举，由 `read()`（在 `ReadResult` 中）和 `write()` 返回：
+
+| 状态 | 含义 |
+|---|---|
+| `Status::OK` | 操作成功。 |
+| `Status::NOT_FOUND` | 密钥不存在（仅限读取）。 |
+| `Status::UNAVAILABLE` | 没有安装密钥环组件。 |
+| `Status::ERROR` | 其他错误。 |
+
+### 声明功能
+
+包含头文件，在文件范围内声明一个功能对象，并将其传递给 `.with()`：
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_keyring))
+```
+
+服务器将在加载时填充 `g_keyring` 对象。如果未安装密钥环组件，则 `read()` 和 `write()` 方法在运行时将返回 `Status::UNAVAILABLE`——请在每次调用时检查该状态，而不是基于单独的可用性探测。
+
+### 读取和写入
+
+```cpp
+struct KeyringCapability::ReadResult {
+  KeyringCapability::Status status;
+  std::string value;
+};
+
+[[nodiscard]] KeyringCapability::ReadResult
+KeyringCapability::read(std::string_view data_id,
+                        std::string_view auth_id = {}) const;
+
+[[nodiscard]] KeyringCapability::Status
+KeyringCapability::write(std::string_view data_id,
+                         std::string_view auth_id,
+                         std::string_view data) const;
+```
+
+`data_id` 是密钥标识符。`auth_id` 是所有者用户——传递一个空字符串（或在 `read` 上省略它，`read` 默认使用 `{}`）以读取或写入与特定用户无关的内部密钥。
+
+`read` 返回一个 `ReadResult`。使用结构化绑定将其绑定：
+
+```cpp
+auto [status, value] = g_keyring.read("my_secret");
+if (status == KeyringCapability::Status::OK) {
+  // value contains the secret bytes
+}
+```
+
+对于任何状态（`Status::OK` 除外），`value` 都是空的。
+
+`write` 直接返回 `Status`，并将 `data` 存储在 `data_id` / `auth_id` 下。
+
+### 完整示例
+
+这是与服务器一起提供的 `vsql_keyring_reader` 测试扩展程序的简化版本。它注册了 2 个 VDF：`keyring_read` 和 `keyring_store`。
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+void keyring_read(StringArg data_id, StringArg auth_id, StringResult out) {
+  if (data_id.is_null()) { out.set_null(); return; }
+
+  const auto [status, value] =
+      g_keyring.read(data_id.value(), auth_id.is_null() ? "" : auth_id.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  if (status != KeyringCapability::Status::OK) { out.set_null(); return; }
+
+  auto buf = out.buffer();
+  size_t len = std::min(value.size(), buf.size());
+  memcpy(buf.data(), value.data(), len);
+  out.set_length(len);
+}
+
+void keyring_store(StringArg data_id, StringArg auth_id, StringArg value,
+                   IntResult out) {
+  if (data_id.is_null() || value.is_null()) { out.set(1); return; }
+
+  KeyringCapability::Status status = g_keyring.write(
+      data_id.value(), auth_id.is_null() ? "" : auth_id.value(), value.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  out.set(status == KeyringCapability::Status::OK ? 0 : 1);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&keyring_read>("keyring_read")
+                  .returns(STRING).param(STRING).param(STRING).build())
+        .func(make_func<&keyring_store>("keyring_store")
+                  .returns(INT).param(STRING).param(STRING).param(STRING).build())
+        .with(g_keyring))
+```
+
+## 状态变量 {#status-variables}
+
+`status_var` 功能 (`vsql::preview::status_var`) 允许扩展程序将 `long long` 和 `double` 计数器作为 MySQL 状态变量公开。扩展程序拥有存储空间并写入其中；服务器每次查询状态变量时，都会通过指针读取。
+
+使用 `vsql::preview_status_var::make_capability()` 构建功能，并传递来自 `make_int(name, value_ptr)` 或 `make_double(name, value_ptr)` 的大括号列表。模板从大括号列表中推断计数，因此不需要显式大小。
+
+### 完整示例
+
+```cpp
+#include <villagesql/preview/status_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_status_var;
+
+static long long g_hits   = 0;
+static long long g_misses = 0;
+
+static auto STATUS_VARS = sv::make_capability({
+    sv::make_int("ext_hits",   &g_hits),
+    sv::make_int("ext_misses", &g_misses)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STATUS_VARS))
+```
+
+`make_int` 需要一个 `long long *`；`make_double` 需要一个 `double *`。这是支持的两种类型。
+
+### 从 SQL 访问
+
+在 `INSTALL EXTENSION my_ext` 之后，该变量将以扩展程序名称作为前缀显示：
+
+```sql
+SHOW GLOBAL STATUS LIKE 'my_ext%';
+```
+```
+Variable_name       Value
+my_ext.ext_hits     0
+my_ext.ext_misses   0
+```
+
+来自多个查询线程的并发递增（使用非原子 `++`）可能会偶尔丢失；这对于通过 `SHOW STATUS` 公开的近似调用计数器是可以接受的。
+
+## 系统变量 {#system-variables}
+
+`sys_var` 功能 (`vsql::preview::sys_var`) 允许扩展程序注册由扩展程序拥有的存储空间支持的 MySQL 系统变量。支持三种类型：`BOOL` (`bool *`)、`INT` (`long long *`) 和 `STR` (`char **`)。`INT` 描述符还携带 `min_val` 和 `max_val` 边界；所有描述符都携带默认值和注释。
+
+使用 `vsql::preview_sys_var::make_capability()` 和相应的工厂函数 `make_bool`、`make_int` 和 `make_str` 构建功能。功能对象还公开 `get()` 和 `set()`，以便从扩展程序代码中进行编程访问。两者都返回 `false` 表示成功。
+
+要响应值更改，请在描述符上链接 `.on_change<&fn>()`。回调将接收一个 `sv::SysVarChange`，其中包含 `var_name()` 和类型化的访问器 (`as_int()`、`as_real()`、`as_str()`)。
+
+功能对象必须具有静态存储期。当用户设置变量时，MySQL 会直接写入存储指针。
+
+| 工厂 | 存储类型 | 附加参数 |
+|---|---|---|
+| `sv::make_bool` | `bool *` | `def_val` |
+| `sv::make_int` | `long long *` | `def_val`、`min_val`、`max_val` |
+| `sv::make_str` | `char **` | `def_val` |
+
+### 完整示例
+
+```cpp
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_sys_var;
+
+static bool      g_enabled   = true;
+static long long g_threshold = 1000;
+static char     *g_log_file  = nullptr;
+
+static void on_threshold_change(sv::SysVarChange c) {
+  // c.var_name() identifies the variable; c.as_int() returns the new value
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled",      "Enable feature",  &g_enabled,   true),
+    sv::make_int ("threshold_ms", "Threshold in ms", &g_threshold, 1000, 0, 3600000)
+        .on_change<&on_threshold_change>(),
+    sv::make_str ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log")});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SYS_VARS))
+```
+
+### 从 SQL 访问
+
+安装 `INSTALL EXTENSION my_ext` 后，可以使用扩展名作为组件前缀来访问变量：
+
+```sql
+SELECT @@global.my_ext.threshold_ms;
+SET GLOBAL my_ext.threshold_ms = 500;
+SET GLOBAL my_ext.log_file = '/var/log/myext.log';
+```
+
+### 从扩展代码读取和写入
+
+对于 INT 和 BOOL 变量，直接读取全局存储指针——MySQL 以原子方式更新这些变量。要通过 MySQL 更新变量（以便服务器处理锁定、范围验证和持久性），请调用
+`SYS_VARS.set(extension_name, var_name, scope, value)`。`set` 和 `get` 都成功时返回 `false`。
+
+```cpp
+bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
+```
+
+`scope` 参数控制持久性：
+
+| 范围 | 行为 |
+|-------|----------|
+| `nullptr` | 仅更新运行时值，不持久化。 |
+| `"PERSIST"` | 更新运行时值并写入 `mysqld-auto.cnf`。 |
+| `"PERSIST_ONLY"` | 仅写入 `mysqld-auto.cnf`；在下次重启时生效。 |
+
+## 线程工作器
+
+线程工作器功能 (`vsql::preview::thread_worker`) 允许扩展在服务器驱动的后台线程中运行。线程通过控制系统变量进行启动和停止，该变量由服务器在扩展加载时注册；服务器在定期计时器上、在文件描述符准备就绪时，或响应启用/禁用事件时调用扩展的工作函数。
+
+功能名称 `VEF_PREVIEW_THREAD_WORKER_NAME` 是
+`"vsql::preview::thread_worker"`。
+
+### 声明功能
+
+包含头文件，在文件范围内声明一个实例化了工作函数的 `ThreadWorkerCapability`，并将其传递给 `.with()`：
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"suffix"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+工作函数作为非类型模板参数提供 (`ThreadWorkerCapability<&my_work>`)，因此它必须是一个具有以下签名的函数。第一个构造函数参数是线程名称后缀；可选的第二个参数覆盖控制系统变量名称。
+
+### 工作函数签名
+
+```c
+typedef vef_next_wakeup_t (*vef_work_fn_t)(vef_wakeup_reason_t reason,
+                                           struct vef_thread_handle_t *thread,
+                                           void *arg);
+```
+
+`reason` 指示服务器调用该函数的原因。`thread` 是服务器拥有的此工作器的句柄（在初始 `VEF_WAKEUP_ENABLE` 调用时为 NULL——参见下文）。`arg` 是在描述符上注册的不透明指针；它会保持不变地传递。
+
+### 唤醒生命周期
+
+服务器使用以下四个原因之一调用工作函数：
+
+| 原因 | 含义 |
+|---|---|
+| `VEF_WAKEUP_ENABLE` | 工作器刚刚启用（控制系统变量切换为 ON）。返回值设置初始 `poll_fd` 和 `sleep_ms`。 |
+| `VEF_WAKEUP_PERIODIC` | 定期计时器触发（`sleep_ms` 过去）。 |
+| `VEF_WAKEUP_POLL_FD` | 监视的文件描述符变为可读。 |
+| `VEF_WAKEUP_DISABLE` | 工作器禁用（控制系统变量 OFF）或服务器正在关闭。返回值将被忽略。 |
+
+当原因是 `VEF_WAKEUP_ENABLE` 时，`thread` 参数为 NULL，因为此时线程句柄尚不存在。对于其他三个原因，`thread` 不为 NULL。
+
+### 唤醒返回值
+
+```c
+typedef struct {
+  unsigned int sleep_ms;
+  int poll_fd;
+} vef_next_wakeup_t;
+```
+
+工作函数返回一个 `vef_next_wakeup_t`，以更新下一个唤醒配置。任何字段中的零值都表示“保持当前设置”——返回一个值初始化的结构体 (`return {};`) 以保持两者不变。
+
+要设置新的轮询文件描述符，请返回其值（必须大于零）。要清除现有的轮询文件描述符，请在 `poll_fd` 中返回 `-1`。
+
+当原因是 `VEF_WAKEUP_DISABLE` 时，返回值将被忽略。
+
+### 线程名称和控制变量
+
+描述符上的两个字段控制命名：
+
+- `suffix`——线程名称后缀。服务器将其与扩展名称连接起来，生成线程名称，如 `my_ext/monitor`。
+- `var_name`——可选。如果非 NULL，服务器将注册此确切名称作为控制系统变量。如果为 NULL，服务器将使用默认模式 `{suffix}_enabled`。
+
+控制变量是服务器注册的系统变量。使用 `SET GLOBAL {suffix}_enabled = ON` 启用工作器；将其设置为 `OFF` 以停止它。
+
+### 完整示例
+
+一个带有单个周期性工作器的最小扩展，该工作器在每个计时器周期中递增一个心跳计数器。
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+#include <atomic>
+
+static std::atomic<unsigned long long> g_heartbeat{0};
+
+static vef_next_wakeup_t heartbeat_work(vef_wakeup_reason_t reason,
+                                        struct vef_thread_handle_t *thread,
+                                        void *arg) {
+  switch (reason) {
+    case VEF_WAKEUP_ENABLE:
+      return {1000, 0};  // tick every 1000 ms, no poll fd
+    case VEF_WAKEUP_PERIODIC:
+      g_heartbeat.fetch_add(1, std::memory_order_relaxed);
+      return {};  // keep current sleep_ms and poll_fd
+    case VEF_WAKEUP_POLL_FD:
+      return {};  // not used in this example
+    case VEF_WAKEUP_DISABLE:
+      return {};  // ignored
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&heartbeat_work>
+    g_worker{"heartbeat"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+安装此扩展（并且 `vsql_allow_preview_extensions = ON`）后，服务器将注册一个 `heartbeat_enabled` 系统变量。使用以下命令启用工作器：
+
+```sql
+SET GLOBAL heartbeat_enabled = ON;
+```
+
+## SQL 查询
+
+sql_query 功能 (`vsql::preview::sql_query`) 允许扩展从后台线程执行 SQL 语句。查询在服务器内部通过功能 vtable 运行——扩展不链接到任何 MySQL 客户端库。
+
+功能名称 `VEF_PREVIEW_SQL_QUERY_NAME` 是
+`"vsql::preview::sql_query"`。
+
+<Warning>
+必须从线程工作器回调中使用该回调的 `vef_thread_handle_t *` 打开 SQL 会话。从 VDF 或从任意扩展创建的线程中调用 `open()` 是无效的——它需要工作器会话上下文。
+</Warning>
+
+### 声明功能
+
+包含头文件，在文件范围内声明一个 `SqlQueryCapability`，并将其传递给 `.with()`。它通常与 `ThreadWorkerCapability` 一起注册，因为会话是从工作器回调中打开的：
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
+
+`g_sql.open(handle)` 返回一个 `Session`。在使用之前，使用 `operator bool` 检查它；无效的 `Session` 表示功能 vtable 未绑定或服务器无法分配会话。`Session` 是只移动的，并在销毁时自行关闭。
+
+### 执行查询
+
+`Session` 通过 `session.sql(sv)` 生成一个 `SqlQuery`。查询可以以两种模式运行：
+
+- `execute()`——运行该语句并将完整的结果集缓冲到 `Result` 中。通过按调用方自己的速度调用 `next()` 来迭代行。
+- `for_each(fn)`——运行该语句，并为生成的每一行调用一次 `fn`，而不进行缓冲。返回的 `Result` 仅包含诊断信息（不包含行）。
+
+两者都返回一个 `Result`。非 NULL 的 `Result` 并不意味着该语句已成功——调用 `has_error()` 以确定。
+
+缓冲 (`execute`)：
+
+```cpp
+auto result = session.sql("SELECT id, name FROM t").execute();
+if (result.has_error()) {
+  // result.error().message holds the server error string.
+  return {};
+}
+while (result.next()) {
+  long long id          = result.column_int(0);
+  std::string_view name = result.column_str(1);
+  // ...
+}
+```
+
+`column_str()` 返回一个 `string_view`，它仅在下一次 `next()` 调用或 `Result` 销毁之前有效。如果需要更长的生命周期，请复制它。`string_view` 具有 `data() == nullptr` 表示 SQL NULL。
+
+流式 (`for_each`)：
+
+```cpp
+auto status = session.sql("SELECT 1").for_each(
+    [](const auto &row) {
+      // row.column_int(0), row.column_str(1), etc.
+    });
+if (status.has_error()) {
+  // status.error().message
+}
+```
+
+传递给回调的 `Row` 仅在调用期间有效——不要存储对它的引用，以便跨行使用。`for_each` 返回的 `Result` 不包含缓冲的行；在其上调用 `next()` 不会产生数据。仅将其用于 `has_error()`、`error()`、`warning_count()` 和 `warning(i)`。
+
+### 诊断
+
+`execute()` 和 `for_each()` 都通过返回的 `Result` 提供诊断信息。一个诊断信息是一个 `Diag`：
+
+```cpp
+struct Diag {
+  uint32_t errno_;
+  vef_sql_diag_severity_t severity;   // NOTE | WARNING | ERROR
+  std::string_view sqlstate;          // 5-char SQLSTATE
+  std::string_view message;           // may be empty
+};
+```
+
+| 字段 | 含义 |
+|---|---|
+| `errno_` | MySQL 错误编号。默认构造的 `Diag` 在没有错误时返回 `0`。 |
+| `severity` | `VEF_SQL_DIAG_NOTE`、`VEF_SQL_DIAG_WARNING` 或 `VEF_SQL_DIAG_ERROR`。 |
+| `sqlstate` | 5 个字符的 SQLSTATE。 |
+| `message` | 服务器提供的诊断消息；可能为空。 |
+
+`Result` 暴露：
+
+```cpp
+bool         Result::has_error() const;
+Diag         Result::error() const;
+unsigned int Result::warning_count() const;
+Diag         Result::warning(unsigned int i) const;
+```
+
+`error()` 在语句成功时返回一个默认构造的 `Diag` (`errno_ == 0`)。`warning(i)` 在 `i >= warning_count()` 时返回一个默认构造的 `Diag`。
+
+`sqlstate` 和 `message` 视图指向由 `Result` 拥有的存储，并在 `Result` 销毁时失效——如果需要超出其生命周期，请复制它们。
+
+### 完整示例
+
+一个工作线程，在每个周期执行一个带缓冲的查询和一个流式查询，并记录来自两者的诊断信息：
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t sql_demo_work(vef_wakeup_reason_t reason,
+                                       struct vef_thread_handle_t *thread,
+                                       void *arg) {
+  if (reason == VEF_WAKEUP_ENABLE) return {5000, 0};
+  if (reason != VEF_WAKEUP_PERIODIC) return {};
+
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+
+  // Buffered: read a small result set.
+  auto rs = session.sql("SELECT id, name FROM mydb.t LIMIT 10").execute();
+  if (rs.has_error()) {
+    auto e = rs.error();
+    // Log e.errno_, e.sqlstate, e.message somewhere extension-owned.
+  } else {
+    while (rs.next()) {
+      long long id          = rs.column_int(0);
+      std::string_view name = rs.column_str(1);
+      (void)id; (void)name;
+    }
+  }
+
+  // Streaming: process rows without buffering.
+  auto status = session.sql("SELECT v FROM mydb.t").for_each(
+      [](const auto &row) {
+        long long v = row.column_int(0);
+        (void)v;
+      });
+  for (unsigned i = 0; i < status.warning_count(); ++i) {
+    auto w = status.warning(i);
+    (void)w;
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&sql_demo_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
+
+## 列存储 {#column-storage}
+
+列存储允许扩展直接向 InnoDB 注册自定义的磁盘布局，用于其自定义类型之一，而不是将该类型的数据通过行的 VARBINARY 负载进行路由。当您的类型需要一种 VARBINARY 无法表达的磁盘布局时，请使用它——例如，必须存储在专用页中的打包浮点数组。这是一个功能特性：它启用了新的存储布局，而不是用于现有布局的调整旋钮。
+
+<Warning>
+  列存储是一个预览版 ABI——正在积极开发中，并且可能在不同版本之间发生变化。它目前仅涵盖行级持久性；对自定义存储列进行索引尚未可用。
+</Warning>
+
+### 声明功能
+
+两个预览功能协同工作：
+
+- `vsql::preview::storage` — 开放对 InnoDB 存储基础设施的访问（微事务、段、页）。在文件范围内声明一个 `StorageCapability`。
+- `vsql::preview::column_store` — 将每个类型的存储实现绑定到扩展的自定义类型之一。在文件范围内使用 `make_column_store<Ctx>(TYPE).…build()` 声明一个 `ColumnStoreCapability`。
+
+两者都必须传递给 `make_extension()` 上的 `.with()`：
+
+```cpp
+#include <villagesql/preview/storage_builder.h>
+#include <villagesql/preview/storage_api.h>
+#include <villagesql/vsql.h>
+
+namespace storage = vsql::preview_storage;
+using vsql::preview_storage_builder::ColumnStoreCapability;
+using vsql::preview_storage_builder::make_column_store;
+using vsql::preview_storage_builder::StorageCapability;
+
+struct MyCtx {
+  storage::Space::Ref space = 0;
+  storage::Segment::PageRef root_page = storage::Page::INVALID_REF;
+};
+
+static auto STORAGE = StorageCapability{};
+
+static constexpr auto kMyStorage =
+    make_column_store<MyCtx>(MY_TYPE)
+        .create<&MyStorage::create>()
+        .drop<&MyStorage::drop>()
+        .load<&MyStorage::load>()
+        .insert<&MyStorage::insert>()
+        .select<&MyStorage::select>()
+        .mark_delete<&MyStorage::mark_delete>()
+        .purge<&MyStorage::purge>()
+        .build();
+
+static auto COLUMN_STORE = ColumnStoreCapability().column_store(kMyStorage);
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STORAGE)
+        .with(COLUMN_STORE)
+        .type(MY_TYPE))
+```
+
+`make_column_store<MyCtx>(MY_TYPE)` 将实现绑定到在同一扩展上注册的一个自定义类型。所有七个槽位都必须在 `build()` 时提供，因为每个槽位都映射到列生命周期中的一个不同点，InnoDB 在正常操作期间会到达该点。
+
+### 七个存储函数
+
+每个函数都接受 `storage::Column::StorageCtx<MyCtx>*`，其 `user()` 访问器返回扩展的每个列状态，并且其 `arena()` 提供服务器管理的辅助对象分配。每个函数在成功时返回 `false`，在出错时返回 `true`，并将消息写入 `error_msg`（容量 `error_msg_len`），以便将故障传递到 SQL 客户端。
+
+```cpp
+// CREATE TABLE / ALTER TABLE ADD COLUMN.
+// col_len is the type's persisted length. Reserve segments here and store
+// space + root_page in ctx->user() so DML functions can reach them.
+bool create(storage::Column::StorageCtx<MyCtx>*, storage::Space::Ref,
+            storage::Segment::TrxRef, uint32_t col_len,
+            char* error_msg, uint32_t error_msg_len);
+
+// DROP TABLE / ALTER TABLE DROP COLUMN.
+// Release any segments reserved in create(). Arena memory is freed by the
+// server after this call returns.
+bool drop(storage::Column::StorageCtx<MyCtx>*, storage::Segment::TrxRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// Called when the server reattaches to existing storage (e.g. after restart).
+// Recover space and root_page from the StorageRef set in create().
+bool load(storage::Column::StorageCtx<MyCtx>*, storage::Column::StorageRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// INSERT. col_data is the encoded value; rowid_prefix identifies the owning
+// row. Write into your storage layout and return a Column::Ref the server
+// stores in the row payload in place of the value bytes.
+bool insert(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Segment::TrxRef, storage::Column::Data col_data,
+            storage::Column::Data rowid_prefix, storage::Column::Ref* col_ref,
+            char* error_msg, uint32_t error_msg_len);
+
+// SELECT. Given the Column::Ref produced by insert, populate col_data and
+// rowid_prefix, and report the writing transaction and delete-mark status.
+bool select(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Column::Ref, storage::Column::Data* col_data,
+            storage::Column::Data* rowid_prefix, storage::Segment::TrxRef*,
+            bool* delete_marked, char* error_msg, uint32_t error_msg_len);
+
+// DELETE (in-transaction). Set or clear the delete-mark flag. The actual
+// bytes must remain readable until purge() runs.
+bool mark_delete(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+                 storage::Segment::TrxRef, storage::Column::Ref,
+                 bool delete_mark, char* error_msg, uint32_t error_msg_len);
+
+// InnoDB purge. Reclaim storage for entries whose deleting transaction is
+// no longer visible to any active snapshot.
+bool purge(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+           storage::Segment::TrxRef, storage::Column::Ref,
+           char* error_msg, uint32_t error_msg_len);
+```
+
+`mark_delete` 和 `purge` 是不同的，因为 InnoDB MVCC 要求已删除的行在 purge 运行之前对旧的快照保持可读。
+
+### 每个列的上下文和 Arena
+
+C++ SDK 在调用 `create` 或 `load` 之前，默认构造 `MyCtx`——在进入您的函数时，`ctx->user()` 已经填充。`MyCtx` 必须是默认可构造的；C++ SDK 使用不带参数的 `T()` 调用。
+
+直接使用 `ctx->user()` 来初始化状态。不要调用 `ctx->arena().construct<MyCtx>()`——这将分配第二个、未使用的实例，并且 `ctx->user()` 不指向它。
+
+```cpp
+bool MyStorage::create(storage::Column::StorageCtx<MyCtx>* ctx,
+                       storage::Space::Ref space, storage::Segment::TrxRef trx,
+                       uint32_t col_len,
+                       char* error_msg, uint32_t error_msg_len) {
+  storage::Segment::PageRef root;
+  if (storage::Segment::create(space, 1, trx, root) != storage::Error::SUCCESS) {
+    snprintf(error_msg, error_msg_len, "%s", storage::last_error().data());
+    return true;
+  }
+
+  ctx->user()->space = space;
+  ctx->user()->root_page = root;
+  // Encode space and root into StorageRef so load() can recover both.
+  ctx->set_ref((static_cast<storage::Column::StorageRef>(space) << 32) |
+               static_cast<storage::Column::StorageRef>(root));
+  return false;
+}
+```
+
+`load` 遵循相同的模式——`ctx->user()` 预先填充，并且 `storage_ref` 携带由 `ctx->set_ref()` 在 `create` 中存储的打包值：
+
+```cpp
+bool MyStorage::load(storage::Column::StorageCtx<MyCtx>* ctx,
+                     storage::Column::StorageRef storage_ref,
+                     char* error_msg, uint32_t error_msg_len) {
+  ctx->user()->space =
+      static_cast<storage::Space::Ref>(storage_ref >> 32);
+  ctx->user()->root_page =
+      static_cast<storage::Segment::PageRef>(storage_ref & 0xFFFFFFFF);
+  ctx->set_ref(storage_ref);
+  return false;
+}
+```
+
+仅使用 `ctx->arena()` 来分配辅助对象，这些对象太大或太动态，无法直接嵌入到 `MyCtx` 中。C++ SDK 在 `drop` 返回后，无论 `drop` 是否成功，都会自动销毁 arena 并调用 `~MyCtx()`。
+
+### InnoDB 访问实用程序
+
+包含 `<villagesql/preview/storage_api.h>` 以获取 InnoDB 原语。所有页面的读取和写入都必须在微事务中进行：
+
+```cpp
+storage::MtrCtx mtr;
+storage::MtrCtx::Ref mtr_ref = mtr.start();
+if (mtr_ref == nullptr) { /* OOM — handle error */ return true; }
+// ... page operations ...
+mtr.commit();
+```
+
+提交微事务会释放页面锁，并写入重做日志记录，以使更改持久化。
+
+**段** 在 `create` 时保留——有关完整的设置模式，请参见上面“每个列的上下文”中的 `create` 和 `load` 示例。在 DML 操作期间，从根页面获取段引用以分配新页面：
+
+```cpp
+storage::Page root;
+root.load(ctx->user()->space, ctx->user()->root_page,
+          storage::Page::Latch::EXCLUSIVE, mtr_ref);
+storage::Segment::Ref seg = storage::Segment::get_header(root, 0);
+storage::Page data_page;
+data_page.load_new(seg, mtr_ref);  // allocates a fresh page
+```
+
+**页面** 使用共享锁读取，使用独占锁写入。将 `mtr_ref` 传递给写入调用，以便 InnoDB 记录更改：
+
+```cpp
+storage::Page page;
+
+// Read
+page.load(ctx->user()->space, page_num, storage::Page::Latch::SHARED, mtr_ref);
+uint32_t v = page.read_integer_4(storage::Page::HEADER_SIZE + offset);
+
+// Write
+page.load(ctx->user()->space, page_num, storage::Page::Latch::EXCLUSIVE, mtr_ref);
+page.write_integer_4(storage::Page::HEADER_SIZE + offset, v, mtr_ref);
+```
+
+页面布局常量：
+
+| 常量 | 值 | 备注 |
+|---|---|---|
+| `storage::Page::HEADER_SIZE` | `38` | 扩展数据从此偏移量开始。 |
+| `storage::Page::TRAILER_SIZE` | `8` | 不要写入 `page_size - TRAILER_SIZE` 之后。 |
+| `storage::Page::get_size(space)` | 运行时 | 使用它来代替硬编码的 16384。 |
+
+在标头或尾部区域内读取或写入会损坏页面——InnoDB 使用这些字节范围用于其自身的簿记和校验和。
+
+## 语句事件
+
+语句事件功能 (`vsql::preview::statement_event`) 在每个查询完成执行后运行一个扩展提供的处理程序。服务器在查询自己的线程上同步调用该处理程序，并传递执行元数据——查询文本、计时、行计数、连接标识以及优化器质量指标。可将其用于慢查询日志记录、审计或指标收集。
+
+功能名称 `VEF_PREVIEW_STATEMENT_EVENT_NAME` 是
+`"vsql::preview::statement_event"`。
+
+### 声明功能
+
+声明一个 `StatementEventCapability`，在触发阶段和您的处理程序函数上实例化，将其置于文件范围内并传递给 `.with()`：
+
+```cpp
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/vsql.h>
+
+namespace se = vsql::preview_statement_event;
+
+static void on_statement(const se::StatementEventArgs &args,
+                         se::StatementEventResult &result) {
+  // inspect args; optionally write an advisory message via result
+}
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &on_statement>
+    g_statement_event;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_statement_event))
+```
+
+第一个模板参数是触发阶段，一个 `vef_statement_event_phase_t` 值。`VEF_STATEMENT_EVENT_POSTEXECUTE` 在查询完成执行后触发（无论成功还是失败），并且是此版本中唯一实现的阶段。其他 `vef_statement_event_phase_t` 值是保留的；为其中之一声明处理程序会导致服务器拒绝 `INSTALL EXTENSION`。
+
+### 处理程序参数
+
+`StatementEventArgs` 是已完成查询的只读视图；在 POSTEXECUTE 阶段，每个字段都已填充。部分访问器：
+
+| 访问器 | 含义 |
+|---|---|
+| `query()` | 查询文本，作为 `string_view`。当服务器有该语句的重写形式时，这就是该形式——与常规日志、慢查询日志和二进制日志记录的相同经过脱敏的文本。 |
+| `query_time_secs()` | 挂钟执行时间，以秒为单位。 |
+| `lock_time_secs()` | 等待锁所花费的时间，以秒为单位。 |
+| `rows_sent()`、`rows_examined()`、`rows_affected()` | 行计数器。 |
+| `user()`、`client_ip()`、`connection_id()` | 连接标识。 |
+| `schema()` | 默认架构，如果未选择任何架构则为 `NULL`。 |
+| `status()` | 成功时为 `0`，否则为 MySQL 错误代码。 |
+| `digest_text()` | 规范化的查询形式，用于对相似查询进行分组。 |
+| `no_index_used()` | 当查询在没有可用索引的情况下运行时为 `true`。 |
+
+由于 `query()` 在存在重写形式时返回服务器的重写形式，因此携带凭据的语句到达时会将密钥混淆，而不是以明文形式呈现，这与常规日志、慢查询日志和二进制日志已经对它们进行脱敏的方式相匹配：`SET PASSWORD`、`CREATE`/`ALTER USER ... IDENTIFIED BY`、`CHANGE REPLICATION SOURCE ... SOURCE_PASSWORD` 以及 `CREATE SERVER ... OPTIONS(PASSWORD ...)`。没有重写规则的语句会逐字传递。
+
+诸如 `query()`、`sqlstate()` 和 `error_message()` 之类的字符串访问器指向仅在处理程序调用期间有效的存储——如果您在处理程序返回后需要它们，请复制这些字节。
+
+`StatementEventResult::error_msg(fmt, ...)` 写入一条 printf 格式化的消息。在 POSTEXECUTE 阶段，该消息是建议性的：服务器会记录它，但不会将其传播到客户端。
+
+### 完整示例
+
+[`vsql_slow_query_log`](https://github.com/villagesql/villagesql-server/tree/main/villagesql/test-extensions/vsql-slow-query-log) 测试扩展的精简形式，该扩展与服务器一起提供。它记录每个执行时间超过阈值的查询，将语句事件功能与[系统变量](#system-variables)结合以进行运行时配置：
+
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+namespace sv = vsql::preview_sys_var;
+namespace se = vsql::preview_statement_event;
+
+static bool g_enabled;
+static long long g_threshold_ms;
+static char *g_log_filename;
+static std::mutex g_log_mutex;
+
+static void slow_query_hook(const se::StatementEventArgs &args,
+                            se::StatementEventResult &result) {
+  if (!g_enabled) return;
+  if (args.query_time_secs() * 1000.0 < static_cast<double>(g_threshold_ms))
+    return;
+
+  time_t now = static_cast<time_t>(args.query_start_utime() / 1000000);
+  char ts[32];
+  struct tm tm_utc;
+  gmtime_r(&now, &tm_utc);
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+  std::lock_guard<std::mutex> lock(g_log_mutex);
+  FILE *f = fopen(g_log_filename, "a");
+  if (f == nullptr) {
+    result.error_msg("failed to open '%s': %s", g_log_filename,
+                     strerror(errno));
+    return;
+  }
+
+  fprintf(f, "# Time: %s\n", ts);
+  fprintf(f, "# User@Host: %s @ %s  Id: %lu\n", args.user() ? args.user() : "",
+          args.client_ip() ? args.client_ip() : "", args.connection_id());
+  fprintf(f,
+          "# Schema: %s  Query_time: %.6f  Lock_time: %.6f"
+          "  Rows_sent: %llu  Rows_examined: %llu\n",
+          args.schema() ? args.schema() : "", args.query_time_secs(),
+          args.lock_time_secs(), (unsigned long long)args.rows_sent(),
+          (unsigned long long)args.rows_examined());
+  fprintf(f, "SET timestamp=%llu;\n", (unsigned long long)now);
+  auto q = args.query();
+  fprintf(f, "%.*s;\n", (int)q.size(), q.data());
+  fclose(f);
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled", "Enable the slow query log", &g_enabled, false),
+    sv::make_int("threshold_ms", "Minimum execution time to log, in ms",
+                 &g_threshold_ms, 1000, 0, 3600000),
+    sv::make_str("log_file", "Path to the slow query log file",
+                 &g_log_filename, "/tmp/vsql_slow_query.log")});
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &slow_query_hook>
+    STATEMENT_EVENT;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension().with(SYS_VARS).with(STATEMENT_EVENT))
+```
+
+#### 从 SQL 启用
+
+启用预览层后（请参阅[启用预览层](#启用预览层)），安装该扩展并通过其系统变量进行配置：
+
+```sql
+INSTALL EXTENSION vsql_slow_query_log;
+SET GLOBAL vsql_slow_query_log.enabled = ON;
+SET GLOBAL vsql_slow_query_log.threshold_ms = 500;
+```
+
+每个比阈值慢的查询都会追加到配置的日志文件中：
+
+```
+# Time: 2026-06-22T22:53:44Z
+# User@Host: root @   Id: 27
+# Schema:   Query_time: 0.605084  Lock_time: 0.000000  Rows_sent: 1  Rows_examined: 1
+SET timestamp=1782168824;
+SELECT SLEEP(0.6);
+```

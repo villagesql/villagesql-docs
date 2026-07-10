@@ -1,0 +1,112 @@
+---
+audience: extension-author
+title: "协议 1 API"
+description: "协议 1 函数指针类型 API 和原始 ABI 样式的参考——这是原始 VEF 接口，自 v0.0.1 版本起稳定，将在 0.0.5 版本后移除。"
+---
+
+协议 1 是原始 VEF 接口。自 v0.0.1 版本起稳定，将在 0.0.5 版本后移除。新的扩展应使用协议 3 API——基于模板的类型构建器，请参阅 [使用 C++ 创建扩展](/zh/mysql-8.4/0.0.5/create) 和 [C++ 开发](/zh/mysql-8.4/0.0.5/development) 指南。
+
+本页面用于在处理基于协议 1 构建的现有扩展时提供参考。
+
+## 函数指针类型 API
+
+协议 1 中的自定义类型使用显式函数指针进行注册，而不是使用 `vsql::make_type<>` 模板。函数签名与协议 3 的等效签名不同——它们接受原始指针和长度，而不是 `Arg` 和 `Result` 对象。
+
+### 函数签名
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+### 注册
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()`（带有编译时字符串 NTTP）是首选形式。`make_type(MYTYPE)`（没有模板参数）是协议 1 形式——对它的支持将在 0.0.5 版本后移除。
+
+## 原始 ABI 样式（函数）
+
+协议 1 VDF 实现可以直接传递原始 C 结构体，而不是使用类型化包装器。这种样式将在 0.0.5 版本后移除——对于所有新代码，请使用 [类型化参数/结果 API](/zh/mysql-8.4/0.0.5/development#argument-and-result-types)。
+
+```cpp
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+```
+
+注册与类型化方法相同——构建器会自动检测签名。
+
+### 结果常量
+
+原始 ABI 通过在 `result->type` 上设置的 `vef_return_value_type_t` 来传达结果状态：
+
+| 常量 | 值 | 含义 |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | 成功——输出位于相应的联合字段中 |
+| `VEF_RESULT_NULL` | 1 | 结果为 SQL NULL |
+| `VEF_RESULT_WARNING` | 2 | 行级警告——执行继续，该行返回 NULL，并添加一条 SQL 警告；在严格模式下，MySQL 会在 INSERT/UPDATE 时将其提升为错误 |
+| `VEF_RESULT_ERROR` | 3 | 致命错误——语句执行被中止；消息位于 `result->error_msg` 中 |
+
+在协议 3 中，`out.set()`、`out.set_null()`、`out.warning()` 和 `out.error()` 会自动处理这一点。
+
+### 协议 1 中的聚合注册
+
+对于聚合，`.clear<>()` 和 `.accumulate<>()` 接受原始 ABI 函数指针签名。`.prerun<>()` 和 `.postrun<>()` 不接受——构建器需要类型化签名（`void(PrerunArgs, PrerunResult)` 和 `void(PostrunArgs)`），即使对于协议 1 扩展也是如此。对于所有新代码，请使用 [类型化聚合方法](/zh/mysql-8.4/0.0.5/development#aggregate-vdfs)。
+
+```cpp
+make_func<&raw_result>("my_agg")
+    .returns(INT).param(INT)
+    // prerun/postrun require typed signatures even in Protocol 1 mode:
+    .prerun<&my_prerun>()      // void(vsql::PrerunArgs, vsql::PrerunResult)
+    .postrun<&my_postrun>()    // void(vsql::PostrunArgs)
+    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
+    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
+    .build()
+```

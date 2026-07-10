@@ -1,0 +1,581 @@
+---
+audience: extension-author
+title: "使用 C++ 创建扩展"
+description: "了解如何使用扩展模板和 VEF，用 C++ 创建自定义 VillageSQL 扩展。"
+---
+
+<Warning>
+VEF Protocol 3 is stable as of v0.0.4. Protocol 4 is under development and is available only via opt-in dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`). Extensions built against the old Protocol 2 are rejected by the server and must be rebuilt.
+</Warning>
+
+## 概述
+
+VillageSQL 的扩展框架 (VEF) 允许您向数据库服务器添加自定义功能。本指南将逐步介绍如何使用 C++ SDK 和扩展模板用 C++ 构建扩展。
+
+如需深入了解编写 VDF 实现——参数和结果类型、聚合、系统变量、参数化类型——请参阅 [开发指南](/zh/mysql-8.4/0.0.5/development)。
+
+<Note>
+如果您更偏好 Rust，请参阅 [使用 Rust 创建扩展](/zh/mysql-8.4/0.0.5/rust-sdk)。
+</Note>
+
+## 什么是 VillageSQL 扩展？
+
+VillageSQL 扩展打包为 **VEB 文件**（VillageSQL Extension Bundle），包含：
+- **清单文件 (Manifest)** - 有关扩展的元数据（名称、版本、描述）
+- **共享库 (Shared library)** - 实现功能的已编译 C++ 代码
+- **可选元数据** - 其他资源或配置
+
+C++ 扩展使用 **C++ SDK** 构建，它是 VEF（VillageSQL Extension Framework）的 C++ 绑定。它提供：
+- 用于定义类型和函数的 C++ API
+- 无需 SQL 脚本的自动注册
+- 类型安全的参数和结果类型
+- 用于扩展定义的构建器模式
+
+<Note>
+**VDF 与传统 UDF 的区别：** 通过 VEF 注册的函数称为 VDF（VillageSQL Defined Functions）。VillageSQL 也支持通过 `CREATE FUNCTION ... SONAME` 注册的传统 MySQL UDF，但对于新扩展，推荐使用 VDF。
+</Note>
+
+### 在 SQL 中调用 VDF
+
+VDF 可以带或不带扩展前缀进行调用：
+
+```sql
+-- Unqualified (preferred for cleaner code)
+SELECT complex_abs(impedance) FROM signals;
+
+-- Qualified with extension name (explicit)
+SELECT vsql_complex.complex_abs(impedance) FROM signals;
+```
+
+**函数解析顺序：**
+
+当调用未限定的函数时，VillageSQL 按以下顺序解析它：
+1. **系统函数**（内置 MySQL 函数，如 `NOW()`、`CONCAT()`）
+2. **UDF**（传统 MySQL 用户定义函数）
+3. **VDF**（扩展函数）- 仅当该名称恰好对应一个函数时
+4. **存储函数**（使用 `CREATE FUNCTION` 创建）
+
+**何时使用限定名称：**
+- 当多个扩展提供同名函数时，使用 `extension.function_name`
+- 当不存在歧义时，使用非限定名称以获得更简洁的代码
+- 如果仅有一个扩展提供该函数名称，则永远不需要限定
+
+扩展可以添加：
+- **自定义函数 (VDF)** - 具有自动类型检查和验证的 SQL 函数
+- **自定义数据类型** - 可与 ORDER BY 和索引配合使用的新列类型，如 COMPLEX、UUID 或 VECTOR
+- **类型操作** - 用于自定义类型的编码、解码、比较和哈希函数
+
+## 前置条件
+
+在开始之前，请先从源代码构建 VillageSQL——扩展需要链接服务器 SDK 的头文件和构建树。请先遵循 [从源代码构建](/zh/mysql-8.4/0.0.5/source) 指南。
+
+您还需要：
+
+- **Git** - 用于克隆和版本控制
+- **CMake** 3.18 或更高版本 - 构建系统
+- **C++ 编译器** - GCC 8+、Clang 8+ 或支持 C++17 的 MSVC 2019+
+- **基础 C++ 知识** - 理解 C++ 和函数指针
+
+<Tip>
+  **使用 AI 代理进行构建？** [`vsql-extension-builder`](https://github.com/villagesql/villagesql-skills) 技能可自动化整个工作流程——从脚手架生成到测试——使用 Claude Code、Gemini 或其他支持的代理。使用以下命令安装：
+
+  ```bash
+  curl -sSL https://villagesql.com/skills | bash
+  ```
+</Tip>
+
+## 步骤 1：获取扩展模板
+
+您可以通过两种方式开始使用扩展模板：
+
+### 选项 A：从 VillageSQL 源代码使用模板
+
+如果您拥有 VillageSQL 源代码，则模板已包含在内：
+
+```bash
+cd /path/to/villagesql-source
+cp -r villagesql/sdk/template my-extension
+cd my-extension
+```
+
+### 选项 B：从 GitHub Fork
+
+首先 Fork VillageSQL 扩展模板仓库：
+
+1. 访问 GitHub 上的模板仓库：
+   ```
+   https://github.com/villagesql/vsql-extension-template
+   ```
+
+2. 点击 **“Fork”** 按钮创建您自己的副本
+
+3. 在本地克隆您的 Fork：
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/vsql-extension-template.git
+   cd vsql-extension-template
+   ```
+
+<Tip>
+  或者，使用 GitHub 上的“Use this template”按钮基于模板创建新仓库，而无需保留 Fork 历史。
+</Tip>
+
+## 步骤 2：更新清单文件
+
+编辑 `manifest.json` 以定义扩展的元数据：
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/villagesql/villagesql-docs/main/mysql-8.4/0.0.5/manifest.json.schema.json",
+  "name": "my_awesome_extension",
+  "version": "1.0.0",
+  "description": "My custom VillageSQL extension that does amazing things",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+`$schema` 字段是可选的，但可为所有清单字段启用 IDE 自动补全和内联验证。
+
+### manifest.json 架构
+
+| 字段 | 必填 | 格式 | 描述 |
+|-------|----------|--------|-----|
+| `name` | ✅ 是 | 字母、数字、`_`、`-` | 唯一标识符。必须与 `INSTALL EXTENSION` 名称匹配。 |
+| `version` | ✅ 是 | MAJOR.MINOR.PATCH | 语义化版本字符串 |
+| `description` | 否 | 字符串 | 功能的简要说明 |
+| `author` | 否 | 字符串 | 作者名称或组织 |
+| `license` | 否 | 字符串 | 许可证标识符（推荐 GPL-2.0） |
+
+**验证规则：**
+- `name`：必须以字母开头，以字母或数字结尾。可包含小写字母、数字、下划线和连字符。最多 64 个字符。**使用下划线**——连字符在 SQL 中需要反引号引用。
+- `version`：必须遵循语义化版本控制（例如 1.0.0、0.2.1）
+- 无效的清单文件将导致 `INSTALL EXTENSION` 失败
+
+**示例：**
+```sql
+-- manifest.json has "name": "my_awesome_extension"
+INSTALL EXTENSION my_awesome_extension;  -- ✅ Correct: no quoting needed
+INSTALL EXTENSION `my-awesome-extension`;  -- ⚠️ Works, but requires backtick quoting
+```
+
+有关 SQL、文件名和仓库名称的完整命名约定，请参阅 [扩展命名约定](/zh/mysql-8.4/0.0.5/install#extension-naming-conventions)。
+
+## 步骤 3：使用 C++ SDK 实现扩展
+
+C++ SDK 提供了一套 C++ API，使用流畅的构建器模式定义扩展：
+- 具有编译时检查的类型安全函数定义
+- 自动参数验证和类型转换
+- 支持带有比较/哈希函数的自定义类型（启用 ORDER BY 和索引）
+
+### 包含 VillageSQL 头文件
+
+创建您的主扩展文件（例如 `src/extension.cc`）并包含 C++ SDK 头文件：
+
+```cpp
+#include <villagesql/vsql.h>
+
+// Your implementation code here
+```
+
+`<villagesql/vsql.h>` 头文件引入了类型构建器、函数构建器和扩展构建器，并将常用符号重新导出到 `vsql` 命名空间中。
+
+### 定义您的扩展
+
+使用 `VEF_GENERATE_ENTRY_POINTS()` 宏定义您的扩展：
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(make_func<&my_reverse_impl>("my_reverse")
+      .returns(STRING)
+      .param(STRING)
+      .build())
+    .func(make_func<&count_vowels_impl>("count_vowels")
+      .returns(INT)
+      .param(STRING)
+      .build())
+);
+```
+
+**函数构建器方法：**
+- `make_func<&impl>("name")` - 使用实现指针创建函数
+- `.returns(type)` - 设置返回类型（STRING、INT、REAL 或自定义类型名称）
+- `.param(type)` - 添加参数（最多 8 个参数）
+- `.buffer_size(size_t)` - 为 STRING/CUSTOM 返回请求特定的输出缓冲区大小
+- `.max_result_length(size_t)` - 为 STRING 返回设置结果列大小，使物化结果不会被截断至参数宽度。超过 `VEF_MAX_RESULT_LENGTH`（16 MiB）的值将被服务器限制。仅适用于 STRING；请先调用 `.returns(STRING)`。需要 Protocol 4（开发 ABI）。
+- `.deterministic(bool = true)` - 声明此函数对于相同的输入始终返回相同的输出且无副作用。默认情况下为非确定性函数。
+- `.prerun<func>()` - 设置每条语句的初始化函数（可选）
+- `.postrun<func>()` - 设置每条语句的清理函数（可选）
+- `.build()` - 完成函数注册
+
+<Note>
+**参数限制：** 函数最多支持 8 个参数（由 `kMaxParams` 定义）。如果需要更多，请考虑使用结构化类型或多个函数。
+</Note>
+
+### 带有自定义类型参数和返回值的 VDF
+
+VDF 可以使用构建器中的 `.param(TYPE_NAME)` 和 `.returns(TYPE_NAME)` 接收和返回自定义类型值。实现部分使用 `CustomArg` 作为输入，使用 `CustomResult` 作为输出——这与类型操作使用的参数和结果类型相同：
+
+```cpp
+void complex_conjugate_impl(CustomArg in, CustomResult out) {
+    if (in.is_null()) { out.set_null(); return; }
+    auto src = in.value();    // Span<const unsigned char> — raw binary
+    auto dst = out.buffer();  // Span<unsigned char>
+    // ... read src, write result to dst ...
+    out.set_length(src.size());
+}
+```
+
+使用 `.param(COMPLEX)` 和 `.returns(COMPLEX)` 进行注册：
+
+```cpp
+.func(make_func<&complex_conjugate_impl>("complex_conjugate")
+          .returns(COMPLEX)
+          .param(COMPLEX)
+          .build())
+```
+
+有关完整的 `CustomArg`/`CustomResult` API（包括用于参数化类型的 `CustomArgWith<P>` 和 `CustomResultWith<P>`），请参阅 [开发指南](/zh/mysql-8.4/0.0.5/development#argument-and-result-types)。
+
+### 确定性函数
+
+默认情况下，VDF 注册为非确定性函数。非确定性函数在三个 SQL 上下文中被禁用：生成列、CHECK 约束和表达式默认值（列上的 `DEFAULT (expr)`）——将任何这些功能与非确定性 VDF 一起使用都会返回错误。如果您的函数对于相同的输入始终产生相同的输出且无副作用，您可以通过在构建器链中添加 `.deterministic()` 将其声明为确定性函数。
+
+优化器可能会利用此信息，在每条语句中仅对该函数求值一次，并在行之间重用该值，而不是逐行调用。因此，错误地将非确定性函数标记为确定性函数可能导致服务器对应该产生不同输出的输入返回相同的结果。仅当您的函数确实不依赖外部状态、随机性或时间时，才添加 `.deterministic()`。
+
+**构建器签名：** `.deterministic(bool d = true)`——无参形式默认为 `true`。
+
+**示例：**
+
+```cpp
+.func(make_func<&complex_add_impl>("complex_add")
+          .returns(COMPLEX)
+          .param(COMPLEX)
+          .param(COMPLEX)
+          .deterministic()
+          .build())
+```
+
+由于 `complex_add` 被声明为确定性函数，因此可用于生成列定义中：
+
+```sql
+-- Deterministic VDFs can be used in generated columns
+CREATE TABLE t (
+    a COMPLEX,
+    b COMPLEX,
+    result COMPLEX GENERATED ALWAYS AS (complex_add(a, b)) STORED
+);
+-- STORED vs VIRTUAL follows standard MySQL generated column rules
+```
+
+### 自定义缓冲区大小 {#custom-buffer-sizes}
+
+对于返回变长数据的函数，请指定所需的缓冲区大小：
+
+```cpp
+make_func<&large_result_impl>("large_result")
+  .returns(STRING)
+  .param(INT)
+  .buffer_size(65536)  // Request 64KB buffer
+  .build()
+```
+
+当您使用 `buffer()` 和 `set_length()` 自行构建值时，缓冲区大小固定为 `buffer().size()` 字节——写入超出部分会导致缓冲区溢出，因此请对此加以防范：
+
+```cpp
+void large_result_impl(StringArg input, StringResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+    size_t needed = calculate_output_size(input.value());
+
+    auto buf = out.buffer();
+    if (needed > buf.size()) {
+        out.error("Output exceeds buffer size");
+        return;
+    }
+
+    // Write output into buf.data()
+    out.set_length(actual_output_length);
+}
+```
+
+对于 STRING 结果，`out.set(sv)` 遵循 snprintf 风格的溢出契约：它复制能容纳的尽可能多的字节，并通过 `set_length` 报告值的完整大小。当报告的大小超过缓冲区时，服务器会扩大结果缓冲区并重新调用该函数，因此大于所请求缓冲区的 STRING 值不再被截断。
+
+该契约在逐行处理时生效。而*物化的* STRING 结果——在 GROUP BY/DISTINCT 临时表、`CREATE TABLE ... SELECT` 或 UNION 中——仍会截断至参数宽度，除非该函数声明了 `.max_result_length(n)`，它用于设置结果列大小（以字符为单位，上限为 `VEF_MAX_RESULT_LENGTH`，即 16 MiB）：
+
+```cpp
+make_func<&large_result_impl>("large_result")
+  .returns(STRING)
+  .max_result_length(65536)
+  .build()
+```
+
+<Note>
+请根据函数的最大输出大小，通过 `.buffer_size()` 请求足够的缓冲区大小。正确地设置缓冲区大小可避免扩容重试往返的开销。
+</Note>
+
+<Note>
+在实现函数之前，请查阅 [C++ API 参考](/zh/mysql-8.4/0.0.5/extension-api-reference) 以了解完整的 VDF 契约：空值检查、结果类型、缓冲区大小和错误处理。
+</Note>
+
+## 步骤 4：创建自定义类型
+
+自定义类型允许您定义新的列类型——例如 `COMPLEX`、`UUID` 或
+`VECTOR`——这些类型可与 `ORDER BY`、索引和聚合函数配合使用。
+如果您的扩展仅注册函数，请跳至步骤 5。
+
+请参阅 [使用 C++ 创建自定义类型](/zh/mysql-8.4/0.0.5/custom-types) 获取完整的实现指南。如果您的类型需要参数（例如 `VECTOR(1536)`），
+请参阅 [参数化类型](/zh/mysql-8.4/0.0.5/type-operations#parameterized-types)。
+
+## 步骤 5：更新构建配置 {#step-5-update-build-configuration}
+
+编辑 `CMakeLists.txt` 以将您的扩展构建为 VEB 文件：
+
+```cmake
+cmake_minimum_required(VERSION 3.18)
+project(my_extension)
+
+# Find VillageSQL Extension Framework
+find_package(VillageSQLExtensionFramework QUIET)
+
+# The framework detects build flags via 4 methods (in order):
+# 1. Explicit MYSQL_INCLUDE_FLAGS/MYSQL_CXXFLAGS
+# 2. VillageSQL_BUILD_DIR (reads CMakeCache.txt from VillageSQL build)
+# 3. VSQL_BASE_DIR (uses mysql_config)
+# 4. Default - mysql_config from PATH
+
+# Build shared library with your source files
+add_library(extension SHARED
+    src/extension.cc
+    src/my_functions.cc
+)
+
+# Create VEB archive
+VEF_CREATE_VEB(
+    NAME my_extension
+    LIBRARY_TARGET extension
+    MANIFEST ${CMAKE_CURRENT_SOURCE_DIR}/manifest.json
+)
+
+# Install VEB to VillageSQL extensions directory
+install(FILES ${VEB_OUTPUT} DESTINATION ${INSTALL_DIR})
+```
+
+**配置说明：**
+- `VillageSQLExtensionFramework` 提供用于构建扩展的 CMake 辅助工具
+- `VEF_CREATE_VEB()` 将您的库、清单和元数据打包为 `.veb` 归档文件
+- 框架会自动检测 MySQL/VillageSQL 构建标志
+- 库目标名称通常为 `extension`（可以是任意名称）
+- VEB 名称必须与您的 manifest.json 名称匹配
+- 默认情况下，扩展针对稳定的 ABI 头文件进行构建。设置 `-DVSQL_USE_DEV_ABI=ON` 可改为针对不稳定的开发头文件构建
+
+---
+
+## 步骤 6：创建构建目录
+
+创建单独的构建目录：
+
+```bash
+mkdir build
+cd build
+```
+
+## 步骤 7：使用 CMake 和 Make 进行构建
+
+配置并构建您的扩展：
+
+```bash
+# Configure the build
+cmake ..
+
+# Or, if building against VillageSQL source:
+cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+
+# Or, to build against the unstable dev ABI headers:
+cmake .. -DVSQL_USE_DEV_ABI=ON
+
+# Build the extension
+make
+```
+
+这将生成：
+- 编译后的共享库（`.so` 文件）
+- VEB 包（`.veb` 文件）- 包含清单和库的 tar 归档文件
+
+### 验证构建结果
+
+检查您的 VEB 文件内容：
+
+```bash
+make show_veb
+```
+
+您应该看到：
+```
+manifest.json
+lib/myext.so
+```
+
+## 步骤 8：安装与测试
+
+### 选项 A：安装到 VillageSQL 扩展目录
+
+使用 install 目标将 VEB 复制到您的 VillageSQL 安装目录：
+
+```bash
+make install
+```
+
+这会将 `.veb` 文件复制到通过 `VillageSQL_VEB_INSTALL_DIR` 配置的目录中。
+
+### 选项 B：手动安装
+
+手动复制 VEB 文件：
+
+```bash
+# Find the VEF directory
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# Copy the VEB file
+sudo cp my-awesome-extension.veb /path/to/veb_dir/
+```
+
+### 测试您的扩展
+
+1. **连接到 VillageSQL**：
+   ```bash
+   mysql -u root -p
+   ```
+
+2. **安装扩展**：
+   ```sql
+   INSTALL EXTENSION my_awesome_extension;
+   ```
+
+3. **验证安装**：
+   ```sql
+   SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+   ```
+
+4. **测试您的函数**：
+   ```sql
+   SELECT my_reverse('Hello, World!');
+   -- Output: !dlroW ,olleH
+
+   SELECT count_vowels('VillageSQL');
+   -- Output: 3
+   ```
+
+## 创建测试
+
+添加测试文件以验证您的扩展是否正常工作：
+
+1. **在 `mysql-test/t/` 中创建测试文件**：
+   ```sql
+   -- mysql-test/t/my_basic.test
+   SELECT my_reverse('abc');
+   SELECT my_reverse('');
+   SELECT my_reverse(NULL);
+   ```
+
+2. **生成预期结果**：
+   ```bash
+   cd /path/to/villagesql/build/mysql-test
+   perl mysql-test-run.pl --suite=/path/to/your/extension/mysql-test --record
+   ```
+
+3. **运行测试**：
+   ```bash
+   perl mysql-test-run.pl --suite=/path/to/your/extension/mysql-test
+   ```
+
+## 故障排除
+
+### 扩展无法加载
+
+检查错误日志并验证 VEB 内容：
+```bash
+make show_veb
+tail -f /var/log/mysql/error.log
+```
+
+### 未找到函数
+
+验证安装和注册情况：
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+### 构建错误
+
+```bash
+# Verify mysql_config is available
+which mysql_config
+mysql_config --version
+
+# Check compiler version
+gcc --version  # or clang --version
+
+# Verify CMake version (3.18+ required)
+cmake --version
+```
+
+## 示例扩展
+
+从现有的 VillageSQL 扩展中学习：
+
+<CardGroup cols={2}>
+  <Card
+    title="vsql_complex"
+    icon="wave-square"
+    href="https://github.com/villagesql/villagesql-server/tree/main/villagesql/examples/vsql-complex"
+  >
+    复数数据类型实现
+  </Card>
+  <Card
+    title="vsql_extension_template"
+    icon="code"
+    href="https://github.com/villagesql/vsql-extension-template"
+  >
+    用于创建扩展的最小模板
+  </Card>
+</CardGroup>
+
+## 后续步骤
+
+<CardGroup cols={2}>
+  <Card
+    title="使用扩展"
+    icon="puzzle-piece"
+    href="/zh/mysql-8.4/0.0.5/install"
+  >
+    了解如何安装和管理扩展
+  </Card>
+  <Card
+    title="开发指南"
+    icon="code"
+    href="/zh/mysql-8.4/0.0.5/development"
+  >
+    参数和结果类型、聚合函数、系统变量和测试
+  </Card>
+  <Card
+    title="扩展架构"
+    icon="sitemap"
+    href="/zh/mysql-8.4/0.0.5/architecture"
+  >
+    生命周期、缓存、性能和安全模型
+  </Card>
+  <Card
+    title="从源码构建"
+    icon="hammer"
+    href="/zh/mysql-8.4/0.0.5/source"
+  >
+    从源代码构建 VillageSQL
+  </Card>
+</CardGroup>
+
+## 资源
+
+- [VillageSQL Extension Template](https://github.com/villagesql/vsql-extension-template)
+- [MySQL UDF API Documentation](https://dev.mysql.com/doc/extending-mysql/8.4/en/adding-loadable-function.html)
+- [CMake Documentation](https://cmake.org/documentation/)
+- [VillageSQL Community Discord](https://discord.gg/KSr6whd3Fr)

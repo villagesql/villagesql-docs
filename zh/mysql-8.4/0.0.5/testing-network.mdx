@@ -1,0 +1,201 @@
+---
+title: "测试依赖网络的扩展"
+description: "为会启动 HTTP 服务器或外部监听器的扩展编写可靠的 MTR 测试，使用操作系统分配的端口以及前台启动器。"
+audience: extension-author
+---
+
+某些扩展在测试期间需要与外部 HTTP 服务器或其他网络监听器通信——例如，一个发起出站 HTTP 请求的扩展需要一个本地回显服务器来接收这些请求。本页介绍如何构建这类测试，使其能够在 `--parallel=auto` 下并跨操作系统可靠地运行。
+
+这里的模式同样适用于 C++ 和 Rust 扩展——两者都通过 `cargo vsql test` 使用 MTR 作为测试运行器。
+
+## 为什么硬编码端口会失败
+
+有两种失败模式会使硬编码端口在 MTR 中变得不可靠：
+
+**`--parallel` 下的端口冲突。** MTR 为每个 worker 分配其 `@@port` 值附近的一段端口范围。位于该范围之外的固定端口（比如 `18777`）可能与另一个 worker 保留的端口块或某个系统服务发生冲突——从而导致间歇性的 `EADDRINUSE`，且只在高并行度下才会重现。
+
+**操作系统级别的变化。** 新的运行器镜像和操作系统版本会不时保留或限制此前可用的端口。今天在本地和 CI 中都能通过的端口，明天可能会悄无声息地无法绑定。
+
+在这两种情况下，解决方案都是相同的：绑定到端口 `0`，让操作系统分配一个可用端口，然后将实际端口回传给测试。
+
+## 模式 A：服务器集成式监听器
+
+当网络监听器运行在 MySQL 进程内部时使用此模式——例如，一个内嵌 HTTP 服务器的扩展。
+
+**在扩展中**，在绑定后将已绑定的端口作为状态变量暴露出来：
+
+```cpp
+// After calling bind() with port 0:
+vsql_my_http_port = server.actual_port();  // exposed as vsql_my_ext.http_port
+```
+
+**在测试中**，使用 MTR 的 `wait_condition.inc` 轮询该状态变量，直到它非零，然后将端口捕获到一个 MTR 变量中。在任何 `UNINSTALL EXTENSION` / `INSTALL EXTENSION` 循环之后都要重新读取——临时端口会在每次绑定时发生变化。
+
+```sql
+--disable_query_log
+let $wait_timeout= 10;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_my_ext.http_port';
+--source include/wait_condition.inc
+--let $my_port = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_my_ext.http_port'`
+--enable_query_log
+
+--eval SET @url = CONCAT('http://127.0.0.1:', $my_port, '/endpoint');
+SELECT my_extension.fetch(@url);
+```
+
+## 模式 B：外部进程监听器
+
+当监听器是一个独立进程时使用此模式——例如 Python 辅助服务器、模拟 API，或任何 MTR 无法直接控制的外部程序。
+
+<Note>
+  此模式要求 `PATH` 上有 `python3`。GitHub 托管的运行器已包含它；在自托管运行器上使用之前请先确认其可用性。
+</Note>
+
+### 前台启动器
+
+与其用 `--exec ... &` 将服务器放到后台并轮询端口，不如使用一个前台启动器脚本，它会：
+
+1. 以 `start_new_session=True` 在子进程中启动服务器
+2. 阻塞，直到服务器已完成绑定并写入就绪文件
+3. 退出，让 MTR 继续执行
+
+MTR 会在前台 `--exec` 调用上阻塞，因此这保证了服务器在任何 SQL 运行之前就已就绪——无需单独的轮询器或 sleep。
+
+**`launcher.py`** — 用 `--write_file` 写入此内容：
+
+```python
+import os, subprocess, sys, time
+
+_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Start the server subprocess detached from this process
+proc = subprocess.Popen(
+    [sys.executable, os.path.join(_dir, 'echo_server.py')],
+    start_new_session=True,
+    stdout=open(os.path.join(_dir, 'echo_server.log'), 'w'),
+    stderr=subprocess.STDOUT,
+)
+
+# Write PID for cleanup
+with open(os.path.join(_dir, 'echo_server.pid'), 'w') as f:
+    f.write(str(proc.pid))
+
+# Block until readiness file appears and is non-empty.
+# Check content, not just existence — the file is created before the write
+# completes and an empty read would produce a broken MTR include.
+port_inc = os.path.join(_dir, 'echo_port.inc')
+for _ in range(40):
+    try:
+        if open(port_inc).read().strip():
+            sys.exit(0)
+    except OSError:
+        pass
+    time.sleep(0.25)
+
+# Timed out — print server log for diagnosis
+with open(os.path.join(_dir, 'echo_server.log')) as f:
+    sys.stderr.write(f.read())
+sys.exit(1)
+```
+
+**`echo_server.py`** — 实际的服务器，在开始服务之前写出其端口：
+
+```python
+import http.server, json, os, signal
+
+signal.alarm(60)  # self-terminate if orphaned by a killed MTR job
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def handle_any(self):
+        n = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(n).decode() if n else ''
+        self.send_response(200)
+        payload = json.dumps({'method': self.command, 'body': body}).encode()
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(payload))
+        self.end_headers()
+        self.wfile.write(payload)
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = handle_any
+    def log_message(self, *args): pass
+
+_dir = os.path.dirname(os.path.abspath(__file__))
+srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+port = srv.server_address[1]
+
+# Write atomically via rename — the launcher reads content, not just existence,
+# so the file must be complete before it becomes visible.
+tmp = os.path.join(_dir, 'echo_port.tmp')
+inc = os.path.join(_dir, 'echo_port.inc')
+with open(tmp, 'w') as f:
+    f.write('let $echo_port = %d;\n' % port)
+os.rename(tmp, inc)
+
+srv.serve_forever()
+```
+
+### 在测试中
+
+启动启动器（前台——MTR 会阻塞直到它退出），然后 source 端口文件：
+
+```sql
+--write_file $MYSQLTEST_VARDIR/tmp/echo_server.py
+# ... (echo_server.py contents)
+EOF
+
+--write_file $MYSQLTEST_VARDIR/tmp/launcher.py
+# ... (launcher.py contents)
+EOF
+
+--exec python3 $MYSQLTEST_VARDIR/tmp/launcher.py
+--disable_query_log
+--source $MYSQLTEST_VARDIR/tmp/echo_port.inc
+--eval SET @echo_url = CONCAT('http://127.0.0.1:', $echo_port, '/');
+--enable_query_log
+```
+
+## 让端口不出现在结果文件中
+
+结果文件按照编写的内容记录 SQL。如果 URL 中包含临时端口号，那么结果文件在每次运行时都会包含不同的值，测试在记录/重放时就会始终失败。
+
+在 `--disable_query_log` 下一并 source 端口文件并设置 MySQL 会话变量，这样 `let` 赋值和临时端口都不会出现在输出中。在任何需要 URL 的地方都使用该会话变量：
+
+```sql
+--disable_query_log
+--source $MYSQLTEST_VARDIR/tmp/echo_port.inc
+--eval SET @echo_url = CONCAT('http://127.0.0.1:', $echo_port, '/');
+--enable_query_log
+
+# All queries reference @echo_url — the port never appears in the result file
+SELECT JSON_VALUE(CONVERT(my_ext.http_get(@echo_url) USING utf8mb4), '$.status') AS status;
+```
+
+## 进程管理
+
+**记录辅助进程的输出——切勿丢弃它。** 上面的启动器模式将服务器的 stderr 写入 `echo_server.log`，并在失败时打印出来。丢弃辅助进程的输出会让 CI 工件中的偶发故障无法解释。
+
+**按 PID 杀进程，而非按名称。** 在 Linux 上，`pkill -f echo_server.py` 可能会通过 `/proc/cmdline` 匹配到 MTR 进程本身。请使用启动器写入的 PID 文件：
+
+```sql
+--exec sh -c 'kill $(cat $MYSQLTEST_VARDIR/tmp/echo_server.pid) 2>/dev/null || true'
+```
+
+**在测试结束前移除所有临时文件。** MTR 的 check-testcase 会将留在 `$MYSQLTEST_VARDIR/tmp/` 中的任何文件标记为脏状态并使测试失败：
+
+```sql
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.py
+--remove_file $MYSQLTEST_VARDIR/tmp/launcher.py
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.log
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.pid
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_port.inc
+```
+
+关于模式 B 的一份完整、经过测试的实现，请参阅 `vsql-http/mysql-test/t/vsql_http_requests.test`——它涵盖了从 `--write_file` 到清理的完整测试生命周期。
+
+## 另请参阅
+
+- [C++ 测试](/zh/mysql-8.4/0.0.5/testing) — MTR 设置、运行测试套件、记录结果以及调试故障
+- [使用 C++ 创建扩展](/zh/mysql-8.4/0.0.5/create) — 端到端的构建步骤与 CMake 设置
+- [C++ 开发](/zh/mysql-8.4/0.0.5/development) — VDF 编写、参数类型与结果处理

@@ -1,0 +1,385 @@
+---
+audience: extension-author
+title: C++ 拡張の例
+description: C++ SDK を使用した vsql_complex の参照実装から学ぶ
+---
+
+`vsql_complex` 拡張は、C++ SDK を使用したカスタム型の VillageSQL の参照実装であり、実運用可能な拡張パターンを示しています。
+
+**ソース:** [VillageSQL リポジトリ](https://github.com/villagesql/villagesql-server/tree/main/villagesql/examples/vsql-complex) の `villagesql/examples/vsql-complex/`
+
+---
+
+## vsql_complex が提供するもの
+
+複素数 (a + bi) 用の COMPLEX 型。算術演算、ユーティリティ、集計機能を備えています。
+
+**使用例:**
+```sql
+INSTALL EXTENSION vsql_complex;
+
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX
+);
+
+INSERT INTO signals VALUES (1, '(50.0,10.0)');
+
+SELECT
+    complex_real(impedance) as resistance,
+    complex_imag(impedance) as reactance,
+    complex_abs(impedance) as magnitude
+FROM signals;
+```
+
+---
+
+## ディレクトリ構造
+
+```
+vsql_complex/
+├── CMakeLists.txt       # Build config with VEF_CREATE_VEB
+├── manifest.json        # Extension metadata
+├── src/
+│   └── complex.cc       # Complete implementation: types, functions, and VEF registration
+└── test/
+    ├── t/*.test         # Test cases
+    └── r/*.result       # Expected results
+```
+
+---
+
+## VEF 登録パターン
+
+**ファイル: `src/complex.cc`**
+
+vsql_complex は、`VEF_GENERATE_ENTRY_POINTS()` を用いて C++ SDK を使用します。
+
+```cpp
+#include <villagesql/vsql.h>
+
+// Type name constants as char arrays — required as non-type template parameters
+// (NTTPs) so that make_type can auto-generate VDF names like "COMPLEX::from_string".
+static constexpr const char kComplexTypeName[] = "COMPLEX";
+static constexpr const char kComplex2TypeName[] = "COMPLEX2";
+
+// Type objects: encode/decode/compare VDFs are embedded via template parameters.
+// No separate .func() registration is needed for type operations.
+constexpr auto COMPLEX =
+    vsql::make_type<kComplexTypeName>()
+        .persisted_length(kComplexSize)
+        .max_decode_buffer_length(64)
+        .from_string<&complex_from_string>()
+        .to_string<&complex_to_string>()
+        .compare<&complex_compare>()
+        .intrinsic_default_str("(0,0)")
+        .build();
+
+constexpr auto COMPLEX2 =
+    vsql::make_type<kComplex2TypeName>()
+        .persisted_length(kComplexSize)
+        .max_decode_buffer_length(64)
+        .from_string<&complex2_from_string>()
+        .to_string<&complex_to_string>()
+        .compare<&complex_compare>()
+        .hash<&complex2_hash>()
+        .intrinsic_default_str("(0,0)")
+        .build();
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(COMPLEX)
+        .type(COMPLEX2)
+        // Arithmetic operations
+        .func(make_func<&complex_add_impl>("complex_add")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .param(COMPLEX)
+                  .deterministic()
+                  .build())
+        .func(make_func<&complex_subtract_impl>("complex_subtract")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .param(COMPLEX)
+                  .deterministic()
+                  .build())
+        .func(make_func<&complex_multiply_impl>("complex_multiply")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .param(COMPLEX)
+                  .deterministic()
+                  .build())
+        .func(make_func<&complex_divide_impl>("complex_divide")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .param(COMPLEX)
+                  .deterministic()
+                  .build())
+        // Utility functions
+        .func(make_func<&complex_real_impl>("complex_real")
+                  .returns(REAL)
+                  .param(COMPLEX)
+                  .build())
+        .func(make_func<&complex_imag_impl>("complex_imag")
+                  .returns(REAL)
+                  .param(COMPLEX)
+                  .build())
+        .func(make_func<&complex_abs_impl>("complex_abs")
+                  .returns(REAL)
+                  .param(COMPLEX)
+                  .build())
+        .func(make_func<&complex_conjugate_impl>("complex_conjugate")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .build())
+        // Aggregate functions
+        .func(make_aggregate_func<ComplexSumState, &complex_sum_result>(
+                  "complex_sum")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .clear<&complex_sum_clear>()
+                  .accumulate<&complex_sum_accumulate>()
+                  .build()))
+```
+
+**主なパターン:**
+- 単一のマクロ呼び出しですべてを登録 — 手動による SQL は不要
+- 型オブジェクトは、`kName` を非型テンプレートパラメータとして使用した `vsql::make_type<kName>()` で構築された `constexpr` 変数です。ここで、`kName` は `static constexpr const char[]` です。
+- 型操作 (`.from_string<>()`、`.to_string<>()`、`.compare<>()`、`.hash<>()`) は、型オブジェクトに埋め込まれており、それらのために個別の `.func()` 呼び出しは必要ありません。
+- `.compare()` は ORDER BY とインデックスを有効にします。`.hash()` はオプションです。
+- `.intrinsic_default_str("(0,0)")` は、INSERT IGNORE または UPDATE IGNORE がこの型の NOT NULL 列に NULL を割り当てた場合に書き込まれるデフォルト値を設定します。
+- 関数登録では、`make_func<&impl>("name")` を `.build()` とともに使用します。
+- 集計関数の登録では、`make_aggregate_func<State, &result_fn>("name")` を `.clear<&fn>()` および `.accumulate<&fn>()` とともに使用します。結果関数は、`void(const State&, ResultType)` というシグネチャを持ちます。
+
+---
+
+## バイナリストレージ形式
+
+COMPLEX は **16 バイト** (リトルエンディアン) を格納します。
+- バイト 0-7: 実数部 (double)
+- バイト 8-15: 虚数部 (double)
+
+**エンコード/デコード (complex.cc):**
+```cpp
+void complex_from_string(std::string_view from, vsql::CustomResult out);
+void complex_to_string(vsql::CustomArg in, vsql::StringResult out);
+```
+
+プラットフォームに依存しないバイトオーダー関数を使用して、クロスプラットフォームの互換性を実現します。
+
+---
+
+## 引数と結果の型
+
+実装は、生のプロトコル構造体ではなく、型付きの引数と結果の型で動作します。
+
+**算術演算の例 (complex.cc から):**
+
+```cpp
+void complex_add_impl(CustomArg in_l, CustomArg in_r, CustomResult out) {
+  // Handle NULL inputs and validate arguments
+  // ...
+  store_complex(out.buffer().data(), Complex{lhs.re + rhs.re, lhs.im + rhs.im});
+  out.set_length(kComplexSize);
+}
+```
+
+**ユーティリティ関数 (complex.cc から):**
+
+```cpp
+void complex_real_impl(CustomArg in, RealResult out) {
+  // Handle NULL and validate
+  // ...
+  out.set(cx.re);
+}
+
+void complex_abs_impl(CustomArg in, RealResult out) {
+  // Handle NULL and validate
+  // ...
+  out.set(sqrt(cx.re * cx.re + cx.im * cx.im));
+}
+```
+
+
+---
+
+## テスト戦略
+
+**テストファイル (test/t/complex_create.test):**
+```sql
+INSTALL EXTENSION vsql_complex;
+
+CREATE TABLE t1 (id INT, val COMPLEX);
+INSERT INTO t1 VALUES (1, '(1.0,2.0)');
+SELECT * FROM t1;
+
+DROP TABLE t1;
+UNINSTALL EXTENSION vsql_complex;
+```
+
+**結果の生成:**
+```bash
+cd /path/to/villagesql/build/mysql-test
+./mysql-test-run.pl --suite=vsql_complex --record
+```
+
+**テストの実行:**
+```bash
+./mysql-test-run.pl --suite=vsql_complex
+```
+
+---
+
+## 主要な実装パターン
+
+| パターン | 使用方法 |
+|---------|-------|
+| **固定長のストレージ** | 型ビルダーで `.persisted_length()` を設定します。 |
+| **プラットフォームに依存しない** | double 用のカスタムバイトオーダー関数を使用します。 |
+| **NULL の処理** | 引数の型で `in.is_null()` を呼び出します。 |
+| **エラー処理** | 結果の型で `out.error("message")` を呼び出します。 |
+| **結果の出力** | 結果の型で `out.set(value)` / `out.set_length(n)` を呼び出します。 |
+
+---
+
+## マニフェスト
+
+**ファイル: `manifest.json`**
+
+```json
+{
+  "name": "vsql_complex",
+  "version": "0.0.1",
+  "description": "Complex number data type for VillageSQL",
+  "author": "VillageSQL Contributors",
+  "license": "GPL-2.0"
+}
+```
+
+---
+
+## カスタム型を使用したデータのエクスポートとインポート
+
+VillageSQL は、カスタム型に対して `SELECT INTO OUTFILE` および `LOAD DATA INFILE` をサポートしており、カスタム型の値を保持したままデータをエクスポートおよびインポートできます。
+
+### SELECT INTO OUTFILE
+
+カスタム型は、エクスポート時に文字列表現にシリアライズされます。
+
+```sql
+INSTALL EXTENSION vsql_complex;
+
+-- Create table with custom type
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    reading COMPLEX
+);
+
+INSERT INTO signals VALUES
+    (1, '(3.0,4.0)'),
+    (2, '(5.0,12.0)'),
+    (3, '(-1.0,2.0)');
+
+-- Export to file
+SELECT * FROM signals INTO OUTFILE '/tmp/signals_export.txt';
+```
+
+**ファイルの内容 (`/tmp/signals_export.txt`):**
+```
+1	(3.00,4.00)
+2	(5.00,12.00)
+3	(-1.00,2.00)
+```
+
+### LOAD DATA INFILE
+
+エクスポートされたデータをテーブルにロードします。
+
+```sql
+-- Create new table with same schema
+CREATE TABLE signals_imported (
+    id INT PRIMARY KEY,
+    reading COMPLEX
+);
+
+-- Import data
+LOAD DATA INFILE '/tmp/signals_export.txt' INTO TABLE signals_imported;
+
+-- Verify
+SELECT * FROM signals_imported;
+```
+
+### カスタム区切り文字を使用したエクスポート
+
+カスタムフィールド区切り文字と行末文字を使用できます。
+
+```sql
+SELECT * FROM signals
+INTO OUTFILE '/tmp/signals_csv.txt'
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n';
+```
+
+**出力:**
+```
+"1","(3.00,4.00)"
+"2","(5.00,12.00)"
+"3","(-1.00,2.00)"
+```
+
+### VDF 関数を使用したエクスポート
+
+拡張関数を使用して、計算された値をエクスポートします。
+
+```sql
+SELECT
+    id,
+    reading,
+    complex_abs(reading) AS magnitude,
+    complex_real(reading) AS real_part,
+    complex_imag(reading) AS imag_part
+INTO OUTFILE '/tmp/signals_computed.txt'
+FROM signals;
+```
+
+<Note>
+  カスタム型は、文字列表現形式でエクスポートされます。カスタム型に対するバイナリエクスポート (`SELECT INTO DUMPFILE`) は、現在サポートされていません。
+</Note>
+
+---
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card
+    title="拡張機能の作成"
+    icon="code"
+    href="/ja/mysql-8.4/0.0.5/create"
+  >
+    独自の拡張機能を作成します。
+  </Card>
+  <Card
+    title="拡張機能のアーキテクチャ"
+    icon="sitemap"
+    href="/ja/mysql-8.4/0.0.5/architecture"
+  >
+    内部構造を理解します。
+  </Card>
+  <Card
+    title="vsql_complexソースコード"
+    icon="github"
+    href="https://github.com/villagesql/villagesql-server/tree/main/villagesql/examples/vsql-complex"
+  >
+    完全なソースコードを表示します。
+  </Card>
+  <Card
+    title="利用可能な拡張機能"
+    icon="list"
+    href="/ja/extensions"
+  >
+    拡張機能カタログを参照します。
+  </Card>
+</CardGroup>

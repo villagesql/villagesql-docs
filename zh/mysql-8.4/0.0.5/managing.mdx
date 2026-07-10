@@ -1,0 +1,677 @@
+---
+audience: extension-author
+title: 管理扩展
+description: 监控、排查并管理 VillageSQL 扩展
+---
+
+## 查看已安装的扩展
+
+使用 INFORMATION_SCHEMA 视图查询已安装的扩展：
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+**输出：**
+```
++------------------+-------------------+
+| EXTENSION_NAME   | EXTENSION_VERSION |
++------------------+-------------------+
+| vsql_complex     | 0.0.1             |
+| vsql_uuid        | 0.0.3             |
++------------------+-------------------+
+```
+
+**用法：**
+- 可以在交互式会话和脚本中使用
+- 标准 SQL 接口，与 MySQL 工具兼容
+
+---
+
+## 检查扩展函数
+
+验证扩展函数在安装后是否正常工作：
+
+```sql
+-- Test a function directly
+SELECT complex_abs('(1.0,2.0)');
+```
+
+---
+
+## 扩展目录
+
+检查 VillageSQL 查找 `.veb` 文件的位置：
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+**列出可用的扩展：**
+```bash
+ls -la /path/to/veb_dir/*.veb
+```
+
+### 配置 veb_dir {#configuring-veb_dir}
+
+要更改扩展目录的位置，请在 MySQL 配置文件中设置 `veb_dir`：
+
+**my.cnf / my.ini：**
+```ini
+[mysqld]
+veb_dir=/custom/path/to/extensions/
+```
+
+**要求：**
+- 路径必须是绝对路径（而不是相对路径）
+- 目录必须在服务器启动之前存在
+- MySQL 用户必须对该目录具有读取权限
+- 仅支持一个 `veb_dir`（不能有多个路径）
+- 更改后需要重新启动服务器才能生效
+
+**重启后验证：**
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## 故障排除
+
+### 快速参考
+
+| 问题 | 快速解决方法 |
+|-------|-----------|
+| 找不到扩展 | 验证 `.veb` 文件是否存在于 `veb_dir` 中，并且名称正确 |
+| 权限被拒绝 | 检查权限：`chmod 644 extension.veb` |
+| 无法卸载：类型正在使用 | 尝试 `UNINSTALL EXTENSION`；错误会通过名称标识阻止的列 |
+| 版本不匹配 | 重新启动服务器以清除缓存 |
+| 更新后扩展显示旧行为 | `UNINSTALL` 然后 `INSTALL`；如果需要，清除 `.veb_expansion_cache/` |
+| 无法比较类型 X 和 Y | 两侧都必须使用相同的自定义类型 |
+| 无法隐式转换非自定义类型 | 要比较的字面量或列与自定义类型不兼容 |
+
+### 找不到扩展
+
+**错误：** `Extension 'my_extension' not found`
+
+**调试步骤：**
+```bash
+# 1. Check veb_dir location
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# 2. List .veb files
+ls -la /path/to/veb_dir/
+
+# 3. Verify filename matches extension name
+# File: my_extension.veb
+# Install: INSTALL EXTENSION my_extension;
+
+# 4. Check permissions
+ls -l /path/to/veb_dir/my_extension.veb
+sudo chmod 644 /path/to/veb_dir/my_extension.veb
+```
+
+### 安装后函数不可用
+
+**错误：** `FUNCTION my_func does not exist`
+
+**调试步骤：**
+```sql
+-- 1. Verify extension installed
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+### 更新后扩展显示旧行为
+
+**症状：** 在替换 `.veb` 文件并重新安装后，扩展仍然
+运行旧代码。
+
+**原因：** VillageSQL 会在第一次加载时将 `.veb` 文件解包到 `{datadir}/.veb_expansion_cache/`。如果您
+在不先运行 `UNINSTALL EXTENSION` 的情况下复制新的 `.veb`，服务器将继续
+使用先前解包的 `.so`，该 `.so` 已经加载到内存中。
+
+**解决方案：** 始终遵循完整的 UNINSTALL → 替换 → INSTALL 流程：
+
+```sql
+UNINSTALL EXTENSION my_extension;
+```
+
+然后，替换 `veb_dir` 中的 `.veb` 文件并重新安装：
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+如果扩展仍然显示旧行为，请在重新安装之前清除扩展缓存：
+
+```bash
+rm -rf {datadir}/.veb_expansion_cache/my_extension/
+```
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+---
+
+### 无法卸载扩展
+
+**错误：** `Cannot uninstall extension: types in use`
+
+**解决方案：**
+
+```sql
+-- Attempt uninstall; the error identifies blocking columns by name
+UNINSTALL EXTENSION my_extension;
+-- If blocked: ERROR HY000: Cannot drop extension `my_extension` as 1 column(s) depend on it,
+--             e.g. mydb.mytable.my_column has type MYTYPE
+
+-- Drop or alter the identified column(s), then retry
+DROP TABLE mydb.mytable;
+-- OR
+ALTER TABLE mydb.mytable DROP COLUMN my_column;
+
+UNINSTALL EXTENSION my_extension;
+```
+
+### 库加载错误
+
+**错误：** `Cannot load library: undefined symbol`
+
+**原因：**
+- 缺少库依赖项
+- ABI 兼容性不匹配
+- MySQL 版本不正确
+
+**调试：**
+```bash
+# Check library dependencies (Linux)
+ldd {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+
+# Check library dependencies (macOS)
+otool -L {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+```
+
+### 扩展名称验证错误
+
+**错误：** `Failed to load VEF extension 'extension_name'` with log message `Extension name mismatch`
+
+**原因：** `manifest.json` 中的扩展名称与 VEB 文件名不匹配。
+
+**调试步骤：**
+
+1. **检查 VEB 文件名是否与清单文件匹配：**
+   ```bash
+   # VEB filename: my_extension.veb
+   # manifest.json should have:
+   {
+     "name": "my_extension",  # Must match VEB filename (without .veb)
+     ...
+   }
+   ```
+
+2. **验证 manifest.json 中的 name 字段：**
+   ```bash
+   # Extract and check manifest from VEB
+   tar -xOf /path/to/veb_dir/my_extension.veb manifest.json | grep name
+   ```
+
+**解决方案：**
+
+两个名称必须完全相同，使用下划线（请参阅[扩展命名约定](/zh/mysql-8.4/0.0.5/install#extension-naming-conventions)）：
+- VEB 文件名：`my_extension.veb`
+- manifest.json：`"name": "my_extension"`
+
+**常见错误：**
+- 在清单文件中使用连字符：`"name": "my-extension"` ❌
+- VEB 文件名不匹配：`my-extension.veb` 与 `"name": "my_extension"` ❌
+
+**正确示例：**
+```json
+// manifest.json
+{
+  "name": "my_extension",
+  "version": "1.0.0"
+}
+```
+
+```cpp
+// extension.cc
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(...)
+)
+```
+
+```bash
+# VEB filename
+my_extension.veb
+```
+
+### 自定义类型比较错误
+
+**错误：** `Cannot compare types X and Y in =`
+
+**原因：** 比较的两侧都是自定义类型，但来自不同的类型或扩展。
+
+```sql
+-- Example: comparing COMPLEX with UUID in a WHERE clause
+SELECT * FROM t WHERE complex_col = uuid_col;
+-- ERROR: Cannot compare types vsql_complex.COMPLEX and vsql_uuid.UUID in =
+```
+
+**解决方案：** 确保比较的两侧使用相同的自定义类型。如果需要跨类型进行比较，请使用适当的类型转换函数显式转换一侧。
+
+---
+
+**错误：** `Unable to implicitly cast a non-custom type during compare with a custom type in =`
+
+**原因：** 比较的一侧是自定义类型列，另一侧是无法自动转换为该类型的字面量或列。
+
+```sql
+-- Example: comparing a custom type with an integer literal
+SELECT * FROM t WHERE complex_col = 42;
+-- ERROR: Unable to implicitly cast a non-custom type during compare...
+```
+
+**解决方案：** 使用类型的编码函数，字面字符串会自动转换为自定义类型。对于其他类型（整数、浮点数），请使用显式转换函数：
+
+```sql
+-- Use a string literal instead (auto-cast works)
+SELECT * FROM t WHERE complex_col = '(1.0,2.0)';
+
+-- Or use the type's from_string method explicitly
+SELECT * FROM t WHERE complex_col = COMPLEX::from_string('(1.0,2.0)');
+```
+
+---
+
+## 监控扩展使用情况
+
+### 查询性能
+
+使用 performance_schema 跟踪 VDF 执行时间：
+
+```sql
+-- Enable statement instrumentation
+UPDATE performance_schema.setup_instruments
+SET ENABLED = 'YES', TIMED = 'YES'
+WHERE NAME LIKE '%statement%';
+
+-- Query VDF execution times
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR as executions,
+    ROUND(SUM_TIMER_WAIT/1000000000, 2) as total_ms,
+    ROUND(AVG_TIMER_WAIT/1000000000, 2) as avg_ms
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST_TEXT LIKE '%complex_%'
+ORDER BY total_ms DESC
+LIMIT 10;
+```
+
+### 自定义类型使用情况
+
+跟踪哪些表使用自定义类型：
+
+```sql
+-- Find all columns using custom extension types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY DATA_TYPE, TABLE_SCHEMA, TABLE_NAME;
+```
+
+---
+
+## 更新扩展
+
+要将已安装的扩展更改为其他版本，请使用 `ALTER EXTENSION`。
+它会根据现有数据验证新版本，并在下次服务器重启时应用该更改。
+手动卸载并重新安装仍然是一种可选的替代方式。
+
+### 更改扩展版本 {#changing-an-extension-version}
+
+`ALTER EXTENSION` 将已安装的扩展更改为其他版本，
+并在下次服务器重启时应用：
+
+```sql
+ALTER EXTENSION update_test VERSION '1.2.0' AT RESTART;
+```
+
+VillageSQL 会解析磁盘上的目标版本，并在接受更改前运行兼容性
+预检。目标 VEB 必须以 `<name>-<version>.veb` 的形式存在于扩展目录中
+（此处为 `update_test-1.2.0.veb`）；缺少该文件会被拒绝：
+
+```
+ERROR 3219 (HY000): VEB file not found: update_test-9.9.9.veb
+```
+
+预检会查找会破坏已存储数据的已知不兼容项——
+例如自定义类型持久化长度的更改：
+
+```
+ERROR 3219 (HY000): Cannot update extension 'update_test': type 'COUNTER'
+persisted_length changed from 4 to 8 -- existing stored data would be corrupted
+```
+
+一旦被接受，更改会在下次重启时应用。在此之前，
+`INFORMATION_SCHEMA.EXTENSIONS` 会报告当前版本以及它将
+更改到的目标版本：
+
+```sql
+SELECT EXTENSION_NAME, EXTENSION_VERSION, PENDING_VERSION
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'update_test';
+```
+
+```
++----------------+-------------------+-----------------+
+| EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION |
++----------------+-------------------+-----------------+
+| update_test    | 1.0.0             | 1.2.0           |
++----------------+-------------------+-----------------+
+```
+
+`INFORMATION_SCHEMA.EXTENSIONS` 会在四个列中报告已计划的更改：
+
+| 列 | 含义 |
+|--------|---------|
+| `PENDING_VERSION` | 扩展将在下次重启时更改到的版本，或 `NULL` |
+| `PENDING_REQUESTED_AT` | 请求更改的时间 |
+| `PENDING_LAST_ERROR` | 更改失败时的消息，或 `NULL` |
+| `PENDING_LAST_ERROR_AT` | 记录该失败的时间，或 `NULL` |
+
+一次仅跟踪一个已计划的更改：
+
+- **取消已计划的更改**，方法是再次请求当前版本：
+  ```sql
+  ALTER EXTENSION update_test VERSION '1.0.0' AT RESTART;
+  -- Note: Cleared pending update for extension 'update_test'
+  --       (target matches current version '1.0.0')
+  ```
+- **在没有计划任何更改时请求当前版本**不会执行任何操作：
+  ```sql
+  ALTER EXTENSION update_test VERSION '1.0.0' AT RESTART;
+  -- Note: Extension 'update_test' is already at version '1.0.0'
+  ```
+- **在已计划更改时，不同的目标会被拒绝**——请先取消
+  现有的更改：
+  ```
+  ERROR 3219 (HY000): Extension 'update_test' already has a pending update;
+  clear it with ALTER EXTENSION update_test VERSION '1.0.0' AT RESTART before
+  queueing a different version
+  ```
+
+`AT RESTART` 子句会在下次服务器启动期间应用该更改。
+
+### 成功重启之后
+
+在下次重启时，待处理的更改会被应用：`EXTENSION_VERSION` 变为
+目标版本，`PENDING_VERSION` 被清除。对于上面计划的更改
+（`update_test` `1.0.0` → 待处理 `1.2.0`）：
+
+```sql
+SELECT EXTENSION_NAME, EXTENSION_VERSION, PENDING_VERSION
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'update_test';
+```
+
+```
++----------------+-------------------+-----------------+
+| EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION |
++----------------+-------------------+-----------------+
+| update_test    | 1.2.0             | NULL            |
++----------------+-------------------+-----------------+
+```
+
+在同一次重启期间，任何引用旧版本的 `custom_columns` 和
+存储过程参数行都会被重写，因此依赖的表和例程无需手动迁移
+即可继续正常工作。
+
+<Note>
+更改会在重启期间应用，而不是在活动连接上应用——上面的值
+是重启后的状态。
+</Note>
+
+### 从启动时的待处理版本更改中恢复
+
+已计划的版本更改会在下次服务器启动期间应用。如果
+某个待处理的操作无法应用，服务器可能会启动失败，而其待处理更新决策仍保留在磁盘上。当排队的
+`ALTER EXTENSION ... AT RESTART` 阻止了启动，而你需要在清除它之前
+先让服务器启动时，请使用 `--villagesql-skip-extension-updates`。
+
+`--villagesql-skip-extension-updates` 是一个 `mysqld` 启动标志。设置后，
+服务器会绕过对待处理 `ALTER EXTENSION ... AT RESTART` 操作的处理：
+每个扩展都以其当前已安装的版本加载，其待处理操作
+在磁盘上保持完整。该标志本身不会改变任何内容——它只是跳过在该次启动中
+应用待处理操作。
+
+设置该标志且至少有一个扩展存在待处理操作时，服务器
+会在启动时记录一条警告，指出绕过了多少个操作：
+
+```text
+--villagesql-skip-extension-updates is set: bypassing N pending extension update(s). Extensions load at their currently-installed version. Query INFORMATION_SCHEMA.EXTENSIONS to see the pending actions; clear each via ALTER EXTENSION <name> VERSION '<current>' AT RESTART, then restart without the flag.
+```
+
+<Steps>
+  <Step title="使用该标志启动服务器">
+    在生产环境中，将其作为普通的 `mysqld` 命令行选项传递，或在
+    `my.cnf` 的 `[mysqld]` 下添加：
+
+    ```bash
+    mysqld --villagesql-skip-extension-updates
+    ```
+
+    在开发工具链中，通过 `--` 传递：
+
+    ```bash
+    ./villagesql start -- --villagesql-skip-extension-updates
+    ```
+
+    **成功信号：** 服务器启动，且错误日志包含上面所示的
+    `bypassing N pending extension update(s)` 警告。
+  </Step>
+  <Step title="识别待处理的操作">
+    ```sql
+    SELECT EXTENSION_NAME, EXTENSION_VERSION, PENDING_VERSION, PENDING_LAST_ERROR
+    FROM INFORMATION_SCHEMA.EXTENSIONS
+    WHERE PENDING_VERSION IS NOT NULL;
+    ```
+
+    ```text
+    +--------------+-------------------+-----------------+--------------------+
+    | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_LAST_ERROR |
+    +--------------+-------------------+-----------------+--------------------+
+    | my_extension   | 1.0.0             | 2.0.0           | NULL               |
+    +--------------+-------------------+-----------------+--------------------+
+    ```
+
+    **成功信号：** 每一行的 `PENDING_VERSION` 就是你需要清除的目标；
+    `PENDING_LAST_ERROR` 会显示它未能应用的原因。
+  </Step>
+  <Step title="清除每个待处理的操作">
+    对于上面返回的每个扩展，请求其当前版本以取消
+    排队的更改（在
+    [更改扩展版本](#changing-an-extension-version)下描述的取消机制）：
+
+    ```sql
+    ALTER EXTENSION my_extension VERSION '1.0.0' AT RESTART;
+    ```
+
+    **成功信号：** 返回一条 `Cleared pending update for extension '<name>'
+    (target matches current version '<current>')` 提示，且
+    重新运行上一个查询显示 `PENDING_VERSION` 为 `NULL`。
+  </Step>
+  <Step title="不带该标志重启">
+    正常重启服务器，省略 `--villagesql-skip-extension-updates`。
+
+    **成功信号：** 服务器启动，且日志中不再出现
+    `bypassing N pending extension update(s)` 警告。
+  </Step>
+</Steps>
+
+### 手动更新过程
+
+1. **卸载当前版本：**
+   ```sql
+   UNINSTALL EXTENSION extension_name;
+   ```
+
+2. **替换 `.veb` 文件：**
+   ```bash
+   # Remove old .veb file
+   sudo rm /path/to/veb_dir/extension_name.veb
+
+   # Copy new .veb file
+   sudo cp new_extension_name.veb /path/to/veb_dir/
+   ```
+
+3. **安装新版本：**
+   ```sql
+   INSTALL EXTENSION extension_name;
+   ```
+
+4. **验证更新：**
+   ```sql
+   SELECT EXTENSION_VERSION
+   FROM INFORMATION_SCHEMA.EXTENSIONS
+   WHERE EXTENSION_NAME = 'extension_name';
+   ```
+
+<Warning>
+  **数据安全：** 如果表使用来自扩展的自定义类型，则必须在卸载之前删除或修改这些表。首先备份数据。
+</Warning>
+
+**示例：**
+```sql
+-- Find columns using vsql_complex types before updating
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
+
+-- If columns exist, back up data and drop/alter them first
+-- Then proceed with update
+UNINSTALL EXTENSION vsql_complex;
+-- (replace .veb file)
+INSTALL EXTENSION vsql_complex;
+```
+
+---
+
+## 清理
+
+### 移除孤立的解包缓存目录
+
+VillageSQL 将 `.veb` 文件解包到 `{datadir}/.veb_expansion_cache/{name}/{sha256}/`。旧版本会随着时间的推移而累积。
+
+```bash
+# List expansion directories (replace {datadir} with your actual datadir path)
+ls -la {datadir}/.veb_expansion_cache/
+
+# Compare with installed extensions
+mysql -u root -p -e "SELECT EXTENSION_NAME FROM INFORMATION_SCHEMA.EXTENSIONS;"
+
+# Find the actual SHA256 directory name for a specific extension
+ls {datadir}/.veb_expansion_cache/my_extension/
+
+# Remove the unused SHA256 directory using the name shown above
+rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
+```
+
+<Note>
+  服务器重启会自动清理孤立的解包缓存目录。
+</Note>
+
+---
+
+## 复制 {#replication}
+
+自定义类型需要 ROW 格式的 binlog。对于具有自定义类型列的表，不支持 STATEMENT 和 MIXED 模式。对自定义类型列执行的 INSERT、UPDATE、DELETE 和 ALTER TABLE 操作在 ROW 格式中都能正确复制。
+
+`INSTALL EXTENSION` 不会复制——每个服务器管理自己的扩展。在复制开始之前，在每个副本上安装扩展，并使用与源相同的版本。服务器强制执行精确的版本匹配；版本不匹配会停止复制。
+
+如果副本遇到它不识别的自定义类型，则复制将在 DDL 语句处停止——在 `CREATE TABLE` 或 `ALTER TABLE` 处，在任何依赖的 DML 应用之前。安装正确的扩展版本，然后恢复：
+
+```sql
+INSTALL EXTENSION my_extension;
+START REPLICA SQL_THREAD;
+```
+
+`mysqldump` 在输出中保留完全限定的自定义类型名称。只要在导入转储之前在目标服务器上安装了扩展，逻辑恢复就可以工作。
+
+<Warning>
+尚未测试与 Clone 插件、XtraBackup 和 InnoDB Cluster / Group Replication 的行为。在生产环境中依赖它之前，请测试您的恢复路径。
+</Warning>
+
+---
+
+## 在 Docker 中使用扩展
+
+在 Docker 中运行 VillageSQL 时，将本地目录挂载为 `veb_dir`，以便您可以从主机添加 `.veb` 文件，而无需重新构建容器。
+
+**Docker Compose 示例：**
+
+```yaml
+services:
+  villagesql:
+    image: villagesql/server:stable
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./extensions:/usr/lib/veb
+    command: --veb_dir=/usr/lib/veb
+```
+
+将 `.veb` 文件复制到主机上的 `./extensions/` 中，然后从 SQL 安装：
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+要验证正在运行的服务器正在使用的目录：
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## 获取帮助
+
+如果您遇到此处未涵盖的问题：
+
+1. **检查错误日志：** 大多数扩展错误都带有详细信息记录在日志中。
+2. **查看扩展文档：** 扩展特定的故障排除方法可能存在。
+3. **在 Discord 上提问：** 加入 [VillageSQL Discord](https://discord.gg/KSr6whd3Fr)。
+4. **提交问题：** 在 [GitHub Issues](https://github.com/villagesql/villagesql-server/issues) 上报告错误。
+
+---
+
+## 后续步骤
+
+<CardGroup cols={2}>
+  <Card
+    title="系统参考"
+    icon="book"
+    href="/zh/mysql-8.4/0.0.5/reference"
+  >
+    查询系统表和视图
+  </Card>
+  <Card
+    title="卸载扩展"
+    icon="trash"
+    href="/zh/mysql-8.4/0.0.5/uninstall"
+  >
+    安全地删除扩展
+  </Card>
+  <Card
+    title="扩展架构"
+    icon="sitemap"
+    href="/zh/mysql-8.4/0.0.5/architecture"
+  >
+    了解内部结构
+  </Card>
+</CardGroup>
