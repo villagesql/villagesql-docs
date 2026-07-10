@@ -115,7 +115,15 @@ translation) both assume the content is final.
      and its dev URLs (`0.0.5-dev` → `0.0.6-dev`). Leave the "requires
      VillageSQL 0.0.4" extension lines (minimum version, same as step 7).
 
-10. **All future changes go to the new dev branch** (`mysql-8.4/0.0.6-dev/`).
+10. **Update `vsql-docs-validator/freshness.py` version references.** It
+    hardcodes version dirs in `_ARCHIVED_VERSIONS`, `_RAW_ABI_PROSE_EXEMPT`,
+    the audience-check path prefix, and `REFERENCE_SCHEMA_CHECKS`. Add the
+    previous stable (e.g. `0.0.4`) to `_ARCHIVED_VERSIONS`; remap the retired
+    dev version (`0.0.5-dev`) to the new dev (`0.0.6-dev`) everywhere else.
+    Otherwise `freshness.py --check-docs` crashes on the renamed path. It is
+    on disk, not a git repo — edit in place.
+
+11. **All future changes go to the new dev branch** (`mysql-8.4/0.0.6-dev/`).
 
 ## Archive Policy
 
