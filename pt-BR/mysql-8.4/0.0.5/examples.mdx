@@ -1,0 +1,385 @@
+---
+audience: extension-author
+title: Exemplos de Extensões em C++
+description: Aprenda com a implementação de referência vsql_complex usando o SDK C++
+---
+
+A extensão `vsql_complex` é a implementação de referência do VillageSQL para tipos personalizados usando o SDK C++, demonstrando padrões de extensão prontos para produção.
+
+**Fonte:** `villagesql/examples/vsql-complex/` no [repositório do VillageSQL](https://github.com/villagesql/villagesql-server/tree/main/villagesql/examples/vsql-complex)
+
+---
+
+## O que o vsql_complex Oferece
+
+Tipo COMPLEX para números complexos (a + bi) com aritmética, utilitários e agregação.
+
+**Exemplo de Uso:**
+```sql
+INSTALL EXTENSION vsql_complex;
+
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX
+);
+
+INSERT INTO signals VALUES (1, '(50.0,10.0)');
+
+SELECT
+    complex_real(impedance) as resistance,
+    complex_imag(impedance) as reactance,
+    complex_abs(impedance) as magnitude
+FROM signals;
+```
+
+---
+
+## Estrutura de Diretórios
+
+```
+vsql_complex/
+├── CMakeLists.txt       # Build config with VEF_CREATE_VEB
+├── manifest.json        # Extension metadata
+├── src/
+│   └── complex.cc       # Complete implementation: types, functions, and VEF registration
+└── test/
+    ├── t/*.test         # Test cases
+    └── r/*.result       # Expected results
+```
+
+---
+
+## Padrão de Registro do VEF
+
+**Arquivo: `src/complex.cc`**
+
+O vsql_complex usa o SDK C++ com `VEF_GENERATE_ENTRY_POINTS()`:
+
+```cpp
+#include <villagesql/vsql.h>
+
+// Type name constants as char arrays — required as non-type template parameters
+// (NTTPs) so that make_type can auto-generate VDF names like "COMPLEX::from_string".
+static constexpr const char kComplexTypeName[] = "COMPLEX";
+static constexpr const char kComplex2TypeName[] = "COMPLEX2";
+
+// Type objects: encode/decode/compare VDFs are embedded via template parameters.
+// No separate .func() registration is needed for type operations.
+constexpr auto COMPLEX =
+    vsql::make_type<kComplexTypeName>()
+        .persisted_length(kComplexSize)
+        .max_decode_buffer_length(64)
+        .from_string<&complex_from_string>()
+        .to_string<&complex_to_string>()
+        .compare<&complex_compare>()
+        .intrinsic_default_str("(0,0)")
+        .build();
+
+constexpr auto COMPLEX2 =
+    vsql::make_type<kComplex2TypeName>()
+        .persisted_length(kComplexSize)
+        .max_decode_buffer_length(64)
+        .from_string<&complex2_from_string>()
+        .to_string<&complex_to_string>()
+        .compare<&complex_compare>()
+        .hash<&complex2_hash>()
+        .intrinsic_default_str("(0,0)")
+        .build();
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(COMPLEX)
+        .type(COMPLEX2)
+        // Arithmetic operations
+        .func(make_func<&complex_add_impl>("complex_add")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .param(COMPLEX)
+                  .deterministic()
+                  .build())
+        .func(make_func<&complex_subtract_impl>("complex_subtract")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .param(COMPLEX)
+                  .deterministic()
+                  .build())
+        .func(make_func<&complex_multiply_impl>("complex_multiply")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .param(COMPLEX)
+                  .deterministic()
+                  .build())
+        .func(make_func<&complex_divide_impl>("complex_divide")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .param(COMPLEX)
+                  .deterministic()
+                  .build())
+        // Utility functions
+        .func(make_func<&complex_real_impl>("complex_real")
+                  .returns(REAL)
+                  .param(COMPLEX)
+                  .build())
+        .func(make_func<&complex_imag_impl>("complex_imag")
+                  .returns(REAL)
+                  .param(COMPLEX)
+                  .build())
+        .func(make_func<&complex_abs_impl>("complex_abs")
+                  .returns(REAL)
+                  .param(COMPLEX)
+                  .build())
+        .func(make_func<&complex_conjugate_impl>("complex_conjugate")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .build())
+        // Aggregate functions
+        .func(make_aggregate_func<ComplexSumState, &complex_sum_result>(
+                  "complex_sum")
+                  .returns(COMPLEX)
+                  .param(COMPLEX)
+                  .clear<&complex_sum_clear>()
+                  .accumulate<&complex_sum_accumulate>()
+                  .build()))
+```
+
+**Padrões-chave:**
+- Uma única chamada de macro registra tudo, não sendo necessário nenhum SQL manual
+- Objetos de tipo são variáveis `constexpr` construídas com `vsql::make_type<kName>()`, onde `kName` é um `static constexpr const char[]` usado como parâmetro de template que não é tipo (non-type template parameter)
+- As operações de tipo (`.from_string<>()`, `.to_string<>()`, `.compare<>()`, `.hash<>()`) são incorporadas ao objeto de tipo, não sendo necessária nenhuma chamada `.func()` separada para elas
+- `.compare()` habilita ORDER BY e indexação; `.hash()` é opcional
+- `.intrinsic_default_str("(0,0)")` define o valor padrão escrito quando INSERT IGNORE ou UPDATE IGNORE atribui NULL a uma coluna NOT NULL desse tipo
+- O registro de funções usa `make_func<&impl>("name")` com `.build()`
+- O registro de agregações usa `make_aggregate_func<State, &result_fn>("name")` com `.clear<&fn>()` e `.accumulate<&fn>()`; a função de resultado tem a assinatura `void(const State&, ResultType)`
+
+---
+
+## Formato de Armazenamento Binário
+
+COMPLEX armazena **16 bytes** (little-endian):
+- Bytes 0-7: Parte real (double)
+- Bytes 8-15: Parte imaginária (double)
+
+**Codificação/Decodificação (complex.cc):**
+```cpp
+void complex_from_string(std::string_view from, vsql::CustomResult out);
+void complex_to_string(vsql::CustomArg in, vsql::StringResult out);
+```
+
+Usa funções de ordem de bytes independentes de plataforma para compatibilidade multiplataforma.
+
+---
+
+## Tipos de Argumento e de Resultado
+
+As implementações trabalham com tipos de argumento e de resultado tipados em vez de structs brutos do protocolo:
+
+**Exemplo de Aritmética (de complex.cc):**
+
+```cpp
+void complex_add_impl(CustomArg in_l, CustomArg in_r, CustomResult out) {
+  // Handle NULL inputs and validate arguments
+  // ...
+  store_complex(out.buffer().data(), Complex{lhs.re + rhs.re, lhs.im + rhs.im});
+  out.set_length(kComplexSize);
+}
+```
+
+**Funções utilitárias (de complex.cc):**
+
+```cpp
+void complex_real_impl(CustomArg in, RealResult out) {
+  // Handle NULL and validate
+  // ...
+  out.set(cx.re);
+}
+
+void complex_abs_impl(CustomArg in, RealResult out) {
+  // Handle NULL and validate
+  // ...
+  out.set(sqrt(cx.re * cx.re + cx.im * cx.im));
+}
+```
+
+
+---
+
+## Estratégia de Testes
+
+**Arquivo de Teste (test/t/complex_create.test):**
+```sql
+INSTALL EXTENSION vsql_complex;
+
+CREATE TABLE t1 (id INT, val COMPLEX);
+INSERT INTO t1 VALUES (1, '(1.0,2.0)');
+SELECT * FROM t1;
+
+DROP TABLE t1;
+UNINSTALL EXTENSION vsql_complex;
+```
+
+**Gerar Resultados:**
+```bash
+cd /path/to/villagesql/build/mysql-test
+./mysql-test-run.pl --suite=vsql_complex --record
+```
+
+**Executar Testes:**
+```bash
+./mysql-test-run.pl --suite=vsql_complex
+```
+
+---
+
+## Padrões-Chave de Implementação
+
+| Padrão | Uso |
+|---------|-------|
+| **Armazenamento de comprimento fixo** | Defina `.persisted_length()` no construtor do tipo |
+| **Independente de plataforma** | Use funções de ordem de bytes personalizadas para doubles |
+| **Tratamento de NULL** | Chame `in.is_null()` no tipo de argumento |
+| **Tratamento de erros** | Chame `out.error("message")` no tipo de resultado |
+| **Saída de resultado** | Chame `out.set(value)` / `out.set_length(n)` no tipo de resultado |
+
+---
+
+## Manifesto
+
+**Arquivo: `manifest.json`**
+
+```json
+{
+  "name": "vsql_complex",
+  "version": "0.0.1",
+  "description": "Complex number data type for VillageSQL",
+  "author": "VillageSQL Contributors",
+  "license": "GPL-2.0"
+}
+```
+
+---
+
+## Exportando e Importando Dados com Tipos Personalizados
+
+O VillageSQL oferece suporte a `SELECT INTO OUTFILE` e `LOAD DATA INFILE` para tipos personalizados, permitindo que você exporte e importe dados preservando os valores de tipos personalizados.
+
+### SELECT INTO OUTFILE
+
+Tipos personalizados são serializados para sua representação em string ao serem exportados:
+
+```sql
+INSTALL EXTENSION vsql_complex;
+
+-- Create table with custom type
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    reading COMPLEX
+);
+
+INSERT INTO signals VALUES
+    (1, '(3.0,4.0)'),
+    (2, '(5.0,12.0)'),
+    (3, '(-1.0,2.0)');
+
+-- Export to file
+SELECT * FROM signals INTO OUTFILE '/tmp/signals_export.txt';
+```
+
+**Conteúdo do arquivo (`/tmp/signals_export.txt`):**
+```
+1	(3.00,4.00)
+2	(5.00,12.00)
+3	(-1.00,2.00)
+```
+
+### LOAD DATA INFILE
+
+Carregue os dados exportados de volta para uma tabela:
+
+```sql
+-- Create new table with same schema
+CREATE TABLE signals_imported (
+    id INT PRIMARY KEY,
+    reading COMPLEX
+);
+
+-- Import data
+LOAD DATA INFILE '/tmp/signals_export.txt' INTO TABLE signals_imported;
+
+-- Verify
+SELECT * FROM signals_imported;
+```
+
+### Exportação com Delimitadores Personalizados
+
+Você pode usar terminadores de campo e de linha personalizados:
+
+```sql
+SELECT * FROM signals
+INTO OUTFILE '/tmp/signals_csv.txt'
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n';
+```
+
+**Saída:**
+```
+"1","(3.00,4.00)"
+"2","(5.00,12.00)"
+"3","(-1.00,2.00)"
+```
+
+### Exportação com Funções VDF
+
+Exporte valores computados usando funções da extensão:
+
+```sql
+SELECT
+    id,
+    reading,
+    complex_abs(reading) AS magnitude,
+    complex_real(reading) AS real_part,
+    complex_imag(reading) AS imag_part
+INTO OUTFILE '/tmp/signals_computed.txt'
+FROM signals;
+```
+
+<Note>
+  Tipos personalizados são exportados no formato de sua representação em string. A exportação binária com `SELECT INTO DUMPFILE` atualmente não é compatível com tipos personalizados.
+</Note>
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card
+    title="Criando Extensões em C++"
+    icon="code"
+    href="/pt-BR/mysql-8.4/0.0.5/create"
+  >
+    Compile sua própria extensão
+  </Card>
+  <Card
+    title="Arquitetura de Extensões"
+    icon="sitemap"
+    href="/pt-BR/mysql-8.4/0.0.5/architecture"
+  >
+    Entenda os detalhes internos
+  </Card>
+  <Card
+    title="vsql_complex Source"
+    icon="github"
+    href="https://github.com/villagesql/villagesql-server/tree/main/villagesql/examples/vsql-complex"
+  >
+    Veja o código-fonte completo
+  </Card>
+  <Card
+    title="Extensões Disponíveis"
+    icon="list"
+    href="/extensions"
+  >
+    Navegue pelo catálogo de extensões
+  </Card>
+</CardGroup>

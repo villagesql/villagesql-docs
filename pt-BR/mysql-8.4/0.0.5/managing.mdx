@@ -1,0 +1,692 @@
+---
+audience: extension-author
+title: Gerenciando Extensões
+description: Monitore, solucione problemas e gerencie extensões do VillageSQL
+---
+
+## Visualizando Extensões Instaladas
+
+Consulte as extensões instaladas usando a view INFORMATION_SCHEMA:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+**Saída:**
+```
++------------------+-------------------+
+| EXTENSION_NAME   | EXTENSION_VERSION |
++------------------+-------------------+
+| vsql_complex     | 0.0.1             |
+| vsql_uuid        | 0.0.3             |
++------------------+-------------------+
+```
+
+**Uso:**
+- Use tanto em sessões interativas quanto em scripts
+- Interface SQL padrão compatível com ferramentas do MySQL
+
+---
+
+## Verificando Funções de Extensão
+
+Verifique se as funções da extensão funcionam após a instalação:
+
+```sql
+-- Test a function directly
+SELECT complex_abs('(1.0,2.0)');
+```
+
+---
+
+## Diretório de Extensões
+
+Verifique onde o VillageSQL procura por arquivos `.veb`:
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+**Liste as extensões disponíveis:**
+```bash
+ls -la /path/to/veb_dir/*.veb
+```
+
+### Configurando o veb_dir {#configuring-veb_dir}
+
+Para alterar o local do diretório de extensões, defina `veb_dir` no seu arquivo de configuração do MySQL:
+
+**my.cnf / my.ini:**
+```ini
+[mysqld]
+veb_dir=/custom/path/to/extensions/
+```
+
+**Requisitos:**
+- O caminho deve ser absoluto (não relativo)
+- O diretório deve existir antes da inicialização do servidor
+- O usuário do MySQL deve ter permissões de leitura no diretório
+- Apenas um `veb_dir` é compatível (não é possível ter múltiplos caminhos)
+- As alterações exigem a reinicialização do servidor para entrarem em vigor
+
+**Verifique após a reinicialização:**
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## Solução de Problemas
+
+### Referência Rápida
+
+| Problema | Correção Rápida |
+|-------|-----------|
+| Extensão não encontrada | Verifique se o arquivo `.veb` existe no veb_dir com o nome correto |
+| Permissão negada | Verifique as permissões: `chmod 644 extension.veb` |
+| Não é possível desinstalar: tipos em uso | Tente `UNINSTALL EXTENSION`; o erro identifica pelo nome as colunas que estão bloqueando |
+| Incompatibilidade de versão | Reinicie o servidor para limpar o cache |
+| A extensão apresenta comportamento antigo após a atualização | `UNINSTALL` e depois `INSTALL`; limpe `.veb_expansion_cache/` se necessário |
+| Não é possível comparar os tipos X e Y | Ambos os lados devem usar o mesmo tipo personalizado |
+| Não é possível fazer cast implícito de tipo não personalizado | O literal ou a coluna sendo comparados não são compatíveis com o tipo personalizado |
+
+### Extensão Não Encontrada
+
+**Erro:** `Extension 'my_extension' not found`
+
+**Passos de depuração:**
+```bash
+# 1. Check veb_dir location
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# 2. List .veb files
+ls -la /path/to/veb_dir/
+
+# 3. Verify filename matches extension name
+# File: my_extension.veb
+# Install: INSTALL EXTENSION my_extension;
+
+# 4. Check permissions
+ls -l /path/to/veb_dir/my_extension.veb
+sudo chmod 644 /path/to/veb_dir/my_extension.veb
+```
+
+### Função Indisponível Após a Instalação
+
+**Erro:** `FUNCTION my_func does not exist`
+
+**Passos de depuração:**
+```sql
+-- 1. Verify extension installed
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+### A Extensão Apresenta Comportamento Antigo Após a Atualização
+
+**Sintoma:** Após substituir um arquivo `.veb` e reinstalar, a extensão ainda
+executa o código antigo.
+
+**Causa:** O VillageSQL expande os arquivos `.veb` em `{datadir}/.veb_expansion_cache/` no primeiro carregamento. Se você
+copiar um novo `.veb` sem antes executar `UNINSTALL EXTENSION`, o servidor continua
+usando o `.so` previamente expandido que já está carregado na memória.
+
+**Solução:** Sempre siga o ciclo completo UNINSTALL → substituir → INSTALL:
+
+```sql
+UNINSTALL EXTENSION my_extension;
+```
+
+Em seguida, substitua o arquivo `.veb` em `veb_dir` e reinstale:
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+Se a extensão ainda apresentar comportamento antigo, limpe o cache de expansão antes de reinstalar:
+
+```bash
+rm -rf {datadir}/.veb_expansion_cache/my_extension/
+```
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+---
+
+### Não é Possível Desinstalar a Extensão
+
+**Erro:** `Cannot uninstall extension: types in use`
+
+**Solução:**
+
+```sql
+-- Attempt uninstall; the error identifies blocking columns by name
+UNINSTALL EXTENSION my_extension;
+-- If blocked: ERROR HY000: Cannot drop extension `my_extension` as 1 column(s) depend on it,
+--             e.g. mydb.mytable.my_column has type MYTYPE
+
+-- Drop or alter the identified column(s), then retry
+DROP TABLE mydb.mytable;
+-- OR
+ALTER TABLE mydb.mytable DROP COLUMN my_column;
+
+UNINSTALL EXTENSION my_extension;
+```
+
+### Erros de Carregamento de Biblioteca
+
+**Erro:** `Cannot load library: undefined symbol`
+
+**Causas:**
+- Dependências de biblioteca ausentes
+- Incompatibilidade de ABI
+- Versão incorreta do MySQL
+
+**Depuração:**
+```bash
+# Check library dependencies (Linux)
+ldd {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+
+# Check library dependencies (macOS)
+otool -L {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.so
+```
+
+### Erros de Validação de Nome de Extensão
+
+**Erro:** `Failed to load VEF extension 'extension_name'` com a mensagem de log `Extension name mismatch`
+
+**Causa:** O nome da extensão em `manifest.json` não corresponde ao nome do arquivo VEB.
+
+**Passos de depuração:**
+
+1. **Verifique se o nome do arquivo VEB corresponde ao manifest:**
+   ```bash
+   # VEB filename: my_extension.veb
+   # manifest.json should have:
+   {
+     "name": "my_extension",  # Must match VEB filename (without .veb)
+     ...
+   }
+   ```
+
+2. **Verifique o campo name em manifest.json:**
+   ```bash
+   # Extract and check manifest from VEB
+   tar -xOf /path/to/veb_dir/my_extension.veb manifest.json | grep name
+   ```
+
+**Solução:**
+
+Ambos os nomes devem ser idênticos, usando underscores (consulte [Convenções de Nomenclatura de Extensões](/pt-BR/mysql-8.4/0.0.5/install#extension-naming-conventions)):
+- Nome do arquivo VEB: `my_extension.veb`
+- manifest.json: `"name": "my_extension"`
+
+**Erros comuns:**
+- Usar hífens no manifest: `"name": "my-extension"` ❌
+- O nome do arquivo VEB não corresponde: `my-extension.veb` vs `"name": "my_extension"` ❌
+
+**Exemplo correto:**
+```json
+// manifest.json
+{
+  "name": "my_extension",
+  "version": "1.0.0"
+}
+```
+
+```cpp
+// extension.cc
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(...)
+)
+```
+
+```bash
+# VEB filename
+my_extension.veb
+```
+
+### Erros de Comparação de Tipos Personalizados
+
+**Erro:** `Cannot compare types X and Y in =`
+
+**Causa:** Ambos os lados da comparação são tipos personalizados, mas de tipos ou extensões diferentes.
+
+```sql
+-- Example: comparing COMPLEX with UUID in a WHERE clause
+SELECT * FROM t WHERE complex_col = uuid_col;
+-- ERROR: Cannot compare types vsql_complex.COMPLEX and vsql_uuid.UUID in =
+```
+
+**Solução:** Garanta que ambos os lados de uma comparação usem o mesmo tipo personalizado. Se você precisar comparar entre tipos, converta um dos lados explicitamente usando a função de conversão de tipo apropriada.
+
+---
+
+**Erro:** `Unable to implicitly cast a non-custom type during compare with a custom type in =`
+
+**Causa:** Um dos lados da comparação é uma coluna de tipo personalizado e o outro é um valor (literal ou coluna) que não pode ser convertido automaticamente para esse tipo.
+
+```sql
+-- Example: comparing a custom type with an integer literal
+SELECT * FROM t WHERE complex_col = 42;
+-- ERROR: Unable to implicitly cast a non-custom type during compare...
+```
+
+**Solução:** Literais de string são convertidos automaticamente para o tipo personalizado usando a função de encode do tipo. Para outros tipos (inteiros, floats), use uma função de conversão explícita:
+
+```sql
+-- Use a string literal instead (auto-cast works)
+SELECT * FROM t WHERE complex_col = '(1.0,2.0)';
+
+-- Or use the type's from_string method explicitly
+SELECT * FROM t WHERE complex_col = COMPLEX::from_string('(1.0,2.0)');
+```
+
+---
+
+## Monitorando o Uso de Extensões
+
+### Desempenho de Consultas
+
+Acompanhe os tempos de execução de VDF usando o performance_schema:
+
+```sql
+-- Enable statement instrumentation
+UPDATE performance_schema.setup_instruments
+SET ENABLED = 'YES', TIMED = 'YES'
+WHERE NAME LIKE '%statement%';
+
+-- Query VDF execution times
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR as executions,
+    ROUND(SUM_TIMER_WAIT/1000000000, 2) as total_ms,
+    ROUND(AVG_TIMER_WAIT/1000000000, 2) as avg_ms
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST_TEXT LIKE '%complex_%'
+ORDER BY total_ms DESC
+LIMIT 10;
+```
+
+### Uso de Tipos Personalizados
+
+Acompanhe quais tabelas usam tipos personalizados:
+
+```sql
+-- Find all columns using custom extension types
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE '%.%'
+ORDER BY DATA_TYPE, TABLE_SCHEMA, TABLE_NAME;
+```
+
+---
+
+## Atualizando Extensões
+
+Para alterar uma extensão instalada para uma versão diferente, use `ALTER EXTENSION`.
+Ele valida a nova versão em relação aos seus dados existentes e aplica a alteração
+na próxima vez que o servidor for reiniciado. Uma desinstalação e reinstalação manuais continuam
+disponíveis como alternativa.
+
+### Alterando a Versão de uma Extensão {#changing-an-extension-version}
+
+`ALTER EXTENSION` altera uma extensão instalada para uma versão diferente,
+aplicada na próxima reinicialização do servidor:
+
+```sql
+ALTER EXTENSION update_test VERSION '1.2.0' AT RESTART;
+```
+
+O VillageSQL resolve a versão de destino no disco e executa uma verificação prévia de
+compatibilidade antes de aceitar a alteração. O VEB de destino deve existir no
+diretório de extensões como `<name>-<version>.veb` (aqui, `update_test-1.2.0.veb`);
+um arquivo ausente é rejeitado:
+
+```
+ERROR 3219 (HY000): VEB file not found: update_test-9.9.9.veb
+```
+
+A verificação prévia procura por incompatibilidades conhecidas que quebrariam os dados armazenados,
+por exemplo, uma alteração no comprimento persistido de um tipo personalizado:
+
+```
+ERROR 3219 (HY000): Cannot update extension 'update_test': type 'COUNTER'
+persisted_length changed from 4 to 8 -- existing stored data would be corrupted
+```
+
+Uma vez aceita, a alteração é aplicada na próxima reinicialização. Até lá,
+`INFORMATION_SCHEMA.EXTENSIONS` informa a versão atual junto com a
+versão de destino para a qual ela mudará:
+
+```sql
+SELECT EXTENSION_NAME, EXTENSION_VERSION, PENDING_VERSION
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'update_test';
+```
+
+```
++----------------+-------------------+-----------------+
+| EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION |
++----------------+-------------------+-----------------+
+| update_test    | 1.0.0             | 1.2.0           |
++----------------+-------------------+-----------------+
+```
+
+`INFORMATION_SCHEMA.EXTENSIONS` informa uma alteração agendada em quatro colunas:
+
+| Coluna | Significado |
+|--------|---------|
+| `PENDING_VERSION` | Versão para a qual a extensão mudará na próxima reinicialização, ou `NULL` |
+| `PENDING_REQUESTED_AT` | Quando a alteração foi solicitada |
+| `PENDING_LAST_ERROR` | Mensagem de uma alteração que falhou, ou `NULL` |
+| `PENDING_LAST_ERROR_AT` | Quando essa falha foi registrada, ou `NULL` |
+
+Uma alteração agendada é rastreada por vez:
+
+- **Cancele uma alteração agendada** solicitando novamente a versão atual:
+  ```sql
+  ALTER EXTENSION update_test VERSION '1.0.0' AT RESTART;
+  -- Note: Cleared pending update for extension 'update_test'
+  --       (target matches current version '1.0.0')
+  ```
+- **Solicitar a versão atual quando nada está agendado** não faz nada:
+  ```sql
+  ALTER EXTENSION update_test VERSION '1.0.0' AT RESTART;
+  -- Note: Extension 'update_test' is already at version '1.0.0'
+  ```
+- **Um destino diferente é recusado enquanto uma alteração está agendada**, portanto, cancele a
+  existente primeiro:
+  ```
+  ERROR 3219 (HY000): Extension 'update_test' already has a pending update;
+  clear it with ALTER EXTENSION update_test VERSION '1.0.0' AT RESTART before
+  queueing a different version
+  ```
+
+A cláusula `AT RESTART` aplica a alteração durante a próxima inicialização do servidor.
+
+### Após uma Reinicialização Bem-Sucedida
+
+Na próxima reinicialização, a alteração pendente é aplicada: `EXTENSION_VERSION` torna-se a
+versão de destino e `PENDING_VERSION` é limpo. Para a alteração agendada acima
+(`update_test` `1.0.0` → pendente `1.2.0`):
+
+```sql
+SELECT EXTENSION_NAME, EXTENSION_VERSION, PENDING_VERSION
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'update_test';
+```
+
+```
++----------------+-------------------+-----------------+
+| EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION |
++----------------+-------------------+-----------------+
+| update_test    | 1.2.0             | NULL            |
++----------------+-------------------+-----------------+
+```
+
+Quaisquer linhas de `custom_columns` e de parâmetros de stored procedures que referenciam a versão
+antiga são reescritas durante a mesma reinicialização, para que as tabelas e rotinas dependentes
+continuem funcionando sem migração manual.
+
+<Note>
+A alteração é aplicada durante a reinicialização, não em uma conexão ativa, sendo que os valores acima
+são o estado pós-reinicialização.
+</Note>
+
+### Recuperando de uma Alteração de Versão Pendente na Inicialização
+
+Uma alteração de versão agendada é aplicada durante a próxima inicialização do servidor. Se uma
+ação pendente não puder ser aplicada, o servidor pode falhar ao iniciar enquanto persiste
+suas decisões de atualização pendentes. Use `--villagesql-skip-extension-updates` quando um
+`ALTER EXTENSION ... AT RESTART` enfileirado estiver bloqueando a inicialização e você precisar do
+servidor no ar antes de poder limpá-lo.
+
+`--villagesql-skip-extension-updates` é uma flag de inicialização do `mysqld`. Quando definida, o
+servidor ignora o processamento de ações `ALTER EXTENSION ... AT RESTART` pendentes:
+cada extensão carrega em sua versão atualmente instalada, e sua ação pendente
+é mantida intacta no disco. A flag por si só não muda nada; ela apenas ignora a aplicação
+das ações pendentes naquela inicialização.
+
+Quando a flag está definida e pelo menos uma extensão tem uma ação pendente, o servidor
+registra um único aviso na inicialização informando quantas foram ignoradas:
+
+```text
+--villagesql-skip-extension-updates is set: bypassing N pending extension update(s). Extensions load at their currently-installed version. Query INFORMATION_SCHEMA.EXTENSIONS to see the pending actions; clear each via ALTER EXTENSION <name> VERSION '<current>' AT RESTART, then restart without the flag.
+```
+
+<Steps>
+  <Step title="Inicie o servidor com a flag">
+    Em produção, passe-a como uma opção normal de linha de comando do `mysqld` ou adicione-a
+    em `[mysqld]` no `my.cnf`:
+
+    ```bash
+    mysqld --villagesql-skip-extension-updates
+    ```
+
+    No dev harness, passe-a com `--`:
+
+    ```bash
+    ./villagesql start -- --villagesql-skip-extension-updates
+    ```
+
+    **Sinal de sucesso:** o servidor inicia e o log de erros contém o
+    aviso `bypassing N pending extension update(s)` mostrado acima.
+  </Step>
+  <Step title="Identifique as ações pendentes">
+    ```sql
+    SELECT EXTENSION_NAME, EXTENSION_VERSION, PENDING_VERSION, PENDING_LAST_ERROR
+    FROM INFORMATION_SCHEMA.EXTENSIONS
+    WHERE PENDING_VERSION IS NOT NULL;
+    ```
+
+    ```text
+    +--------------+-------------------+-----------------+--------------------+
+    | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_LAST_ERROR |
+    +--------------+-------------------+-----------------+--------------------+
+    | my_extension   | 1.0.0             | 2.0.0           | NULL               |
+    +--------------+-------------------+-----------------+--------------------+
+    ```
+
+    **Sinal de sucesso:** o `PENDING_VERSION` de cada linha é o destino que você precisa
+    limpar; `PENDING_LAST_ERROR` mostra por que falhou ao aplicar.
+  </Step>
+  <Step title="Limpe cada ação pendente">
+    Para cada extensão retornada acima, solicite sua versão atual para cancelar
+    a alteração enfileirada (o mecanismo de cancelamento descrito em
+    [Alterando a Versão de uma Extensão](#changing-an-extension-version)):
+
+    ```sql
+    ALTER EXTENSION my_extension VERSION '1.0.0' AT RESTART;
+    ```
+
+    **Sinal de sucesso:** uma nota `Cleared pending update for extension '<name>'
+    (target matches current version '<current>')` é retornada, e
+    executar novamente a consulta anterior mostra que `PENDING_VERSION` é `NULL`.
+  </Step>
+  <Step title="Reinicie sem a flag">
+    Reinicie o servidor normalmente, omitindo `--villagesql-skip-extension-updates`.
+
+    **Sinal de sucesso:** o servidor inicia e o
+    aviso `bypassing N pending extension update(s)` não aparece mais no
+    log.
+  </Step>
+</Steps>
+
+### Processo de Atualização Manual
+
+1. **Desinstale a versão atual:**
+   ```sql
+   UNINSTALL EXTENSION extension_name;
+   ```
+
+2. **Substitua o arquivo .veb:**
+   ```bash
+   # Remove old .veb file
+   sudo rm /path/to/veb_dir/extension_name.veb
+
+   # Copy new .veb file
+   sudo cp new_extension_name.veb /path/to/veb_dir/
+   ```
+
+3. **Instale a nova versão:**
+   ```sql
+   INSTALL EXTENSION extension_name;
+   ```
+
+4. **Verifique a atualização:**
+   ```sql
+   SELECT EXTENSION_VERSION
+   FROM INFORMATION_SCHEMA.EXTENSIONS
+   WHERE EXTENSION_NAME = 'extension_name';
+   ```
+
+<Warning>
+  **Segurança de Dados:** Se as tabelas usarem tipos personalizados da extensão, você deve remover ou alterar essas tabelas antes de desinstalar. Faça backup dos seus dados primeiro.
+</Warning>
+
+**Exemplo:**
+```sql
+-- Find columns using vsql_complex types before updating
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE DATA_TYPE LIKE 'vsql_complex.%';
+
+-- If columns exist, back up data and drop/alter them first
+-- Then proceed with update
+UNINSTALL EXTENSION vsql_complex;
+-- (replace .veb file)
+INSTALL EXTENSION vsql_complex;
+```
+
+---
+
+## Limpeza
+
+### Remover Diretórios de Expansão Órfãos
+
+O VillageSQL expande os arquivos `.veb` em `{datadir}/.veb_expansion_cache/{name}/{sha256}/`. Versões antigas se acumulam ao longo do tempo.
+
+```bash
+# List expansion directories (replace {datadir} with your actual datadir path)
+ls -la {datadir}/.veb_expansion_cache/
+
+# Compare with installed extensions
+mysql -u root -p -e "SELECT EXTENSION_NAME FROM INFORMATION_SCHEMA.EXTENSIONS;"
+
+# Find the actual SHA256 directory name for a specific extension
+ls {datadir}/.veb_expansion_cache/my_extension/
+
+# Remove the unused SHA256 directory using the name shown above
+rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
+```
+
+<Note>
+  A reinicialização do servidor limpa automaticamente os diretórios de expansão órfãos.
+</Note>
+
+---
+
+## Replicação {#replication}
+
+Tipos personalizados exigem o binlog no formato ROW. Os modos STATEMENT e MIXED não são
+compatíveis com tabelas com colunas de tipo personalizado. Operações de INSERT, UPDATE, DELETE e
+ALTER TABLE em colunas de tipo personalizado replicam corretamente no formato ROW.
+
+`INSTALL EXTENSION` não é replicado; cada servidor gerencia suas próprias extensões.
+Instale a extensão em cada réplica antes de a replicação começar, usando a mesma
+versão da origem. O servidor impõe a correspondência exata de versão; uma incompatibilidade
+de versão interrompe a replicação.
+
+Se uma réplica encontrar um tipo personalizado que não reconhece, a replicação para na
+instrução DDL, seja em `CREATE TABLE` ou `ALTER TABLE`, antes que qualquer DML dependente
+seja aplicado. Instale a versão correta da extensão e depois retome:
+
+```sql
+INSTALL EXTENSION my_extension;
+START REPLICA SQL_THREAD;
+```
+
+O `mysqldump` preserva os nomes de tipo personalizado totalmente qualificados na saída. As
+restaurações lógicas funcionam desde que a extensão esteja instalada no servidor de destino antes
+de importar o dump.
+
+<Warning>
+O comportamento com o plugin Clone, o XtraBackup e o InnoDB Cluster / Group
+Replication ainda não foi testado. Teste seu caminho de restauração antes de confiar nele
+em produção.
+</Warning>
+
+---
+
+## Usando Extensões com Docker
+
+Ao executar o VillageSQL no Docker, monte um diretório local como `veb_dir` para poder adicionar arquivos `.veb` a partir do host sem recompilar o contêiner.
+
+**Exemplo de Docker Compose:**
+
+```yaml
+services:
+  villagesql:
+    image: villagesql/server:stable
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./extensions:/usr/lib/veb
+    command: --veb_dir=/usr/lib/veb
+```
+
+Copie um arquivo `.veb` para `./extensions/` no host e depois instale via SQL:
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+Para verificar o diretório que o servidor em execução está usando:
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+---
+
+## Obtendo Ajuda
+
+Se você encontrar problemas não abordados aqui:
+
+1. **Verifique o Log de Erros:** A maioria dos erros de extensão é registrada com detalhes
+2. **Revise a Documentação da Extensão:** Pode existir uma solução de problemas específica da extensão
+3. **Pergunte no Discord:** Entre no [Discord do VillageSQL](https://discord.gg/KSr6whd3Fr)
+4. **Registre um Issue:** Reporte bugs no [GitHub Issues](https://github.com/villagesql/villagesql-server/issues)
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card
+    title="Referência do Sistema"
+    icon="book"
+    href="/pt-BR/mysql-8.4/0.0.5/reference"
+  >
+    Consulte tabelas e views do sistema
+  </Card>
+  <Card
+    title="Desinstalando Extensões"
+    icon="trash"
+    href="/pt-BR/mysql-8.4/0.0.5/uninstall"
+  >
+    Remova extensões com segurança
+  </Card>
+  <Card
+    title="Arquitetura de Extensões"
+    icon="sitemap"
+    href="/pt-BR/mysql-8.4/0.0.5/architecture"
+  >
+    Entenda os detalhes internos
+  </Card>
+</CardGroup>

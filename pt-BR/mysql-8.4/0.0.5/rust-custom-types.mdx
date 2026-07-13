@@ -1,0 +1,255 @@
+---
+audience: extension-author
+title: "Tipos Personalizados em Rust"
+description: "Defina novos tipos de coluna no SDK Rust do VillageSQL — layout binário, encode, decode, compare, hash e funções aritméticas com a macro custom_type!."
+---
+
+<Warning>
+  O SDK Rust está em alfa — espere mudanças incompatíveis na API entre
+  versões. Extensões que contêm apenas funções e tipos personalizados (encode, decode,
+  compare, hash) têm suporte. Agregações, `prerun()`, `VarArgs`, variáveis de sistema
+  e de status, acesso ao keyring e a ABI de armazenamento em coluna são
+  exclusivos de C++ hoje — use o [Criando Extensões em C++](/pt-BR/mysql-8.4/0.0.5/create) se você
+  precisar de qualquer um deles.
+</Warning>
+
+Tipos personalizados permitem que você defina novos tipos de coluna, como `RATIONAL`, `VECTOR` ou `INET`, que funcionam com `ORDER BY`, índices e funções de agregação. O SDK Rust oferece suporte a isso por meio da macro `custom_type!`.
+
+Esta página pressupõe que você já tenha trabalhado com [Criando Extensões em Rust](/pt-BR/mysql-8.4/0.0.5/rust-sdk). A configuração (Cargo.toml, manifest.json, cargo-vsql) é a mesma.
+
+## Quando usar um tipo personalizado
+
+Use um tipo personalizado quando:
+
+- Você precisar de um layout binário em disco que um tipo SQL padrão não consegue expressar (floats compactados, inteiros de largura fixa, identificadores binários)
+- Seu tipo tiver semântica de ordenação própria que difere da ordenação lexicográfica de strings
+- Você quiser que o servidor indexe e faça hash dos valores corretamente para `ORDER BY`, `COUNT(DISTINCT)` e operações de conjunto
+
+Se você precisar apenas de funções chamáveis via SQL e seus dados couberem confortavelmente em colunas `STRING`, `INT` ou `REAL`, você não precisa de um tipo personalizado.
+
+## A macro custom_type!
+
+Todo tipo personalizado precisa de 4 callbacks (encode, decode, compare, hash) e um valor padrão. Aqui está a assinatura completa da macro:
+
+```rust
+villagesql::custom_type!(
+    type_name: "type_name_in_sql",
+    persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: your_encode_fn,
+    decode: your_decode_fn,
+    compare: your_compare_fn,
+    hash: your_hash_fn,
+    default: "a_valid_string_literal",
+)
+```
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `type_name` | literal de string | O nome do tipo SQL. Não diferencia maiúsculas de minúsculas em SQL. |
+| `persisted_length` | `usize` | Comprimento fixo em bytes para o armazenamento em disco. |
+| `max_decode_buffer_length` | `usize` | Comprimento máximo em bytes da representação de string decodificada. |
+| `encode` | fn | Converte um `&str` em bytes binários no momento do INSERT. |
+| `decode` | fn | Converte bytes binários de volta em uma `String` para exibição. |
+| `compare` | fn | Retorna `Ordering` para `ORDER BY`, `MIN`, `MAX`. |
+| `hash` | fn | Retorna um hash `usize` para `COUNT(DISTINCT)` e operações de conjunto. Opcional, mas recomendado para colunas indexadas. |
+| `default` | literal de string | Uma string válida que o servidor consegue codificar na inicialização do tipo. Deve codificar para exatamente `persisted_length` bytes. Opcional, mas recomendado. |
+
+`type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode` e `compare` são obrigatórios. `hash` e `default` são opcionais, mas recomendados — `hash` é necessário para que o `COUNT(DISTINCT)` e as operações de conjunto funcionem corretamente, e `default` é necessário para a verificação de inicialização do tipo.
+
+## Recebendo e retornando valores binários
+
+Funções que recebem ou retornam um tipo personalizado trabalham com bytes brutos.
+
+**Entrada** — `InValue::Custom(b)` carrega o binário armazenado como `&[u8]`:
+
+```rust
+fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::Custom(b)) => {
+            let numer = read_i64(b, 0);
+            VdfReturn::int(numer)
+        }
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("rational_numer: expected a RATIONAL argument"),
+    }
+}
+```
+
+**Saída** — `VdfReturn::Binary(bytes)` envia bytes binários de volta ao servidor:
+
+```rust
+fn rational_add_impl(args: &[InValue]) -> VdfReturn {
+    match (args.get(0), args.get(1)) {
+        (Some(InValue::Custom(a)), Some(InValue::Custom(b))) => {
+            let result = add_rationals(a, b);
+            VdfReturn::Binary(result)
+        }
+        _ => VdfReturn::null(),
+    }
+}
+```
+
+Para referenciar um tipo personalizado em uma declaração `func!`, use `villagesql::custom!("type_name")`:
+
+```rust
+villagesql::func!(
+    rational_add_impl,
+    "rational_add",
+    [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
+    deterministic: true
+)
+```
+
+## Exemplo: tipo de número racional
+
+`examples/vsql_rational` no repositório do SDK é uma extensão funcional que implementa um tipo `RATIONAL`. Ela armazena um número racional como um par de valores `i64` (numerador, denominador, totalizando 16 bytes) em ordem de bytes little-endian e fornece funções aritméticas.
+
+Aqui estão as implementações principais de encode, decode, compare e hash:
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+// Binary layout: [numerator: i64 LE][denominator: i64 LE] — 16 bytes total.
+// Always stored in reduced form (GCD = 1) with a positive denominator.
+const BYTES: usize = 16;
+
+fn to_bytes(num: i64, den: i64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(BYTES);
+    v.extend_from_slice(&num.to_le_bytes());
+    v.extend_from_slice(&den.to_le_bytes());
+    v
+}
+
+fn from_bytes(b: &[u8]) -> (i64, i64) {
+    let num = i64::from_le_bytes(b[..8].try_into().unwrap());
+    let den = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    (num, den)
+}
+
+// encode: "3/4" -> 16 bytes
+pub fn rational_encode(s: &str) -> Result<Vec<u8>, String> {
+    let (num_s, den_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("rational: expected 'n/d', got {:?}", s))?;
+    let num: i64 = num_s.trim().parse()
+        .map_err(|e| format!("rational numerator: {}", e))?;
+    let den: i64 = den_s.trim().parse()
+        .map_err(|e| format!("rational denominator: {}", e))?;
+    let (n, d) = normalize(num as i128, den as i128)
+        .ok_or_else(|| "rational: zero or overflowing denominator".to_string())?;
+    Ok(to_bytes(n, d))
+}
+
+// decode: 16 bytes -> "3/4"
+pub fn rational_decode(b: &[u8]) -> Result<String, String> {
+    if b.len() < BYTES {
+        return Err(format!("rational: expected {} bytes, got {}", BYTES, b.len()));
+    }
+    let (n, d) = from_bytes(b);
+    Ok(format!("{}/{}", n, d))
+}
+
+// compare: for ORDER BY, MIN, MAX
+pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (n1, d1) = from_bytes(a);
+    let (n2, d2) = from_bytes(b);
+    // cross-multiply (denominators are always positive)
+    let lhs = (n1 as i128) * (d2 as i128);
+    let rhs = (n2 as i128) * (d1 as i128);
+    lhs.cmp(&rhs)
+}
+
+// hash: for COUNT(DISTINCT) and set operations
+pub fn rational_hash(b: &[u8]) -> usize {
+    // FNV-1a over the 16 bytes
+    let mut h: usize = 0xcbf29ce484222325u64 as usize;
+    for &byte in b {
+        h ^= byte as usize;
+        h = h.wrapping_mul(0x100000001b3u64 as usize);
+    }
+    h
+}
+```
+
+O registro `custom_type!` e as VDFs aritméticas (`rational_add`, `rational_sub`, etc.) estão no código-fonte completo em `examples/vsql_rational/src/lib.rs`.
+
+Com a extensão instalada:
+
+```sql
+INSTALL EXTENSION vsql_rational;
+
+CREATE TABLE fractions (
+    id   INT PRIMARY KEY,
+    val  RATIONAL
+);
+
+INSERT INTO fractions VALUES (1, '1/2'), (2, '3/4'), (3, '1/4');
+
+-- ORDER BY uses rational_compare
+SELECT val FROM fractions ORDER BY val;
+-- → 1/4, 1/2, 3/4
+
+-- Arithmetic with rational_add
+SELECT rational_add('1/3', '1/6');
+-- → 1/2
+
+-- Extract numerator and denominator
+SELECT rational_numer(val), rational_denom(val) FROM fractions;
+
+-- Convert to floating-point approximation
+SELECT rational_to_real('1/3');
+-- → 0.3333333333333333
+```
+
+`rational_to_real(r RATIONAL) -> REAL` converte um valor `RATIONAL` em uma aproximação de ponto flutuante de 64 bits, dividindo o numerador pelo denominador. Útil quando você precisa de um decimal aproximado para exibição ou comparação, mas não quer armazenar a representação com perda na coluna.
+
+## O bloco extension! com tipos
+
+Ao registrar tanto funções quanto tipos, o bloco `extension!` tem duas seções:
+
+```rust
+villagesql::extension! {
+    funcs: [
+        // VDFs declared with func!
+    ],
+    types: [
+        // Custom types declared with custom_type!
+    ]
+}
+```
+
+Qualquer uma das seções pode ser omitida se estiver vazia. Uma extensão que contém apenas tipos omite `funcs:`; uma extensão que contém apenas funções omite `types:`.
+
+## Próximos passos
+
+<CardGroup cols={2}>
+  <Card
+    title="Referência da API Rust"
+    icon="book"
+    href="/pt-BR/mysql-8.4/0.0.5/rust-api-reference"
+  >
+    Referência completa para InValue, VdfReturn e todas as macros.
+  </Card>
+  <Card
+    title="Criando Extensões em Rust"
+    icon="wrench"
+    href="/pt-BR/mysql-8.4/0.0.5/rust-sdk"
+  >
+    Primeiros passos — configuração do Cargo, primeira função, empacotamento e testes.
+  </Card>
+  <Card
+    title="Tipos Personalizados em C++"
+    icon="shapes"
+    href="/pt-BR/mysql-8.4/0.0.5/custom-types"
+  >
+    Tipos personalizados em C++ — `make_type<>`, encode/decode/compare/hash, regras de ALTER TABLE.
+  </Card>
+  <Card
+    title="Arquitetura de Extensões"
+    icon="sitemap"
+    href="/pt-BR/mysql-8.4/0.0.5/architecture"
+  >
+    Como tipos personalizados são resolvidos, armazenados em cache e persistidos.
+  </Card>
+</CardGroup>

@@ -1,0 +1,112 @@
+---
+audience: extension-author
+title: "API do Protocolo 1"
+description: "Referência para a API de tipos baseada em ponteiros de função do Protocolo 1 e o estilo de ABI bruta — a interface original do VEF, estável desde a v0.0.1 e que será removida após a 0.0.5."
+---
+
+O Protocolo 1 é a interface original do VEF. Ele é estável desde a v0.0.1 e será removido após a 0.0.5. Novas extensões devem usar a API do Protocolo 3 — os construtores de tipos baseados em templates dos guias [Criando Extensões em C++](/pt-BR/mysql-8.4/0.0.5/create) e [Desenvolvimento em C++](/pt-BR/mysql-8.4/0.0.5/development).
+
+Esta página existe como referência ao trabalhar com extensões existentes compiladas com o Protocolo 1.
+
+## API de Tipos Baseada em Ponteiros de Função
+
+Os tipos personalizados do Protocolo 1 são registrados usando ponteiros de função explícitos em vez do template `vsql::make_type<>`. As assinaturas das funções diferem das equivalentes do Protocolo 3 — elas recebem ponteiros brutos e comprimentos em vez de objetos `Arg` e `Result`.
+
+### Assinaturas de Funções
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+### Registro
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()` (com um NTTP de string em tempo de compilação) é a forma preferida. `make_type(MYTYPE)` (sem parâmetro de template) é a forma do Protocolo 1 — o suporte a ela será removido após a 0.0.5.
+
+## Estilo de ABI Bruta (Funções)
+
+As implementações de VDF do Protocolo 1 podem passar as structs C brutas diretamente em vez de usar wrappers tipados. Este estilo será removido após a 0.0.5 — use a [API tipada de argumento/resultado](/pt-BR/mysql-8.4/0.0.5/development#argument-and-result-types) para todo código novo.
+
+```cpp
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+```
+
+O registro é idêntico à abordagem tipada — o construtor detecta a assinatura automaticamente.
+
+### Constantes de Resultado
+
+A ABI bruta comunica o estado do resultado por meio de `vef_return_value_type_t` definido em `result->type`:
+
+| Constante | Valor | Significado |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | Sucesso — a saída está no campo de union apropriado |
+| `VEF_RESULT_NULL` | 1 | O resultado é SQL NULL |
+| `VEF_RESULT_WARNING` | 2 | Aviso em nível de linha — a execução continua, NULL é retornado para esta linha, um aviso SQL é adicionado; no modo estrito o MySQL promove isso a um erro em INSERT/UPDATE |
+| `VEF_RESULT_ERROR` | 3 | Erro fatal — a execução da instrução é abortada; a mensagem está em `result->error_msg` |
+
+No Protocolo 3, `out.set()`, `out.set_null()`, `out.warning()` e `out.error()` tratam disso automaticamente.
+
+### Registro de Agregados no Protocolo 1
+
+Para agregados, `.clear<>()` e `.accumulate<>()` aceitam assinaturas de ponteiros de função de ABI bruta. `.prerun<>()` e `.postrun<>()` não aceitam — o construtor exige assinaturas tipadas (`void(PrerunArgs, PrerunResult)` e `void(PostrunArgs)`) mesmo para extensões do Protocolo 1. Use a [abordagem tipada de agregados](/pt-BR/mysql-8.4/0.0.5/development#aggregate-vdfs) para todo código novo.
+
+```cpp
+make_func<&raw_result>("my_agg")
+    .returns(INT).param(INT)
+    // prerun/postrun require typed signatures even in Protocol 1 mode:
+    .prerun<&my_prerun>()      // void(vsql::PrerunArgs, vsql::PrerunResult)
+    .postrun<&my_postrun>()    // void(vsql::PostrunArgs)
+    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
+    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
+    .build()
+```

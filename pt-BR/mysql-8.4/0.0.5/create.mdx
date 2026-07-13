@@ -1,0 +1,598 @@
+---
+audience: extension-author
+title: "Criando Extensões em C++"
+description: "Aprenda a criar extensões personalizadas do VillageSQL em C++ usando o template de extensão e o VEF."
+---
+
+<Warning>
+O Protocolo 3 do VEF é estável a partir da v0.0.4. O Protocolo 4 está em desenvolvimento e disponível apenas por meio de cabeçalhos opcionais da dev ABI (`-DVSQL_USE_DEV_ABI=ON`). Extensões compiladas com o antigo Protocolo 2 são rejeitadas pelo servidor e precisam ser recompiladas.
+</Warning>
+
+## Visão geral
+
+O framework de extensões do VillageSQL (VEF) permite adicionar funcionalidades personalizadas ao servidor de banco de dados. Este guia percorre a criação de uma extensão em C++ usando o SDK C++ e o template de extensão.
+
+Para escrever implementações de VDF em profundidade (como tipos de argumento e de retorno, agregados, variáveis de sistema e tipos parametrizados), consulte o [Guia de Desenvolvimento](/pt-BR/mysql-8.4/0.0.5/development).
+
+<Note>
+Se você prefere Rust, consulte [Criando Extensões em Rust](/pt-BR/mysql-8.4/0.0.5/rust-sdk).
+</Note>
+
+## O que é uma Extensão do VillageSQL?
+
+Uma extensão do VillageSQL é empacotada como um **arquivo VEB** (VillageSQL Extension Bundle) contendo:
+- **Manifesto** - Metadados sobre a extensão (nome, versão, descrição)
+- **Biblioteca compartilhada** - Código C++ compilado que implementa a funcionalidade
+- **Metadados opcionais** - Recursos ou configurações adicionais
+
+Extensões em C++ são compiladas usando o **SDK C++**, a ligação C++ para o VEF (o VillageSQL Extension Framework). Ele fornece:
+- API C++ para definir tipos e funções
+- Registro automático sem scripts SQL
+- Tipos de argumento e de retorno com segurança de tipos
+- Padrão de builder para a definição da extensão
+
+<Note>
+**VDFs vs UDFs tradicionais:** Funções registradas por meio do VEF são chamadas de VDFs (VillageSQL Defined Functions). O VillageSQL também oferece suporte a UDFs tradicionais do MySQL registradas via `CREATE FUNCTION ... SONAME`, mas VDFs são recomendadas para novas extensões.
+</Note>
+
+### Chamando VDFs em SQL
+
+VDFs podem ser chamadas com ou sem o prefixo da extensão:
+
+```sql
+-- Unqualified (preferred for cleaner code)
+SELECT complex_abs(impedance) FROM signals;
+
+-- Qualified with extension name (explicit)
+SELECT vsql_complex.complex_abs(impedance) FROM signals;
+```
+
+**Ordem de resolução de funções:**
+
+Quando você chama uma função sem qualificação, o VillageSQL a resolve nesta ordem:
+1. **Funções de sistema** (funções nativas do MySQL como `NOW()`, `CONCAT()`)
+2. **UDFs** (funções tradicionais definidas pelo usuário do MySQL)
+3. **VDFs** (funções de extensão) - apenas se houver exatamente uma função com esse nome
+4. **Funções armazenadas** (criadas com `CREATE FUNCTION`)
+
+**Quando usar nomes qualificados:**
+- Use `extension.function_name` quando várias extensões fornecem funções com o mesmo nome
+- Use nomes não qualificados para um código mais limpo quando não houver ambiguidade
+- A qualificação nunca é obrigatória se apenas uma extensão fornecer aquele nome de função
+
+Extensões podem adicionar:
+- **Funções personalizadas (VDFs)** - Funções SQL com verificação e validação de tipos automáticas
+- **Tipos de dados personalizados** - Novos tipos de coluna como COMPLEX, UUID ou VECTOR que funcionam com ORDER BY e índices
+- **Operações de tipo** - Funções de encode, decode, compare e hash para tipos personalizados
+
+## Pré-requisitos
+
+Antes de começar, compile o VillageSQL a partir do código-fonte — extensões são vinculadas aos cabeçalhos do SDK e à árvore de compilação do servidor. Siga primeiro o guia [Compilar a Partir do Código-Fonte](/pt-BR/mysql-8.4/0.0.5/source).
+
+Você também precisa de:
+
+- **Git** - Para clonagem e controle de versão
+- **CMake** 3.18 ou superior - Sistema de compilação
+- **Compilador C++** - GCC 8+, Clang 8+ ou MSVC 2019+ com suporte a C++17
+- **Conhecimento básico de C++** - Compreensão de C++ e ponteiros de função
+
+<Tip>
+  **Compilando com um agente de IA?** A skill [`vsql-extension-builder`](https://github.com/villagesql/villagesql-skills) automatiza todo esse fluxo de trabalho, da estruturação aos testes, usando Claude Code, Gemini ou outros agentes compatíveis. Instale-a com:
+
+  ```bash
+  curl -sSL https://villagesql.com/skills | bash
+  ```
+</Tip>
+
+## Passo 1: Obtenha o Template de Extensão
+
+Você pode começar com o template de extensão de duas maneiras:
+
+### Opção A: Usar o Template a Partir do Código-Fonte do VillageSQL
+
+Se você tem o código-fonte do VillageSQL, o template já está incluído:
+
+```bash
+cd /path/to/villagesql-source
+cp -r villagesql/sdk/template my-extension
+cd my-extension
+```
+
+### Opção B: Fazer um Fork no GitHub
+
+Comece fazendo um fork do repositório do template de extensão do VillageSQL:
+
+1. Acesse o repositório do template no GitHub:
+   ```
+   https://github.com/villagesql/vsql-extension-template
+   ```
+
+2. Clique no botão **"Fork"** para criar sua própria cópia
+
+3. Clone seu fork localmente:
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/vsql-extension-template.git
+   cd vsql-extension-template
+   ```
+
+<Tip>
+  Como alternativa, use o botão "Use this template" no GitHub para criar um novo repositório baseado no template sem o histórico do fork.
+</Tip>
+
+## Passo 2: Atualize o Manifesto
+
+Edite `manifest.json` para definir os metadados da sua extensão:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/villagesql/villagesql-docs/main/mysql-8.4/0.0.5/manifest.json.schema.json",
+  "name": "my_awesome_extension",
+  "version": "1.0.0",
+  "description": "My custom VillageSQL extension that does amazing things",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+O campo `$schema` é opcional, mas habilita o autocompletar da IDE e a validação inline
+para todos os campos do manifesto.
+
+### Esquema do manifest.json
+
+| Campo | Obrigatório | Formato | Descrição |
+|-------|----------|--------|-------------|
+| `name` | ✅ Sim | letras, dígitos, `_`, `-` | Identificador único. Deve corresponder ao nome em `INSTALL EXTENSION`. |
+| `version` | ✅ Sim | MAJOR.MINOR.PATCH | String de versão semântica |
+| `description` | Não | String | Breve explicação da funcionalidade |
+| `author` | Não | String | Nome do autor ou organização |
+| `license` | Não | String | Identificador de licença (GPL-2.0 recomendado) |
+
+**Regras de validação:**
+- `name`: Deve começar com uma letra e terminar com uma letra ou dígito. Pode conter letras minúsculas, dígitos, sublinhados e hifens. Máximo de 64 caracteres. **Use sublinhados** — hifens exigem uso de crases (backticks) em SQL.
+- `version`: Deve seguir o versionamento semântico (ex.: 1.0.0, 0.2.1)
+- Um manifesto inválido fará com que `INSTALL EXTENSION` falhe
+
+**Exemplo:**
+```sql
+-- manifest.json has "name": "my_awesome_extension"
+INSTALL EXTENSION my_awesome_extension;  -- ✅ Correct: no quoting needed
+INSTALL EXTENSION `my-awesome-extension`;  -- ⚠️ Works, but requires backtick quoting
+```
+
+Para a convenção de nomenclatura completa em SQL, nomes de arquivo e nomes de repositório, consulte [Convenções de Nomenclatura de Extensões](/pt-BR/mysql-8.4/0.0.5/install#extension-naming-conventions).
+
+## Passo 3: Implemente Sua Extensão com o SDK C++
+
+O SDK C++ fornece uma API C++ para definir extensões usando um padrão de builder fluente:
+- Definições de função com segurança de tipos e verificação em tempo de compilação
+- Validação automática de argumentos e conversão de tipos
+- Suporte a tipos personalizados com funções compare/hash (habilita ORDER BY e índices)
+
+### Inclua os Cabeçalhos do VillageSQL
+
+Crie o arquivo principal da sua extensão (ex.: `src/extension.cc`) e inclua os cabeçalhos do SDK C++:
+
+```cpp
+#include <villagesql/vsql.h>
+
+// Your implementation code here
+```
+
+O cabeçalho `<villagesql/vsql.h>` traz o builder de tipos, o builder de funções e
+o builder de extensão, e reexporta símbolos comumente usados para o namespace `vsql`.
+
+### Defina Sua Extensão
+
+Use a macro `VEF_GENERATE_ENTRY_POINTS()` para definir sua extensão:
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(make_func<&my_reverse_impl>("my_reverse")
+      .returns(STRING)
+      .param(STRING)
+      .build())
+    .func(make_func<&count_vowels_impl>("count_vowels")
+      .returns(INT)
+      .param(STRING)
+      .build())
+);
+```
+
+**Métodos do Builder de Função:**
+- `make_func<&impl>("name")` - Cria a função com o ponteiro de implementação
+- `.returns(type)` - Define o tipo de retorno (STRING, INT, REAL ou nome de tipo personalizado)
+- `.param(type)` - Adiciona um parâmetro (máximo de 8 parâmetros)
+- `.buffer_size(size_t)` - Solicita um tamanho de buffer de saída específico para retornos STRING/CUSTOM
+- `.max_result_length(size_t)` - Dimensiona a coluna de resultado para um retorno STRING para que um resultado materializado não seja truncado na largura do argumento. Valores acima de `VEF_MAX_RESULT_LENGTH` (16 MiB) são limitados pelo servidor. Somente STRING; chame `.returns(STRING)` primeiro. Requer o Protocolo 4 (dev ABI).
+- `.deterministic(bool = true)` - Declara que esta função sempre retorna a mesma saída para as mesmas entradas e não tem efeitos colaterais. O padrão é não determinística.
+- `.prerun<func>()` - Define a função de preparação por instrução (opcional)
+- `.postrun<func>()` - Define a função de limpeza por instrução (opcional)
+- `.build()` - Finaliza o registro da função
+
+<Note>
+**Limite de Parâmetros:** As funções oferecem suporte a no máximo 8 parâmetros (definido por `kMaxParams`). Se você precisar de mais, considere usar tipos estruturados ou várias funções.
+</Note>
+
+### VDFs com Argumentos e Valores de Retorno de Tipo Personalizado
+
+Uma VDF pode receber e retornar valores de tipo personalizado usando `.param(TYPE_NAME)` e
+`.returns(TYPE_NAME)` no builder. A implementação usa `CustomArg`
+para entrada e `CustomResult` para saída — os mesmos tipos de argumento e resultado usados nas operações
+de tipo:
+
+```cpp
+void complex_conjugate_impl(CustomArg in, CustomResult out) {
+    if (in.is_null()) { out.set_null(); return; }
+    auto src = in.value();    // Span<const unsigned char> — raw binary
+    auto dst = out.buffer();  // Span<unsigned char>
+    // ... read src, write result to dst ...
+    out.set_length(src.size());
+}
+```
+
+Registre com `.param(COMPLEX)` e `.returns(COMPLEX)`:
+
+```cpp
+.func(make_func<&complex_conjugate_impl>("complex_conjugate")
+          .returns(COMPLEX)
+          .param(COMPLEX)
+          .build())
+```
+
+Consulte o [guia de desenvolvimento](/pt-BR/mysql-8.4/0.0.5/development#argument-and-result-types)
+para a API completa de `CustomArg`/`CustomResult`, incluindo `CustomArgWith<P>`
+e `CustomResultWith<P>` para tipos parametrizados.
+
+### Funções Determinísticas
+
+Por padrão, VDFs são registradas como não determinísticas. Uma função não determinística é bloqueada em três contextos SQL: colunas geradas, restrições CHECK e valores padrão de expressão (`DEFAULT (expr)` em uma coluna) — usar qualquer um desses recursos com uma VDF não determinística retorna um erro. Se sua função sempre produz a mesma saída para as mesmas entradas e não tem efeitos colaterais, você pode declará-la determinística adicionando `.deterministic()` à cadeia do builder.
+
+O otimizador pode usar essa informação para avaliar a função uma vez por instrução e reutilizar o valor entre as linhas, em vez de chamá-la por linha. Marcar incorretamente uma função não determinística como determinística pode, portanto, fazer com que o servidor retorne o mesmo resultado para entradas que deveriam produzir saídas diferentes. Adicione `.deterministic()` apenas quando sua função realmente não tiver dependência de estado externo, aleatoriedade ou tempo.
+
+**Assinatura do builder:** `.deterministic(bool d = true)` — a forma sem argumentos assume `true` como padrão.
+
+**Exemplo:**
+
+```cpp
+.func(make_func<&complex_add_impl>("complex_add")
+          .returns(COMPLEX)
+          .param(COMPLEX)
+          .param(COMPLEX)
+          .deterministic()
+          .build())
+```
+
+Como `complex_add` é declarada determinística, ela pode ser usada em uma definição de coluna gerada:
+
+```sql
+-- Deterministic VDFs can be used in generated columns
+CREATE TABLE t (
+    a COMPLEX,
+    b COMPLEX,
+    result COMPLEX GENERATED ALWAYS AS (complex_add(a, b)) STORED
+);
+-- STORED vs VIRTUAL follows standard MySQL generated column rules
+```
+
+### Tamanhos de Buffer Personalizados {#custom-buffer-sizes}
+
+Para funções que retornam dados de comprimento variável, solicite um tamanho de buffer específico:
+
+```cpp
+make_func<&large_result_impl>("large_result")
+  .returns(STRING)
+  .param(INT)
+  .buffer_size(65536)  // Request 64KB buffer
+  .build()
+```
+
+Quando você mesmo constrói o valor com `buffer()` e `set_length()`, o buffer
+tem tamanho fixo de `buffer().size()` bytes — escrever além dele causa estouro de memória, então proteja-se
+contra isso:
+
+```cpp
+void large_result_impl(StringArg input, StringResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+    size_t needed = calculate_output_size(input.value());
+
+    auto buf = out.buffer();
+    if (needed > buf.size()) {
+        out.error("Output exceeds buffer size");
+        return;
+    }
+
+    // Write output into buf.data()
+    out.set_length(actual_output_length);
+}
+```
+
+Para resultados STRING, `out.set(sv)` segue um contrato de estouro no estilo snprintf: ele
+copia quantos bytes couberem e informa o tamanho total do valor via `set_length`.
+Quando o tamanho informado excede o buffer, o servidor aumenta o buffer de resultado e
+reinvoca a função, de modo que um valor STRING maior que o buffer solicitado deixa de ser truncado.
+
+Esse contrato se aplica no momento da linha. Um resultado STRING *materializado* (em uma
+tabela temporária de GROUP BY/DISTINCT, `CREATE TABLE ... SELECT` ou UNION) ainda
+é truncado na largura do argumento, a menos que a função declare
+`.max_result_length(n)`, que dimensiona a coluna de resultado (em caracteres, limitada a
+`VEF_MAX_RESULT_LENGTH`, 16 MiB):
+
+```cpp
+make_func<&large_result_impl>("large_result")
+  .returns(STRING)
+  .max_result_length(65536)
+  .build()
+```
+
+<Note>
+Solicite um tamanho de buffer suficiente via `.buffer_size()` com base no tamanho máximo de saída da sua função. Dimensionar o buffer corretamente evita o custo de um ciclo de aumento-e-nova-tentativa.
+</Note>
+
+<Note>
+Antes de implementar suas funções, revise a [Referência da API C++](/pt-BR/mysql-8.4/0.0.5/extension-api-reference) para os contratos completos de VDF: verificação de null, tipos de resultado, dimensionamento de buffer e tratamento de erros.
+</Note>
+
+## Passo 4: Criando Tipos Personalizados
+
+Tipos personalizados permitem definir novos tipos de coluna — como `COMPLEX`, `UUID` ou
+`VECTOR` — que funcionam com `ORDER BY`, índices e funções de agregação.
+Se sua extensão registra apenas funções, pule para o Passo 5.
+
+Consulte [Tipos Personalizados em C++](/pt-BR/mysql-8.4/0.0.5/custom-types) para o passo a passo completo
+da implementação. Se seu tipo recebe parâmetros (ex.: `VECTOR(1536)`),
+consulte [Tipos Parametrizados](/pt-BR/mysql-8.4/0.0.5/type-operations#parameterized-types).
+
+## Passo 5: Atualize a Configuração de Compilação {#step-5-update-build-configuration}
+
+Edite `CMakeLists.txt` para compilar sua extensão como um arquivo VEB:
+
+```cmake
+cmake_minimum_required(VERSION 3.18)
+project(my_extension)
+
+# Find VillageSQL Extension Framework
+find_package(VillageSQLExtensionFramework QUIET)
+
+# The framework detects build flags via 4 methods (in order):
+# 1. Explicit MYSQL_INCLUDE_FLAGS/MYSQL_CXXFLAGS
+# 2. VillageSQL_BUILD_DIR (reads CMakeCache.txt from VillageSQL build)
+# 3. VSQL_BASE_DIR (uses mysql_config)
+# 4. Default - mysql_config from PATH
+
+# Build shared library with your source files
+add_library(extension SHARED
+    src/extension.cc
+    src/my_functions.cc
+)
+
+# Create VEB archive
+VEF_CREATE_VEB(
+    NAME my_extension
+    LIBRARY_TARGET extension
+    MANIFEST ${CMAKE_CURRENT_SOURCE_DIR}/manifest.json
+)
+
+# Install VEB to VillageSQL extensions directory
+install(FILES ${VEB_OUTPUT} DESTINATION ${INSTALL_DIR})
+```
+
+**Notas de configuração:**
+- `VillageSQLExtensionFramework` fornece helpers do CMake para compilar extensões
+- `VEF_CREATE_VEB()` empacota sua biblioteca, manifesto e metadados em um arquivo `.veb`
+- O framework detecta automaticamente as flags de compilação do MySQL/VillageSQL
+- O nome do target da biblioteca é normalmente `extension` (pode ser qualquer um)
+- O nome do VEB deve corresponder ao nome no seu manifest.json
+- Por padrão, extensões são compiladas com os cabeçalhos da ABI estável. Defina `-DVSQL_USE_DEV_ABI=ON` para compilar com os cabeçalhos instáveis da dev ABI
+
+---
+
+## Passo 6: Crie um Diretório de Compilação
+
+Crie um diretório de compilação separado:
+
+```bash
+mkdir build
+cd build
+```
+
+## Passo 7: Compile com CMake e Make
+
+Configure e compile sua extensão:
+
+```bash
+# Configure the build
+cmake ..
+
+# Or, if building against VillageSQL source:
+cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+
+# Or, to build against the unstable dev ABI headers:
+cmake .. -DVSQL_USE_DEV_ABI=ON
+
+# Build the extension
+make
+```
+
+Isso cria:
+- Biblioteca compartilhada compilada (arquivo `.so`)
+- Pacote VEB (arquivo `.veb`) - um arquivo tar contendo manifesto e biblioteca
+
+### Verifique a Compilação
+
+Verifique o conteúdo do seu arquivo VEB:
+
+```bash
+make show_veb
+```
+
+Você deverá ver:
+```
+manifest.json
+lib/myext.so
+```
+
+## Passo 8: Instale e Teste
+
+### Opção A: Instalar no Diretório de Extensões do VillageSQL
+
+Use o target de instalação para copiar o VEB para sua instalação do VillageSQL:
+
+```bash
+make install
+```
+
+Isso copia o arquivo `.veb` para o diretório configurado via `VillageSQL_VEB_INSTALL_DIR`.
+
+### Opção B: Instalação Manual
+
+Copie o arquivo VEB manualmente:
+
+```bash
+# Find the VEF directory
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# Copy the VEB file
+sudo cp my-awesome-extension.veb /path/to/veb_dir/
+```
+
+### Teste Sua Extensão
+
+1. **Conecte-se ao VillageSQL**:
+   ```bash
+   mysql -u root -p
+   ```
+
+2. **Instale a extensão**:
+   ```sql
+   INSTALL EXTENSION my_awesome_extension;
+   ```
+
+3. **Verifique a instalação**:
+   ```sql
+   SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+   ```
+
+4. **Teste suas funções**:
+   ```sql
+   SELECT my_reverse('Hello, World!');
+   -- Output: !dlroW ,olleH
+
+   SELECT count_vowels('VillageSQL');
+   -- Output: 3
+   ```
+
+## Criando Testes
+
+Adicione arquivos de teste para validar que sua extensão funciona corretamente:
+
+1. **Crie um arquivo de teste** em `mysql-test/t/`:
+   ```sql
+   -- mysql-test/t/my_basic.test
+   SELECT my_reverse('abc');
+   SELECT my_reverse('');
+   SELECT my_reverse(NULL);
+   ```
+
+2. **Gere os resultados esperados**:
+   ```bash
+   cd /path/to/villagesql/build/mysql-test
+   perl mysql-test-run.pl --suite=/path/to/your/extension/mysql-test --record
+   ```
+
+3. **Execute os testes**:
+   ```bash
+   perl mysql-test-run.pl --suite=/path/to/your/extension/mysql-test
+   ```
+
+## Solução de Problemas
+
+### A Extensão Não Carrega
+
+Verifique o log de erros e confira o conteúdo do VEB:
+```bash
+make show_veb
+tail -f /var/log/mysql/error.log
+```
+
+### Função Não Encontrada
+
+Verifique a instalação e o registro:
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+### Erros de Compilação
+
+```bash
+# Verify mysql_config is available
+which mysql_config
+mysql_config --version
+
+# Check compiler version
+gcc --version  # or clang --version
+
+# Verify CMake version (3.18+ required)
+cmake --version
+```
+
+## Extensões de Exemplo
+
+Aprenda com extensões existentes do VillageSQL:
+
+<CardGroup cols={2}>
+  <Card
+    title="vsql_complex"
+    icon="wave-square"
+    href="https://github.com/villagesql/villagesql-server/tree/main/villagesql/examples/vsql-complex"
+  >
+    Implementação do tipo de dado de número complexo
+  </Card>
+  <Card
+    title="vsql_extension_template"
+    icon="code"
+    href="https://github.com/villagesql/vsql-extension-template"
+  >
+    Template mínimo para criar extensões
+  </Card>
+</CardGroup>
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card
+    title="Instalando Extensões"
+    icon="puzzle-piece"
+    href="/pt-BR/mysql-8.4/0.0.5/install"
+  >
+    Aprenda a instalar e gerenciar extensões
+  </Card>
+  <Card
+    title="Guia de Desenvolvimento"
+    icon="code"
+    href="/pt-BR/mysql-8.4/0.0.5/development"
+  >
+    Tipos de argumento e de retorno, agregados, variáveis de sistema e testes
+  </Card>
+  <Card
+    title="Arquitetura de Extensões"
+    icon="sitemap"
+    href="/pt-BR/mysql-8.4/0.0.5/architecture"
+  >
+    Ciclo de vida, cache, desempenho e modelo de segurança
+  </Card>
+  <Card
+    title="Compilar a Partir do Código-Fonte"
+    icon="hammer"
+    href="/pt-BR/mysql-8.4/0.0.5/source"
+  >
+    Compile o VillageSQL a partir do código-fonte
+  </Card>
+</CardGroup>
+
+## Recursos
+
+- [VillageSQL Extension Template](https://github.com/villagesql/vsql-extension-template)
+- [MySQL UDF API Documentation](https://dev.mysql.com/doc/extending-mysql/8.4/en/adding-loadable-function.html)
+- [CMake Documentation](https://cmake.org/documentation/)
+- [VillageSQL Community Discord](https://discord.gg/KSr6whd3Fr)

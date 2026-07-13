@@ -1,0 +1,249 @@
+---
+audience: extension-author
+title: "Criando Extensões em Rust"
+description: "Comece a usar o SDK Rust do VillageSQL — escreva funções de extensão em Rust seguro, empacote-as como arquivos VEB e instale-as no VillageSQL."
+---
+
+<Warning>
+  O SDK Rust está em alpha — espere mudanças incompatíveis de API entre
+  versões. Extensões somente de função e tipos personalizados (encode, decode,
+  compare, hash) são compatíveis. Agregações, `prerun()`, `VarArgs`, variáveis de
+  sistema e de status, acesso ao keyring e a ABI de armazenamento em colunas são
+  exclusivos de C++ hoje — use o [SDK C++](/pt-BR/mysql-8.4/0.0.5/create) se
+  você precisar de algum deles.
+</Warning>
+
+<Note>
+Se você prefere C++, consulte [Criando Extensões em C++](/pt-BR/mysql-8.4/0.0.5/create) para o guia passo a passo do SDK C++.
+</Note>
+
+As extensões do VillageSQL podem ser escritas em Rust usando a crate `villagesql`. O SDK cuida de todo o marshaling de FFI — você trabalha com tipos Rust comuns e a macro `extension!` gera os pontos de entrada C que o servidor chama no momento do carregamento.
+
+## Pré-requisitos
+
+Antes de começar, compile o VillageSQL a partir do código-fonte — as extensões são vinculadas à árvore de compilação do servidor. Siga primeiro o guia [Compilar a Partir do Código-Fonte](/pt-BR/mysql-8.4/0.0.5/source).
+
+Você também precisa de:
+
+- **Toolchain estável do Rust** — instale em [rustup.rs](https://rustup.rs)
+- **Git** — para clonar o SDK e o repositório da sua extensão
+- **cargo-vsql** — o subcomando do Cargo para empacotar, instalar e testar extensões
+- **Diretório de compilação do VillageSQL** — defina `VillageSQL_BUILD_DIR` como o caminho de compilação do seu servidor para `cargo vsql install` e `cargo vsql test`
+- **Conhecimento básico de Rust** — familiaridade com Cargo, enums e correspondência de padrões
+
+Instale o `cargo-vsql` a partir do repositório do SDK:
+
+```bash
+git clone https://github.com/villagesql/vsql-rust-sdk
+cd vsql-rust-sdk
+cargo install --path cargo-vsql
+```
+
+Verifique se está disponível:
+
+```bash
+cargo vsql --help
+```
+
+## Crie uma nova crate
+
+Crie uma nova crate de biblioteca Rust:
+
+```bash
+cargo new --lib vsql_rot13
+cd vsql_rot13
+```
+
+Edite o `Cargo.toml` para definir o tipo da crate e adicionar a dependência `villagesql`:
+
+```toml
+[package]
+name = "vsql_rot13"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+villagesql = "0.0.1"
+```
+
+O tipo de crate `cdylib` diz ao Cargo para produzir uma biblioteca compartilhada (`.so` no Linux, `.dylib` no macOS) que o servidor pode carregar.
+
+## Escreva sua primeira função
+
+Substitua `src/lib.rs` por uma extensão completa:
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("vsql_rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rot13_impl, "vsql_rot13", [villagesql::Type::String] -> villagesql::Type::String),
+    ]
+}
+```
+
+A macro `func!` conecta `rot13_impl` ao nome SQL `vsql_rot13` com uma assinatura `STRING -> STRING`.
+
+A assinatura da função é `fn(&[InValue]) -> VdfReturn`. `InValue` é um enum sobre os tipos SQL que o servidor passa. `VdfReturn` é o que você retorna. Verifique `args.first()` para tratar tanto o caso NULL quanto o caso de tipo incorreto antes de acessar o valor.
+
+Se a sua função sempre retorna a mesma saída para as mesmas entradas, declare-a como determinística — o otimizador pode então armazenar em cache os resultados para entradas idênticas:
+
+```rust
+villagesql::func!(rot13_impl, "vsql_rot13", [villagesql::Type::String] -> villagesql::Type::String, deterministic: true)
+```
+
+## Adicione o manifest.json
+
+Crie o `manifest.json` na raiz da crate (ao lado do `Cargo.toml`):
+
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "ROT-13 encoding for VillageSQL",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+O servidor lê isso no momento da instalação. O campo `name` deve corresponder ao que você passa para `INSTALL EXTENSION`.
+
+## Compile e instale
+
+<Note>
+Execute `cargo vsql package`, `cargo vsql install` e `cargo vsql test` de dentro do diretório da extensão (onde ficam o `Cargo.toml` e o `manifest.json`), não da raiz do workspace.
+</Note>
+
+Empacote a extensão em um arquivo `.veb`:
+
+```bash
+cargo vsql package
+```
+
+Isso produz `dist/vsql_rot13.veb`. Para empacotar e copiar o VEB diretamente para o seu diretório de compilação do VillageSQL:
+
+```bash
+export VillageSQL_BUILD_DIR=/path/to/villagesql/build
+cargo vsql install
+```
+
+Para aplicar um patch em uma dependência apontando para um checkout local durante o desenvolvimento, passe `--config KEY=VALUE` (repetível):
+
+```bash
+cargo vsql install --config 'patch.crates-io.villagesql.path="/path/to/villagesql"'
+```
+
+Você deve ver o VEB copiado para o diretório de extensões. Verifique se ele está lá:
+
+```bash
+ls "$VillageSQL_BUILD_DIR/veb_dir/"
+# vsql_rot13.veb
+```
+
+## Teste
+
+Escreva um arquivo de teste em `mysql-test/t/rot13_basic.test`:
+
+```sql
+INSTALL EXTENSION vsql_rot13;
+SELECT vsql_rot13('Hello');
+SELECT vsql_rot13('');
+SELECT vsql_rot13(NULL);
+UNINSTALL EXTENSION vsql_rot13;
+```
+
+Gere os resultados esperados:
+
+```bash
+cargo vsql test --record
+```
+
+Execute a suíte:
+
+```bash
+cargo vsql test
+```
+
+Após modificar o comportamento da sua função, execute novamente `cargo vsql test --record` para atualizar os resultados esperados e, em seguida, `cargo vsql test` para confirmar.
+
+## Instale em SQL
+
+Assim que o VEB estiver no diretório de extensões, instale-o:
+
+```sql
+INSTALL EXTENSION vsql_rot13;
+```
+
+Verifique:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'vsql_rot13';
+```
+
+Chame-a:
+
+```sql
+SELECT vsql_rot13('Hello, World!');
+-- → Uryyb, Jbeyq!
+```
+
+## Próximos passos
+
+<CardGroup cols={2}>
+  <Card
+    title="Tipos Personalizados em Rust"
+    icon="shapes"
+    href="/pt-BR/mysql-8.4/0.0.5/rust-custom-types"
+  >
+    Defina novos tipos de coluna com armazenamento binário, ordenação e hashing.
+  </Card>
+  <Card
+    title="Referência da API Rust"
+    icon="book"
+    href="/pt-BR/mysql-8.4/0.0.5/rust-api-reference"
+  >
+    InValue, VdfReturn, extension!, func! e custom_type! — todos os campos.
+  </Card>
+  <Card
+    title="SDK C++ (Criando Extensões em C++)"
+    icon="code"
+    href="/pt-BR/mysql-8.4/0.0.5/create"
+  >
+    O caminho C++ — wrappers tipados, API de builder e configuração do CMake.
+  </Card>
+  <Card
+    title="Arquitetura de Extensões"
+    icon="sitemap"
+    href="/pt-BR/mysql-8.4/0.0.5/architecture"
+  >
+    Como os arquivos VEB são carregados, hooks de ciclo de vida e isolamento de símbolos.
+  </Card>
+  <Card
+    title="Testando Extensões Dependentes de Rede"
+    icon="network-wired"
+    href="/pt-BR/mysql-8.4/0.0.5/testing-network"
+  >
+    Padrões de porta do MTR para extensões que iniciam servidores HTTP ou listeners externos — aplica-se igualmente a extensões Rust e C++.
+  </Card>
+</CardGroup>

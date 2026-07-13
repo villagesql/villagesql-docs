@@ -1,0 +1,314 @@
+---
+audience: extension-author
+title: "Referência da API C++"
+description: "Contratos da API de VDF, tratamento de NULL, dimensionamento de buffer, convenções de encode/decode, hooks prerun/postrun e compatibilidade de recursos SQL para extensões do VillageSQL."
+---
+
+Esta página é uma referência para autores de extensões em C++. Para o tutorial passo a passo,
+consulte [Criando Extensões em C++](/pt-BR/mysql-8.4/0.0.5/create). Para tipos de coluna personalizados,
+consulte [Tipos Personalizados em C++](/pt-BR/mysql-8.4/0.0.5/custom-types).
+
+<Note>
+  Curioso sobre por que a API tem essa aparência? Leia [Happy Path, Escape Hatch,
+  and the Space Between](https://villagesql.com/blog/escape-hatch/) para conhecer a
+  filosofia de design por trás da API tipada de argumento/resultado e dos hooks de nível mais baixo, como
+  `prerun()` e varargs.
+</Note>
+
+## Contratos das Funções VDF
+
+Estes contratos regem como as funções de implementação de VDF interagem com o
+runtime do VEF. Toda função registrada via `make_func<>` deve segui-los.
+Os tipos referenciados abaixo estão disponíveis via `#include <villagesql/vsql.h>`.
+
+**1. As funções de implementação de VDF são `void` e nunca retornam um valor.**
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    // ... compute result ...
+    return;  // always void — no return value
+}
+```
+
+Comunique sucesso, NULL, aviso ou erro chamando um método terminal no
+tipo de resultado: `out.set(...)` / `out.set_length(n)`, `out.set_null()`,
+`out.warning(msg)` ou `out.error(msg)`.
+
+**2. Verifique `input.is_null()` antes de chamar `input.value()`.**
+
+Se `is_null()` retornar true, chamar `value()` é comportamento indefinido.
+
+```cpp
+void my_func_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+    // Safe to call input.value() -> std::string_view
+}
+```
+
+**3. Para resultados de string, escreva em `out.buffer()` e chame `out.set_length(n)`. Verifique `out.buffer().size()` antes de escrever.**
+
+- `out.buffer()` retorna um `Span<char>` sobre o buffer gerenciado pelo servidor.
+- `out.set_length(n)` registra quantos bytes foram escritos.
+- `out.buffer().size()` é a capacidade máxima. Sempre verifique antes de escrever.
+
+```cpp
+void upper_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    if (sv.size() > buf.size()) {
+        out.error("Input length exceeds buffer size");
+        return;
+    }
+
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = toupper(sv[i]);
+    }
+    out.set_length(sv.size());
+}
+```
+
+**4. Passe as mensagens de erro para `out.error(msg)`. A mensagem é truncada em `VEF_MAX_ERROR_LEN` (512 bytes) se necessário.**
+
+`out.error(msg)` aceita um `std::string_view`. Ele copia a mensagem para um
+buffer gerenciado pelo servidor e define o estado do resultado como erro em uma única chamada.
+
+```cpp
+// Correct — error goes through out.error()
+out.error("Invalid input: expected positive integer");
+return;
+```
+
+## Implementar Funções
+
+As funções de implementação usam tipos de argumento e resultado tipados:
+
+```cpp
+#include <villagesql/vsql.h>
+#include <algorithm>
+
+using namespace vsql;
+
+// String reverse implementation
+void my_reverse_impl(StringArg input, StringResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    auto sv = input.value();
+    auto buf = out.buffer();
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = sv[sv.size() - 1 - i];
+    }
+    out.set_length(sv.size());
+}
+
+// Count vowels implementation
+void count_vowels_impl(StringArg input, IntResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    long long count = 0;
+    for (char c : input.value()) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    out.set(count);
+}
+```
+
+## Tratando Valores NULL
+
+Verifique se há NULL via `is_null()` e retorne NULL chamando `set_null()`.
+
+**Opções de tratamento de NULL:**
+- **Verificação de NULL na entrada:** `input.is_null()`
+- **Retornar NULL:** `out.set_null()`
+- **Retornar valor:** `out.set(v)` (numérico/personalizado) ou `out.set_length(n)` após escrever em `out.buffer()` (string)
+- **Retornar aviso:** `out.warning(msg)` — retorna NULL para esta linha, adiciona um aviso SQL, continua a execução; no modo estrito, o MySQL promove isso a um erro em INSERT/UPDATE. Chame em vez de `out.set()`, não além dele.
+- **Retornar erro:** `out.error(msg)` — aborta a execução da instrução
+
+## Tratamento de Erros
+
+Retorne erros com mensagens personalizadas para falhas de validação ou entrada inválida:
+
+```cpp
+void validate_age_impl(IntArg age_input, IntResult out) {
+    if (age_input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    long long age = age_input.value();
+
+    if (age < 0 || age > 150) {
+        out.error("Age must be between 0 and 150");
+        return;
+    }
+
+    out.set(age);
+}
+```
+
+## Estado por Instrução com Prerun/Postrun
+
+Registre hooks com `.prerun<>()` e `.postrun<>()`. As assinaturas obrigatórias são:
+
+```cpp
+void my_prerun(vsql::PrerunArgs args, vsql::PrerunResult out);
+void my_postrun(vsql::PostrunArgs args);
+```
+
+Para detalhes dos métodos de `PrerunArgs` e `PostrunArgs`, consulte
+[Estado por Instrução](/pt-BR/mysql-8.4/0.0.5/development#per-statement-state-prerun-and-postrun)
+no guia de Desenvolvimento.
+
+<Note>
+**A maioria das extensões não precisa de hooks prerun/postrun.** O SDK C++ trata
+automaticamente casos comuns, como verificação de tipos e dimensionamento do buffer de resultado; tanto para
+VDFs que retornam STRING quanto para as que retornam CUSTOM, o buffer de resultado é aumentado para acomodar
+o tipo de retorno resolvido antes de o corpo da VDF ser executado. Use prerun/postrun somente quando
+você precisar de uma configuração cara por instrução (como abrir conexões) que
+não deveria acontecer por linha.
+
+Se você perceber que precisa de prerun/postrun para o seu caso de uso, compartilhe seu cenário no
+[Discord do VillageSQL](https://discord.gg/KSr6whd3Fr), pois a equipe pode conseguir
+adicionar suporte no SDK C++ para tratá-lo automaticamente.
+</Note>
+
+## Funções de Agregação
+
+As agregações integradas COUNT(DISTINCT), MIN, MAX e GROUP_CONCAT funcionam com
+tipos personalizados prontas para uso. MIN e MAX exigem uma função de comparação registrada
+no tipo.
+
+VDFs de agregação personalizadas também têm suporte. Registre uma com
+`make_aggregate_func<State, &result_fn>("name")`, depois encadeie `.returns()`,
+`.param()`, `.clear<>()` e `.accumulate<>()` antes de chamar `.build()`.
+Tanto `.clear<>()` quanto `.accumulate<>()` são obrigatórios. Consulte
+[Aggregate VDFs](/pt-BR/mysql-8.4/0.0.5/development#aggregate-vdfs) para a
+API do builder e as assinaturas de callback.
+
+**Operações de agregação integradas com tipos personalizados:**
+```sql
+-- COUNT(DISTINCT) works with custom types
+SELECT COUNT(DISTINCT impedance) FROM signals;
+
+-- MIN and MAX work with custom types (requires compare function)
+SELECT MIN(impedance), MAX(impedance) FROM signals;
+
+-- GROUP_CONCAT works with custom types
+SELECT GROUP_CONCAT(impedance ORDER BY impedance SEPARATOR ', ') FROM signals;
+```
+
+As funções de extensão são chamadas em um modelo de execução por linha:
+
+- Cada chamada de função processa uma linha com seu próprio buffer de resultado (thread-safe)
+- `prerun`/`postrun` fornecem configuração/finalização por instrução
+- **Evite estado global**: use parâmetros de função e valores de retorno em vez disso
+- Se você tiver que usar estado global, proteja-o com mutexes/locks
+
+**Boa prática:** Projete funções para serem stateless, visando simplicidade e segurança.
+
+## Funções de Janela
+
+As seguintes funções de janela funcionam com tipos personalizados:
+
+```sql
+SELECT
+    id,
+    impedance,
+    LAG(impedance)  OVER (ORDER BY id) AS prev_impedance,
+    LEAD(impedance) OVER (ORDER BY id) AS next_impedance
+FROM signals;
+
+SELECT
+    id,
+    impedance,
+    FIRST_VALUE(impedance) OVER w AS first_impedance,
+    LAST_VALUE(impedance)  OVER w AS last_impedance,
+    NTH_VALUE(impedance, 2) OVER w AS second_impedance
+FROM signals
+WINDOW w AS (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
+```
+
+## Tabelas Temporárias
+
+Tipos personalizados funcionam em tabelas temporárias. `CREATE TEMPORARY TABLE`, `INSERT`
+e `ALTER TABLE` se comportam da mesma forma que em tabelas permanentes.
+
+```sql
+CREATE TEMPORARY TABLE tmp_signals (
+    id        INT PRIMARY KEY,
+    impedance COMPLEX
+);
+
+INSERT INTO tmp_signals VALUES (1, '(10,5)'), (2, '(20,0)');
+SELECT id, impedance FROM tmp_signals;
+```
+
+## APIs de Prévia
+
+Algumas capacidades do VEF estão disponíveis como headers opcionais (opt-in) sob
+`villagesql/preview/` na árvore de includes do SDK C++. A ABI e a API ainda estão
+em desenvolvimento ativo e podem mudar sem aviso prévio.
+
+Para optar por elas, adicione o include ao código-fonte da sua extensão. Por exemplo:
+
+```cpp
+#include <villagesql/preview/keyring.h>        // vsql::preview_keyring::KeyringCapability
+#include <villagesql/preview/thread_worker.h>  // vsql::preview_thread_worker::ThreadWorkerCapability
+#include <villagesql/preview/sql_query.h>      // vsql::preview_sql_query::SqlQueryCapability
+```
+
+Nenhum desses headers é incluído por `<villagesql/vsql.h>`; você deve incluí-lo
+diretamente ao optar por eles.
+
+O layout de namespace sob `vsql::preview` é por capacidade, não havendo um único
+padrão universal. A API do keyring usa `vsql::preview_keyring::KeyringCapability`;
+a API do thread worker usa `vsql::preview_thread_worker::ThreadWorkerCapability`;
+a API de consulta SQL usa `vsql::preview_sql_query::SqlQueryCapability` e deve ser
+aberta a partir de um handle de thread de worker em segundo plano (`vef_thread_handle_t *`).
+Verifique cada header para saber o namespace exato e o nome de classe que ele define.
+
+Para a documentação completa da API de prévia, consulte [Capacidades de Prévia](/pt-BR/mysql-8.4/0.0.5/preview-capabilities).
+
+<Warning>
+Os headers de prévia não são estáveis. Uma extensão compilada com eles pode quebrar
+quando o servidor for atualizado. Quando um recurso se estabiliza, seus headers são movidos para um
+caminho versionado do SDK C++ estável.
+</Warning>
+
+## Gatilhos
+
+Gatilhos disparam em tabelas com colunas de tipo personalizado. O corpo do gatilho pode
+referenciar colunas de tipo não personalizado de `NEW` e `OLD`. Acessar valores de
+coluna de tipo personalizado dentro do corpo de um gatilho ainda não tem suporte.
+
+```sql
+CREATE TABLE signals (
+    id        INT PRIMARY KEY,
+    impedance COMPLEX,
+    label     VARCHAR(50)
+);
+CREATE TABLE signal_log (
+    id        INT,
+    label     VARCHAR(50),
+    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER signals_after_insert
+AFTER INSERT ON signals
+FOR EACH ROW
+    INSERT INTO signal_log (id, label) VALUES (NEW.id, NEW.label);
+
+INSERT INTO signals VALUES (1, '(10,5)', 'sensor_a');
+SELECT id, label FROM signal_log;
+```
