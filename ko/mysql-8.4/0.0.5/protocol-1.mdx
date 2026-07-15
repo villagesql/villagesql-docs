@@ -1,0 +1,112 @@
+---
+audience: extension-author
+title: "프로토콜 1 API"
+description: "프로토콜 1 함수 포인터 유형 API 및 원시 ABI 스타일에 대한 참조 — 원래의 VEF 인터페이스로, v0.0.1부터 안정적이며 0.0.5 이후에 제거될 예정입니다."
+---
+
+프로토콜 1은 원래의 VEF 인터페이스입니다. v0.0.1부터 안정적이었으며, 0.0.5 이후에는 제거될 예정입니다. 새로운 확장은 프로토콜 3 API를 사용해야 합니다 — [C++에서 확장 만들기](/ko/mysql-8.4/0.0.5/create) 및 [C++ 개발](/ko/mysql-8.4/0.0.5/development) 가이드에서 설명하는 템플릿 기반 유형 빌더를 사용하세요.
+
+이 페이지는 프로토콜 1에 기반하여 구축된 기존 확장을 다룰 때 참고용으로 존재합니다.
+
+## 함수 포인터 유형 API
+
+프로토콜 1 사용자 정의 유형은 `vsql::make_type<>` 템플릿 대신 명시적인 함수 포인터를 사용하여 등록됩니다. 함수 서명은 프로토콜 3의 상응하는 서명과 다릅니다 — `Arg` 및 `Result` 객체 대신 원시 포인터와 길이를 인자로 받습니다.
+
+### 함수 서명
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+### 등록
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+컴파일 타임 문자열 NTTP를 사용하는 `vsql::make_type<kMyTypeName>()`이 선호되는 형식입니다. `make_type(MYTYPE)` (템플릿 매개변수 없음)는 프로토콜 1 형식입니다 — 이 지원은 0.0.5 이후에 제거될 예정입니다.
+
+## 원시 ABI 스타일 (함수)
+
+프로토콜 1 VDF 구현은 타입화된 래퍼를 사용하는 대신 원시 C 구조체를 직접 전달할 수 있습니다. 이 스타일은 0.0.5 이후에 제거될 예정입니다 — 모든 새로운 코드에 [타입화된 인자/결과 API](/ko/mysql-8.4/0.0.5/development#argument-and-result-types)를 사용하세요.
+
+```cpp
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+```
+
+등록은 타입화된 접근법과 동일합니다 — 빌더는 서명을 자동으로 감지합니다.
+
+### 결과 상수
+
+원시 ABI는 `result->type`에 설정된 `vef_return_value_type_t`를 통해 결과 상태를 전달합니다:
+
+| 상수 | 값 | 의미 |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | 성공 — 출력이 적절한 유니온 필드에 있습니다 |
+| `VEF_RESULT_NULL` | 1 | 결과가 SQL NULL입니다 |
+| `VEF_RESULT_WARNING` | 2 | 행 수준 경고 — 실행이 계속되고, 이 행에 대해 NULL이 반환되며, SQL 경고가 추가됩니다. strict 모드에서 MySQL은 INSERT/UPDATE 시 이를 오류로 승격합니다 |
+| `VEF_RESULT_ERROR` | 3 | 치명적 오류 — 명령문 실행이 중단됩니다. 메시지는 `result->error_msg`에 있습니다 |
+
+프로토콜 3에서는 `out.set()`, `out.set_null()`, `out.warning()`, `out.error()`가 이를 자동으로 처리합니다.
+
+### 프로토콜 1에서의 집계 등록
+
+집계의 경우, `.clear<>()`와 `.accumulate<>()`는 원시 ABI 함수 포인터 서명을 허용합니다. `.prerun<>()`와 `.postrun<>()`는 그렇지 않습니다 — 빌더는 프로토콜 1 확장에도 타입화된 서명 (`void(PrerunArgs, PrerunResult)` 및 `void(PostrunArgs)`)을 요구합니다. 모든 새로운 코드에 [타입화된 집계 접근법](/ko/mysql-8.4/0.0.5/development#aggregate-vdfs)을 사용하세요.
+
+```cpp
+make_func<&raw_result>("my_agg")
+    .returns(INT).param(INT)
+    // prerun/postrun require typed signatures even in Protocol 1 mode:
+    .prerun<&my_prerun>()      // void(vsql::PrerunArgs, vsql::PrerunResult)
+    .postrun<&my_postrun>()    // void(vsql::PostrunArgs)
+    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
+    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
+    .build()
+```

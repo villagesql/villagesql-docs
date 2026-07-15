@@ -1,0 +1,181 @@
+---
+audience: extension-author
+title: "卸载扩展"
+description: "安全地移除 VillageSQL 扩展"
+---
+
+## 命令语法
+
+```sql
+UNINSTALL EXTENSION extension_name [VERSION 'version'];
+```
+
+当提供 `VERSION` 时，服务器会将它与已安装扩展的版本进行比较，如果两者不同，则中止操作。省略此子句以卸载当前安装的任何版本。
+
+<Warning>
+在卸载扩展之前，必须删除所有使用扩展中类型的列、存储过程参数和 `DECLARE` 变量。然后，卸载过程将删除扩展提供的所有函数和类型。
+</Warning>
+
+## 先决条件
+
+- 对 VillageSQL 的管理员访问权限
+- 没有使用扩展中自定义类型的表
+- 没有使用扩展中自定义类型的参数或 `DECLARE` 变量的存储过程
+- 如果扩展存储自定义数据，则备份数据
+
+## 卸载步骤
+
+### 1. 尝试卸载
+
+运行卸载命令。如果扩展没有依赖项，它将立即成功。如果列依赖于它，则错误消息会准确地标识哪些列：
+
+```sql
+UNINSTALL EXTENSION vsql_complex;
+```
+
+**如果扩展具有列依赖项，**您将看到如下错误：
+```
+ERROR HY000: Cannot drop extension `vsql_complex` as 1 column(s) depend on it,
+e.g. mydb.signals.impedance has type COMPLEX
+```
+
+删除或修改标识的列，然后重试：
+
+```sql
+-- Option 1: Drop the table
+DROP TABLE mydb.signals;
+
+-- Option 2: Alter to remove only the custom type column
+ALTER TABLE mydb.signals DROP COLUMN impedance;
+```
+
+**如果存储过程使用扩展中的自定义类型，**您将看到如下错误：
+```
+ERROR 3219 (HY000): Cannot uninstall extension 'vsql_complex': stored procedure mydb.transform_signal uses custom type COMPLEX
+```
+
+删除或修改存储过程，以删除带有类型的参数或变量，然后重试：
+
+```sql
+-- Option 1: Drop the stored procedure
+DROP PROCEDURE mydb.transform_signal;
+
+-- Option 2: Recreate the procedure without the custom type parameter
+-- (replace the custom type with a compatible built-in type or remove the parameter)
+```
+
+### 2. 卸载扩展
+
+```sql
+UNINSTALL EXTENSION vsql_complex;
+```
+
+为了防止卸载意外版本（在 CI 或滚动升级后很有用），请包含 `VERSION` 子句：
+
+```sql
+UNINSTALL EXTENSION vsql_complex VERSION '1.2.0';
+```
+
+如果 `1.2.0` 不是已安装的版本，服务器将返回错误并保留扩展：
+
+```
+ERROR 3219 (HY000): Cannot uninstall extension 'vsql_complex': installed
+version is '0.0.1' but VERSION '1.2.0' was specified
+```
+
+**这将删除以下内容：**
+- ✅ 扩展提供的所有 VDF（函数）
+- ✅ 扩展注册的自定义类型定义
+- ✅ 扩展注册记录
+- ✅ 扩展的自定义列元数据
+- ✅ 扩展的持久系统变量（`SET PERSIST`），来自 `mysqld-auto.cnf`
+
+**这将不会删除以下内容：**
+- ❌ `.veb` 文件将保留在 `veb_dir` 中
+- ❌ `{datadir}/.veb_expansion_cache/` 中的解压目录将暂时保留
+- ❌ 表数据（您必须首先删除具有自定义类型的表）
+
+<Note>
+服务器重新启动时，`{datadir}/.veb_expansion_cache/{extension}/{sha256}/` 中的解压目录将自动清理。
+</Note>
+
+<Note>
+`UNINSTALL EXTENSION` 还会删除属于扩展的所有持久系统变量，这些变量来自 `mysqld-auto.cnf`。如果您之前运行了 `SET PERSIST extensionname.varname = value`，则该条目将在卸载期间自动删除。持久值不会在服务器关闭期间删除——它们会在重新启动周期中保留，以便扩展可以在下次加载时读取它们。
+</Note>
+
+<Note>
+卸载具有待处理版本更改（已排队的 `ALTER EXTENSION name VERSION 'x' AT RESTART`）的扩展时，会随扩展行一并丢弃该待处理操作——不会遗留孤立的待处理状态需要清理，也不会报错。之后的 `INSTALL EXTENSION` 会重新开始，没有任何待处理操作。有关如何跟踪和清除待处理版本更改的信息，请参阅 [管理扩展](/zh/mysql-8.4/0.0.5/managing)。
+</Note>
+
+### 3. 验证卸载
+
+```sql
+-- Check extension is gone
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'vsql_complex';
+-- Should return no rows
+
+-- Verify functions removed
+SELECT complex_abs('(1.0,2.0)');
+-- Error: FUNCTION test_db.complex_abs does not exist
+```
+
+## 常见错误
+
+| 错误 | 原因 | 解决方案 |
+|-------|-------|----------|
+| `Cannot drop extension \`name\` as N column(s) depend on it, e.g. db.table.col has type TYPE` | 表具有使用扩展的自定义类型的列 | 删除或修改标识的列，然后重试 |
+| `Cannot uninstall extension 'name': stored procedure db.sp uses custom type TYPE` | 存储过程具有使用扩展的自定义类型的参数或 `DECLARE` 变量 | 删除或修改存储过程，以删除自定义类型的使用，然后重试 |
+| `Cannot uninstall extension 'name': installed version is 'X' but VERSION 'Y' was specified` | 指定了 `VERSION` 子句，但它与已安装的版本不匹配 | 重新运行，不使用 `VERSION`，或使用 `SELECT EXTENSION_VERSION FROM INFORMATION_SCHEMA.EXTENSIONS` 中显示的版本 |
+| `Extension not found` | 扩展未安装 | 使用 `SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS` 进行验证 |
+
+## 可选：删除 .veb 文件
+
+卸载后，`.veb` 文件将保留。要完全删除：
+
+```bash
+# Find veb_dir
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# Delete .veb file
+sudo rm /path/to/veb_dir/vsql_complex.veb
+```
+
+<Note>
+`.veb` 文件可以安全地保留以供将来重新安装。删除它不会影响服务器性能。
+</Note>
+
+## 重新安装
+
+要重新安装扩展，请再次使用 `INSTALL EXTENSION`（如果 `.veb` 文件仍然存在）：
+
+```sql
+INSTALL EXTENSION vsql_complex;
+```
+
+有关详细信息，请参阅 [安装扩展](/zh/mysql-8.4/0.0.5/install)。
+
+## 后续步骤
+
+<CardGroup cols={2}>
+  <Card
+    title="安装扩展"
+    icon="download"
+    href="/zh/mysql-8.4/0.0.5/install"
+  >
+    如果需要，请添加扩展。
+  </Card>
+  <Card
+    title="管理扩展"
+    icon="sliders"
+    href="/zh/mysql-8.4/0.0.5/managing"
+  >
+    监视和排除扩展故障。
+  </Card>
+  <Card
+    title="系统参考"
+    icon="book"
+    href="/zh/mysql-8.4/0.0.5/reference"
+  >
+    查询系统表。
+  </Card>
+</CardGroup>

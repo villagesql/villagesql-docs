@@ -1,0 +1,112 @@
+---
+audience: extension-author
+title: "プロトコル 1 API"
+description: "プロトコル 1 の関数ポインタ型 API および生の ABI スタイルに関するリファレンス — これは元の VEF インターフェースであり、v0.0.1 で安定しており、0.0.5 以降は廃止されます。"
+---
+
+プロトコル 1 は元の VEF インターフェースです。v0.0.1 で安定しており、0.0.5 以降は廃止されます。新しい拡張機能では、[C++ での拡張機能の作成](/ja/mysql-8.4/0.0.5/create) および [C++ 開発](/ja/mysql-8.4/0.0.5/development) ガイドにあるテンプレートベースの型ビルダーを使用して、プロトコル 3 API を使用する必要があります。
+
+このページは、プロトコル 1 を使用して構築された既存の拡張機能を扱う際に参照するために存在します。
+
+## 関数ポインタ型 API
+
+プロトコル 1 のカスタム型は、`vsql::make_type<>` テンプレートの代わりに、明示的な関数ポインタを使用して登録されます。関数シグネチャは、プロトコル 3 の同等物とは異なり、`Arg` および `Result` オブジェクトではなく、生のポインタと長さを引数として受け取ります。
+
+### 関数シグネチャ
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+### 登録
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()` (コンパイル時の文字列 NTTP を使用) が推奨される形式です。`make_type(MYTYPE)` (テンプレートパラメータなし) はプロトコル 1 の形式であり、0.0.5 以降はサポートが終了します。
+
+## 生の ABI スタイル (関数)
+
+プロトコル 1 の VDF 実装では、型付きラッパーを使用する代わりに、生の C 構造体を直接渡すことができます。このスタイルは 0.0.5 以降は廃止されます。すべての新しいコードでは、[型付き引数/結果 API](/ja/mysql-8.4/0.0.5/development#argument-and-result-types) を使用してください。
+
+```cpp
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+```
+
+登録は、型付きラッパーのアプローチと同じです。ビルダーはシグネチャを自動的に検出します。
+
+### 結果定数
+
+生の ABI は、`result->type` に設定された `vef_return_value_type_t` を介して結果の状態を伝達します。
+
+| 定数 | 値 | 意味 |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | 成功 — 出力は適切な共用体フィールドに格納されます |
+| `VEF_RESULT_NULL` | 1 | 結果は SQL NULL です |
+| `VEF_RESULT_WARNING` | 2 | 行レベルの警告 — 実行は継続され、この行には NULL が返され、SQL 警告が追加されます。厳格モードでは、MySQL は INSERT/UPDATE でこれをエラーに昇格させます |
+| `VEF_RESULT_ERROR` | 3 | 致命的なエラー — ステートメントの実行は中止されます。メッセージは `result->error_msg` に格納されます |
+
+プロトコル 3 では、`out.set()`、`out.set_null()`、`out.warning()`、`out.error()` がこれを自動的に処理します。
+
+### プロトコル 1 における集計関数の登録
+
+集計関数の場合、`.clear<>()` および `.accumulate<>()` は生の ABI 関数ポインタシグネチャを受け入れます。`.prerun<>()` および `.postrun<>()` は受け入れません。ビルダーは、プロトコル 1 の拡張機能であっても、型付きシグネチャ (`void(PrerunArgs, PrerunResult)` および `void(PostrunArgs)`) を必要とします。すべての新しいコードでは、[型付き集計関数のアプローチ](/ja/mysql-8.4/0.0.5/development#aggregate-vdfs) を使用してください。
+
+```cpp
+make_func<&raw_result>("my_agg")
+    .returns(INT).param(INT)
+    // prerun/postrun require typed signatures even in Protocol 1 mode:
+    .prerun<&my_prerun>()      // void(vsql::PrerunArgs, vsql::PrerunResult)
+    .postrun<&my_postrun>()    // void(vsql::PostrunArgs)
+    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
+    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
+    .build()
+```

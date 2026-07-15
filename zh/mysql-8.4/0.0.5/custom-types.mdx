@@ -1,0 +1,288 @@
+---
+audience: extension-author
+title: "C++ 中的自定义类型"
+description: "在 C++ 中为 VillageSQL 扩展定义新的列类型——类型操作、ALTER TABLE 规则、转换函数，以及一个完整的 COMPLEX 类型示例。"
+---
+
+<Warning>
+  自定义类型使用 VEF 协议 3，该协议自 v0.0.4 版本起已稳定。协议 4 正在
+  开发中，并且仅通过选择加入的开发 ABI 头文件提供
+  (`-DVSQL_USE_DEV_ABI=ON`)。使用旧协议 2 构建的扩展程序将被服务器拒绝，并且必须重新构建。
+</Warning>
+
+自定义类型允许您定义新的列类型——例如 `COMPLEX`、`UUID` 或
+`VECTOR`——这些类型可以与 `ORDER BY`、索引和聚合函数一起使用。本
+页是 [在 C++ 中创建扩展](/zh/mysql-8.4/0.0.5/create)
+教程的第 4 步。在继续操作之前，请完成第 1-3 步。
+
+## 定义类型操作
+
+每个自定义类型都需要编码、解码和比较操作，以及可选的哈希操作。针对以下签名实现它们，并将构建器对象传递给 `vsql::make_type<>()`：
+
+```cpp
+// Encode: string -> binary. Write to out.buffer() and call out.set_length(n).
+void mytype_from_string(std::string_view from, vsql::CustomResult out) { /* ... */ }
+
+// Decode: binary -> string. Write to out.buffer() and call out.set_length(n).
+void mytype_to_string(vsql::CustomArg in, vsql::StringResult out) { /* ... */ }
+
+// Compare: returns <0, 0, or >0.
+int mytype_compare(vsql::CustomArg a, vsql::CustomArg b) { /* ... */ }
+
+// Hash: returns hash code (optional).
+size_t mytype_hash(vsql::CustomArg in) { /* ... */ }
+```
+
+<Note>
+对于返回自定义类型的 VDF (`from_string`)，服务器在调用 VDF 之前，会将
+输出缓冲区的大小设置为至少为类型的 `persisted_length` 值，因此在进入时，可以保证 `buf.size() >= persisted_length`。
+这适用于固定宽度类型和参数化类型（其中 `persisted_length` 在调用时从类型上下文中解析）。
+不需要单独的缓冲区大小请求。
+</Note>
+
+原始二进制访问通过 `vsql::Span<T>` 进行，这是一个对连续的 `T` 序列的非所有权视图——`in.value()` 返回
+`vsql::Span<const unsigned char>`，`out.buffer()` 返回
+`vsql::Span<unsigned char>`。使用 C++20 或更高版本，`vsql::Span<T>` 是 `std::span<T>` 的别名；在 C++17 下，C++ SDK 提供了一个最小的源代码兼容回退，具有相同的 `data()`、`size()`、`empty()`、索引和迭代器接口。它通过 `#include <villagesql/vsql.h>` 提供。
+
+## 注册类型
+
+`vsql::make_type<kName>()` 模板将编码、解码、比较和哈希操作直接嵌入到类型对象中。VDF 名称在编译时自动生成为
+`TYPE::from_string`、`TYPE::to_string`、`TYPE::compare` 和 `TYPE::hash`。
+不需要单独的 `.func(make_type_encode<>(...))` 调用。
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Required for auto-generating VDF names at compile time.
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&mytype_from_string>()   // auto: "MYTYPE::from_string"
+        .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
+        .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
+        .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
+        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Development guide
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE)
+);
+```
+
+如果缺少 `from_string`、`to_string` 或 `compare`，`build()` 将无法编译。
+每个模板方法使用 `static_assert` 验证函数指针签名。
+
+类型名称作为非类型模板参数 (NTTP) 传递。将其声明为
+`static constexpr const char[]` 数组——使用指针身份来确定独立的 VDF 名称缓冲区，因此即使两个类型共享一个函数指针，它们仍然会获得单独的自动生成名称。
+
+## 类型操作参考
+
+基于模板的 API 自动生成以下可由 SQL 调用的 VDF：
+
+| 构建器方法 | 自动生成的 VDF 名称 | VDF SQL 签名 |
+|----------------|------------------------|-------------------|
+| `.from_string<&f>()` | `TYPE::from_string` | `(STRING) -> CUSTOM(此类型)` |
+| `.to_string<&f>()` | `TYPE::to_string` | `(CUSTOM(此类型)) -> STRING` |
+| `.compare<&f>()` | `TYPE::compare` | `(CUSTOM(此类型), CUSTOM(此类型)) -> INT` |
+| `.hash<&f>()` | `TYPE::hash` | `(CUSTOM(此类型)) -> INT` |
+
+有关完整的 C++ 签名，请参阅 [类型操作](/zh/mysql-8.4/0.0.5/type-operations)。
+
+## ALTER TABLE 和自定义类型
+
+当涉及自定义类型时，`ALTER TABLE ... MODIFY COLUMN` 和 `CHANGE COLUMN` 强制执行以下规则：
+
+| 从 | 到 | 结果 |
+|------|----|--------|
+| 非自定义 | 自定义 | 错误：`Cannot convert column 'col' to custom type 'MYTYPE'` |
+| 自定义 | 字符串类型 | 允许 |
+| 自定义 | 非字符串类型 | 错误：`Cannot convert custom type column 'col' to non-string type` |
+| 自定义 | 不同的自定义类型 | 如果不兼容，则出错：`Cannot convert between incompatible custom types 'A' and 'B'` |
+
+## 类型转换函数
+
+使用基于模板的 API，编码和解码 VDF 嵌入在类型对象中，并自动注册——不需要单独的 `.func()` 调用。
+自动生成的 VDF 可以通过 SQL 调用：
+
+```sql
+-- Convert string to custom type (calls MYTYPE::from_string)
+SELECT MYTYPE::from_string('(1.0,2.0)');
+
+-- Convert custom type to string (calls MYTYPE::to_string)
+SELECT MYTYPE::to_string(my_column) FROM my_table;
+
+-- Explicit conversion in INSERT
+INSERT INTO my_table (id, value)
+VALUES (1, MYTYPE::from_string('(3.0,4.0)'));
+```
+
+**何时需要显式转换。** VillageSQL 隐式地将字符串字面量转换为自定义类型，直接赋值到列中，因此
+`INSERT INTO t (val) VALUES ('(1.0,2.0)')` 可以在没有显式调用的情况下工作。但是，解析为 `STRING` 类型的表达式——`CASE` 表达式、`CONCAT` 等——不会隐式强制转换。使用 `TYPE::from_string` 包装它们：
+
+```sql
+UPDATE my_table
+SET val = MYTYPE::from_string(
+  CASE (pk MOD 2)
+    WHEN 0 THEN '(1.0,2.0)'
+    ELSE '(0.0,0.0)'
+  END
+);
+```
+
+## 示例：COMPLEX 类型
+
+这是一个完整的示例，实现了 COMPLEX 数字类型：
+
+```cpp
+#include <cstdio>
+#include <cstring>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Encode: "(real,imag)" string -> 16 bytes little-endian
+void encode_complex(std::string_view from, CustomResult out) {
+    auto buf = out.buffer();
+    if (buf.size() < 16) return;
+    double real, imag;
+    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+        out.warning("invalid complex format: expected (real,imag)");
+        return;
+    }
+    memcpy(buf.data(), &real, 8);
+    memcpy(buf.data() + 8, &imag, 8);
+    out.set_length(16);
+}
+
+// Decode: 16 bytes -> "(real,imag)" string
+void decode_complex(CustomArg in, StringResult out) {
+    auto data = in.value();
+    if (data.size() < 16) return;
+    double real, imag;
+    memcpy(&real, data.data(), 8);
+    memcpy(&imag, data.data() + 8, 8);
+    auto buf = out.buffer();
+    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
+    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
+    out.set_length(static_cast<size_t>(len));
+}
+
+// Compare for ORDER BY: real part first, then imaginary
+int compare_complex(CustomArg a, CustomArg b) {
+    auto da = a.value();
+    auto db = b.value();
+    if (da.size() < 16 || db.size() < 16) return 0;
+    double a_real, a_imag, b_real, b_imag;
+    memcpy(&a_real, da.data(), 8);
+    memcpy(&a_imag, da.data() + 8, 8);
+    memcpy(&b_real, db.data(), 8);
+    memcpy(&b_imag, db.data() + 8, 8);
+    if (a_real < b_real) return -1;
+    if (a_real > b_real) return 1;
+    if (a_imag < b_imag) return -1;
+    if (a_imag > b_imag) return 1;
+    return 0;
+}
+```
+
+定义这些操作后，用户可以创建包含自定义类型的表：
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    frequency_response COMPLEX
+);
+
+INSERT INTO signals VALUES (1, '(50.0,10.0)', '(0.95,0.31)');
+
+-- ORDER BY works because we provided compare_complex!
+SELECT * FROM signals ORDER BY impedance;
+
+-- Prepared statements work with custom types
+PREPARE stmt FROM 'SELECT * FROM signals WHERE impedance = ?';
+SET @val = '(50.0,10.0)';
+EXECUTE stmt USING @val;
+
+-- Aggregate operations work with custom types
+SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
+       GROUP_CONCAT(impedance ORDER BY impedance) FROM signals;
+```
+
+## 生成列中的 VDF
+
+VDF 可用于生成列表达式。VDF 必须在扩展构建器中声明为 `.deterministic()`——服务器会阻止在此上下文中使用的非确定性函数。
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    -- Generated column computed by a VDF
+    magnitude DOUBLE GENERATED ALWAYS AS (complex_abs(impedance)) STORED
+);
+```
+
+<Note>
+`complex_abs` 必须使用 `.deterministic()` 注册。传统的 MySQL UDF 不允许在生成列中使用。
+</Note>
+
+有关完整的实现，请参阅 [vsql_complex 示例](/zh/mysql-8.4/0.0.5/examples)。
+
+## 函数索引中的 VDF
+
+VDF 可用于函数索引表达式。与生成列相同的 `.deterministic()` 要求也适用于此处，因为 MySQL 将函数索引实现为隐藏的生成列。
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    sig COMPLEX,
+    INDEX idx_magnitude ((COMPLEX_ABS(sig)))
+);
+```
+
+当相同的 VDF 表达式出现在 `WHERE`、`ORDER BY` 或 `GROUP BY` 中时，优化器会使用该索引。将比较值转换为 VDF 的返回类型，以便优化器匹配该表达式：
+
+```sql
+SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+```
+
+## 后续步骤
+
+定义完类型后，请继续教程的第 5 步，以构建和安装您的扩展。
+
+<CardGroup cols={2}>
+  <Card
+    title="继续：构建您的扩展"
+    icon="hammer"
+    href="/zh/mysql-8.4/0.0.5/create#step-5-update-build-configuration"
+  >
+    返回教程，以构建和安装您的扩展。
+  </Card>
+  <Card
+    title="参数化类型"
+    icon="sliders"
+    href="/zh/mysql-8.4/0.0.5/type-operations#parameterized-types"
+  >
+    接受参数的类型，例如 `VECTOR(1536)`——感知维度的编码、解码和存储大小调整。
+  </Card>
+  <Card
+    title="扩展 API 参考"
+    icon="book"
+    href="/zh/mysql-8.4/0.0.5/extension-api-reference"
+  >
+    VDF API 契约、空值处理、缓冲区大小调整和高级模式。
+  </Card>
+  <Card
+    title="复制"
+    icon="arrow-right-left"
+    href="/zh/mysql-8.4/0.0.5/managing#replication"
+  >
+    ROW 格式要求、扩展安装顺序和复制设置的版本匹配。
+  </Card>
+</CardGroup>

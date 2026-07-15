@@ -1,0 +1,272 @@
+---
+audience: extension-author
+title: "C++でのカスタム型"
+description: "C++でVillageSQL拡張の新しいカラムタイプを定義します。タイプ操作、ALTER TABLEルール、変換関数、および完全なCOMPLEXタイプの例。"
+---
+
+<Warning>
+  カスタムタイプは、v0.0.4で安定しているVEFプロトコル3を使用します。プロトコル4は開発中で、オプトインされた開発ABIヘッダー（`-DVSQL_USE_DEV_ABI=ON`）でのみ利用可能です。古いプロトコル2で構築された拡張機能は、サーバーによって拒否され、再構築する必要があります。
+</Warning>
+
+カスタムタイプを使用すると、`ORDER BY`、インデックス、および集計関数で機能する`COMPLEX`、`UUID`、または`VECTOR`のような新しいカラムタイプを定義できます。このページは、[C++での拡張機能の作成](/ja/mysql-8.4/0.0.5/create)チュートリアルのステップ4です。ここで続行する前に、ステップ1〜3を完了してください。
+
+## タイプ操作の定義
+
+すべてのカスタムタイプには、エンコード、デコード、および比較操作が必要であり、オプションでハッシュ操作も必要です。これらのシグネチャに対して実装し、`vsql::make_type<>()`にビルダーオブジェクトを渡します。
+
+```cpp
+// Encode: string -> binary. Write to out.buffer() and call out.set_length(n).
+void mytype_from_string(std::string_view from, vsql::CustomResult out) { /* ... */ }
+
+// Decode: binary -> string. Write to out.buffer() and call out.set_length(n).
+void mytype_to_string(vsql::CustomArg in, vsql::StringResult out) { /* ... */ }
+
+// Compare: returns <0, 0, or >0.
+int mytype_compare(vsql::CustomArg a, vsql::CustomArg b) { /* ... */ }
+
+// Hash: returns hash code (optional).
+size_t mytype_hash(vsql::CustomArg in) { /* ... */ }
+```
+
+<Note>
+カスタムタイプを返すVDF（`from_string`）の場合、サーバーはVDFを呼び出す前に、出力バッファーのサイズをタイプの`persisted_length`値以上に設定するため、呼び出し時に`buf.size() >= persisted_length`が保証されます。これは、固定幅タイプとパラメータ化されたタイプの両方に適用されます（`persisted_length`は、呼び出し時にタイプコンテキストから解決されます）。個別のバッファーサイズ要求は必要ありません。
+</Note>
+
+生のバイナリアクセスは、連続した`T`のシーケンスに対する非所有ビューである`vsql::Span<T>`を介して行われます。`in.value()`は`vsql::Span<const unsigned char>`を返し、`out.buffer()`は`vsql::Span<unsigned char>`を返します。C++20以降を使用する場合、`vsql::Span<T>`は`std::span<T>`のエイリアスです。C++17の場合、C++ SDKは、同じ`data()`、`size()`、`empty()`、インデックス、およびイテレータインターフェースを持つ、最小限のソース互換のフォールバックを提供します。これは、`#include <villagesql/vsql.h>`を介して利用できます。
+
+## タイプの登録
+
+`vsql::make_type<kName>()`テンプレートは、エンコード、デコード、比較、およびハッシュ操作をタイプオブジェクトに直接埋め込みます。VDF名は、コンパイル時に`TYPE::from_string`、`TYPE::to_string`、`TYPE::compare`、および`TYPE::hash`として自動的に生成されます。個別の`.func(make_type_encode<>(...))`呼び出しは必要ありません。
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Required for auto-generating VDF names at compile time.
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&mytype_from_string>()   // auto: "MYTYPE::from_string"
+        .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
+        .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
+        .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
+        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Development guide
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE)
+);
+```
+
+`build()`は、`from_string`、`to_string`、または`compare`が欠落している場合、コンパイルに失敗します。各テンプレートメソッドは、`static_assert`を使用して関数ポインタのシグネチャを検証します。
+
+タイプ名は、非型テンプレートパラメータ（NTTP）として渡されます。`static constexpr const char[]`配列として宣言します。ポインタの同一性は、独立したVDF名バッファーのキーとして使用されるため、同じ関数ポインタを共有する2つのタイプでも、個別の自動生成された名前が付けられます。
+
+## タイプ操作のリファレンス
+
+テンプレートベースのAPIは、これらのSQL呼び出し可能なVDFを自動的に生成します。
+
+| ビルダーメソッド | 自動生成されたVDF名 | VDF SQLシグネチャ |
+|----------------|------------------------|-------------------|
+| `.from_string<&f>()` | `TYPE::from_string` | `(STRING) -> CUSTOM(このタイプ)` |
+| `.to_string<&f>()` | `TYPE::to_string` | `(CUSTOM(このタイプ)) -> STRING` |
+| `.compare<&f>()` | `TYPE::compare` | `(CUSTOM(このタイプ), CUSTOM(このタイプ)) -> INT` |
+| `.hash<&f>()` | `TYPE::hash` | `(CUSTOM(このタイプ)) -> INT` |
+
+完全なC++シグネチャについては、[タイプ操作](/ja/mysql-8.4/0.0.5/type-operations)を参照してください。
+
+## ALTER TABLEとカスタムタイプ
+
+`ALTER TABLE ... MODIFY COLUMN`および`CHANGE COLUMN`は、カスタムタイプが関与する場合、これらのルールを適用します。
+
+| 元 | 宛先 | 結果 |
+|------|----|--------|
+| 非カスタム | カスタム | エラー: `Cannot convert column 'col' to custom type 'MYTYPE'` |
+| カスタム | 文字列タイプ | 許可 |
+| カスタム | 文字列以外のタイプ | エラー: `Cannot convert custom type column 'col' to non-string type` |
+| カスタム | 異なるカスタムタイプ | 互換性がない場合はエラー: `Cannot convert between incompatible custom types 'A' and 'B'` |
+
+## タイプ変換関数
+
+テンプレートベースのAPIを使用すると、エンコードおよびデコードVDFはタイプオブジェクトに埋め込まれ、自動的に登録されます。個別の`.func()`呼び出しは必要ありません。自動生成されたVDFはSQL呼び出し可能です。
+
+```sql
+-- Convert string to custom type (calls MYTYPE::from_string)
+SELECT MYTYPE::from_string('(1.0,2.0)');
+
+-- Convert custom type to string (calls MYTYPE::to_string)
+SELECT MYTYPE::to_string(my_column) FROM my_table;
+
+-- Explicit conversion in INSERT
+INSERT INTO my_table (id, value)
+VALUES (1, MYTYPE::from_string('(3.0,4.0)'));
+```
+
+**明示的な変換が必要な場合** VillageSQLは、直接カラムへの代入時に文字列リテラルをカスタムタイプに暗黙的に変換するため、`INSERT INTO t (val) VALUES ('(1.0,2.0)')`は、明示的な呼び出しなしで機能します。ただし、`STRING`タイプに解決される式（`CASE`式、`CONCAT`など）は、暗黙的に強制変換されません。`TYPE::from_string`でラップします。
+
+```sql
+UPDATE my_table
+SET val = MYTYPE::from_string(
+  CASE (pk MOD 2)
+    WHEN 0 THEN '(1.0,2.0)'
+    ELSE '(0.0,0.0)'
+  END
+);
+```
+
+## 例：COMPLEXタイプ
+
+COMPLEX数を実装する完全な例を以下に示します。
+
+```cpp
+#include <cstdio>
+#include <cstring>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Encode: "(real,imag)" string -> 16 bytes little-endian
+void encode_complex(std::string_view from, CustomResult out) {
+    auto buf = out.buffer();
+    if (buf.size() < 16) return;
+    double real, imag;
+    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+        out.warning("invalid complex format: expected (real,imag)");
+        return;
+    }
+    memcpy(buf.data(), &real, 8);
+    memcpy(buf.data() + 8, &imag, 8);
+    out.set_length(16);
+}
+
+// Decode: 16 bytes -> "(real,imag)" string
+void decode_complex(CustomArg in, StringResult out) {
+    auto data = in.value();
+    if (data.size() < 16) return;
+    double real, imag;
+    memcpy(&real, data.data(), 8);
+    memcpy(&imag, data.data() + 8, 8);
+    auto buf = out.buffer();
+    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
+    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
+    out.set_length(static_cast<size_t>(len));
+}
+
+// Compare for ORDER BY: real part first, then imaginary
+int compare_complex(CustomArg a, CustomArg b) {
+    auto da = a.value();
+    auto db = b.value();
+    if (da.size() < 16 || db.size() < 16) return 0;
+    double a_real, a_imag, b_real, b_imag;
+    memcpy(&a_real, da.data(), 8);
+    memcpy(&a_imag, da.data() + 8, 8);
+    memcpy(&b_real, db.data(), 8);
+    memcpy(&b_imag, db.data() + 8, 8);
+    if (a_real < b_real) return -1;
+    if (a_real > b_real) return 1;
+    if (a_imag < b_imag) return -1;
+    if (a_imag > b_imag) return 1;
+    return 0;
+}
+```
+
+これらの操作を定義した後、ユーザーはカスタムタイプを持つテーブルを作成できます。
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    frequency_response COMPLEX
+);
+
+INSERT INTO signals VALUES (1, '(50.0,10.0)', '(0.95,0.31)');
+
+-- ORDER BY works because we provided compare_complex!
+SELECT * FROM signals ORDER BY impedance;
+
+-- Prepared statements work with custom types
+PREPARE stmt FROM 'SELECT * FROM signals WHERE impedance = ?';
+SET @val = '(50.0,10.0)';
+EXECUTE stmt USING @val;
+
+-- Aggregate operations work with custom types
+SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
+       GROUP_CONCAT(impedance ORDER BY impedance) FROM signals;
+```
+
+## 生成されたカラム内のVDF
+
+VDFは、生成されたカラム式で使用できます。VDFは、拡張ビルダーで`.deterministic()`として宣言されている必要があります。サーバーは、このコンテキストで非決定的な関数をブロックします。
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    -- Generated column computed by a VDF
+    magnitude DOUBLE GENERATED ALWAYS AS (complex_abs(impedance)) STORED
+);
+```
+
+<Note>
+`complex_abs`は`.deterministic()`で登録する必要があります。従来のMySQL UDFは、生成されたカラムでは許可されていません。
+</Note>
+
+完全な実装については、[vsql_complexの例](/ja/mysql-8.4/0.0.5/examples)を参照してください。
+
+## 関数インデックス内のVDF
+
+VDFは、関数インデックス式で使用できます。生成されたカラムからの同じ`.deterministic()`要件がここにも適用されます。これは、MySQLが関数インデックスを隠し生成カラムとして実装するためです。
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    sig COMPLEX,
+    INDEX idx_magnitude ((COMPLEX_ABS(sig)))
+);
+```
+
+オプティマイザは、同じVDF式が`WHERE`、`ORDER BY`、または`GROUP BY`に含まれる場合に、インデックスを使用します。比較値をVDFの戻り値のタイプにキャストして、オプティマイザが式を一致させます。
+
+```sql
+SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+```
+
+## 次のステップ
+
+タイプを定義したら、チュートリアルのステップ5に進み、拡張機能をビルドしてインストールします。
+
+<CardGroup cols={2}>
+  <Card
+    title="次のステップ：拡張機能のビルド"
+    icon="hammer"
+    href="/ja/mysql-8.4/0.0.5/create#step-5-update-build-configuration"
+  >
+    チュートリアルに戻って、拡張機能をビルドしてインストールします。
+  </Card>
+  <Card
+    title="パラメータ化された型"
+    icon="sliders"
+    href="/ja/mysql-8.4/0.0.5/type-operations#parameterized-types"
+  >
+    `VECTOR(1536)`のようにパラメータを受け取るタイプ — 次元を認識するエンコード、デコード、およびストレージサイジング。
+  </Card>
+  <Card
+    title="拡張機能APIリファレンス"
+    icon="book"
+    href="/ja/mysql-8.4/0.0.5/extension-api-reference"
+  >
+    VDF APIコントラクト、null処理、バッファーサイズ、および高度なパターン。
+  </Card>
+  <Card
+    title="レプリケーション"
+    icon="arrow-right-left"
+    href="/ja/mysql-8.4/0.0.5/managing#replication"
+  >
+    ROW形式の要件、拡張機能のインストール順序、およびレプリケートされたセットアップのバージョンマッチング。
+  </Card>
+</CardGroup>

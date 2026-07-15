@@ -1,0 +1,165 @@
+---
+audience: extension-author
+title: "C++ 测试"
+description: "设置本地 VillageSQL 服务器，使用 MTR 运行扩展回归测试，并调试测试失败。"
+---
+
+本指南介绍 C++ 扩展的测试与迭代循环：设置本地服务器、安装 `.veb` 文件、运行回归测试以及调试测试失败。它是 [使用 C++ 创建扩展](/zh/mysql-8.4/0.0.5/create) 的补充，后者涵盖初始构建；也是 [C++ 开发](/zh/mysql-8.4/0.0.5/development) 的补充，后者深入介绍 VDF 编写。
+
+<Note>
+  如果您正在为 VillageSQL 服务器本身做贡献（而不是构建扩展），请参阅 [从源代码构建](/zh/mysql-8.4/0.0.5/source)，其中涵盖了完整的服务器开发人员工作流程，包括直接使用 `mysql-test-run.pl` 运行测试。
+</Note>
+
+## 设置您的环境
+
+要开发和测试扩展，您需要一个已构建的 VillageSQL 服务器。请按照 [从源代码克隆和构建](/zh/mysql-8.4/0.0.5/source) 指南来编译服务器二进制文件。
+
+构建完成后，使用 `villagesql` CLI 管理本地开发服务器实例。从安装 VillageSQL 的目录运行所有命令。
+
+### 启动本地开发服务器
+
+初始化并启动服务器实例：
+
+```bash
+./villagesql init    # initialize database and seed bundled extensions
+./villagesql start   # start the server (default port 3307)
+./villagesql status  # check the server is running
+./villagesql connect # open a mysql shell
+./villagesql stop    # stop the server
+```
+
+要在初始化时设置 root 密码：
+
+```bash
+./villagesql init --password
+./villagesql start
+```
+
+要为某次测试运行启用或禁用 mysqld 功能，请在 `--` 分隔符之后传递标志；其后的所有内容都会原封不动地转发给 `mysqld`：
+
+```bash
+./villagesql start -- --skip-name-resolve --general-log
+```
+
+`--` 之前任何无法识别的参数都会被拒绝，因此请对每个打算传给 `mysqld` 的标志都使用 `--`。
+
+在任何命令之前传递 `--dir <path>` 以管理多个独立的实例，或者使用 `--here` 在当前工作目录中创建一个服务器目录：
+
+```bash
+./villagesql --here init
+./villagesql --here start
+```
+
+### 管理扩展文件
+
+在通过 SQL 安装扩展之前，其 `.veb` 文件必须存在于服务器上。CLI 管理服务器的 `lib/veb/` 目录：
+
+```bash
+./villagesql veb add /path/to/my_extension.veb  # copy a .veb to the server
+./villagesql veb ls                              # list available .veb files
+./villagesql veb rm my_extension                # remove a .veb file
+```
+
+在 `init` 之前放置在 `lib/veb/` 中的 `.veb` 文件会自动预置。添加文件后，通过 SQL 安装扩展：
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+## 运行回归测试
+
+使用 VillageSQL 构建目录中的 MySQL 测试运行器来运行扩展回归测试。
+
+### 运行完整套件
+
+要运行扩展的所有测试：
+
+```bash
+cd $BUILD_HOME
+./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/mysql-test --parallel=auto
+```
+
+### 运行单个测试
+
+要运行单个测试用例，请指定套件路径和测试名称：
+
+```bash
+cd $BUILD_HOME
+./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/mysql-test my_test_name
+```
+
+## 创建新测试
+
+在添加新功能或修复错误时，您应该添加相应的回归测试。
+
+### 测试位置
+
+扩展测试位于扩展自己的存储库中的 `mysql-test/` 目录中——而不是在 VillageSQL 服务器的 `mysql-test/suite/` 树中。
+
+- 测试文件以 `.test` 结尾，并位于 `mysql-test/t/` 中。
+- 预期结果文件以 `.result` 结尾，并位于 `mysql-test/r/` 中。
+
+例如，对于名为 `my_extension` 的扩展：
+- `mysql-test/t/my_new_test.test`
+- `mysql-test/r/my_new_test.result`
+
+### 测试文件约定
+
+典型的扩展测试安装扩展、运行 SQL 并卸载：
+
+```sql
+# Description of the test
+
+INSTALL EXTENSION my_extension;
+
+# ... Your Test Code Here ...
+CREATE TABLE t1 (val MYTYPE);
+INSERT INTO t1 VALUES ('some_value');
+SELECT * FROM t1;
+DROP TABLE t1;
+
+UNINSTALL EXTENSION my_extension;
+```
+
+当您的测试输出包含来自测试运行器临时目录的路径时，请在 `.test` 文件中添加以下指令以对其进行规范化——否则，记录的结果将包含在其他机器上会出错的绝对路径：
+
+```sql
+--replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
+```
+
+### 添加测试的步骤
+
+1.  在扩展的 `mysql-test/t/` 目录中**创建 `.test` 文件**。
+2.  在扩展的 `mysql-test/r/` 目录中**创建空的 `.result` 文件**。
+3.  **使用 `--record` 运行测试**，以生成预期的输出：
+    ```bash
+    cd $BUILD_HOME
+    ./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/mysql-test --record my_new_test
+    ```
+4.  **验证生成的 `.result` 文件中的输出**，以确保它与您的期望相符。
+
+## 调试测试
+
+如果测试失败，测试框架会提供详细的日志。
+
+-   **测试输出：** 检查 `mysql-test/var/log/mysqltest.log`（合并日志）或 `mysql-test/var/log/<test_name>/`（每个测试的目录）。
+-   **服务器错误日志：** 检查 `mysql-test/var/log/mysqld.1.err`。VillageSQL 特定的日志消息（通过 `LogVSQL()` 发出）仅在服务器使用 `--log-error-verbosity=3` 运行时才会出现。
+-   **差异：** 框架会输出实际输出与预期的 `.result` 文件之间的差异。
+
+要使用额外的调试信息运行测试：
+
+```bash
+cd $BUILD_HOME
+./mysql-test/mysql-test-run.pl --verbose --suite=/path/to/your/extension/mysql-test my_new_test
+
+# To surface LogVSQL() messages in the error log:
+./mysql-test/mysql-test-run.pl --mysqld=--log-error-verbosity=3 \
+    --suite=/path/to/your/extension/mysql-test my_new_test
+```
+
+## 另请参阅
+
+- [测试依赖网络的扩展](/zh/mysql-8.4/0.0.5/testing-network) — 针对启动 HTTP 服务器或外部监听器的扩展的可靠 MTR 模式
+- [使用 C++ 创建扩展](/zh/mysql-8.4/0.0.5/create) — 端到端构建步骤、CMake 设置和安装
+- [C++ 开发](/zh/mysql-8.4/0.0.5/development) — 深入介绍 VDF 编写、参数与结果类型、聚合、可变参数
+- [C++ API 参考](/zh/mysql-8.4/0.0.5/extension-api-reference) — VDF 契约、空值处理和缓冲区大小

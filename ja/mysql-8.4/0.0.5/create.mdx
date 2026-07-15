@@ -1,0 +1,578 @@
+---
+audience: extension-author
+title: "C++での拡張機能の作成"
+description: "拡張テンプレートとVEFを使用して、C++でカスタムのVillageSQL拡張機能を作成する方法を学びます。"
+---
+
+<Warning>
+VEFプロトコル3は、v0.0.4で安定しています。プロトコル4は開発中で、オプトインされた開発ABIヘッダー（`-DVSQL_USE_DEV_ABI=ON`）でのみ利用可能です。古いプロトコル2で構築された拡張機能は、サーバーによって拒否され、再構築する必要があります。
+</Warning>
+
+## 概要
+
+VillageSQLの拡張フレームワーク（VEF）を使用すると、データベースサーバーにカスタム機能を追加できます。このガイドでは、C++ SDKと拡張テンプレートを使用して、C++で拡張機能を構築する手順を説明します。
+
+VDFの実装の詳細（引数と結果の型、集約、システム変数、パラメータ化された型）については、[開発ガイド](/ja/mysql-8.4/0.0.5/development)を参照してください。
+
+<Note>
+Rustを使用する場合は、[Rustでの拡張機能の作成](/ja/mysql-8.4/0.0.5/rust-sdk)を参照してください。
+</Note>
+
+## VillageSQL拡張機能とは？
+
+VillageSQL拡張機能は、**VEBファイル**（VillageSQL拡張バンドル）としてパッケージ化され、次のものが含まれます。
+- **マニフェスト** - 拡張機能に関するメタデータ（名前、バージョン、説明）
+- **共有ライブラリ** - 機能の実装であるコンパイルされたC++コード
+- **オプションのメタデータ** - 追加のリソースまたは構成
+
+C++拡張機能は、VEF（VillageSQL拡張フレームワーク）のC++バインディングである**C++ SDK**を使用して構築されます。次のものを提供します。
+- 型と関数を定義するためのC++ API
+- SQLスクリプトなしでの自動登録
+- 型セーフな引数と結果の型
+- 拡張機能の定義のためのビルダーパターン
+
+<Note>
+**VDFと従来のUDF:** VEFを通じて登録された関数は、VDF（VillageSQL定義関数）と呼ばれます。VillageSQLは、`CREATE FUNCTION ... SONAME`を通じて登録された従来のMySQL UDFもサポートしていますが、新しい拡張機能にはVDFをお勧めします。
+</Note>
+
+### SQLでのVDFの呼び出し
+
+VDFは、拡張機能プレフィックスの有無にかかわらず呼び出すことができます。
+
+```sql
+-- Unqualified (preferred for cleaner code)
+SELECT complex_abs(impedance) FROM signals;
+
+-- Qualified with extension name (explicit)
+SELECT vsql_complex.complex_abs(impedance) FROM signals;
+```
+
+**関数解決順序:**
+
+プレフィックスなしで関数を呼び出すと、VillageSQLは次の順序で解決します。
+1. **システム関数**（組み込みのMySQL関数（`NOW()`、`CONCAT()`など））
+2. **UDF**（従来のMySQLユーザー定義関数）
+3. **VDF**（拡張機能の関数）- 同じ名前の関数が1つだけ存在する場合
+4. **ストアド関数**（`CREATE FUNCTION`で作成）
+
+**修飾名を使用する場合:**
+- 複数の拡張機能が同じ名前の関数を提供する場合、`extension.function_name`を使用します。
+- 曖昧さがない場合は、コードをシンプルにするために非修飾名を使用します。
+- その関数名を提供する拡張機能が1つだけの場合、修飾名は必要ありません。
+
+拡張機能は、次のものを追加できます。
+- **カスタム関数（VDF）** - 自動型チェックと検証を備えたSQL関数
+- **カスタムデータ型** - `ORDER BY`およびインデックスで機能する`COMPLEX`、`UUID`、または`VECTOR`などの新しい列タイプ
+- **型操作** - カスタム型のエンコード、デコード、比較、およびハッシュ関数
+
+## 前提条件
+
+開始する前に、VillageSQLをソースからビルドします。拡張機能は、サーバーのSDKヘッダーとビルドツリーに対してリンクされます。最初に[ソースからのビルド](/ja/mysql-8.4/0.0.5/source)ガイドに従ってください。
+
+また、次のものも必要です。
+
+- **Git** - クローニングとバージョン管理用
+- **CMake** 3.18以降 - ビルドシステム
+- **C++コンパイラ** - GCC 8+、Clang 8+、またはC++17サポートを備えたMSVC 2019+
+- **基本的なC++の知識** - C++と関数ポインタの理解
+
+<Tip>
+  **AIエージェントでビルドしますか？** [`vsql-extension-builder`](https://github.com/villagesql/villagesql-skills)スキルは、Claude Code、Gemini、またはその他のサポートされているエージェントを使用して、スキャフォールディングからテストまで、このワークフロー全体を自動化します。次のようにインストールします。
+
+  ```bash
+  curl -sSL https://villagesql.com/skills | bash
+  ```
+</Tip>
+
+## ステップ1：拡張テンプレートを取得する
+
+拡張テンプレートを次の2つの方法で開始できます。
+
+### オプションA：VillageSQLソースからテンプレートを使用する
+
+VillageSQLソースコードがある場合は、テンプレートが含まれています。
+
+```bash
+cd /path/to/villagesql-source
+cp -r villagesql/sdk/template my-extension
+cd my-extension
+```
+
+### オプションB：GitHubからフォークする
+
+VillageSQL拡張テンプレートリポジトリをフォークすることから始めます。
+
+1. GitHubのテンプレートリポジトリにアクセスします。
+   ```
+   https://github.com/villagesql/vsql-extension-template
+   ```
+
+2. **「フォーク」**ボタンをクリックして、独自のコピーを作成します。
+
+3. ローカルにフォークをクローンします。
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/vsql-extension-template.git
+   cd vsql-extension-template
+   ```
+
+<Tip>
+  GitHubの「このテンプレートを使用」ボタンを使用して、履歴なしでテンプレートに基づいて新しいリポジトリを作成することもできます。
+</Tip>
+
+## ステップ2：マニフェストを更新する
+
+`manifest.json`を編集して、拡張機能のメタデータを定義します。
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/villagesql/villagesql-docs/main/mysql-8.4/0.0.5/manifest.json.schema.json",
+  "name": "my_awesome_extension",
+  "version": "1.0.0",
+  "description": "My custom VillageSQL extension that does amazing things",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+`$schema`フィールドはオプションですが、すべてのマニフェストフィールドのIDEのオートコンプリートとインライン検証を有効にします。
+
+### manifest.jsonスキーマ
+
+| フィールド | 必須 | 形式 | 説明 |
+|-------|----------|--------|-------------|
+| `name` | ✅ はい | 文字、数字、`_`、`-` | 一意の識別子。`INSTALL EXTENSION`名と一致する必要があります。 |
+| `version` | ✅ はい | MAJOR.MINOR.PATCH | セマンティックバージョンの文字列 |
+| `description` | いいえ | 文字列 | 機能の簡単な説明 |
+| `author` | いいえ | 文字列 | 著者名または組織 |
+| `license` | いいえ | 文字列 | ライセンス識別子（GPL-2.0を推奨） |
+
+**検証ルール:**
+- `name`: 文字で始まり、文字または数字で終わる必要があります。小文字、数字、アンダースコア、ハイフンを含めることができます。最大64文字。**アンダースコアを使用します** - ハイフンはSQLでバッククォートで囲む必要があります。
+- `version`: セマンティックバージョンに従う必要があります（例：1.0.0、0.2.1）
+- 無効なマニフェストは、`INSTALL EXTENSION`の失敗を引き起こします。
+
+**例:**
+```sql
+-- manifest.json has "name": "my_awesome_extension"
+INSTALL EXTENSION my_awesome_extension;  -- ✅ Correct: no quoting needed
+INSTALL EXTENSION `my-awesome-extension`;  -- ⚠️ Works, but requires backtick quoting
+```
+
+SQL、ファイル名、リポジトリ名全体での完全な命名規則については、[拡張機能の命名規則](/ja/mysql-8.4/0.0.5/install#extension-naming-conventions)を参照してください。
+
+## ステップ3：C++ SDKを使用して拡張機能を実装する
+
+C++ SDKは、フルーエントなビルダーパターンを使用して拡張機能を定義するためのC++ APIを提供します。
+- コンパイル時のチェックを備えた型セーフな関数定義
+- 引数の自動検証と型変換
+- 比較/ハッシュ関数を備えたカスタム型のサポート（`ORDER BY`およびインデックスを有効にします）
+
+### VillageSQLヘッダーを含める
+
+メインの拡張ファイル（例：`src/extension.cc`）を作成し、C++ SDKヘッダーを含めます。
+
+```cpp
+#include <villagesql/vsql.h>
+
+// Your implementation code here
+```
+
+`<villagesql/vsql.h>`ヘッダーは、型ビルダー、関数ビルダー、および拡張ビルダーをプルインし、一般的に使用されるシンボルを`vsql`名前空間に再エクスポートします。
+
+### 拡張機能を定義する
+
+`VEF_GENERATE_ENTRY_POINTS()`マクロを使用して、拡張機能を定義します。
+
+```cpp
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .func(make_func<&my_reverse_impl>("my_reverse")
+      .returns(STRING)
+      .param(STRING)
+      .build())
+    .func(make_func<&count_vowels_impl>("count_vowels")
+      .returns(INT)
+      .param(STRING)
+      .build())
+);
+```
+
+**関数ビルダーメソッド:**
+- `make_func<&impl>("name")` - 実装ポインタを持つ関数を作成します。
+- `.returns(type)` - 戻り値の型を設定します（`STRING`、`INT`、`REAL`、またはカスタム型名）。
+- `.param(type)` - パラメータを追加します（最大8つのパラメータ）。
+- `.buffer_size(size_t)` - `STRING`/`CUSTOM`戻りの特定の出力バッファサイズを要求します。
+- `.max_result_length(size_t)` - `STRING`戻りの結果列のサイズを設定し、マテリアライズされた結果が引数の幅で切り捨てられないようにします。`VEF_MAX_RESULT_LENGTH`（16 MiB）を超える値は、サーバーによって上限が設定されます。`STRING`のみ。最初に`.returns(STRING)`を呼び出します。プロトコル4（開発ABI）が必要です。
+- `.deterministic(bool = true)` - この関数は常に同じ入力に対して同じ出力を返し、副作用がないことを宣言します。デフォルトは非決定性です。
+- `.prerun<func>()` - ステートメントごとのセットアップ関数を設定します（オプション）。
+- `.postrun<func>()` - ステートメントごとのクリーンアップ関数を設定します（オプション）。
+- `.build()` - 関数の登録を完了します。
+
+<Note>
+**パラメータ制限:** 関数は最大8つのパラメータ（`kMaxParams`で定義）をサポートします。それ以上のパラメータが必要な場合は、構造化型または複数の関数を検討してください。
+</Note>
+
+### カスタム型引数と戻り値を持つVDF
+
+VDFは、`.param(TYPE_NAME)`および`.returns(TYPE_NAME)`をビルダーで使用して、カスタム型の値を受け取り、返すことができます。実装では、入力に`CustomArg`、出力に`CustomResult`を使用します。これは、型操作で使用されるのと同じ引数と結果の型です。
+
+```cpp
+void complex_conjugate_impl(CustomArg in, CustomResult out) {
+    if (in.is_null()) { out.set_null(); return; }
+    auto src = in.value();    // Span<const unsigned char> — raw binary
+    auto dst = out.buffer();  // Span<unsigned char>
+    // ... read src, write result to dst ...
+    out.set_length(src.size());
+}
+```
+
+`.param(COMPLEX)`および`.returns(COMPLEX)`で登録します。
+
+```cpp
+.func(make_func<&complex_conjugate_impl>("complex_conjugate")
+          .returns(COMPLEX)
+          .param(COMPLEX)
+          .build())
+```
+
+完全な`CustomArg`/`CustomResult`APIについては、[開発ガイド](/ja/mysql-8.4/0.0.5/development#argument-and-result-types)を参照してください。これには、パラメータ化された型用の`CustomArgWith<P>`および`CustomResultWith<P>`が含まれます。
+
+### 決定性関数
+
+デフォルトでは、VDFは非決定性として登録されます。非決定性関数は、次の3つのSQLコンテキストでブロックされます。生成された列、`CHECK`制約、および式デフォルト値（列の`DEFAULT (expr)`）。これらの機能のいずれかを使用すると、非決定性VDFがエラーを返します。関数が常に同じ入力に対して同じ出力を生成し、副作用がない場合は、ビルダーチェーンに`.deterministic()`を追加して、決定性として宣言できます。
+
+オプティマイザは、この情報を使用して、関数を1つのステートメントに対して1回評価し、行ごとに呼び出すのではなく、行間で値を再利用する場合があります。非決定性関数を誤って決定性としてマークすると、サーバーが異なる出力を生成する必要がある入力に対して同じ結果を返す可能性があります。関数が外部状態、ランダム性、または時間に依存しない場合にのみ、`.deterministic()`を追加してください。
+
+**ビルダーのシグネチャ:** `.deterministic(bool d = true)` - 引数なしの形式は、デフォルトで`true`になります。
+
+**例:**
+
+```cpp
+.func(make_func<&complex_add_impl>("complex_add")
+          .returns(COMPLEX)
+          .param(COMPLEX)
+          .param(COMPLEX)
+          .deterministic()
+          .build())
+```
+
+`complex_add`は決定性として宣言されているため、生成された列の定義で使用できます。
+
+```sql
+-- Deterministic VDFs can be used in generated columns
+CREATE TABLE t (
+    a COMPLEX,
+    b COMPLEX,
+    result COMPLEX GENERATED ALWAYS AS (complex_add(a, b)) STORED
+);
+-- STORED vs VIRTUAL follows standard MySQL generated column rules
+```
+
+### カスタムバッファサイズ {#custom-buffer-sizes}
+
+可変長のデータを返す関数の場合は、特定のバッファサイズを要求します。
+
+```cpp
+make_func<&large_result_impl>("large_result")
+  .returns(STRING)
+  .param(INT)
+  .buffer_size(65536)  // Request 64KB buffer
+  .build()
+```
+
+`buffer()`と`set_length()`を使用して値を自分で構築する場合、バッファは`buffer().size()`バイトに固定されます。それを超えて書き込むとメモリオーバーフローが発生するため、超過しないようにガードしてください。
+
+```cpp
+void large_result_impl(StringArg input, StringResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+    size_t needed = calculate_output_size(input.value());
+
+    auto buf = out.buffer();
+    if (needed > buf.size()) {
+        out.error("Output exceeds buffer size");
+        return;
+    }
+
+    // Write output into buf.data()
+    out.set_length(actual_output_length);
+}
+```
+
+`STRING`結果の場合、`out.set(sv)`はsnprintfスタイルのオーバーフロー契約に従います。収まる分だけバイトをコピーし、`set_length`を介して値の完全なサイズを報告します。報告されたサイズがバッファを超えると、サーバーは結果バッファを拡張して関数を再呼び出しするため、要求されたバッファより大きい`STRING`値は切り捨てられなくなります。
+
+その契約は行の評価時に適用されます。*マテリアライズされた*`STRING`結果（GROUP BY/DISTINCTの一時テーブル、`CREATE TABLE ... SELECT`、またはUNION内）は、関数が`.max_result_length(n)`を宣言しない限り、引数の幅で切り捨てられます。これは結果列のサイズを設定します（文字数単位で、`VEF_MAX_RESULT_LENGTH`（16 MiB）が上限です）。
+
+```cpp
+make_func<&large_result_impl>("large_result")
+  .returns(STRING)
+  .max_result_length(65536)
+  .build()
+```
+
+<Note>
+関数の最大出力サイズに基づいて、`.buffer_size()`を使用して十分なバッファサイズを要求します。バッファサイズを正しく設定すると、バッファの拡張と再実行のラウンドトリップのコストを回避できます。
+</Note>
+
+<Note>
+関数を実装する前に、[C++ APIリファレンス](/ja/mysql-8.4/0.0.5/extension-api-reference)を確認して、完全なVDF契約を確認してください。これには、nullチェック、結果の型、バッファのサイズ設定、およびエラー処理が含まれます。
+</Note>
+
+## ステップ4：カスタム型を作成する
+
+カスタム型を使用すると、`ORDER BY`、インデックス、および集約関数で機能する`COMPLEX`、`UUID`、または`VECTOR`などの新しい列タイプを定義できます。拡張機能にのみ関数を登録する場合は、ステップ5に進みます。
+
+完全な実装のウォークスルーについては、[C++でのカスタム型](/ja/mysql-8.4/0.0.5/custom-types)を参照してください。型にパラメータがある場合（例：`VECTOR(1536)`）、[パラメータ化された型](/ja/mysql-8.4/0.0.5/type-operations#parameterized-types)を参照してください。
+
+## ステップ5：ビルド構成を更新する {#step-5-update-build-configuration}
+
+`CMakeLists.txt`を編集して、拡張機能をVEBファイルとしてビルドします。
+
+```cmake
+cmake_minimum_required(VERSION 3.18)
+project(my_extension)
+
+# Find VillageSQL Extension Framework
+find_package(VillageSQLExtensionFramework QUIET)
+
+# The framework detects build flags via 4 methods (in order):
+# 1. Explicit MYSQL_INCLUDE_FLAGS/MYSQL_CXXFLAGS
+# 2. VillageSQL_BUILD_DIR (reads CMakeCache.txt from VillageSQL build)
+# 3. VSQL_BASE_DIR (uses mysql_config)
+# 4. Default - mysql_config from PATH
+
+# Build shared library with your source files
+add_library(extension SHARED
+    src/extension.cc
+    src/my_functions.cc
+)
+
+# Create VEB archive
+VEF_CREATE_VEB(
+    NAME my_extension
+    LIBRARY_TARGET extension
+    MANIFEST ${CMAKE_CURRENT_SOURCE_DIR}/manifest.json
+)
+
+# Install VEB to VillageSQL extensions directory
+install(FILES ${VEB_OUTPUT} DESTINATION ${INSTALL_DIR})
+```
+
+**構成に関する注意:**
+- `VillageSQLExtensionFramework`は、拡張機能をビルドするためのCMakeヘルパーを提供します。
+- `VEF_CREATE_VEB()`は、ライブラリ、マニフェスト、およびメタデータを`.veb`アーカイブにパッケージ化します。
+- フレームワークは、MySQL/VillageSQLビルドフラグを自動的に検出します。
+- ライブラリターゲット名は通常`extension`です（任意の名前を使用できます）。
+- VEB名は、`manifest.json`の名前と一致する必要があります。
+- デフォルトでは、拡張機能は安定したABIヘッダーに対してビルドされます。不安定な開発ヘッダーに対してビルドするには、`-DVSQL_USE_DEV_ABI=ON`を設定します。
+
+---
+
+## ステップ6：ビルドディレクトリを作成する
+
+別のビルドディレクトリを作成します。
+
+```bash
+mkdir build
+cd build
+```
+
+## ステップ7：CMakeとMakeでビルドする
+
+拡張機能を構成してビルドします。
+
+```bash
+# Configure the build
+cmake ..
+
+# Or, if building against VillageSQL source:
+cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+
+# Or, to build against the unstable dev ABI headers:
+cmake .. -DVSQL_USE_DEV_ABI=ON
+
+# Build the extension
+make
+```
+
+これにより、次のものが作成されます。
+- コンパイルされた共有ライブラリ（`.so`ファイル）
+- VEBパッケージ（`.veb`ファイル）- マニフェストとライブラリを含むtarアーカイブ
+
+### ビルドを確認する
+
+VEBファイルの内容を確認します。
+
+```bash
+make show_veb
+```
+
+次のものが表示されるはずです。
+```
+manifest.json
+lib/myext.so
+```
+
+## ステップ8：インストールしてテストする
+
+### オプションA：VillageSQL拡張ディレクトリにインストールする
+
+インストールターゲットを使用して、VEBをVillageSQLインストールにコピーします。
+
+```bash
+make install
+```
+
+これにより、`.veb`ファイルが、`VillageSQL_VEB_INSTALL_DIR`で構成されたディレクトリにコピーされます。
+
+### オプションB：手動インストール
+
+VEBファイルを手動でコピーします。
+
+```bash
+# Find the VEF directory
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# Copy the VEB file
+sudo cp my-awesome-extension.veb /path/to/veb_dir/
+```
+
+### 拡張機能をテストする
+
+1. **VillageSQLに接続します。**
+   ```bash
+   mysql -u root -p
+   ```
+
+2. **拡張機能をインストールします。**
+   ```sql
+   INSTALL EXTENSION my_awesome_extension;
+   ```
+
+3. **インストールを確認します。**
+   ```sql
+   SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+   ```
+
+4. **関数をテストします。**
+   ```sql
+   SELECT my_reverse('Hello, World!');
+   -- Output: !dlroW ,olleH
+
+   SELECT count_vowels('VillageSQL');
+   -- Output: 3
+   ```
+
+## テストの作成
+
+拡張機能が正しく機能することを確認するために、テストファイルを追加します。
+
+1. **`mysql-test/t/`にテストファイルを作成します。**
+   ```sql
+   -- mysql-test/t/my_basic.test
+   SELECT my_reverse('abc');
+   SELECT my_reverse('');
+   SELECT my_reverse(NULL);
+   ```
+
+2. **期待される結果を生成します。**
+   ```bash
+   cd /path/to/villagesql/build/mysql-test
+   perl mysql-test-run.pl --suite=/path/to/your/extension/mysql-test --record
+   ```
+
+3. **テストを実行します。**
+   ```bash
+   perl mysql-test-run.pl --suite=/path/to/your/extension/mysql-test
+   ```
+
+## トラブルシューティング
+
+### 拡張機能がロードされない
+
+エラーログを確認し、VEBの内容を確認します。
+```bash
+make show_veb
+tail -f /var/log/mysql/error.log
+```
+
+### 関数が見つからない
+
+インストールと登録を確認します。
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+### ビルドエラー
+
+```bash
+# Verify mysql_config is available
+which mysql_config
+mysql_config --version
+
+# Check compiler version
+gcc --version  # or clang --version
+
+# Verify CMake version (3.18+ required)
+cmake --version
+```
+
+## 拡張機能の例
+
+既存のVillageSQL拡張機能から学習します。
+
+<CardGroup cols={2}>
+  <Card
+    title="vsql_complex"
+    icon="wave-square"
+    href="https://github.com/villagesql/villagesql-server/tree/main/villagesql/examples/vsql-complex"
+  >
+    複素数データ型の実装
+  </Card>
+  <Card
+    title="vsql_extension_template"
+    icon="code"
+    href="https://github.com/villagesql/vsql-extension-template"
+  >
+    拡張機能を作成するための最小限のテンプレート
+  </Card>
+</CardGroup>
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card
+    title="拡張機能の使用"
+    icon="puzzle-piece"
+    href="/ja/mysql-8.4/0.0.5/install"
+  >
+    拡張機能をインストールおよび管理する方法を学びます。
+  </Card>
+  <Card
+    title="開発ガイド"
+    icon="code"
+    href="/ja/mysql-8.4/0.0.5/development"
+  >
+    引数と結果の型、集約、システム変数、およびテスト
+  </Card>
+  <Card
+    title="拡張機能のアーキテクチャ"
+    icon="sitemap"
+    href="/ja/mysql-8.4/0.0.5/architecture"
+  >
+    ライフサイクル、キャッシュ、パフォーマンス、およびセキュリティモデル
+  </Card>
+  <Card
+    title="ソースからのビルド"
+    icon="hammer"
+    href="/ja/mysql-8.4/0.0.5/source"
+  >
+    VillageSQLをソースコードからビルドします。
+  </Card>
+</CardGroup>
+
+## リソース
+
+- [VillageSQL拡張テンプレート](https://github.com/villagesql/vsql-extension-template)
+- [MySQL UDF APIドキュメント](https://dev.mysql.com/doc/extending-mysql/8.4/en/adding-loadable-function.html)
+- [CMakeドキュメント](https://cmake.org/documentation/)
+- [VillageSQLコミュニティDiscord](https://discord.gg/KSr6whd3Fr)

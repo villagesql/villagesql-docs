@@ -1,0 +1,302 @@
+---
+audience: extension-author
+title: Rust 확장 예제
+description: Rust SDK를 사용하는 vsql_rot13 및 vsql_rational 참조 구현에서 배우기
+---
+
+Rust SDK 리포지토리에는 두 가지 참조 확장이 함께 제공됩니다 — 최소한의 함수 전용 예제와 산술, 정렬, 해싱을 갖춘 완전한 사용자 정의 타입입니다.
+
+**소스:** [vsql-rust-sdk](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples)의 `examples/`
+
+---
+
+## vsql_rot13 — 함수 전용 확장
+
+가능한 한 가장 간단한 Rust 확장: STRING을 받아 STRING을 반환하는 VDF 하나입니다.
+
+**사용법:**
+```sql
+INSTALL EXTENSION vsql_rot13;
+
+SELECT rot13('Hello, World!');
+-- 'Uryyb, Jbeyq!'
+
+SELECT rot13(rot13('Hello, World!'));
+-- 'Hello, World!' (rot13 is its own inverse)
+
+SELECT rot13(NULL);
+-- NULL
+```
+
+### 디렉터리 구조
+
+```
+vsql_rot13/
+├── Cargo.toml          # cdylib crate, depends on villagesql
+├── manifest.json       # Extension metadata
+├── src/
+│   └── lib.rs          # Implementation + extension! registration
+└── mysql-test/
+    └── t/*.test        # MTR test cases
+```
+
+### 구현
+
+**파일: `src/lib.rs`**
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// SQL: rot13(s STRING) -> STRING
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rot13_impl, "rot13",
+            [villagesql::Type::String] -> villagesql::Type::String),
+    ]
+}
+```
+
+**핵심 패턴:**
+- VDF는 `&[InValue]`를 받고 `VdfReturn`을 반환합니다 — 둘 다 안전한 Rust 열거형입니다
+- NULL은 양쪽 모두에서 일급 배리언트(variant)입니다; 직접 패턴 매치하세요
+- `extension!` 매크로는 서버가 로드 시 호출하는 C 엔트리 포인트를 생성합니다
+- `func!`는 SQL 시그니처를 선언합니다; 인수 및 반환 타입은 `villagesql::Type::*`를 사용합니다
+
+### 매니페스트
+
+**파일: `manifest.json`**
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "Example VillageSQL extension: provides vsql_rot13(STRING) -> STRING",
+  "author": "VillageSQL Community",
+  "license": "GPL-2.0"
+}
+```
+
+---
+
+## vsql_rational — 산술을 갖춘 사용자 정의 타입
+
+완전한 사용자 정의 타입: 기약 형태의 `(numerator, denominator)`로 저장되는 유리수이며, 산술 함수, 정렬, 해싱을 갖춥니다.
+
+**사용법:**
+```sql
+INSTALL EXTENSION vsql_rational;
+
+CREATE TABLE measurements (id INT, ratio rational);
+INSERT INTO measurements VALUES
+    (1, '1/2'),
+    (2, '2/4'),   -- normalizes to '1/2' on storage
+    (3, '-3/6'),  -- normalizes to '-1/2'
+    (4, '0/1');
+
+SELECT id, ratio FROM measurements ORDER BY ratio;
+
+SELECT rational_add('1/2', '1/3');     -- '5/6'
+SELECT rational_mul('2/3', '3/4');     -- '1/2'
+SELECT rational_to_real('22/7');       -- 3.142857...
+```
+
+### 이진 저장 형식
+
+`rational`은 **16바이트**를 저장합니다(리틀 엔디언):
+- 바이트 0–7: 분자(`i64`)
+- 바이트 8–15: 분모(`i64`)
+
+값은 항상 양의 분모와 함께 기약 형태(GCD = 1)로 저장됩니다.
+
+### 타입 시스템 함수
+
+**파일: `src/lib.rs`**
+
+이 타입은 네 가지 연산을 등록합니다: encode(문자열 → 바이트), decode(바이트 → 문자열), compare(ORDER BY용), hash(인덱싱용).
+
+```rust
+pub fn rational_encode(s: &str) -> Result<Vec<u8>, String> {
+    let (num_s, den_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("rational: expected 'n/d', got {s:?}"))?;
+    let num: i64 = num_s.trim().parse().map_err(|e| format!("numerator: {e}"))?;
+    let den: i64 = den_s.trim().parse().map_err(|e| format!("denominator: {e}"))?;
+    let (n, d) = normalize(i128::from(num), i128::from(den))
+        .ok_or_else(|| "rational: zero or overflowing denominator".to_string())?;
+    Ok(to_bytes(n, d))
+}
+
+pub fn rational_decode(b: &[u8]) -> Result<String, String> {
+    if b.len() < BYTES {
+        return Err(format!("rational: expected {} bytes, got {}", BYTES, b.len()));
+    }
+    let (n, d) = from_bytes(b);
+    Ok(format!("{n}/{d}"))
+}
+
+pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (n1, d1) = from_bytes(a);
+    let (n2, d2) = from_bytes(b);
+    // Cross-multiply; denominators are always positive after normalization
+    let lhs = i128::from(n1) * i128::from(d2);
+    let rhs = i128::from(n2) * i128::from(d1);
+    lhs.cmp(&rhs)
+}
+```
+
+### VDF 구현
+
+사용자 정의 타입을 받는 VDF는 `InValue::Custom(&[u8])`를 받아 바이트를 직접 디코딩합니다:
+
+```rust
+fn rational_add_impl(args: &[InValue]) -> VdfReturn {
+    match (arg(args, 0), arg(args, 1)) {
+        (Ok(Some((n1, d1))), Ok(Some((n2, d2)))) => {
+            match normalize(
+                i128::from(n1) * i128::from(d2) + i128::from(n2) * i128::from(d1),
+                i128::from(d1) * i128::from(d2),
+            ) {
+                Some((n, d)) => VdfReturn::Binary(to_bytes(n, d)),
+                None => VdfReturn::error("rational_add: overflow"),
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => VdfReturn::error(format!("rational_add: {e}")),
+        _ => VdfReturn::null(),
+    }
+}
+```
+
+### 등록
+
+`extension!` 매크로는 타입과 그 함수를 단일 선언으로 등록합니다:
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rational_add_impl, "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_sub_impl, "rational_sub",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_mul_impl, "rational_mul",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_div_impl, "rational_div",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_numer_impl, "rational_numer",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_denom_impl, "rational_denom",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_to_real_impl, "rational_to_real",
+            [villagesql::custom!("rational")] -> villagesql::Type::Real,
+            deterministic: true),
+    ],
+    types: [
+        villagesql::custom_type!(
+            type_name: "rational",
+            persisted_length: 16,
+            max_decode_buffer_length: 42,
+            encode: rational_encode,
+            decode: rational_decode,
+            compare: rational_compare,
+            hash: rational_hash,
+            default: "0/1",
+        ),
+    ]
+}
+```
+
+**핵심 패턴:**
+- `villagesql::custom!("name")`는 사용자 정의 타입을 인수 또는 반환으로 참조합니다
+- `custom_type!`은 타입을 그 encode/decode/compare/hash 함수와 함께 등록합니다
+- `default: "0/1"`은 내재적 기본값입니다 — 서버는 타입 초기화 시 이 문자열에 대해 `encode()`를 호출하므로 유효한 값이어야 합니다
+- `persisted_length`는 `encode()`가 반환하는 바이트 길이와 일치해야 합니다
+- `deterministic: true`는 최적화기가 상수 호출을 폴딩할 수 있게 합니다
+
+---
+
+## 핵심 구현 패턴
+
+| 패턴 | 사용법 |
+|---------|-------|
+| **VDF 시그니처** | `fn impl(args: &[InValue]) -> VdfReturn` |
+| **NULL 처리** | `InValue::Null`과 `None`을 명시적으로 매치 |
+| **오류 보고** | `VdfReturn::error("message")`는 문 실행을 중단합니다 |
+| **사용자 정의 타입 encode** | `Result<Vec<u8>, String>`을 반환 |
+| **사용자 정의 타입 decode** | `Result<String, String>`을 반환 |
+| **타입 인식 인수** | `func!`에서 `villagesql::custom!("name")` 사용 |
+| **등록** | 단일 `extension!` 블록이 함수와 타입을 선언 |
+
+---
+
+## 테스트
+
+두 예제 모두 C++ 확장과 마찬가지로 MTR(MySQL Test Runner)을 사용합니다:
+
+```bash
+cd /path/to/villagesql/build/mysql-test
+./mysql-test-run.pl --suite=vsql_rot13
+./mysql-test-run.pl --suite=vsql_rational
+```
+
+`--record`로 예상 결과를 생성하거나 업데이트합니다.
+
+---
+
+## 다음 단계
+
+<CardGroup cols={2}>
+  <Card
+    title="Rust에서 확장 만들기"
+    icon="rust"
+    href="/ko/mysql-8.4/0.0.5/rust-sdk"
+  >
+    SDK 설치, 빌드, extension! 매크로
+  </Card>
+  <Card
+    title="Rust 사용자 정의 타입"
+    icon="cube"
+    href="/ko/mysql-8.4/0.0.5/rust-custom-types"
+  >
+    encode, decode, compare, hash에 대한 심층 분석
+  </Card>
+  <Card
+    title="Rust API 참조"
+    icon="book"
+    href="/ko/mysql-8.4/0.0.5/rust-api-reference"
+  >
+    InValue, VdfReturn, 그리고 매크로 API
+  </Card>
+  <Card
+    title="예제 소스"
+    icon="github"
+    href="https://github.com/villagesql/vsql-rust-sdk/tree/main/examples"
+  >
+    vsql_rot13 및 vsql_rational 전체 소스
+  </Card>
+</CardGroup>

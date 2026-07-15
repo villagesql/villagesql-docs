@@ -1,0 +1,334 @@
+---
+audience: extension-author
+title: "C++ Development"
+description: "VDF authoring depth for C++ extensions — argument and result types, aggregates, prerun/postrun, varargs, and registration."
+---
+
+This guide is the deep reference for writing C++ VDF implementations. It is the companion to [Creating Extensions in C++](/mysql-8.4/0.0.5/create), which covers the end-to-end build steps, and [C++ Testing](/mysql-8.4/0.0.5/testing), which covers the test-and-iterate loop.
+
+<Warning>
+VEF Protocol 3 is stable as of v0.0.4. Protocol 4 is under development and is available only via opt-in dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`). Extensions built against the old Protocol 2 are rejected by the server and must be rebuilt.
+</Warning>
+
+## Writing Extension Functions
+
+Extension functions are written in C++ and registered with VEF. Include a
+single header to access the full SDK:
+
+```cpp
+#include <villagesql/vsql.h>
+```
+
+## Argument and Result Types
+
+VDF parameters and results are passed as type-safe argument and result types.
+The framework detects them from your function signature and adapts
+automatically — the `make_func` registration syntax is unchanged.
+
+**Argument types:** `IntArg`, `RealArg`, `StringArg`, `CustomArg` — each
+provides `is_null()` and `value()`. For parameterized custom types,
+`CustomArgWith<P>` adds a `params()` accessor that returns the cached
+parsed params struct (see [Parameterized Types](/mysql-8.4/0.0.5/type-operations#parameterized-types)).
+
+**Result types:** `IntResult`, `RealResult`, `StringResult`, `CustomResult`
+— each provides `set_null()`, `warning(msg)`, and `error(msg)`. Scalar
+results also provide `set(value)`. Buffer results provide `buffer()` and
+`set_length(len)`. `StringResult` also provides
+`set(std::string_view)`, which copies up to `buffer().size()` bytes from the
+view and sets the length in one call. For parameterized custom types,
+`CustomResultWith<P>` adds a `params()` accessor.
+
+**Span type:** `value()` and `buffer()` on the byte-oriented argument and
+result types return a `vsql::Span<T>` — a non-owning view over a contiguous
+run of `T` with `data()`, `size()`, `empty()`, `begin()`/`end()`, and
+`operator[]`. Under C++20 it is an alias for `std::span<T>`; under C++17 this
+SDK provides a minimal compatible implementation, so the same code compiles in
+either standard. It is available through `<villagesql/vsql.h>`.
+
+`warning(msg)` returns SQL NULL for the row and appends a SQL warning. In strict mode (`STRICT_TRANS_TABLES`), MySQL promotes it to a statement error on INSERT/UPDATE, so it behaves like `error(msg)` in strict contexts. Use it for recoverable bad input, such as an unparseable string in an encode function. Use `error(msg)` for corrupt stored data or any condition where continuing is unsafe. The message for both is truncated to fit the server's internal error buffer if necessary.
+
+**Scalar example** — add two integers:
+
+```cpp
+using namespace vsql;
+
+void add_impl(IntArg a, IntArg b, IntResult out) {
+  if (a.is_null() || b.is_null()) { out.set_null(); return; }
+  out.set(a.value() + b.value());
+}
+
+// Registration is unchanged:
+make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build();
+```
+
+**Binary example** — transform a custom type buffer in place:
+
+```cpp
+using namespace vsql;
+
+void rot13_impl(CustomArg in, CustomResult out) {
+  if (in.is_null()) { out.set_null(); return; }
+  auto src = in.value();   // vsql::Span<const unsigned char>
+  auto dst = out.buffer(); // vsql::Span<unsigned char>
+  for (size_t i = 0; i < src.size(); i++) { dst[i] = transform(src[i]); }
+  out.set_length(src.size());
+}
+```
+
+For `StringResult` and `CustomResult`, write into `buffer()`, then call
+`set_length()` with the number of bytes written. `buffer().size()` is the
+maximum capacity.
+
+For VDFs that return a custom type (`returns(CUSTOM(MYTYPE))`), the server
+sizes the result buffer to the resolved return type's `persisted_length`
+automatically — extension authors do not need to declare `.buffer_size(...)`
+on the function builder for this case. If `prerun` grows the buffer further,
+that larger size is preserved. This is what lets, for example,
+`SVECTOR::from_string('[…1024 floats…]')` encode a wide vector without the
+result buffer running out of room.
+
+You can use different styles across functions in the same extension — each
+function's style is determined by its own signature.
+
+## Aggregate VDFs
+
+Aggregate VDFs accumulate state across rows within each `GROUP BY` group and
+return a single result per group, like SQL `SUM` or `COUNT`. Use
+`make_aggregate_func<State, &result_fn>("name")` to register one. The State
+type is the per-group accumulation buffer; `prerun` and `postrun` are
+auto-generated to allocate and delete it.
+
+The result function must have the signature `void(const State&, ResultType)`
+where `ResultType` is one of `IntResult`, `RealResult`, `StringResult`,
+`CustomResult`, or `CustomResultWith<P>`. Call `out.set(value)` to return a
+value or `out.set_null()` to return SQL NULL.
+
+Both `.clear<>()` and `.accumulate<>()` are required. The builder enforces
+this at compile time (via `build()`), and the server validates it again at
+`INSTALL EXTENSION` time — `clear` resets state, `accumulate` folds rows, and
+the result function reads the final state.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <optional>
+
+using namespace vsql;
+
+// State type: nullopt means no non-NULL rows seen yet.
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+// Registration:
+// make_aggregate_func<SumState, &my_result>("my_sum")
+//     .returns(INT)
+//     .param(INT)
+//     .clear<&my_clear>()
+//     .accumulate<&my_acc>()
+//     .build()
+```
+
+How the builder methods work:
+- `make_aggregate_func<State, &result_fn>()` auto-generates `prerun` and `postrun` (value-initializes and deletes `State`).
+- `.clear<&fn>()` registers your `void(State&)` reset function.
+- `.accumulate<&fn>()` registers your `void(State&, TypedArgs...)` fold function. `TypedArgs` are deduced from the function signature (`IntArg`, `StringArg`, etc.).
+- The result type (`IntResult`, `RealResult`, etc.) is deduced from the result function signature.
+
+For a counter that never returns NULL, use a plain state type:
+
+```cpp
+using CountState = long long;
+void count_clear(CountState &s) { s = 0; }
+void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
+void count_result(const CountState &s, IntResult out) { out.set(s); }
+```
+
+A `StringResult` aggregate VDF returns text: the result reports the
+`utf8mb4_bin` charset and collation, so clients display it as characters
+rather than hex — the same as the scalar VDF STRING path. It also honors
+`.max_result_length(n)` the same way, sizing a materialized aggregate result
+(a `GROUP BY`/`DISTINCT` temp table, `CREATE TABLE ... SELECT`, or UNION) so it
+isn't truncated at the argument width. See
+[Custom Buffer Sizes](/mysql-8.4/0.0.5/create#custom-buffer-sizes) for the
+sizing rules and cap.
+
+## Per-Statement State (Prerun and Postrun)
+
+Some VDFs need state that spans every row a single query touches — a call
+counter, a cached result, an open resource. Allocate it in a **prerun** hook,
+access it from the VDF body, and release it in a **postrun** hook. Both hooks
+run once per statement; the VDF body runs once per row.
+
+Register them with `.prerun<&Hook>()` and `.postrun<&Hook>()`. The required
+signatures are:
+
+| Hook | Required signature |
+|------|--------------------|
+| Prerun | `void(vsql::PrerunArgs, vsql::PrerunResult)` |
+| Postrun | `void(vsql::PostrunArgs)` |
+
+Use `PrerunResult::set_user_data(void*)` to stash state; use `PostrunArgs::delete_state<T>()` to release it. If prerun calls `set_user_data(new T{})`, postrun **must** call `delete_state<T>()` — the SDK does not auto-free.
+
+`PrerunArgs::type_at(i)` exposes the declared SQL type of each argument before any rows are read; the predicates `is_int()`, `is_real()`, `is_str()`, `is_custom()` on the returned `PrerunArgType` mirror the column types. Use this in prerun to validate argument types or call `PrerunResult::request_buffer_size(n)` to size the result buffer.
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+struct CallCounter { long long n = 0; };
+
+void ba_call_index_prerun(PrerunArgs, PrerunResult out) {
+  out.set_user_data(new CallCounter{});
+}
+
+void ba_call_index(CallCounter &state, IntResult out) {
+  state.n++;
+  out.set(state.n);
+}
+
+void ba_call_index_postrun(PostrunArgs args) {
+  args.delete_state<CallCounter>();
+}
+
+// Registration:
+// make_func<&ba_call_index>("ba_call_index")
+//     .returns(INT).no_params()
+//     .prerun<&ba_call_index_prerun>()
+//     .postrun<&ba_call_index_postrun>()
+//     .build()
+```
+
+## Varargs VDFs
+
+A **varargs** VDF accepts any number of arguments of any SQL type. Declare one
+with `.varargs()` on the func builder, which is mutually exclusive with
+`.no_params()` and `.param(TYPE)`. The body receives a `vsql::VarArgs` argument
+instead of the usual fixed-arity argument types.
+
+<Warning>
+Varargs registration requires VEF Protocol 3. Older servers reject the
+extension at install time.
+</Warning>
+
+The framework cannot validate argument count or types for varargs VDFs. Pair
+every varargs registration with a prerun hook that calls `PrerunResult::error()`
+on invalid input or `PrerunResult::request_buffer_size(n)` to size the result
+buffer.
+
+Iterate over arguments with range-for. Each `AnyArg` element requires a type
+check before reading its value:
+
+| Predicate | Accessor | Return type |
+|-----------|----------|-------------|
+| `is_int()` | `as_int()` | `long long` |
+| `is_real()` | `as_real()` | `double` |
+| `is_str()` | `as_str()` | `std::string_view` |
+| `is_custom()` | `as_custom()` | `vsql::Span<const unsigned char>` |
+
+Check `is_null()` before any accessor — all four are undefined on a null argument.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+constexpr size_t kBytearrayLen = 4;
+
+void ba_concat_all_prerun(PrerunArgs args, PrerunResult out) {
+  if (args.size() == 0) {
+    out.error("ba_concat_all requires at least one argument");
+    return;
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    auto t = args.type_at(i);
+    if (!t.is_custom() && !t.is_str()) {
+      out.error("ba_concat_all: argument " + std::to_string(i) +
+                " must be BYTEARRAY");
+      return;
+    }
+  }
+  out.request_buffer_size(args.size() * kBytearrayLen);
+}
+
+void ba_concat_all(VarArgs args, StringResult out) {
+  auto dst = out.buffer();
+  size_t off = 0;
+  for (auto a : args) {
+    if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
+    auto bytes = a.as_custom();
+    std::memcpy(dst.data() + off, bytes.data(), bytes.size());
+    off += bytes.size();
+  }
+  out.set_length(off);
+}
+
+// Registration:
+// make_func<&ba_concat_all>("ba_concat_all")
+//     .returns(STRING).varargs()
+//     .prerun<&ba_concat_all_prerun>()
+//     .build()
+```
+
+## VEF_GENERATE_REGISTRATION
+
+`VEF_GENERATE_REGISTRATION` creates an internal `_vef_do_register()` helper
+that performs extension registration but does not define the `extern "C"` entry
+points. Use it when you need to customize `vef_register` behavior — for
+example, to patch descriptors after registration in a test build. For normal
+extensions, use `VEF_GENERATE_ENTRY_POINTS` instead.
+
+```cpp
+VEF_GENERATE_REGISTRATION(
+    make_extension()
+        .func(make_func<&my_impl>("my_func").returns(INT).build()))
+
+// Then define your own extern "C" vef_register/vef_unregister that call
+// _vef_do_register() and optionally modify the result.
+```
+
+## Custom Type Operations
+
+For the full type operation builder reference — encode, decode, compare, hash, intrinsic defaults, and parameterized types — see [Type Operations](/mysql-8.4/0.0.5/type-operations).
+
+## Preview Capabilities
+
+The following VEF capabilities are available as opt-in preview headers. ABI and API are still under active development; see [Preview Capabilities](/mysql-8.4/0.0.5/preview-capabilities) for the full reference.
+
+- **Extension system variables** — [Preview Capabilities → System Variables](/mysql-8.4/0.0.5/preview-capabilities#system-variables)
+- **Extension status variables** — [Preview Capabilities → Status Variables](/mysql-8.4/0.0.5/preview-capabilities#status-variables)
+- **Keyring access** — [Preview Capabilities → Keyring Access](/mysql-8.4/0.0.5/preview-capabilities#keyring-access)
+- **Column storage** — [Preview Capabilities → Column Storage](/mysql-8.4/0.0.5/preview-capabilities#column-storage)
+
+## Inspecting Extension Registration Metadata
+
+`INFORMATION_SCHEMA.EXTENSION_REGISTRATION` exposes the in-memory VEF
+registration struct for each loaded extension as a JSON document. Use it to
+verify that the server parsed your extension's functions, types, and system
+variables correctly after `INSTALL EXTENSION`.
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL, REGISTRATION_JSON
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION
+WHERE EXTENSION_NAME = 'my_ext';
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `EXTENSION_NAME` | `VARCHAR(64)` | Name of the installed extension. |
+| `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | VEF protocol version negotiated between the extension and the server. |
+| `REGISTRATION_JSON` | `TEXT` | JSON serialization of the `vef_registration_t` struct, including `funcs` and `types` arrays. |
+
+## See Also
+
+- [Creating Extensions in C++](/mysql-8.4/0.0.5/create) — end-to-end build steps, CMake setup, and installation
+- [C++ Testing](/mysql-8.4/0.0.5/testing) — local dev server, MTR, and debugging failures
+- [Type Operations](/mysql-8.4/0.0.5/type-operations) — encode, decode, compare, hash, parameterized types
+- [C++ API Reference](/mysql-8.4/0.0.5/extension-api-reference) — VDF contracts, null handling, and buffer sizing
+- [Extension Architecture](/mysql-8.4/0.0.5/architecture) — lifecycle, Victionary caching, performance patterns, and security model

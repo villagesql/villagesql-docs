@@ -1,0 +1,248 @@
+---
+audience: extension-author
+title: "Rust로 확장 만들기"
+description: "VillageSQL Rust SDK를 사용하여 안전한 Rust로 확장 함수를 작성하고, VEB 파일로 패키지화한 후 VillageSQL에 설치하는 방법을 알아보세요."
+---
+
+<Warning>
+  Rust SDK는 알파 단계입니다 — 릴리스 간에 API가 호환되지 않게 변경될 수
+  있습니다. 함수 전용 확장과 사용자 정의 타입(encode, decode, compare,
+  hash)이 지원됩니다. 집계, `prerun()`, `VarArgs`, 시스템 및 상태 변수,
+  키링 접근, 컬럼 저장 ABI는 현재 C++ 전용입니다 — 이러한 기능이 필요하다면
+  [C++ SDK](/ko/mysql-8.4/0.0.5/create)를 사용하세요.
+</Warning>
+
+<Note>
+C++를 선호하는 경우 [C++로 확장 만들기](/ko/mysql-8.4/0.0.5/create)에서 C++ SDK 워크스루를 참조하세요.
+</Note>
+
+VillageSQL 확장은 `villagesql` 크레이트를 사용하여 Rust로 작성할 수 있습니다. SDK는 모든 FFI 마샬링을 처리하므로 일반적인 Rust 타입을 사용하여 작업할 수 있습니다. 서버가 로드 시 호출하는 C 엔트리 포인트는 `extension!` 매크로가 생성합니다.
+
+## 사전 요구 사항
+
+시작하기 전에 소스에서 VillageSQL을 빌드하세요 — 확장은 서버의 빌드 트리에 링크됩니다. 먼저 [소스에서 빌드](/ko/mysql-8.4/0.0.5/source) 가이드를 따르세요.
+
+또한 다음이 필요합니다:
+
+- **Rust 안정 도구 체인** — [rustup.rs](https://rustup.rs)에서 설치
+- **Git** — SDK 및 확장 리포지토리를 클론하기 위해
+- **cargo-vsql** — 확장 패키지화, 설치, 테스트를 위한 Cargo 하위 명령어
+- **VillageSQL 빌드 디렉터리** — `cargo vsql install` 및 `cargo vsql test`를 위해 `VillageSQL_BUILD_DIR`을 서버 빌드 경로로 설정
+- **기본적인 Rust 지식** — Cargo, 열거형, 패턴 매칭에 대한 익숙함
+
+SDK 리포지토리에서 `cargo-vsql`을 설치합니다:
+
+```bash
+git clone https://github.com/villagesql/vsql-rust-sdk
+cd vsql-rust-sdk
+cargo install --path cargo-vsql
+```
+
+사용 가능 여부를 확인합니다:
+
+```bash
+cargo vsql --help
+```
+
+## 새 크레이트 생성
+
+새로운 Rust 라이브러리 크레이트를 만듭니다:
+
+```bash
+cargo new --lib vsql_rot13
+cd vsql_rot13
+```
+
+`Cargo.toml`을 편집하여 크레이트 유형을 설정하고 `villagesql` 의존성을 추가합니다:
+
+```toml
+[package]
+name = "vsql_rot13"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+villagesql = "0.0.1"
+```
+
+`cdylib` 크레이트 유형은 Cargo에게 서버가 로드할 수 있는 공유 라이브러리(리눅스에서는 `.so`, 맥OS에서는 `.dylib`)를 생성하도록 지시합니다.
+
+## 첫 번째 함수 작성
+
+`src/lib.rs`를 완전한 확장으로 대체합니다:
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("vsql_rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rot13_impl, "vsql_rot13", [villagesql::Type::String] -> villagesql::Type::String),
+    ]
+}
+```
+
+`func!` 매크로는 `rot13_impl`을 SQL 이름 `vsql_rot13`과 `STRING -> STRING` 시그니처로 연결합니다.
+
+함수 시그니처는 `fn(&[InValue]) -> VdfReturn`입니다. `InValue`는 서버가 전달하는 SQL 타입의 열거형입니다. `VdfReturn`은 반환 타입입니다. 값에 접근하기 전에 `args.first()`를 확인하여 NULL 경우와 잘못된 타입 경우를 처리하세요.
+
+함수가 동일한 입력에 대해 항상 동일한 출력을 반환한다면 결정적(deterministic)으로 선언하세요 — 옵티마이저는 동일한 입력에 대한 결과를 캐시할 수 있습니다:
+
+```rust
+villagesql::func!(rot13_impl, "vsql_rot13", [villagesql::Type::String] -> villagesql::Type::String, deterministic: true)
+```
+
+## manifest.json 추가
+
+크레이트 루트(여기서 `Cargo.toml`과 함께)에 `manifest.json`을 생성합니다:
+
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "ROT-13 encoding for VillageSQL",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+서버는 설치 시 이 파일을 읽습니다. `name` 필드는 `INSTALL EXTENSION`에 전달하는 값과 일치해야 합니다.
+
+## 빌드 및 설치
+
+<Note>
+`cargo vsql package`, `cargo vsql install`, `cargo vsql test` 명령은 워크스페이스 루트가 아닌, 확장 디렉터리 내부(`Cargo.toml`과 `manifest.json`이 있는 위치)에서 실행하세요.
+</Note>
+
+확장을 `.veb` 파일로 패키지화합니다:
+
+```bash
+cargo vsql package
+```
+
+이로 인해 `dist/vsql_rot13.veb`가 생성됩니다. VEB를 직접 VillageSQL 빌드 디렉터리로 패키지화하고 복사하려면:
+
+```bash
+export VillageSQL_BUILD_DIR=/path/to/villagesql/build
+cargo vsql install
+```
+
+개발 중에 의존성을 로컬 체크아웃으로 패치하려면 `--config KEY=VALUE`를 전달하세요(반복 가능):
+
+```bash
+cargo vsql install --config 'patch.crates-io.villagesql.path="/path/to/villagesql"'
+```
+
+VEB가 확장 디렉터리로 복사된 것을 확인할 수 있습니다. 존재하는지 확인합니다:
+
+```bash
+ls "$VillageSQL_BUILD_DIR/veb_dir/"
+# vsql_rot13.veb
+```
+
+## 테스트
+
+`mysql-test/t/rot13_basic.test`에 테스트 파일을 작성합니다:
+
+```sql
+INSTALL EXTENSION vsql_rot13;
+SELECT vsql_rot13('Hello');
+SELECT vsql_rot13('');
+SELECT vsql_rot13(NULL);
+UNINSTALL EXTENSION vsql_rot13;
+```
+
+예상 결과를 생성합니다:
+
+```bash
+cargo vsql test --record
+```
+
+테스트 스위트를 실행합니다:
+
+```bash
+cargo vsql test
+```
+
+함수의 동작을 수정한 후, 예상 결과를 업데이트하기 위해 `cargo vsql test --record`를 다시 실행하고, 확인하기 위해 `cargo vsql test`를 실행합니다.
+
+## SQL에 설치
+
+VEB가 확장 디렉터리에 있으면 설치합니다:
+
+```sql
+INSTALL EXTENSION vsql_rot13;
+```
+
+확인합니다:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'vsql_rot13';
+```
+
+호출합니다:
+
+```sql
+SELECT vsql_rot13('Hello, World!');
+-- → Uryyb, Jbeyq!
+```
+
+## 다음 단계
+
+<CardGroup cols={2}>
+  <Card
+    title="Rust에서 사용자 정의 타입"
+    icon="shapes"
+    href="/ko/mysql-8.4/0.0.5/rust-custom-types"
+  >
+    이진 저장, 정렬, 해싱을 갖는 새 컬럼 타입 정의.
+  </Card>
+  <Card
+    title="Rust API 참조"
+    icon="book"
+    href="/ko/mysql-8.4/0.0.5/rust-api-reference"
+  >
+    InValue, VdfReturn, extension!, func!, custom_type! — 모든 필드.
+  </Card>
+  <Card
+    title="C++ SDK (확장 만들기)"
+    icon="code"
+    href="/ko/mysql-8.4/0.0.5/create"
+  >
+    C++ 경로 — 타입화된 래퍼, 빌더 API, CMake 설정.
+  </Card>
+  <Card
+    title="확장 아키텍처"
+    icon="sitemap"
+    href="/ko/mysql-8.4/0.0.5/architecture"
+  >
+    VEB 파일 로드, 라이프사이클 훅, 심볼 격리.
+  </Card>
+  <Card
+    title="네트워크 의존 확장 테스트"
+    icon="network-wired"
+    href="/ko/mysql-8.4/0.0.5/testing-network"
+  >
+    HTTP 서버나 외부 리스너를 생성하는 확장을 위한 MTR 포트 패턴 — Rust와 C++ 확장에 동일하게 적용됩니다.
+  </Card>
+</CardGroup>

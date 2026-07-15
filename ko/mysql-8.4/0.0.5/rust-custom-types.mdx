@@ -1,0 +1,255 @@
+---
+audience: extension-author
+title: "Rust에서의 사용자 정의 타입"
+description: "VillageSQL Rust SDK에서 새로운 컬럼 타입을 정의합니다 — custom_type! 매크로를 사용하여 이진 레이아웃, 인코딩, 디코딩, 비교, 해시 및 산술 함수를 제공합니다."
+---
+
+<Warning>
+  Rust SDK는 알파 단계입니다 — 릴리스 간에 호환성이 깨지는 API
+  변경이 있을 수 있습니다. 함수 전용 확장과 사용자 정의
+  타입(인코딩, 디코딩, 비교, 해시)이 지원됩니다. 집계, `prerun()`,
+  `VarArgs`, 시스템 및 상태 변수, 키링 접근, 그리고 컬럼 저장소 ABI는
+  현재 C++ 전용입니다 — 이 중 하나라도 필요하다면
+  [C++ SDK](/ko/mysql-8.4/0.0.5/create)를 사용하세요.
+</Warning>
+
+사용자 정의 타입을 통해 `RATIONAL`, `VECTOR`, 또는 `INET`과 같은 새로운 컬럼 타입을 정의할 수 있습니다. 이러한 타입은 `ORDER BY`, 인덱스, 및 집계 함수와 함께 작동합니다. Rust SDK는 `custom_type!` 매크로를 통해 이를 지원합니다.
+
+이 페이지는 이미 [Rust에서 확장 빌드](/ko/mysql-8.4/0.0.5/rust-sdk)를 완료했음을 전제로 합니다. 설정(Cargo.toml, manifest.json, cargo-vsql)은 동일합니다.
+
+## 사용자 정의 타입을 사용해야 하는 경우
+
+다음과 같은 경우 사용자 정의 타입을 사용하세요:
+
+- 표준 SQL 타입으로 표현할 수 없는 디스크 상의 이진 레이아웃이 필요할 때(압축된 부동소수점, 고정 폭 정수, 이진 식별자)
+- 타입 자체가 사전식 문자열 정렬과 다른 순서 의미론을 가질 때
+- 서버가 `ORDER BY`, `COUNT(DISTINCT)`, 및 집합 연산을 위해 값들을 올바르게 인덱싱하고 해시하도록 하려 할 때
+
+SQL 호출 가능한 함수만 필요하고 데이터를 `STRING`, `INT`, 또는 `REAL` 컬럼에 무리 없이 담을 수 있을 경우, 사용자 정의 타입이 필요하지 않습니다.
+
+## custom_type! 매크로
+
+모든 사용자 정의 타입은 4개의 콜백(인코딩, 디코딩, 비교, 해시)과 기본값이 필요합니다. 전체 매크로 서명은 다음과 같습니다:
+
+```rust
+villagesql::custom_type!(
+    type_name: "type_name_in_sql",
+    persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: your_encode_fn,
+    decode: your_decode_fn,
+    compare: your_compare_fn,
+    hash: your_hash_fn,
+    default: "a_valid_string_literal",
+)
+```
+
+| 필드 | 유형 | 설명 |
+|---|---|---|
+| `type_name` | 문자열 리터럴 | SQL 타입 이름. SQL에서는 대소문자 구분 없음. |
+| `persisted_length` | `usize` | 디스크 저장을 위한 고정 바이트 길이. |
+| `max_decode_buffer_length` | `usize` | 디코딩된 문자열 표현의 최대 바이트 길이. |
+| `encode` | fn | INSERT 시에 `&str`를 이진 바이트로 변환합니다. |
+| `decode` | fn | 이진 바이트를 표시용 `String`으로 변환합니다. |
+| `compare` | fn | `ORDER BY`, `MIN`, `MAX`에 대한 `Ordering`을 반환합니다. |
+| `hash` | fn | `COUNT(DISTINCT)` 및 집합 연산을 위한 `usize` 해시를 반환합니다. 선택적이지만 인덱스가 있는 컬럼에는 권장됩니다. |
+| `default` | 문자열 리터럴 | 서버가 타입 초기화 시 인코딩할 수 있는 유효한 문자열. 정확히 `persisted_length` 바이트로 인코딩되어야 합니다. 선택적이지만 권장됩니다. |
+
+`type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`는 필수입니다. `hash`와 `default`는 선택적이지만 권장됩니다 — `hash`는 올바른 `COUNT(DISTINCT)` 및 집합 연산을 위해 필요하며, `default`는 타입 초기화 검증을 위해 필요합니다.
+
+## 이진 값 수신 및 반환
+
+사용자 정의 타입을 받거나 반환하는 함수는 원시 바이트를 다룹니다.
+
+**입력** — `InValue::Custom(b)`는 저장된 이진 데이터를 `&[u8]`로 전달합니다:
+
+```rust
+fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::Custom(b)) => {
+            let numer = read_i64(b, 0);
+            VdfReturn::int(numer)
+        }
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("rational_numer: expected a RATIONAL argument"),
+    }
+}
+```
+
+**출력** — `VdfReturn::Binary(bytes)`는 이진 바이트를 서버로 전송합니다:
+
+```rust
+fn rational_add_impl(args: &[InValue]) -> VdfReturn {
+    match (args.get(0), args.get(1)) {
+        (Some(InValue::Custom(a)), Some(InValue::Custom(b))) => {
+            let result = add_rationals(a, b);
+            VdfReturn::Binary(result)
+        }
+        _ => VdfReturn::null(),
+    }
+}
+```
+
+`func!` 선언에서 사용자 정의 타입을 참조하려면 `villagesql::custom!("type_name")`을 사용합니다:
+
+```rust
+villagesql::func!(
+    rational_add_impl,
+    "rational_add",
+    [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
+    deterministic: true
+)
+```
+
+## 예시: 유리수 타입
+
+SDK 리포지토리의 `examples/vsql_rational`은 `RATIONAL` 타입을 구현하는 작동하는 확장입니다. 이 타입은 유리수를 리틀 엔디안 바이트 순서로 16바이트의 `i64` 값 쌍(분자, 분모)으로 저장하고 산술 함수를 제공합니다.
+
+다음은 핵심 인코딩, 디코딩, 비교, 해시 구현입니다:
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+// Binary layout: [numerator: i64 LE][denominator: i64 LE] — 16 bytes total.
+// Always stored in reduced form (GCD = 1) with a positive denominator.
+const BYTES: usize = 16;
+
+fn to_bytes(num: i64, den: i64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(BYTES);
+    v.extend_from_slice(&num.to_le_bytes());
+    v.extend_from_slice(&den.to_le_bytes());
+    v
+}
+
+fn from_bytes(b: &[u8]) -> (i64, i64) {
+    let num = i64::from_le_bytes(b[..8].try_into().unwrap());
+    let den = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    (num, den)
+}
+
+// encode: "3/4" -> 16 bytes
+pub fn rational_encode(s: &str) -> Result<Vec<u8>, String> {
+    let (num_s, den_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("rational: expected 'n/d', got {:?}", s))?;
+    let num: i64 = num_s.trim().parse()
+        .map_err(|e| format!("rational numerator: {}", e))?;
+    let den: i64 = den_s.trim().parse()
+        .map_err(|e| format!("rational denominator: {}", e))?;
+    let (n, d) = normalize(num as i128, den as i128)
+        .ok_or_else(|| "rational: zero or overflowing denominator".to_string())?;
+    Ok(to_bytes(n, d))
+}
+
+// decode: 16 bytes -> "3/4"
+pub fn rational_decode(b: &[u8]) -> Result<String, String> {
+    if b.len() < BYTES {
+        return Err(format!("rational: expected {} bytes, got {}", BYTES, b.len()));
+    }
+    let (n, d) = from_bytes(b);
+    Ok(format!("{}/{}", n, d))
+}
+
+// compare: for ORDER BY, MIN, MAX
+pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (n1, d1) = from_bytes(a);
+    let (n2, d2) = from_bytes(b);
+    // cross-multiply (denominators are always positive)
+    let lhs = (n1 as i128) * (d2 as i128);
+    let rhs = (n2 as i128) * (d1 as i128);
+    lhs.cmp(&rhs)
+}
+
+// hash: for COUNT(DISTINCT) and set operations
+pub fn rational_hash(b: &[u8]) -> usize {
+    // FNV-1a over the 16 bytes
+    let mut h: usize = 0xcbf29ce484222325u64 as usize;
+    for &byte in b {
+        h ^= byte as usize;
+        h = h.wrapping_mul(0x100000001b3u64 as usize);
+    }
+    h
+}
+```
+
+`custom_type!` 등록 및 산술 VDF(`rational_add`, `rational_sub` 등)는 `examples/vsql_rational/src/lib.rs`의 전체 소스에 있습니다.
+
+확장이 설치된 후:
+
+```sql
+INSTALL EXTENSION vsql_rational;
+
+CREATE TABLE fractions (
+    id   INT PRIMARY KEY,
+    val  RATIONAL
+);
+
+INSERT INTO fractions VALUES (1, '1/2'), (2, '3/4'), (3, '1/4');
+
+-- ORDER BY uses rational_compare
+SELECT val FROM fractions ORDER BY val;
+-- → 1/4, 1/2, 3/4
+
+-- Arithmetic with rational_add
+SELECT rational_add('1/3', '1/6');
+-- → 1/2
+
+-- Extract numerator and denominator
+SELECT rational_numer(val), rational_denom(val) FROM fractions;
+
+-- Convert to floating-point approximation
+SELECT rational_to_real('1/3');
+-- → 0.3333333333333333
+```
+
+`rational_to_real(r RATIONAL) -> REAL`은 분자를 분모로 나누어 `RATIONAL` 값을 64비트 부동소수점 근사치로 변환합니다. 표시나 비교를 위해 근사 소수를 필요로 하지만 열에 손실형 표현을 저장하고 싶지 않을 때 유용합니다.
+
+## extension! 블록과 타입
+
+함수와 타입을 모두 등록할 때, `extension!` 블록은 두 개의 섹션을 가집니다:
+
+```rust
+villagesql::extension! {
+    funcs: [
+        // VDFs declared with func!
+    ],
+    types: [
+        // Custom types declared with custom_type!
+    ]
+}
+```
+
+비어 있는 경우 해당 섹션을 생략할 수 있습니다. 타입만 포함하는 확장은 `funcs:`를 생략하고, 함수만 포함하는 확장은 `types:`를 생략합니다.
+
+## 다음 단계
+
+<CardGroup cols={2}>
+  <Card
+    title="Rust API 참조"
+    icon="book"
+    href="/ko/mysql-8.4/0.0.5/rust-api-reference"
+  >
+    InValue, VdfReturn, 및 모든 매크로에 대한 완전한 참조.
+  </Card>
+  <Card
+    title="Rust에서 확장 빌드"
+    icon="wrench"
+    href="/ko/mysql-8.4/0.0.5/rust-sdk"
+  >
+    시작하기 — Cargo 설정, 첫 번째 함수, 패키징 및 테스트.
+  </Card>
+  <Card
+    title="C++ 사용자 정의 타입"
+    icon="shapes"
+    href="/ko/mysql-8.4/0.0.5/custom-types"
+  >
+    C++에서의 사용자 정의 타입 — `make_type<>`, 인코딩/디코딩/비교/해시, ALTER TABLE 규칙.
+  </Card>
+  <Card
+    title="확장 아키텍처"
+    icon="sitemap"
+    href="/ko/mysql-8.4/0.0.5/architecture"
+  >
+    사용자 정의 타입이 해석, 캐시, 저장되는 방식.
+  </Card>
+</CardGroup>

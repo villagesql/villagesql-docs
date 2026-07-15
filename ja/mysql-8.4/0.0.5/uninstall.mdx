@@ -1,0 +1,181 @@
+---
+audience: extension-author
+title: "拡張機能のアンインストール"
+description: "VillageSQL拡張機能を安全に削除します"
+---
+
+## コマンド構文
+
+```sql
+UNINSTALL EXTENSION extension_name [VERSION 'version'];
+```
+
+`VERSION`が指定された場合、サーバーはそれをインストールされている拡張機能のバージョンと比較し、バージョンが異なる場合は処理を中止します。現在インストールされているバージョンをアンインストールするには、この句を省略します。
+
+<Warning>
+拡張機能をアンインストールする前に、拡張機能のカスタムタイプを使用しているすべての列、ストアドプロシージャのパラメータ、およびDECLARE変数を削除する必要があります。アンインストールプロセスでは、拡張機能によって提供されるすべての関数とタイプが削除されます。
+</Warning>
+
+## 前提条件
+
+- VillageSQLへの管理者アクセス
+- 拡張機能のカスタムタイプを使用しているテーブルがないこと
+- 拡張機能のカスタムタイプを使用しているパラメータまたはDECLARE変数を持つストアドプロシージャがないこと
+- 拡張機能がカスタムデータを保存している場合は、データのバックアップ
+
+## アンインストール手順
+
+### 1. アンインストールを試行
+
+アンインストールコマンドを実行します。拡張機能に依存関係がない場合、すぐに成功します。列が依存している場合、エラーメッセージには正確にどの列であるかが示されます。
+
+```sql
+UNINSTALL EXTENSION vsql_complex;
+```
+
+**拡張機能に列の依存関係がある場合**、次のようなエラーが表示されます。
+```
+ERROR HY000: Cannot drop extension `vsql_complex` as 1 column(s) depend on it,
+e.g. mydb.signals.impedance has type COMPLEX
+```
+
+特定された列を削除または変更してから、再試行します。
+
+```sql
+-- Option 1: Drop the table
+DROP TABLE mydb.signals;
+
+-- Option 2: Alter to remove only the custom type column
+ALTER TABLE mydb.signals DROP COLUMN impedance;
+```
+
+**ストアドプロシージャが拡張機能のカスタムタイプを使用している場合**、次のようなエラーが表示されます。
+```
+ERROR 3219 (HY000): Cannot uninstall extension 'vsql_complex': stored procedure mydb.transform_signal uses custom type COMPLEX
+```
+
+ストアドプロシージャを削除または変更して、型付きパラメータまたは変数を削除してから、再試行します。
+
+```sql
+-- Option 1: Drop the stored procedure
+DROP PROCEDURE mydb.transform_signal;
+
+-- Option 2: Recreate the procedure without the custom type parameter
+-- (replace the custom type with a compatible built-in type or remove the parameter)
+```
+
+### 2. 拡張機能をアンインストール
+
+```sql
+UNINSTALL EXTENSION vsql_complex;
+```
+
+予期しないバージョンのアンインストールを防ぐために（CI環境やローリングアップグレード後に役立ちます）、`VERSION`句を含めます。
+
+```sql
+UNINSTALL EXTENSION vsql_complex VERSION '1.2.0';
+```
+
+`1.2.0`がインストールされているバージョンでない場合、サーバーはエラーを返し、拡張機能をそのままにします。
+
+```
+ERROR 3219 (HY000): Cannot uninstall extension 'vsql_complex': installed
+version is '0.0.1' but VERSION '1.2.0' was specified
+```
+
+**これにより削除されるもの:**
+- ✅ 拡張機能によって提供されるすべてのVDF（関数）
+- ✅ 拡張機能によって登録されたカスタムタイプの定義
+- ✅ 拡張機能の登録レコード
+- ✅ 拡張機能のカスタム列メタデータ
+- ✅ `mysqld-auto.cnf`からの拡張機能の永続システム変数（`SET PERSIST`）
+
+**これにより削除されないもの:**
+- ❌ `.veb`ファイルは`veb_dir`に残ります
+- ❌ `{datadir}/.veb_expansion_cache/`内の展開されたディレクトリは一時的に残ります
+- ❌ テーブルデータ（カスタムタイプを持つテーブルを最初に削除する必要があります）
+
+<Note>
+`{datadir}/.veb_expansion_cache/{extension}/{sha256}/`内の展開ディレクトリは、サーバーの再起動時に自動的にクリーンアップされます。
+</Note>
+
+<Note>
+`UNINSTALL EXTENSION`は、拡張機能に関連する永続システム変数を`mysqld-auto.cnf`から削除します。以前に`SET PERSIST extensionname.varname = value`を実行した場合、そのエントリはアンインストール中に自動的に削除されます。永続化された値は、サーバーのシャットダウン中に削除されることはありません。拡張機能は、次回ロード時にそれらを読み取ることができるように、再起動後も保持されます。
+</Note>
+
+<Note>
+保留中のバージョン変更（キューに入れられた`ALTER EXTENSION name VERSION 'x' AT RESTART`）がある拡張機能をアンインストールすると、その保留中のアクションは拡張機能の行とともに破棄されます。クリーンアップすべき孤立した保留状態は残らず、エラーも発生しません。その後の`INSTALL EXTENSION`は、保留中のアクションなしで新規に開始されます。保留中のバージョン変更がどのように追跡され、クリアされるかについては、[拡張機能の管理](/ja/mysql-8.4/0.0.5/managing)を参照してください。
+</Note>
+
+### 3. アンインストールを確認
+
+```sql
+-- Check extension is gone
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'vsql_complex';
+-- Should return no rows
+
+-- Verify functions removed
+SELECT complex_abs('(1.0,2.0)');
+-- Error: FUNCTION test_db.complex_abs does not exist
+```
+
+## 一般的なエラー
+
+| エラー | 原因 | 解決策 |
+|-------|-------|----------|
+| `拡張機能 'name' を削除できません。N個の列がそれに依存しています。例：db.table.col には TYPE というタイプがあります` | テーブルに、拡張機能のカスタムタイプを使用する列があります | 特定された列を削除または変更してから、再試行します |
+| `拡張機能 'name' をアンインストールできません。ストアドプロシージャ db.sp はカスタムタイプ TYPE を使用しています` | ストアドプロシージャに、拡張機能のカスタムタイプを使用するパラメータまたはDECLARE変数があります | ストアドプロシージャを削除または変更して、カスタムタイプの使用を削除してから、再試行します |
+| `拡張機能 'name' をアンインストールできません。インストールされているバージョンは 'X' ですが、VERSION 'Y' が指定されました` | `VERSION`句が指定されましたが、インストールされているバージョンと一致しません | `VERSION`句なしで再実行するか、`SELECT EXTENSION_VERSION FROM INFORMATION_SCHEMA.EXTENSIONS`に表示されているバージョンを使用します |
+| `拡張機能が見つかりません` | 拡張機能がインストールされていません | `SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS`で確認します |
+
+## オプション：.vebファイルを削除
+
+`.veb`ファイルはアンインストール後に残ります。完全に削除するには：
+
+```bash
+# Find veb_dir
+mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
+
+# Delete .veb file
+sudo rm /path/to/veb_dir/vsql_complex.veb
+```
+
+<Note>
+`.veb`ファイルは、将来の再インストールのために安全に保持できます。削除してもサーバーのパフォーマンスに影響はありません。
+</Note>
+
+## 再インストール
+
+拡張機能を再インストールするには、`INSTALL EXTENSION`を再度使用します（`.veb`ファイルがまだ存在する場合）。
+
+```sql
+INSTALL EXTENSION vsql_complex;
+```
+
+詳細については、[拡張機能のインストール](/ja/mysql-8.4/0.0.5/install)を参照してください。
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card
+    title="拡張機能のインストール"
+    icon="download"
+    href="/ja/mysql-8.4/0.0.5/install"
+  >
+    必要に応じて拡張機能を再度追加します
+  </Card>
+  <Card
+    title="拡張機能の管理"
+    icon="sliders"
+    href="/ja/mysql-8.4/0.0.5/managing"
+  >
+    拡張機能を監視およびトラブルシューティングします
+  </Card>
+  <Card
+    title="システムリファレンス"
+    icon="book"
+    href="/ja/mysql-8.4/0.0.5/reference"
+  >
+    システムテーブルをクエリします
+  </Card>
+</CardGroup>

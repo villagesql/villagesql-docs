@@ -1,0 +1,272 @@
+---
+audience: extension-author
+title: "C++ 开发"
+description: "C++ 扩展的 VDF 编写深度参考——参数和结果类型、聚合、prerun/postrun、可变参数以及注册。"
+---
+
+本指南是编写 C++ VDF 实现的深度参考。它是 [使用 C++ 创建扩展](/zh/mysql-8.4/0.0.5/create) 的补充，后者涵盖端到端的构建步骤；也是 [C++ 测试](/zh/mysql-8.4/0.0.5/testing) 的补充，后者涵盖测试与迭代循环。
+
+<Warning>
+VEF 协议 3 自 v0.0.4 版本起已稳定。协议 4 正在开发中，并且仅通过选择加入的开发 ABI 标头提供 (`-DVSQL_USE_DEV_ABI=ON`)。使用旧协议 2 构建的扩展会被服务器拒绝，必须重新构建。
+</Warning>
+
+## 编写扩展函数
+
+扩展函数是用 C++ 编写的，并向 VEF 注册。包含一个标头以访问完整的 SDK：
+
+```cpp
+#include <villagesql/vsql.h>
+```
+
+## 参数和结果类型 {#argument-and-result-types}
+
+VDF 参数和结果作为类型安全的参数和结果类型传递。框架会从您的函数签名中检测它们并自动进行调整——`make_func` 注册语法保持不变。
+
+**参数类型：** `IntArg`、`RealArg`、`StringArg`、`CustomArg`——每个都提供 `is_null()` 和 `value()`。对于参数化的自定义类型，`CustomArgWith<P>` 添加了一个 `params()` 访问器，该访问器返回缓存的解析参数结构（请参阅 [参数化类型](/zh/mysql-8.4/0.0.5/type-operations#parameterized-types)）。
+
+**结果类型：** `IntResult`、`RealResult`、`StringResult`、`CustomResult`——每个都提供 `set_null()`、`warning(msg)` 和 `error(msg)`。标量结果还提供 `set(value)`。缓冲区结果提供 `buffer()` 和 `set_length(len)`。`StringResult` 此外还提供 `set(std::string_view)`，它从视图中复制最多 `buffer().size()` 个字节，并在一次调用中设置长度。对于参数化的自定义类型，`CustomResultWith<P>` 添加了一个 `params()` 访问器。
+
+**Span 类型：** 面向字节的参数和结果类型上的 `value()` 和 `buffer()` 返回一个 `vsql::Span<T>`——一个非所有权视图，用于连续的 `T` 序列，具有 `data()`、`size()`、`empty()`、`begin()`/`end()` 和 `operator[]`。在 C++20 中，它是 `std::span<T>` 的别名；在 C++17 中，此 SDK 提供了一个最小的兼容实现，因此相同的代码可以在任何标准中编译。它通过 `<villagesql/vsql.h>` 提供。
+
+`warning(msg)` 会为该行返回 SQL NULL，并附加一个 SQL 警告。在严格模式 (`STRICT_TRANS_TABLES`) 下，MySQL 会将其升级为 INSERT/UPDATE 上的语句错误，因此它在严格上下文中表现得像 `error(msg)`。将其用于可恢复的错误输入，例如编码函数中的无法解析的字符串。对于已损坏的存储数据或任何继续操作不安全的情况，请使用 `error(msg)`。两种情况下的消息都会被截断以适应服务器的内部错误缓冲区（如果需要）。
+
+**标量示例**——将两个整数相加：
+
+```cpp
+using namespace vsql;
+
+void add_impl(IntArg a, IntArg b, IntResult out) {
+  if (a.is_null() || b.is_null()) { out.set_null(); return; }
+  out.set(a.value() + b.value());
+}
+
+// Registration is unchanged:
+make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build();
+```
+
+**二进制示例**——就地转换自定义类型缓冲区：
+
+```cpp
+using namespace vsql;
+
+void rot13_impl(CustomArg in, CustomResult out) {
+  if (in.is_null()) { out.set_null(); return; }
+  auto src = in.value();   // vsql::Span<const unsigned char>
+  auto dst = out.buffer(); // vsql::Span<unsigned char>
+  for (size_t i = 0; i < src.size(); i++) { dst[i] = transform(src[i]); }
+  out.set_length(src.size());
+}
+```
+
+对于 `StringResult` 和 `CustomResult`，写入 `buffer()`，然后调用 `set_length()`，其中包含写入的字节数。`buffer().size()` 是最大容量。
+
+对于返回自定义类型的 VDF (`returns(CUSTOM(MYTYPE))`)，服务器会自动调整结果缓冲区的大小以匹配解析的返回类型的 `persisted_length`——扩展作者在此情况下不需要在函数生成器上声明 `.buffer_size(...)`。如果 `prerun` 进一步增大缓冲区，则会保留更大的大小。这使得，例如，`SVECTOR::from_string('[…1024 floats…]')` 可以在不使结果缓冲区耗尽空间的情况下编码一个大型向量。
+
+您可以在同一扩展中的不同函数中使用不同的样式——每个函数的样式由其自身的签名决定。
+
+## 聚合 VDF {#aggregate-vdfs}
+
+聚合 VDF 在每个 `GROUP BY` 组内的行中累积状态，并为每个组返回单个结果，类似于 SQL `SUM` 或 `COUNT`。使用 `make_aggregate_func<State, &result_fn>("name")` 注册一个。`State` 类型是每个组的累积缓冲区；`prerun` 和 `postrun` 是自动生成的，用于分配和删除它。
+
+结果函数必须具有签名 `void(const State&, ResultType)`，其中 `ResultType` 是 `IntResult`、`RealResult`、`StringResult`、`CustomResult` 或 `CustomResultWith<P>` 中的一个。调用 `out.set(value)` 以返回一个值，或者调用 `out.set_null()` 以返回 SQL NULL。
+
+`.clear<>()` 和 `.accumulate<>()` 都是必需的。生成器在编译时（通过 `build()`）强制执行这一点，并且服务器在 `INSTALL EXTENSION` 时再次验证它——`clear` 重置状态，`accumulate` 折叠行，结果函数读取最终状态。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <optional>
+
+using namespace vsql;
+
+// State type: nullopt means no non-NULL rows seen yet.
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+// Registration:
+// make_aggregate_func<SumState, &my_result>("my_sum")
+//     .returns(INT)
+//     .param(INT)
+//     .clear<&my_clear>()
+//     .accumulate<&my_acc>()
+//     .build()
+```
+
+生成器方法的工作方式：
+- `make_aggregate_func<State, &result_fn>()` 自动生成 `prerun` 和 `postrun`（值初始化并删除 `State`）。
+- `.clear<&fn>()` 注册您的 `void(State&)` 重置函数。
+- `.accumulate<&fn>()` 注册您的 `void(State&, TypedArgs...)` 折叠函数。`TypedArgs` 从函数签名中推断出来（`IntArg`、`StringArg` 等）。
+- 结果类型 (`IntResult`、`RealResult` 等)从结果函数签名中推断出来。
+
+对于永不返回 NULL 的计数器，请使用纯状态类型：
+
+```cpp
+using CountState = long long;
+void count_clear(CountState &s) { s = 0; }
+void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
+void count_result(const CountState &s, IntResult out) { out.set(s); }
+```
+
+`StringResult` 聚合 VDF 返回文本：结果报告 `utf8mb4_bin` 字符集和排序规则，因此客户端将其显示为字符而不是十六进制——与标量 VDF STRING 路径相同。它还以相同的方式支持 `.max_result_length(n)`，调整物化聚合结果（`GROUP BY`/`DISTINCT` 临时表、`CREATE TABLE ... SELECT` 或 UNION）的大小，使其不会在参数宽度处被截断。有关调整大小的规则和上限，请参阅 [自定义缓冲区大小](/zh/mysql-8.4/0.0.5/create#custom-buffer-sizes)。
+
+## 每个语句的状态（Prerun 和 Postrun） {#per-statement-state-prerun-and-postrun}
+
+某些 VDF 需要跨单个查询触及的每一行都存在的状态——调用计数器、缓存结果、打开的资源。在 **prerun** 钩子中分配它，在 VDF 主体中访问它，并在 **postrun** 钩子中释放它。这两个钩子都为每个语句运行一次；VDF 主体为每一行运行一次。
+
+使用 `.prerun<&Hook>()` 和 `.postrun<&Hook>()` 注册它们。所需的签名是：
+
+| 钩子 | 所需签名 |
+|------|--------------------|
+| Prerun | `void(vsql::PrerunArgs, vsql::PrerunResult)` |
+| Postrun | `void(vsql::PostrunArgs)` |
+
+使用 `PrerunResult::set_user_data(void*)` 来存储状态；使用 `PostrunArgs::delete_state<T>()` 来释放它。如果 prerun 调用 `set_user_data(new T{})`，则 postrun **必须**调用 `delete_state<T>()`——SDK 不会自动释放。
+
+`PrerunArgs::type_at(i)` 公开了在读取任何行之前声明的每个参数的 SQL 类型；返回的 `PrerunArgType` 上的谓词 `is_int()`、`is_real()`、`is_str()`、`is_custom()` 镜像列类型。在 prerun 中使用它来验证参数类型或调用 `PrerunResult::request_buffer_size(n)` 以调整结果缓冲区的大小。
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+struct CallCounter { long long n = 0; };
+
+void ba_call_index_prerun(PrerunArgs, PrerunResult out) {
+  out.set_user_data(new CallCounter{});
+}
+
+void ba_call_index(CallCounter &state, IntResult out) {
+  state.n++;
+  out.set(state.n);
+}
+
+void ba_call_index_postrun(PostrunArgs args) {
+  args.delete_state<CallCounter>();
+}
+
+// Registration:
+// make_func<&ba_call_index>("ba_call_index")
+//     .returns(INT).no_params()
+//     .prerun<&ba_call_index_prerun>()
+//     .postrun<&ba_call_index_postrun>()
+//     .build()
+```
+
+## 可变参数 VDF
+
+**varargs** VDF 接受任意数量的任何 SQL 类型的参数。使用 `.varargs()` 在函数生成器上声明一个，这与 `.no_params()` 和 `.param(TYPE)` 互斥。主体接收一个 `vsql::VarArgs` 参数，而不是通常的固定参数个数的参数类型。
+
+<Warning>
+Varargs 注册需要 VEF 协议 3。旧服务器会在安装时拒绝该扩展。
+</Warning>
+
+框架无法验证 varargs VDF 的参数计数或类型。将每个 varargs 注册与 prerun 钩子配对，该钩子在输入无效时调用 `PrerunResult::error()`，或者调用 `PrerunResult::request_buffer_size(n)` 以调整结果缓冲区的大小。
+
+使用 range-for 循环遍历参数。每个 `AnyArg` 元素都需要在读取其值之前进行类型检查：
+
+| 谓词 | 访问器 | 返回类型 |
+|-----------|----------|-------------|
+| `is_int()` | `as_int()` | `long long` |
+| `is_real()` | `as_real()` | `double` |
+| `is_str()` | `as_str()` | `std::string_view` |
+| `is_custom()` | `as_custom()` | `vsql::Span<const unsigned char>` |
+
+在任何访问器之前检查 `is_null()`——所有四个访问器在 null 参数上都是未定义的。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+constexpr size_t kBytearrayLen = 4;
+
+void ba_concat_all_prerun(PrerunArgs args, PrerunResult out) {
+  if (args.size() == 0) {
+    out.error("ba_concat_all requires at least one argument");
+    return;
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    auto t = args.type_at(i);
+    if (!t.is_custom() && !t.is_str()) {
+      out.error("ba_concat_all: argument " + std::to_string(i) +
+                " must be BYTEARRAY");
+      return;
+    }
+  }
+  out.request_buffer_size(args.size() * kBytearrayLen);
+}
+
+void ba_concat_all(VarArgs args, StringResult out) {
+  auto dst = out.buffer();
+  size_t off = 0;
+  for (auto a : args) {
+    if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
+    auto bytes = a.as_custom();
+    std::memcpy(dst.data() + off, bytes.data(), bytes.size());
+    off += bytes.size();
+  }
+  out.set_length(off);
+}
+
+// Registration:
+// make_func<&ba_concat_all>("ba_concat_all")
+//     .returns(STRING).varargs()
+//     .prerun<&ba_concat_all_prerun>()
+//     .build()
+```
+
+## VEF_GENERATE_REGISTRATION
+
+`VEF_GENERATE_REGISTRATION` 创建一个内部 `_vef_do_register()` 辅助函数，该函数执行扩展注册，但不定义 `extern "C"` 入口点。当您需要自定义 `vef_register` 行为时使用它——例如，在测试构建中注册后修补描述符。对于常规扩展，请改用 `VEF_GENERATE_ENTRY_POINTS`。
+
+```cpp
+VEF_GENERATE_REGISTRATION(
+    make_extension()
+        .func(make_func<&my_impl>("my_func").returns(INT).build()))
+
+// Then define your own extern "C" vef_register/vef_unregister that call
+// _vef_do_register() and optionally modify the result.
+```
+
+## 自定义类型操作
+
+有关完整的类型操作生成器参考——编码、解码、比较、哈希、内建默认值和参数化类型——请参阅 [类型操作](/zh/mysql-8.4/0.0.5/type-operations)。
+
+## 预览功能
+
+以下 VEF 功能作为选择加入的预览标头提供。ABI 和 API 仍在积极开发中；有关完整参考，请参阅 [预览功能](/zh/mysql-8.4/0.0.5/preview-capabilities)。
+
+- **扩展系统变量**——[预览功能 → 系统变量](/zh/mysql-8.4/0.0.5/preview-capabilities#system-variables)
+- **扩展状态变量**——[预览功能 → 状态变量](/zh/mysql-8.4/0.0.5/preview-capabilities#status-variables)
+- **密钥环访问**——[预览功能 → 密钥环访问](/zh/mysql-8.4/0.0.5/preview-capabilities#keyring-access)
+- **列存储**——[预览功能 → 列存储](/zh/mysql-8.4/0.0.5/preview-capabilities#column-storage)
+
+## 检查扩展注册元数据
+
+`INFORMATION_SCHEMA.EXTENSION_REGISTRATION` 将每个已加载扩展的内存 VEF 注册结构作为 JSON 文档公开。使用它来验证服务器在 `INSTALL EXTENSION` 之后是否已正确解析扩展的函数、类型和系统变量。
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL, REGISTRATION_JSON
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION
+WHERE EXTENSION_NAME = 'my_ext';
+```
+
+| 列 | 类型 | 描述 |
+|--------|------|-------------|
+| `EXTENSION_NAME` | `VARCHAR(64)` | 已安装扩展的名称。 |
+| `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | 扩展和服务器之间协商的 VEF 协议版本。 |
+| `REGISTRATION_JSON` | `TEXT` | `vef_registration_t` 结构的 JSON 序列化，包括 `funcs` 和 `types` 数组。 |
+
+## 另请参阅
+
+- [使用 C++ 创建扩展](/zh/mysql-8.4/0.0.5/create) — 端到端构建步骤、CMake 设置和安装
+- [C++ 测试](/zh/mysql-8.4/0.0.5/testing) — 本地开发服务器、MTR 以及调试失败
+- [类型操作](/zh/mysql-8.4/0.0.5/type-operations) — 编码、解码、比较、哈希、参数化类型
+- [C++ API 参考](/zh/mysql-8.4/0.0.5/extension-api-reference) — VDF 合约、空值处理和缓冲区大小
+- [扩展架构](/zh/mysql-8.4/0.0.5/architecture) — 生命周期、Victionary 缓存、性能模式和安全模型

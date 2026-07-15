@@ -1,0 +1,302 @@
+---
+audience: extension-author
+title: Rust 扩展示例
+description: 通过 vsql_rot13 和 vsql_rational 参考实现学习使用 Rust SDK
+---
+
+Rust SDK 仓库中随附了两个参考扩展——一个仅包含函数的最小示例，以及一个包含算术运算、排序和哈希的完整自定义类型。
+
+**源码：** [vsql-rust-sdk](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples) 中的 `examples/`
+
+---
+
+## vsql_rot13 — 仅包含函数的扩展
+
+最简单的 Rust 扩展：一个接受 STRING 并返回 STRING 的 VDF。
+
+**用法：**
+```sql
+INSTALL EXTENSION vsql_rot13;
+
+SELECT rot13('Hello, World!');
+-- 'Uryyb, Jbeyq!'
+
+SELECT rot13(rot13('Hello, World!'));
+-- 'Hello, World!' (rot13 is its own inverse)
+
+SELECT rot13(NULL);
+-- NULL
+```
+
+### 目录结构
+
+```
+vsql_rot13/
+├── Cargo.toml          # cdylib crate, depends on villagesql
+├── manifest.json       # Extension metadata
+├── src/
+│   └── lib.rs          # Implementation + extension! registration
+└── mysql-test/
+    └── t/*.test        # MTR test cases
+```
+
+### 实现
+
+**文件：`src/lib.rs`**
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// SQL: rot13(s STRING) -> STRING
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rot13_impl, "rot13",
+            [villagesql::Type::String] -> villagesql::Type::String),
+    ]
+}
+```
+
+**关键模式：**
+- VDF 接收 `&[InValue]` 并返回 `VdfReturn`——两者都是安全的 Rust 枚举
+- NULL 在两端都是一等变体；直接对其进行模式匹配
+- `extension!` 宏生成服务器在加载时调用的 C 入口点
+- `func!` 声明 SQL 签名；参数和返回类型使用 `villagesql::Type::*`
+
+### 清单
+
+**文件：`manifest.json`**
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "Example VillageSQL extension: provides vsql_rot13(STRING) -> STRING",
+  "author": "VillageSQL Community",
+  "license": "GPL-2.0"
+}
+```
+
+---
+
+## vsql_rational — 带算术运算的自定义类型
+
+一个完整的自定义类型：以约分形式 `(numerator, denominator)` 存储有理数，并带有算术函数、排序和哈希。
+
+**用法：**
+```sql
+INSTALL EXTENSION vsql_rational;
+
+CREATE TABLE measurements (id INT, ratio rational);
+INSERT INTO measurements VALUES
+    (1, '1/2'),
+    (2, '2/4'),   -- normalizes to '1/2' on storage
+    (3, '-3/6'),  -- normalizes to '-1/2'
+    (4, '0/1');
+
+SELECT id, ratio FROM measurements ORDER BY ratio;
+
+SELECT rational_add('1/2', '1/3');     -- '5/6'
+SELECT rational_mul('2/3', '3/4');     -- '1/2'
+SELECT rational_to_real('22/7');       -- 3.142857...
+```
+
+### 二进制存储格式
+
+`rational` 存储 **16 字节**（小端序）：
+- 字节 0–7：分子（`i64`）
+- 字节 8–15：分母（`i64`）
+
+值始终以约分形式（GCD = 1）存储，且分母为正。
+
+### 类型系统函数
+
+**文件：`src/lib.rs`**
+
+该类型注册了四个操作：编码（字符串 → 字节）、解码（字节 → 字符串）、比较（用于 ORDER BY）和哈希（用于索引）。
+
+```rust
+pub fn rational_encode(s: &str) -> Result<Vec<u8>, String> {
+    let (num_s, den_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("rational: expected 'n/d', got {s:?}"))?;
+    let num: i64 = num_s.trim().parse().map_err(|e| format!("numerator: {e}"))?;
+    let den: i64 = den_s.trim().parse().map_err(|e| format!("denominator: {e}"))?;
+    let (n, d) = normalize(i128::from(num), i128::from(den))
+        .ok_or_else(|| "rational: zero or overflowing denominator".to_string())?;
+    Ok(to_bytes(n, d))
+}
+
+pub fn rational_decode(b: &[u8]) -> Result<String, String> {
+    if b.len() < BYTES {
+        return Err(format!("rational: expected {} bytes, got {}", BYTES, b.len()));
+    }
+    let (n, d) = from_bytes(b);
+    Ok(format!("{n}/{d}"))
+}
+
+pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (n1, d1) = from_bytes(a);
+    let (n2, d2) = from_bytes(b);
+    // Cross-multiply; denominators are always positive after normalization
+    let lhs = i128::from(n1) * i128::from(d2);
+    let rhs = i128::from(n2) * i128::from(d1);
+    lhs.cmp(&rhs)
+}
+```
+
+### VDF 实现
+
+接受自定义类型的 VDF 会接收 `InValue::Custom(&[u8])`，并自行解码这些字节：
+
+```rust
+fn rational_add_impl(args: &[InValue]) -> VdfReturn {
+    match (arg(args, 0), arg(args, 1)) {
+        (Ok(Some((n1, d1))), Ok(Some((n2, d2)))) => {
+            match normalize(
+                i128::from(n1) * i128::from(d2) + i128::from(n2) * i128::from(d1),
+                i128::from(d1) * i128::from(d2),
+            ) {
+                Some((n, d)) => VdfReturn::Binary(to_bytes(n, d)),
+                None => VdfReturn::error("rational_add: overflow"),
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => VdfReturn::error(format!("rational_add: {e}")),
+        _ => VdfReturn::null(),
+    }
+}
+```
+
+### 注册
+
+`extension!` 宏在单个声明中同时注册类型及其函数：
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rational_add_impl, "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_sub_impl, "rational_sub",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_mul_impl, "rational_mul",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_div_impl, "rational_div",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_numer_impl, "rational_numer",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_denom_impl, "rational_denom",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_to_real_impl, "rational_to_real",
+            [villagesql::custom!("rational")] -> villagesql::Type::Real,
+            deterministic: true),
+    ],
+    types: [
+        villagesql::custom_type!(
+            type_name: "rational",
+            persisted_length: 16,
+            max_decode_buffer_length: 42,
+            encode: rational_encode,
+            decode: rational_decode,
+            compare: rational_compare,
+            hash: rational_hash,
+            default: "0/1",
+        ),
+    ]
+}
+```
+
+**关键模式：**
+- `villagesql::custom!("name")` 用于以参数或返回值的形式引用自定义类型
+- `custom_type!` 注册类型及其 encode/decode/compare/hash 函数
+- `default: "0/1"` 是内建默认值——服务器在类型初始化时会对该字符串调用 `encode()`，因此它必须是一个有效值
+- `persisted_length` 必须与 `encode()` 返回的字节长度匹配
+- `deterministic: true` 让优化器可以折叠常量调用
+
+---
+
+## 关键实现模式
+
+| 模式 | 用法 |
+|---------|-------|
+| **VDF 签名** | `fn impl(args: &[InValue]) -> VdfReturn` |
+| **NULL 处理** | 显式匹配 `InValue::Null` 和 `None` |
+| **错误报告** | `VdfReturn::error("message")` 中止语句 |
+| **自定义类型 encode** | 返回 `Result<Vec<u8>, String>` |
+| **自定义类型 decode** | 返回 `Result<String, String>` |
+| **类型感知参数** | 在 `func!` 中使用 `villagesql::custom!("name")` |
+| **注册** | 单个 `extension!` 块声明函数和类型 |
+
+---
+
+## 测试
+
+这两个示例都像 C++ 扩展一样使用 MTR（MySQL Test Runner）：
+
+```bash
+cd /path/to/villagesql/build/mysql-test
+./mysql-test-run.pl --suite=vsql_rot13
+./mysql-test-run.pl --suite=vsql_rational
+```
+
+使用 `--record` 生成或更新预期结果。
+
+---
+
+## 后续步骤
+
+<CardGroup cols={2}>
+  <Card
+    title="在 Rust 中创建扩展"
+    icon="rust"
+    href="/zh/mysql-8.4/0.0.5/rust-sdk"
+  >
+    SDK 安装、构建以及 extension! 宏
+  </Card>
+  <Card
+    title="Rust 自定义类型"
+    icon="cube"
+    href="/zh/mysql-8.4/0.0.5/rust-custom-types"
+  >
+    深入了解 encode、decode、compare 和 hash
+  </Card>
+  <Card
+    title="Rust API 参考"
+    icon="book"
+    href="/zh/mysql-8.4/0.0.5/rust-api-reference"
+  >
+    InValue、VdfReturn 以及宏接口
+  </Card>
+  <Card
+    title="示例源码"
+    icon="github"
+    href="https://github.com/villagesql/vsql-rust-sdk/tree/main/examples"
+  >
+    vsql_rot13 和 vsql_rational 的完整源码
+  </Card>
+</CardGroup>

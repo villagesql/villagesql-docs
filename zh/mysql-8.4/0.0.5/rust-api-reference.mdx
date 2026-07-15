@@ -1,0 +1,182 @@
+---
+audience: extension-author
+title: "Rust API 参考"
+description: "VillageSQL Rust SDK 的完整参考 — InValue、VdfReturn、extension!、func!、custom_type!、custom! 以及 manifest.json 字段。"
+---
+
+<Warning>
+  Rust SDK 处于 alpha 阶段——各版本之间可能出现破坏性的 API 变更。支持纯函数扩展和自定义类型（encode、decode、compare、hash）。聚合、`prerun()`、`VarArgs`、系统变量和状态变量、keyring 访问以及列存储 ABI 目前仅在 C++ SDK 中提供——如果您需要其中任何一项，请使用 [C++ SDK](/zh/mysql-8.4/0.0.5/create)。
+</Warning>
+
+本页是 `villagesql` crate API 的参考。有关入门教程，请参阅 [在 Rust 中构建扩展](/zh/mysql-8.4/0.0.5/rust-sdk)。有关自定义类型，请参阅 [Rust 中的自定义类型](/zh/mysql-8.4/0.0.5/rust-custom-types)。
+
+## InValue
+
+`InValue` 是服务器为每个函数参数传递的枚举。您的函数接收 `args: &[InValue]`，并且必须在使用其值之前检查每个参数。
+
+```rust
+pub enum InValue<'a> {
+    String(&'a str),
+    Real(f64),
+    Int(i64),
+    Null,
+    Custom(&'a [u8]),
+}
+```
+
+| 变体 | Rust 类型 | 对应的 SQL 类型 |
+|---|---|---|
+| `String(&str)` | UTF-8 字符串切片 | `STRING` / `VARCHAR` / `TEXT` |
+| `Real(f64)` | 64 位浮点数 | `REAL` / `DOUBLE` / `FLOAT` |
+| `Int(i64)` | 64 位有符号整数 | `INT` / `BIGINT` / `TINYINT` |
+| `Null` | — | SQL 中任何类型的 `NULL` |
+| `Custom(&[u8])` | 原始二进制字节 | 通过 `custom_type!` 注册的任何自定义类型 |
+
+始终显式匹配 `Null`。调用 `.unwrap()` 或仅模式匹配值变体是一种错误——SQL NULL 是一种正常的输入，而不是错误。
+
+## VdfReturn
+
+`VdfReturn` 是您的函数返回给服务器的内容。使用以下关联函数之一构造它：
+
+| 构造函数 | SQL 效果 |
+|---|---|
+| `VdfReturn::null()` | 为此行返回 SQL NULL |
+| `VdfReturn::string(s)` | 返回一个 `String` 值；`s` 是 `impl Into<String>` |
+| `VdfReturn::real(v)` | 返回一个 `f64` 值 |
+| `VdfReturn::int(v)` | 返回一个 `i64` 值 |
+| `VdfReturn::binary(bytes)` | 返回自定义类型列的二进制字节；`bytes` 是 `Vec<u8>` |
+| `VdfReturn::warning(msg)` | 为此行返回 NULL，添加 SQL 警告，执行继续 |
+| `VdfReturn::error(msg)` | 因致命错误中止语句 |
+
+**警告与错误：**
+
+对于用户输入验证失败的情况，如果继续处理其余结果集是有意义的，请使用 `warning`。在严格模式下，MySQL 会在 `INSERT` 和 `UPDATE` 上将警告升级为错误。对于继续操作不安全的情况（损坏存储的数据、违反内部不变量），请使用 `error`。致命错误会中止整个语句。
+
+```rust
+fn validate_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::Int(n)) if *n >= 0 => VdfReturn::int(*n),
+        Some(InValue::Int(_)) => VdfReturn::warning("value must be non-negative"),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("validate: expected an INT argument"),
+    }
+}
+```
+
+## extension! 宏
+
+`extension!` 生成服务器在加载 VEB 文件时调用的 VEF 入口点。它必须在 crate 中恰好出现一次。
+
+```rust
+villagesql::extension! {
+    funcs: [
+        // One or more villagesql::func!(...) declarations
+    ],
+    types: [
+        // One or more villagesql::custom_type!(...) declarations
+    ]
+}
+```
+
+两个部分都是可选的。纯函数扩展省略 `types:`；仅类型扩展省略 `funcs:`。一个空的 `extension!` 块（没有函数，也没有类型）是有效的，但会生成一个不执行任何操作的扩展。
+
+## func! 宏
+
+`func!` 声明一个可从 SQL 调用的函数。有四种形式（不带可选参数、仅 `buffer_size`、仅 `deterministic`、两者都有）：
+
+```rust
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N, deterministic: true)
+```
+
+<Note>
+  `buffer_size` 参数需要 `villagesql` crate **0.0.2 或更高版本**。当前的 [crates.io](https://crates.io/crates/villagesql) 发布版本（`0.0.1`）尚未公开该参数——在 `0.0.2` 发布之前，请使用不带 `buffer_size` 的形式。
+</Note>
+
+| 参数 | 描述 |
+|---|---|
+| `rust_fn` | 实现 VDF 的 Rust 函数。签名：`fn(&[InValue]) -> VdfReturn`。 |
+| `"sql_name"` | SQL 函数名，作为一个字符串字面量。这是用户从 SQL 中调用的名称。 |
+| `[param_types]` | 以逗号分隔的 `villagesql::Type::*` 或 `villagesql::custom!("name")` 值列表。对于零参数函数，使用 `[]`。 |
+| `return_type` | `villagesql::Type::*` 或 `villagesql::custom!("name")`。 |
+| `buffer_size: N` | 可选。字符串/二进制返回值的结果缓冲区大小（以字节为单位）。使用 `0` 表示服务器默认值（256 字节）。当函数返回的字符串或二进制值大于 `buffer_size` 时，函数会报错而不是截断——声明一个更大的 `buffer_size` 以处理更大的结果。 |
+| `deterministic: true` | 可选。声明该函数是确定性的——相同的输入始终产生相同的输出，没有副作用。优化器可以缓存相同输入的结果。仅当为真时才设置此项。 |
+
+在 `func!` 中使用的 **类型常量**：
+
+| `villagesql::Type::*` | SQL 类型 |
+|---|---|
+| `villagesql::Type::String` | `STRING` |
+| `villagesql::Type::Real` | `REAL` |
+| `villagesql::Type::Int` | `INT` |
+
+## custom_type! 宏
+
+`custom_type!` 注册一个新的列类型。`type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode` 和 `compare` 是必需的。`hash` 和 `default` 是可选的，但建议使用。
+
+```rust
+villagesql::custom_type!(
+    type_name: "sql_type_name",
+    persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: encode_fn,
+    decode: decode_fn,
+    compare: compare_fn,
+    hash: hash_fn,
+    default: "default_string",
+)
+```
+
+| 字段 | 类型 | 描述 |
+|---|---|---|
+| `type_name` | `&str` 字面量 | SQL 中该类型的名称。在 SQL 中不区分大小写。必须是所有已安装扩展中唯一的。 |
+| `persisted_length` | `usize` | 磁盘上存储的固定字节长度。所有编码的值都必须产生恰好该长度的字节。 |
+| `max_decode_buffer_length` | `usize` | 解码字符串的最大字节长度。用于在调用 `decode` 之前确定输出缓冲区的大小。 |
+| `encode` | `fn(&str) -> Result<Vec<u8>, String>` | 在 `INSERT` 时调用。将 SQL 字符串字面量转换为二进制。返回 `Err(msg)` 以拒绝输入。 |
+| `decode` | `fn(&[u8]) -> Result<String, String>` | 在显示值时调用。将二进制转换为字符串。 |
+| `compare` | `fn(&[u8], &[u8]) -> std::cmp::Ordering` | 在 `ORDER BY`、`MIN`、`MAX` 中调用。返回 `Less`、`Equal` 或 `Greater`。 |
+| `hash` | `fn(&[u8]) -> usize` | 可选。在 `COUNT(DISTINCT)` 和集合操作中调用。比较结果为 `Equal` 的值必须哈希到相同的值。建议用于索引列。 |
+| `default` | `&str` 字面量 | 可选。一个有效的字符串，服务器在类型初始化时对其进行编码，以验证回调是否正常工作。必须编码为恰好 `persisted_length` 个字节。 |
+
+`default` 字段不是列的默认值——它是一个启动探测。服务器在加载扩展时调用 `encode(default)` 以验证回调是否正常工作。如果 `encode` 对该默认值返回 `Err`，则扩展将无法加载。
+
+## custom! 宏
+
+`villagesql::custom!("type_name")` 在 `func!` 声明中按名称引用一个自定义类型：
+
+```rust
+villagesql::func!(
+    my_fn,
+    "my_sql_func",
+    [villagesql::custom!("mytype")] -> villagesql::custom!("mytype"),
+    deterministic: true
+)
+```
+
+在任何可以使用 `villagesql::Type::*` 的参数列表或返回类型位置中使用它。该字符串必须与相应的 `custom_type!` 中声明的 `type_name` 匹配。
+
+## manifest.json 字段
+
+每个扩展都需要一个与 `Cargo.toml` 位于同一位置的 `manifest.json` 文件：
+
+```json
+{
+  "name": "vsql_my_extension",
+  "version": "0.1.0",
+  "description": "Brief description of what the extension does",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+| 字段 | 必需 | 格式 | 描述 |
+|---|---|---|---|
+| `name` | 是 | 小写字母、数字、`_`、`-` | 扩展标识符。必须与 `INSTALL EXTENSION` 名称匹配。使用下划线——连字符需要在 SQL 中使用反引号引用。 |
+| `version` | 是 | MAJOR.MINOR.PATCH | 语义版本。 |
+| `description` | 否 | 字符串 | 在 `INFORMATION_SCHEMA.EXTENSIONS` 中显示。 |
+| `author` | 否 | 字符串 | 作者姓名或组织。 |
+| `license` | 否 | 字符串 | 许可证标识符。建议使用 `GPL-2.0` 作为开源扩展。 |
+
+`name` 验证规则：必须以字母开头，以字母或数字结尾，最大长度为 64 个字符。无效的清单会导致 `INSTALL EXTENSION` 失败。
