@@ -1,0 +1,414 @@
+---
+audience: extension-author
+title: "Operações de Tipo"
+description: "Referência detalhada dos construtores de operações de tipo em C++ — encode, decode, compare, hash, padrões intrínsecos e tipos parametrizados."
+---
+
+Esta página é a referência dos construtores de operações de tipo em C++. Para a introdução em nível de tutorial aos tipos personalizados, consulte [Tipos Personalizados em C++](/pt-BR/mysql-8.4/0.0.5/custom-types).
+
+Os tipos personalizados exigem três operações que o mecanismo chama internamente: encode (string para binário), decode (binário para string) e compare. O hash é opcional. Implemente-as de acordo com estas assinaturas em C++ (todas disponíveis via `<villagesql/vsql.h>`):
+
+## Tipos de Comprimento Fixo
+
+```cpp
+// Encode: string -> binary. Write the encoded bytes via out.buffer() and
+// out.set_length(n); call out.set_null() for SQL NULL, out.warning(msg) for
+// recoverable bad input, or out.error(msg) to abort the statement. Returning
+// without calling any of these surfaces a default warning.
+using TypeEncodeFunc = void (*)(std::string_view from, vsql::CustomResult out);
+
+// Decode: binary -> string. Report the outcome by calling
+// out.set_length(n), out.set(sv), out.set_null(), out.warning(msg), or
+// out.error(msg). If none is called the SDK falls back to a default
+// "failed to decode value" ERROR.
+using TypeDecodeFunc = void (*)(vsql::CustomArg in, vsql::StringResult out);
+
+// Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
+using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
+
+// Hash: returns hash code (used for hash joins).
+using TypeHashFunc = size_t (*)(vsql::CustomArg in);
+```
+
+Registre essas operações usando `vsql::make_type<kTypeName>()`. O nome do tipo
+é passado como um parâmetro de template que não é de tipo (NTTP) — um array
+`static constexpr const char[]`. O construtor gera automaticamente nomes de VDF
+no formato `TYPE::method` (por exemplo, `"MYTYPE::from_string"`) a partir desse NTTP,
+de modo que nenhuma correspondência manual de strings seja necessária. Passe o objeto de
+tipo construído para `.type()` no construtor da extensão; chamadas `.func()`
+separadas para operações de tipo não são necessárias.
+
+<Warning>
+O nome do tipo deve ser uma variável `static constexpr const char[]` — um literal de string não pode ser usado como parâmetro de template que não é de tipo. Passar `"MYTYPE"` diretamente produz um erro de compilação como:
+
+```
+error: '"MYTYPE"' is not a valid template argument for type 'const char*'
+```
+
+Declare o nome como um array nomeado, como mostrado abaixo.
+</Warning>
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(8)
+        .max_decode_buffer_length(64)
+        .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
+        .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
+        .compare<&my_compare>()      // auto: "MYTYPE::compare"
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
+        .intrinsic_default_str("0")  // string-literal intrinsic default
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE))
+```
+
+`build()` falha em tempo de compilação se `from_string`, `to_string` ou `compare`
+estiver ausente. Cada método de template verifica a assinatura do ponteiro de função via
+`static_assert`.
+
+## Padrão Intrínseco {#intrinsic-default}
+
+Quando uma coluna de tipo personalizado `NOT NULL` recebe `NULL` no modo `IGNORE`
+(por exemplo, `INSERT IGNORE` ou `UPDATE IGNORE`), o servidor chama o padrão
+intrínseco para produzir um valor alternativo em vez de gerar um erro. O
+padrão intrínseco fornece uma representação em string; o servidor a converte
+para binário usando a função `from_string` do tipo.
+
+<Note>
+Se você omitir tanto `.intrinsic_default_str()` quanto `.intrinsic_default_vdf()`,
+o servidor chama `from_string("")` como alternativa. Isso acontece quando o tipo
+é **usado pela primeira vez** (na criação da tabela), não em `INSTALL EXTENSION`. Se a sua
+função de encode rejeitar a string vazia (ou codificá-la para o número errado de
+bytes), a inicialização do tipo falha com um erro visível no cliente SQL:
+
+```
+Type 'MYTYPE' failed to initialize: from_string VDF encoded intrinsic
+default input '' to N bytes, expected persisted_length=M
+```
+
+Para tipos de comprimento fixo, a string padrão deve codificar para exatamente
+`persisted_length` bytes. Defina um padrão explícito para qualquer tipo em que
+a string vazia não seja uma entrada válida.
+</Note>
+
+**Literal de string: `.intrinsic_default_str()`**
+
+Para um padrão constante, passe a string diretamente no construtor do tipo (como
+mostrado no exemplo de comprimento fixo acima, com `.intrinsic_default_str("0")`).
+
+**Baseado em VDF: `.intrinsic_default_vdf()` + `make_intrinsic_default`**
+
+Quando o valor padrão depende dos parâmetros do tipo, implemente uma função
+de acordo com uma destas assinaturas (disponíveis via `<villagesql/vsql.h>`):
+
+<Warning>
+  **Mudança incompatível**: `IntrinsicDefaultFunc` e
+  `IntrinsicDefaultWithParamsFunc` retornam `std::string` em vez de `const char*`.
+  Atualize quaisquer implementações de padrão intrínseco existentes para retornar `std::string` diretamente.
+</Warning>
+
+```cpp
+// Fixed (no type parameters):
+using IntrinsicDefaultFunc = std::string (*)(char *error_msg);
+
+// Parameterized (receives cached parsed params):
+template <typename P>
+using IntrinsicDefaultWithParamsFunc = std::string (*)(const P &,
+                                                       char *error_msg);
+```
+
+Retorne uma representação `std::string` do valor padrão. Em caso de erro,
+escreva uma mensagem em `error_msg` e retorne qualquer valor (o SDK verifica
+`error_msg[0] != '\0'` para detectar erros). Registre com
+`make_intrinsic_default<&fn>("vdf_name")` (um argumento: o nome da VDF) e
+referencie esse nome no construtor do tipo com `.intrinsic_default_vdf()`.
+O exemplo de tipos parametrizados abaixo mostra o padrão de registro completo.
+
+```cpp
+std::string mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
+  return /* build string representation based on p */;
+}
+```
+
+## Tipos Parametrizados {#parameterized-types}
+
+Os tipos parametrizados precisam dos parâmetros declarados da coluna nos momentos de
+encode, decode, compare e hash para determinar os tamanhos de alocação e o layout.
+Defina uma struct de parâmetros com uma função de parse e uma função inversa `to_strings`,
+registre ambas no construtor do tipo com
+`.params<P, &ParseFunc, &ToStringsFunc>()`, e use `const P&` como o primeiro
+argumento das suas funções de operação de tipo. O SDK armazena em cache o resultado do parse
+por combinação única de parâmetros, de modo que a função de parse é executada no máximo uma vez
+por instanciação de tipo. A função `to_strings` é a inversa de `parse`:
+ela escreve um `P` tipado de volta na forma canônica de string chave/valor para que
+o servidor possa publicar os parâmetros inferidos no mesmo formato que `parse` consome.
+
+```cpp
+struct MyTypeParams {
+  int64_t dimension;
+  static MyTypeParams parse(const std::map<std::string, std::string> &p) {
+    return {.dimension = stoll(p.at("dimension"))};
+  }
+  static void to_strings(const MyTypeParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
+  }
+};
+
+void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
+                   std::string_view from, vsql::CustomResult out) {
+  const MyTypeParams &p = params.value();  // is_known() is always true at runtime
+  size_t bytes = (size_t)p.dimension * 4;
+  auto buf = out.buffer();
+  if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
+  // ... parse from, write to buf ...
+  out.set_length(bytes);
+}
+
+void mytype_decode(vsql::CustomArgWith<MyTypeParams> in,
+                   vsql::StringResult out) {
+  const MyTypeParams &p = in.params();
+  // ... read p.dimension floats from in.value(), write to out.buffer() ...
+  out.set_length(bytes_written);
+}
+
+int mytype_compare(vsql::CustomArgWith<MyTypeParams> a,
+                   vsql::CustomArgWith<MyTypeParams> b) {
+  // Returns -1, 0, or 1.
+}
+
+size_t mytype_hash(vsql::CustomArgWith<MyTypeParams> in) {
+  // Returns hash code.
+}
+
+// Converts MYTYPE(N) integer syntax to a parameter map.
+// Signature: IntToTypeParamsFunc from <villagesql/vsql.h>.
+bool mytype_int_to_params_fn(int64_t value,
+                             std::map<std::string, std::string> &params,
+                             char *error_msg) {
+  if (value <= 0) {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: dimension must be a positive integer");
+    return true;
+  }
+  params["dimension"] = std::to_string(value);
+  return false;  // success
+}
+
+// Validates parameters and computes storage sizes.
+// Signature: ResolveTypeParamsFunc from <villagesql/vsql.h>.
+bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
+                              vsql::ResolvedTypeParams *result,
+                              char *error_msg) {
+  int64_t dim = std::stoll(params.at("dimension"));
+  result->persisted_length = dim * 4;
+  result->max_decode_buffer_length = 64;
+  return false;  // success
+}
+```
+
+Registre `.params<>()` no construtor do tipo. Use `.int_to_params<&mytype_int_to_params_fn>()`
+para tratar a sintaxe de inteiro `MYTYPE(N)` e `.resolve_params<&mytype_resolve_params_fn>()` para
+validar os parâmetros e calcular os tamanhos de armazenamento. Chame `.max_persisted_length(N)` com um
+limite superior do tamanho persistido em bytes em todas as parametrizações válidas; o servidor
+usa isso apenas no caminho de inferência de parâmetros de tipo, onde ele ainda não inferiu
+os parâmetros e, portanto, não pode consultar `resolve_params` para dimensionar o buffer de encode.
+Para um padrão intrínseco baseado em VDF, use `.intrinsic_default_vdf()` com o nome da VDF e
+registre a VDF separadamente via `make_intrinsic_default<&mytype_default>()`.
+
+<Warning>
+`.max_persisted_length()` requer o VEF Protocolo 3 ou superior. Um tipo que o utiliza
+não pode ser carregado por servidores anteriores ao Protocolo 3.
+</Warning>
+
+```cpp
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+// Maximum valid dimension for MYTYPE.
+constexpr int64_t kMyTypeMaxDimension = 1024;  // your max valid dimension
+// Upper bound on MYTYPE's persisted byte size across all valid params.
+constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .variable_length_type()  // Protocol 4; use instead of persisted_length(-1)
+        .max_decode_buffer_length(16)
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
+        .int_to_params<&mytype_int_to_params_fn>()
+        .resolve_params<&mytype_resolve_params_fn>()
+        .from_string<&mytype_encode>()
+        .to_string<&mytype_decode>()
+        .compare<&mytype_compare>()
+        .intrinsic_default_vdf("mytype_intrinsic_default")
+        .build();
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE)
+        .func(make_intrinsic_default<&mytype_default>(
+            "mytype_intrinsic_default")))
+```
+
+As variantes parametrizadas (`TypeEncodeWithParamsFunc<P>`,
+`TypeDecodeWithParamsFunc<P>`, `TypeCompareWithParamsFunc<P>` e
+`TypeHashWithParamsFunc<P>`) juntamente com `ParamsToStringsFunc<P>`
+(`void fn(const P&, std::map<std::string,std::string>&)`) estão disponíveis via
+`<villagesql/vsql.h>`.
+Os métodos de template `vsql::make_type` detectam o argumento de parâmetros e roteiam
+através do cache de parâmetros automaticamente. As funções de encode recebem
+`vsql::MaybeParams<P> &` como primeiro argumento; `is_known()` é sempre verdadeiro
+em tempo de execução, e `value()` retorna `const P&`. As variantes de decode, compare e hash
+recebem `vsql::CustomArgWith<P>`, cujo acessador `params()` retorna
+`const P&`.
+
+**Fornecendo parâmetros em SQL.** Duas sintaxes chegam a `resolve_params`:
+
+- **Inteiro** — `MYTYPE(N)`. O servidor roteia `N` através de `int_to_params` para
+  construir o mapa de parâmetros. Requer `.int_to_params<>()`.
+- **String** — `MYTYPE('key=value,...')`. O servidor normaliza a string e
+  chama `resolve_params` diretamente; `int_to_params` não é envolvido. Disponível
+  sempre que `.resolve_params<>()` estiver registrado — sem chamada extra do construtor.
+
+Um tipo que registra apenas `.resolve_params<>()` aceita a forma de string e
+rejeita `MYTYPE(N)`. `SHOW CREATE TABLE` preserva qualquer forma que tenha sido escrita.
+
+```sql
+CREATE TABLE t (v ext.MYTYPE(8));              -- integer form (.int_to_params)
+CREATE TABLE t2 (v ext.MYTYPE('dimension=8')); -- string form (.resolve_params only)
+```
+
+<Note>
+A string de parâmetros serializada `key=value,...` que `int_to_params` produz
+e `resolve_params` consome é limitada a `VEF_MAX_TYPE_PARAMS_STRING_LEN`
+(1024 bytes). Uma parametrização cuja string canônica exceda esse limite
+é rejeitada com um erro definido em vez de ser truncada silenciosamente — mantenha os
+nomes e valores de parâmetros combinados de um único tipo dentro de 1024 bytes.
+</Note>
+
+### Reescrevendo parâmetros e fornecendo padrões
+
+`resolve_params` tem uma segunda sobrecarga, mutável: ela recebe o mapa de parâmetros por
+referência não constante, de modo que o tipo pode reescrevê-lo — normalmente para preencher padrões que o
+autor omitiu. Registre-a da mesma forma (`.resolve_params<&fn>()` aceita
+qualquer forma; registre apenas uma):
+
+```cpp
+bool mytype_resolve_params_fn(std::map<std::string, std::string> &params,
+                              vsql::ResolvedTypeParams *result, char *error_msg) {
+  if (params.find("dimension") == params.end())
+    params["dimension"] = "128";                 // supply a default
+  int64_t dim = std::stoll(params.at("dimension"));
+  result->persisted_length = dim * 4;
+  result->max_decode_buffer_length = 64;
+  return false;                                  // success
+}
+```
+
+O mapa reescrito torna-se a string de parâmetros canônica que o servidor persiste e
+`SHOW CREATE TABLE` imprime, portanto a reescrita deve ser idempotente. Uma declaração
+**simples** (`MYTYPE`, sem comprimento ou parâmetros) agora chama `resolve_params` com um
+mapa vazio em vez de ignorá-la, de modo que um tipo que fornece padrões dá a cada
+coluna parâmetros explícitos — o `BITFIELD` de `vsql_bitfield_test` resolve uma coluna
+simples para `max_number_of_bits=4096`:
+
+```sql
+INSTALL EXTENSION vsql_bitfield_test;
+CREATE TABLE bits (id INT PRIMARY KEY, b vsql_bitfield_test.BITFIELD);
+SHOW CREATE TABLE bits;   -- b persists as BITFIELD('max_number_of_bits=4096')
+```
+
+## Tipos de Comprimento Variável
+
+Um tipo personalizado de comprimento variável decide seu tamanho persistido por valor, em vez de
+usar um único footprint fixo. Declare um chamando `.variable_length_type()`
+no construtor do tipo, o que define a flag `variable_length` do tipo.
+
+<Warning>
+`.variable_length_type()` eleva o protocolo exigido pelo tipo para o VEF Protocolo 4.
+O servidor lê a flag `variable_length` apenas no protocolo 4 ou superior. Compile
+com os cabeçalhos opcionais da dev ABI (`-DVSQL_USE_DEV_ABI=ON`); servidores mais antigos não
+leem a flag.
+</Warning>
+
+Os tipos de comprimento variável também devem chamar `.max_persisted_length(N)`. `build()` falha
+em tempo de compilação se ele for omitido — o servidor precisa do limite superior para alocar
+um buffer para o campo de suporte.
+
+`.variable_length_type()` é monotônico: chamá-lo antes ou depois dos setters do Protocolo 3
+(`max_persisted_length()`, `params()`, `int_to_params()`) não reduz
+a exigência de protocolo de volta para abaixo do Protocolo 4.
+
+```cpp
+#include <villagesql/vsql.h>
+using namespace vsql;
+
+static constexpr const char kMyTypeName[] = "MYTYPE";
+constexpr int64_t kMyTypeMaxPersistedLength = 4096;
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .variable_length_type()  // per-value sizing; requires Protocol 4
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .max_decode_buffer_length(64)
+        .from_string<&my_encode>()
+        .to_string<&my_decode>()
+        .compare<&my_compare>()
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE))
+```
+
+<Note>
+Como todo tipo personalizado, um tipo de comprimento variável deve produzir um
+[padrão intrínseco](#intrinsic-default) utilizável. O padrão é codificado dentro da
+capacidade máxima do campo, e qualquer resultado não vazio de 1 a
+`max_persisted_length` bytes é aceito. Um tipo cujo encode de string vazia
+produz **zero** bytes (um array ou conjunto de bits vazio, digamos) não tem um padrão
+utilizável, portanto declare um explícito que codifique para um valor não vazio:
+
+```cpp
+        .max_persisted_length(kMyTypeMaxPersistedLength)
+        .intrinsic_default_str("[0]")  // empty "[]" would encode to zero bytes
+```
+
+Caso contrário, o tipo falha ao inicializar na primeira vez que uma coluna `NOT NULL` o
+referencia, em `CREATE TABLE` — o mesmo que um tipo de comprimento fixo que não consegue
+codificar `from_string("")`.
+</Note>
+
+## Tipos Personalizados em Stored Procedures
+
+Tipos personalizados de extensão podem ser usados como tipos de parâmetro de stored procedure e
+em declarações de variáveis `DECLARE`. O servidor resolve o tipo personalizado no
+momento da execução da rotina usando os metadados de tipo da extensão instalada.
+
+```sql
+DELIMITER //
+CREATE PROCEDURE insert_complex(IN val COMPLEX)
+BEGIN
+  DECLARE tmp COMPLEX;
+  SET tmp = val;
+  INSERT INTO t1 VALUES (tmp);
+END //
+DELIMITER ;
+```
+
+## Veja Também
+
+- [Tipos Personalizados em C++](/pt-BR/mysql-8.4/0.0.5/custom-types) — introdução em nível de tutorial aos tipos personalizados
+- [Referência da API C++](/pt-BR/mysql-8.4/0.0.5/extension-api-reference) — contratos de VDF, tratamento de null e dimensionamento de buffer
+- [Desenvolvimento em C++](/pt-BR/mysql-8.4/0.0.5/development) — profundidade de autoria de VDF, tipos de argumento e resultado, agregados, varargs

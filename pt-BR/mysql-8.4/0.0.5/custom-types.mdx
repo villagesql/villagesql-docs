@@ -1,0 +1,314 @@
+---
+audience: extension-author
+title: "Tipos Personalizados em C++"
+description: "Defina novos tipos de coluna para extensões VillageSQL em C++ — operações de tipo, regras de ALTER TABLE, funções de conversão e um exemplo completo do tipo COMPLEX."
+---
+
+<Warning>
+  Os tipos personalizados usam o VEF Protocolo 3, estável a partir da v0.0.4. O
+  Protocolo 4 está em desenvolvimento e está disponível apenas por meio dos
+  cabeçalhos opt-in da dev ABI (`-DVSQL_USE_DEV_ABI=ON`). Extensões compiladas
+  contra o antigo Protocolo 2 são rejeitadas pelo servidor e precisam ser
+  recompiladas.
+</Warning>
+
+Os tipos personalizados permitem que você defina novos tipos de coluna (como
+`COMPLEX`, `UUID` ou `VECTOR`) que funcionam com `ORDER BY`, índices e funções
+de agregação. Esta página é o Passo 4 do tutorial [Criando Extensões em C++](/pt-BR/mysql-8.4/0.0.5/create).
+Conclua os Passos 1 a 3 antes de continuar aqui.
+
+## Definir as Operações de Tipo
+
+Todo tipo personalizado precisa de operações de codificação, decodificação e comparação e, opcionalmente, de uma operação de hash. Implemente-as de acordo com estas assinaturas e passe os objetos builder para `vsql::make_type<>()`:
+
+```cpp
+// Encode: string -> binary. Write to out.buffer() and call out.set_length(n).
+void mytype_from_string(std::string_view from, vsql::CustomResult out) { /* ... */ }
+
+// Decode: binary -> string. Write to out.buffer() and call out.set_length(n).
+void mytype_to_string(vsql::CustomArg in, vsql::StringResult out) { /* ... */ }
+
+// Compare: returns <0, 0, or >0.
+int mytype_compare(vsql::CustomArg a, vsql::CustomArg b) { /* ... */ }
+
+// Hash: returns hash code (optional).
+size_t mytype_hash(vsql::CustomArg in) { /* ... */ }
+```
+
+<Note>
+Para uma VDF `from_string` (que retorna o tipo personalizado), o servidor
+dimensiona o buffer de saída para pelo menos o valor `persisted_length` do tipo
+antes de invocar a VDF, portanto `buf.size() >= persisted_length` é garantido na
+entrada. Isso se aplica tanto a tipos de largura fixa quanto a tipos
+parametrizados (onde `persisted_length` é resolvido a partir do contexto do tipo
+no momento da chamada). Nenhuma solicitação separada de tamanho de buffer é
+necessária.
+</Note>
+
+O acesso binário bruto passa por `vsql::Span<T>`, uma visão não proprietária
+sobre uma sequência contígua de `T` — `in.value()` retorna
+`vsql::Span<const unsigned char>` e `out.buffer()` retorna
+`vsql::Span<unsigned char>`. Usando C++20 ou posterior, `vsql::Span<T>` é um
+alias para `std::span<T>`; sob C++17, o SDK C++ fornece uma implementação de
+fallback mínima e compatível em nível de código-fonte, com a mesma superfície de
+`data()`, `size()`, `empty()`, indexação e iteradores. Ela está disponível por
+meio de `#include <villagesql/vsql.h>`.
+
+## Registrar o Tipo
+
+O template `vsql::make_type<kName>()` incorpora as operações de codificação,
+decodificação, comparação e hash diretamente no objeto do tipo. Os nomes das VDFs
+são gerados automaticamente como `TYPE::from_string`, `TYPE::to_string`,
+`TYPE::compare` e `TYPE::hash` em tempo de compilação. Chamadas separadas de
+`.func(make_type_encode<>(...))` não são necessárias.
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Required for auto-generating VDF names at compile time.
+static constexpr const char kMyTypeName[] = "MYTYPE";
+
+constexpr auto MYTYPE =
+    vsql::make_type<kMyTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&mytype_from_string>()   // auto: "MYTYPE::from_string"
+        .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
+        .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
+        .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
+        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Development guide
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(MYTYPE)
+);
+```
+
+`build()` falha na compilação se `from_string`, `to_string` ou `compare` estiver
+ausente. Cada método de template valida a assinatura do ponteiro de função com
+`static_assert`.
+
+O nome do tipo é passado como um parâmetro de template que não é de tipo (NTTP).
+Declare-o como um array `static constexpr const char[]` — a identidade do ponteiro
+é usada como chave para buffers independentes de nomes de VDF, portanto dois tipos
+que compartilham um ponteiro de função ainda obtêm nomes gerados automaticamente
+separados.
+
+## Referência das Operações de Tipo
+
+A API baseada em template gera automaticamente estas VDFs que podem ser chamadas via SQL:
+
+| Método do Builder | Nome da VDF Gerado Automaticamente | Assinatura SQL da VDF |
+|----------------|------------------------|-------------------|
+| `.from_string<&f>()` | `TYPE::from_string` | `(STRING) -> CUSTOM(this type)` |
+| `.to_string<&f>()` | `TYPE::to_string` | `(CUSTOM(this type)) -> STRING` |
+| `.compare<&f>()` | `TYPE::compare` | `(CUSTOM(this type), CUSTOM(this type)) -> INT` |
+| `.hash<&f>()` | `TYPE::hash` | `(CUSTOM(this type)) -> INT` |
+
+Consulte [Operações de Tipo](/pt-BR/mysql-8.4/0.0.5/type-operations) para as assinaturas C++ completas.
+
+## ALTER TABLE e Tipos Personalizados
+
+`ALTER TABLE ... MODIFY COLUMN` e `CHANGE COLUMN` aplicam estas regras quando tipos personalizados estão envolvidos:
+
+| De | Para | Resultado |
+|------|----|--------|
+| Não personalizado | Personalizado | Erro: `Cannot convert column 'col' to custom type 'MYTYPE'` |
+| Personalizado | Tipo string | Permitido |
+| Personalizado | Tipo não string | Erro: `Cannot convert custom type column 'col' to non-string type` |
+| Personalizado | Tipo personalizado diferente | Erro se incompatível: `Cannot convert between incompatible custom types 'A' and 'B'` |
+
+## Funções de Conversão de Tipo
+
+Com a API baseada em template, as VDFs de codificação e decodificação são
+incorporadas no objeto do tipo e registradas automaticamente — nenhuma chamada
+separada de `.func()` é necessária. As VDFs geradas automaticamente podem ser
+chamadas via SQL:
+
+```sql
+-- Convert string to custom type (calls MYTYPE::from_string)
+SELECT MYTYPE::from_string('(1.0,2.0)');
+
+-- Convert custom type to string (calls MYTYPE::to_string)
+SELECT MYTYPE::to_string(my_column) FROM my_table;
+
+-- Explicit conversion in INSERT
+INSERT INTO my_table (id, value)
+VALUES (1, MYTYPE::from_string('(3.0,4.0)'));
+```
+
+**Quando a conversão explícita é necessária.** O VillageSQL converte
+implicitamente um literal de string para um tipo personalizado em atribuição
+direta de coluna, então `INSERT INTO t (val) VALUES ('(1.0,2.0)')` funciona sem
+uma chamada explícita. Mas expressões que resolvem para o tipo `STRING`,
+como expressões `CASE`, `CONCAT` e similares, não sofrem coerção implícita.
+Envolva-as com `TYPE::from_string`:
+
+```sql
+UPDATE my_table
+SET val = MYTYPE::from_string(
+  CASE (pk MOD 2)
+    WHEN 0 THEN '(1.0,2.0)'
+    ELSE '(0.0,0.0)'
+  END
+);
+```
+
+## Exemplo: Tipo COMPLEX
+
+Aqui está um exemplo completo implementando um tipo de número COMPLEX:
+
+```cpp
+#include <cstdio>
+#include <cstring>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+// Encode: "(real,imag)" string -> 16 bytes little-endian
+void encode_complex(std::string_view from, CustomResult out) {
+    auto buf = out.buffer();
+    if (buf.size() < 16) return;
+    double real, imag;
+    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+        out.warning("invalid complex format: expected (real,imag)");
+        return;
+    }
+    memcpy(buf.data(), &real, 8);
+    memcpy(buf.data() + 8, &imag, 8);
+    out.set_length(16);
+}
+
+// Decode: 16 bytes -> "(real,imag)" string
+void decode_complex(CustomArg in, StringResult out) {
+    auto data = in.value();
+    if (data.size() < 16) return;
+    double real, imag;
+    memcpy(&real, data.data(), 8);
+    memcpy(&imag, data.data() + 8, 8);
+    auto buf = out.buffer();
+    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
+    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
+    out.set_length(static_cast<size_t>(len));
+}
+
+// Compare for ORDER BY: real part first, then imaginary
+int compare_complex(CustomArg a, CustomArg b) {
+    auto da = a.value();
+    auto db = b.value();
+    if (da.size() < 16 || db.size() < 16) return 0;
+    double a_real, a_imag, b_real, b_imag;
+    memcpy(&a_real, da.data(), 8);
+    memcpy(&a_imag, da.data() + 8, 8);
+    memcpy(&b_real, db.data(), 8);
+    memcpy(&b_imag, db.data() + 8, 8);
+    if (a_real < b_real) return -1;
+    if (a_real > b_real) return 1;
+    if (a_imag < b_imag) return -1;
+    if (a_imag > b_imag) return 1;
+    return 0;
+}
+```
+
+Depois de definir essas operações, os usuários podem criar tabelas com o seu tipo personalizado:
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    frequency_response COMPLEX
+);
+
+INSERT INTO signals VALUES (1, '(50.0,10.0)', '(0.95,0.31)');
+
+-- ORDER BY works because we provided compare_complex!
+SELECT * FROM signals ORDER BY impedance;
+
+-- Prepared statements work with custom types
+PREPARE stmt FROM 'SELECT * FROM signals WHERE impedance = ?';
+SET @val = '(50.0,10.0)';
+EXECUTE stmt USING @val;
+
+-- Aggregate operations work with custom types
+SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
+       GROUP_CONCAT(impedance ORDER BY impedance) FROM signals;
+```
+
+## VDFs em Colunas Geradas
+
+As VDFs podem ser usadas em expressões de colunas geradas. A VDF precisa ser declarada como `.deterministic()` no builder da extensão — o servidor bloqueia funções não determinísticas neste contexto.
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    impedance COMPLEX,
+    -- Generated column computed by a VDF
+    magnitude DOUBLE GENERATED ALWAYS AS (complex_abs(impedance)) STORED
+);
+```
+
+<Note>
+`complex_abs` precisa ser registrada com `.deterministic()`. UDFs tradicionais do MySQL não são permitidas em colunas geradas.
+</Note>
+
+Consulte [Exemplo vsql_complex](/pt-BR/mysql-8.4/0.0.5/examples) para a implementação completa.
+
+## VDFs em Índices Funcionais
+
+As VDFs podem ser usadas em expressões de índices funcionais. O mesmo requisito
+de `.deterministic()` das colunas geradas se aplica aqui, porque o MySQL
+implementa índices funcionais como colunas geradas ocultas.
+
+```sql
+CREATE TABLE signals (
+    id INT PRIMARY KEY,
+    sig COMPLEX,
+    INDEX idx_magnitude ((COMPLEX_ABS(sig)))
+);
+```
+
+O otimizador usa o índice quando a mesma expressão de VDF aparece em `WHERE`,
+`ORDER BY` ou `GROUP BY`. Faça o cast do valor de comparação para o tipo de
+retorno da VDF, de modo que o otimizador corresponda à expressão:
+
+```sql
+SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+```
+
+## Próximos Passos
+
+Quando o seu tipo estiver definido, continue com o Passo 5 do tutorial para compilar e instalar a sua extensão.
+
+<CardGroup cols={2}>
+  <Card
+    title="Continuar: Compile a Sua Extensão"
+    icon="hammer"
+    href="/pt-BR/mysql-8.4/0.0.5/create#step-5-update-build-configuration"
+  >
+    Volte ao tutorial para compilar e instalar a sua extensão.
+  </Card>
+  <Card
+    title="Tipos Parametrizados"
+    icon="sliders"
+    href="/pt-BR/mysql-8.4/0.0.5/type-operations#parameterized-types"
+  >
+    Tipos que recebem parâmetros como VECTOR(1536) — codificação, decodificação e dimensionamento de armazenamento cientes da dimensão.
+  </Card>
+  <Card
+    title="Referência da API C++"
+    icon="book"
+    href="/pt-BR/mysql-8.4/0.0.5/extension-api-reference"
+  >
+    Contratos da API de VDFs, tratamento de null, dimensionamento de buffer e padrões avançados.
+  </Card>
+  <Card
+    title="Replicação"
+    icon="arrow-right-left"
+    href="/pt-BR/mysql-8.4/0.0.5/managing#replication"
+  >
+    Requisitos do formato ROW, ordem de instalação de extensões e correspondência de versões para configurações replicadas.
+  </Card>
+</CardGroup>

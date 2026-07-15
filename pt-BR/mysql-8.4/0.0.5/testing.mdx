@@ -1,0 +1,165 @@
+---
+audience: extension-author
+title: "Testes em C++"
+description: "Configure um servidor VillageSQL local, execute testes de regressão de extensões com o MTR e depure falhas de teste."
+---
+
+Este guia cobre o ciclo de teste e iteração de uma extensão em C++: configurar um servidor local, instalar arquivos `.veb`, executar testes de regressão e depurar falhas. Ele é o complemento de [Criando Extensões em C++](/pt-BR/mysql-8.4/0.0.5/create), que cobre a compilação inicial, e de [Desenvolvimento em C++](/pt-BR/mysql-8.4/0.0.5/development), que aprofunda a criação de VDFs.
+
+<Note>
+  Se você estiver contribuindo com o próprio servidor VillageSQL (e não construindo uma extensão), consulte [Compilar a Partir do Código-Fonte](/pt-BR/mysql-8.4/0.0.5/source), que cobre o fluxo de trabalho completo do desenvolvedor do servidor, incluindo a execução de testes diretamente com o `mysql-test-run.pl`.
+</Note>
+
+## Configurando Seu Ambiente
+
+Para desenvolver e testar extensões, você precisa de um servidor VillageSQL compilado. Siga o guia [Clone e Compile a Partir do Código-Fonte](/pt-BR/mysql-8.4/0.0.5/source) para compilar os binários do servidor.
+
+Depois de ter uma compilação, use a CLI `villagesql` para gerenciar uma instância local de servidor de desenvolvimento. Execute todos os comandos a partir do diretório onde o VillageSQL foi instalado.
+
+### Iniciando um Servidor de Desenvolvimento Local
+
+Inicialize e inicie uma instância de servidor:
+
+```bash
+./villagesql init    # initialize database and seed bundled extensions
+./villagesql start   # start the server (default port 3307)
+./villagesql status  # check the server is running
+./villagesql connect # open a mysql shell
+./villagesql stop    # stop the server
+```
+
+Para definir uma senha de root na inicialização:
+
+```bash
+./villagesql init --password
+./villagesql start
+```
+
+Para habilitar ou desabilitar recursos do mysqld em uma execução de teste, passe as flags após um separador `--`; tudo o que vier depois dele é encaminhado literalmente para o `mysqld`:
+
+```bash
+./villagesql start -- --skip-name-resolve --general-log
+```
+
+Qualquer argumento não reconhecido antes do `--` é rejeitado, portanto use `--` para toda flag destinada ao `mysqld`.
+
+Passe `--dir <path>` antes de qualquer comando para gerenciar múltiplas instâncias independentes, ou use `--here` para criar um diretório de servidor no diretório de trabalho atual:
+
+```bash
+./villagesql --here init
+./villagesql --here start
+```
+
+### Gerenciando Arquivos de Extensão
+
+Antes de instalar uma extensão via SQL, seu arquivo `.veb` precisa estar presente no servidor. A CLI gerencia o diretório `lib/veb/` do servidor:
+
+```bash
+./villagesql veb add /path/to/my_extension.veb  # copy a .veb to the server
+./villagesql veb ls                              # list available .veb files
+./villagesql veb rm my_extension                # remove a .veb file
+```
+
+Arquivos `.veb` colocados em `lib/veb/` antes do `init` são semeados automaticamente. Após adicionar um arquivo, instale a extensão via SQL:
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+## Executando Testes de Regressão
+
+Execute os testes de regressão de extensões usando o MySQL Test Runner a partir do diretório de compilação do seu VillageSQL.
+
+### Executando a Suíte Completa
+
+Para executar todos os testes da sua extensão:
+
+```bash
+cd $BUILD_HOME
+./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/mysql-test --parallel=auto
+```
+
+### Executando Testes Individuais
+
+Para executar um único caso de teste, especifique o caminho da suíte e o nome do teste:
+
+```bash
+cd $BUILD_HOME
+./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/mysql-test my_test_name
+```
+
+## Criando Novos Testes
+
+Ao adicionar novos recursos ou corrigir bugs, você deve adicionar testes de regressão correspondentes.
+
+### Local dos Testes
+
+Os testes de extensão ficam no próprio repositório da extensão, sob um diretório `mysql-test/` — e não na árvore `mysql-test/suite/` do servidor VillageSQL.
+
+- Arquivos de teste terminam com `.test` e vão em `mysql-test/t/`.
+- Arquivos de resultado esperado terminam com `.result` e vão em `mysql-test/r/`.
+
+Por exemplo, para uma extensão chamada `my_extension`:
+- `mysql-test/t/my_new_test.test`
+- `mysql-test/r/my_new_test.result`
+
+### Convenções de Arquivos de Teste
+
+Um teste de extensão típico instala a extensão, executa SQL e desinstala:
+
+```sql
+# Description of the test
+
+INSTALL EXTENSION my_extension;
+
+# ... Your Test Code Here ...
+CREATE TABLE t1 (val MYTYPE);
+INSERT INTO t1 VALUES ('some_value');
+SELECT * FROM t1;
+DROP TABLE t1;
+
+UNINSTALL EXTENSION my_extension;
+```
+
+Quando a saída do seu teste incluir caminhos do diretório temporário do executor de testes, adicione esta diretiva dentro do seu arquivo `.test` para normalizá-los — sem ela, os resultados registrados contêm caminhos absolutos que quebram em outras máquinas:
+
+```sql
+--replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
+```
+
+### Passos para Adicionar um Teste
+
+1.  **Crie o arquivo `.test`** no diretório `mysql-test/t/` da sua extensão.
+2.  **Crie um arquivo `.result` vazio** no diretório `mysql-test/r/` da sua extensão.
+3.  **Execute o teste com `--record`** para gerar a saída esperada:
+    ```bash
+    cd $BUILD_HOME
+    ./mysql-test/mysql-test-run.pl --suite=/path/to/your/extension/mysql-test --record my_new_test
+    ```
+4.  **Verifique a saída** no arquivo `.result` gerado para garantir que ela corresponde às suas expectativas.
+
+## Depurando Testes
+
+Se um teste falhar, o framework de testes fornece logs detalhados.
+
+-   **Saída do teste:** Verifique `mysql-test/var/log/mysqltest.log` (combinado) ou `mysql-test/var/log/<test_name>/` (diretório por teste).
+-   **Log de erros do servidor:** Verifique `mysql-test/var/log/mysqld.1.err`. Mensagens de log específicas do VillageSQL (emitidas via `LogVSQL()`) só aparecem quando o servidor é executado com `--log-error-verbosity=3`.
+-   **Diff:** O framework gera um diff entre a saída real e o arquivo `.result` esperado.
+
+Para executar um teste com informações extras de depuração:
+
+```bash
+cd $BUILD_HOME
+./mysql-test/mysql-test-run.pl --verbose --suite=/path/to/your/extension/mysql-test my_new_test
+
+# To surface LogVSQL() messages in the error log:
+./mysql-test/mysql-test-run.pl --mysqld=--log-error-verbosity=3 \
+    --suite=/path/to/your/extension/mysql-test my_new_test
+```
+
+## Veja Também
+
+- [Testando Extensões Dependentes de Rede](/pt-BR/mysql-8.4/0.0.5/testing-network) — padrões confiáveis de MTR para extensões que iniciam servidores HTTP ou listeners externos
+- [Criando Extensões em C++](/pt-BR/mysql-8.4/0.0.5/create) — passos de compilação de ponta a ponta, configuração do CMake e instalação
+- [Desenvolvimento em C++](/pt-BR/mysql-8.4/0.0.5/development) — aprofundamento na criação de VDFs, tipos de argumento e resultado, agregações, varargs
+- [Referência da API C++](/pt-BR/mysql-8.4/0.0.5/extension-api-reference) — contratos de VDF, tratamento de nulos e dimensionamento de buffer

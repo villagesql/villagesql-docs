@@ -1,0 +1,61 @@
+---
+audience: extension-author
+title: Como as Extensões e a ABI se Comportam
+description: "Esta página aborda a ABI de extensões do VillageSQL: o que o servidor controla, o que as extensões controlam e como essa divisão se manifesta na recuperação de falhas, na replicação, na restauração e nas operações de esquema."
+---
+
+O VillageSQL Extension Framework (VEF) chama o código da extensão em locais predefinidos do código do servidor MySQL. Tudo o que acontece com a saída da extensão (recuperação de falhas, replicação, operações de esquema, backups) é tratado pelo servidor da mesma forma que ele trata qualquer tipo de coluna nativo. Este documento descreve essa fronteira: o que o VEF faz, o que as extensões fazem e como o sistema resultante se comporta em operação.
+
+Os exemplos ao longo desta página usam a extensão [vsql-uuid](https://github.com/villagesql/vsql-uuid) para ilustrar como os dados fluem.
+
+## A fronteira da ABI
+
+As extensões do VillageSQL interagem com o servidor por meio de uma interface binária (ABI) com uma separação clara de responsabilidades entre a extensão e o servidor.
+
+**O servidor controla:**
+- Armazenamento: o InnoDB lê e grava bytes; ele não os interpreta
+- Esquema: os metadados do tipo de coluna e qual extensão registrou cada tipo são armazenados nas tabelas de sistema do VillageSQL e persistem entre reinicializações
+- Recuperação, replicação e backups: essas operações atuam sobre bytes brutos, da mesma forma que com qualquer tipo de coluna nativo
+- Registro de extensões: nomes, versões e registros de funções/tipos são recarregados das tabelas de sistema do VillageSQL na inicialização
+
+**A extensão controla:**
+- Formato binário: a função de codificação `from_string` define o que é gravado em disco; `to_string` faz a leitura de volta durante a saída
+- Regras de negócio: validação, comparação, hashing e tratamento de erros
+- Estado: as extensões não persistem nada além dos bytes que o servidor armazena para elas
+
+Para a interface binária completa (structs, typedefs de ponteiros de função e versionamento de protocolo), consulte [`villagesql/sdk/include/villagesql/abi/types.h`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/sdk/include/villagesql/abi/types.h) no repositório do servidor.
+
+## Como os tipos personalizados são armazenados
+
+Quando você declara uma coluna como `UUID` (como exemplo do vsql-uuid), o servidor armazena um bloco de bytes brutos de tamanho fixo por linha. A forma legível por humanos, como `d7d665f3-bb13-4c2f-b10f-d2126eb40cba`, existe apenas nas fronteiras: `from_string` a codifica em binário na gravação e `to_string` a decodifica de volta na leitura. Tudo o que está no meio (armazenamento, redo log, recuperação de falhas, binary log) atua sobre esses bytes sem interpretá-los.
+
+## Recuperação de falhas
+
+As extensões são recarregadas automaticamente ao reiniciar o servidor — nenhuma intervenção manual é necessária. Você pode verificar isso por meio de `INFORMATION_SCHEMA.EXTENSION_REGISTRATION`, que mostra a mesma entrada de registro após a reinicialização que antes dela.
+
+Os dados das linhas sobrevivem à recuperação de falhas normal do InnoDB. O formato binário da extensão nunca recebe tratamento especial — o InnoDB lida com uma coluna UUID exatamente como faz com uma coluna `VARBINARY`.
+
+## Formato do binary log
+
+Na replicação em formato de linha (o padrão), os valores de tipos personalizados trafegam como binário bruto no binary log. Não há etapa de recodificação: o `from_string` da extensão não é chamado ao gravar o binlog, e o `to_string` é chamado apenas quando um cliente lê o valor de volta.
+
+Uma entrada de binary log em nível de linha para uma coluna UUID tem esta aparência:
+
+```
+### INSERT INTO `abi_test`.`t1`
+### SET
+###   @1='\xd7\xd6\x65\xf3\xbb\x13\x4c\x2f\xb1\x0f\xd2\x12\x6e\xb4\x0c\xba'
+###   @2='alpha'
+```
+
+Esses 16 bytes brutos fluem pelo binary log sem alterações. Um consumidor com a extensão instalada pode decodificá-los para o valor legível por meio de `to_string`; um sem ela (um pipeline de CDC externo ou um leitor de binlog) vê apenas os bytes brutos.
+
+## Restauração
+
+Restaurar um servidor VillageSQL funciona da mesma forma que a recuperação de falhas: o servidor inicializa, lê seus registros de extensões e carrega cada extensão automaticamente. Nenhum tratamento especial é necessário para colunas com tipo de extensão — os bytes brutos estão no backup, e as extensões os decodificam sob demanda.
+
+As extensões não são armazenadas dentro do banco de dados — elas residem como arquivos `.veb` em `veb_dir` no disco. Se o arquivo VEB estiver ausente quando o servidor inicializar na instância restaurada, a inicialização é abortada com `VEB file not found`. O `.veb_expansion_cache` não substitui o próprio `.veb`. Ao distribuir sua extensão, certifique-se de que seus usuários saibam que devem incluir o `veb_dir` em qualquer backup ou migração de servidor, junto com o diretório de dados.
+
+## Operações de esquema
+
+`ALTER TABLE` em tabelas com colunas de tipo de extensão se comporta exatamente como para tipos nativos. O servidor rastreia a vinculação da coluna à extensão em seus metadados de esquema, e essa vinculação sobrevive à reconstrução da tabela. Adicionar ou modificar outras colunas em uma tabela com uma coluna `id` do vsql-uuid deixa os dados UUID intactos.

@@ -1,0 +1,190 @@
+---
+audience: extension-author
+title: "Referência da API Rust"
+description: "Referência completa do SDK Rust do VillageSQL — InValue, VdfReturn, extension!, func!, custom_type!, custom! e campos do manifest.json."
+---
+
+<Warning>
+  O SDK Rust está em alpha — espere mudanças incompatíveis de API entre
+  versões. Extensões apenas de funções e tipos personalizados (encode, decode,
+  compare, hash) são compatíveis. Agregações, `prerun()`, `VarArgs`, variáveis de
+  sistema e de status, acesso ao keyring e a ABI de armazenamento de coluna são
+  exclusivos do C++ hoje — use o [SDK C++](/pt-BR/mysql-8.4/0.0.5/create) se você
+  precisar de qualquer um desses.
+</Warning>
+
+Esta página é uma referência da API do crate `villagesql`. Para o tutorial de introdução, consulte [Criando Extensões em Rust](/pt-BR/mysql-8.4/0.0.5/rust-sdk). Para tipos personalizados, consulte [Tipos Personalizados em Rust](/pt-BR/mysql-8.4/0.0.5/rust-custom-types).
+
+## InValue
+
+`InValue` é o enum que o servidor passa para cada argumento de função. Sua função recebe `args: &[InValue]` e deve verificar cada argumento antes de usar seu valor.
+
+```rust
+pub enum InValue<'a> {
+    String(&'a str),
+    Real(f64),
+    Int(i64),
+    Null,
+    Custom(&'a [u8]),
+}
+```
+
+| Variante | Tipo Rust | Tipo SQL correspondente |
+|---|---|---|
+| `String(&str)` | Fatia de string UTF-8 | `STRING` / `VARCHAR` / `TEXT` |
+| `Real(f64)` | Ponto flutuante de 64 bits | `REAL` / `DOUBLE` / `FLOAT` |
+| `Int(i64)` | Inteiro com sinal de 64 bits | `INT` / `BIGINT` / `TINYINT` |
+| `Null` | — | `NULL` do SQL para qualquer tipo |
+| `Custom(&[u8])` | Bytes binários brutos | Qualquer tipo personalizado registrado via `custom_type!` |
+
+Sempre faça a correspondência de `Null` explicitamente. Chamar `.unwrap()` ou fazer a correspondência de padrão apenas das variantes de valor é um bug — o NULL do SQL é uma entrada normal, não um erro.
+
+## VdfReturn
+
+`VdfReturn` é o que sua função retorna ao servidor. Construa-o com uma das funções associadas:
+
+| Construtor | Efeito no SQL |
+|---|---|
+| `VdfReturn::null()` | Retorna NULL do SQL para esta linha |
+| `VdfReturn::string(s)` | Retorna um valor `String`; `s` é `impl Into<String>` |
+| `VdfReturn::real(v)` | Retorna um valor `f64` |
+| `VdfReturn::int(v)` | Retorna um valor `i64` |
+| `VdfReturn::binary(bytes)` | Retorna bytes binários para uma coluna de tipo personalizado; `bytes` é `Vec<u8>` |
+| `VdfReturn::warning(msg)` | Retorna NULL para esta linha, adiciona um aviso SQL, a execução continua |
+| `VdfReturn::error(msg)` | Aborta a instrução com um erro fatal |
+
+**Aviso vs. erro:**
+
+Use `warning` para falhas de validação de entrada do usuário em que faz sentido continuar com o restante do conjunto de resultados. No modo estrito, o MySQL promove avisos a erros em `INSERT` e `UPDATE`. Use `error` para condições em que prosseguir é inseguro: dados armazenados corrompidos, violações de invariantes internas. Um erro fatal aborta a instrução inteira.
+
+```rust
+fn validate_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::Int(n)) if *n >= 0 => VdfReturn::int(*n),
+        Some(InValue::Int(_)) => VdfReturn::warning("value must be non-negative"),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("validate: expected an INT argument"),
+    }
+}
+```
+
+## macro extension!
+
+`extension!` gera os pontos de entrada VEF que o servidor chama ao carregar seu arquivo VEB. Ele deve aparecer exatamente uma vez no crate.
+
+```rust
+villagesql::extension! {
+    funcs: [
+        // One or more villagesql::func!(...) declarations
+    ],
+    types: [
+        // One or more villagesql::custom_type!(...) declarations
+    ]
+}
+```
+
+Ambas as seções são opcionais. Uma extensão apenas de funções omite `types:`; uma extensão apenas de tipos omite `funcs:`. Um bloco `extension!` vazio (sem funcs, sem types) é válido, mas produz uma extensão que não faz nada.
+
+## macro func!
+
+`func!` declara uma função chamável via SQL. Quatro formas (sem parâmetros, apenas `buffer_size`, apenas `deterministic`, ambos):
+
+```rust
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N, deterministic: true)
+```
+
+<Note>
+  O parâmetro `buffer_size` requer o crate `villagesql` **0.0.2 ou
+  posterior**. A versão atual do [crates.io](https://crates.io/crates/villagesql)
+  (`0.0.1`) não o expõe — até que o `0.0.2` seja lançado, use as formas sem
+  `buffer_size`.
+</Note>
+
+| Argumento | Descrição |
+|---|---|
+| `rust_fn` | A função Rust que implementa a VDF. Assinatura: `fn(&[InValue]) -> VdfReturn`. |
+| `"sql_name"` | O nome da função SQL como um literal de string. É isso que os usuários chamam a partir do SQL. |
+| `[param_types]` | Lista separada por vírgulas de valores `villagesql::Type::*` ou `villagesql::custom!("name")`. Use `[]` para funções de aridade zero. |
+| `return_type` | `villagesql::Type::*` ou `villagesql::custom!("name")`. |
+| `buffer_size: N` | Opcional. Tamanho em bytes do buffer de resultado para retornos de string/binário. Use `0` para o padrão do servidor (256 bytes). Quando uma função retorna um valor de string ou binário maior que `buffer_size`, a função gera um erro em vez de truncar — declare um `buffer_size` maior para lidar com resultados maiores. |
+| `deterministic: true` | Opcional. Declara a função como determinística — as mesmas entradas sempre produzem a mesma saída, sem efeitos colaterais. O otimizador pode armazenar em cache os resultados para entradas idênticas. Defina isso apenas quando for verdadeiro. |
+
+**Constantes de tipo** para uso em `func!`:
+
+| `villagesql::Type::*` | Tipo SQL |
+|---|---|
+| `villagesql::Type::String` | `STRING` |
+| `villagesql::Type::Real` | `REAL` |
+| `villagesql::Type::Int` | `INT` |
+
+## macro custom_type!
+
+`custom_type!` registra um novo tipo de coluna. `type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode` e `compare` são obrigatórios. `hash` e `default` são opcionais, mas recomendados.
+
+```rust
+villagesql::custom_type!(
+    type_name: "sql_type_name",
+    persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: encode_fn,
+    decode: decode_fn,
+    compare: compare_fn,
+    hash: hash_fn,
+    default: "default_string",
+)
+```
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `type_name` | Literal `&str` | Nome SQL para o tipo. Não diferencia maiúsculas de minúsculas no SQL. Deve ser único entre todas as extensões instaladas. |
+| `persisted_length` | `usize` | Comprimento fixo em bytes para armazenamento em disco. Todos os valores codificados devem produzir exatamente essa quantidade de bytes. |
+| `max_decode_buffer_length` | `usize` | Comprimento máximo em bytes da string decodificada. Usado para dimensionar o buffer de saída antes de chamar `decode`. |
+| `encode` | `fn(&str) -> Result<Vec<u8>, String>` | Chamado no momento do `INSERT`. Converte um literal de string SQL em binário. Retorne `Err(msg)` para rejeitar a entrada. |
+| `decode` | `fn(&[u8]) -> Result<String, String>` | Chamado para exibir o valor. Converte binário de volta em uma string. |
+| `compare` | `fn(&[u8], &[u8]) -> std::cmp::Ordering` | Chamado para `ORDER BY`, `MIN`, `MAX`. Retorne `Less`, `Equal` ou `Greater`. |
+| `hash` | `fn(&[u8]) -> usize` | Opcional. Chamado para `COUNT(DISTINCT)` e operações de conjunto. Valores que comparam como `Equal` devem ter o mesmo hash. Recomendado para colunas indexadas. |
+| `default` | Literal `&str` | Opcional. Uma string válida que o servidor codifica na inicialização do tipo para verificar se o callback funciona. Deve codificar em exatamente `persisted_length` bytes. |
+
+O campo `default` não é um valor padrão de coluna — é uma sondagem de inicialização. O servidor chama `encode(default)` ao carregar a extensão para verificar se o callback funciona. Se `encode` retornar `Err` para o padrão, a extensão falha ao carregar.
+
+## macro custom!
+
+`villagesql::custom!("type_name")` referencia um tipo personalizado pelo nome em uma declaração `func!`:
+
+```rust
+villagesql::func!(
+    my_fn,
+    "my_sql_func",
+    [villagesql::custom!("mytype")] -> villagesql::custom!("mytype"),
+    deterministic: true
+)
+```
+
+Use-o em qualquer lugar onde um `villagesql::Type::*` apareceria em uma lista de parâmetros ou posição de tipo de retorno. A string deve corresponder ao `type_name` declarado no `custom_type!` correspondente.
+
+## campos do manifest.json
+
+Toda extensão precisa de um `manifest.json` ao lado de seu `Cargo.toml`:
+
+```json
+{
+  "name": "vsql_my_extension",
+  "version": "0.1.0",
+  "description": "Brief description of what the extension does",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+| Campo | Obrigatório | Formato | Descrição |
+|---|---|---|---|
+| `name` | Sim | letras minúsculas, dígitos, `_`, `-` | Identificador da extensão. Deve corresponder ao nome do `INSTALL EXTENSION`. Use underscores — hifens exigem o uso de crases no SQL. |
+| `version` | Sim | MAJOR.MINOR.PATCH | Versão semântica. |
+| `description` | Não | String | Exibido em `INFORMATION_SCHEMA.EXTENSIONS`. |
+| `author` | Não | String | Nome do autor ou organização. |
+| `license` | Não | String | Identificador de licença. `GPL-2.0` recomendado para extensões de código aberto. |
+
+Regras de validação de `name`: deve começar com uma letra, terminar com uma letra ou dígito, no máximo 64 caracteres. Um manifesto inválido faz com que `INSTALL EXTENSION` falhe.

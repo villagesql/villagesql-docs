@@ -1,0 +1,201 @@
+---
+title: "Testando Extensões Dependentes de Rede"
+description: "Escreva testes MTR confiáveis para extensões que iniciam servidores HTTP ou listeners externos, usando portas atribuídas pelo sistema operacional e um lançador em primeiro plano."
+audience: extension-author
+---
+
+Algumas extensões precisam se comunicar com um servidor HTTP externo ou outro listener de rede durante os testes (por exemplo, uma extensão que faz requisições HTTP de saída precisa de um servidor de echo local para recebê-las). Esta página aborda como estruturar esses testes para que sejam executados de forma confiável sob `--parallel=auto` e em diferentes sistemas operacionais.
+
+Os padrões apresentados aqui se aplicam igualmente a extensões em C++ e Rust, pois ambos usam o MTR como executor de testes por meio de `cargo vsql test`.
+
+## Por que portas fixas falham
+
+Dois modos de falha tornam as portas fixas não confiáveis no MTR:
+
+**Conflitos de porta sob `--parallel`.** O MTR atribui a cada worker uma faixa de portas em torno do seu valor `@@port`. Uma porta fixa fora dessa faixa (digamos, `18777`) pode colidir com o bloco reservado de outro worker ou com um serviço do sistema, o que causa `EADDRINUSE` intermitente que só se reproduz em alto paralelismo.
+
+**Mudanças no nível do sistema operacional.** Novas imagens de runner e versões de sistema operacional periodicamente reservam ou restringem portas que antes funcionavam. Uma porta que passa localmente e no CI hoje pode falhar silenciosamente ao vincular amanhã.
+
+A solução em ambos os casos é a mesma: vincule à porta `0` e deixe o sistema operacional atribuir uma porta disponível, depois comunique a porta real de volta ao teste.
+
+## Padrão A: Listener integrado ao servidor
+
+Use este quando o listener de rede é executado dentro do processo do MySQL (por exemplo, uma extensão que incorpora um servidor HTTP).
+
+**Na extensão**, exponha a porta vinculada como uma variável de status após a vinculação:
+
+```cpp
+// After calling bind() with port 0:
+vsql_my_http_port = server.actual_port();  // exposed as vsql_my_ext.http_port
+```
+
+**No teste**, use o `wait_condition.inc` do MTR para consultar a variável de status até que ela seja diferente de zero, depois capture a porta em uma variável do MTR. Releia após qualquer ciclo de `UNINSTALL EXTENSION` / `INSTALL EXTENSION`, pois uma porta efêmera muda a cada vinculação.
+
+```sql
+--disable_query_log
+let $wait_timeout= 10;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_my_ext.http_port';
+--source include/wait_condition.inc
+--let $my_port = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_my_ext.http_port'`
+--enable_query_log
+
+--eval SET @url = CONCAT('http://127.0.0.1:', $my_port, '/endpoint');
+SELECT my_extension.fetch(@url);
+```
+
+## Padrão B: Listener em processo externo
+
+Use este quando o listener é um processo independente — um servidor auxiliar em Python, uma API simulada ou qualquer programa externo que o MTR não controle diretamente.
+
+<Note>
+  Este padrão requer `python3` no `PATH`. Os runners hospedados pelo GitHub o incluem; verifique a disponibilidade em runners auto-hospedados antes de usar.
+</Note>
+
+### O lançador em primeiro plano
+
+Em vez de colocar o servidor em segundo plano com `--exec ... &` e consultar uma porta, use um script de lançamento em primeiro plano que:
+
+1. Inicia o servidor em um subprocesso com `start_new_session=True`
+2. Bloqueia até que o servidor tenha vinculado e escrito um arquivo de prontidão
+3. Encerra, permitindo que o MTR continue
+
+O MTR bloqueia em chamadas `--exec` em primeiro plano, então isso garante que o servidor esteja pronto antes que qualquer SQL seja executado, sem a necessidade de um poller ou sleep separado.
+
+**`launcher.py`** — escreva isto com `--write_file`:
+
+```python
+import os, subprocess, sys, time
+
+_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Start the server subprocess detached from this process
+proc = subprocess.Popen(
+    [sys.executable, os.path.join(_dir, 'echo_server.py')],
+    start_new_session=True,
+    stdout=open(os.path.join(_dir, 'echo_server.log'), 'w'),
+    stderr=subprocess.STDOUT,
+)
+
+# Write PID for cleanup
+with open(os.path.join(_dir, 'echo_server.pid'), 'w') as f:
+    f.write(str(proc.pid))
+
+# Block until readiness file appears and is non-empty.
+# Check content, not just existence — the file is created before the write
+# completes and an empty read would produce a broken MTR include.
+port_inc = os.path.join(_dir, 'echo_port.inc')
+for _ in range(40):
+    try:
+        if open(port_inc).read().strip():
+            sys.exit(0)
+    except OSError:
+        pass
+    time.sleep(0.25)
+
+# Timed out — print server log for diagnosis
+with open(os.path.join(_dir, 'echo_server.log')) as f:
+    sys.stderr.write(f.read())
+sys.exit(1)
+```
+
+**`echo_server.py`** — o servidor em si, escrevendo sua porta antes de atender:
+
+```python
+import http.server, json, os, signal
+
+signal.alarm(60)  # self-terminate if orphaned by a killed MTR job
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def handle_any(self):
+        n = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(n).decode() if n else ''
+        self.send_response(200)
+        payload = json.dumps({'method': self.command, 'body': body}).encode()
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(payload))
+        self.end_headers()
+        self.wfile.write(payload)
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = handle_any
+    def log_message(self, *args): pass
+
+_dir = os.path.dirname(os.path.abspath(__file__))
+srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+port = srv.server_address[1]
+
+# Write atomically via rename — the launcher reads content, not just existence,
+# so the file must be complete before it becomes visible.
+tmp = os.path.join(_dir, 'echo_port.tmp')
+inc = os.path.join(_dir, 'echo_port.inc')
+with open(tmp, 'w') as f:
+    f.write('let $echo_port = %d;\n' % port)
+os.rename(tmp, inc)
+
+srv.serve_forever()
+```
+
+### No teste
+
+Inicie o lançador (em primeiro plano, já que o MTR bloqueia até que ele encerre), depois inclua o arquivo de porta:
+
+```sql
+--write_file $MYSQLTEST_VARDIR/tmp/echo_server.py
+# ... (echo_server.py contents)
+EOF
+
+--write_file $MYSQLTEST_VARDIR/tmp/launcher.py
+# ... (launcher.py contents)
+EOF
+
+--exec python3 $MYSQLTEST_VARDIR/tmp/launcher.py
+--disable_query_log
+--source $MYSQLTEST_VARDIR/tmp/echo_port.inc
+--eval SET @echo_url = CONCAT('http://127.0.0.1:', $echo_port, '/');
+--enable_query_log
+```
+
+## Mantendo a porta fora do arquivo de resultado
+
+O arquivo de resultado registra o SQL conforme escrito. Se uma URL contiver o número da porta efêmera, o arquivo de resultado conteria um valor diferente a cada execução e o teste sempre falharia no registro/replay.
+
+Inclua o arquivo de porta e defina a variável de sessão do MySQL em conjunto sob `--disable_query_log`, para que nem a atribuição `let` nem a porta efêmera apareçam na saída. Use a variável de sessão em todos os lugares onde uma URL for necessária:
+
+```sql
+--disable_query_log
+--source $MYSQLTEST_VARDIR/tmp/echo_port.inc
+--eval SET @echo_url = CONCAT('http://127.0.0.1:', $echo_port, '/');
+--enable_query_log
+
+# All queries reference @echo_url — the port never appears in the result file
+SELECT JSON_VALUE(CONVERT(my_ext.http_get(@echo_url) USING utf8mb4), '$.status') AS status;
+```
+
+## Gerenciamento de processos
+
+**Registre a saída do auxiliar e nunca a descarte.** O padrão de lançador acima escreve o stderr do servidor em `echo_server.log` e o imprime em caso de falha. Descartar a saída do auxiliar torna as instabilidades inexplicáveis nos artefatos do CI.
+
+**Encerre por PID, não por nome.** No Linux, `pkill -f echo_server.py` pode corresponder ao próprio processo do MTR via `/proc/cmdline`. Use o arquivo de PID escrito pelo lançador:
+
+```sql
+--exec sh -c 'kill $(cat $MYSQLTEST_VARDIR/tmp/echo_server.pid) 2>/dev/null || true'
+```
+
+**Remova todos os arquivos temporários antes de o teste terminar.** O check-testcase do MTR sinaliza qualquer arquivo deixado em `$MYSQLTEST_VARDIR/tmp/` como estado sujo e faz o teste falhar:
+
+```sql
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.py
+--remove_file $MYSQLTEST_VARDIR/tmp/launcher.py
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.log
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_server.pid
+--remove_file $MYSQLTEST_VARDIR/tmp/echo_port.inc
+```
+
+Para uma implementação completa e testada do Padrão B, consulte `vsql-http/mysql-test/t/vsql_http_requests.test`, que cobre todo o ciclo de vida do teste, do `--write_file` até a limpeza.
+
+## Veja também
+
+- [Testes em C++](/pt-BR/mysql-8.4/0.0.5/testing) — configuração do MTR, execução de suítes, registro de resultados e depuração de falhas
+- [Criando Extensões em C++](/pt-BR/mysql-8.4/0.0.5/create) — passos completos de compilação e configuração do CMake
+- [Desenvolvimento em C++](/pt-BR/mysql-8.4/0.0.5/development) — criação de VDF, tipos de argumento e tratamento de resultados

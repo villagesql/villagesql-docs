@@ -1,0 +1,302 @@
+---
+audience: extension-author
+title: Exemplos de Extensões em Rust
+description: Aprenda com as implementações de referência vsql_rot13 e vsql_rational usando o SDK Rust
+---
+
+Duas extensões de referência são fornecidas no repositório do SDK Rust: um exemplo mínimo que contém apenas uma função e um tipo personalizado completo com aritmética, ordenação e hashing.
+
+**Código-fonte:** `examples/` em [vsql-rust-sdk](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples)
+
+---
+
+## vsql_rot13 — Extensão Apenas com Função
+
+A extensão Rust mais simples possível: uma VDF que recebe uma STRING e retorna uma STRING.
+
+**Uso:**
+```sql
+INSTALL EXTENSION vsql_rot13;
+
+SELECT rot13('Hello, World!');
+-- 'Uryyb, Jbeyq!'
+
+SELECT rot13(rot13('Hello, World!'));
+-- 'Hello, World!' (rot13 is its own inverse)
+
+SELECT rot13(NULL);
+-- NULL
+```
+
+### Estrutura de Diretórios
+
+```
+vsql_rot13/
+├── Cargo.toml          # cdylib crate, depends on villagesql
+├── manifest.json       # Extension metadata
+├── src/
+│   └── lib.rs          # Implementation + extension! registration
+└── mysql-test/
+    └── t/*.test        # MTR test cases
+```
+
+### Implementação
+
+**Arquivo: `src/lib.rs`**
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// SQL: rot13(s STRING) -> STRING
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rot13_impl, "rot13",
+            [villagesql::Type::String] -> villagesql::Type::String),
+    ]
+}
+```
+
+**Padrões principais:**
+- As VDFs recebem `&[InValue]` e retornam `VdfReturn`, sendo ambos enums seguros do Rust
+- NULL é uma variante de primeira classe em ambos os lados; faça o pattern-match diretamente
+- A macro `extension!` gera os pontos de entrada em C que o servidor chama no momento do carregamento
+- `func!` declara a assinatura SQL; os tipos de argumento e de retorno usam `villagesql::Type::*`
+
+### Manifesto
+
+**Arquivo: `manifest.json`**
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "Example VillageSQL extension: provides vsql_rot13(STRING) -> STRING",
+  "author": "VillageSQL Community",
+  "license": "GPL-2.0"
+}
+```
+
+---
+
+## vsql_rational — Tipo Personalizado com Aritmética
+
+Um tipo personalizado completo: números racionais armazenados como `(numerator, denominator)` em forma reduzida, com funções aritméticas, ordenação e hashing.
+
+**Uso:**
+```sql
+INSTALL EXTENSION vsql_rational;
+
+CREATE TABLE measurements (id INT, ratio rational);
+INSERT INTO measurements VALUES
+    (1, '1/2'),
+    (2, '2/4'),   -- normalizes to '1/2' on storage
+    (3, '-3/6'),  -- normalizes to '-1/2'
+    (4, '0/1');
+
+SELECT id, ratio FROM measurements ORDER BY ratio;
+
+SELECT rational_add('1/2', '1/3');     -- '5/6'
+SELECT rational_mul('2/3', '3/4');     -- '1/2'
+SELECT rational_to_real('22/7');       -- 3.142857...
+```
+
+### Formato de Armazenamento Binário
+
+`rational` armazena **16 bytes** (little-endian):
+- Bytes 0–7: numerador (`i64`)
+- Bytes 8–15: denominador (`i64`)
+
+Os valores são sempre armazenados em forma reduzida (GCD = 1) com um denominador positivo.
+
+### Funções do Sistema de Tipos
+
+**Arquivo: `src/lib.rs`**
+
+O tipo registra quatro operações: encode (string → bytes), decode (bytes → string), compare (para ORDER BY) e hash (para indexação).
+
+```rust
+pub fn rational_encode(s: &str) -> Result<Vec<u8>, String> {
+    let (num_s, den_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("rational: expected 'n/d', got {s:?}"))?;
+    let num: i64 = num_s.trim().parse().map_err(|e| format!("numerator: {e}"))?;
+    let den: i64 = den_s.trim().parse().map_err(|e| format!("denominator: {e}"))?;
+    let (n, d) = normalize(i128::from(num), i128::from(den))
+        .ok_or_else(|| "rational: zero or overflowing denominator".to_string())?;
+    Ok(to_bytes(n, d))
+}
+
+pub fn rational_decode(b: &[u8]) -> Result<String, String> {
+    if b.len() < BYTES {
+        return Err(format!("rational: expected {} bytes, got {}", BYTES, b.len()));
+    }
+    let (n, d) = from_bytes(b);
+    Ok(format!("{n}/{d}"))
+}
+
+pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (n1, d1) = from_bytes(a);
+    let (n2, d2) = from_bytes(b);
+    // Cross-multiply; denominators are always positive after normalization
+    let lhs = i128::from(n1) * i128::from(d2);
+    let rhs = i128::from(n2) * i128::from(d1);
+    lhs.cmp(&rhs)
+}
+```
+
+### Implementações de VDF
+
+As VDFs que recebem um tipo personalizado recebem `InValue::Custom(&[u8])` e decodificam os bytes por conta própria:
+
+```rust
+fn rational_add_impl(args: &[InValue]) -> VdfReturn {
+    match (arg(args, 0), arg(args, 1)) {
+        (Ok(Some((n1, d1))), Ok(Some((n2, d2)))) => {
+            match normalize(
+                i128::from(n1) * i128::from(d2) + i128::from(n2) * i128::from(d1),
+                i128::from(d1) * i128::from(d2),
+            ) {
+                Some((n, d)) => VdfReturn::Binary(to_bytes(n, d)),
+                None => VdfReturn::error("rational_add: overflow"),
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => VdfReturn::error(format!("rational_add: {e}")),
+        _ => VdfReturn::null(),
+    }
+}
+```
+
+### Registro
+
+A macro `extension!` registra tanto o tipo quanto suas funções em uma única declaração:
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rational_add_impl, "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_sub_impl, "rational_sub",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_mul_impl, "rational_mul",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_div_impl, "rational_div",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_numer_impl, "rational_numer",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_denom_impl, "rational_denom",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_to_real_impl, "rational_to_real",
+            [villagesql::custom!("rational")] -> villagesql::Type::Real,
+            deterministic: true),
+    ],
+    types: [
+        villagesql::custom_type!(
+            type_name: "rational",
+            persisted_length: 16,
+            max_decode_buffer_length: 42,
+            encode: rational_encode,
+            decode: rational_decode,
+            compare: rational_compare,
+            hash: rational_hash,
+            default: "0/1",
+        ),
+    ]
+}
+```
+
+**Padrões principais:**
+- `villagesql::custom!("name")` referencia um tipo personalizado como argumento ou retorno
+- `custom_type!` registra o tipo junto com suas funções encode/decode/compare/hash
+- `default: "0/1"` é o padrão intrínseco: o servidor chama `encode()` nessa string na inicialização do tipo, portanto ela deve ser um valor válido
+- `persisted_length` deve corresponder ao comprimento em bytes que `encode()` retorna
+- `deterministic: true` permite que o otimizador dobre chamadas constantes
+
+---
+
+## Padrões Principais de Implementação
+
+| Padrão | Uso |
+|---------|-------|
+| **Assinatura de VDF** | `fn impl(args: &[InValue]) -> VdfReturn` |
+| **Tratamento de NULL** | Faça o match de `InValue::Null` e `None` explicitamente |
+| **Relato de erros** | `VdfReturn::error("message")` aborta a instrução |
+| **Encode de tipo personalizado** | Retorna `Result<Vec<u8>, String>` |
+| **Decode de tipo personalizado** | Retorna `Result<String, String>` |
+| **Argumentos com reconhecimento de tipo** | Use `villagesql::custom!("name")` em `func!` |
+| **Registro** | Um único bloco `extension!` declara funções e tipos |
+
+---
+
+## Testes
+
+Ambos os exemplos usam MTR (o MySQL Test Runner) assim como as extensões em C++:
+
+```bash
+cd /path/to/villagesql/build/mysql-test
+./mysql-test-run.pl --suite=vsql_rot13
+./mysql-test-run.pl --suite=vsql_rational
+```
+
+Gere ou atualize os resultados esperados com `--record`.
+
+---
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card
+    title="Criando Extensões em Rust"
+    icon="rust"
+    href="/pt-BR/mysql-8.4/0.0.5/rust-sdk"
+  >
+    Instalação do SDK, compilação e a macro extension!
+  </Card>
+  <Card
+    title="Tipos Personalizados em Rust"
+    icon="cube"
+    href="/pt-BR/mysql-8.4/0.0.5/rust-custom-types"
+  >
+    Aprofundamento em encode, decode, compare e hash
+  </Card>
+  <Card
+    title="Referência da API Rust"
+    icon="book"
+    href="/pt-BR/mysql-8.4/0.0.5/rust-api-reference"
+  >
+    InValue, VdfReturn e a superfície da macro
+  </Card>
+  <Card
+    title="Código-Fonte dos Exemplos"
+    icon="github"
+    href="https://github.com/villagesql/vsql-rust-sdk/tree/main/examples"
+  >
+    Código-fonte completo de vsql_rot13 e vsql_rational
+  </Card>
+</CardGroup>
