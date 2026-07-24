@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "Preview Capabilities"
-description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the keyring, status_var, sys_var, thread_worker, sql_query, and statement_event capabilities, and registration patterns."
+description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the auth, keyring, status_var, sys_var, thread_worker, sql_query, and statement_event capabilities, and registration patterns."
 ---
 
 Preview capabilities are server-provided features exposed to extensions before
@@ -50,6 +50,7 @@ Uninstall those extensions first, then turn the setting off.
 
 | Capability | Header | Status |
 |---|---|---|
+| `vsql::preview::auth` | `<villagesql/preview/auth.h>` | Preview |
 | `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview |
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
 | `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | Preview |
@@ -1125,4 +1126,196 @@ Each query slower than the threshold is appended to the configured log file:
 # Schema:   Query_time: 0.605084  Lock_time: 0.000000  Rows_sent: 1  Rows_examined: 1
 SET timestamp=1782168824;
 SELECT SLEEP(0.6);
+```
+
+## Authentication Methods
+
+The auth capability (`vsql::preview::auth`) lets an extension provide a server
+authentication method. An account opts in with `CREATE USER ... IDENTIFIED WITH
+<method-name>`; at connection time, when that name is not a loaded MySQL auth
+plugin, the server consults the VEF auth registry and invokes the extension's
+handler over the handshake. Use it to authenticate accounts against a credential
+source the server does not know about — a bearer token, an external identity
+provider, or a custom challenge — without writing a MySQL authentication plugin.
+
+The capability name `VEF_PREVIEW_AUTH_NAME` is `"vsql::preview::auth"`.
+
+The handler is a sibling of a VDF, not a typed function: it talks to the client
+by reading and writing handshake packets through a server-owned context, and it
+never sees MySQL's internal auth structures.
+
+<Warning>
+The auth result is fail-closed. The server treats anything other than
+`VEF_AUTH_OK` as a denied connection — there is deliberately no "maybe" or
+fail-open result. A handler that returns `VEF_AUTH_REJECT`, returns
+`VEF_AUTH_ERROR`, or never sets the effective account denies the login.
+</Warning>
+
+### Declaring the Capability
+
+Include the header, declare an `AuthCapability` at file scope, and pass it to
+`.with()`. Preview capability headers are not part of the
+`<villagesql/vsql.h>` umbrella, so include `<villagesql/preview/auth.h>`
+explicitly:
+
+```cpp
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static vef_auth_result_t authenticate(vef_auth_ctx_t *ctx,
+                                       const vef_auth_ops_t *ops) {
+  // ... validate the client and set the effective account ...
+  return VEF_AUTH_OK;
+}
+
+static vsql::preview_auth::AuthCapability g_auth{
+    "my_auth", &authenticate, "mysql_clear_password"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_auth))
+```
+
+The `AuthCapability` constructor takes three arguments:
+
+| Argument | Meaning |
+|---|---|
+| `name` | The auth-method name accounts bind to (`IDENTIFIED WITH <name>`). Method names are unique across all installed extensions and must be at most `VEF_AUTH_MAX_NAME_LEN` (64) bytes. |
+| `handler` | The function the server invokes during the handshake. Must remain valid for the lifetime of the extension. |
+| `client_auth_plugin` | The single client-side auth plugin the server pins for this method and advertises to the client during the handshake. Required and non-empty — `mysql_clear_password` receives a bearer token verbatim in the password slot. |
+
+`client_auth_plugin` is required: `INSTALL EXTENSION` fails for a method that
+leaves it unset, because the handshake has no plugin name to send the client and
+a VEF method has no MySQL plugin to fall back on.
+
+### The Handler Contract
+
+The handler has the signature named by `vef_auth_authenticate_func_t`:
+
+```cpp
+vef_auth_result_t authenticate(vef_auth_ctx_t *ctx, const vef_auth_ops_t *ops);
+```
+
+It is invoked synchronously on the connecting thread during the handshake. `ctx`
+is an opaque per-attempt context — hold it only for the duration of the call and
+do not retain the pointer. `ops` is a server-filled table of operations on that
+context; every function pointer is populated, so no null check is needed before
+calling one. The operations a token-based handler uses:
+
+| Operation | Purpose |
+|---|---|
+| `ops->read_packet(ctx, &data)` | Read the next packet the client sent. Returns the byte count (`>= 0`) and points `*data` at a server-owned buffer valid until the next read; returns `< 0` on a protocol or connection error. Paired with `mysql_clear_password`, one read yields the bearer token. |
+| `ops->user_name(ctx)` | The account name the client connected as. |
+| `ops->auth_string(ctx)` | The `AS '...'` clause from `IDENTIFIED WITH <m> AS '...'`, or empty. |
+| `ops->set_authenticated_as(ctx, account)` | Set the effective account the session runs as (shown by `CURRENT_USER()`). Required on `VEF_AUTH_OK`. |
+| `ops->set_external_user(ctx, identity)` | Set the original external identity for the audit trail (`@@external_user`). |
+
+The handler returns one of three results:
+
+| Result | Meaning |
+|---|---|
+| `VEF_AUTH_OK` | Authentication succeeded. The handler must have called `set_authenticated_as()`; the session runs as that account. |
+| `VEF_AUTH_REJECT` | Authentication failed — bad credential or policy rejection. |
+| `VEF_AUTH_ERROR` | An internal error prevented a decision (for example, a key source was unavailable). Treated identically to a rejection by the server; it exists only to distinguish "denied" from "couldn't decide" in logging. |
+
+Both `VEF_AUTH_REJECT` and `VEF_AUTH_ERROR` deny the connection. Only
+`VEF_AUTH_OK` succeeds.
+
+When the handler maps the connecting account to a different effective account —
+as the example below maps `auth_user` to `vsql_auth_test_user` — that is
+proxying, and it requires a `GRANT PROXY`, exactly as on the MySQL plugin auth
+path.
+
+### Complete Example
+
+The `vsql_auth_test` extension that ships with the server. It registers an auth
+method named `vsql_auth_test` that accepts a single fixed token and, on success,
+maps the connection to the account `vsql_auth_test_user`. It pins
+`mysql_clear_password` so the token arrives verbatim in the password slot.
+
+```cpp
+#include <cstring>
+
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+namespace {
+
+constexpr char kToken[] = "vsql-auth-test-token";
+constexpr char kMappedAccount[] = "vsql_auth_test_user";
+
+vef_auth_result_t authenticate(vef_auth_ctx_t *ctx, const vef_auth_ops_t *ops) {
+  const unsigned char *pkt = nullptr;
+  const int64_t len = ops->read_packet(ctx, &pkt);
+  if (len <= 0 || pkt == nullptr) return VEF_AUTH_ERROR;
+
+  // mysql_clear_password sends a NUL-terminated string; drop the trailing NUL.
+  size_t token_len = static_cast<size_t>(len);
+  if (pkt[token_len - 1] == '\0') --token_len;
+
+  if (token_len != std::strlen(kToken) ||
+      std::memcmp(pkt, kToken, token_len) != 0) {
+    return VEF_AUTH_REJECT;
+  }
+
+  ops->set_authenticated_as(ctx, kMappedAccount);
+  // @@external_user is the original identity for the audit trail: the account
+  // the client connected as, not the account we mapped to.
+  ops->set_external_user(ctx, ops->user_name(ctx));
+  return VEF_AUTH_OK;
+}
+
+vsql::preview_auth::AuthCapability g_auth{"vsql_auth_test", &authenticate,
+                                          "mysql_clear_password"};
+
+}  // namespace
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(g_auth))
+```
+
+### Binding an Account and Connecting
+
+With the preview tier enabled (see
+[Enabling the Preview Tier](#enabling-the-preview-tier)), install the extension
+and bind an account to the method. Because the handler maps to a second account,
+create that account too and grant it the `PROXY` privilege that lets the
+connecting account assume its identity:
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+```
+
+`CREATE USER ... IDENTIFIED WITH vsql_auth_test` is accepted because
+`vsql_auth_test` is a registered VEF auth method — the same way an installed
+plugin name is accepted.
+
+The method pins `mysql_clear_password`, so the client must pass
+`--enable-cleartext-plugin` to send the token in cleartext. On a correct token,
+the session runs as the mapped account and exposes the connecting account
+through `@@external_user`:
+
+```bash
+mysql --enable-cleartext-plugin --user=auth_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER(), @@external_user"
+```
+
+```
+CURRENT_USER()	@@external_user
+vsql_auth_test_user@%	auth_user
+```
+
+Uninstalling the extension removes the method; accounts bound to it can no
+longer authenticate:
+
+```sql
+UNINSTALL EXTENSION vsql_auth_test;
 ```
