@@ -168,6 +168,24 @@ the wrong version):
   not "the feature ships." Anything still in progress (for example, features not
   yet merged) must not be documented as available. See [§10](#10-accuracy-and-verification).
 
+**Terms kept in English (pt-BR):** in the Brazilian-Portuguese docs, keep the
+following VEF term families in English and write Portuguese grammar around them,
+rather than translating them literally. A native pt-BR reviewer found the literal
+translations read as awkward jargon.
+
+| English term | Do **not** translate to | Notes |
+|---|---|---|
+| **capability / capabilities** | *capacidade(s)* | The VEF construct only. Generic "capacity" is still translated normally. |
+| **Preview** | *Prévia* | The tier/qualifier, e.g. "capabilities Preview". |
+| **pointer(s)** | *ponteiro(s)* |  |
+| **Protocol N** | *Protocolo N* | e.g. "Protocol 4", not "Protocolo 4". |
+
+Apply this in prose only — code, inline identifiers, URLs, and `{#anchor}` slugs
+are never touched. Because these are English nouns carried into Portuguese
+sentences, they follow Portuguese word order: "capabilities Preview", not
+"Preview Capabilities". ja/ko/zh translate these terms fully; this rule is
+specific to pt-BR.
+
 ## 7. Frontmatter
 Every `.mdx` file starts with YAML frontmatter. Missing frontmatter is a build
 and review failure.
