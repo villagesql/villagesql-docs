@@ -229,16 +229,16 @@ villagesql-docs/
 ├── index.mdx              # docs landing page
 ├── guides/                # how-to guides and tutorials (see also: keywords, cross-links)
 ├── mysql-8.4/
-│   ├── 0.0.4/             # current stable
-│   ├── 0.0.5-dev/         # active development, most edits go here
-│   └── 0.0.1 … 0.0.3/     # archived stable versions
+│   ├── stable/            # current stable (fixed URL slot)
+│   ├── dev/               # active development, most edits go here
+│   └── 0.0.1 … 0.0.4/     # frozen archived versions
 ├── extensions/
 ├── snippets/              # reusable MDX fragments
-└── ja/ ko/ zh/            # translations
+└── ja/ ko/ zh/ pt-BR/     # translations
 ```
 
 - **Edit the dev version.** New content and changes go to the current dev
-  directory (`mysql-8.4/0.0.5-dev/`). Released versions are frozen except for
+  directory (`mysql-8.4/dev/`). Released versions are frozen except for
   corrections. The full release process is in [VERSIONING.md](./VERSIONING.md).
 - **Register new pages in `docs.json`.** A file that isn't in `docs.json` won't
   appear in the sidebar.
