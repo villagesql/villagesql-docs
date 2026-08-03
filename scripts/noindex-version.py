@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-LOCALES = ["", "ja", "ko", "zh"]  # "" = English tree at repo root
+LOCALES = ["", "ja", "ko", "zh", "pt-BR"]  # "" = English tree at repo root
 
 
 def version_dirs(repo: Path, version: str):
