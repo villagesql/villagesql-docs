@@ -62,10 +62,16 @@ This performs, in order:
   `mysql-8.4/0.0.5/...`, keeping its `languages` block so the archived-but-
   translated switcher survives), then **bump** the two labels: `Stable (0.0.5)`
   → `Stable (0.0.6)` and `Development (0.0.6-dev)` → `Development (0.0.7-dev)`.
-  The resulting `docs.json` is re-validated before it is written.
+- **Update redirects** so every version number keeps resolving: drop the
+  `0.0.5 → /stable/` redirects (so the freshly-frozen `0.0.5` archive is
+  reachable, not shadowed), repoint the `0.0.6-dev` redirects to `0.0.6` (old
+  dev links track what shipped), and add `0.0.6 → /stable/` (the new current
+  stable resolves at its number too). `docs.json` is re-validated before write.
 
-No redirects are generated: no live URL moved. (`gen-redirects.py` is only for
-one-off structural URL moves, not normal cuts.)
+The stable and dev *slot* URLs never move — the only redirect churn is on the
+version *numbers*, and it keeps them all resolving: the current stable's number
+bounces to `/stable/`, and a superseded number becomes its own frozen archive.
+(`gen-redirects.py` is only for one-off structural URL moves.)
 
 ### 2. Re-translate the new stable into ja/ko/zh/pt-BR
 

@@ -2,10 +2,12 @@
 """Cut a release under the fixed stable/dev slot model.
 
 The version number is NOT in the URL: current stable always lives at
-`mysql-8.4/stable/`, dev at `mysql-8.4/dev/`. Cutting a release therefore does
-not move any live URL — it freezes the outgoing stable into a numbered archive
-and promotes dev into the stable slot. No redirects are generated on a normal
-cut (see VERSIONING.md; `gen-redirects.py` is only for structural URL moves).
+`mysql-8.4/stable/`, dev at `mysql-8.4/dev/`. Cutting a release does not move
+any live URL — it freezes the outgoing stable into a numbered archive and
+promotes dev into the stable slot. It also keeps every version *number*
+resolving: the current stable's number redirects to /stable/, and a superseded
+number becomes its own frozen archive — nothing ever 404s. (`gen-redirects.py`
+is only for one-off structural URL moves.)
 
 Steps (example: stable 0.0.5 -> 0.0.6, dev opens 0.0.7-dev):
   1. snapshot mysql-8.4/stable (+ locales) -> mysql-8.4/0.0.5, freeze its
@@ -14,8 +16,10 @@ Steps (example: stable 0.0.5 -> 0.0.6, dev opens 0.0.7-dev):
      rewrite dev/ -> stable/ links. Locale stable dirs keep the previous
      translations until re-translated (VERSIONING.md step: Translate).
   3. scaffold new mysql-8.4/dev from the new stable and re-stamp canonicals.
-  4. bump the two docs.json version labels; emit the archived version entry to
-     paste into the versions array (keeps the archived-but-translated switcher).
+  4. docs.json: insert the archived version entry, bump the two version labels,
+     and update redirects — drop the outgoing number's redirect (freeing its
+     archive), repoint the outgoing -dev redirects to the shipped number, and
+     add the new stable number's redirect -> /stable/.
 
 Usage:
     python3 scripts/promote-release.py --old-stable 0.0.5 --new-stable 0.0.6 \
@@ -130,6 +134,30 @@ def _matching_brace(text: str, open_pos: int) -> int:
     return -1
 
 
+def _matching_bracket(text: str, open_pos: int) -> int:
+    """Index of the `]` matching the `[` at open_pos, skipping string contents."""
+    depth = 0
+    in_str = esc = False
+    for i in range(open_pos, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
 def insert_archived_entry(text: str, old_stable: str, entry_json: str) -> str:
     """Splice the archived version entry into docs.json right after the Stable
     entry, preserving surrounding formatting (no full reserialize)."""
@@ -147,6 +175,59 @@ def insert_archived_entry(text: str, old_stable: str, entry_json: str) -> str:
         raise ValueError("expected a comma after the Stable entry")
     indented = "\n".join(indent + ln for ln in entry_json.split("\n"))
     return text[:j + 1] + "\n" + indented + "," + text[j + 1:]
+
+
+def manage_redirects(text: str, repo: Path, old_stable: str, new_stable: str):
+    """Update the docs.json redirect array for a cut. Returns (new_text, stats).
+
+    - Remove the outgoing stable's number redirects, so its freshly-frozen
+      archive is reachable at /mysql-8.4/<old>/ instead of shadowed.
+    - Repoint the outgoing dev's -dev redirects from /dev/ to the shipped
+      number, so old dev links track what actually released.
+    - Add the incoming stable's number redirects -> /stable/, so the current
+      stable resolves at its number too. Every version number thus resolves.
+
+    Re-emits the array in the established format so unchanged entries diff clean.
+    """
+    redirects = json.loads(text).get("redirects", [])
+    old_pref = f"/{PRODUCT}/{old_stable}"
+    dev_pref = f"/{PRODUCT}/{new_stable}-dev"
+    dev_dest = f"/{PRODUCT}/dev"
+    removed = repointed = 0
+    out = []
+    for r in redirects:
+        s = r["source"]
+        if s == old_pref or s.startswith(old_pref + "/"):
+            removed += 1
+            continue
+        if s == dev_pref or s.startswith(dev_pref + "/"):
+            d = r["destination"]
+            if d == dev_dest or d.startswith(dev_dest + "/"):
+                r = {"source": s,
+                     "destination": f"/{PRODUCT}/{new_stable}" + d[len(dev_dest):]}
+                repointed += 1
+        out.append(r)
+
+    stable_dir = repo / PRODUCT / "stable"
+    adds = [(f"/{PRODUCT}/{new_stable}", f"/{PRODUCT}/stable")]
+    for p in sorted(stable_dir.rglob("*.mdx")):
+        slug = str(p.relative_to(stable_dir)).removesuffix(".mdx")
+        adds.append((f"/{PRODUCT}/{new_stable}/{slug}", f"/{PRODUCT}/stable/{slug}"))
+    out.extend({"source": s, "destination": d} for s, d in adds)
+
+    arr_open = text.index("[", text.index('"redirects": ['))
+    arr_close = _matching_bracket(text, arr_open)
+    if arr_close == -1:
+        raise ValueError("could not find end of redirects array")
+    entries = []
+    for i, r in enumerate(out):
+        comma = "," if i < len(out) - 1 else ""
+        entries.append(
+            f'    {{\n      "source": "{r["source"]}",\n'
+            f'      "destination": "{r["destination"]}"\n    }}{comma}')
+    new_arr = "[\n" + "\n".join(entries) + "\n  ]"
+    stats = {"removed": removed, "repointed": repointed, "added": len(adds)}
+    return text[:arr_open] + new_arr + text[arr_close + 1:], stats
 
 
 def main():
@@ -201,13 +282,12 @@ def main():
         subprocess.run([sys.executable, str(scripts / "stamp-canonicals.py"),
                         "--repo", str(repo)], check=True)
 
-    # 4. docs.json: insert the archived version entry, then bump the two labels
+    # 4. docs.json: archived version entry, labels, and redirect lifecycle
     docs_path = repo / "docs.json"
     text = docs_path.read_text()
     entry_json = archived_entry(repo, old)
+    text = insert_archived_entry(text, old, entry_json)
     print(f"{tag}insert archived version entry {old!r} after the Stable entry")
-    if not dry:
-        text = insert_archived_entry(text, old, entry_json)
     subs = [(f"Stable ({old})", f"Stable ({new})"),
             (f"Development ({new}-dev)", f"Development ({ndev})")]
     for a, b in subs:
@@ -216,10 +296,14 @@ def main():
             return 1
         text = text.replace(a, b)
         print(f"{tag}label: {a!r} -> {b!r}")
+    text, rstats = manage_redirects(text, repo, old, new)
+    print(f"{tag}redirects: remove {rstats['removed']} (/{PRODUCT}/{old}/*), "
+          f"repoint {rstats['repointed']} ({new}-dev -> {new}), "
+          f"add {rstats['added']} (/{PRODUCT}/{new}/*)")
+    json.loads(text)  # validate the full transformation (runs in dry-run too)
     if dry:
         print(f"{tag}archived entry that would be inserted:\n{entry_json}")
     else:
-        json.loads(text)  # validate the spliced result before writing
         docs_path.write_text(text)
         print("docs.json updated and re-validated.")
 
