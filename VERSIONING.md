@@ -11,9 +11,11 @@ lives in fixed slots:
 
 - **Current stable** → `mysql-8.4/stable/` (served at
   `villagesql.com/docs/mysql-8.4/stable/...`). Indexed.
-- **Development** → `mysql-8.4/dev/`. Indexed, but every dev page carries a
-  `canonical` pointing at its stable equivalent (a dev-only page with no stable
-  counterpart self-canonicals, so genuinely new content still ranks).
+- **Development** → `mysql-8.4/dev/`. Indexed and **self-canonical** — no
+  cross-canonical to stable, so dev's new features (whether on new pages or
+  added to existing ones) stay findable in search. Making the latest features
+  findable is a deliberate goal; stable wins the identical mirror pages anyway
+  because all internal links, the sitemap, and `llms.txt` point at `/stable/`.
 - **Frozen archives** → `mysql-8.4/0.0.4/`, `0.0.3/`, … Each is a snapshot of a
   past release, `noindex`ed, kept reachable at its direct URL.
 
@@ -53,10 +55,10 @@ This performs, in order:
   rewriting the archive's self-links `stable/` → `0.0.5/` so the frozen copy
   refers to its own version.
 - **Noindex** the new `0.0.5` archive (all locales, via `noindex-version.py`).
-- **Promote** `mysql-8.4/dev/` → `mysql-8.4/stable/` (English): strip the dev
-  `canonical`s and rewrite `dev/` → `stable/` links.
-- **Scaffold** a fresh `mysql-8.4/dev/` from the new stable and re-stamp dev
-  `canonical`s (`stamp-canonicals.py`).
+- **Promote** `mysql-8.4/dev/` → `mysql-8.4/stable/` (English): rewrite `dev/` →
+  `stable/` links.
+- **Scaffold** a fresh `mysql-8.4/dev/` from the new stable. Dev is
+  self-canonical (no canonical stamping), so its new features stay findable.
 - **Insert** the archived version entry into `docs.json` `versions` (the old
   stable entry relabeled to the bare number `0.0.5`, repointed to
   `mysql-8.4/0.0.5/...`, keeping its `languages` block so the archived-but-

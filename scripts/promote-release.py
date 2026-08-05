@@ -12,10 +12,11 @@ is only for one-off structural URL moves.)
 Steps (example: stable 0.0.5 -> 0.0.6, dev opens 0.0.7-dev):
   1. snapshot mysql-8.4/stable (+ locales) -> mysql-8.4/0.0.5, freeze its
      self-links stable/ -> 0.0.5/, and noindex it.
-  2. promote: mysql-8.4/dev -> mysql-8.4/stable (EN), strip dev canonicals,
-     rewrite dev/ -> stable/ links. Locale stable dirs keep the previous
-     translations until re-translated (VERSIONING.md step: Translate).
-  3. scaffold new mysql-8.4/dev from the new stable and re-stamp canonicals.
+  2. promote: mysql-8.4/dev -> mysql-8.4/stable (EN), rewrite dev/ -> stable/
+     links. Locale stable dirs keep the previous translations until
+     re-translated (VERSIONING.md step: Translate).
+  3. scaffold new mysql-8.4/dev from the new stable (dev is indexed and
+     self-canonical — no cross-canonical, so new features stay findable).
   4. docs.json: insert the archived version entry, bump the two version labels,
      and update redirects — drop the outgoing number's redirect (freeing its
      archive), repoint the outgoing -dev redirects to the shipped number, and
@@ -53,17 +54,6 @@ def rewrite_prefix(d: Path, old: str, new: str) -> int:
         t = p.read_text(encoding="utf-8")
         if old in t:
             p.write_text(t.replace(old, new), encoding="utf-8")
-            n += 1
-    return n
-
-
-def strip_canonical(d: Path) -> int:
-    n = 0
-    for p in d.rglob("*.mdx"):
-        lines = p.read_text(encoding="utf-8").split("\n")
-        kept = [ln for ln in lines if not ln.startswith("canonical:")]
-        if len(kept) != len(lines):
-            p.write_text("\n".join(kept), encoding="utf-8")
             n += 1
     return n
 
@@ -267,20 +257,17 @@ def main():
                         "--repo", str(repo)], check=True)
 
     # 2. promote dev -> stable (EN only; locales keep prior translations)
-    print(f"{tag}promote {PRODUCT}/dev -> {PRODUCT}/stable (strip canonicals, dev/ -> stable/ links)")
+    print(f"{tag}promote {PRODUCT}/dev -> {PRODUCT}/stable (dev/ -> stable/ links)")
     if not dry:
         shutil.rmtree(en_stable)
         shutil.copytree(en_dev, en_stable)
-        strip_canonical(en_stable)
         rewrite_prefix(en_stable, f"{PRODUCT}/dev/", f"{PRODUCT}/stable/")
 
-    # 3. scaffold new dev from new stable, re-stamp canonicals
-    print(f"{tag}scaffold {PRODUCT}/dev from new stable + stamp canonicals")
+    # 3. scaffold new dev from new stable (dev is self-canonical, no re-stamp)
+    print(f"{tag}scaffold {PRODUCT}/dev from new stable")
     if not dry:
         shutil.rmtree(en_dev)
         shutil.copytree(en_stable, en_dev)
-        subprocess.run([sys.executable, str(scripts / "stamp-canonicals.py"),
-                        "--repo", str(repo)], check=True)
 
     # 4. docs.json: archived version entry, labels, and redirect lifecycle
     docs_path = repo / "docs.json"
