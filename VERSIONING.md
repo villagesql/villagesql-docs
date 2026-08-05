@@ -11,9 +11,11 @@ lives in fixed slots:
 
 - **Current stable** → `mysql-8.4/stable/` (served at
   `villagesql.com/docs/mysql-8.4/stable/...`). Indexed.
-- **Development** → `mysql-8.4/dev/`. Indexed, but every dev page carries a
-  `canonical` pointing at its stable equivalent (a dev-only page with no stable
-  counterpart self-canonicals, so genuinely new content still ranks).
+- **Development** → `mysql-8.4/dev/`. Indexed and **self-canonical** — no
+  cross-canonical to stable, so dev's new features (whether on new pages or
+  added to existing ones) stay findable in search. Making the latest features
+  findable is a deliberate goal; stable wins the identical mirror pages anyway
+  because all internal links, the sitemap, and `llms.txt` point at `/stable/`.
 - **Frozen archives** → `mysql-8.4/0.0.4/`, `0.0.3/`, … Each is a snapshot of a
   past release, `noindex`ed, kept reachable at its direct URL.
 
@@ -53,19 +55,25 @@ This performs, in order:
   rewriting the archive's self-links `stable/` → `0.0.5/` so the frozen copy
   refers to its own version.
 - **Noindex** the new `0.0.5` archive (all locales, via `noindex-version.py`).
-- **Promote** `mysql-8.4/dev/` → `mysql-8.4/stable/` (English): strip the dev
-  `canonical`s and rewrite `dev/` → `stable/` links.
-- **Scaffold** a fresh `mysql-8.4/dev/` from the new stable and re-stamp dev
-  `canonical`s (`stamp-canonicals.py`).
+- **Promote** `mysql-8.4/dev/` → `mysql-8.4/stable/` (English): rewrite `dev/` →
+  `stable/` links.
+- **Scaffold** a fresh `mysql-8.4/dev/` from the new stable. Dev is
+  self-canonical (no canonical stamping), so its new features stay findable.
 - **Insert** the archived version entry into `docs.json` `versions` (the old
   stable entry relabeled to the bare number `0.0.5`, repointed to
   `mysql-8.4/0.0.5/...`, keeping its `languages` block so the archived-but-
   translated switcher survives), then **bump** the two labels: `Stable (0.0.5)`
   → `Stable (0.0.6)` and `Development (0.0.6-dev)` → `Development (0.0.7-dev)`.
-  The resulting `docs.json` is re-validated before it is written.
+- **Update redirects** so every version number keeps resolving: drop the
+  `0.0.5 → /stable/` redirects (so the freshly-frozen `0.0.5` archive is
+  reachable, not shadowed), repoint the `0.0.6-dev` redirects to `0.0.6` (old
+  dev links track what shipped), and add `0.0.6 → /stable/` (the new current
+  stable resolves at its number too). `docs.json` is re-validated before write.
 
-No redirects are generated: no live URL moved. (`gen-redirects.py` is only for
-one-off structural URL moves, not normal cuts.)
+The stable and dev *slot* URLs never move — the only redirect churn is on the
+version *numbers*, and it keeps them all resolving: the current stable's number
+bounces to `/stable/`, and a superseded number becomes its own frozen archive.
+(`gen-redirects.py` is only for one-off structural URL moves.)
 
 ### 2. Re-translate the new stable into ja/ko/zh/pt-BR
 
