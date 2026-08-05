@@ -168,6 +168,24 @@ the wrong version):
   not "the feature ships." Anything still in progress (for example, features not
   yet merged) must not be documented as available. See [§10](#10-accuracy-and-verification).
 
+**Terms kept in English (pt-BR):** in the Brazilian-Portuguese docs, keep the
+following VEF term families in English and write Portuguese grammar around them,
+rather than translating them literally. A native pt-BR reviewer found the literal
+translations read as awkward jargon.
+
+| English term | Do **not** translate to | Notes |
+|---|---|---|
+| **capability / capabilities** | *capacidade(s)* | The VEF construct only. Generic "capacity" is still translated normally. |
+| **Preview** | *Prévia* | The tier/qualifier, e.g. "capabilities Preview". |
+| **pointer(s)** | *ponteiro(s)* |  |
+| **Protocol N** | *Protocolo N* | e.g. "Protocol 4", not "Protocolo 4". |
+
+Apply this in prose only — code, inline identifiers, URLs, and `{#anchor}` slugs
+are never touched. Because these are English nouns carried into Portuguese
+sentences, they follow Portuguese word order: "capabilities Preview", not
+"Preview Capabilities". ja/ko/zh translate these terms fully; this rule is
+specific to pt-BR.
+
 ## 7. Frontmatter
 Every `.mdx` file starts with YAML frontmatter. Missing frontmatter is a build
 and review failure.
@@ -211,16 +229,16 @@ villagesql-docs/
 ├── index.mdx              # docs landing page
 ├── guides/                # how-to guides and tutorials (see also: keywords, cross-links)
 ├── mysql-8.4/
-│   ├── 0.0.4/             # current stable
-│   ├── 0.0.5-dev/         # active development, most edits go here
-│   └── 0.0.1 … 0.0.3/     # archived stable versions
+│   ├── stable/            # current stable (fixed URL slot)
+│   ├── dev/               # active development, most edits go here
+│   └── 0.0.1 … 0.0.4/     # frozen archived versions
 ├── extensions/
 ├── snippets/              # reusable MDX fragments
-└── ja/ ko/ zh/            # translations
+└── ja/ ko/ zh/ pt-BR/     # translations
 ```
 
 - **Edit the dev version.** New content and changes go to the current dev
-  directory (`mysql-8.4/0.0.5-dev/`). Released versions are frozen except for
+  directory (`mysql-8.4/dev/`). Released versions are frozen except for
   corrections. The full release process is in [VERSIONING.md](./VERSIONING.md).
 - **Register new pages in `docs.json`.** A file that isn't in `docs.json` won't
   appear in the sidebar.

@@ -95,7 +95,7 @@ VillageSQL's key differentiator is its extension framework. When documenting ext
 
 ## Versioning workflow
 - See [VERSIONING.md](./VERSIONING.md) for the complete versioning policy
-- All changes go to the dev branch (e.g., `mysql-8.4/0.0.3-dev/`)
+- All changes go to the dev slot (e.g., `mysql-8.4/dev/`)
 - When cutting a release, follow the process in VERSIONING.md
 
 ## Git workflow
