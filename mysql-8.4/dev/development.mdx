@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "C++ Development"
-description: "VDF authoring depth for C++ extensions — argument and result types, aggregates, prerun/postrun, varargs, and registration."
+description: "VDF authoring depth for C++ extensions — argument and result types, exception safety, aggregates, prerun/postrun, varargs, and registration."
 ---
 
 This guide is the deep reference for writing C++ VDF implementations. It is the companion to [Creating Extensions in C++](/mysql-8.4/dev/create), which covers the end-to-end build steps, and [C++ Testing](/mysql-8.4/dev/testing), which covers the test-and-iterate loop.
@@ -18,6 +18,42 @@ single header to access the full SDK:
 ```cpp
 #include <villagesql/vsql.h>
 ```
+
+## Exception Safety
+
+Containing exceptions is the extension's responsibility. The SDK does not wrap
+your implementation in a `try`/`catch`, and neither does the server, so an
+exception that escapes an entry point unwinds across the C ABI boundary with no
+handler anywhere above it and the server process terminates. Ordinary SQL input
+reaches this: `std::stoi()` throws on a non-numeric string, and
+`nlohmann::json::dump()` throws on text that is not valid UTF-8.
+
+Wrap the body of every entry point you register: VDFs, aggregate result
+functions, and the `from_string`/`to_string` operations of a custom type.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <string>
+
+using namespace vsql;
+
+void to_int_impl(StringArg in, IntResult out) {
+  if (in.is_null()) { out.set_null(); return; }
+  try {
+    out.set(std::stoi(std::string(in.value())));  // throws on bad input
+  } catch (const std::exception &e) {
+    out.warning(e.what());
+  } catch (...) {
+    out.warning("unexpected error");
+  }
+}
+```
+
+Catch `...` in addition to `const std::exception &`: a dependency may throw a
+type that does not derive from `std::exception`, and that one still terminates
+the server. Choose between `warning()` and `error()` on the same basis as any
+other failure — `warning()` for bad input the statement should survive,
+`error()` where continuing is unsafe.
 
 ## Argument and Result Types
 
