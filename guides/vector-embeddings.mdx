@@ -35,6 +35,24 @@ SELECT ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning 
 -- Returns: [0.02646778, 0.019067757, -0.05332306, ...]
 ```
 
+### The charset conversion
+
+`ai_embedding()` returns binary charset, as every VEF STRING function does. MySQL's JSON parser rejects a binary string, so the result has to pass through `CONVERT(... USING utf8mb4)` before it reaches a `JSON` column or a JSON function:
+
+```sql
+-- This throws an error — JSON_LENGTH rejects binary charset
+-- ERROR 3144 (22032): Cannot create a JSON value from a string with CHARACTER SET 'binary'
+SELECT JSON_LENGTH(ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning'));
+
+-- This works
+SELECT JSON_LENGTH(
+  CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning')
+          USING utf8mb4)
+);
+```
+
+The same applies to inserting into a `JSON` column, which is why every example below wraps the call. A `TEXT` column needs no conversion — it is JSON parsing, not storage, that rejects the binary charset.
+
 ### Storing embeddings
 
 Store the JSON array in a `JSON` column:
@@ -53,12 +71,17 @@ SET SESSION max_execution_time = 120000;
 INSERT INTO documents (title, content, embedding) VALUES
     ('Intro to ML',
      'Machine learning is a subset of artificial intelligence',
-     ai_embedding('openai', 'text-embedding-3-small', @key,
-                  'Machine learning is a subset of artificial intelligence')),
+     CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                          'Machine learning is a subset of artificial intelligence')
+             USING utf8mb4)),
     ('Neural Networks',
      'Deep learning uses multi-layer neural networks',
-     ai_embedding('openai', 'text-embedding-3-small', @key,
-                  'Deep learning uses multi-layer neural networks'));
+     CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                          'Deep learning uses multi-layer neural networks')
+             USING utf8mb4));
+
+-- Confirm the vectors parsed as JSON
+SELECT id, JSON_LENGTH(embedding) AS dimensions FROM documents;
 ```
 
 ### Backfilling embeddings on existing rows
@@ -70,7 +93,8 @@ SET @key = 'your-openai-api-key';
 SET SESSION max_execution_time = 300000;
 
 UPDATE documents
-SET embedding = ai_embedding('openai', 'text-embedding-3-small', @key, content)
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, content)
+                        USING utf8mb4)
 WHERE embedding IS NULL
 LIMIT 50;  -- Process in batches
 ```
@@ -108,14 +132,17 @@ The quality of your embeddings depends on what you embed. Some patterns:
 
 ```sql
 -- Embed the full content for document search
-SET embedding = ai_embedding('openai', 'text-embedding-3-small', @key, content);
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, content)
+                        USING utf8mb4);
 
 -- Embed a specific field for product search
-SET embedding = ai_embedding('openai', 'text-embedding-3-small', @key, product_description);
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, product_description)
+                        USING utf8mb4);
 
 -- Embed concatenated fields for richer context
-SET embedding = ai_embedding('openai', 'text-embedding-3-small', @key,
-    CONCAT(product_name, '. ', category, '. ', product_description));
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                            CONCAT(product_name, '. ', category, '. ', product_description))
+                        USING utf8mb4);
 ```
 
 Keep the text you embed under a few thousand tokens. Longer text gets truncated by the embedding model.
@@ -142,7 +169,8 @@ The embedding model truncates input at its token limit (typically 8191 tokens fo
 
 | Problem | Solution |
 |:---|:---|
-| `FUNCTION ai_embedding does not exist` | Run `INSTALL EXTENSION vsql_ai` |
+| `FUNCTION <database>.ai_embedding does not exist` | Run `INSTALL EXTENSION vsql_ai` |
+| `ERROR 3144: Cannot create a JSON value from a string with CHARACTER SET 'binary'` | Wrap the call in `CONVERT(... USING utf8mb4)` — see [The charset conversion](#the-charset-conversion) |
 | `ai_embedding()` returns NULL | Check API key; verify model name; check `max_execution_time` |
 | Similarity search returns wrong results | Confirm all embeddings use the same model; check that embeddings weren't generated with different content than what you're searching |
 | Embeddings take too long to generate | Use LIMIT batches; embeddings are ~1–3 seconds each per API call |
