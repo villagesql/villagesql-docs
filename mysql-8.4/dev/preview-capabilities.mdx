@@ -1195,6 +1195,7 @@ The builder has three pieces:
 |---|---|
 | `make_auth<&handler>("name")` | Starts the builder. The handler is a compile-time template argument, so a null or wrong-signature handler is a compile error rather than a runtime failure. `"name"` is the auth-method name accounts bind to (`IDENTIFIED WITH <name>`) and must be at most `VEF_AUTH_MAX_NAME_LEN` (64) bytes. |
 | `.client_plugin(name)` | Optional. Overrides the client-side auth plugin the server advertises during the handshake. |
+| `.auto_create(callback)` | Optional. Opts the method in to logins for accounts that do not exist (see [Auto-Creating Accounts](#auto-creating-accounts)). |
 | `.build()` | Yields the descriptor you hand to `AuthCapability`. |
 
 `AuthCapability g_auth{descriptor}` is the self-registering token consumed by
@@ -1232,6 +1233,8 @@ uses:
 | `c.authenticate_as(account)` | Set the effective account the session runs as (shown by `CURRENT_USER()`). Required before returning `AuthResult::kOk`. |
 | `c.set_external_user(identity)` | Set the original external identity for the audit trail (`@@external_user`). |
 | `c.set_active_roles(roles, n_roles)` | Stage the session's active roles (see [Staging Active Roles](#staging-active-roles)). |
+| `c.account_unknown()` | `true` when the account being authenticated does not exist and this login was routed to the method by its `.auto_create()` opt-in. `false` for a login against an existing account. |
+| `c.request_provision(account, roles, n_roles)` | Ask the server to create `account` and grant it `roles` (see [Auto-Creating Accounts](#auto-creating-accounts)). |
 
 The handler returns one of three results:
 
@@ -1266,8 +1269,8 @@ beyond what the DBA provisioned. Passing `n_roles == 0` activates no roles
 A minimal authenticator, condensed from the `vsql_auth_test` extension that
 ships with the server. It accepts one fixed token, maps the connection to
 `vsql_auth_test_user`, and pins `mysql_clear_password` so the token arrives
-verbatim in the password slot. (The shipping extension adds extra token paths to
-drive its test suite.)
+verbatim in the password slot. (The shipping extension adds extra token paths
+and the `.auto_create()` opt-in described below to drive its test suite.)
 
 ```cpp
 #include <cstring>
@@ -1385,3 +1388,130 @@ longer authenticate:
 ```sql
 UNINSTALL EXTENSION vsql_auth_test;
 ```
+
+### Auto-Creating Accounts
+
+A method can also handle logins for accounts that do not exist yet, and have the
+server create the account as part of the successful login. Without this, an
+unknown account is rejected before any method runs.
+
+Opt in with `.auto_create(&callback)`. The callback takes no arguments and
+returns `bool`; the server calls it on each unknown-account login rather than
+reading it once at registration, so the method can follow a runtime setting of
+its own instead of freezing the choice when the extension loads:
+
+```cpp
+bool auto_create_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_create(&auto_create_enabled)
+        .build();
+```
+
+Leaving `.auto_create()` off, or returning `false` from the callback, keeps the
+standard behavior: an unknown account is denied. Only one installed method may
+opt in at a time — if two return `true`, the server declines to guess, logs a
+warning to the error log, and rejects unknown accounts as if none had opted in.
+
+In the handler, `c.account_unknown()` distinguishes the two cases. Validate the
+credential first, then describe what to create and authenticate as it:
+
+```cpp
+if (c.account_unknown()) {
+  const char *roles[] = {"vsql_role_granted"};
+  c.request_provision(c.user_name(), roles, 1);
+  c.authenticate_as(c.user_name());
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+```
+
+`request_provision(account, roles, n_roles)` records intent and returns nothing.
+The server runs the DDL itself, after the handler returns `AuthResult::kOk`, and
+only for a login that was routed in as an unknown account — so a login the
+handler goes on to deny creates nothing, and a request naming an account that
+already exists is ignored. What the server runs is
+`CREATE USER IF NOT EXISTS <account>@'%' IDENTIFIED WITH <method>`, followed by
+one `GRANT` per named role: the account is always created for host `%` and bound
+to the method that authenticated it, and `account` need not be the connecting
+user name. If the creation cannot be done — on a `super_read_only` server, for
+example — the login fails rather than proceeding without an account.
+
+Roles behave as they do for [Staging Active Roles](#staging-active-roles): the
+DBA owns them. Each name must already exist as a grantable role, and one that
+cannot be granted is logged and skipped rather than failing the login, so a
+token can name a role but never create or escalate one. The account name comes
+from the client, so the server quotes it as an identifier — a crafted name
+becomes one oddly-named account, never a second statement.
+
+The `vsql_auth_test` extension opts in, and provisions the connecting user with
+the role `vsql_role_granted`. Create that role first, then connect as an account
+that does not exist:
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+CREATE ROLE vsql_role_granted;
+GRANT SELECT ON *.* TO vsql_role_granted;
+```
+
+```bash
+mysql --enable-cleartext-plugin --user=auto_created_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER() AS who, @@external_user AS ext"
+```
+
+```text
++---------------------+-------------------+
+| who                 | ext               |
++---------------------+-------------------+
+| auto_created_user@% | auto_created_user |
++---------------------+-------------------+
+```
+
+The account now exists, bound to the method, holding the granted role:
+
+```sql
+SELECT user, host, plugin FROM mysql.user WHERE user = 'auto_created_user';
+```
+
+```text
++-------------------+------+----------------+
+| user              | host | plugin         |
++-------------------+------+----------------+
+| auto_created_user | %    | vsql_auth_test |
++-------------------+------+----------------+
+```
+
+```sql
+SHOW GRANTS FOR 'auto_created_user'@'%';
+```
+
+```text
++----------------------------------------------------------+
+| Grants for auto_created_user@%                           |
++----------------------------------------------------------+
+| GRANT USAGE ON *.* TO `auto_created_user`@`%`            |
+| GRANT `vsql_role_granted`@`%` TO `auto_created_user`@`%` |
++----------------------------------------------------------+
+```
+
+A wrong token still fails closed, and provisions nothing:
+
+```bash
+mysql --enable-cleartext-plugin --user=never_created --password=wrong-token \
+      -e "SELECT 1"
+```
+
+```text
+ERROR 1045 (28000): Access denied for user 'never_created'@'localhost' (using password: NO)
+```
+
+<Warning>
+Opting in makes the difference between an unknown and an existing account
+observable to anyone holding a valid credential, which the standard
+unknown-account rejection deliberately hides. That is the trade this feature
+makes; weigh it before enabling the opt-in on a method whose credentials are
+widely held.
+</Warning>
