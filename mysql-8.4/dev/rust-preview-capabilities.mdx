@@ -1,0 +1,402 @@
+---
+audience: extension-author
+title: "Preview Capabilities in Rust"
+description: "Use VillageSQL preview capabilities from the Rust SDK — declare status variables, system variables, background thread workers, and keyring access with the requires: list in extension!."
+---
+
+<Warning>
+  The Rust SDK is in alpha — expect breaking API changes between releases.
+  Preview capabilities are additionally unstable on the server side: their
+  ABIs may change between server releases. An extension built against a
+  preview capability may fail to load after a server update.
+</Warning>
+
+Preview capabilities are server features exposed to extensions before their
+APIs are finalized. The Rust SDK wraps four of them: status variables, system
+variables, background thread workers, and keyring access. This page covers
+declaring and using each one from Rust. For the concept, the preview tier,
+and the capabilities that exist only in C++, see
+[Preview Capabilities](/mysql-8.4/dev/preview-capabilities).
+
+## Prerequisites
+
+An extension that uses any preview capability installs only when
+`vsql_allow_preview_extensions` is `ON`:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+```
+
+See [Enabling the Preview Tier](/mysql-8.4/dev/preview-capabilities#enabling-the-preview-tier)
+for the details, including why `SET GLOBAL` is rejected for this variable.
+
+You also need a working Rust extension setup — the
+[Creating Extensions in Rust](/mysql-8.4/dev/rust-sdk) walkthrough covers the
+toolchain, `cargo-vsql`, and your first `extension!` block.
+
+## What the Rust SDK Wraps
+
+| Capability | Rust module | SDK example |
+|---|---|---|
+| `vsql::status_var` | `villagesql::preview::status_var` | [`vsql_status_var`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_status_var) |
+| `vsql::sys_var` | `villagesql::preview::sys_var` | [`vsql_sys_var`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_sys_var) |
+| `vsql::preview::thread_worker` | `villagesql::preview::thread_worker` | [`vsql_thread_worker`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_thread_worker) |
+| `vsql::preview::keyring` | `villagesql::preview::keyring` | [`vsql_keyring`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_keyring) |
+
+The remaining preview capabilities — `sql_query`, `statement_event`, and the
+column storage ABI — are C++-only today. Use the
+[C++ SDK](/mysql-8.4/dev/preview-capabilities) if you need one of those.
+
+## Registration Pattern
+
+Declare each capability as a `static`, then list it by reference in the
+`requires:` section of `extension!` — the Rust equivalent of the C++ SDK's
+`.with()`:
+
+```rust
+use villagesql::preview::keyring::KeyringCapability;
+
+static KEYRING: KeyringCapability = KeyringCapability::new();
+
+villagesql::extension! {
+    funcs: [
+        // ...
+    ],
+    requires: [
+        &KEYRING,
+    ]
+}
+```
+
+The server populates the capability object at load time; before that, its
+accessor methods report the capability as unavailable rather than crashing.
+The `static` is required — the server holds pointers into the capability for
+the extension's whole lifetime.
+
+## Status Variables
+
+The `status_var` capability exposes extension-owned counters through
+`SHOW GLOBAL STATUS`. Your extension owns the storage as `'static` atomics
+and writes to them; the server reads through the pointers each time the
+status variable is queried.
+
+Declare each variable as a `StatusVarSpec` — `Int` backed by an
+`AtomicI64`, or `Double` backed by the SDK's `AtomicF64` (Rust's standard
+library has no atomic `f64`, so the SDK provides one with `new`, `load`, and
+`store`):
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use villagesql::preview::status_var::{AtomicF64, StatusVarCapability, StatusVarSpec};
+use villagesql::{InValue, VdfReturn};
+
+static REQUESTS: AtomicI64 = AtomicI64::new(0);
+static LOAD: AtomicF64 = AtomicF64::new(0.5);
+
+static SPECS: &[StatusVarSpec] = &[
+    StatusVarSpec::Int {
+        name: c"requests",
+        value: &REQUESTS,
+    },
+    StatusVarSpec::Double {
+        name: c"load",
+        value: &LOAD,
+    },
+];
+
+static STATUS_VAR: StatusVarCapability = StatusVarCapability::new(SPECS);
+
+fn bump_impl(_args: &[InValue]) -> VdfReturn {
+    let n = REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    VdfReturn::int(n)
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(bump_impl, "bump", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &STATUS_VAR,
+    ]
+}
+```
+
+After `INSTALL EXTENSION`, the variables appear with the extension name as a
+prefix:
+
+```sql
+SELECT vsql_status_var.bump();
+-- 1
+SHOW GLOBAL STATUS LIKE 'vsql_status_var%';
+```
+
+```
+Variable_name	Value
+vsql_status_var.load	0.500000
+vsql_status_var.requests	1
+```
+
+## System Variables
+
+The `sys_var` capability registers MySQL system variables owned by your
+extension. Three types are supported: `Bool`, `Int` (with `min`/`max`
+bounds), and `Str`. Every spec carries a name, a comment shown in
+`SHOW VARIABLES` metadata, a default, and an optional `on_change` callback.
+
+Names and string defaults are `&'static CStr` values — write them as C-string
+literals (`c"enabled"`):
+
+```rust
+use villagesql::preview::sys_var::{SysVarCapability, SysVarSpec};
+
+static SPECS: &[SysVarSpec] = &[
+    SysVarSpec::Bool {
+        name: c"enabled",
+        comment: c"Enable the feature",
+        default: true,
+        on_change: None,
+    },
+    SysVarSpec::Int {
+        name: c"threshold",
+        comment: c"Threshold in milliseconds",
+        default: 1000,
+        min: 0,
+        max: 60000,
+        on_change: None,
+    },
+    SysVarSpec::Str {
+        name: c"log_path",
+        comment: c"Path to the log file",
+        default: c"/tmp/vsql_sys_var.log",
+        on_change: None,
+    },
+];
+
+static SYS_VAR: SysVarCapability = SysVarCapability::new(SPECS);
+
+villagesql::extension! {
+    funcs: [],
+    requires: [
+        &SYS_VAR,
+    ]
+}
+```
+
+The `funcs:` section must be present before `requires:`, even when empty.
+
+After install, the variables are addressable with the extension name as a
+prefix:
+
+```sql
+SELECT @@global.vsql_sys_var.enabled;
+-- 1
+SELECT @@global.vsql_sys_var.threshold;
+-- 1000
+SET GLOBAL vsql_sys_var.enabled = 0;
+```
+
+### Reacting to Changes
+
+`on_change` is a raw C callback, invoked by the server after a variable is
+set. It runs on the server's thread: keep it quick, and don't panic — a
+panic here crosses the FFI boundary. The callback receives a
+`*const vef_sys_var_change_t` from the raw ABI layer:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+use villagesql::sys::vef_sys_var_change_t;
+
+static CHANGE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn on_enabled_change(_change: *const vef_sys_var_change_t) {
+    CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+```
+
+Wire it into a spec with `on_change: Some(on_enabled_change)`.
+
+### Reading and Writing from Extension Code
+
+`SysVarCapability` also exposes `get()` and `set()` for programmatic access
+through the server (so range validation and persistence are handled for
+you). Both are `unsafe` FFI methods taking NUL-terminated C strings, and
+both use the inverted C convention: `Some(false)` means success, `Some(true)`
+means the server reported an error, and `None` means the capability is
+unavailable. On a successful `get`, the server writes a `malloc`'d string
+you must release with the C `free()`. The
+[`vsql_sys_var` example](https://github.com/villagesql/vsql-rust-sdk/blob/main/examples/vsql_sys_var/src/lib.rs)
+shows the full pattern, including the `free` extern and the safety
+comments.
+
+## Thread Worker
+
+The `thread_worker` capability runs a function you provide on a
+server-managed background thread. The server registers a control system
+variable at load time; while it is `ON`, your work function is called on a
+periodic timer, on file-descriptor readiness, or on enable/disable
+transitions.
+
+Your work function is plain safe Rust:
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+use villagesql::preview::thread_worker::{
+    NextWakeup, ThreadHandle, ThreadWorkerCapability, WakeupReason,
+};
+use villagesql::{InValue, VdfReturn};
+
+static TICKS: AtomicI64 = AtomicI64::new(0);
+
+fn worker(reason: WakeupReason, _handle: ThreadHandle) -> NextWakeup {
+    if reason == WakeupReason::Periodic {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    NextWakeup::unchanged()
+}
+
+static WORKER: ThreadWorkerCapability =
+    ThreadWorkerCapability::new(worker, "ticker", Duration::from_millis(100), None);
+
+fn ticks_impl(_args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(TICKS.load(Ordering::Relaxed))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(ticks_impl, "ticks", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &WORKER,
+    ]
+}
+```
+
+`ThreadWorkerCapability::new` takes the work function, a thread-name suffix,
+the initial sleep interval, and an optional control-variable name override.
+When the override is `None`, the control variable is named
+`{suffix}_enabled` and registered under the extension's prefix:
+
+```sql
+SHOW GLOBAL VARIABLES LIKE '%ticker%';
+```
+
+```
+Variable_name	Value
+vsql_thread_worker.ticker_enabled	OFF
+```
+
+```sql
+SET GLOBAL vsql_thread_worker.ticker_enabled = ON;
+SELECT SLEEP(0.5);
+SELECT vsql_thread_worker.ticks();
+-- 4  (varies with timing — one tick per 100 ms while enabled)
+SET GLOBAL vsql_thread_worker.ticker_enabled = OFF;
+```
+
+### Wakeups
+
+`WakeupReason` tells you why the server called: `Enable`, `Periodic`,
+`PollFd`, or `Disable`. Your return value adjusts the next wakeup:
+
+- `NextWakeup::unchanged()` — keep the current sleep interval and poll fd.
+- `NextWakeup::after(duration)` — wake again after `duration`.
+- Set the `poll_fd` field to a file descriptor greater than zero to also
+  wake when it becomes readable, or to `-1` to clear a previously set one.
+
+A zero-length `Duration` collapses to "no change" — the underlying C ABI
+reserves `0` for that, so an instant wakeup can't be expressed.
+
+If the work function panics, the SDK catches the panic at the FFI boundary
+and treats the call as returning `NextWakeup::unchanged()` — the worker
+keeps running.
+
+The `ThreadHandle` parameter is reserved for opening SQL sessions from the
+worker once the `sql_query` capability is ported to Rust; it has no methods
+yet.
+
+## Keyring Access
+
+The `keyring` capability reads and writes secrets stored in the MySQL
+keyring component — API keys, encryption keys, anything that shouldn't live
+in a table. A keyring component (for example `component_keyring_file`) must
+be installed on the server; without one, every read and write fails with
+`KeyringError::NoComponent`.
+
+```rust
+use std::ffi::CString;
+
+use villagesql::preview::keyring::KeyringCapability;
+use villagesql::{InValue, VdfReturn};
+
+static KEYRING: KeyringCapability = KeyringCapability::new();
+
+const MAX_SECRET_LEN: usize = 1024;
+
+fn keyring_read_impl(args: &[InValue]) -> VdfReturn {
+    let Some(&InValue::String(data_id)) = args.first() else {
+        return VdfReturn::null();
+    };
+    let Ok(data_id) = CString::new(data_id) else {
+        return VdfReturn::null();
+    };
+
+    let mut buf = [0u8; MAX_SECRET_LEN];
+    match KEYRING.read(&data_id, None, &mut buf) {
+        Ok(Some(n)) => match std::str::from_utf8(&buf[..n]) {
+            Ok(s) => VdfReturn::string(s),
+            Err(_) => VdfReturn::null(),
+        },
+        Ok(None) | Err(_) => VdfReturn::null(),
+    }
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(
+            keyring_read_impl, "keyring_read",
+            [villagesql::Type::String] -> villagesql::Type::String,
+            buffer_size: MAX_SECRET_LEN
+        ),
+    ],
+    requires: [
+        &KEYRING,
+    ]
+}
+```
+
+`read(data_id, auth_id, buf)` fills the buffer you pass and returns
+`Ok(Some(n))` with the secret's length, or `Ok(None)` when no secret exists
+under `data_id` — a normal outcome, not an error. `write(data_id, auth_id,
+data)` returns `Ok(())` on success. `auth_id` is the owning user; pass
+`None` for internal keys not associated with a specific user.
+
+Both return `Err(KeyringError)` on failure: `CapabilityUnavailable` (the
+capability was never wired up), `NoComponent` (no keyring component on the
+server), or `Other`.
+
+The keyring has no size probe: a secret larger than the buffer you pass to
+`read` comes back as `Ok(None)`, indistinguishable from a missing key. Size
+your buffer for the largest secret you expect to store.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Preview Capabilities (C++)"
+    icon="flask"
+    href="/mysql-8.4/dev/preview-capabilities"
+  >
+    The full capability index, the preview tier, and the C++-only
+    capabilities: sql_query, statement_event, and column storage.
+  </Card>
+  <Card
+    title="Rust API Reference"
+    icon="book"
+    href="/mysql-8.4/dev/rust-api-reference"
+  >
+    InValue, VdfReturn, extension!, func!, and custom_type! — all fields.
+  </Card>
+</CardGroup>
