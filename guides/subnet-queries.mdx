@@ -44,7 +44,7 @@ Neither approach works for IPv6 — `INET_ATON()` only handles IPv4.
 
 ## With VillageSQL: Network Functions on INET Columns
 
-VillageSQL's `vsql_network_address` extension provides `inet_network()`, `inet_set_masklen()`, and `inet_compare()` — enough to do subnet containment checks on both IPv4 and IPv6 `INET` columns.
+VillageSQL's `vsql_network_address` extension provides containment predicates that answer "is this address inside that subnet" directly — `inet_contained_by()`, `inet_contains()`, and `inet_overlaps()` — plus `inet_network()`, `inet_set_masklen()`, and `inet_compare()` for building the check by hand. All of them work on both IPv4 and IPv6 `INET` columns.
 
 ```sql
 INSTALL EXTENSION vsql_network_address;
@@ -87,6 +87,42 @@ SELECT inet_to_string(ip_address) FROM access_log
 WHERE cidr_to_string(inet_network(inet_set_masklen(ip_address, @prefix_len)))
     = @network;
 ```
+
+### Containment predicates
+
+The extension ships PostgreSQL's five containment predicates as functions. They
+take two `INET` values and return `1`, `0`, or `NULL`:
+
+| Function | PostgreSQL operator | True when |
+|:---|:---|:---|
+| `inet_contained_by(a, b)` | `a << b` | `a` is inside `b`, and `b` is the wider network |
+| `inet_contained_by_or_equals(a, b)` | `a <<= b` | `a` is inside `b`, or the two networks are equal |
+| `inet_contains(a, b)` | `a >> b` | `a` is the wider network and `b` is inside it |
+| `inet_contains_or_equals(a, b)` | `a >>= b` | `b` is inside `a`, or the two networks are equal |
+| `inet_overlaps(a, b)` | `a && b` | either network contains the other, or they are equal |
+
+The subnet query above becomes a single call:
+
+```sql
+-- All IPs in 192.168.1.0/24
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE inet_contained_by(ip_address, inet_from_string('192.168.1.0/24'));
+```
+
+Only the network part of each value is compared, through the shorter of the two
+prefix lengths — so `192.168.1.5/24` and `192.168.1.9/24` are the same network,
+and the strict forms return `0` for them while the `_or_equals` forms return `1`.
+Two addresses of different families never match: comparing an IPv4 value with an
+IPv6 one returns `0` rather than raising an error, matching PostgreSQL.
+
+Both arguments must be `INET`. A `CIDR` value is not coerced:
+
+```text
+ERROR 3219 (HY000): Cannot initialize function 'inet_contains': argument 1 type mismatch (expected vsql_network_address.INET, got vsql_network_address.CIDR)
+```
+
+Pass `inet_from_string()` on the subnet instead, as the example above does. These
+functions were added in `vsql_network_address` 0.0.5.
 
 ### Range-based containment with inet_compare
 
@@ -151,12 +187,13 @@ WHERE cidr_to_string(inet_network(inet_set_masklen(
 | `BETWEEN INET_ATON()` | No | Moderate | Requires computing broadcast manually |
 | Bitwise AND with `INET_ATON()` | No | Low | Requires computing netmask manually |
 | `inet_network()` + `inet_set_masklen()` | Yes | High | Functions handle the math |
+| `inet_contained_by()` | Yes | High | One call, no manual calculation |
 
 ## Frequently Asked Questions
 
-#### Why doesn't VillageSQL have a contains operator like PostgreSQL's `<<`?
+#### Does VillageSQL have PostgreSQL's `<<` containment operator?
 
-The current version provides functions rather than operators. The `inet_network()` + `inet_set_masklen()` pattern covers the same logic. Operator support may come in a future release.
+The behaviour is there, as functions rather than operators: `inet_contained_by()` for `<<`, `inet_contains()` for `>>`, the `_or_equals` variants for `<<=` and `>>=`, and `inet_overlaps()` for `&&`. See [Containment predicates](#containment-predicates).
 
 #### Does the subnet query use the index?
 
@@ -164,13 +201,13 @@ The `cidr_to_string(inet_network(inet_set_masklen(...)))` pattern does not use a
 
 #### Can I store subnets and query containment at the same time?
 
-Yes. Store the host address in an `INET` column and the authorized subnet in a `CIDR` column. Compare them using `inet_network(inet_set_masklen(host_ip, inet_masklen(subnet)))` = `cidr_to_string(subnet)`.
+Yes. Store both the host address and the subnet in `INET` columns and compare them with `inet_contained_by(host_ip, subnet)`. If the subnet is in a `CIDR` column, convert it first — the containment predicates take `INET` on both sides and do not coerce `CIDR`.
 
 ## Troubleshooting
 
 | Problem | Solution |
 |:---|:---|
-| `FUNCTION inet_network does not exist` | Run `INSTALL EXTENSION vsql_network_address` |
+| `FUNCTION <database>.inet_network does not exist` | Run `INSTALL EXTENSION vsql_network_address` |
 | Subnet query returns no rows | Verify `@network` matches the expanded CIDR string — IPv6 CIDRs use expanded notation |
 | Range query includes addresses outside the subnet | Check the broadcast address; for /24 the range is `.0` to `.255` |
 | Mixed IPv4/IPv6 column returns wrong results | IPv4 and IPv6 addresses don't overlap — the query returns correct results per-family |
