@@ -287,9 +287,10 @@ make_func<&large_result_impl>("large_result")
   .build()
 ```
 
-When you build the value yourself with `buffer()` and `set_length()`, the buffer
-is fixed at `buffer().size()` bytes — writing past it overflows memory, so guard
-against it:
+When you build the value yourself with `buffer()` and `set_length()`, never write
+past `buffer().size()` — that overflows memory. But do not fail on a value that is
+too large either: report the size you would have written and let the server grow
+the buffer and call you again.
 
 ```cpp
 void large_result_impl(StringArg input, StringResult out) {
@@ -298,7 +299,10 @@ void large_result_impl(StringArg input, StringResult out) {
 
     auto buf = out.buffer();
     if (needed > buf.size()) {
-        out.error("Output exceeds buffer size");
+        // Too small this time. Report what is needed and return: the server
+        // grows the buffer to `needed` and re-invokes this function, and the
+        // second call takes the branch below.
+        out.set_length(needed);
         return;
     }
 
@@ -307,11 +311,20 @@ void large_result_impl(StringArg input, StringResult out) {
 }
 ```
 
-For STRING results, `out.set(sv)` truncates silently: it copies as many bytes as
-fit in `out.buffer()` and reports that truncated length. It does not report the
-value's full size, and the server does not grow the buffer and re-invoke the
-function. To avoid truncation, size the buffer correctly with `.buffer_size()`,
-or write into `out.buffer()` and call `out.set_length()` yourself as shown above.
+For STRING results, `out.set(sv)` follows an snprintf-style overflow contract: it
+copies as many bytes as fit in `out.buffer()`, but reports the value's *full*
+size. The server detects that the reported length exceeds the buffer, grows the
+buffer, and calls the function a second time — so a value larger than
+`.buffer_size()` is returned whole rather than truncated. One retry always
+suffices, because the reported length says exactly how large the buffer must be.
+
+Growth is bounded by `max_allowed_packet`. A value larger than that is returned
+as `NULL`, not truncated.
+
+Writing into `out.buffer()` and calling `out.set_length()` yourself participates
+in the same contract: report the full size you would have written, not the number
+of bytes that fit. Reporting the truncated length defeats the retry and silently
+drops the remainder.
 
 That contract applies at row time. A *materialized* STRING result — in a
 GROUP BY/DISTINCT temp table, `CREATE TABLE ... SELECT`, or UNION — still
