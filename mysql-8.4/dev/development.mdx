@@ -313,6 +313,69 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .build()
 ```
 
+## Extension Load and Unload Hooks
+
+An extension sometimes has work to do once per load rather than once per call —
+picking a CPU-specific implementation, or building a lookup table the VDFs then
+read. Register that work with `.on_init<&Fn>()` on the extension builder, and
+the matching teardown with `.on_deinit<&Fn>()`. Both take a function with the
+signature `void()`.
+
+`on_init` runs at every extension load: at `INSTALL EXTENSION` and again on each
+server startup, after the server has validated and accepted the extension. It
+never runs for an extension the server rejected. `on_deinit` runs at unload —
+`UNINSTALL EXTENSION` or server shutdown.
+
+Both hooks run inside the extension process with **no access to the server**:
+they cannot run SQL, read system variables, or reach server state. That is why
+they are the wrong place for setup that has to talk to the server — use a
+preview capability's populate step for that.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cmath>
+using namespace vsql;
+
+static float *g_sqrt_table = nullptr;
+
+void build_table() {
+  g_sqrt_table = new float[256];
+  for (int i = 0; i < 256; i++) g_sqrt_table[i] = std::sqrt(float(i));
+}
+
+void free_table() {
+  delete[] g_sqrt_table;
+  g_sqrt_table = nullptr;
+}
+
+void fast_sqrt(IntArg n, RealResult out) {
+  if (n.is_null() || n.value() < 0 || n.value() > 255) {
+    out.set_null();
+    return;
+  }
+  out.set(g_sqrt_table[n.value()]);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .on_init<&build_table>()
+        .on_deinit<&free_table>()
+        .func(make_func<&fast_sqrt>("fast_sqrt")
+                  .returns(REAL)
+                  .param(INT)
+                  .build()))
+```
+
+After `INSTALL EXTENSION my_extension`, `SELECT fast_sqrt(16)` returns `4` —
+a result that is only reachable if `build_table` already ran.
+
+<Note>
+`on_deinit` is called from the `vef_unregister` entry point that
+`VEF_GENERATE_ENTRY_POINTS` generates. `VEF_GENERATE_REGISTRATION` does not
+define that entry point, so an extension using it must call its teardown from
+the `vef_unregister` it writes itself.
+</Note>
+
 ## VEF_GENERATE_REGISTRATION
 
 `VEF_GENERATE_REGISTRATION` creates an internal `_vef_do_register()` helper
