@@ -244,17 +244,17 @@ VEF_GENERATE_ENTRY_POINTS(
 ## MySQL Services
 
 The mysql_services capability (`vsql::preview::mysql_services`) lets an
-extension consume MySQL registry services — the services a MySQL component
-consumes, whether an installed component or the server core provides them. The
+extension consume MySQL registry services — the same services a MySQL component
+consumes, provided either by an installed component or by the server core. The
 extension declares every service it needs in one place; the server acquires each
 one when the extension loads and releases it when the extension unloads.
 
 The capability name `VEF_PREVIEW_MYSQL_SERVICES_NAME` is
 `"vsql::preview::mysql_services"`.
 
-Reach for it when a server facility has no VEF capability of its own — the
-error log, session attributes, or the keyring's own component services are all
-available this way. Only consuming is supported: registering the extension's own
+Reach for it when a server facility has no VEF capability of its own. Session
+attributes and the keyring's own component services are both reachable this
+way. Only consuming is supported: registering the extension's own
 implementation into the registry is a planned follow-up and is not part of this
 capability.
 
@@ -268,14 +268,14 @@ methods are declared:
 ```cpp
 #include <cstddef>
 
-#include <mysql/components/services/mysql_simple_error_log.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
 #include <villagesql/preview/mysql_services.h>
 #include <villagesql/vsql.h>
 
 using namespace vsql;
 
 static preview_mysql_services::MysqlServices services;
-VSQL_REQUIRE_SERVICE(services, mysql_simple_error_log, error_log);
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
 
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()
@@ -283,21 +283,73 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(services))
 ```
 
-`VSQL_REQUIRE_SERVICE(services, name, var)` does two things in one line: it
-declares `var`, the reference the server writes the acquired service into, and
-it registers `name` on `services`. Both the `MysqlServices` object and every
-reference must be `static` — the server writes through them at load, so they
-have to outlive registration.
+`VSQL_REQUIRE_SERVICE(services, name, var)` declares `var`, the reference the
+server writes the acquired service into, and registers `name` on `services`. It
+declares `var` `static` for you. The `MysqlServices` object needs to be `static`
+too, and so does any reference you declare by hand: the server writes through
+them at load, and they must outlive the extension.
 
-The macro spends one `name` on two roles: the C++ `SERVICE_TYPE(name)` and the
-string the server looks up in the registry. When a service's registry name is
-not its type name, declare the reference and require it explicitly instead:
+### Pinning a Specific Implementation
+
+`VSQL_REQUIRE_SERVICE` uses `name` twice — as the C++ `SERVICE_TYPE(name)` and
+as the string the server looks up in the registry. Under that bare name the
+server acquires the service's default implementation.
+
+To name one implementation instead, use its qualified registry name —
+`service.component`, the form MySQL's `PROVIDES_SERVICE(component, service)`
+generates. This asks for the keyring reader from the `component_keyring_file`
+component rather than for the default:
 
 ```cpp
-static preview_mysql_services::ServiceRef<SERVICE_TYPE(svc)> svc_ref;
-static const int svc_req =
-    (services.require<SERVICE_TYPE(svc)>("svc.impl", svc_ref), 0);
+static preview_mysql_services::ServiceRef<SERVICE_TYPE(keyring_reader_with_status)>
+    reader;
+static const int reader_req =
+    (services.require<SERVICE_TYPE(keyring_reader_with_status)>(
+         "keyring_reader_with_status.component_keyring_file", reader),
+     0);
 ```
+
+A qualified name is acquired the same way as a bare one, so the usual rule
+applies: if that exact implementation is not registered, the extension fails to
+install rather than falling back to another one.
+
+### Building Against MySQL's Headers
+
+Service definitions belong to MySQL's component framework rather than to VEF,
+and the server does not install them. `mysql/components/services/*.h` is
+therefore absent from the extension SDK and from anything built by
+`make install`, which includes the release tarball and the Docker image. An
+extension that consumes services builds against a VillageSQL server source
+tree:
+
+| Include path | Provides |
+|---|---|
+| `<source>/include` | the service definitions, `mysql/components/services/*.h` |
+| `<build>/include` | headers generated at build time, such as `mysqld_error.h` |
+
+The in-tree test extensions get both from the `MYSQL_HEADERS` flag on
+`vsql_add_test_extension()`, which passes them as `MYSQL_INCLUDE_DIR` and
+`MYSQL_GENERATED_INCLUDE_DIR`. An out-of-tree build sets its own include paths.
+
+Two build failures land somewhere other than the line that caused them.
+
+Omitting a service's MySQL header leaves `VSQL_REQUIRE_SERVICE` with a name
+that resolves to nothing, so the error appears on the macro rather than on the
+missing include (clang 17):
+
+```text
+error: unknown type name 'mysql_service_mysql_current_thread_reader_t'
+```
+
+Some service definitions use `size_t` without including `<cstddef>`, so putting
+one of those headers ahead of every villagesql header fails inside MySQL's own
+header:
+
+```text
+error: unknown type name 'size_t'
+```
+
+Include `<cstddef>` first, as the examples on this page do.
 
 ### Calling a Service
 
@@ -305,12 +357,19 @@ A service reference exposes `valid()` of its own, and `->` forwards to the
 service. Use `.` for the reference and `->` for the service:
 
 ```cpp
-if (!error_log.valid()) { out.set(1); return; }
-const bool err = error_log->emit(/* ... */);
+if (!thd_reader.valid()) { out.error("service unavailable"); return; }
+MYSQL_THD thd = nullptr;
+if (thd_reader->get(&thd) || thd == nullptr) { out.set_null(); return; }
 ```
 
-Check `valid()` before every `->` call. `->` dereferences the acquired pointer,
-which is null when the service was not acquired.
+Check `valid()` before every `->` call. `->` returns the acquired pointer, which
+is null when the service was not acquired.
+
+A service that fails to acquire fails the install, so inside a function that is
+running, a required service is valid. The check still matters, because a
+`ServiceRef` declared by hand and never passed to `require()` is never written
+to: it compiles, the extension installs, and `valid()` is false for the life of
+the extension.
 
 What a service *is* — its methods, their parameters, and what they return — is
 documented by MySQL rather than here. For a service named `NAME`, read
@@ -334,73 +393,78 @@ INSTALL EXTENSION vsql_mysql_services_missing_test;
 ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mysql_services_missing_test': failed to acquire MySQL service 'vsql_intentionally_missing'
 ```
 
+Two other install failures reach the same capability from outside it: leaving
+the `MysqlServices` object out of `.with()`, and installing on a server with
+`vsql_allow_preview_extensions` OFF. Both are covered under
+[Registration Pattern](#registration-pattern).
+
 ### Complete Example
 
-The `vsql_mysql_services_errlog_test` extension that ships with the server. It
-writes a line to the server error log through `mysql_simple_error_log`, a
-server-core service that is registered on every server, so nothing has to be
-installed first:
+A simplified version of `vsql_mysql_services_session_test`, in the server's
+`villagesql/test-extensions/` tree. It reads the SQL command running on the
+calling session by composing two services: one hands back the current `THD`,
+the other reads a named attribute off it. Both are server-core services
+registered on every server, so nothing has to be installed first:
 
 ```cpp
 #include <cstddef>
 
-#include <mysql/components/services/mysql_simple_error_log.h>
-#include <mysqld_error.h>  // ER_LOG_PRINTF_MSG
+#include <mysql/components/services/defs/mysql_string_defs.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
 #include <villagesql/preview/mysql_services.h>
 #include <villagesql/vsql.h>
 
 using namespace vsql;
 
 static preview_mysql_services::MysqlServices services;
-VSQL_REQUIRE_SERVICE(services, mysql_simple_error_log, error_log);
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+VSQL_REQUIRE_SERVICE(services, mysql_thd_attributes, attrs);
 
-// log_warning(text) -> INT: 0 on success, 1 on error. WARNING severity is used
-// so the line survives the default log_error_verbosity of 2, which drops
-// informational lines.
-void log_warning(StringArg text, IntResult out) {
-  if (text.is_null() || !error_log.valid()) {
-    out.set(1);
+// session_sql_command() -> STRING: the name of the SQL command running on the
+// calling session, or NULL when the THD or the attribute cannot be read.
+void session_sql_command(StringResult out) {
+  if (!thd_reader.valid() || !attrs.valid()) {
+    out.error("MySQL session services are not available");
     return;
   }
-  const std::string_view msg = text.value();
-  const bool err = error_log->emit("vsql_mysql_services_errlog_test", __FILE__,
-                                   __LINE__, MYSQL_ERROR_LOG_SEVERITY_WARNING,
-                                   ER_LOG_PRINTF_MSG, std::string(msg).c_str());
-  out.set(err ? 1 : 0);
+
+  MYSQL_THD thd = nullptr;
+  // MySQL convention: a false return means success.
+  if (thd_reader->get(&thd) || thd == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  mysql_cstring_with_length value{nullptr, 0};
+  if (attrs->get(thd, "sql_command", &value) || value.str == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  out.set(std::string_view(value.str, value.length));
 }
 
 VEF_GENERATE_ENTRY_POINTS(make_extension().with(services).func(
-    make_func<&log_warning>("log_warning").returns(INT).param(STRING).build()))
+    make_func<&session_sql_command>("session_sql_command")
+        .returns(STRING)
+        .no_params()
+        .build()))
 ```
 
-Install it and call the function; a `0` means the service accepted the line:
+Install it and call the function:
 
 ```sql
-INSTALL EXTENSION vsql_mysql_services_errlog_test;
-SELECT vsql_mysql_services_errlog_test.log_warning('service-check') AS emit_status;
+INSTALL EXTENSION vsql_mysql_services_session_test;
+SELECT vsql_mysql_services_session_test.session_sql_command() AS sql_command;
 ```
 
 ```text
 +-------------+
-| emit_status |
+| sql_command |
 +-------------+
-|           0 |
+| select      |
 +-------------+
-```
-
-The line lands in the server error log, which `performance_schema` exposes:
-
-```sql
-SELECT COUNT(*) > 0 AS marker_logged FROM performance_schema.error_log
-WHERE DATA LIKE '%service-check%';
-```
-
-```text
-+---------------+
-| marker_logged |
-+---------------+
-|             1 |
-+---------------+
 ```
 
 ## Status Variables
