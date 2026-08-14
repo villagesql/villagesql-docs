@@ -1,0 +1,61 @@
+---
+title: "Read Replicas in MySQL"
+sidebarTitle: "Read Replicas"
+description: "How to scale reads with MySQL replicas: routing queries, living with replication lag, and the read-your-own-writes problem every replica setup hits."
+keywords: "mysql read replica, read replica lag, mysql scale reads, read your own writes, mysql replica routing, replication lag mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+import AiNote from '/snippets/ai-note.mdx';
+
+<VillagesqlBanner />
+
+<AiNote />
+
+A read replica is a second server that replays everything the source writes and answers read queries. Replicas scale reads almost linearly and give you a warm copy for failover, at the cost of one new problem your application must own: the replica is always slightly behind, and no configuration option makes that go away. Setting up replication itself is covered in [Replication basics](/guides/replication-basics); this guide is about using replicas well.
+
+## What Replicas Are For
+
+- **Read scaling.** Dashboards, search, exports, and API reads move off the source, which keeps its capacity for writes.
+- **Isolation for expensive queries.** The analyst's 40-second aggregation runs on a replica and blocks nobody.
+- **A warm standby.** A current replica can be promoted when the source fails.
+
+What they are not: a write-scaling tool. Every replica replays every write the source takes, so replicas add zero write capacity.
+
+## Routing Reads
+
+MySQL does not route queries for you. Something in your stack must send writes to the source and chosen reads to replicas:
+
+- **Application-level routing.** Most frameworks support it directly (Django database routers, Rails `connects_to`/roles, Laravel read/write connections). Simple and explicit; the application decides per query.
+- **A proxy.** ProxySQL and similar route by statement type or rule, so applications keep one connection string. This also centralizes failover.
+
+Start with application-level routing. It forces the right question early: not "can this query run on a replica" but "can this query tolerate stale data".
+
+## Replication Lag: The Actual Hard Part
+
+Replication is asynchronous by default. Commit on the source returns before replicas apply the change, so a replica read a moment later can miss a write that already succeeded. Measure lag from the replica:
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+The `Seconds_Behind_Source` field is the standard signal. It is usually near zero and spikes under bursts of writes, large transactions, and schema changes. Alert on it, and know your tolerance per read path.
+
+The classic failure is **read-your-own-writes**: a user saves a profile (write to source), the next page loads it from a replica, and the replica has not applied the write yet. The user sees their change vanish. Standard mitigations, cheapest first:
+
+- **Pin after write.** After a session writes, route that session's reads to the source for the next few seconds. Many frameworks and proxies support this pattern directly.
+- **Route by tolerance.** Money balances and just-edited pages read from the source; browse pages, search, and analytics read from replicas.
+- **Session consistency via GTIDs.** After a write, capture the transaction identifier and have the replica read wait for it with `WAIT_FOR_EXECUTED_GTID_SET()`. Precise, at the cost of plumbing the GTID through the request.
+
+## Two Practical Rules
+
+- **Replicas should be superset hardware, not leftovers.** A replica slower than the source falls behind under exactly the load that made you add replicas.
+- **Rehearse promotion.** A replica you have never promoted is a backup you have never restored. Practice the failover path before you need it.
+
+VillageSQL inherits this replication machinery unchanged from MySQL 8.4, so everything above applies to it as well.
+
+## See also
+
+- [Replication basics](/guides/replication-basics) — setting up the replication this guide builds on
+- [Binary logging](/guides/binary-logging) — the log stream replicas replay
+- [Connection pooling](/guides/connection-pooling) — pooling per role once reads and writes split

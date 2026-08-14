@@ -1,0 +1,100 @@
+---
+title: "Common MySQL Errors and How to Fix Them"
+sidebarTitle: "Common Errors"
+description: "Decoding the MySQL errors everyone hits: access denied (1045), can't connect (2002), ONLY_FULL_GROUP_BY (1055), syntax errors (1064), and duplicate keys (1062)."
+keywords: "mysql error 1045 access denied, mysql error 2002 can't connect, only_full_group_by error, mysql error 1055, mysql error 1064, mysql duplicate entry 1062"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+import AiNote from '/snippets/ai-note.mdx';
+
+<VillagesqlBanner />
+
+<AiNote />
+
+Five errors account for most MySQL support questions. Each one below is shown exactly as the server emits it, with what it actually means and the fix. All of them behave identically on VillageSQL.
+
+## ERROR 2002: Can't Connect Through Socket
+
+```text
+ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/tmp/nosuch.sock' (2)
+```
+
+The client never reached a server. This is a connection problem, not an authentication problem: either the server is not running, or the client is looking in the wrong place. The `(2)` is errno 2, "no such file".
+
+- Check the server is up: `pgrep mysqld` or your service manager.
+- `mysql -h localhost` uses a Unix socket. If the server listens on a different socket path, pass it: `mysql -S /path/to/mysql.sock`.
+- To force TCP instead of the socket, use `-h 127.0.0.1`, not `-h localhost`.
+
+## ERROR 1045: Access Denied
+
+```text
+ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)
+```
+
+The opposite of 2002: the server was reached, and it rejected the credentials. Read the message precisely, it names three facts:
+
+- **The user** the server thinks you are.
+- **The host** you connected from. MySQL accounts are `user@host` pairs: `'app'@'localhost'` and `'app'@'%'` are different accounts with different passwords and grants.
+- **`using password: YES/NO`** — whether a password was sent at all. `NO` often means the client found no password in the environment or config file it read.
+
+Fix by confirming which account exists for your host (`SELECT user, host FROM mysql.user;` as an admin) and resetting its password with `ALTER USER`. See [User management](/guides/user-management).
+
+## ERROR 1055: ONLY_FULL_GROUP_BY
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'myapp.orders.total' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+The query that produced it:
+
+```sql
+SELECT customer_id, total
+FROM orders
+GROUP BY customer_id;
+```
+
+Each group has one `customer_id` but many `total` values, and the query never says which one it wants. Old MySQL versions picked one arbitrarily; since 5.7 the default `ONLY_FULL_GROUP_BY` mode makes this an error, and it is protecting you from a query that was wrong all along. Three real fixes:
+
+```sql
+-- Say what you meant with an aggregate
+SELECT customer_id, SUM(total) FROM orders GROUP BY customer_id;
+
+-- Or group by every selected column
+SELECT customer_id, total FROM orders GROUP BY customer_id, total;
+
+-- Or, if any value from the group is genuinely fine, say so explicitly
+SELECT customer_id, ANY_VALUE(total) FROM orders GROUP BY customer_id;
+```
+
+Disabling `ONLY_FULL_GROUP_BY` in `sql_mode` also works and is the wrong answer: it turns the error back into silently arbitrary results. See [GROUP BY and HAVING](/guides/group-by-having).
+
+## ERROR 1064: Syntax Error
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'SELEC 1' at line 1
+```
+
+The quoted fragment starts at the first token the parser could not accept, so the actual mistake is at or just before the start of the quote. The usual suspects: a typo in a keyword, a missing comma in a column list, a reserved word used as an identifier without backticks, or a stray quote that turned half the statement into a string.
+
+## ERROR 1062: Duplicate Entry
+
+```text
+ERROR 1062 (23000): Duplicate entry '1' for key 'orders.PRIMARY'
+```
+
+A unique constraint did its job. The message names the value and the index, so the diagnosis is done; the decision is what the insert should mean:
+
+- The row should never exist twice: fix the generator of the duplicate key.
+- The insert should update the existing row instead: use `INSERT ... ON DUPLICATE KEY UPDATE`. See [Upsert](/guides/upsert).
+- The insert should be skipped silently: `INSERT IGNORE`, used sparingly, since it also silences other errors.
+
+## Reading Any MySQL Error
+
+The pattern `ERROR <number> (<SQLSTATE>): <message>` carries three signals. The number is MySQL-specific and the best search key. The SQLSTATE class is portable: `28000` is authentication, `42000` is a query problem, `23000` is a constraint violation, `HY000` is the general bucket. Client-side errors (2xxx, like 2002) never reached the server; server-side errors (1xxx) mean the connection works.
+
+## See also
+
+- [User management](/guides/user-management) — the account model behind access-denied errors
+- [GROUP BY and HAVING](/guides/group-by-having) — writing aggregate queries that pass ONLY_FULL_GROUP_BY
+- [Upsert](/guides/upsert) — turning duplicate-key errors into updates

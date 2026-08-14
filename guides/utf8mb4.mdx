@@ -1,0 +1,87 @@
+---
+title: "utf8mb4 in MySQL: Storing Emoji and Full Unicode"
+sidebarTitle: "utf8mb4 and Emoji"
+description: "Why MySQL's utf8 charset rejects emoji, how to convert tables to utf8mb4 safely, and the index length limit that used to make conversions fail."
+keywords: "mysql utf8mb4, mysql emoji, incorrect string value mysql, convert utf8 to utf8mb4, utf8mb4 vs utf8, mysql unicode"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+import AiNote from '/snippets/ai-note.mdx';
+
+<VillagesqlBanner />
+
+<AiNote />
+
+MySQL's charset named `utf8` is not UTF-8. It is a three-bytes-per-character subset (`utf8mb3`) frozen in time before emoji, and any four-byte character — emoji, many CJK ideographs, mathematical symbols — fails to store in it. `utf8mb4` is the real UTF-8. On MySQL 8.0 and later it is the default for new tables, but tables created on older versions, or with explicit `utf8` in their DDL, still carry the trap.
+
+## The Failure
+
+```sql
+CREATE TABLE notes_mb3 (
+  body VARCHAR(100)
+) CHARACTER SET utf8mb3;
+
+INSERT INTO notes_mb3 (body) VALUES ('launch day 🚀');
+```
+
+```text
+ERROR 1366 (HY000): Incorrect string value: '\xF0\x9F\x9A\x80' for column 'body' at row 1
+```
+
+`\xF0\x9F\x9A\x80` is the rocket emoji's four bytes. With strict SQL mode off, this arrives as a warning instead and the value is silently truncated at the emoji, which is worse: you find out weeks later, from the data.
+
+## Find What Needs Converting
+
+Ask the metadata which tables and columns still use three-byte utf8:
+
+```sql
+SELECT table_schema, table_name, column_name, character_set_name
+FROM information_schema.columns
+WHERE character_set_name = 'utf8mb3'
+  AND table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys');
+```
+
+Check the schema and table defaults too, or new columns will be born wrong:
+
+```sql
+SELECT schema_name, default_character_set_name
+FROM information_schema.schemata;
+```
+
+## Convert
+
+`CONVERT TO CHARACTER SET` rewrites the table, converting both the column definitions and the stored data:
+
+```sql
+ALTER TABLE notes_mb3 CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+Then fix the defaults so future objects inherit the right charset:
+
+```sql
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+On a large table this is a full rewrite; treat it like any other blocking `ALTER` and run it with your normal online-migration tooling. See [Schema migrations](/guides/schema-migrations).
+
+Two things to check before converting:
+
+- **Index length.** A `VARCHAR(255)` unique index needed 765 bytes under utf8mb3 but 1,020 under utf8mb4. Modern InnoDB defaults (`DYNAMIC` row format) allow 3,072 bytes, so this mostly bites tables carried forward with `REDUNDANT` or `COMPACT` row formats from very old servers. If the `ALTER` fails with a max-key-length error, check the table's row format first.
+- **The connection charset.** Storage is only half the path. If the client connection negotiates `utf8mb3`, emoji die in transit even though the column could hold them. Verify what your session actually uses:
+
+```sql
+SHOW VARIABLES LIKE 'character_set_c%';
+```
+
+You want `character_set_client` and `character_set_connection` both reading `utf8mb4`. Most modern drivers do this by default; older JDBC and PHP configurations may pin `utf8`.
+
+## Collation, Briefly
+
+Charset is what bytes mean; collation is how they compare. For utf8mb4 on MySQL 8.x, `utf8mb4_0900_ai_ci` is the default and the right general answer: accent-insensitive, case-insensitive, correct Unicode 9.0 ordering. Mixing collations across tables that get joined on string columns forces conversions and can skip indexes, so pick one and use it everywhere. [Character sets and collations](/guides/character-sets) covers the comparison rules in depth.
+
+## See also
+
+- [Character sets and collations](/guides/character-sets) — the wider charset model this guide is a special case of
+- [Schema migrations](/guides/schema-migrations) — running the conversion ALTER safely in production
+- [Choosing data types](/guides/choosing-data-types) — column sizing once every character can be four bytes
+- [Using MySQL with ORMs: Django, Rails, and Prisma](/guides/mysql-with-orms) — the ORM connection settings that use this charset

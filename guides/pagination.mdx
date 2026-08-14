@@ -1,0 +1,98 @@
+---
+title: "Pagination in MySQL: Keyset vs OFFSET"
+sidebarTitle: "Paginating Results"
+description: "Why OFFSET pagination slows down on deep pages, and how keyset (cursor) pagination keeps page 10,000 as fast as page 1."
+keywords: "mysql pagination, keyset pagination, cursor pagination mysql, limit offset slow, mysql offset performance, seek method"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+import AiNote from '/snippets/ai-note.mdx';
+
+<VillagesqlBanner />
+
+<AiNote />
+
+`LIMIT 20 OFFSET 200000` reads 200,020 rows and throws away 200,000 of them. That is not a bug; it is what OFFSET means. The server has no way to jump to row 200,001 in an arbitrary ordering, so it walks there. Page 1 is fast, page 10,000 is slow, and the slowdown grows linearly with page depth. Keyset pagination fixes this by remembering where the last page ended instead of counting from the top.
+
+## OFFSET Pagination: Fine Until It Isn't
+
+The familiar pattern:
+
+```sql
+SELECT id, title, created_at
+FROM articles
+ORDER BY id
+LIMIT 20 OFFSET 40;   -- page 3
+```
+
+This is fine for shallow paging: admin screens, result sets a human will never scroll past page 20. The problems appear at depth:
+
+- **Cost grows with the page number.** `OFFSET 200000` scans and discards 200,000 index entries before returning anything.
+- **Rows shift between requests.** If a row is inserted while a user pages, page boundaries move, and the user sees a duplicate or misses a row.
+
+## Keyset Pagination: Remember Where You Stopped
+
+Instead of counting rows, filter on the last value the client saw:
+
+```sql
+-- First page
+SELECT id, title, created_at
+FROM articles
+ORDER BY id
+LIMIT 20;
+
+-- Next page: the client sends back the last id it received (say, 20)
+SELECT id, title, created_at
+FROM articles
+WHERE id > 20
+ORDER BY id
+LIMIT 20;
+```
+
+The `WHERE id > 20` clause lets the server seek directly into the index and read exactly 20 rows, no matter how deep the page. Page 10,000 costs the same as page 1. Inserted rows cannot shift page boundaries, because the boundary is a value, not a position.
+
+The trade-off: keyset pagination gives you next and previous, not "jump to page 47". For infinite scroll and APIs, that is usually the interface you wanted anyway.
+
+## Sorting by Something Other Than the Key
+
+Real listings rarely sort by `id`. Sort by a non-unique column and you need a tiebreaker, or rows with equal values are skipped or repeated across pages. The client sends back both values from the last row it saw, and the query compares on both:
+
+```sql
+-- Sorted by created_at, with id as the tiebreaker
+SELECT id, title, created_at
+FROM articles
+WHERE created_at > '2026-08-01 12:00:00'
+   OR (created_at = '2026-08-01 12:00:00' AND id > 143)
+ORDER BY created_at, id
+LIMIT 20;
+```
+
+SQL also has a shorter row-constructor spelling, `WHERE (created_at, id) > ('2026-08-01 12:00:00', 143)`. It returns the same rows, but MySQL's optimizer does not convert it into an index range seek: `EXPLAIN` shows a full index scan (`type: index`) for the row constructor and a seek (`type: range`) for the expanded form above. Use the expanded form.
+
+Either way, the index must match the ORDER BY:
+
+```sql
+CREATE INDEX idx_articles_created_id ON articles (created_at, id);
+```
+
+Check the plan with `EXPLAIN`: you want `type: range` on that index and no filesort. See [Reading EXPLAIN](/guides/reading-explain) for what to look for.
+
+## Do You Need a Total Count?
+
+`SELECT COUNT(*)` over a large filtered set can cost more than the page query itself. Interfaces built on keyset pagination usually drop exact counts in favor of a "load more" affordance. If the product genuinely needs a count, cache it or maintain it in a summary table rather than counting per request.
+
+## Which One to Use
+
+| Situation | Use |
+|---|---|
+| Admin table, hundreds of rows | OFFSET, it is simpler |
+| Numbered page links the user can jump between | OFFSET, keyset cannot jump |
+| API result pagination | Keyset, return an opaque cursor |
+| Infinite scroll | Keyset |
+| Any listing that can grow past ~100k rows | Keyset |
+
+## See also
+
+- [MySQL indexes](/guides/mysql-indexes) — the index design keyset pagination depends on
+- [Reading EXPLAIN](/guides/reading-explain) — confirming the seek instead of a scan
+- [Primary key strategies](/guides/primary-key-strategies) — sortable keys (like UUIDv7) make good cursors
