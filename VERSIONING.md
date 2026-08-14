@@ -114,6 +114,12 @@ The slots are fixed, so hrefs no longer change at a cut. Only the version-number
   number (`0.0.5`) to `_ARCHIVED_VERSIONS`. The `dev/`/`stable/` slot prefixes
   are fixed, so — unlike the old numbered model — they no longer need remapping
   every cut.
+- **`vsql-extension-template` and `vsql-extension-template-rust`**: bump the
+  pinned `villagesql-version` in each repo's scaffold CI workflow
+  (`.github/workflows/ci.yml` and `_github/workflows/ci.yml` respectively) to
+  the new stable. The scaffold pins a fixed release rather than tracking the
+  newest one, so an extension author's build never changes underneath them —
+  which means nothing bumps it but this step.
 
 ### 5. All future changes go to the dev slot (`mysql-8.4/dev/`).
 
