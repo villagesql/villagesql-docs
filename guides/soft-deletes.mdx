@@ -1,0 +1,97 @@
+---
+title: "Soft Deletes in MySQL"
+sidebarTitle: "Soft Deletes"
+description: "How to implement soft deletes with a deleted_at column, keep unique constraints working on soft-deleted rows, and decide when a hard delete is the better call."
+keywords: "mysql soft delete, deleted_at column, soft delete unique constraint, mysql logical delete, restore deleted rows mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A soft delete marks a row as deleted instead of removing it. The row stays in the table, invisible to the application, restorable in one statement. It is the standard answer to "a user deleted something and wants it back", and it creates two problems worth understanding before you adopt it: every query must remember the filter, and unique constraints stop meaning what you think.
+
+## The Basic Pattern
+
+Add a nullable timestamp. `NULL` means live; a timestamp means deleted, and records when:
+
+```sql
+CREATE TABLE customers (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  name VARCHAR(100),
+  deleted_at TIMESTAMP NULL DEFAULT NULL
+);
+
+-- Delete
+UPDATE customers SET deleted_at = NOW() WHERE id = 42;
+
+-- Restore
+UPDATE customers SET deleted_at = NULL WHERE id = 42;
+
+-- Every read now needs the filter
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+Prefer a timestamp over a `deleted` boolean: it costs the same, and it answers "when" for free, which the support ticket will ask.
+
+## Problem 1: Unique Constraints
+
+A unique index on `email` blocks re-registration forever: the soft-deleted row still occupies the value.
+
+```sql
+ALTER TABLE customers ADD UNIQUE KEY uq_email (email);
+UPDATE customers SET deleted_at = NOW() WHERE email = 'a@example.com';
+INSERT INTO customers (email, name) VALUES ('a@example.com', 'Again');
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'a@example.com' for key 'customers.uq_email'
+```
+
+The fix is a functional index trick: make the unique key cover a column that is constant for live rows and unique for deleted ones. A generated column does it cleanly:
+
+```sql
+ALTER TABLE customers DROP KEY uq_email;
+ALTER TABLE customers
+  ADD COLUMN email_live VARCHAR(255)
+    GENERATED ALWAYS AS (IF(deleted_at IS NULL, email, NULL)) VIRTUAL,
+  ADD UNIQUE KEY uq_email_live (email_live);
+```
+
+MySQL unique indexes allow any number of `NULL`s, so deleted rows never collide, while two live rows with the same email still fail. See [Generated columns](/guides/generated-columns) for the mechanics.
+
+## Problem 2: Every Query Must Remember
+
+One forgotten `WHERE deleted_at IS NULL` and deleted data leaks into a report or an API response. Two mitigations:
+
+- **A view for the live subset.** Point read paths at the view and the filter cannot be forgotten:
+
+```sql
+CREATE VIEW live_customers AS
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+- **ORM scopes.** Most ORMs can apply the filter globally (Rails `default_scope`, Django managers, Prisma middleware). Turn it on in one place instead of auditing every query.
+
+Foreign keys need thought too: a soft-deleted parent still exists, so `ON DELETE CASCADE` never fires. If children should disappear with the parent, the application (or a trigger) has to cascade the `deleted_at` itself.
+
+## When Not to Soft Delete
+
+- **Regulatory erasure.** A GDPR deletion request means the data is gone, not hidden. Soft-deleted rows still count as personal data.
+- **High-churn tables.** Sessions, queue jobs, and logs deleted by the millions just bloat the table and every index on it.
+- **Data nobody will restore.** If there is no undo story, the filter tax buys nothing.
+
+A common middle path: soft delete on user action, then a scheduled job hard-deletes rows where `deleted_at` is older than the retention window:
+
+```sql
+DELETE FROM customers
+WHERE deleted_at IS NOT NULL
+  AND deleted_at < NOW() - INTERVAL 90 DAY;
+```
+
+## See also
+
+- [Generated columns](/guides/generated-columns) — the mechanism behind the unique-constraint fix
+- [Views](/guides/views) — a live-rows view that cannot forget the filter
+- [Foreign keys](/guides/foreign-keys) — why cascades don't fire on soft deletes

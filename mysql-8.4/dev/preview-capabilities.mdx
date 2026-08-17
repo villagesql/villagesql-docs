@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "Preview Capabilities"
-description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the auth, keyring, status_var, sys_var, thread_worker, sql_query, and statement_event capabilities, and registration patterns."
+description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the auth, keyring, mysql_services, status_var, sys_var, thread_worker, sql_query, and statement_event capabilities, and registration patterns."
 ---
 
 Preview capabilities are server-provided features exposed to extensions before
@@ -53,6 +53,7 @@ Uninstall those extensions first, then turn the setting off.
 | `vsql::preview::auth` | `<villagesql/preview/auth.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
 | `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview |
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
+| `vsql::preview::mysql_services` | `<villagesql/preview/mysql_services.h>` | Preview |
 | `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | Preview |
 | `vsql::preview::statement_event` | `<villagesql/preview/statement_event.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
 | `vsql::status_var` | `<villagesql/preview/status_var.h>` | Preview |
@@ -189,9 +190,9 @@ On any status other than `Status::OK`, `value` is empty.
 
 ### Complete Example
 
-This is a simplified version of the `vsql_keyring_reader` test extension
-that ships with the server. It registers 2 VDFs: `keyring_read` and
-`keyring_store`.
+This is a simplified version of the `vsql_keyring_reader` test extension, in
+the server's `villagesql/test-extensions/` tree. It registers 2 VDFs:
+`keyring_read` and `keyring_store`.
 
 ```cpp
 #include <villagesql/preview/keyring.h>
@@ -239,6 +240,233 @@ VEF_GENERATE_ENTRY_POINTS(
         .func(make_func<&keyring_store>("keyring_store")
                   .returns(INT).param(STRING).param(STRING).param(STRING).build())
         .with(g_keyring))
+```
+
+## MySQL Services
+
+The mysql_services capability (`vsql::preview::mysql_services`) lets an
+extension consume MySQL registry services — the same services a MySQL component
+consumes, provided either by an installed component or by the server core. The
+extension declares every service it needs in one place; the server acquires each
+one when the extension loads and releases it when the extension unloads.
+
+The capability name `VEF_PREVIEW_MYSQL_SERVICES_NAME` is
+`"vsql::preview::mysql_services"`.
+
+Reach for it when a server facility has no VEF capability of its own. Session
+attributes and the keyring's own component services are both reachable this
+way. Only consuming is supported: registering the extension's own
+implementation into the registry is a planned follow-up and is not part of this
+capability.
+
+### Declaring the Capability
+
+Declare one `MysqlServices` object at file scope, name each service you consume
+with `VSQL_REQUIRE_SERVICE`, and pass the object to `.with()`. Include MySQL's
+own header for each service — that header is where the service's type and
+methods are declared:
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(services))
+```
+
+`VSQL_REQUIRE_SERVICE(services, name, var)` declares `var`, the reference the
+server writes the acquired service into, and registers `name` on `services`. It
+declares `var` `static` for you. The `MysqlServices` object needs to be `static`
+too, and so does any reference you declare by hand: the server writes through
+them at load, and they must outlive the extension.
+
+### Pinning a Specific Implementation
+
+`VSQL_REQUIRE_SERVICE` uses `name` twice — as the C++ `SERVICE_TYPE(name)` and
+as the string the server looks up in the registry. Under that bare name the
+server acquires the service's default implementation.
+
+To name one implementation instead, use its qualified registry name —
+`service.component`, the form MySQL's `PROVIDES_SERVICE(component, service)`
+generates. This asks for the keyring reader from the `component_keyring_file`
+component rather than for the default:
+
+```cpp
+static preview_mysql_services::ServiceRef<SERVICE_TYPE(keyring_reader_with_status)>
+    reader;
+static const int reader_req =
+    (services.require<SERVICE_TYPE(keyring_reader_with_status)>(
+         "keyring_reader_with_status.component_keyring_file", reader),
+     0);
+```
+
+A qualified name is acquired the same way as a bare one, so the usual rule
+applies: if that exact implementation is not registered, the extension fails to
+install rather than falling back to another one.
+
+### Building Against MySQL's Headers
+
+Service definitions belong to MySQL's component framework rather than to VEF,
+and the server does not install them. `mysql/components/services/*.h` is
+therefore absent from the extension SDK and from anything built by
+`make install`, which includes the release tarball and the Docker image. An
+extension that consumes services builds against a VillageSQL server source
+tree:
+
+| Include path | Provides |
+|---|---|
+| `<source>/include` | the service definitions, `mysql/components/services/*.h` |
+| `<build>/include` | headers generated at build time, such as `mysqld_error.h` |
+
+The in-tree test extensions get both from the `MYSQL_HEADERS` flag on
+`vsql_add_test_extension()`, which passes them as `MYSQL_INCLUDE_DIR` and
+`MYSQL_GENERATED_INCLUDE_DIR`. An out-of-tree build sets its own include paths.
+
+Two build failures land somewhere other than the line that caused them.
+
+Omitting a service's MySQL header leaves `VSQL_REQUIRE_SERVICE` with a name
+that resolves to nothing, so the error appears on the macro rather than on the
+missing include (clang 17):
+
+```text
+error: unknown type name 'mysql_service_mysql_current_thread_reader_t'
+```
+
+Some service definitions use `size_t` without including `<cstddef>`, so putting
+one of those headers ahead of every villagesql header fails inside MySQL's own
+header:
+
+```text
+error: unknown type name 'size_t'
+```
+
+Include `<cstddef>` first, as the examples on this page do.
+
+### Calling a Service
+
+A service reference exposes `valid()` of its own, and `->` forwards to the
+service. Use `.` for the reference and `->` for the service:
+
+```cpp
+if (!thd_reader.valid()) { out.error("service unavailable"); return; }
+MYSQL_THD thd = nullptr;
+if (thd_reader->get(&thd) || thd == nullptr) { out.set_null(); return; }
+```
+
+Check `valid()` before every `->` call. `->` returns the acquired pointer, which
+is null when the service was not acquired.
+
+A service that fails to acquire fails the install, so inside a function that is
+running, a required service is valid. The check still matters, because a
+`ServiceRef` declared by hand and never passed to `require()` is never written
+to: it compiles, the extension installs, and `valid()` is false for the life of
+the extension.
+
+What a service *is* — its methods, their parameters, and what they return — is
+documented by MySQL rather than here. For a service named `NAME`, read
+`include/mysql/components/services/NAME.h` in the server tree: its
+`BEGIN_SERVICE_DEFINITION(NAME)` block declares every method with its own
+documentation. Call them exactly as that header specifies, including MySQL's
+convention that a `bool` return of `false` means success and `true` means
+failure.
+
+### Acquisition Failure
+
+Every declared service is acquired when the extension loads, before any of its
+functions can be called, so a service that is not registered fails the load
+rather than surfacing later. `INSTALL EXTENSION` fails and names the service.
+
+`vsql_mysql_services_missing_test` below is an in-tree test extension that
+requires a service the registry does not have. It is not something you can
+install — it is how the failure was captured, and what your own extension
+produces if it requires a service this server does not provide:
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mysql_services_missing_test': failed to acquire MySQL service 'vsql_intentionally_missing'
+```
+
+Two other install failures reach the same capability from outside it: leaving
+the `MysqlServices` object out of `.with()`, and installing on a server with
+`vsql_allow_preview_extensions` OFF. Both are covered under
+[Registration Pattern](#registration-pattern).
+
+### Complete Example
+
+A simplified version of `vsql_mysql_services_session_test`, in the server's
+`villagesql/test-extensions/` tree. It reads the SQL command running on the
+calling session by composing two services: one hands back the current `THD`,
+the other reads a named attribute off it. Both are server-core services
+registered on every server, so nothing has to be installed first:
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/defs/mysql_string_defs.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+VSQL_REQUIRE_SERVICE(services, mysql_thd_attributes, attrs);
+
+// session_sql_command() -> STRING: the name of the SQL command running on the
+// calling session, or NULL when the THD or the attribute cannot be read.
+void session_sql_command(StringResult out) {
+  if (!thd_reader.valid() || !attrs.valid()) {
+    out.error("MySQL session services are not available");
+    return;
+  }
+
+  MYSQL_THD thd = nullptr;
+  // MySQL convention: a false return means success.
+  if (thd_reader->get(&thd) || thd == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  mysql_cstring_with_length value{nullptr, 0};
+  if (attrs->get(thd, "sql_command", &value) || value.str == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  out.set(std::string_view(value.str, value.length));
+}
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(services).func(
+    make_func<&session_sql_command>("session_sql_command")
+        .returns(STRING)
+        .no_params()
+        .build()))
+```
+
+Install it and call the function:
+
+```sql
+INSTALL EXTENSION vsql_mysql_services_session_test;
+SELECT vsql_mysql_services_session_test.session_sql_command() AS sql_command;
+```
+
+```text
++-------------+
+| sql_command |
++-------------+
+| select      |
++-------------+
 ```
 
 ## Status Variables
@@ -1037,7 +1265,7 @@ not propagate it to the client.
 
 A condensed form of the
 [`vsql_slow_query_log`](https://github.com/villagesql/villagesql-server/tree/main/villagesql/test-extensions/vsql-slow-query-log)
-test extension that ships with the server. It logs each query whose execution
+test extension. It logs each query whose execution
 time exceeds a threshold, combining the statement event capability with
 [system variables](#system-variables) for runtime configuration:
 

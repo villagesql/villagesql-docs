@@ -1,0 +1,99 @@
+---
+title: "Using MySQL with ORMs: Django, Rails, and Prisma"
+sidebarTitle: "MySQL with ORMs"
+description: "Configuring Django, Rails, and Prisma correctly for MySQL: charset and strict mode settings, the N+1 problem, and when to drop to raw SQL."
+keywords: "django mysql settings, rails mysql config, prisma mysql, orm n+1 queries, mysql strict mode orm, activerecord mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ORMs are how most applications actually talk to MySQL, and most ORM problems trace back to a handful of configuration lines and one query pattern. This guide covers the MySQL-side settings for Django, Rails, and Prisma, and the habits that keep ORM-generated SQL from becoming the slow part of your product. Because VillageSQL is a drop-in replacement for MySQL, every configuration here works with it unchanged: the ORM cannot tell the difference.
+
+## The Settings That Matter Everywhere
+
+Whatever the framework, three things must be true:
+
+- **The connection uses `utf8mb4`**, or emoji break in transit. See [utf8mb4 and emoji](/guides/utf8mb4).
+- **Strict SQL mode is on** (it is the MySQL 8.x default), so bad data errors instead of silently truncating.
+- **The pool size is deliberate.** Every framework opens a pool per process; multiply by your process count before picking a number. See [Connection pooling](/guides/connection-pooling).
+
+## Django
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.mysql",
+        "NAME": "myapp",
+        "USER": "app",
+        "PASSWORD": environ["DB_PASSWORD"],
+        "HOST": "127.0.0.1",
+        "PORT": "3306",
+        "OPTIONS": {
+            "charset": "utf8mb4",
+            "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
+    }
+}
+```
+
+Django-specific notes:
+
+- Use `mysqlclient`, the maintained C driver Django's docs recommend.
+- Django emulates some constraints in Python; add real database constraints too (`unique=True` becomes a real unique index, but check constraints need `CheckConstraint` in `Meta`).
+- `select_related()` (JOIN) and `prefetch_related()` (second query) are the N+1 tools; see below for when.
+
+## Rails
+
+```yaml
+# config/database.yml
+production:
+  adapter: mysql2
+  database: myapp
+  username: app
+  password: <%= ENV["DB_PASSWORD"] %>
+  host: 127.0.0.1
+  encoding: utf8mb4
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+```
+
+Rails-specific notes:
+
+- `encoding: utf8mb4` in `database.yml` sets both the connection charset and the default for `rails db:create`.
+- ActiveRecord validations (`validates_uniqueness_of`) race under concurrency; back every uniqueness validation with a real unique index, and let the [1062 duplicate-key error](/guides/common-mysql-errors) be the last line of defense.
+- `includes` is the N+1 tool; `strict_loading` mode turns lazy loading into an error so N+1s fail in development instead of shipping.
+
+## Prisma
+
+```prisma
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+```
+
+```text
+DATABASE_URL="mysql://app:password@127.0.0.1:3306/myapp?connection_limit=10"
+```
+
+Prisma-specific notes:
+
+- Prisma speaks utf8mb4 by default; the setting to watch is `connection_limit` in the URL, which defaults low.
+- `prisma migrate` generates DDL from schema drift. Read the generated SQL before applying to production, exactly as you would a hand-written migration. See [Schema migrations](/guides/schema-migrations).
+- Relation queries use `include`; the N+1 shape appears when you loop over results and access relations one by one.
+
+## The N+1 Problem, Once
+
+The universal ORM performance bug: load 100 orders, then lazily load each order's customer, and the ORM issues 101 queries. The fix is the same idea in every framework — declare the relations you need up front so the ORM fetches them in one or two queries (`select_related` / `includes` / `include`). The detection tool is also universal: turn on query logging in development and read what the ORM actually sends, or watch the [slow query log](/guides/slow-query-log) in production.
+
+## When to Drop to SQL
+
+ORMs earn their keep on CRUD and lose it on analytics. Window functions, CTEs, bulk upserts, and multi-table reporting queries are clearer in SQL than in a query-builder chain trying to express them. Every ORM has an escape hatch (`raw()` in Django, `find_by_sql` in Rails, `$queryRaw` in Prisma); using it for the 5 percent of queries that deserve it is good engineering, not defeat. It is also how VillageSQL extension functions reach an ORM application: `SELECT UUID_V7()` or `ai_prompt(...)` work through any of these escape hatches, since the ORM just passes the SQL through.
+
+## See also
+
+- [Connection pooling](/guides/connection-pooling) — sizing pools across processes
+- [utf8mb4 and emoji](/guides/utf8mb4) — the charset setting every config above sets
+- [Slow query log](/guides/slow-query-log) — catching what the ORM generates
+- [Schema migrations](/guides/schema-migrations) — applying ORM-generated DDL safely
