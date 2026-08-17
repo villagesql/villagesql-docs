@@ -1,0 +1,103 @@
+---
+title: "Upgrading MySQL 8.0 to 8.4 Before End of Life"
+sidebarTitle: "MySQL 8.0 EOL: Upgrade to 8.4"
+description: "MySQL 8.0 reaches end of life on April 30, 2026. How to upgrade to MySQL 8.4 LTS: pre-upgrade checks, the auth change that breaks clients, and rollback planning."
+keywords: "mysql 8.0 eol, mysql 8.0 end of life, upgrade mysql 8.0 to 8.4, mysql 8.4 upgrade, mysql_native_password 8.4, mysql lts upgrade"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+import AiNote from '/snippets/ai-note.mdx';
+
+<VillagesqlBanner />
+
+<AiNote />
+
+MySQL 8.0 reaches end of life on April 30, 2026. After that date it receives no security patches. The upgrade target is MySQL 8.4 LTS, with premier support to approximately April 2029 and extended support to April 2032. Oracle designed the 8.0 to 8.4 path to be smooth, but two changes break real systems: the default authentication plugin, and removed configuration variables. This guide covers both, plus the checks to run before you start.
+
+## What Changes in 8.4
+
+The upgrade is in-place: install the 8.4 binaries over an 8.0 data directory and the server upgrades the data dictionary itself on first start. Most schemas and queries carry over untouched. The changes that actually bite:
+
+| Change | Who it breaks |
+|---|---|
+| `mysql_native_password` is disabled by default | Old client libraries and any account still using the pre-8.0 auth plugin |
+| Deprecated 8.0 system variables are removed | Config files and scripts that set them; the server refuses to start on unknown variables |
+| Deprecated syntax removed | Schemas using `AUTO_INCREMENT` on float/double columns and non-standard foreign key constraints |
+
+## Step 1: Find Accounts on the Old Auth Plugin
+
+Before upgrading, list every account still using `mysql_native_password`:
+
+```sql
+SELECT user, host, plugin
+FROM mysql.user
+WHERE plugin = 'mysql_native_password';
+```
+
+Migrate each one to `caching_sha2_password` and update the application's stored password:
+
+```sql
+ALTER USER 'app'@'%' IDENTIFIED WITH caching_sha2_password BY 'new-password';
+```
+
+On 8.4, creating an account with the old plugin fails because the plugin is not loaded:
+
+```sql
+CREATE USER 'legacy'@'%' IDENTIFIED WITH mysql_native_password BY 'pw';
+```
+
+```text
+ERROR 1524 (HY000): Plugin 'mysql_native_password' is not loaded
+```
+
+If you cannot migrate an account before the upgrade, 8.4 can load the plugin explicitly with `--mysql-native-password=ON` in your config. Treat that as a bridge, not a destination: the plugin is deprecated and scheduled for removal.
+
+## Step 2: Clean Your Configuration File
+
+MySQL 8.4 removes system variables that were deprecated in 8.0. If your `my.cnf` sets one, the 8.4 server refuses to start with an unknown-variable error. The two most common:
+
+```sql
+-- Both fail on 8.4: the variables no longer exist
+SELECT @@default_authentication_plugin;
+SELECT @@expire_logs_days;
+```
+
+```text
+ERROR 1193 (HY000): Unknown system variable 'default_authentication_plugin'
+```
+
+Replace `expire_logs_days` with `binlog_expire_logs_seconds`, and delete `default_authentication_plugin` (the 8.4 replacement, `authentication_policy`, defaults to `caching_sha2_password` already). Grep your config for every variable you set, and check each against the 8.4 reference before the upgrade rather than during the outage window.
+
+## Step 3: Check the Schema for Removed Syntax
+
+Run `mysqlcheck` against all databases and review the output:
+
+```bash
+mysqlcheck -u root -p --all-databases --check-upgrade
+```
+
+Pay particular attention to `AUTO_INCREMENT` on FLOAT or DOUBLE columns and to non-standard foreign key constraints, both removed in 8.4.
+
+## Step 4: Back Up, Then Upgrade In Place
+
+There is no supported in-place downgrade from 8.4 to 8.0. Once the data dictionary is upgraded, the only way back is restoring a backup. So the backup is not a formality:
+
+```bash
+mysqldump -u root -p --all-databases --events --routines --triggers > pre84_backup.sql
+```
+
+Then the upgrade itself: stop the 8.0 server, install the 8.4 binaries, and start the server on the same data directory. The server runs its upgrade steps automatically on first start; watch the error log until it reports ready for connections. Confirm the result:
+
+```sql
+SELECT VERSION();
+```
+
+## The VillageSQL Angle
+
+VillageSQL Server is a drop-in replacement for MySQL 8.4. Once you are on 8.4, everything in your stack that works with MySQL 8.4 also works with VillageSQL, and switching later is functionally a minor version swap on the same data directory. If the extension framework interests you, the 8.4 upgrade you are doing anyway is the on-ramp. See [Upgrading to VillageSQL](/guides/upgrade) for that procedure.
+
+## See also
+
+- [Upgrading to VillageSQL](/guides/upgrade) — the drop-in swap once you are on 8.4
+- [Backup strategies](/guides/backup-strategies) — the backup this upgrade depends on
+- [Common MySQL errors](/guides/common-mysql-errors) — decoding the errors a botched upgrade produces

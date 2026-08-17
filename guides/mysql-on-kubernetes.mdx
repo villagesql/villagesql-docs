@@ -1,0 +1,62 @@
+---
+title: "Running MySQL on Kubernetes"
+sidebarTitle: "MySQL on Kubernetes"
+description: "What it takes to run MySQL in Kubernetes: StatefulSets vs operators, storage decisions, and an honest look at when a managed database is the better answer."
+keywords: "mysql kubernetes, mysql statefulset, mysql operator kubernetes, mysql k8s persistent volume, run database on kubernetes"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Kubernetes was built for stateless workloads, and MySQL is the opposite of one. Running it there is entirely doable and widely done; it just means Kubernetes gives you none of the database's hard parts for free. This guide covers the three levels of commitment, the storage decisions that matter, and the cases where you should not do this at all.
+
+## Three Ways In
+
+**A single-instance StatefulSet.** One MySQL pod with a PersistentVolumeClaim. This is the right shape for dev environments, CI, and internal tools where a few minutes of downtime on a node failure is acceptable. It is roughly the Kubernetes equivalent of one Docker container with a volume, and the [Docker guide](/guides/mysql-on-docker) covers the MySQL-side configuration that carries over.
+
+The essentials that trip people up, as they appear in the manifest:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+spec:
+  replicas: 1            # one writer; MySQL doesn't scale writes by replica count
+  volumeClaimTemplates:  # storage that survives the pod
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+```
+
+Set the pod's memory request and limit to the same value, and size `innodb_buffer_pool_size` inside it (50 to 70 percent of the limit). A MySQL pod that outgrows its memory limit is OOM-killed mid-write; same failure mode as Docker, same fix.
+
+**An operator.** For anything production-shaped, use an operator rather than hand-rolled StatefulSets: Oracle's MySQL Operator, Percona's, or Vitess for sharding scale. Operators encode the runbooks — provisioning replicas, orchestrating failover, coordinating backups — as controllers. The trade is a new dependency with its own upgrade cadence and failure modes that you must understand before an incident, not during one.
+
+**A managed database next to the cluster.** Run the application in Kubernetes and point it at RDS, Cloud SQL, or another managed MySQL. This is the default answer for small teams: someone else carries backups, failover, and patching, and your cluster stays stateless.
+
+## Storage Is the Decision That Matters
+
+- **Always a PVC, never `emptyDir`.** An `emptyDir` volume dies with the pod, and MySQL pods get rescheduled for reasons that have nothing to do with you.
+- **Prefer a storage class backed by network block storage** (EBS, PD, and equivalents). `ReadWriteOnce` is exactly what a database wants; a network filesystem (NFS-style `ReadWriteMany`) is exactly what it does not.
+- **Local NVMe is faster and riskier.** Local volumes pin the pod to a node; a node loss is a data loss unless replication covers it. Only pair local storage with an operator-managed replica set.
+- **Benchmark IOPS before committing.** Default storage classes on the big clouds are often provisioned for capacity, not IOPS, and a database that was fine on a laptop crawls on an underprovisioned volume.
+
+## Probes Without Foot-Guns
+
+A liveness probe that runs a query can kill a healthy server that is briefly slow (cold buffer pool, long DDL), and Kubernetes restarting MySQL mid-recovery makes recovery take longer. Keep liveness minimal (is the process accepting TCP), and put the real health check (`mysqladmin ping`, replica lag) in the readiness probe, which only affects traffic routing.
+
+## When Not to Do This
+
+Skip MySQL-in-Kubernetes when the database is your product's single source of truth, the team has no one on call who knows both systems, or a managed offering exists in your cloud at acceptable cost. The honest calculus: Kubernetes adds operational surface to the exact component where operational mistakes are least recoverable.
+
+VillageSQL runs anywhere MySQL runs, and the `villagesql/server` image is a drop-in for `mysql` in any of the manifests above: same data directory layout, same port, same clients.
+
+## See also
+
+- [MySQL on Docker](/guides/mysql-on-docker) — the container fundamentals Kubernetes builds on
+- [Replication basics](/guides/replication-basics) — what an operator automates for you
+- [Backup strategies](/guides/backup-strategies) — backups still exist; a PVC snapshot is not a backup policy
