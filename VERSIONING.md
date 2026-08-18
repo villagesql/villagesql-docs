@@ -180,12 +180,29 @@ the table above prints every run and is expected to. Start with the bare report.
 Only if that list grows too noisy to read is it worth adding a per-page
 "differs on purpose" marker — do not build that machinery up front.
 
-**Version selection is a packaging decision first.** The install script and the
-source build each take an option for which MySQL version to use, and the same
-two places carry the Percona-branch option. So `install.mdx` and `source.mdx`
-document the whole matrix, and `percona.mdx` stays short — what the branch is,
-what VillageSQL supports, and a link to Percona's own documentation. Get the
-option names from the server team before writing any of the three pages.
+**Version selection is a packaging decision first.** VillageSQL builds three
+flavors, each with its own build artifacts, and the install script offers all
+three:
+
+| Flavor | Documented in |
+|---|---|
+| MySQL 8.4 | `mysql-8.4/` |
+| MySQL 9.7 | `mysql-9.7/` |
+| MySQL 8.4 with Percona changes | `mysql-8.4/dev/percona.mdx` |
+
+This is a flat choice of three, not a version axis crossed with a Percona
+toggle. Percona is an 8.4 flavor only, so nothing about it belongs in the 9.7
+tree.
+
+Two consequences for the pages. `install.mdx` and `source.mdx` each present a
+three-way choice, and each one appears in both trees — but the 8.4 copy lists
+the Percona flavor and the 9.7 copy does not. That is a real difference, so
+both pages stay permanently on the differs-from-8.4 list. And `percona.mdx`
+stays short: what the branch is, which artifact to install, what VillageSQL
+supports, and a link to Percona's own documentation.
+
+Get the option names from the server team before writing any of these pages.
+The page structure follows the flag names.
 
 ## Percona branch
 
