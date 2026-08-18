@@ -190,16 +190,22 @@ three:
 | MySQL 9.7 | `mysql-9.7/` |
 | MySQL 8.4 with Percona changes | `mysql-8.4/dev/percona.mdx` |
 
-This is a flat choice of three, not a version axis crossed with a Percona
-toggle. Percona is an 8.4 flavor only, so nothing about it belongs in the 9.7
-tree.
+**A Percona flavor belongs to a MySQL version, and there will eventually be a
+9.7 one.** Today only the 8.4 Percona build exists, so `percona.mdx` starts life
+in the 8.4 tree alone. When the 9.7 Percona build ships, it gets its own
+`mysql-9.7/dev/percona.mdx` — do not write a single shared Percona page that
+tries to cover both, and do not treat Percona's absence from the 9.7 tree as
+permanent.
 
-Two consequences for the pages. `install.mdx` and `source.mdx` each present a
-three-way choice, and each one appears in both trees — but the 8.4 copy lists
-the Percona flavor and the 9.7 copy does not. That is a real difference, so
-both pages stay permanently on the differs-from-8.4 list. And `percona.mdx`
-stays short: what the branch is, which artifact to install, what VillageSQL
-supports, and a link to Percona's own documentation.
+That shapes `install.mdx` and `source.mdx`. Both appear in both trees, and each
+lists the flavors that exist for its own MySQL version — three choices in 8.4
+today, two in 9.7 until the 9.7 Percona build lands. So both pages carry a real
+difference between the trees from the start, and stay on the differs-from-8.4
+list permanently.
+
+`percona.mdx` itself stays short: what the branch is, which artifact to install,
+what VillageSQL supports, and a link to Percona's own documentation. Do not
+document Percona's changes here.
 
 Get the option names from the server team before writing any of these pages.
 The page structure follows the flag names.
