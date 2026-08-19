@@ -1417,12 +1417,13 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(g_auth))
 ```
 
-The builder has five pieces:
+The builder has six pieces:
 
 | Element | Meaning |
 |---|---|
 | `make_auth<&handler>("name")` | Starts the builder. The handler is a compile-time template argument, so a null or wrong-signature handler is a compile error rather than a runtime failure. `"name"` is the auth-method name accounts bind to (`IDENTIFIED WITH <name>`) and must be at most `VEF_AUTH_MAX_NAME_LEN` (64) bytes. |
 | `.client_plugin(name)` | Optional. Overrides the client-side auth plugin the server advertises during the handshake. |
+| `.accepts_client_plugin(callback)` | Optional. Takes `bool (*)(const char *offered)`. Returning `true` keeps the plugin the client offered; returning `false` switches the client to `.client_plugin()`. |
 | `.auto_create(callback)` | Optional. Opts the method in to logins for accounts that do not exist (see [Auto-Creating Accounts](#auto-creating-accounts)). |
 | `.auto_grant(callback)` | Optional. Lets the server grant the roles the handler stages, instead of only activating ones the account already holds (see [Auto-Granting Roles](#auto-granting-roles)). |
 | `.build()` | Yields the descriptor you hand to `AuthCapability`. |
@@ -1436,6 +1437,18 @@ ships — so a method that never calls `.client_plugin()` still installs and a
 naive client still connects. Call `.client_plugin(name)` to pin a different
 plugin; `mysql_clear_password` receives a bearer token verbatim in the password
 slot.
+
+A client that offers a different plugin than the pinned one is switched to the
+pin and resends its credential verbatim, which costs a round trip and needs a
+client willing to make that switch. `.accepts_client_plugin(&callback)` lets the
+method keep the offered plugin instead: the server passes each offered name to
+the callback, including the pinned plugin, which is accepted whatever the
+callback returns. A method that sets no callback accepts no other offer, so
+every other offer switches to the pin. Accepting is final — the server does not
+fall back to the pin afterwards — so accept only a plugin whose framing the
+handler really parses. The server queries the callback during handshake
+negotiation, before the handler's first read, so it must be a pure predicate: no
+packet I/O, no blocking, no side effects.
 
 ### The Handler Contract
 
@@ -1459,6 +1472,7 @@ uses:
 | `c.user_name()` | The account name the client connected as. |
 | `c.auth_string()` | The `AS '...'` clause from `IDENTIFIED WITH <m> AS '...'`, or empty. |
 | `c.host_or_ip()` | The client host or IP. |
+| `c.client_auth_plugin()` | The client-side auth plugin the client advertised in its handshake reply (for example `"mysql_clear_password"`). When the method accepted that offer, it is also the plugin that framed the credential the handler reads, so the handler can parse by name instead of sniffing bytes. A forced switch to `.client_plugin()` does not update it, so on that path it still reports what the client first offered. Empty if unknown. |
 | `c.authenticate_as(account)` | Set the effective account the session runs as (shown by `CURRENT_USER()`). Required before returning `AuthResult::kOk`. |
 | `c.set_external_user(identity)` | Set the original external identity for the audit trail (`@@external_user`). |
 | `c.set_active_roles(roles, n_roles)` | Stage the session's active roles (see [Staging Active Roles](#staging-active-roles)). |
@@ -1499,8 +1513,9 @@ A minimal authenticator, condensed from the `vsql_auth_test` extension in the
 server source tree at `villagesql/test-extensions/vsql-auth-test/`, which no
 release includes. It accepts one fixed token, maps the connection to
 `vsql_auth_test_user`, and pins `mysql_clear_password` so the token arrives
-verbatim in the password slot. (The in-tree extension adds extra token paths and
-both opt-ins described below to drive its test suite.)
+verbatim in the password slot. (The in-tree extension adds extra token paths, an
+`.accepts_client_plugin()` callback, and both opt-ins described below to drive
+its test suite.)
 
 ```cpp
 #include <cstring>
