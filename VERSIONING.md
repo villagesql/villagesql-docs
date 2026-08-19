@@ -133,4 +133,96 @@ The slots are fixed, so hrefs no longer change at a cut. Only the version-number
 ## Placeholder products
 
 The "Coming Soon" MySQL 8.0 and 9.7 products in `docs.json` use a plain `Stable`
-label. Keep them in sync with that convention.
+label. Keep them in sync with that convention. Each is a single `index.mdx`
+under `mysql-8.0/0.0.1/` and `mysql-9.7/0.0.1/`, `noindex`ed, pointing readers
+at the MySQL 8.4 stable slot.
+
+## Adding a MySQL version (planned — 9.7)
+
+Not yet executed. This section records the agreed shape so the decision is not
+re-litigated when 9.7 lands.
+
+**Model: parallel trees, like the upstream MySQL manual.** Each MySQL version
+gets a complete, independently editable doc set under its own product in the
+`docs.json` product switcher — `mysql-8.4/` and `mysql-9.7/`. Readers see a
+whole 9.7 manual at 9.7 URLs, not a shared tree with the version filed off. Two
+near-identical indexed trees are normal for versioned documentation and are not
+treated as a duplicate-content problem, the same reasoning that lets the
+`stable/` and `dev/` slots both stay indexed.
+
+**Seed 9.7 by copying the dev slot, not stable.** When 9.7 work begins, mirror
+`mysql-8.4/dev/` to `mysql-9.7/dev/` and substitute the version tokens. Dev is
+English-only, so seeding from dev costs **no translation work at all**;
+translation starts only when 9.7 cuts its first stable. Do not seed from
+`mysql-8.4/stable/`, which would immediately owe four locale mirrors.
+
+**What actually differs.** Measured against `mysql-8.4/dev/` on 2026-08-17,
+excluding in-page self-links, only these pages carry MySQL-version-specific
+content:
+
+| Page | What ties it to a MySQL version |
+|---|---|
+| `index.mdx` | "compatible with MySQL 8.4.10", and the same string in `description` |
+| `reference.mdx` | `VERSION()` output examples (`mysql-8.4_0.0.6-dev`); "not part of standard MySQL 8.4 syntax" |
+| `source.mdx` | build version string example; the source build's version option |
+| `install.mdx` | the install script's version option |
+| `quickstart.mdx` | the Docker tag and the one-line install command |
+| `create.mdx` | one link to `dev.mysql.com/doc/extending-mysql/8.4/en/...` |
+
+The remaining ~24 pages — the whole C++ and Rust SDK surface, extension
+authoring, protocol, testing — contain no MySQL-version reference. They copy
+across unchanged and should stay identical until a real difference appears.
+
+**Reconciliation, kept deliberately minimal.** `freshness.py` reports every page
+whose 9.7 copy differs from its 8.4 twin after version-token substitution. It is
+a reminder to update both copies, not a rule forbidding difference: a page in
+the table above prints every run and is expected to. Start with the bare report.
+Only if that list grows too noisy to read is it worth adding a per-page
+"differs on purpose" marker — do not build that machinery up front.
+
+**Version selection is a packaging decision first.** VillageSQL builds three
+flavors, each with its own build artifacts, and the install script offers all
+three:
+
+| Flavor | Documented in |
+|---|---|
+| MySQL 8.4 | `mysql-8.4/` |
+| MySQL 9.7 | `mysql-9.7/` |
+| MySQL 8.4 with Percona changes | `mysql-8.4/dev/percona.mdx` |
+
+**A Percona flavor belongs to a MySQL version, and there will eventually be a
+9.7 one.** Today only the 8.4 Percona build exists, so `percona.mdx` starts life
+in the 8.4 tree alone. When the 9.7 Percona build ships, it gets its own
+`mysql-9.7/dev/percona.mdx` — do not write a single shared Percona page that
+tries to cover both, and do not treat Percona's absence from the 9.7 tree as
+permanent.
+
+That shapes `install.mdx` and `source.mdx`. Both appear in both trees, and each
+lists the flavors that exist for its own MySQL version — three choices in 8.4
+today, two in 9.7 until the 9.7 Percona build lands. So both pages carry a real
+difference between the trees from the start, and stay on the differs-from-8.4
+list permanently.
+
+`percona.mdx` itself stays short: what the branch is, which artifact to install,
+what VillageSQL supports, and a link to Percona's own documentation. Do not
+document Percona's changes here.
+
+Get the option names from the server team before writing any of these pages.
+The page structure follows the flag names.
+
+## Percona branch
+
+Not yet executed. VillageSQL ships a second buildable 8.4 branch that
+integrates Percona's MySQL improvements.
+
+**Do not document Percona's own changes.** Document that the branch exists, how
+to build and install it, and what VillageSQL supports about it. Send every
+question about the Percona improvements themselves to Percona's documentation.
+This lives in one page, `mysql-8.4/dev/percona.mdx`, linked from `install.mdx`
+and `source.mdx`.
+
+**An index of the Percona changes is worth having only if a script generates
+it.** A hand-written summary of another project's feature set goes stale in
+silence. If the server repo can emit the list — a merge manifest, a tagged
+commit range, a build flag list — generate the page and let `freshness.py` fail
+when the source moves. If nothing can generate it, link to Percona and stop.
