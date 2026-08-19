@@ -539,6 +539,19 @@ To react to value changes, chain `.on_change<&fn>()` on a descriptor. The
 callback receives a `sv::SysVarChange` with `var_name()` and typed accessors
 (`as_int()`, `as_real()`, `as_str()`).
 
+The server calls that callback while it holds its global system-variable lock.
+Reading or writing another of this extension's variables through its storage
+pointer is safe there, and other sessions see the new value immediately, because
+the server reads those variables under the same lock.
+
+<Warning>
+Calling the capability's `get()` or `set()`, running SQL, or waiting on a thread
+that does either deadlocks on that lock. Keep the callback short and
+non-blocking, hand work that needs SQL to a [thread worker](#thread-worker), or
+release `LOCK_global_system_variables` around the blocking part and retake it
+before returning, as `event_scheduler_update()` does in `sql/sys_vars.cc`.
+</Warning>
+
 The capability object must have static storage duration. MySQL writes directly
 to the storage pointers when the user sets a variable.
 
@@ -593,7 +606,8 @@ For INT and BOOL variables, read the global storage pointer directly — MySQL
 updates those atomically. To update a variable through MySQL (so locking, range
 validation, and persistence are handled by the server), call
 `SYS_VARS.set(extension_name, var_name, scope, value)`. Both `set` and `get`
-return `false` on success.
+return `false` on success. Neither can be called from an `on_change` callback:
+both deadlock on the system-variable lock.
 
 ```cpp
 bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
@@ -703,8 +717,16 @@ Two fields on the descriptor control naming:
   as the control system variable. When null, the server uses the default
   pattern `{suffix}_enabled`.
 
-The control variable is a server-registered system variable. Enable the worker
-with `SET GLOBAL {suffix}_enabled = ON`; set it `OFF` to stop it.
+The control variable is a server-registered system variable, so it takes the
+extension name as a component prefix. For extension `my_ext` with suffix
+`monitor`, the variable is `my_ext.monitor_enabled`.
+
+Setting it `ON` starts the worker: the server calls the work function with
+`VEF_WAKEUP_ENABLE`, then creates the thread, so the statement does not return
+until that first call has finished. Setting it `ON` again while the worker is
+already running does nothing. Setting it `OFF` returns after the thread has
+exited. The server releases its global system-variable lock around both, so the
+work function may read system variables and run SQL.
 
 ### Complete Example
 
@@ -745,10 +767,11 @@ VEF_GENERATE_ENTRY_POINTS(
 ```
 
 With this extension installed (and `vsql_allow_preview_extensions = ON`), the
-server registers a `heartbeat_enabled` system variable. Enable the worker with:
+server registers a `heartbeat_enabled` system variable under the extension's
+name. For an extension named `my_ext`, enable the worker with:
 
 ```sql
-SET GLOBAL heartbeat_enabled = ON;
+SET GLOBAL my_ext.heartbeat_enabled = ON;
 ```
 
 ## SQL Query
