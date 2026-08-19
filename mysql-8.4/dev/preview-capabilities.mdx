@@ -1417,13 +1417,14 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(g_auth))
 ```
 
-The builder has three pieces:
+The builder has five pieces:
 
 | Element | Meaning |
 |---|---|
 | `make_auth<&handler>("name")` | Starts the builder. The handler is a compile-time template argument, so a null or wrong-signature handler is a compile error rather than a runtime failure. `"name"` is the auth-method name accounts bind to (`IDENTIFIED WITH <name>`) and must be at most `VEF_AUTH_MAX_NAME_LEN` (64) bytes. |
 | `.client_plugin(name)` | Optional. Overrides the client-side auth plugin the server advertises during the handshake. |
 | `.auto_create(callback)` | Optional. Opts the method in to logins for accounts that do not exist (see [Auto-Creating Accounts](#auto-creating-accounts)). |
+| `.auto_grant(callback)` | Optional. Lets the server grant the roles the handler stages, instead of only activating ones the account already holds (see [Auto-Granting Roles](#auto-granting-roles)). |
 | `.build()` | Yields the descriptor you hand to `AuthCapability`. |
 
 `AuthCapability g_auth{descriptor}` is the self-registering token consumed by
@@ -1494,11 +1495,12 @@ beyond what the DBA provisioned. Passing `n_roles == 0` activates no roles
 
 ### Complete Example
 
-A minimal authenticator, condensed from the `vsql_auth_test` extension that
-ships with the server. It accepts one fixed token, maps the connection to
+A minimal authenticator, condensed from the `vsql_auth_test` extension in the
+server source tree at `villagesql/test-extensions/vsql-auth-test/`, which no
+release includes. It accepts one fixed token, maps the connection to
 `vsql_auth_test_user`, and pins `mysql_clear_password` so the token arrives
-verbatim in the password slot. (The shipping extension adds extra token paths
-and the `.auto_create()` opt-in described below to drive its test suite.)
+verbatim in the password slot. (The in-tree extension adds extra token paths and
+both opt-ins described below to drive its test suite.)
 
 ```cpp
 #include <cstring>
@@ -1674,12 +1676,14 @@ token can name a role but never create or escalate one. The account name comes
 from the client, so the server quotes it as an identifier — a crafted name
 becomes one oddly-named account, never a second statement.
 
-The `vsql_auth_test` extension opts in, and provisions the connecting user with
-the role `vsql_role_granted`. Create that role first, then connect as an account
-that does not exist:
+The `vsql_auth_test` extension provisions the connecting user with the role
+`vsql_role_granted`, and gates the opt-in behind `vsql_auth_test.auto_create`,
+which starts `OFF`. Turn it on and create the role first, then connect as an
+account that does not exist:
 
 ```sql
 INSTALL EXTENSION vsql_auth_test;
+SET GLOBAL vsql_auth_test.auto_create = ON;
 CREATE ROLE vsql_role_granted;
 GRANT SELECT ON *.* TO vsql_role_granted;
 ```
@@ -1742,4 +1746,92 @@ observable to anyone holding a valid credential, which the standard
 unknown-account rejection deliberately hides. That is the trade this feature
 makes; weigh it before enabling the opt-in on a method whose credentials are
 widely held.
+</Warning>
+
+### Auto-Granting Roles
+
+By default a role a token names takes effect only if the account already holds
+it, and one it does not hold is logged and skipped. `.auto_grant(&callback)`
+changes that: the server grants the staged roles to the account, so the token
+decides which roles the session gets rather than only which of the account's
+existing roles to switch on.
+
+The callback matches `.auto_create()` in shape — no arguments, returns `bool`,
+and the server calls it on each login, so it can follow a runtime setting:
+
+```cpp
+bool auto_grant_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_grant(&auto_grant_enabled)
+        .build();
+```
+
+The two opt-ins are independent. `.auto_create()` governs logins for accounts
+that do not exist; `.auto_grant()` governs granting to the account a login
+resolves to, whether or not that account was just created. Leaving
+`.auto_grant()` off, or returning `false`, keeps the activate-only default.
+
+The grant persists — it is an ordinary `GRANT`, not a session-only activation —
+and it is additive: the server never revokes a role the token stopped naming.
+
+`vsql_auth_test` exposes this as `vsql_auth_test.auto_grant`, also `OFF` to start.
+Its `-token-roles` token stages `vsql_role_granted` and `vsql_role_denied`, and
+the account below holds neither. With the setting off, the login leaves the
+account's roles alone:
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+CREATE ROLE vsql_role_granted, vsql_role_denied;
+```
+
+Connecting as `auth_user` with that token, in the same way as above, and asking
+what is active:
+
+```text
++----------------+
+| CURRENT_ROLE() |
++----------------+
+| NONE           |
++----------------+
+```
+
+Turn the setting on and repeat the same login:
+
+```sql
+SET GLOBAL vsql_auth_test.auto_grant = ON;
+```
+
+```text
++------------------------------------------------+
+| CURRENT_ROLE()                                 |
++------------------------------------------------+
+| `vsql_role_denied`@`%`,`vsql_role_granted`@`%` |
++------------------------------------------------+
+```
+
+Both roles are now active, and `SHOW GRANTS` shows the grant the server added:
+
+```sql
+SHOW GRANTS FOR vsql_auth_test_user;
+```
+
+```text
++-----------------------------------------------------------------------------------+
+| Grants for vsql_auth_test_user@%                                                  |
++-----------------------------------------------------------------------------------+
+| GRANT SELECT ON *.* TO `vsql_auth_test_user`@`%`                                  |
+| GRANT `vsql_role_denied`@`%`,`vsql_role_granted`@`%` TO `vsql_auth_test_user`@`%` |
++-----------------------------------------------------------------------------------+
+```
+
+<Warning>
+With `.auto_grant()` on, a valid token is enough to gain any role it names. The
+role must already exist, so a token still cannot invent privileges, but the DBA
+no longer decides which existing roles an account may reach — the method does.
 </Warning>
