@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "Preview Capabilities"
-description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the keyring, mysql_services, status_var, sys_var, thread_worker, sql_query, and statement_event capabilities, and registration patterns."
+description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the auth, keyring, mysql_services, status_var, sys_var, thread_worker, sql_query, and statement_event capabilities, and registration patterns."
 ---
 
 Preview capabilities are server-provided features exposed to extensions before
@@ -50,6 +50,7 @@ Uninstall those extensions first, then turn the setting off.
 
 | Capability | Header | Status |
 |---|---|---|
+| `vsql::preview::auth` | `<villagesql/preview/auth.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
 | `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview |
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
 | `vsql::preview::mysql_services` | `<villagesql/preview/mysql_services.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
@@ -1382,3 +1383,494 @@ Each query slower than the threshold is appended to the configured log file:
 SET timestamp=1782168824;
 SELECT SLEEP(0.6);
 ```
+
+## Authentication Methods
+
+The auth capability (`vsql::preview::auth`) lets an extension provide a server
+authentication method. An account opts in with `CREATE USER ... IDENTIFIED WITH
+<method-name>`; at connection time, when that name is not a loaded MySQL auth
+plugin, the server consults the VEF auth registry and invokes the extension's
+handler over the handshake. Use it to authenticate accounts against a credential
+source the server does not know about — a bearer token, an external identity
+provider, or a custom challenge — without writing a MySQL authentication plugin.
+
+The capability name `VEF_PREVIEW_AUTH_NAME` is `"vsql::preview::auth"`.
+
+The handler is a typed function that receives an `AuthContext`: it talks to the
+client by reading and writing handshake packets through that server-owned
+context, and it never sees MySQL's internal auth structures.
+
+<Warning>
+The auth result is fail-closed. The server treats anything other than
+`AuthResult::kOk` as a denied connection — there is deliberately no "maybe" or
+fail-open result. A handler that returns `AuthResult::kReject`, returns
+`AuthResult::kError`, or never sets the effective account denies the login.
+</Warning>
+
+### Declaring the Capability
+
+Include the header, write a typed handler, build a descriptor with the fluent
+`make_auth<>` builder, and hand the descriptor to an `AuthCapability` token that
+you pass to `.with()`. Preview capability headers are not part of the
+`<villagesql/vsql.h>` umbrella, so include `<villagesql/preview/auth.h>`
+explicitly:
+
+```cpp
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+AuthResult authenticate(AuthContext &c) {
+  // ... validate the client and set the effective account ...
+  return AuthResult::kOk;
+}
+
+constexpr auto MY_AUTH =
+    vsql::preview_auth::make_auth<&authenticate>("my_auth")
+        .client_plugin("mysql_clear_password")
+        .build();
+
+static vsql::preview_auth::AuthCapability g_auth{MY_AUTH};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_auth))
+```
+
+The builder has six pieces:
+
+| Element | Meaning |
+|---|---|
+| `make_auth<&handler>("name")` | Starts the builder. The handler is a compile-time template argument, so a null or wrong-signature handler is a compile error rather than a runtime failure. `"name"` is the auth-method name accounts bind to (`IDENTIFIED WITH <name>`) and must be at most `VEF_AUTH_MAX_NAME_LEN` (64) bytes. |
+| `.client_plugin(name)` | Optional. Overrides the client-side auth plugin the server advertises during the handshake. |
+| `.accepts_client_plugin(callback)` | Optional. Takes `bool (*)(const char *offered)`. Returning `true` keeps the plugin the client offered; returning `false` switches the client to `.client_plugin()`. |
+| `.auto_create(callback)` | Optional. Opts the method in to logins for accounts that do not exist (see [Auto-Creating Accounts](#auto-creating-accounts)). |
+| `.auto_grant(callback)` | Optional. Lets the server grant the roles the handler stages, instead of only activating ones the account already holds (see [Auto-Granting Roles](#auto-granting-roles)). |
+| `.build()` | Yields the descriptor you hand to `AuthCapability`. |
+
+`AuthCapability g_auth{descriptor}` is the self-registering token consumed by
+`.with()`. Declare it `static` so it outlives registration.
+
+`client_plugin` is optional. `make_auth` defaults the advertised plugin to
+`"mysql_clear_password"` — the lowest common denominator every MySQL client
+ships — so a method that never calls `.client_plugin()` still installs and a
+naive client still connects. Call `.client_plugin(name)` to request a different
+plugin; `mysql_clear_password` receives a bearer token verbatim in the password
+slot.
+
+A client that offers a plugin other than the one the method requests is switched
+to the requested plugin and resends its credential verbatim, which costs a round
+trip and needs a client willing to make that switch.
+`.accepts_client_plugin(&callback)` lets the method keep the offered plugin
+instead: the server passes each offered name to the callback, including the
+requested plugin, which is accepted whatever the callback returns. A method that
+sets no callback accepts no other offer, so every other offer switches to the
+requested plugin. Accepting is final — the server does not switch back to the
+requested plugin afterwards — so accept only a plugin whose framing the handler
+really parses. The server queries the callback during handshake negotiation,
+before the handler's first read, so it must be a pure predicate: no packet I/O,
+no blocking, no side effects.
+
+### The Handler Contract
+
+The handler matches the `AuthHandler` type — it takes an `AuthContext &` and
+returns an `AuthResult`:
+
+```cpp
+AuthResult authenticate(AuthContext &c);
+```
+
+It is invoked synchronously on the connecting thread during the handshake. The
+`AuthContext` wraps the server-owned per-attempt context; hold it only for the
+duration of the call and do not retain it. Call its methods instead of threading
+a context pointer through a function table. The methods a token-based handler
+uses:
+
+| Method | Purpose |
+|---|---|
+| `c.read_packet()` | Read the next packet the client sent. Returns the bytes as a `Span<const unsigned char>` valid until the next read (empty on a protocol or connection error). Paired with `mysql_clear_password`, one read yields the bearer token. |
+| `c.write_packet(data)` | Send a packet to the client (e.g. a challenge). Takes a `Span<const unsigned char>` and returns `true` on failure. |
+| `c.user_name()` | The account name the client connected as. |
+| `c.auth_string()` | The `AS '...'` clause from `IDENTIFIED WITH <m> AS '...'`, or empty. |
+| `c.host_or_ip()` | The client host or IP. |
+| `c.client_auth_plugin()` | The client-side auth plugin the client advertised in its handshake reply (for example `"mysql_clear_password"`). When the method accepted that offer, it is also the plugin that framed the credential the handler reads, so the handler can parse by name instead of sniffing bytes. A forced switch to `.client_plugin()` does not update it, so on that path it still reports what the client first offered. Empty if unknown. |
+| `c.authenticate_as(account)` | Set the effective account the session runs as (shown by `CURRENT_USER()`). Required before returning `AuthResult::kOk`. |
+| `c.set_external_user(identity)` | Set the original external identity for the audit trail (`@@external_user`). |
+| `c.set_active_roles(roles, n_roles)` | Stage the session's active roles (see [Staging Active Roles](#staging-active-roles)). |
+| `c.account_unknown()` | `true` when the account being authenticated does not exist and this login was routed to the method by its `.auto_create()` opt-in. `false` for a login against an existing account. |
+| `c.request_provision(account, roles, n_roles)` | Ask the server to create `account` and grant it `roles` (see [Auto-Creating Accounts](#auto-creating-accounts)). |
+
+The handler returns one of three results:
+
+| Result | Meaning |
+|---|---|
+| `AuthResult::kOk` | Authentication succeeded. The handler must have called `authenticate_as()`; the session runs as that account. |
+| `AuthResult::kReject` | Authentication failed — bad credential or policy rejection. |
+| `AuthResult::kError` | An internal error prevented a decision (for example, a key source was unavailable). Treated identically to a rejection by the server; it exists only to distinguish "denied" from "couldn't decide" in logging. |
+
+Both `AuthResult::kReject` and `AuthResult::kError` deny the connection. Only
+`AuthResult::kOk` succeeds.
+
+When the handler maps the connecting account to a different effective account —
+as the example below maps the connecting account to `vsql_auth_test_user` — that
+is proxying, and it requires a `GRANT PROXY`, exactly as on the MySQL plugin auth
+path.
+
+### Staging Active Roles
+
+`c.set_active_roles(roles, n_roles)` stages the roles that should be active on
+the session, replacing the account's default-role activation for this login.
+`roles` is an array of `n_roles` NUL-terminated names; the strings are copied,
+so the caller need not keep them. The server applies them *after* account
+resolution, using the same grant-checked activation as `SET ROLE`: only roles
+actually granted to the authenticated account activate, and names that are not
+granted are silently skipped — so a token can never grant or escalate privileges
+beyond what the DBA provisioned. Passing `n_roles == 0` activates no roles
+(equivalent to `SET ROLE NONE`).
+
+### Complete Example
+
+A minimal authenticator, condensed from the `vsql_auth_test` extension in the
+server source tree at `villagesql/test-extensions/vsql-auth-test/`, which no
+release includes. It accepts one fixed token, maps the connection to
+`vsql_auth_test_user`, and requests `mysql_clear_password` so the token arrives
+verbatim in the password slot. (The in-tree extension adds extra token paths, an
+`.accepts_client_plugin()` callback, and both opt-ins described below to drive
+its test suite.)
+
+```cpp
+#include <cstring>
+
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+namespace {
+
+constexpr char kToken[] = "vsql-auth-test-token";
+constexpr char kMappedAccount[] = "vsql_auth_test_user";
+
+AuthResult authenticate(AuthContext &c) {
+  auto pkt = c.read_packet();
+  if (pkt.empty()) return AuthResult::kError;
+
+  // mysql_clear_password sends a NUL-terminated string; drop the trailing NUL.
+  size_t len = pkt.size();
+  if (len && pkt[len - 1] == '\0') --len;
+
+  if (len != std::strlen(kToken) ||
+      std::memcmp(pkt.data(), kToken, len) != 0) {
+    return AuthResult::kReject;
+  }
+
+  c.authenticate_as(kMappedAccount);
+  // @@external_user records the connecting identity, not the mapped account.
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .build();
+vsql::preview_auth::AuthCapability g_auth{AUTH_METHOD};
+
+}  // namespace
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(g_auth))
+```
+
+### Binding an Account and Connecting
+
+With the preview tier enabled (see
+[Enabling the Preview Tier](#enabling-the-preview-tier)), install the extension
+and bind an account to the method. Because the handler maps to a second account,
+create that account too and grant it the `PROXY` privilege that lets the
+connecting account assume its identity:
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+```
+
+`CREATE USER ... IDENTIFIED WITH vsql_auth_test` is accepted because
+`vsql_auth_test` is a registered VEF auth method — the same way an installed
+plugin name is accepted.
+
+Only the `IDENTIFIED WITH <method>` form is accepted, optionally with
+`AS '...'`. Adding `BY '...'` asks the method to turn a password into a stored
+credential — the job a MySQL plugin does through
+`generate_authentication_string()` — and no VEF auth method declares that hook
+today, so the server rejects it:
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test BY 'secret';
+```
+
+```text
+ERROR 1827 (HY000): The password hash doesn't have the expected format.
+```
+
+The bound method name is written to the account's `plugin` column rather than
+the table default, which is what the account's next login reads:
+
+```sql
+SELECT plugin FROM mysql.user WHERE user = 'auth_user';
+```
+
+```text
++----------------+
+| plugin         |
++----------------+
+| vsql_auth_test |
++----------------+
+```
+
+The method requests `mysql_clear_password`, so the client must pass
+`--enable-cleartext-plugin` to send the token in cleartext. On a correct token,
+the session runs as the mapped account and exposes the connecting account
+through `@@external_user`:
+
+```bash
+mysql --enable-cleartext-plugin --user=auth_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER(), @@external_user"
+```
+
+```
+CURRENT_USER()         @@external_user
+vsql_auth_test_user@%  auth_user
+```
+
+Uninstalling the extension removes the method; accounts bound to it can no
+longer authenticate:
+
+```sql
+UNINSTALL EXTENSION vsql_auth_test;
+```
+
+### Auto-Creating Accounts
+
+A method can also handle logins for accounts that do not exist yet, and have the
+server create the account as part of the successful login. Without this, an
+unknown account is rejected before any method runs.
+
+Opt in with `.auto_create(&callback)`. The callback takes no arguments and
+returns `bool`; the server calls it on each unknown-account login rather than
+reading it once at registration, so the method can follow a runtime setting of
+its own instead of freezing the choice when the extension loads:
+
+```cpp
+bool auto_create_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_create(&auto_create_enabled)
+        .build();
+```
+
+Leaving `.auto_create()` off, or returning `false` from the callback, keeps the
+standard behavior: an unknown account is denied. Only one installed method may
+opt in at a time — if two return `true`, the server declines to guess, logs a
+warning to the error log, and rejects unknown accounts as if none had opted in.
+
+In the handler, `c.account_unknown()` distinguishes the two cases. Validate the
+credential first, then describe what to create and authenticate as it:
+
+```cpp
+if (c.account_unknown()) {
+  const char *roles[] = {"vsql_role_granted"};
+  c.request_provision(c.user_name(), roles, 1);
+  c.authenticate_as(c.user_name());
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+```
+
+`request_provision(account, roles, n_roles)` records intent and returns nothing.
+The server runs the DDL itself, after the handler returns `AuthResult::kOk`, and
+only for a login that was routed in as an unknown account — so a login the
+handler goes on to deny creates nothing, and a request naming an account that
+already exists is ignored. What the server runs is
+`CREATE USER IF NOT EXISTS <account>@'%' IDENTIFIED WITH <method>`, followed by
+one `GRANT` per named role: the account is always created for host `%` and bound
+to the method that authenticated it, and `account` need not be the connecting
+user name. If the creation cannot be done — on a `super_read_only` server, for
+example — the login fails rather than proceeding without an account.
+
+Roles behave as they do for [Staging Active Roles](#staging-active-roles): the
+DBA owns them. Each name must already exist as a grantable role, and one that
+cannot be granted is logged and skipped rather than failing the login, so a
+token can name a role but never create or escalate one. The account name comes
+from the client, so the server quotes it as an identifier — a crafted name
+becomes one oddly-named account, never a second statement.
+
+The `vsql_auth_test` extension provisions the connecting user with the role
+`vsql_role_granted`, and gates the opt-in behind `vsql_auth_test.auto_create`,
+which starts `OFF`. Turn it on and create the role first, then connect as an
+account that does not exist:
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+SET GLOBAL vsql_auth_test.auto_create = ON;
+CREATE ROLE vsql_role_granted;
+GRANT SELECT ON *.* TO vsql_role_granted;
+```
+
+```bash
+mysql --enable-cleartext-plugin --user=auto_created_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER() AS who, @@external_user AS ext"
+```
+
+```text
++---------------------+-------------------+
+| who                 | ext               |
++---------------------+-------------------+
+| auto_created_user@% | auto_created_user |
++---------------------+-------------------+
+```
+
+The account now exists, bound to the method, holding the granted role:
+
+```sql
+SELECT user, host, plugin FROM mysql.user WHERE user = 'auto_created_user';
+```
+
+```text
++-------------------+------+----------------+
+| user              | host | plugin         |
++-------------------+------+----------------+
+| auto_created_user | %    | vsql_auth_test |
++-------------------+------+----------------+
+```
+
+```sql
+SHOW GRANTS FOR 'auto_created_user'@'%';
+```
+
+```text
++----------------------------------------------------------+
+| Grants for auto_created_user@%                           |
++----------------------------------------------------------+
+| GRANT USAGE ON *.* TO `auto_created_user`@`%`            |
+| GRANT `vsql_role_granted`@`%` TO `auto_created_user`@`%` |
++----------------------------------------------------------+
+```
+
+A wrong token still fails closed, and provisions nothing:
+
+```bash
+mysql --enable-cleartext-plugin --user=never_created --password=wrong-token \
+      -e "SELECT 1"
+```
+
+```text
+ERROR 1045 (28000): Access denied for user 'never_created'@'localhost' (using password: NO)
+```
+
+<Warning>
+Opting in makes the difference between an unknown and an existing account
+observable to anyone holding a valid credential, which the standard
+unknown-account rejection deliberately hides. That is the trade this feature
+makes; weigh it before enabling the opt-in on a method whose credentials are
+widely held.
+</Warning>
+
+### Auto-Granting Roles
+
+By default a role a token names takes effect only if the account already holds
+it, and one it does not hold is logged and skipped. `.auto_grant(&callback)`
+changes that: the server grants the staged roles to the account, so the token
+decides which roles the session gets rather than only which of the account's
+existing roles to switch on.
+
+The callback matches `.auto_create()` in shape — no arguments, returns `bool`,
+and the server calls it on each login, so it can follow a runtime setting:
+
+```cpp
+bool auto_grant_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_grant(&auto_grant_enabled)
+        .build();
+```
+
+The two opt-ins are independent. `.auto_create()` governs logins for accounts
+that do not exist; `.auto_grant()` governs granting to the account a login
+resolves to, whether or not that account was just created. Leaving
+`.auto_grant()` off, or returning `false`, keeps the activate-only default.
+
+The grant persists — it is an ordinary `GRANT`, not a session-only activation —
+and it is additive: the server never revokes a role the token stopped naming.
+
+`vsql_auth_test` exposes this as `vsql_auth_test.auto_grant`, also `OFF` to start.
+Its `-token-roles` token stages `vsql_role_granted` and `vsql_role_denied`, and
+the account below holds neither. With the setting off, the login leaves the
+account's roles alone:
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+CREATE ROLE vsql_role_granted, vsql_role_denied;
+```
+
+Connecting as `auth_user` with that token, in the same way as above, and asking
+what is active:
+
+```text
++----------------+
+| CURRENT_ROLE() |
++----------------+
+| NONE           |
++----------------+
+```
+
+Turn the setting on and repeat the same login:
+
+```sql
+SET GLOBAL vsql_auth_test.auto_grant = ON;
+```
+
+```text
++------------------------------------------------+
+| CURRENT_ROLE()                                 |
++------------------------------------------------+
+| `vsql_role_denied`@`%`,`vsql_role_granted`@`%` |
++------------------------------------------------+
+```
+
+Both roles are now active, and `SHOW GRANTS` shows the grant the server added:
+
+```sql
+SHOW GRANTS FOR vsql_auth_test_user;
+```
+
+```text
++-----------------------------------------------------------------------------------+
+| Grants for vsql_auth_test_user@%                                                  |
++-----------------------------------------------------------------------------------+
+| GRANT SELECT ON *.* TO `vsql_auth_test_user`@`%`                                  |
+| GRANT `vsql_role_denied`@`%`,`vsql_role_granted`@`%` TO `vsql_auth_test_user`@`%` |
++-----------------------------------------------------------------------------------+
+```
+
+<Warning>
+With `.auto_grant()` on, a valid token is enough to gain any role it names. The
+role must already exist, so a token still cannot invent privileges, but the DBA
+no longer decides which existing roles an account may reach — the method does.
+</Warning>
