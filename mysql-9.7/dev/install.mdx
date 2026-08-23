@@ -1,0 +1,240 @@
+---
+audience: villagesql-user
+title: "Installing Extensions"
+description: "How to add new capabilities to VillageSQL using extensions."
+---
+
+Install VillageSQL extensions to add custom types, functions, and capabilities to your database.
+
+## Command Syntax
+
+```sql
+INSTALL EXTENSION extension_name [VERSION 'version'];
+```
+
+When `VERSION` is supplied, the server opens `{name}-{version}.veb`,
+compares the version against the manifest, and aborts if they differ.
+Omit the clause to install `{name}.veb`, or — if only versioned VEBs
+are present — the unique `{name}-{version}.veb`. See [Selecting a Version](#selecting-a-version).
+
+<Info>
+  Extensions are distributed as `.veb` (VillageSQL Extension Bundle) files containing compiled libraries and metadata.
+</Info>
+
+### Selecting a Version
+
+VEB files in `veb_dir` may be named either `{name}.veb` (unversioned) or `{name}-{version}.veb` (versioned). To install a specific versioned VEB, add a `VERSION` clause:
+
+```sql
+INSTALL EXTENSION vsql_uuid VERSION '0.2.0';
+```
+
+With `VERSION`, the server opens `vsql_uuid-0.2.0.veb` and verifies that the version in its `manifest.json` matches `0.2.0`.
+
+Without `VERSION`, the server resolves the file as follows:
+
+- If `{name}.veb` exists, install it; the version is read from its `manifest.json`.
+- Otherwise, if exactly one `{name}-{version}.veb` exists, install it; the version in the filename is verified against its `manifest.json`.
+- Otherwise, the install fails and you must specify a version.
+
+<Warning>
+  If multiple versioned VEBs are present and no unversioned VEB exists, `INSTALL EXTENSION` fails with `Multiple versions of extension '<name>' found in '<dir>'; specify a version with INSTALL EXTENSION <name> VERSION 'x.y.z'`. Re-run with an explicit `VERSION` clause.
+</Warning>
+
+### Extension Naming Conventions
+
+VillageSQL uses different naming conventions in different contexts:
+
+- **SQL commands:** Use underscores: `INSTALL EXTENSION vsql_uuid`
+- **Repository names:** Use hyphens: `github.com/villagesql/vsql-uuid`
+- **File names:** Use underscores: `vsql_uuid.veb`
+- **manifest.json:** Use underscores to match SQL: `"name": "vsql_uuid"`
+
+**Example:**
+```bash
+# Clone from GitHub repo (hyphens in URL)
+git clone https://github.com/villagesql/vsql-uuid
+
+# But .veb file uses underscores
+ls vsql_uuid.veb
+
+# Install with underscores (no quotes)
+INSTALL EXTENSION vsql_uuid;
+```
+
+## Required Privilege
+
+`INSTALL EXTENSION`, `UNINSTALL EXTENSION`, and `ALTER EXTENSION` are guarded by
+the `EXTENSION_ADMIN` dynamic privilege. These statements load native extension
+code into the running server, so they require an administrative privilege and
+are not available to unprivileged accounts.
+
+`EXTENSION_ADMIN` is a dynamic privilege granted at the global scope (`ON *.*`):
+
+```sql
+GRANT EXTENSION_ADMIN ON *.* TO user@host;
+```
+
+`SUPER` is accepted as a fallback for backward compatibility, so an account that
+already holds `SUPER` can run these statements without a separate grant.
+
+A data directory created by `--initialize` or `--initialize-insecure` grants
+`EXTENSION_ADMIN` to `root@localhost` directly, so a new server needs no manual
+grant. When an existing data directory is upgraded in place, every user account
+holding `SUPER` is granted `EXTENSION_ADMIN` — but only if no account holds it
+already, so a server upgraded once is not backfilled again on later upgrades.
+The reserved `mysql.*` system accounts are excluded.
+
+An account with neither privilege is rejected before any extension work begins:
+
+```text
+ERROR 1227 (42000): Access denied; you need (at least one of) the EXTENSION_ADMIN or SUPER privilege(s) for this operation
+```
+
+Revoke the privilege the same way:
+
+```sql
+REVOKE EXTENSION_ADMIN ON *.* FROM user@host;
+```
+
+A revoke takes effect on the next connection. An existing session keeps the
+privileges it connected with until it reconnects, so an operator who just lost
+`EXTENSION_ADMIN` can still run extension DDL until the current session ends.
+
+## Prerequisites
+
+- Running VillageSQL Server instance
+- Administrative access (root or equivalent)
+
+## Installing Built-in Extensions
+
+Built-in extensions included with VillageSQL are already in the veb_dir. Simply enable them:
+
+```sql
+-- Connect to VillageSQL
+mysql -u root -p
+
+-- Install the extension
+INSTALL EXTENSION vsql_complex;
+```
+
+### Verify Installation
+
+```sql
+-- List installed extensions
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
+```
+
+**Output:**
+```
++----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
+| EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_REQUESTED_AT | PENDING_LAST_ERROR | PENDING_LAST_ERROR_AT |
++----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
+| vsql_complex   | 0.0.1             | NULL            | NULL                 | NULL               | NULL                  |
++----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
+```
+
+### Test Functionality
+
+```sql
+-- Create a database first
+CREATE DATABASE test_db;
+USE test_db;
+
+-- Test extension functions
+CREATE TABLE test (id INT, value COMPLEX);
+INSERT INTO test VALUES (1, '(3,4)');
+SELECT complex_abs(value) FROM test;  -- Returns 5.0
+
+-- Clean up
+DROP TABLE test;
+DROP DATABASE test_db;
+```
+
+## Installing External Extensions
+
+For extensions downloaded or built separately:
+
+<Info>
+  Your server must have `veb_dir` configured before you can install external extensions. See [Configuring veb_dir](/mysql-9.7/dev/managing#configuring-veb_dir).
+</Info>
+
+### 1. Copy the .veb File
+
+Find your server's extension directory, then copy the `.veb` file into it:
+
+```sql
+-- Find the extension directory
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+```bash
+cp /path/to/my_extension.veb /path/to/veb_dir/
+```
+
+### 2. Install Extension
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+To pin the expected version — useful in CI or scripted rollouts — include
+the `VERSION` clause:
+
+```sql
+INSTALL EXTENSION my_extension VERSION '1.2.0';
+```
+
+If the manifest reports a different version, the install fails and nothing
+is registered:
+
+```
+ERROR 3219 (HY000): Cannot install extension 'my_extension': manifest version
+is '0.0.1' but VERSION '1.2.0' was specified
+```
+
+### 3. Verify Installation
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| `Extension not found` | Verify the `.veb` file is in `veb_dir`: `SHOW VARIABLES LIKE 'veb_dir'` |
+| `Permission denied` | Check file permissions: `chmod 644 extension.veb` |
+| `extension name mismatch` | Extension's internal name doesn't match the `.veb` filename. Rebuild the extension. |
+| `vef_register not found` | The `.veb` file doesn't export a valid VEF entry point. Rebuild against the correct SDK. |
+| `vef_register returned an error: ...` | Extension registration failed. Read the appended message for details. |
+| `Cannot install extension 'name': manifest version is 'X' but VERSION 'Y' was specified` | The `VERSION` clause selects `{name}-{version}.veb` but the manifest inside reports a different version. Re-run with the manifest version, or fix the filename. |
+| `Multiple versions of extension 'name' found in '<dir>'; specify a version with INSTALL EXTENSION name VERSION 'x.y.z'` | Multiple `{name}-{version}.veb` files exist with no unversioned `{name}.veb`. Re-run with an explicit `VERSION` clause. |
+
+For more troubleshooting, see [Managing Extensions](/mysql-9.7/dev/managing).
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Managing Extensions"
+    icon="sliders"
+    href="/mysql-9.7/dev/managing"
+  >
+    Monitor and troubleshoot installed extensions
+  </Card>
+  <Card
+    title="Available Extensions"
+    icon="list"
+    href="/mysql-9.7/dev/extensions"
+  >
+    Browse extensions you can install
+  </Card>
+  <Card
+    title="Create Extensions"
+    icon="code"
+    href="/mysql-9.7/dev/create"
+  >
+    Build your own extensions
+  </Card>
+</CardGroup>
