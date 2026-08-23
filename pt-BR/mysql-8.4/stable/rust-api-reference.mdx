@@ -7,8 +7,9 @@ description: "Referência completa do SDK Rust do VillageSQL — InValue, VdfRet
 <Warning>
   O SDK Rust está em alpha — espere mudanças incompatíveis de API entre
   versões. Extensões apenas de funções e tipos personalizados (encode, decode,
-  compare, hash) são compatíveis. Agregações, `prerun()`, `VarArgs`, variáveis de
-  sistema e de status, acesso ao keyring e a ABI de armazenamento de coluna são
+  compare, hash) são compatíveis, assim como as capabilities Preview `sys_var`,
+  `status_var`, `thread_worker` e `keyring`. Agregações, `VarArgs` e a ABI de
+  armazenamento de coluna são
   exclusivos do C++ hoje — use o [SDK C++](/pt-BR/mysql-8.4/stable/create) se você
   precisar de qualquer um desses.
 </Warning>
@@ -37,6 +38,7 @@ pub enum InValue<'a> {
 | `Int(i64)` | Inteiro com sinal de 64 bits | `INT` / `BIGINT` / `TINYINT` |
 | `Null` | — | `NULL` do SQL para qualquer tipo |
 | `Custom(&[u8])` | Bytes binários brutos | Qualquer tipo personalizado registrado via `custom_type!` |
+| `CustomWithParams { bytes, params }` | Bytes brutos + `TypeParams` | Um tipo personalizado parametrizado registrado via [`parameterized_type!`](/pt-BR/mysql-8.4/stable/rust-custom-types#parameterized-types) |
 
 Sempre faça a correspondência de `Null` explicitamente. Chamar `.unwrap()` ou fazer a correspondência de padrão apenas das variantes de valor é um bug — o NULL do SQL é uma entrada normal, não um erro.
 
@@ -80,21 +82,28 @@ villagesql::extension! {
     ],
     types: [
         // One or more villagesql::custom_type!(...) declarations
+    ],
+    requires: [
+        // Zero or more &'static capability references, e.g. &KEYRING
     ]
 }
 ```
 
-Ambas as seções são opcionais. Uma extensão apenas de funções omite `types:`; uma extensão apenas de tipos omite `funcs:`. Um bloco `extension!` vazio (sem funcs, sem types) é válido, mas produz uma extensão que não faz nada.
+`types:` e `requires:` são opcionais por si só, mas `funcs:` deve estar sempre presente — escreva `funcs: []` para uma extensão apenas de tipos. Uma extensão apenas de funções omite `types:`. Um bloco `extension!` com `funcs: []` e sem tipos é válido, mas produz uma extensão que não faz nada.
+
+`requires:` declara as [capabilities Preview](/pt-BR/mysql-8.4/stable/rust-preview-capabilities) que a extensão usa, como referências a objetos `static` de capability. Ela deve vir por último, depois de uma seção `funcs:` — inclua `funcs: []` se a extensão não registrar nenhuma função.
 
 ## macro func!
 
-`func!` declara uma função chamável via SQL. Quatro formas (sem parâmetros, apenas `buffer_size`, apenas `deterministic`, ambos):
+`func!` declara uma função chamável via SQL. Seis formas — quatro sem estado por instrução (sem parâmetros, apenas `buffer_size`, apenas `deterministic`, ambos) e duas que anexam estado por instrução por meio de uma função `prerun`:
 
 ```rust
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, deterministic: true)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
 ```
 
 <Note>
@@ -106,7 +115,7 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size
 
 | Argumento | Descrição |
 |---|---|
-| `rust_fn` | A função Rust que implementa a VDF. Assinatura: `fn(&[InValue]) -> VdfReturn`. |
+| `rust_fn` | A função Rust que implementa a VDF. Assinatura: `fn(&[InValue]) -> VdfReturn`, ou `fn(&mut StateType, &[InValue]) -> VdfReturn` para as formas `state:` / `prerun:`. |
 | `"sql_name"` | O nome da função SQL como um literal de string. É isso que os usuários chamam a partir do SQL. |
 | `[param_types]` | Lista separada por vírgulas de valores `villagesql::Type::*` ou `villagesql::custom!("name")`. Use `[]` para funções de aridade zero. |
 | `return_type` | `villagesql::Type::*` ou `villagesql::custom!("name")`. |
@@ -120,6 +129,73 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size
 | `villagesql::Type::String` | `STRING` |
 | `villagesql::Type::Real` | `REAL` |
 | `villagesql::Type::Int` | `INT` |
+
+### Estado por instrução {#per-statement-state}
+
+Algumas funções precisam de um estado que abrange todas as linhas de uma única instrução — um contador de chamadas, um acumulador. Declare o tipo do estado com `state:` e uma função de configuração com `prerun:`. A função prerun é executada uma vez, antes da primeira linha; a função de linha então é executada uma vez por linha com acesso `&mut` a esse estado.
+
+Uma função prerun tem a assinatura `fn(PrerunArgs, PrerunResult<T>)`, e a função de linha que ela alimenta recebe o estado primeiro: `fn(state: &mut T, args: &[InValue]) -> VdfReturn`. `T` é o tipo nomeado por `state:`, e o compilador verifica se a prerun e a função de linha concordam sobre ele.
+
+| Método de `PrerunResult<T>` | Efeito |
+|---|---|
+| `set_state(self, state: T)` | Aloca o estado por instrução e o entrega ao servidor. Ele consome `self` em vez de tomá-lo emprestado, então o compilador rejeita uma segunda chamada. |
+| `request_buffer_size(&mut self, n: usize)` | Solicita ao servidor um tamanho específico de buffer de resultado. |
+| `error(self, msg: &str)` | Faz a instrução inteira falhar com uma mensagem. |
+
+`PrerunArgs::len()` é o número de argumentos que cada linha vai receber, e `PrerunArgs::is_empty()` é verdadeiro quando a função foi chamada sem argumentos.
+
+Você não deve liberar o estado por conta própria: `func!` gera a postrun que o descarta quando a instrução termina. Isso é o oposto do SDK C++, onde sua postrun tem que chamar `delete_state<T>()` — consulte [Estado por Instrução](/pt-BR/mysql-8.4/stable/development#per-statement-state-prerun-and-postrun).
+
+<Note>
+  Os parâmetros `state` e `prerun` ainda não estão em uma versão publicada. A
+  versão atual do [crates.io](https://crates.io/crates/villagesql) (`0.0.1`)
+  não os expõe.
+</Note>
+
+Uma extensão completa cuja função retorna o próprio índice de chamada dentro da instrução:
+
+```rust
+use villagesql::{InValue, PrerunArgs, PrerunResult, VdfReturn};
+
+/// Per-statement state: how many times the row function has been called.
+struct CallCounter {
+    n: i64,
+}
+
+/// Runs once, before the first row: allocate the counter at zero.
+fn call_index_prerun(_args: PrerunArgs, out: PrerunResult<CallCounter>) {
+    out.set_state(CallCounter { n: 0 });
+}
+
+/// Runs once per row: bump the counter and return its new value.
+fn call_index(state: &mut CallCounter, _args: &[InValue]) -> VdfReturn {
+    state.n += 1;
+    VdfReturn::int(state.n)
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(call_index, "call_index", [] -> villagesql::Type::Int,
+            state: CallCounter, prerun: call_index_prerun),
+    ]
+}
+```
+
+Compile e instale a extensão conforme descrito em [Criando Extensões em Rust](/pt-BR/mysql-8.4/stable/rust-sdk), e então:
+
+```sql
+INSTALL EXTENSION vsql_call_index;
+CREATE TABLE t (id INT);
+INSERT INTO t VALUES (10), (20), (30);
+SELECT SUM(vsql_call_index.call_index()) AS total FROM t;
+-- → 6
+SELECT SUM(vsql_call_index.call_index()) AS total FROM t;
+-- → 6
+```
+
+A tabela tem três linhas, então `call_index()` é executada três vezes e retorna `1`, depois `2`, depois `3` — um valor por linha. `SUM` soma esses três valores, o que dá `6`.
+
+O segundo `SELECT` retorna o mesmo total do primeiro, não um maior: o contador é alocado para uma instrução e descartado quando ela termina.
 
 ## macro custom_type!
 

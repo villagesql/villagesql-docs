@@ -122,7 +122,7 @@ INSERT INTO my_table (id, value)
 VALUES (1, MYTYPE::from_string('(3.0,4.0)'));
 ```
 
-**何时需要显式转换。** VillageSQL 隐式地将字符串字面量转换为自定义类型，直接赋值到列中，因此
+**何时需要显式转换。** 在直接进行列赋值时，VillageSQL 会隐式将字符串字面量转换为自定义类型，因此
 `INSERT INTO t (val) VALUES ('(1.0,2.0)')` 可以在没有显式调用的情况下工作。但是，解析为 `STRING` 类型的表达式——`CASE` 表达式、`CONCAT` 等——不会隐式强制转换。使用 `TYPE::from_string` 包装它们：
 
 ```sql
@@ -137,11 +137,14 @@ SET val = MYTYPE::from_string(
 
 ## 示例：COMPLEX 类型
 
-这是一个完整的示例，实现了 COMPLEX 数字类型：
+这是一个完整的示例，实现了 COMPLEX 复数类型：
 
 ```cpp
-#include <cstdio>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <system_error>
 #include <villagesql/vsql.h>
 
 using namespace vsql;
@@ -150,11 +153,20 @@ using namespace vsql;
 void encode_complex(std::string_view from, CustomResult out) {
     auto buf = out.buffer();
     if (buf.size() < 16) return;
+    // strtod needs a null-terminated string; string_view is not one.
+    const std::string input(from);
+    const char *p = input.c_str();
     double real, imag;
-    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+    auto fail = [&] {
         out.warning("invalid complex format: expected (real,imag)");
-        return;
-    }
+    };
+    if (*p++ != '(') return fail();
+    char *endptr = nullptr;
+    real = strtod(p, &endptr);
+    if (endptr == p || *endptr != ',') return fail();
+    p = endptr + 1;
+    imag = strtod(p, &endptr);
+    if (endptr == p || *endptr != ')') return fail();
     memcpy(buf.data(), &real, 8);
     memcpy(buf.data() + 8, &imag, 8);
     out.set_length(16);
@@ -168,9 +180,19 @@ void decode_complex(CustomArg in, StringResult out) {
     memcpy(&real, data.data(), 8);
     memcpy(&imag, data.data() + 8, 8);
     auto buf = out.buffer();
-    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
-    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
-    out.set_length(static_cast<size_t>(len));
+    char *p = buf.data();
+    char *const end = p + buf.size();
+    if (p == end) return;
+    *p++ = '(';
+    auto re = std::to_chars(p, end, real);
+    if (re.ec != std::errc() || re.ptr == end) return;
+    p = re.ptr;
+    *p++ = ',';
+    auto im = std::to_chars(p, end, imag);
+    if (im.ec != std::errc() || im.ptr == end) return;
+    p = im.ptr;
+    *p++ = ')';
+    out.set_length(static_cast<size_t>(p - buf.data()));
 }
 
 // Compare for ORDER BY: real part first, then imaginary
@@ -190,6 +212,8 @@ int compare_complex(CustomArg a, CustomArg b) {
     return 0;
 }
 ```
+
+解码使用 `std::to_chars` 而不是 `snprintf`：诸如 `"%.6f"` 这样的固定精度格式会丢失 `double` 所需的数位，因此 `0.1234567891` 读回时变为 `0.123457`。编码会在调用 `strtod` 之前复制输入，因为 `std::string_view` 不带终止空字符。`std::from_chars` 的浮点重载可以避免该复制，但 libc++ 将它们标记为仅从 macOS 26 起可用，因此使用它们的扩展在为更早的目标平台构建时会失败。
 
 定义这些操作后，用户可以创建包含自定义类型的表：
 

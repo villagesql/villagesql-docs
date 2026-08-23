@@ -30,6 +30,12 @@ using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
 using TypeHashFunc = size_t (*)(vsql::CustomArg in);
 ```
 
+Omitir uma função de hash personalizada faz com que o hash recaia sobre os bytes
+brutos armazenados do tipo. Isso não é seguro para um tipo cuja função de encode
+possa produzir mais de uma representação binária de um mesmo valor lógico — o caso
+comum é um campo de ponto flutuante, em que `-0.0` e `+0.0` são iguais na comparação
+mas diferem bit a bit, de modo que `GROUP BY` e `COUNT(DISTINCT)` os tratariam como diferentes.
+
 Registre essas operações usando `vsql::make_type<kTypeName>()`. O nome do tipo
 é passado como um parâmetro de template que não é de tipo (NTTP) — um array
 `static constexpr const char[]`. O construtor gera automaticamente nomes de VDF
@@ -62,7 +68,7 @@ constexpr auto MYTYPE =
         .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
         .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
         .compare<&my_compare>()      // auto: "MYTYPE::compare"
-        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash" — required for types storing floating-point values
         .intrinsic_default_str("0")  // string-literal intrinsic default
         .build();
 
@@ -74,6 +80,24 @@ VEF_GENERATE_ENTRY_POINTS(
 `build()` falha em tempo de compilação se `from_string`, `to_string` ou `compare`
 estiver ausente. Cada método de template verifica a assinatura do pointer de função via
 `static_assert`.
+
+Um tipo personalizado pode declarar no máximo **65532 bytes** de armazenamento por valor. Uma
+coluna personalizada é sustentada por um campo `VARBINARY`, e o orçamento de 65535 bytes por
+linha do MySQL também paga pelos dois bytes de comprimento desse campo e pelo byte de nulo da
+linha; como a decisão de uma coluna ser nullable é tomada por coluna em `CREATE TABLE`, e
+nullable é o padrão, o limite precisa deixar espaço para o byte de nulo. Tanto
+`persisted_length` quanto `max_persisted_length` são verificados contra ele, e a
+verificação ocorre em `INSTALL EXTENSION` em vez de em `CREATE TABLE`, de modo que um tipo
+largo demais é rejeitado junto com a extensão inteira:
+
+```text
+ERROR HY000: Failed to install extension 'vsql_huge_fixed_test': type 'HUGE_FIELD' declares 70000 bytes of storage per value, which exceeds the maximum of 65532 bytes supported for custom-type columns today
+```
+
+Ficar abaixo do limite não garante que uma coluna caiba. Todas as demais colunas da
+tabela usam o mesmo orçamento de 65535 bytes por linha, que somente `CREATE TABLE` pode
+avaliar, portanto um tipo no limite ou perto dele ainda pode falhar lá com
+`ER_TOO_BIG_ROWSIZE`. Um `VARBINARY` simples da mesma largura se comporta da mesma forma.
 
 ## Padrão Intrínseco {#intrinsic-default}
 
@@ -99,6 +123,10 @@ Para tipos de comprimento fixo, a string padrão deve codificar para exatamente
 `persisted_length` bytes. Defina um padrão explícito para qualquer tipo em que
 a string vazia não seja uma entrada válida.
 </Note>
+
+Forneça o padrão intrínseco de uma de duas formas. As duas são mutuamente exclusivas:
+declarar tanto `.intrinsic_default_str()` quanto `.intrinsic_default_vdf()` é um
+erro de compilação.
 
 **Literal de string: `.intrinsic_default_str()`**
 
@@ -225,10 +253,27 @@ os parâmetros e, portanto, não pode consultar `resolve_params` para dimensiona
 Para um padrão intrínseco baseado em VDF, use `.intrinsic_default_vdf()` com o nome da VDF e
 registre a VDF separadamente via `make_intrinsic_default<&mytype_default>()`.
 
+`build()` exige `.resolve_params<>()` sempre que `.params<>()` ou
+`.int_to_params<>()` estiver registrado: `int_to_params` apenas reescreve a
+forma abreviada `MYTYPE(N)` em uma string de parâmetros, enquanto `resolve_params` é o
+portão que valida os parâmetros e resolve o tamanho de armazenamento. Omiti-lo é um
+erro de compilação.
+
 <Warning>
 `.max_persisted_length()` requer o VEF Protocol 3 ou superior. Um tipo que o utiliza
-não pode ser carregado por servidores anteriores ao Protocol 3.
+não pode ser carregado por servidores anteriores ao Protocol 3. Ele é válido apenas para
+tipos de comprimento variável ou parametrizados; um tipo de comprimento fixo não
+parametrizado que o define falha ao compilar.
 </Warning>
+
+Os tamanhos que `resolve_params` reporta também são validados no momento do `CREATE TABLE`,
+uma vez que os parâmetros de uma coluna sejam conhecidos. Para um tipo de comprimento fixo, o
+`persisted_length` resolvido não pode exceder o `max_persisted_length` declarado: uma
+parametrização cujo footprint calculado (por exemplo, um dimensionamento `dimension * 4`)
+ultrapasse esse limite é rejeitada com um erro de sintaxe. Independentemente do tipo de
+comprimento, `resolve_params` deve resolver um `max_decode_buffer_length` maior que
+zero, já que esse valor dimensiona o buffer de trabalho do decode; um resultado não positivo é
+rejeitado com a mesma classe de erro.
 
 ```cpp
 static constexpr const char kMyTypeName[] = "MYTYPE";
@@ -282,7 +327,13 @@ recebem `vsql::CustomArgWith<P>`, cujo acessador `params()` retorna
   sempre que `.resolve_params<>()` estiver registrado — sem chamada extra do construtor.
 
 Um tipo que registra apenas `.resolve_params<>()` aceita a forma de string e
-rejeita `MYTYPE(N)`. `SHOW CREATE TABLE` preserva qualquer forma que tenha sido escrita.
+rejeita `MYTYPE(N)`.
+
+`SHOW CREATE TABLE` não repete o que o autor escreveu. O servidor mantém o
+mapa de parâmetros resolvido e reconstrói uma forma de exibição a partir dele, preferindo
+`MYTYPE(N)` quando `int_to_params(N)` reproduz o mapa inteiro e recorrendo à
+forma canônica `MYTYPE('key=value,...')` com as chaves ordenadas. Uma coluna escrita como
+`MYTYPE('dimension=8')` portanto é lida de volta como `MYTYPE(8)`.
 
 ```sql
 CREATE TABLE t (v ext.MYTYPE(8));              -- integer form (.int_to_params)
@@ -344,7 +395,9 @@ leem a flag.
 
 Os tipos de comprimento variável também devem chamar `.max_persisted_length(N)`. `build()` falha
 em tempo de compilação se ele for omitido — o servidor precisa do limite superior para alocar
-um buffer para o campo de suporte.
+um buffer para o campo de suporte. Um tipo de comprimento variável não deve também chamar
+`.persisted_length()`: seu tamanho é decidido por valor, portanto `build()` rejeita a
+combinação em tempo de compilação.
 
 `.variable_length_type()` é monotônico: chamá-lo antes ou depois dos setters do Protocol 3
 (`max_persisted_length()`, `params()`, `int_to_params()`) não reduz

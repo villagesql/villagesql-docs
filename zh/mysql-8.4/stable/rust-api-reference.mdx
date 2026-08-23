@@ -5,10 +5,10 @@ description: "VillageSQL Rust SDK 的完整参考 — InValue、VdfReturn、exte
 ---
 
 <Warning>
-  Rust SDK 处于 alpha 阶段——各版本之间可能出现破坏性的 API 变更。支持纯函数扩展和自定义类型（encode、decode、compare、hash）。聚合、`prerun()`、`VarArgs`、系统变量和状态变量、keyring 访问以及列存储 ABI 目前仅在 C++ SDK 中提供——如果您需要其中任何一项，请使用 [C++ SDK](/zh/mysql-8.4/stable/create)。
+  Rust SDK 处于 alpha 阶段——各版本之间可能出现破坏性的 API 变更。支持纯函数扩展和自定义类型（encode、decode、compare、hash），同时也支持 `sys_var`、`status_var`、`thread_worker` 和 `keyring` 预览功能。聚合、`VarArgs` 以及列存储 ABI 目前仅在 C++ SDK 中提供——如果您需要其中任何一项，请使用 [C++ SDK](/zh/mysql-8.4/stable/create)。
 </Warning>
 
-本页是 `villagesql` crate API 的参考。有关入门教程，请参阅 [在 Rust 中构建扩展](/zh/mysql-8.4/stable/rust-sdk)。有关自定义类型，请参阅 [Rust 中的自定义类型](/zh/mysql-8.4/stable/rust-custom-types)。
+本页是 `villagesql` crate API 的参考。有关入门教程，请参阅 [使用 Rust 构建扩展](/zh/mysql-8.4/stable/rust-sdk)。有关自定义类型，请参阅 [Rust 中的自定义类型](/zh/mysql-8.4/stable/rust-custom-types)。
 
 ## InValue
 
@@ -32,6 +32,7 @@ pub enum InValue<'a> {
 | `Int(i64)` | 64 位有符号整数 | `INT` / `BIGINT` / `TINYINT` |
 | `Null` | — | SQL 中任何类型的 `NULL` |
 | `Custom(&[u8])` | 原始二进制字节 | 通过 `custom_type!` 注册的任何自定义类型 |
+| `CustomWithParams { bytes, params }` | 原始字节 + `TypeParams` | 通过 [`parameterized_type!`](/zh/mysql-8.4/stable/rust-custom-types#parameterized-types) 注册的参数化自定义类型 |
 
 始终显式匹配 `Null`。调用 `.unwrap()` 或仅模式匹配值变体是一种错误——SQL NULL 是一种正常的输入，而不是错误。
 
@@ -75,21 +76,28 @@ villagesql::extension! {
     ],
     types: [
         // One or more villagesql::custom_type!(...) declarations
+    ],
+    requires: [
+        // Zero or more &'static capability references, e.g. &KEYRING
     ]
 }
 ```
 
-两个部分都是可选的。纯函数扩展省略 `types:`；仅类型扩展省略 `funcs:`。一个空的 `extension!` 块（没有函数，也没有类型）是有效的，但会生成一个不执行任何操作的扩展。
+`types:` 和 `requires:` 各自都是可选的，但 `funcs:` 必须始终存在——对于仅类型扩展，请写 `funcs: []`。纯函数扩展省略 `types:`。一个带有 `funcs: []` 且没有类型的 `extension!` 块是有效的，但会生成一个不执行任何操作的扩展。
+
+`requires:` 声明扩展所使用的 [Rust 中的预览功能](/zh/mysql-8.4/stable/rust-preview-capabilities)，以对 `static` 功能对象的引用的形式给出。它必须放在最后，位于 `funcs:` 部分之后——如果扩展不注册任何函数，请包含 `funcs: []`。
 
 ## func! 宏
 
-`func!` 声明一个可从 SQL 调用的函数。有四种形式（不带可选参数、仅 `buffer_size`、仅 `deterministic`、两者都有）：
+`func!` 声明一个可从 SQL 调用的函数。有六种形式——四种不带每个语句状态的形式（不带可选参数、仅 `buffer_size`、仅 `deterministic`、两者都有），以及两种通过 `prerun` 函数附加每个语句状态的形式：
 
 ```rust
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, deterministic: true)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
 ```
 
 <Note>
@@ -98,7 +106,7 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size
 
 | 参数 | 描述 |
 |---|---|
-| `rust_fn` | 实现 VDF 的 Rust 函数。签名：`fn(&[InValue]) -> VdfReturn`。 |
+| `rust_fn` | 实现 VDF 的 Rust 函数。签名：`fn(&[InValue]) -> VdfReturn`，对于 `state:` / `prerun:` 形式则为 `fn(&mut StateType, &[InValue]) -> VdfReturn`。 |
 | `"sql_name"` | SQL 函数名，作为一个字符串字面量。这是用户从 SQL 中调用的名称。 |
 | `[param_types]` | 以逗号分隔的 `villagesql::Type::*` 或 `villagesql::custom!("name")` 值列表。对于零参数函数，使用 `[]`。 |
 | `return_type` | `villagesql::Type::*` 或 `villagesql::custom!("name")`。 |
@@ -112,6 +120,73 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size
 | `villagesql::Type::String` | `STRING` |
 | `villagesql::Type::Real` | `REAL` |
 | `villagesql::Type::Int` | `INT` |
+
+### 每个语句的状态 {#per-statement-state}
+
+有些函数需要跨单个语句的每一行都存在的状态——调用计数器、累加器。使用 `state:` 声明状态类型，使用 `prerun:` 声明一个设置函数。prerun 函数在第一行之前运行一次；随后行函数对每一行运行一次，并对该状态拥有 `&mut` 访问权限。
+
+prerun 函数的签名是 `fn(PrerunArgs, PrerunResult<T>)`，它所供给状态的行函数将状态作为第一个参数：`fn(state: &mut T, args: &[InValue]) -> VdfReturn`。`T` 是由 `state:` 指定的类型，编译器会检查 prerun 与行函数在该类型上是否一致。
+
+| `PrerunResult<T>` 方法 | 效果 |
+|---|---|
+| `set_state(self, state: T)` | 分配每个语句的状态并将其交给服务器。它消耗 `self` 而不是借用它，因此编译器会拒绝第二次调用。 |
+| `request_buffer_size(&mut self, n: usize)` | 向服务器请求特定的结果缓冲区大小。 |
+| `error(self, msg: &str)` | 以一条消息使整个语句失败。 |
+
+`PrerunArgs::len()` 是每一行将接收的参数数量，当函数调用时不带任何参数时，`PrerunArgs::is_empty()` 为真。
+
+您不能自行释放该状态：`func!` 会生成在语句结束时丢弃它的 postrun。这与 C++ SDK 相反，在 C++ SDK 中，您的 postrun 必须调用 `delete_state<T>()`——请参阅[每个语句的状态](/zh/mysql-8.4/stable/development#per-statement-state-prerun-and-postrun)。
+
+<Note>
+  `state` 和 `prerun` 参数尚未包含在已发布的版本中。当前的
+  [crates.io](https://crates.io/crates/villagesql) 发布版本（`0.0.1`）
+  尚未公开它们。
+</Note>
+
+一个完整的扩展示例，其函数返回它在语句内自身的调用序号：
+
+```rust
+use villagesql::{InValue, PrerunArgs, PrerunResult, VdfReturn};
+
+/// Per-statement state: how many times the row function has been called.
+struct CallCounter {
+    n: i64,
+}
+
+/// Runs once, before the first row: allocate the counter at zero.
+fn call_index_prerun(_args: PrerunArgs, out: PrerunResult<CallCounter>) {
+    out.set_state(CallCounter { n: 0 });
+}
+
+/// Runs once per row: bump the counter and return its new value.
+fn call_index(state: &mut CallCounter, _args: &[InValue]) -> VdfReturn {
+    state.n += 1;
+    VdfReturn::int(state.n)
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(call_index, "call_index", [] -> villagesql::Type::Int,
+            state: CallCounter, prerun: call_index_prerun),
+    ]
+}
+```
+
+按照[使用 Rust 构建扩展](/zh/mysql-8.4/stable/rust-sdk)中的说明构建并安装它，然后：
+
+```sql
+INSTALL EXTENSION vsql_call_index;
+CREATE TABLE t (id INT);
+INSERT INTO t VALUES (10), (20), (30);
+SELECT SUM(vsql_call_index.call_index()) AS total FROM t;
+-- → 6
+SELECT SUM(vsql_call_index.call_index()) AS total FROM t;
+-- → 6
+```
+
+该表有三行，因此 `call_index()` 运行三次，依次返回 `1`、`2`、`3`——每行一个值。`SUM` 将这三个值相加，得到 `6`。
+
+第二个 `SELECT` 返回与第一个相同的总和，而不是更大的值：该计数器为一个语句分配，并在该语句结束时被丢弃。
 
 ## custom_type! 宏
 

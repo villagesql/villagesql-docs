@@ -7,13 +7,14 @@ description: "VillageSQL Rust SDK에서 새로운 컬럼 타입을 정의합니�
 <Warning>
   Rust SDK는 알파 단계입니다 — 릴리스 간에 호환성이 깨지는 API
   변경이 있을 수 있습니다. 함수 전용 확장과 사용자 정의
-  타입(인코딩, 디코딩, 비교, 해시)이 지원됩니다. 집계, `prerun()`,
-  `VarArgs`, 시스템 및 상태 변수, 키링 접근, 그리고 컬럼 저장소 ABI는
+  타입(인코딩, 디코딩, 비교, 해시)이 지원되며, `sys_var`, `status_var`,
+  `thread_worker`, `keyring` 미리보기 기능도 지원됩니다. 집계,
+  `VarArgs`, 그리고 컬럼 저장소 ABI는
   현재 C++ 전용입니다 — 이 중 하나라도 필요하다면
   [C++ SDK](/ko/mysql-8.4/stable/create)를 사용하세요.
 </Warning>
 
-사용자 정의 타입을 통해 `RATIONAL`, `VECTOR`, 또는 `INET`과 같은 새로운 컬럼 타입을 정의할 수 있습니다. 이러한 타입은 `ORDER BY`, 인덱스, 및 집계 함수와 함께 작동합니다. Rust SDK는 `custom_type!` 매크로를 통해 이를 지원합니다.
+사용자 정의 타입을 통해 `RATIONAL`, `VECTOR`, 또는 `INET`과 같은 새로운 컬럼 타입을 정의할 수 있습니다. 이러한 타입은 `ORDER BY`, 인덱스, 및 집계 함수와 함께 작동합니다. Rust SDK는 `custom_type!` 매크로를 통해, 그리고 저장 크기가 컬럼 매개변수에 따라 달라지는 타입에 대해서는 `parameterized_type!`을 통해 이를 지원합니다([매개변수화된 타입](#parameterized-types) 참조).
 
 이 페이지는 이미 [Rust에서 확장 빌드](/ko/mysql-8.4/stable/rust-sdk)를 완료했음을 전제로 합니다. 설정(Cargo.toml, manifest.json, cargo-vsql)은 동일합니다.
 
@@ -204,6 +205,126 @@ SELECT rational_to_real('1/3');
 
 `rational_to_real(r RATIONAL) -> REAL`은 분자를 분모로 나누어 `RATIONAL` 값을 64비트 부동소수점 근사치로 변환합니다. 표시나 비교를 위해 근사 소수를 필요로 하지만 열에 손실형 표현을 저장하고 싶지 않을 때 유용합니다.
 
+## 매개변수화된 타입 {#parameterized-types}
+
+매개변수화된 타입은 저장 크기를 알기 위해 `CREATE TABLE` 시점에 읽는
+값이 필요합니다 — `VECTOR(3)`의 `3` 같은 값입니다. `custom_type!`은
+이를 표현할 수 없습니다: 그 `persisted_length`는 모든 컬럼에 대해
+하나의 고정 상수입니다. `parameterized_type!`은 매개변수화된 대응물로,
+저장 길이가 고정되는 대신 `int_to_params`와 `resolve_params`를 통해
+선언된 매개변수로부터 컬럼마다 계산됩니다.
+
+```rust
+villagesql::parameterized_type!(
+    type_name: "type_name_in_sql",
+    max_persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: your_encode_fn,
+    decode: your_decode_fn,
+    compare: your_compare_fn,
+    int_to_params: your_int_to_params_fn,
+    resolve_params: your_resolve_params_fn,
+    params_type: YourParamsType,
+    params_parse: your_params_parse_fn,
+    params_to_strings: your_params_to_strings_fn,
+    hash: your_hash_fn,
+    default: "a_valid_string_literal",
+)
+```
+
+| 필드 | 유형 | 설명 |
+|---|---|---|
+| `type_name` | 문자열 리터럴 | SQL 타입 이름. SQL에서는 대소문자 구분 없음. |
+| `max_persisted_length` | `i64` | 모든 유효한 매개변수화에 걸친 디스크 상 바이트 길이의 상한. |
+| `max_decode_buffer_length` | `usize` | 디코딩된 문자열 표현의 최대 바이트 길이. |
+| `encode` | fn | INSERT 시에 `&str`와 `&mut MaybeParams<P>`를 이진 바이트로 변환합니다. |
+| `decode` | fn | 이진 바이트와 `&P`를 표시용 `String`으로 다시 변환합니다. |
+| `compare` | fn | `&P`가 주어졌을 때 `ORDER BY`, `MIN`, `MAX`에 대한 `Ordering`을 반환합니다. |
+| `int_to_params` | fn | `TYPE(N)` 정수 구문을 정규 매개변수 문자열로 변환합니다. |
+| `resolve_params` | fn | 파싱된 `Params`를 검증하고 `Resolved`(저장 크기, 선택적으로 다시 작성된 매개변수)를 반환합니다. |
+| `params_type` | 타입 | 파싱된 매개변수 구조체입니다. 예: `PadintParams`. |
+| `params_parse` | fn | `Params`를 `params_type`으로 파싱합니다. 고유한 매개변수 조합마다 최대 한 번 실행됩니다 — SDK가 결과를 캐시합니다. |
+| `params_to_strings` | fn | `params_parse`의 역방향입니다: `params_type`을 정규 `(key, value)` 쌍으로 다시 씁니다. |
+| `hash` | fn | `&P`가 주어졌을 때 `usize` 해시를 반환합니다. 선택적이지만 인덱스가 있는 컬럼에는 권장됩니다. |
+| `default` | 문자열 리터럴 | 서버가 타입 초기화 시 인코딩할 수 있는 유효한 문자열. 선택적이지만 권장됩니다. |
+
+`type_name`, `max_persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`, `int_to_params`, `resolve_params`, `params_type`, `params_parse`, `params_to_strings`는 필수입니다. `hash`와 `default`는 선택적입니다. `intrinsic_default_fn`(기본값이 매개변수에 따라 달라질 때 `&P`로부터 기본값을 계산하는 함수) 또한 선택적이며 `default`와 상호 배타적입니다.
+
+다음은 `padint`입니다 — 고정된 8바이트에 저장되는 `i64`이며, `width` 매개변수가 0으로 채워지는 표시 폭을 제어합니다:
+
+```rust
+pub struct PadintParams {
+    pub width: u32,
+}
+
+pub fn padint_parse(params: Params) -> PadintParams {
+    let width = params.get("width").and_then(|s| s.parse().ok()).unwrap_or(1);
+    PadintParams { width }
+}
+
+pub fn padint_to_strings(p: &PadintParams) -> Vec<(String, String)> {
+    vec![("width".to_string(), p.width.to_string())]
+}
+
+pub fn padint_int_to_params(n: i64) -> Result<String, String> {
+    if n < 1 {
+        return Err(format!("padint: width must be >= 1, got {n}"));
+    }
+    Ok(format!("width={n}"))
+}
+
+pub fn padint_resolve_params(params: Params) -> Result<Resolved, String> {
+    let width: i64 = params
+        .get("width")
+        .ok_or_else(|| "padint: missing 'width' param".to_string())?
+        .parse()
+        .map_err(|e| format!("padint: bad width: {e}"))?;
+    // Fixed 8-byte i64 storage; the decode buffer must fit the widest
+    // rendering, which is the larger of an i64's digits and the padded width.
+    Ok(Resolved::new(8, width.max(20)))
+}
+
+pub fn padint_encode(s: &str, params: &mut MaybeParams<PadintParams>) -> Result<Vec<u8>, String> {
+    let n: i64 = s.trim().parse().map_err(|e| format!("padint: {e}"))?;
+    if !params.is_known() {
+        // Bare constant with no column to anchor it: infer width from digits.
+        let digits = s.trim().trim_start_matches('-').len().max(1);
+        params.set(PadintParams { width: u32::try_from(digits).unwrap_or(u32::MAX) });
+    }
+    Ok(n.to_le_bytes().to_vec())
+}
+
+pub fn padint_decode(b: &[u8], p: &PadintParams) -> Result<String, String> {
+    let n = i64::from_le_bytes(b[..8].try_into().unwrap());
+    Ok(format!("{n:0width$}", width = p.width as usize))
+}
+
+pub fn padint_compare(a: &[u8], b: &[u8], _p: &PadintParams) -> std::cmp::Ordering {
+    i64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(b[..8].try_into().unwrap()))
+}
+
+villagesql::parameterized_type!(
+    type_name: "padint",
+    max_persisted_length: 8,
+    max_decode_buffer_length: 32,
+    encode: padint_encode,
+    decode: padint_decode,
+    compare: padint_compare,
+    int_to_params: padint_int_to_params,
+    resolve_params: padint_resolve_params,
+    params_type: PadintParams,
+    params_parse: padint_parse,
+    params_to_strings: padint_to_strings,
+    default: "0",
+)
+```
+
+매개변수화된 사용자 정의 타입 인수를 받는 함수는 일반
+`InValue::Custom(bytes)`가 아니라
+`InValue::CustomWithParams { bytes, params }`를 봅니다 — `params`는
+컬럼에 선언된 `key=value` 쌍에 대한 읽기 전용, 무복사 뷰인
+[`TypeParams`]입니다.
+
 ## extension! 블록과 타입
 
 함수와 타입을 모두 등록할 때, `extension!` 블록은 두 개의 섹션을 가집니다:
@@ -219,7 +340,7 @@ villagesql::extension! {
 }
 ```
 
-비어 있는 경우 해당 섹션을 생략할 수 있습니다. 타입만 포함하는 확장은 `funcs:`를 생략하고, 함수만 포함하는 확장은 `types:`를 생략합니다.
+함수만 포함하는 확장은 `types:`를 생략합니다. 타입만 포함하는 확장은 `funcs: []`를 유지하며 그 밖의 것은 생략하지 않습니다.
 
 ## 다음 단계
 

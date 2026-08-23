@@ -30,6 +30,8 @@ using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
 using TypeHashFunc = size_t (*)(vsql::CustomArg in);
 ```
 
+省略自定义哈希函数会回退为对该类型存储的原始字节进行哈希。对于编码函数可能为同一个逻辑上相等的值生成多种二进制表示的类型，这样做并不安全——常见情形是浮点字段，其中 `-0.0` 和 `+0.0` 比较相等，但逐位不同，因此 `GROUP BY` 和 `COUNT(DISTINCT)` 会把它们视为不同的值。
+
 使用 `vsql::make_type<kTypeName>()` 注册这些操作。类型名称作为非类型模板参数 (NTTP) 传递——一个 `static constexpr const char[]`
 数组。构建器会根据这个 NTTP 以 `TYPE::method` 格式（例如 `"MYTYPE::from_string"`）自动生成 VDF 名称，因此无需手动匹配字符串。将构建好的类型对象传递给扩展构建器上的 `.type()`；类型操作不需要单独的 `.func()` 调用。
 
@@ -57,7 +59,7 @@ constexpr auto MYTYPE =
         .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
         .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
         .compare<&my_compare>()      // auto: "MYTYPE::compare"
-        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash" — required for types storing floating-point values
         .intrinsic_default_str("0")  // string-literal intrinsic default
         .build();
 
@@ -67,6 +69,21 @@ VEF_GENERATE_ENTRY_POINTS(
 ```
 
 如果缺少 `from_string`、`to_string` 或 `compare`，`build()` 将在编译时失败。每个模板方法都通过 `static_assert` 检查函数指针签名。
+
+一个自定义类型每个值最多可以声明 **65532 字节** 的存储空间。自定义列由一个
+`VARBINARY` 字段支撑，而 MySQL 每行 65535 字节的预算还要为该字段的两个长度字节
+以及该行的空值字节买单；因为列是否可为空是在 `CREATE TABLE` 时按列决定的，
+而且默认可为空，所以该上限必须为空值字节留出空间。`persisted_length` 和
+`max_persisted_length` 都会依据它进行检查，并且该检查在 `INSTALL EXTENSION` 时
+运行，而不是在 `CREATE TABLE` 时运行，因此过宽的类型会连同整个扩展一起被拒绝：
+
+```text
+ERROR HY000: Failed to install extension 'vsql_huge_fixed_test': type 'HUGE_FIELD' declares 70000 bytes of storage per value, which exceeds the maximum of 65532 bytes supported for custom-type columns today
+```
+
+不超过该上限并不能保证列一定放得下。表中的其他每一列都要占用同一份 65535 字节的
+行预算，而只有 `CREATE TABLE` 才能衡量它，因此达到或接近上限的类型仍可能在那里
+以 `ER_TOO_BIG_ROWSIZE` 失败。同等宽度的普通 `VARBINARY` 的行为也是如此。
 
 ## 内建默认值 {#intrinsic-default}
 
@@ -82,6 +99,9 @@ default input '' to N bytes, expected persisted_length=M
 
 对于固定长度类型，默认字符串必须编码为恰好 `persisted_length` 个字节。对于任何空字符串不是有效输入的类型，请设置一个显式默认值。
 </Note>
+
+可以用两种方式之一提供内建默认值。两者互斥：同时声明
+`.intrinsic_default_str()` 和 `.intrinsic_default_vdf()` 是编译时错误。
 
 **字符串字面量：`.intrinsic_default_str()`**
 
@@ -186,9 +206,20 @@ bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
 在类型构建器上注册 `.params<>()`。使用 `.int_to_params<&mytype_int_to_params_fn>()`
 处理 `MYTYPE(N)` 整数语法，使用 `.resolve_params<&mytype_resolve_params_fn>()` 来验证参数并计算存储大小。调用 `.max_persisted_length(N)` 并传入所有有效参数化下持久化字节大小的上界；服务器仅在类型参数推断路径上使用它，此时它尚未推断出参数，因此无法查询 `resolve_params` 来确定编码缓冲区的大小。对于基于 VDF 的内建默认值，请使用带有 VDF 名称的 `.intrinsic_default_vdf()`，并通过 `make_intrinsic_default<&mytype_default>()` 单独注册该 VDF。
 
+只要注册了 `.params<>()` 或 `.int_to_params<>()`，`build()` 就要求
+`.resolve_params<>()`：`int_to_params` 只是把 `MYTYPE(N)` 简写改写为参数字符串，
+而 `resolve_params` 才是验证参数并解析存储大小的关口。省略它是编译时错误。
+
 <Warning>
-`.max_persisted_length()` 需要 VEF 协议 3 或更高版本。使用它的类型无法被协议 3 之前的服务器加载。
+`.max_persisted_length()` 需要 VEF 协议 3 或更高版本。使用它的类型无法被协议 3 之前的服务器加载。它仅对可变长度类型或参数化类型有效；设置了它的固定长度非参数化类型将无法编译。
 </Warning>
+
+`resolve_params` 报告的大小还会在 `CREATE TABLE` 时进行验证，此时列的参数已经确定。
+对于固定长度类型，解析出的 `persisted_length` 不得超过声明的
+`max_persisted_length`：如果某个参数化计算出的占用空间（例如按 `dimension * 4`
+计算大小）超出该上界，它会被拒绝并返回一个语法错误。无论长度种类如何，
+`resolve_params` 都必须解析出一个大于零的 `max_decode_buffer_length`，
+因为该值决定解码暂存缓冲区的大小；非正的结果会被以同一类错误拒绝。
 
 ```cpp
 static constexpr const char kMyTypeName[] = "MYTYPE";
@@ -235,7 +266,12 @@ VEF_GENERATE_ENTRY_POINTS(
 - **整数**——`MYTYPE(N)`。服务器将 `N` 通过 `int_to_params` 路由以构建参数映射。需要 `.int_to_params<>()`。
 - **字符串**——`MYTYPE('key=value,...')`。服务器规范化该字符串并直接调用 `resolve_params`；不涉及 `int_to_params`。只要注册了 `.resolve_params<>()` 即可使用——无需额外的构建器调用。
 
-仅注册了 `.resolve_params<>()` 的类型接受字符串形式并拒绝 `MYTYPE(N)`。`SHOW CREATE TABLE` 会保留写入时所用的形式。
+仅注册了 `.resolve_params<>()` 的类型接受字符串形式并拒绝 `MYTYPE(N)`。
+
+`SHOW CREATE TABLE` 不会重复作者写下的内容。服务器保留解析后的参数映射，并据此
+重建一种显示形式：当 `int_to_params(N)` 能够重现整个映射时，优先使用
+`MYTYPE(N)`，否则回退到键已排序的规范形式 `MYTYPE('key=value,...')`。因此，
+写作 `MYTYPE('dimension=8')` 的列读回时显示为 `MYTYPE(8)`。
 
 ```sql
 CREATE TABLE t (v ext.MYTYPE(8));              -- integer form (.int_to_params)
@@ -279,7 +315,8 @@ SHOW CREATE TABLE bits;   -- b persists as BITFIELD('max_number_of_bits=4096')
 `.variable_length_type()` 将类型所需的协议提升至 VEF 协议 4。服务器仅在协议 4 或更高版本读取 `variable_length` 标志。请针对选择加入的开发 ABI 标头进行构建 (`-DVSQL_USE_DEV_ABI=ON`)；旧版服务器不会读取该标志。
 </Warning>
 
-可变长度类型还必须调用 `.max_persisted_length(N)`。如果省略它，`build()` 将在编译时失败——服务器需要这个上界来为底层字段分配缓冲区。
+可变长度类型还必须调用 `.max_persisted_length(N)`。如果省略它，`build()` 将在编译时失败——服务器需要这个上界来为底层字段分配缓冲区。可变长度类型不得同时调用
+`.persisted_length()`：它的大小是按每个值决定的，因此 `build()` 会在编译时拒绝这种组合。
 
 `.variable_length_type()` 是单调的：在协议 3 的设置器（`max_persisted_length()`、`params()`、`int_to_params()`）之前或之后调用它，都不会将协议要求降回到协议 4 以下。
 

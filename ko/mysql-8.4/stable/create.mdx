@@ -67,13 +67,13 @@ SELECT vsql_complex.complex_abs(impedance) FROM signals;
 
 ## 사전 요구 사항
 
-시작하기 전에 VillageSQL을 소스에서 빌드해야 합니다. 확장은 서버의 SDK 헤더와 빌드 트리에 연결됩니다. 먼저 [소스에서 빌드하기](/ko/mysql-8.4/stable/source) 가이드를 따르세요.
+시작하기 전에 VillageSQL 확장 SDK가 필요하며, CMake가 SDK를 찾도록 하는 방법은 두 가지입니다. VillageSQL 빌드 트리가 있다면 `-DVillageSQL_BUILD_DIR=/path/to/villagesql/build`를 전달하세요. [소스에서 빌드](/ko/mysql-8.4/stable/source) 가이드가 그 트리를 생성합니다. 압축을 푼 SDK 디렉터리(`include/villagesql/vsql.h`를 포함하는 디렉터리)가 있다면 그것만으로 충분합니다. `-DVillageSQL_SDK_DIR=/path/to/sdk`를 전달하세요. 서버를 빌드하지 않고 SDK를 얻는 방법은 [확장 템플릿 README](https://github.com/villagesql/vsql-extension-template)에서 다룹니다. 빌드 트리 방식만 VEB 설치 디렉터리를 설정하므로, SDK만 사용하는 경우에는 빌드된 VEB 파일을 `SHOW VARIABLES LIKE 'veb_dir'`가 보고하는 디렉터리로 직접 복사하세요.
 
 다음도 필요합니다:
 
 - **Git** - 복제 및 버전 관리
 - **CMake** 3.18 이상 - 빌드 시스템
-- **C++ 컴파일러** - GCC 8+, Clang 8+, 또는 C++17 지원이 있는 MSVC 2019+
+- **C++ 컴파일러** - C++17을 지원해야 합니다. 템플릿은 `CMAKE_CXX_STANDARD 17`을 설정하며, SDK의 CMake 패키지는 그보다 낮은 표준을 거부합니다
 - **기본 C++ 지식** - C++ 및 함수 포인터 이해
 
 <Tip>
@@ -241,7 +241,7 @@ void complex_conjugate_impl(CustomArg in, CustomResult out) {
 
 기본적으로 VDF는 비결정적으로 등록됩니다. 비결정적 함수는 생성된 열, CHECK 제약 조건, 표현식 기본값(`DEFAULT (expr)` 열) 세 가지 SQL 컨텍스트에서 차단됩니다. 비결정적 VDF를 이러한 기능과 함께 사용하면 오류가 반환됩니다. 함수가 동일한 입력에 항상 동일한 출력을 생성하고 부작용이 없으면 빌더 체인에 `.deterministic()`을 추가하여 결정적이라고 선언할 수 있습니다.
 
-최적화기는 이 정보를 사용하여 문장당 한 번만 함수를 평가하고 행 간에 결과를 재사용할 수 있습니다. 비결정적 함수를 잘못 결정적으로 표시하면 서버가 실제로 다른 출력을 생성해야 하는 입력에 대해 동일한 결과를 반환할 수 있습니다. 외부 상태, 난수, 시간에 의존하지 않는 경우에만 `.deterministic()`을 추가하세요.
+최적화기는 이 정보를 사용하여 행마다 호출하는 대신 문장당 한 번만 함수를 평가하고 행 간에 결과를 재사용할 수 있습니다. 비결정적 함수를 잘못 결정적으로 표시하면 서버가 실제로 다른 출력을 생성해야 하는 입력에 대해 동일한 결과를 반환할 수 있습니다. 외부 상태, 난수, 시간에 의존하지 않는 경우에만 `.deterministic()`을 추가하세요.
 
 **빌더 서명:** `.deterministic(bool d = true)` — 인수 없이 사용하면 기본값이 `true`입니다.
 
@@ -270,7 +270,7 @@ CREATE TABLE t (
 
 ### 사용자 정의 버퍼 크기 {#custom-buffer-sizes}
 
-변수 길이 데이터를 반환하는 함수의 경우 특정 버퍼 크기 요청:
+가변 길이 데이터를 반환하는 함수의 경우 특정 버퍼 크기 요청:
 
 ```cpp
 make_func<&large_result_impl>("large_result")
@@ -280,7 +280,7 @@ make_func<&large_result_impl>("large_result")
   .build()
 ```
 
-`buffer()`와 `set_length()`로 값을 직접 빌드할 때 버퍼는 `buffer().size()` 바이트로 고정됩니다 — 그 이상으로 쓰면 메모리가 오버플로되므로 넘어 쓰지 않도록 방지하세요:
+`buffer()`와 `set_length()`로 값을 직접 빌드할 때 `buffer().size()`를 넘어서 쓰지 마세요 — 메모리가 오버플로됩니다. 하지만 값이 너무 크다고 해서 실패하지도 마세요. 쓰려고 했던 크기를 보고하고, 서버가 버퍼를 늘려 함수를 다시 호출하도록 하세요.
 
 ```cpp
 void large_result_impl(StringArg input, StringResult out) {
@@ -289,7 +289,10 @@ void large_result_impl(StringArg input, StringResult out) {
 
     auto buf = out.buffer();
     if (needed > buf.size()) {
-        out.error("Output exceeds buffer size");
+        // Too small this time. Report what is needed and return: the server
+        // grows the buffer to `needed` and re-invokes this function, and the
+        // second call takes the branch below.
+        out.set_length(needed);
         return;
     }
 
@@ -298,7 +301,11 @@ void large_result_impl(StringArg input, StringResult out) {
 }
 ```
 
-STRING 결과의 경우 `out.set(sv)`는 snprintf 스타일 오버플로 계약을 따릅니다. 즉, 버퍼에 들어가는 만큼의 바이트를 복사하고 `set_length`를 통해 값의 전체 크기를 보고합니다. 보고된 크기가 버퍼를 초과하면 서버는 결과 버퍼를 늘리고 함수를 다시 호출하므로, 요청된 버퍼보다 큰 STRING 값은 더 이상 잘리지 않습니다.
+STRING 결과의 경우 `out.set(sv)`는 snprintf 스타일 오버플로 계약을 따릅니다. 즉, `out.buffer()`에 들어가는 만큼의 바이트를 복사하되 값의 *전체* 크기를 보고합니다. 서버는 보고된 길이가 버퍼를 초과함을 감지하고 버퍼를 늘린 다음 함수를 두 번째로 호출하므로, `.buffer_size()`보다 큰 값도 잘리지 않고 전체가 반환됩니다. 보고된 길이가 필요한 버퍼 크기를 정확히 알려주기 때문에 재시도는 항상 한 번으로 충분합니다.
+
+버퍼 증가는 `max_allowed_packet`으로 제한됩니다. 그보다 큰 값은 잘리지 않고 `NULL`로 반환됩니다.
+
+`out.buffer()`에 직접 쓰고 `out.set_length()`를 호출하는 경우에도 동일한 계약이 적용됩니다. 들어간 바이트 수가 아니라 쓰려고 했던 전체 크기를 보고하세요. 잘린 길이를 보고하면 재시도가 무효화되고 나머지가 조용히 버려집니다.
 
 이 계약은 행 단위로 평가되는 시점에 적용됩니다. *구체화된* STRING 결과 — GROUP BY/DISTINCT 임시 테이블, `CREATE TABLE ... SELECT`, 또는 UNION 내의 결과 — 는 함수가 `.max_result_length(n)`을 선언하지 않는 한 여전히 인수 폭에서 잘립니다. `.max_result_length(n)`은 결과 열의 크기를 지정합니다(문자 단위, `VEF_MAX_RESULT_LENGTH`인 16 MiB로 제한):
 
@@ -466,7 +473,7 @@ sudo cp my-awesome-extension.veb /path/to/veb_dir/
 
 확장이 올바르게 작동하는지 검증하기 위해 테스트 파일 추가:
 
-1. `mysql-test/t/`에 테스트 파일 생성:
+1. `mysql-test/t/`에 **테스트 파일 생성**:
    ```sql
    -- mysql-test/t/my_basic.test
    SELECT my_reverse('abc');
@@ -474,13 +481,13 @@ sudo cp my-awesome-extension.veb /path/to/veb_dir/
    SELECT my_reverse(NULL);
    ```
 
-2. 예상 결과 생성:
+2. **예상 결과 생성**:
    ```bash
    cd /path/to/villagesql/build/mysql-test
    perl mysql-test-run.pl --suite=/path/to/your/extension/mysql-test --record
    ```
 
-3. 테스트 실행:
+3. **테스트 실행**:
    ```bash
    perl mysql-test-run.pl --suite=/path/to/your/extension/mysql-test
    ```

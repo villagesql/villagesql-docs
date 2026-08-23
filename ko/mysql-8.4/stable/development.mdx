@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "C++ 개발"
-description: "C++ 확장을 위한 VDF 작성 심층 참조 — 인자 및 결과 타입, 집계, prerun/postrun, 가변 인자, 등록."
+description: "C++ 확장을 위한 VDF 작성 심층 참조 — 인자 및 결과 타입, 예외 안전성, 집계, prerun/postrun, 가변 인자, 등록."
 ---
 
 이 가이드는 C++ VDF 구현을 작성하기 위한 심층 참조입니다. 종단간 빌드 단계를 다루는 [C++로 확장 만들기](/ko/mysql-8.4/stable/create), 그리고 테스트-반복 루프를 다루는 [C++ 테스트](/ko/mysql-8.4/stable/testing)의 동반 자료입니다.
@@ -18,6 +18,42 @@ VEF 프로토콜 3은 v0.0.4부터 안정적입니다. 프로토콜 4는 개발 
 ```cpp
 #include <villagesql/vsql.h>
 ```
+
+## 예외 안전성 {#exception-safety}
+
+예외를 가두는 것은 확장의 책임입니다. SDK는 사용자의 구현을 `try`/`catch`로
+감싸지 않으며 서버도 마찬가지이므로, 엔트리 포인트를 벗어난 예외는 그 위
+어디에도 핸들러가 없는 상태로 C ABI 경계를 넘어 스택을 풀고 서버 프로세스가
+종료됩니다. 일반적인 SQL 입력이 이 상황에 도달합니다: `std::stoi()`는 숫자가
+아닌 문자열에서 예외를 던지고, `nlohmann::json::dump()`는 유효한 UTF-8이 아닌
+텍스트에서 예외를 던집니다.
+
+등록하는 모든 엔트리 포인트의 본문을 감싸세요: VDF, 집계 결과 함수, 그리고
+사용자 정의 타입의 `from_string`/`to_string` 연산.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <string>
+
+using namespace vsql;
+
+void to_int_impl(StringArg in, IntResult out) {
+  if (in.is_null()) { out.set_null(); return; }
+  try {
+    out.set(std::stoi(std::string(in.value())));  // throws on bad input
+  } catch (const std::exception &e) {
+    out.warning(e.what());
+  } catch (...) {
+    out.warning("unexpected error");
+  }
+}
+```
+
+`const std::exception &`에 더해 `...`도 잡으세요: 의존성이 `std::exception`을
+상속하지 않는 타입을 던질 수 있으며, 그런 예외도 여전히 서버를 종료시킵니다.
+`warning()`과 `error()` 중 무엇을 사용할지는 다른 모든 실패와 동일한 기준으로
+선택합니다 — 문장이 계속 진행되어야 하는 잘못된 입력에는 `warning()`, 계속
+실행이 안전하지 않은 경우에는 `error()`입니다.
 
 ## 인자 및 결과 타입 {#argument-and-result-types}
 
@@ -150,8 +186,9 @@ void count_result(const CountState &s, IntResult out) { out.set(s); }
 
 `StringResult` 집계 VDF는 텍스트를 반환합니다: 결과는 `utf8mb4_bin` 문자
 집합 및 콜레이션을 보고하므로, 클라이언트는 이를 16진수가 아닌 문자로 표시합니다
-— 스칼라 VDF STRING 경로와 동일합니다. 또한 `.max_result_length(n)`을 동일한
-방식으로 존중하여, 구체화된 집계 결과(`GROUP BY`/`DISTINCT` 임시 테이블,
+— 스칼라 VDF STRING 경로와 동일합니다. 또한 `.max_result_length(n)`(선택적으로
+활성화하는 개발 ABI 헤더(`-DVSQL_USE_DEV_ABI=ON`)와 프로토콜 4가 필요합니다)을
+동일한 방식으로 존중하여, 구체화된 집계 결과(`GROUP BY`/`DISTINCT` 임시 테이블,
 `CREATE TABLE ... SELECT`, 또는 UNION)의 크기를 조정하여 인자 너비에서
 잘리지 않도록 합니다. 크기 조정 규칙 및 상한선은
 [사용자 정의 버퍼 크기](/ko/mysql-8.4/stable/create#custom-buffer-sizes)를
@@ -280,6 +317,75 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .prerun<&ba_concat_all_prerun>()
 //     .build()
 ```
+
+## 확장 로드 및 언로드 훅 {#extension-load-and-unload-hooks}
+
+확장은 때때로 호출마다가 아니라 로드마다 한 번씩 수행해야 하는 작업이 있습니다
+— CPU에 특화된 구현을 선택하거나, VDF가 이후에 읽을 조회 테이블을 구축하는
+작업입니다. 그 작업은 확장 빌더의 `.on_init<&Fn>()`으로 등록하고, 대응하는
+정리 작업은 `.on_deinit<&Fn>()`으로 등록합니다. 둘 다 `void()` 시그니처를 갖는
+함수를 받습니다.
+
+<Warning>
+`.on_init<&Fn>()` 및 `.on_deinit<&Fn>()`은 선택적으로 활성화하는 개발 ABI
+헤더(`-DVSQL_USE_DEV_ABI=ON`)에만 선언되어 있습니다. 기본 안정 ABI 빌드에는 두
+메서드가 모두 없으므로, 훅을 등록하면 컴파일에 실패합니다.
+</Warning>
+
+`on_init`은 확장이 로드될 때마다 실행됩니다: `INSTALL EXTENSION` 시점, 그리고
+서버가 확장을 검증하고 수락한 후 서버가 시작될 때마다 실행됩니다. 서버가
+거부한 확장에 대해서는 절대 실행되지 않습니다. `on_deinit`은 언로드 시점 —
+`UNINSTALL EXTENSION` 또는 서버 종료 시 — 에 실행됩니다.
+
+두 훅은 모두 **서버에 액세스할 수 없는** 상태로 확장 프로세스 내부에서
+실행됩니다: SQL을 실행하거나, 시스템 변수를 읽거나, 서버 상태에 도달할 수
+없습니다. 그렇기 때문에 서버와 통신해야 하는 설정 작업에는 적합하지 않습니다 —
+그런 작업에는 미리보기 기능의 populate 단계를 사용하세요.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cmath>
+using namespace vsql;
+
+static float *g_sqrt_table = nullptr;
+
+void build_table() {
+  g_sqrt_table = new float[256];
+  for (int i = 0; i < 256; i++) g_sqrt_table[i] = std::sqrt(float(i));
+}
+
+void free_table() {
+  delete[] g_sqrt_table;
+  g_sqrt_table = nullptr;
+}
+
+void fast_sqrt(IntArg n, RealResult out) {
+  if (n.is_null() || n.value() < 0 || n.value() > 255) {
+    out.set_null();
+    return;
+  }
+  out.set(g_sqrt_table[n.value()]);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .on_init<&build_table>()
+        .on_deinit<&free_table>()
+        .func(make_func<&fast_sqrt>("fast_sqrt")
+                  .returns(REAL)
+                  .param(INT)
+                  .build()))
+```
+
+`INSTALL EXTENSION my_extension` 후에 `SELECT fast_sqrt(16)`은 `4`를
+반환합니다 — `build_table`이 이미 실행된 경우에만 도달할 수 있는 결과입니다.
+
+<Note>
+`on_deinit`은 `VEF_GENERATE_ENTRY_POINTS`가 생성하는 `vef_unregister` 엔트리
+포인트에서 호출됩니다. `VEF_GENERATE_REGISTRATION`은 그 엔트리 포인트를
+정의하지 않으므로, 이를 사용하는 확장은 직접 작성한 `vef_unregister`에서 정리
+작업을 호출해야 합니다.
+</Note>
 
 ## VEF_GENERATE_REGISTRATION
 

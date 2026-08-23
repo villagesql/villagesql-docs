@@ -5,7 +5,7 @@ description: "了解如何使用扩展模板和 VEF，用 C++ 创建自定义 Vi
 ---
 
 <Warning>
-VEF Protocol 3 is stable as of v0.0.4. Protocol 4 is under development and is available only via opt-in dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`). Extensions built against the old Protocol 2 are rejected by the server and must be rebuilt.
+VEF 协议 3 自 v0.0.4 版本起已稳定。协议 4 正在开发中，并且仅通过选择加入的开发 ABI 标头提供 (`-DVSQL_USE_DEV_ABI=ON`)。使用旧协议 2 构建的扩展会被服务器拒绝，必须重新构建。
 </Warning>
 
 ## 概述
@@ -67,13 +67,13 @@ SELECT vsql_complex.complex_abs(impedance) FROM signals;
 
 ## 前置条件
 
-在开始之前，请先从源代码构建 VillageSQL——扩展需要链接服务器 SDK 的头文件和构建树。请先遵循 [从源代码构建](/zh/mysql-8.4/stable/source) 指南。
+在开始之前，您需要 VillageSQL Extension SDK，有两种方式可以让 CMake 指向它。如果您有 VillageSQL 构建树，请传入 `-DVillageSQL_BUILD_DIR=/path/to/villagesql/build`——[从源代码构建](/zh/mysql-8.4/stable/source) 指南会生成该构建树。如果您有一个已解包的 SDK 目录——其中包含 `include/villagesql/vsql.h`——那么仅此就已足够：传入 `-DVillageSQL_SDK_DIR=/path/to/sdk`。[扩展模板 README](https://github.com/villagesql/vsql-extension-template) 介绍了如何在不构建服务器的情况下获取 SDK。只有构建树方式会设置 VEB 安装目录，因此在仅使用 SDK 的方式下，请自行将构建好的 VEB 文件复制到 `SHOW VARIABLES LIKE 'veb_dir'` 所报告的目录中。
 
 您还需要：
 
 - **Git** - 用于克隆和版本控制
 - **CMake** 3.18 或更高版本 - 构建系统
-- **C++ 编译器** - GCC 8+、Clang 8+ 或支持 C++17 的 MSVC 2019+
+- **C++ 编译器** - 需支持 C++17：模板设置了 `CMAKE_CXX_STANDARD 17`，并且 SDK 的 CMake 包会拒绝更低的标准
 - **基础 C++ 知识** - 理解 C++ 和函数指针
 
 <Tip>
@@ -280,7 +280,7 @@ make_func<&large_result_impl>("large_result")
   .build()
 ```
 
-当您使用 `buffer()` 和 `set_length()` 自行构建值时，缓冲区大小固定为 `buffer().size()` 字节——写入超出部分会导致缓冲区溢出，因此请对此加以防范：
+当您使用 `buffer()` 和 `set_length()` 自行构建值时，切勿写入超出 `buffer().size()` 的部分——那会导致内存溢出。但也不要因为值过大而失败：请报告您本应写入的大小，并让服务器扩大缓冲区并再次调用您的函数。
 
 ```cpp
 void large_result_impl(StringArg input, StringResult out) {
@@ -289,7 +289,10 @@ void large_result_impl(StringArg input, StringResult out) {
 
     auto buf = out.buffer();
     if (needed > buf.size()) {
-        out.error("Output exceeds buffer size");
+        // Too small this time. Report what is needed and return: the server
+        // grows the buffer to `needed` and re-invokes this function, and the
+        // second call takes the branch below.
+        out.set_length(needed);
         return;
     }
 
@@ -298,7 +301,11 @@ void large_result_impl(StringArg input, StringResult out) {
 }
 ```
 
-对于 STRING 结果，`out.set(sv)` 遵循 snprintf 风格的溢出契约：它复制能容纳的尽可能多的字节，并通过 `set_length` 报告值的完整大小。当报告的大小超过缓冲区时，服务器会扩大结果缓冲区并重新调用该函数，因此大于所请求缓冲区的 STRING 值不再被截断。
+对于 STRING 结果，`out.set(sv)` 遵循 snprintf 风格的溢出契约：它复制能容纳的尽可能多的字节，但报告值的*完整*大小。服务器检测到所报告的长度超过缓冲区后，会扩大缓冲区并第二次调用该函数——因此大于 `.buffer_size()` 的值会被完整返回，而不是被截断。一次重试总是足够的，因为所报告的长度准确说明了缓冲区必须有多大。
+
+扩容受 `max_allowed_packet` 限制。大于该限制的值将返回 `NULL`，而不是被截断。
+
+您自行写入 `out.buffer()` 并调用 `out.set_length()` 时，同样遵循该契约：请报告您本应写入的完整大小，而不是能容纳的字节数。报告被截断的长度会使重试失效，并静默丢弃剩余部分。
 
 该契约在逐行处理时生效。而*物化的* STRING 结果——在 GROUP BY/DISTINCT 临时表、`CREATE TABLE ... SELECT` 或 UNION 中——仍会截断至参数宽度，除非该函数声明了 `.max_result_length(n)`，它用于设置结果列大小（以字符为单位，上限为 `VEF_MAX_RESULT_LENGTH`，即 16 MiB）：
 

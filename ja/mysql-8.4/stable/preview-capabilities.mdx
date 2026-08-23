@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "プレビュー機能"
-description: "プレビュー機能は、APIが最終化される前に拡張機能にサーバー機能へのアクセスを提供します。このページでは、プレビュー層の有効化、keyring、status_var、sys_var、thread_worker、sql_query、statement_event機能の設定方法と登録パターンについて説明します。"
+description: "プレビュー機能は、まだ安定化の途上にあるサーバー機能へのアクセスを拡張機能に提供します。このページでは、プレビュー層の有効化、auth、keyring、mysql_services、status_var、sys_var、thread_worker、sql_query、statement_event の各機能、および登録パターンについて説明します。"
 ---
 
 プレビュー機能は、APIが最終化される前に拡張機能に公開されるサーバー機能です。プレビュー機能を宣言する拡張機能は、`vsql_allow_preview_extensions = ON` が設定されている場合にのみインストールできます（[プレビュー層の有効化](#enabling-the-preview-tier)を参照）—プレビュー機能を使用しない拡張機能は、この設定に関係なく通常通りインストールされます。
@@ -38,8 +38,12 @@ SET PERSIST vsql_allow_preview_extensions = OFF;
 
 | 機能 | ヘッダー | 状態 |
 |---|---|---|
+| `vsql::preview::auth` | `<villagesql/preview/auth.h>` | プレビュー（dev ABI のみ、`-DVSQL_USE_DEV_ABI=ON`） |
 | `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | プレビュー |
+| `vsql::preview::index_profile` | `<villagesql/preview/index_builder.h>` | プレビュー — [カスタムインデックス](/ja/mysql-8.4/stable/custom-indexes)を参照 |
+| `vsql::preview::index_type` | `<villagesql/preview/index_builder.h>` | プレビュー — [カスタムインデックス](/ja/mysql-8.4/stable/custom-indexes)を参照 |
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | プレビュー |
+| `vsql::preview::mysql_services` | `<villagesql/preview/mysql_services.h>` | プレビュー（dev ABI のみ、`-DVSQL_USE_DEV_ABI=ON`） |
 | `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | プレビュー |
 | `vsql::preview::statement_event` | `<villagesql/preview/statement_event.h>` | プレビュー（dev ABI のみ、`-DVSQL_USE_DEV_ABI=ON`） |
 | `vsql::status_var` | `<villagesql/preview/status_var.h>` | プレビュー |
@@ -47,7 +51,7 @@ SET PERSIST vsql_allow_preview_extensions = OFF;
 | `vsql::sys_var` | `<villagesql/preview/sys_var.h>` | プレビュー |
 | `vsql::preview::thread_worker` | `<villagesql/preview/thread_worker.h>` | プレビュー |
 
-## 登録パターン
+## 登録パターン {#registration-pattern}
 
 プレビュー機能を使用するには、ファイルスコープで機能オブジェクトを値として宣言し、`make_extension()` 内の `.with()` に参照で渡します。サーバーは登録時にオブジェクトの `abi` ポインタを設定します：
 
@@ -65,7 +69,7 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(g_keyring))
 ```
 
-`.with(capability)` はサーバーに拡張機能が必要とする機能を伝えます。拡張機能をインストールする際に `vsql_allow_preview_extensions` がオフの場合、サーバーはその機能名を示すエラーを返してインストールを拒否します。
+`.with(capability)` はサーバーに拡張機能が必要とする機能を伝えます。拡張機能をインストールする際に `vsql_allow_preview_extensions` が OFF の場合、サーバーは拡張機能名を示すエラーを返してインストールを拒否します：`ERROR 3219 (HY000): Failed to load VEF extension 'name': extension requires preview capabilities but vsql_allow_preview_extensions is OFF`。このメッセージは、どの機能が原因であったかは示しません。
 
 <Warning>
 拡張機能内で宣言されたすべての機能オブジェクトは、`.with()` に正確に1回渡す必要があります。ロード時にサーバーは宣言されたすべての機能インスタンスを `.with()` が受け取った内容と照合し、ルール違反の場合 `INSTALL EXTENSION` を失敗させます：
@@ -203,6 +207,175 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(g_keyring))
 ```
 
+## MySQL サービス {#mysql-services}
+
+mysql_services 機能（`vsql::preview::mysql_services`）は、拡張機能が MySQL レジストリサービスを利用できるようにします — MySQL コンポーネントが利用するのと同じサービスで、インストールされたコンポーネントまたはサーバーコアによって提供されます。拡張機能は必要なすべてのサービスを1か所で宣言します。サーバーは拡張機能のロード時に各サービスを取得し、拡張機能のアンロード時に解放します。
+
+機能名 `VEF_PREVIEW_MYSQL_SERVICES_NAME` は `"vsql::preview::mysql_services"` です。
+
+サーバーの機構に専用の VEF 機能がない場合にこれを使用します。セッション属性と keyring 自身のコンポーネントサービスは、どちらもこの方法で利用できます。サポートされるのは利用のみです。拡張機能自身の実装をレジストリに登録することは今後の作業として計画されており、この機能には含まれません。
+
+### 機能の宣言
+
+ファイルスコープで `MysqlServices` オブジェクトを1つ宣言し、利用する各サービスを `VSQL_REQUIRE_SERVICE` で指定し、そのオブジェクトを `.with()` に渡します。各サービスについて MySQL 自身のヘッダーを含めてください — サービスの型とメソッドはそのヘッダーで宣言されています：
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(services))
+```
+
+`VSQL_REQUIRE_SERVICE(services, name, var)` は、サーバーが取得したサービスを書き込む参照 `var` を宣言し、`name` を `services` に登録します。`var` は自動的に `static` として宣言されます。`MysqlServices` オブジェクトも `static` である必要があり、手動で宣言する参照も同様です。サーバーはロード時にそれらを介して書き込むため、それらは拡張機能より長く存続する必要があります。
+
+### 特定の実装の指定 {#pinning-a-specific-implementation}
+
+`VSQL_REQUIRE_SERVICE` は `name` を2回使用します — C++ の `SERVICE_TYPE(name)` として、およびサーバーがレジストリで検索する文字列として。この修飾なしの名前では、サーバーはサービスのデフォルト実装を取得します。
+
+代わりに1つの実装を指定するには、修飾されたレジストリ名 — MySQL の `PROVIDES_SERVICE(component, service)` が生成する `service.component` の形式 — を使用します。以下は、デフォルトではなく `component_keyring_file` コンポーネントの keyring リーダーを要求します：
+
+```cpp
+static preview_mysql_services::ServiceRef<SERVICE_TYPE(keyring_reader_with_status)>
+    reader;
+static const int reader_req =
+    (services.require<SERVICE_TYPE(keyring_reader_with_status)>(
+         "keyring_reader_with_status.component_keyring_file", reader),
+     0);
+```
+
+修飾された名前は修飾なしの名前と同じ方法で取得されるため、通常のルールが適用されます。その実装が登録されていない場合、拡張機能は別の実装にフォールバックするのではなくインストールに失敗します。
+
+### MySQL のヘッダーに対するビルド {#building-against-mysqls-headers}
+
+サービス定義は VEF ではなく MySQL のコンポーネントフレームワークに属しており、サーバーはそれらをインストールしません。そのため `mysql/components/services/*.h` は、拡張機能 SDK にも、`make install` が構築するもの（リリース tarball や Docker イメージを含む）にも存在しません。サービスを利用する拡張機能は、VillageSQL サーバーのソースツリーに対してビルドします：
+
+| インクルードパス | 提供内容 |
+|---|---|
+| `<source>/include` | サービス定義、`mysql/components/services/*.h` |
+| `<build>/include` | `mysqld_error.h` など、ビルド時に生成されるヘッダー |
+
+ツリー内のテスト拡張機能は、`vsql_add_test_extension()` の `MYSQL_HEADERS` フラグから両方を取得します。このフラグはそれらを `MYSQL_INCLUDE_DIR` および `MYSQL_GENERATED_INCLUDE_DIR` として渡します。ツリー外のビルドは独自のインクルードパスを設定します。
+
+2つのビルド失敗は、原因となった行とは別の場所で報告されます。
+
+サービスの MySQL ヘッダーを省略すると、`VSQL_REQUIRE_SERVICE` に何も解決しない名前が残るため、エラーは不足しているインクルードではなくマクロの位置に表示されます（clang 17）：
+
+```text
+error: unknown type name 'mysql_service_mysql_current_thread_reader_t'
+```
+
+一部のサービス定義は `<cstddef>` を含めずに `size_t` を使用するため、それらのヘッダーの1つをすべての villagesql ヘッダーより前に置くと、MySQL 自身のヘッダー内で失敗します：
+
+```text
+error: unknown type name 'size_t'
+```
+
+このページの例のように、`<cstddef>` を最初に含めてください。
+
+### サービスの呼び出し {#calling-a-service}
+
+サービス参照は独自の `valid()` を公開し、`->` はサービスに転送します。参照には `.` を、サービスには `->` を使用します：
+
+```cpp
+if (!thd_reader.valid()) { out.error("service unavailable"); return; }
+MYSQL_THD thd = nullptr;
+if (thd_reader->get(&thd) || thd == nullptr) { out.set_null(); return; }
+```
+
+すべての `->` 呼び出しの前に `valid()` を確認してください。`->` は取得されたポインタを返しますが、サービスが取得されなかった場合そのポインタは NULL です。
+
+取得に失敗したサービスはインストールを失敗させるため、実行中の関数の内部では、必要なサービスは有効です。それでも確認は重要です。手動で宣言され `require()` に渡されなかった `ServiceRef` には何も書き込まれないためです。コンパイルは通り、拡張機能はインストールされ、`valid()` は拡張機能の生存期間を通じて false のままになります。
+
+サービスが*何であるか* — そのメソッド、パラメータ、戻り値 — は、ここではなく MySQL によって文書化されています。`NAME` という名前のサービスについては、サーバーツリーの `include/mysql/components/services/NAME.h` を読んでください。その `BEGIN_SERVICE_DEFINITION(NAME)` ブロックが、各メソッドを独自のドキュメントとともに宣言しています。`bool` の戻り値が `false` の場合は成功、`true` の場合は失敗を意味するという MySQL の慣習を含め、そのヘッダーが指定するとおりに呼び出してください。
+
+### 取得の失敗 {#acquisition-failure}
+
+宣言されたすべてのサービスは、拡張機能のロード時、その関数が呼び出せるようになる前に取得されます。そのため、登録されていないサービスは後から表面化するのではなくロードを失敗させます。`INSTALL EXTENSION` は失敗し、そのサービス名を示します。
+
+以下の `vsql_mysql_services_missing_test` は、レジストリに存在しないサービスを必要とするツリー内のテスト拡張機能です。これはインストールできるものではありません — これは失敗を記録した方法であり、このサーバーが提供しないサービスをあなた自身の拡張機能が必要とする場合に生成される出力です：
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mysql_services_missing_test': failed to acquire MySQL service 'vsql_intentionally_missing'
+```
+
+他に2つのインストール失敗が、この機能の外側から同じ機能に到達します：`MysqlServices` オブジェクトを `.with()` に渡さない場合と、`vsql_allow_preview_extensions` が OFF のサーバーにインストールする場合です。どちらも[登録パターン](#registration-pattern)で説明しています。
+
+### 完全な例
+
+サーバーの `villagesql/test-extensions/` ツリーにある `vsql_mysql_services_session_test` の簡略化されたバージョンです。2つのサービスを組み合わせて、呼び出し元のセッションで実行中の SQL コマンドを読み取ります。一方は現在の `THD` を返し、もう一方はそこから名前付き属性を読み取ります。どちらもすべてのサーバーに登録されているサーバーコアのサービスであるため、事前に何かをインストールする必要はありません：
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/defs/mysql_string_defs.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+VSQL_REQUIRE_SERVICE(services, mysql_thd_attributes, attrs);
+
+// session_sql_command() -> STRING: the name of the SQL command running on the
+// calling session, or NULL when the THD or the attribute cannot be read.
+void session_sql_command(StringResult out) {
+  if (!thd_reader.valid() || !attrs.valid()) {
+    out.error("MySQL session services are not available");
+    return;
+  }
+
+  MYSQL_THD thd = nullptr;
+  // MySQL convention: a false return means success.
+  if (thd_reader->get(&thd) || thd == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  mysql_cstring_with_length value{nullptr, 0};
+  if (attrs->get(thd, "sql_command", &value) || value.str == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  out.set(std::string_view(value.str, value.length));
+}
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(services).func(
+    make_func<&session_sql_command>("session_sql_command")
+        .returns(STRING)
+        .no_params()
+        .build()))
+```
+
+インストールして関数を呼び出します：
+
+```sql
+INSTALL EXTENSION vsql_mysql_services_session_test;
+SELECT vsql_mysql_services_session_test.session_sql_command() AS sql_command;
+```
+
+```text
++-------------+
+| sql_command |
++-------------+
+| select      |
++-------------+
+```
+
 ## ステータス変数 {#status-variables}
 
 status_var 機能（`vsql::status_var`）は、拡張機能が MySQL ステータス変数として `long long` および `double` カウンターを公開できるようにします。拡張機能はストレージを所有し、値を書き込みます。サーバーはステータス変数がクエリされるたびにポインタ経由で読み取ります。
@@ -248,11 +421,17 @@ my_ext.ext_misses   0
 
 ## システム変数 {#system-variables}
 
-sys_var 機能（`vsql::sys_var`）は、拡張機能所有のストレージに紐付けられた MySQL システム変数を登録できるようにします。3つの型がサポートされます：`BOOL`（`bool *`）、`INT`（`long long *`）、`STR`（`char **`）。`INT` 記述子には `min_val` および `max_val` の境界が含まれます。すべての記述子にはデフォルト値とコメントが含まれます。
+sys_var 機能（`vsql::sys_var`）は、拡張機能所有のストレージに紐付けられた MySQL システム変数を登録できるようにします。4つの型がサポートされます：`BOOL`（`bool *`）、`INT`（`long long *`）、`DOUBLE`（`double *`）、`STR`（`char **`）。`INT` および `DOUBLE` 記述子には `min_val` および `max_val` の境界も含まれます。すべての記述子にはデフォルト値とコメントが含まれます。
 
-`vsql::preview_sys_var::make_capability()` で機能を構築し、対応するファクトリ関数 `make_bool`、`make_int`、`make_str` を使用します。機能オブジェクトは `get()` および `set()` を公開し、拡張機能コードからのプログラム的アクセスを可能にします。両方とも成功時に `false` を返します。
+`vsql::preview_sys_var::make_capability()` で機能を構築し、対応するファクトリ関数 `make_bool`、`make_int`、`make_double`、`make_str` を使用します。機能オブジェクトは `get()` および `set()` を公開し、拡張機能コードからのプログラム的アクセスを可能にします。両方とも成功時に `false` を返します。
 
-値の変更に反応するには、記述子に `.on_change<&fn>()` をチェーンします。コールバックは `var_name()` および型アクセス（`as_int()`、`as_real()`、`as_str()`）を備えた `sv::SysVarChange` を受け取ります。
+値の変更に反応するには、記述子に `.on_change<&fn>()` をチェーンします。コールバックは `var_name()` および型付きアクセサ（`as_int()`、`as_real()`、`as_str()`）を備えた `sv::SysVarChange` を受け取ります。
+
+サーバーは、グローバルなシステム変数ロックを保持したままそのコールバックを呼び出します。その中でこの拡張機能の別の変数をストレージポインタ経由で読み書きすることは安全です。また、サーバーが同じロックの下でそれらの変数を読み取るため、他のセッションはすぐに新しい値を参照できます。
+
+<Warning>
+機能の `get()` または `set()` を呼び出すこと、SQL を実行すること、あるいはそのいずれかを行うスレッドを待機することは、そのロックでデッドロックします。コールバックは短くブロックしないように保ち、SQL を必要とする処理は[スレッドワーカー](#thread-worker)に渡すか、`sql/sys_vars.cc` の `event_scheduler_update()` が行うように、ブロックする部分の前後で `LOCK_global_system_variables` を解放し、戻る前に再取得してください。
+</Warning>
 
 機能オブジェクトは静的ストレージ持続期間でなければなりません。MySQL はユーザーが変数を設定する際にストレージポインタに直接書き込みます。
 
@@ -302,7 +481,7 @@ SET GLOBAL my_ext.log_file = '/var/log/myext.log';
 
 ### 拡張機能コードからの読み書き
 
-INT および BOOL 変数については、グローバルストレージポインタを直接読み取ります — MySQL はそれらをアトミックに更新します。MySQL を介して変数を更新するには（ロック、範囲検証、永続化をサーバーが処理するため）、`SYS_VARS.set(extension_name, var_name, scope, value)` を呼び出します。`set` および `get` は成功時に `false` を返します。
+INT および BOOL 変数については、グローバルストレージポインタを直接読み取ります — MySQL はそれらをアトミックに更新します。MySQL を介して変数を更新するには（ロック、範囲検証、永続化をサーバーが処理するため）、`SYS_VARS.set(extension_name, var_name, scope, value)` を呼び出します。`set` および `get` は成功時に `false` を返します。どちらも `on_change` コールバックから呼び出すことはできません。両方ともシステム変数ロックでデッドロックします。
 
 ```cpp
 bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
@@ -313,10 +492,10 @@ bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
 | スコープ | 動作 |
 |-------|-------|
 | `nullptr` | 実行中の値のみ更新、永続化されません。 |
-| `"PERSIST"` | 実行中の値と `mysqld-auto.cnf` に書き込みます。 |
+| `"PERSIST"` | 実行中の値を更新し、`mysqld-auto.cnf` に書き込みます。 |
 | `"PERSIST_ONLY"` | `mysqld-auto.cnf` にのみ書き込み、次回起動時に有効になります。 |
 
-## スレッドワーカー
+## スレッドワーカー {#thread-worker}
 
 thread worker 機能（`vsql::preview::thread_worker`）は、サーバーによって駆動されるバックグラウンドスレッドを拡張機能が実行できるようにします。スレッドは、サーバーが拡張機能ロード時に登録する制御システム変数を介して開始および停止されます。サーバーは、定期タイマー、ファイルディスクリプタの準備完了（レディ状態）、有効/無効イベントに応じて拡張機能の作業関数を呼び出します。
 
@@ -365,7 +544,7 @@ typedef vef_next_wakeup_t (*vef_work_fn_t)(vef_wakeup_reason_t reason,
 |---|---|
 | `VEF_WAKEUP_ENABLE` | ワーカーが有効化された（制御 sys var が ON に切り替えられた）。戻り値は初期の `poll_fd` および `sleep_ms` を設定します。 |
 | `VEF_WAKEUP_PERIODIC` | 定期タイマーが発火（`sleep_ms` 経過）。 |
-| `VEF_WAKEUP_POLL_FD` | 監視中のファイルディスクリプタが読み可能になりました。 |
+| `VEF_WAKEUP_POLL_FD` | 監視中のファイルディスクリプタが読み取り可能になりました。 |
 | `VEF_WAKEUP_DISABLE` | ワーカーが無効化（制御 sys var OFF）またはサーバーがシャットダウン中。戻り値は無視されます。 |
 
 理由が `VEF_WAKEUP_ENABLE` の場合、`thread` パラメータは NULL です。この時点でスレッドハンドルはまだ存在しないためです。他の3つの理由では `thread` は非 NULL です。
@@ -392,7 +571,9 @@ typedef struct {
 - `suffix` — スレッド名サフィックス。サーバーは拡張機能名を前置し、`my_ext/monitor` のようなスレッド名を生成します。
 - `var_name` — オプション。NULL でない場合、サーバーはこの名前を制御システム変数として登録します。NULL の場合、サーバーはデフォルトパターン `{suffix}_enabled` を使用します。
 
-制御変数はサーバー登録のシステム変数です。ワーカーを有効化するには `SET GLOBAL {suffix}_enabled = ON`、無効化するには `OFF` に設定します。
+制御変数はサーバー登録のシステム変数であるため、拡張機能名をコンポーネントプレフィックスとして取ります。サフィックス `monitor` を持つ拡張機能 `my_ext` の場合、変数は `my_ext.monitor_enabled` です。
+
+`ON` に設定するとワーカーが開始されます。サーバーは `VEF_WAKEUP_ENABLE` で作業関数を呼び出してからスレッドを作成するため、その最初の呼び出しが終了するまで文は戻りません。ワーカーがすでに実行中に再度 `ON` に設定しても何も起こりません。`OFF` に設定した場合、スレッドが終了した後に戻ります。サーバーはその両方の前後でグローバルなシステム変数ロックを解放するため、作業関数はシステム変数の読み取りと SQL の実行ができます。
 
 ### 完全な例
 
@@ -431,10 +612,10 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(g_worker))
 ```
 
-この拡張機能をインストールし（`vsql_allow_preview_extensions = ON` が設定されている場合）、サーバーは `heartbeat_enabled` システム変数を登録します。ワーカーを有効化するには：
+この拡張機能をインストールし（`vsql_allow_preview_extensions = ON` が設定されている場合）、サーバーは拡張機能名の下に `heartbeat_enabled` システム変数を登録します。`my_ext` という名前の拡張機能の場合、ワーカーを有効化するには：
 
 ```sql
-SET GLOBAL heartbeat_enabled = ON;
+SET GLOBAL my_ext.heartbeat_enabled = ON;
 ```
 
 ## SQL クエリ
@@ -619,7 +800,7 @@ VEF_GENERATE_ENTRY_POINTS(
 2つのプレビュー機能が連携して動作します：
 
 - `vsql::preview::storage` — InnoDB ストレージインフラストラクチャ（ミニトランザクション、セグメント、ページ）へのアクセスを提供します。ファイルスコープで `StorageCapability` を宣言します。
-- `vsql::preview::column_store` — 拡張機能のカスタム型の1つに、1つのストレージ実装をバインドします。`make_column_store<Ctx>(TYPE).…build()` を使用してファイルスコープで `ColumnStoreCapability` を宣言します。
+- `vsql::preview::column_store` — 型ごとのストレージ実装を、拡張機能のカスタム型の1つにバインドします。`make_column_store<Ctx>(TYPE).…build()` を使用してファイルスコープで `ColumnStoreCapability` を宣言します。
 
 両方を `make_extension()` の `.with()` に渡す必要があります：
 
@@ -666,7 +847,7 @@ VEF_GENERATE_ENTRY_POINTS(
 
 ### 7つのストレージ関数
 
-すべての関数は `storage::Column::StorageCtx<MyCtx>*` を受け取ります。`user()` アクセサは拡張機能のカラムごとの状態を返し、`arena()` は補助オブジェクトのサーバー管理割り当てを提供します。すべての関数は成功時に `false` を返し、エラー時に `true` を返し、`error_msg`（容量 `error_msg_len`）にメッセージを書き込みます。
+すべての関数は `storage::Column::StorageCtx<MyCtx>*` を受け取ります。`user()` アクセサは拡張機能のカラムごとの状態を返し、`arena()` は補助オブジェクトのサーバー管理割り当てを提供します。すべての関数は成功時に `false` を返し、エラー時に `true` を返し、失敗が SQL クライアントに伝わるように `error_msg`（容量 `error_msg_len`）にメッセージを書き込みます。
 
 ```cpp
 // CREATE TABLE / ALTER TABLE ADD COLUMN.
@@ -758,7 +939,7 @@ bool MyStorage::load(storage::Column::StorageCtx<MyCtx>* ctx,
 }
 ```
 
-`ctx->arena()` は `MyCtx` に直接埋め込むことができないほど大きいか動的な補助オブジェクトを割り当てる場合にのみ使用します。C++ SDK はアリーナを破棄し（`~MyCtx()` を呼び出し）、`drop` が成功するかどうかに関係なく、`drop` が返した後自動的に破棄します。
+`ctx->arena()` は `MyCtx` に直接埋め込むことができないほど大きいか動的な補助オブジェクトを割り当てる場合にのみ使用します。C++ SDK は、`drop` が成功したかどうかに関係なく、`drop` から戻った後にアリーナを自動的に破棄し（`~MyCtx()` を呼び出し）ます。
 
 ### InnoDB アクセスユーティリティ
 
@@ -856,6 +1037,8 @@ VEF_GENERATE_ENTRY_POINTS(
 | `status()` | 成功時は `0`、それ以外は MySQL エラーコード。 |
 | `digest_text()` | 類似クエリをグループ化するための正規化されたクエリ形式。 |
 | `no_index_used()` | クエリが使用可能なインデックスなしで実行された場合 `true`。 |
+| `digest_hash()` | 64文字の小文字16進数によるステートメントダイジェスト — `performance_schema` が `DIGEST` として公開する値です。同一の文をグループ化するためのコンパクトなキーで、`digest_text()` が `NULL` の場合は常に `NULL` です。 |
+| `read_first()`, `read_last()`, `read_key()`, `read_next()`, `read_prev()`, `read_rnd()`, `read_rnd_next()` | 文ごとのハンドラ行アクセスカウンター（スローログの `Read_*` フィールド）。`no_index_used()` がフラグを立てるだけのアクセス方法を定量化します — 例えば `read_rnd_next()` が大きい場合は、フルテーブルスキャンを示します。 |
 
 `query()` は存在する場合サーバーの書き換え形式を返すため、認証情報を含む文はシークレットが平文ではなく難読化された状態で到着し、一般ログ、スローログ、バイナリログが既にそれらを難読化（伏字化）する方法と一致します：`SET PASSWORD`、`CREATE`/`ALTER USER ... IDENTIFIED BY`、`CHANGE REPLICATION SOURCE ... SOURCE_PASSWORD`、`CREATE SERVER ... OPTIONS(PASSWORD ...)`。書き換えルールのない文はそのまま配信されます。
 
@@ -956,3 +1139,379 @@ SET GLOBAL vsql_slow_query_log.threshold_ms = 500;
 SET timestamp=1782168824;
 SELECT SLEEP(0.6);
 ```
+
+## 認証方式 {#authentication-methods}
+
+auth 機能（`vsql::preview::auth`）は、拡張機能がサーバーの認証方式を提供できるようにします。アカウントは `CREATE USER ... IDENTIFIED WITH <method-name>` でこれを選択します。接続時に、その名前がロード済みの MySQL 認証プラグインでない場合、サーバーは VEF 認証レジストリを参照し、ハンドシェイクを通じて拡張機能のハンドラを呼び出します。MySQL 認証プラグインを書かずに、サーバーが知らない認証情報ソース — ベアラートークン、外部 ID プロバイダー、カスタムチャレンジなど — に対してアカウントを認証する場合に使用します。
+
+機能名 `VEF_PREVIEW_AUTH_NAME` は `"vsql::preview::auth"` です。
+
+ハンドラは `AuthContext` を受け取る型付き関数です。サーバー所有のそのコンテキストを介してハンドシェイクパケットを読み書きすることでクライアントと通信し、MySQL の内部認証構造体を参照することはありません。
+
+<Warning>
+認証結果はフェイルクローズです。サーバーは `AuthResult::kOk` 以外のすべてを接続拒否として扱います — 「たぶん」やフェイルオープンの結果は意図的に存在しません。`AuthResult::kReject` を返すハンドラ、`AuthResult::kError` を返すハンドラ、または実効アカウントを設定しないハンドラは、ログインを拒否します。
+</Warning>
+
+### 機能の宣言
+
+ヘッダーを含め、型付きハンドラを記述し、`make_auth<>` ビルダーのチェーン呼び出しで記述子を構築し、その記述子を `.with()` に渡す `AuthCapability` トークンに渡します。プレビュー機能のヘッダーは `<villagesql/vsql.h>` のアンブレラには含まれないため、`<villagesql/preview/auth.h>` を明示的に含めてください：
+
+```cpp
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+AuthResult authenticate(AuthContext &c) {
+  // ... validate the client and set the effective account ...
+  return AuthResult::kOk;
+}
+
+constexpr auto MY_AUTH =
+    vsql::preview_auth::make_auth<&authenticate>("my_auth")
+        .client_plugin("mysql_clear_password")
+        .build();
+
+static vsql::preview_auth::AuthCapability g_auth{MY_AUTH};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_auth))
+```
+
+ビルダーは6つの要素で構成されます：
+
+| 要素 | 意味 |
+|---|---|
+| `make_auth<&handler>("name")` | ビルダーを開始します。ハンドラはコンパイル時のテンプレート引数であるため、NULL または誤ったシグネチャのハンドラは実行時の失敗ではなくコンパイルエラーになります。`"name"` はアカウントがバインドする認証方式名（`IDENTIFIED WITH <name>`）で、最大 `VEF_AUTH_MAX_NAME_LEN`（64）バイトです。 |
+| `.client_plugin(name)` | オプション。ハンドシェイク中にサーバーが通知するクライアント側認証プラグインを上書きします。 |
+| `.accepts_client_plugin(callback)` | オプション。`bool (*)(const char *offered)` を取ります。`true` を返すとクライアントが提示したプラグインを維持し、`false` を返すとクライアントを `.client_plugin()` に切り替えます。 |
+| `.auto_create(callback)` | オプション。存在しないアカウントのログインをこの方式で扱うようにします（[アカウントの自動作成](#auto-creating-accounts)を参照）。 |
+| `.auto_grant(callback)` | オプション。アカウントがすでに保持しているロールを有効化するだけでなく、ハンドラがステージングしたロールをサーバーが付与できるようにします（[ロールの自動付与](#auto-granting-roles)を参照）。 |
+| `.build()` | `AuthCapability` に渡す記述子を生成します。 |
+
+`AuthCapability g_auth{descriptor}` は `.with()` が消費する自己登録トークンです。登録より長く存続するように `static` として宣言してください。
+
+`client_plugin` はオプションです。`make_auth` は通知するプラグインを既定で `"mysql_clear_password"` — すべての MySQL クライアントが同梱する最も基本的なプラグイン — に設定します。そのため `.client_plugin()` を一度も呼び出さない方式でもインストールでき、単純なクライアントでも接続できます。別のプラグインを要求するには `.client_plugin(name)` を呼び出します。`mysql_clear_password` はパスワードスロットでベアラートークンをそのまま受け取ります。
+
+方式が要求するものとは別のプラグインを提示するクライアントは、要求されたプラグインに切り替えられ、認証情報をそのまま再送します。これには1往復のコストがかかり、その切り替えに応じるクライアントが必要です。`.accepts_client_plugin(&callback)` を使うと、方式は提示されたプラグインをそのまま維持できます。サーバーは提示された各名前をコールバックに渡します。要求されたプラグインも渡されますが、これはコールバックの戻り値にかかわらず受け入れられます。コールバックを設定しない方式は他の提示を一切受け入れないため、他のすべての提示は要求されたプラグインに切り替わります。受け入れは最終的です — サーバーはその後で要求されたプラグインに切り替え直しません — したがって、ハンドラが実際にフレーミングを解析できるプラグインだけを受け入れてください。サーバーはハンドシェイクのネゴシエーション中、ハンドラの最初の読み取りより前にコールバックを呼び出すため、コールバックは純粋な述語でなければなりません：パケット I/O、ブロッキング、副作用のいずれも行わないでください。
+
+### ハンドラの契約 {#the-handler-contract}
+
+ハンドラは `AuthHandler` 型に一致します — `AuthContext &` を取り、`AuthResult` を返します：
+
+```cpp
+AuthResult authenticate(AuthContext &c);
+```
+
+ハンドラは、ハンドシェイク中に接続スレッド上で同期的に呼び出されます。`AuthContext` は、サーバー所有の試行ごとのコンテキストをラップします。呼び出しの実行中のみ保持し、保存しないでください。関数テーブルを通じてコンテキストポインタを引き回す代わりに、そのメソッドを呼び出してください。トークンベースのハンドラが使用するメソッド：
+
+| メソッド | 目的 |
+|---|---|
+| `c.read_packet()` | クライアントが送信した次のパケットを読み取ります。バイト列を `Span<const unsigned char>` として返します。これは次の読み取りまで有効です（プロトコルエラーまたは接続エラーの場合は空）。`mysql_clear_password` と組み合わせると、1回の読み取りでベアラートークンが得られます。 |
+| `c.write_packet(data)` | クライアントにパケットを送信します（チャレンジなど）。`Span<const unsigned char>` を取り、失敗時に `true` を返します。 |
+| `c.user_name()` | クライアントが接続したアカウント名。 |
+| `c.auth_string()` | `IDENTIFIED WITH <m> AS '...'` の `AS '...'` 句、または空。 |
+| `c.host_or_ip()` | クライアントのホストまたは IP。 |
+| `c.client_auth_plugin()` | クライアントがハンドシェイク応答で通知したクライアント側認証プラグイン（例：`"mysql_clear_password"`）。方式がその提示を受け入れた場合、これはハンドラが読み取る認証情報をフレーミングしたプラグインでもあるため、ハンドラはバイト列を調べる代わりに名前で解析できます。`.client_plugin()` への強制的な切り替えではこの値は更新されないため、その経路ではクライアントが最初に提示したものを報告し続けます。不明な場合は空。 |
+| `c.authenticate_as(account)` | セッションが実行される実効アカウントを設定します（`CURRENT_USER()` に表示されます）。`AuthResult::kOk` を返す前に必須です。 |
+| `c.set_external_user(identity)` | 監査証跡のために元の外部 ID を設定します（`@@external_user`）。 |
+| `c.set_active_roles(roles, n_roles)` | セッションのアクティブなロールをステージングします（[アクティブロールのステージング](#staging-active-roles)を参照）。 |
+| `c.account_unknown()` | 認証中のアカウントが存在せず、このログインが `.auto_create()` のオプトインによってこの方式にルーティングされた場合に `true`。既存のアカウントに対するログインでは `false`。 |
+| `c.request_provision(account, roles, n_roles)` | `account` を作成し、`roles` を付与するようサーバーに要求します（[アカウントの自動作成](#auto-creating-accounts)を参照）。 |
+
+ハンドラは3つの結果のいずれかを返します：
+
+| 結果 | 意味 |
+|---|---|
+| `AuthResult::kOk` | 認証に成功しました。ハンドラは `authenticate_as()` を呼び出している必要があります。セッションはそのアカウントとして実行されます。 |
+| `AuthResult::kReject` | 認証に失敗しました — 認証情報が不正、またはポリシーによる拒否。 |
+| `AuthResult::kError` | 内部エラーにより判断できませんでした（例：キーソースが利用できなかった）。サーバーは拒否とまったく同じように扱います。これは、ログ記録において「拒否した」と「判断できなかった」を区別するためだけに存在します。 |
+
+`AuthResult::kReject` と `AuthResult::kError` はどちらも接続を拒否します。成功するのは `AuthResult::kOk` のみです。
+
+ハンドラが接続アカウントを別の実効アカウントにマッピングする場合 — 以下の例が接続アカウントを `vsql_auth_test_user` にマッピングするように — それはプロキシであり、MySQL のプラグイン認証の経路とまったく同じように `GRANT PROXY` が必要です。
+
+### アクティブロールのステージング {#staging-active-roles}
+
+`c.set_active_roles(roles, n_roles)` は、このログインにおいてアカウントのデフォルトロールの有効化に代えて、セッションでアクティブにすべきロールをステージングします。`roles` は `n_roles` 個の NUL 終端名の配列です。文字列はコピーされるため、呼び出し側が保持し続ける必要はありません。サーバーはアカウント解決の*後*に、`SET ROLE` と同じ付与チェック付きの有効化を使用してそれらを適用します。実際に認証済みアカウントに付与されているロールのみが有効になり、付与されていない名前は黙ってスキップされます — したがってトークンが DBA の用意した範囲を超えて権限を付与したり昇格させたりすることはできません。`n_roles == 0` を渡すとロールは有効になりません（`SET ROLE NONE` と同等）。
+
+### 完全な例
+
+サーバーソースツリーの `villagesql/test-extensions/vsql-auth-test/` にある `vsql_auth_test` 拡張機能を凝縮した、最小限の認証機能です。この拡張機能はどのリリースにも含まれていません。固定のトークンを1つ受け入れ、接続を `vsql_auth_test_user` にマッピングし、トークンがパスワードスロットにそのまま届くように `mysql_clear_password` を要求します。（ツリー内の拡張機能は、テストスイートを動かすために追加のトークン経路、`.accepts_client_plugin()` コールバック、および以下で説明する2つのオプトインを備えています。）
+
+```cpp
+#include <cstring>
+
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+namespace {
+
+constexpr char kToken[] = "vsql-auth-test-token";
+constexpr char kMappedAccount[] = "vsql_auth_test_user";
+
+AuthResult authenticate(AuthContext &c) {
+  auto pkt = c.read_packet();
+  if (pkt.empty()) return AuthResult::kError;
+
+  // mysql_clear_password sends a NUL-terminated string; drop the trailing NUL.
+  size_t len = pkt.size();
+  if (len && pkt[len - 1] == '\0') --len;
+
+  if (len != std::strlen(kToken) ||
+      std::memcmp(pkt.data(), kToken, len) != 0) {
+    return AuthResult::kReject;
+  }
+
+  c.authenticate_as(kMappedAccount);
+  // @@external_user records the connecting identity, not the mapped account.
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .build();
+vsql::preview_auth::AuthCapability g_auth{AUTH_METHOD};
+
+}  // namespace
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(g_auth))
+```
+
+### アカウントのバインドと接続 {#binding-an-account-and-connecting}
+
+プレビュー層を有効化した上で（[プレビュー層の有効化](#enabling-the-preview-tier)を参照）、拡張機能をインストールし、アカウントをこの方式にバインドします。ハンドラは2つ目のアカウントにマッピングするため、そのアカウントも作成し、接続アカウントがその ID を引き継げるようにする `PROXY` 権限を付与します：
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+```
+
+`vsql_auth_test` は登録済みの VEF 認証方式であるため、`CREATE USER ... IDENTIFIED WITH vsql_auth_test` は受け入れられます — インストール済みのプラグイン名が受け入れられるのと同じ仕組みです。
+
+受け入れられるのは `IDENTIFIED WITH <method>` の形式のみで、オプションで `AS '...'` を付けられます。`BY '...'` を追加すると、パスワードを保存用の認証情報に変換することを方式に要求することになります — MySQL のプラグインが `generate_authentication_string()` を通じて行う処理です — が、現在そのフックを宣言する VEF 認証方式はないため、サーバーはこれを拒否します：
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test BY 'secret';
+```
+
+```text
+ERROR 1827 (HY000): The password hash doesn't have the expected format.
+```
+
+バインドされた方式名は、テーブルのデフォルトではなくアカウントの `plugin` カラムに書き込まれます。これがアカウントの次回ログイン時に読み取られる値です：
+
+```sql
+SELECT plugin FROM mysql.user WHERE user = 'auth_user';
+```
+
+```text
++----------------+
+| plugin         |
++----------------+
+| vsql_auth_test |
++----------------+
+```
+
+この方式は `mysql_clear_password` を要求するため、クライアントはトークンを平文で送信するために `--enable-cleartext-plugin` を渡す必要があります。トークンが正しい場合、セッションはマッピングされたアカウントとして実行され、接続アカウントを `@@external_user` を通じて公開します：
+
+```bash
+mysql --enable-cleartext-plugin --user=auth_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER(), @@external_user"
+```
+
+```
+CURRENT_USER()         @@external_user
+vsql_auth_test_user@%  auth_user
+```
+
+拡張機能をアンインストールすると方式が削除されます。それにバインドされたアカウントは認証できなくなります：
+
+```sql
+UNINSTALL EXTENSION vsql_auth_test;
+```
+
+### アカウントの自動作成 {#auto-creating-accounts}
+
+方式は、まだ存在しないアカウントのログインを処理し、ログイン成功の一部としてサーバーにそのアカウントを作成させることもできます。これがない場合、未知のアカウントはどの方式が実行されるよりも前に拒否されます。
+
+`.auto_create(&callback)` でオプトインします。コールバックは引数を取らず `bool` を返します。サーバーは登録時に一度読み取るのではなく、未知のアカウントによるログインのたびにこれを呼び出します。そのため方式は、拡張機能のロード時に選択を固定するのではなく、自身の実行時設定に従うことができます：
+
+```cpp
+bool auto_create_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_create(&auto_create_enabled)
+        .build();
+```
+
+`.auto_create()` を付けない場合、またはコールバックが `false` を返す場合、標準の動作が維持されます：未知のアカウントは拒否されます。同時にオプトインできるインストール済みの方式は1つだけです — 2つが `true` を返した場合、サーバーは推測を行わず、エラーログに警告を記録し、どの方式もオプトインしていない場合と同じように未知のアカウントを拒否します。
+
+ハンドラ内では、`c.account_unknown()` が2つのケースを区別します。まず認証情報を検証し、次に何を作成するかを指定して、そのアカウントとして認証します：
+
+```cpp
+if (c.account_unknown()) {
+  const char *roles[] = {"vsql_role_granted"};
+  c.request_provision(c.user_name(), roles, 1);
+  c.authenticate_as(c.user_name());
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+```
+
+`request_provision(account, roles, n_roles)` は意図を記録するだけで、何も返しません。サーバーは、ハンドラが `AuthResult::kOk` を返した後に DDL を自身で実行します。実行するのは、未知のアカウントとしてルーティングされたログインの場合のみです — そのため、ハンドラがその後で拒否するログインは何も作成せず、すでに存在するアカウントを指定した要求は無視されます。サーバーが実行するのは `CREATE USER IF NOT EXISTS <account>@'%' IDENTIFIED WITH <method>` で、続いて指定されたロールごとに1つの `GRANT` を実行します。アカウントは常にホスト `%` に対して作成され、認証を行った方式にバインドされます。また `account` は接続ユーザー名である必要はありません。作成ができない場合 — 例えば `super_read_only` のサーバーでは — アカウントなしで処理を続行するのではなく、ログインが失敗します。
+
+ロールの扱いは[アクティブロールのステージング](#staging-active-roles)と同じです：ロールは DBA が管理します。各名前は付与可能なロールとしてすでに存在している必要があり、付与できないものはログインを失敗させるのではなくログに記録されてスキップされます。そのためトークンはロールを指定できますが、ロールを作成したり昇格させたりすることはできません。アカウント名はクライアントから渡されるため、サーバーはそれを識別子として引用符で囲みます — 細工された名前は奇妙な名前のアカウント1つになるだけで、2つ目の文になることはありません。
+
+`vsql_auth_test` 拡張機能は、接続ユーザーにロール `vsql_role_granted` を付与してプロビジョニングし、オプトインを `vsql_auth_test.auto_create` で制御します。この変数の初期値は `OFF` です。まずこれをオンにしてロールを作成し、その後で存在しないアカウントとして接続します：
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+SET GLOBAL vsql_auth_test.auto_create = ON;
+CREATE ROLE vsql_role_granted;
+GRANT SELECT ON *.* TO vsql_role_granted;
+```
+
+```bash
+mysql --enable-cleartext-plugin --user=auto_created_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER() AS who, @@external_user AS ext"
+```
+
+```text
++---------------------+-------------------+
+| who                 | ext               |
++---------------------+-------------------+
+| auto_created_user@% | auto_created_user |
++---------------------+-------------------+
+```
+
+アカウントが作成され、方式にバインドされ、付与されたロールを保持しています：
+
+```sql
+SELECT user, host, plugin FROM mysql.user WHERE user = 'auto_created_user';
+```
+
+```text
++-------------------+------+----------------+
+| user              | host | plugin         |
++-------------------+------+----------------+
+| auto_created_user | %    | vsql_auth_test |
++-------------------+------+----------------+
+```
+
+```sql
+SHOW GRANTS FOR 'auto_created_user'@'%';
+```
+
+```text
++----------------------------------------------------------+
+| Grants for auto_created_user@%                           |
++----------------------------------------------------------+
+| GRANT USAGE ON *.* TO `auto_created_user`@`%`            |
+| GRANT `vsql_role_granted`@`%` TO `auto_created_user`@`%` |
++----------------------------------------------------------+
+```
+
+誤ったトークンは引き続きフェイルクローズで失敗し、何もプロビジョニングしません：
+
+```bash
+mysql --enable-cleartext-plugin --user=never_created --password=wrong-token \
+      -e "SELECT 1"
+```
+
+```text
+ERROR 1045 (28000): Access denied for user 'never_created'@'localhost' (using password: YES)
+```
+
+<Warning>
+オプトインすると、有効な認証情報を持つ者にとって、未知のアカウントと既存のアカウントの違いが観測可能になります。標準の未知アカウント拒否は、この違いを意図的に隠しています。これがこの機能のトレードオフです。認証情報が広く共有されている方式でオプトインを有効にする前に、この点を検討してください。
+</Warning>
+
+### ロールの自動付与 {#auto-granting-roles}
+
+既定では、トークンが指定したロールは、アカウントがすでにそれを保持している場合にのみ有効になり、保持していないものはログに記録されてスキップされます。`.auto_grant(&callback)` はこれを変更します：サーバーはステージングされたロールをアカウントに付与します。そのためトークンは、アカウントの既存のロールのうちどれを有効にするかだけでなく、セッションがどのロールを得るかを決定します。
+
+コールバックの形は `.auto_create()` と同じです — 引数を取らず、`bool` を返し、サーバーはログインのたびにこれを呼び出すため、実行時設定に従うことができます：
+
+```cpp
+bool auto_grant_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_grant(&auto_grant_enabled)
+        .build();
+```
+
+2つのオプトインは独立しています。`.auto_create()` は存在しないアカウントのログインを制御します。`.auto_grant()` は、そのアカウントが今作成されたかどうかにかかわらず、ログインが解決したアカウントへの付与を制御します。`.auto_grant()` を付けない場合、または `false` を返す場合、有効化のみを行う既定の動作が維持されます。
+
+付与は永続します — これはセッション限りの有効化ではなく通常の `GRANT` です — そして加算的です：サーバーは、トークンが指定しなくなったロールを取り消すことはありません。
+
+`vsql_auth_test` はこれを `vsql_auth_test.auto_grant` として公開します。この変数も初期値は `OFF` です。この拡張機能の `-token-roles` トークンは `vsql_role_granted` と `vsql_role_denied` をステージングしますが、以下のアカウントはどちらも保持していません。設定がオフの場合、ログインはアカウントのロールをそのままにします：
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+CREATE ROLE vsql_role_granted, vsql_role_denied;
+```
+
+上記と同じ方法でそのトークンを使って `auth_user` として接続し、何が有効かを確認します：
+
+```text
++----------------+
+| CURRENT_ROLE() |
++----------------+
+| NONE           |
++----------------+
+```
+
+設定をオンにして、同じログインを繰り返します：
+
+```sql
+SET GLOBAL vsql_auth_test.auto_grant = ON;
+```
+
+```text
++------------------------------------------------+
+| CURRENT_ROLE()                                 |
++------------------------------------------------+
+| `vsql_role_denied`@`%`,`vsql_role_granted`@`%` |
++------------------------------------------------+
+```
+
+両方のロールが有効になり、`SHOW GRANTS` はサーバーが追加した付与を表示します：
+
+```sql
+SHOW GRANTS FOR vsql_auth_test_user;
+```
+
+```text
++-----------------------------------------------------------------------------------+
+| Grants for vsql_auth_test_user@%                                                  |
++-----------------------------------------------------------------------------------+
+| GRANT SELECT ON *.* TO `vsql_auth_test_user`@`%`                                  |
+| GRANT `vsql_role_denied`@`%`,`vsql_role_granted`@`%` TO `vsql_auth_test_user`@`%` |
++-----------------------------------------------------------------------------------+
+```
+
+<Warning>
+`.auto_grant()` がオンの場合、有効なトークンがあれば、それが指定するどのロールも取得できます。ロールはすでに存在している必要があるため、トークンが権限を作り出すことはできませんが、アカウントがどの既存ロールに到達できるかを決めるのは DBA ではなく方式になります。
+</Warning>

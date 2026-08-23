@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "Desenvolvimento em C++"
-description: "Profundidade na criação de VDFs para extensões C++ — tipos de argumento e resultado, agregações, prerun/postrun, varargs e registro."
+description: "Profundidade na criação de VDFs para extensões C++ — tipos de argumento e resultado, segurança de exceções, agregações, prerun/postrun, varargs e registro."
 ---
 
 Este guia é a referência aprofundada para escrever implementações de VDF em C++. Ele é o complemento de [Criando Extensões em C++](/pt-BR/mysql-8.4/stable/create), que cobre as etapas de compilação de ponta a ponta, e de [Testes em C++](/pt-BR/mysql-8.4/stable/testing), que cobre o ciclo de teste e iteração.
@@ -18,6 +18,42 @@ As funções de extensão são escritas em C++ e registradas com o VEF. Inclua u
 ```cpp
 #include <villagesql/vsql.h>
 ```
+
+## Segurança de Exceções {#exception-safety}
+
+Conter as exceções é responsabilidade da extensão. O SDK não envolve a sua
+implementação em um `try`/`catch`, e o servidor também não, então uma exceção
+que escapa de um ponto de entrada desenrola a pilha através da fronteira da ABI C
+sem nenhum tratador acima dela e o processo do servidor é encerrado. Uma entrada
+SQL comum chega a isso: `std::stoi()` lança uma exceção em uma string não numérica, e
+`nlohmann::json::dump()` lança uma exceção em um texto que não é UTF-8 válido.
+
+Envolva o corpo de cada ponto de entrada que você registrar: VDFs, funções de
+resultado de agregação e as operações `from_string`/`to_string` de um tipo personalizado.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <string>
+
+using namespace vsql;
+
+void to_int_impl(StringArg in, IntResult out) {
+  if (in.is_null()) { out.set_null(); return; }
+  try {
+    out.set(std::stoi(std::string(in.value())));  // throws on bad input
+  } catch (const std::exception &e) {
+    out.warning(e.what());
+  } catch (...) {
+    out.warning("unexpected error");
+  }
+}
+```
+
+Capture `...` além de `const std::exception &`: uma dependência pode lançar um
+tipo que não deriva de `std::exception`, e esse ainda encerra o servidor.
+Escolha entre `warning()` e `error()` com o mesmo critério de qualquer
+outra falha — `warning()` para entrada inválida à qual a instrução deve sobreviver,
+`error()` para os casos em que continuar é inseguro.
 
 ## Tipos de Argumento e Resultado {#argument-and-result-types}
 
@@ -153,7 +189,8 @@ void count_result(const CountState &s, IntResult out) { out.set(s); }
 Uma VDF agregada com `StringResult` retorna texto: o resultado informa o
 charset e a collation `utf8mb4_bin`, de modo que os clientes o exibem como caracteres
 em vez de hexadecimal — o mesmo que o caminho STRING da VDF escalar. Ela também respeita
-`.max_result_length(n)` da mesma forma, dimensionando um resultado agregado materializado
+`.max_result_length(n)` — o que exige os cabeçalhos de ABI de desenvolvimento
+opcionais (`-DVSQL_USE_DEV_ABI=ON`) e o Protocol 4 — da mesma forma, dimensionando um resultado agregado materializado
 (uma tabela temporária de `GROUP BY`/`DISTINCT`, `CREATE TABLE ... SELECT` ou UNION) de modo que ele
 não seja truncado na largura do argumento. Consulte
 [Tamanhos de Buffer Personalizados](/pt-BR/mysql-8.4/stable/create#custom-buffer-sizes) para as
@@ -275,6 +312,77 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .prerun<&ba_concat_all_prerun>()
 //     .build()
 ```
+
+## Ganchos de Carregamento e Descarregamento da Extensão {#extension-load-and-unload-hooks}
+
+Às vezes uma extensão tem trabalho a fazer uma vez por carregamento, em vez de uma
+vez por chamada — escolher uma implementação específica de CPU ou construir uma
+tabela de consulta que as VDFs depois leem. Registre esse trabalho com
+`.on_init<&Fn>()` no construtor da extensão, e a desmontagem correspondente com
+`.on_deinit<&Fn>()`. Ambos recebem uma função com a assinatura `void()`.
+
+<Warning>
+`.on_init<&Fn>()` e `.on_deinit<&Fn>()` são declarados apenas nos cabeçalhos de ABI
+de desenvolvimento opcionais (`-DVSQL_USE_DEV_ABI=ON`). Uma compilação padrão com a
+ABI estável não tem nenhum dos dois métodos, então registrar um gancho falha na compilação.
+</Warning>
+
+`on_init` é executado a cada carregamento da extensão: no `INSTALL EXTENSION` e
+novamente a cada inicialização do servidor, depois que o servidor validou e aceitou
+a extensão. Ele nunca é executado para uma extensão que o servidor rejeitou.
+`on_deinit` é executado no descarregamento — `UNINSTALL EXTENSION` ou desligamento
+do servidor.
+
+Ambos os ganchos são executados dentro do processo da extensão **sem acesso ao
+servidor**: eles não podem executar SQL, ler variáveis de sistema nem alcançar o
+estado do servidor. É por isso que eles são o lugar errado para uma configuração que
+precisa falar com o servidor — use a etapa de populate de uma capability Preview
+para isso.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cmath>
+using namespace vsql;
+
+static float *g_sqrt_table = nullptr;
+
+void build_table() {
+  g_sqrt_table = new float[256];
+  for (int i = 0; i < 256; i++) g_sqrt_table[i] = std::sqrt(float(i));
+}
+
+void free_table() {
+  delete[] g_sqrt_table;
+  g_sqrt_table = nullptr;
+}
+
+void fast_sqrt(IntArg n, RealResult out) {
+  if (n.is_null() || n.value() < 0 || n.value() > 255) {
+    out.set_null();
+    return;
+  }
+  out.set(g_sqrt_table[n.value()]);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .on_init<&build_table>()
+        .on_deinit<&free_table>()
+        .func(make_func<&fast_sqrt>("fast_sqrt")
+                  .returns(REAL)
+                  .param(INT)
+                  .build()))
+```
+
+Depois de `INSTALL EXTENSION my_extension`, `SELECT fast_sqrt(16)` retorna `4` —
+um resultado que só é alcançável se `build_table` já tiver sido executado.
+
+<Note>
+`on_deinit` é chamado a partir do ponto de entrada `vef_unregister` que
+`VEF_GENERATE_ENTRY_POINTS` gera. `VEF_GENERATE_REGISTRATION` não define esse
+ponto de entrada, então uma extensão que o utiliza precisa chamar a sua desmontagem
+a partir do `vef_unregister` que ela mesma escreve.
+</Note>
 
 ## VEF_GENERATE_REGISTRATION
 

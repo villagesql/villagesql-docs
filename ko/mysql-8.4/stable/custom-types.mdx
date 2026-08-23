@@ -29,7 +29,7 @@ size_t mytype_hash(vsql::CustomArg in) { /* ... */ }
 ```
 
 <Note>
-`from_string` VDF(문자열을 사용자 정의 유형으로 변환하는 함수)의 경우, 서버는 VDF를 호출하기 전에 출력 버퍼를 유형의 `persisted_length` 값 이상으로 크기 조정합니다. 따라서 `buf.size() >= persisted_length`가 호출 시 보장됩니다. 이는 고정 폭 유형과 매개변수화 유형(해당 유형 컨텍스트에서 `persisted_length`가 호출 시 해석됨) 모두에 적용됩니다. 별도의 버퍼 크기 요청이 필요하지 않습니다.
+`from_string` VDF(사용자 정의 유형을 반환하는 함수)의 경우, 서버는 VDF를 호출하기 전에 출력 버퍼를 유형의 `persisted_length` 값 이상으로 크기 조정합니다. 따라서 `buf.size() >= persisted_length`가 호출 시 보장됩니다. 이는 고정 폭 유형과 매개변수화 유형(해당 유형 컨텍스트에서 `persisted_length`가 호출 시 해석됨) 모두에 적용됩니다. 별도의 버퍼 크기 요청이 필요하지 않습니다.
 </Note>
 
 원시 바이너리 접근은 `vsql::Span<T>`를 통해 이루어집니다. 이는 `T`의 연속된 시퀀스를 가리키는 소유하지 않는 뷰로, `in.value()`는 `vsql::Span<const unsigned char>`를 반환하고 `out.buffer()`는 `vsql::Span<unsigned char>`를 반환합니다. C++20 이상에서는 `vsql::Span<T>`가 `std::span<T>`의 별칭이며, C++17에서는 동일한 `data()`, `size()`, `empty()`, 인덱싱, 반복자 인터페이스를 제공하는 최소한의 소스 호환 대체 구현이 C++ SDK에 포함됩니다. `#include <villagesql/vsql.h>`를 통해 사용할 수 있습니다.
@@ -124,8 +124,11 @@ SET val = MYTYPE::from_string(
 다음은 COMPLEX 숫자 유형을 구현한 완전한 예제입니다:
 
 ```cpp
-#include <cstdio>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <system_error>
 #include <villagesql/vsql.h>
 
 using namespace vsql;
@@ -134,11 +137,20 @@ using namespace vsql;
 void encode_complex(std::string_view from, CustomResult out) {
     auto buf = out.buffer();
     if (buf.size() < 16) return;
+    // strtod needs a null-terminated string; string_view is not one.
+    const std::string input(from);
+    const char *p = input.c_str();
     double real, imag;
-    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+    auto fail = [&] {
         out.warning("invalid complex format: expected (real,imag)");
-        return;
-    }
+    };
+    if (*p++ != '(') return fail();
+    char *endptr = nullptr;
+    real = strtod(p, &endptr);
+    if (endptr == p || *endptr != ',') return fail();
+    p = endptr + 1;
+    imag = strtod(p, &endptr);
+    if (endptr == p || *endptr != ')') return fail();
     memcpy(buf.data(), &real, 8);
     memcpy(buf.data() + 8, &imag, 8);
     out.set_length(16);
@@ -152,9 +164,19 @@ void decode_complex(CustomArg in, StringResult out) {
     memcpy(&real, data.data(), 8);
     memcpy(&imag, data.data() + 8, 8);
     auto buf = out.buffer();
-    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
-    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
-    out.set_length(static_cast<size_t>(len));
+    char *p = buf.data();
+    char *const end = p + buf.size();
+    if (p == end) return;
+    *p++ = '(';
+    auto re = std::to_chars(p, end, real);
+    if (re.ec != std::errc() || re.ptr == end) return;
+    p = re.ptr;
+    *p++ = ',';
+    auto im = std::to_chars(p, end, imag);
+    if (im.ec != std::errc() || im.ptr == end) return;
+    p = im.ptr;
+    *p++ = ')';
+    out.set_length(static_cast<size_t>(p - buf.data()));
 }
 
 // Compare for ORDER BY: real part first, then imaginary
@@ -174,6 +196,8 @@ int compare_complex(CustomArg a, CustomArg b) {
     return 0;
 }
 ```
+
+디코딩에는 `snprintf` 대신 `std::to_chars`를 사용합니다. `"%.6f"`와 같은 고정 정밀도 형식은 `double`에 필요한 자릿수를 버리므로, `0.1234567891`이 `0.123457`로 읽힙니다. 인코딩은 `strtod`를 호출하기 전에 입력을 복사하는데, `std::string_view`에는 종료 널 문자가 없기 때문입니다. `std::from_chars`의 부동소수점 오버로드를 사용하면 이 복사를 피할 수 있지만, libc++는 이 오버로드를 macOS 26부터만 사용할 수 있는 것으로 표시하므로 이를 사용하는 확장은 이전 대상에 대해 빌드에 실패합니다.
 
 이러한 연산을 정의한 후 사용자는 사용자 정의 유형을 사용해 테이블을 생성할 수 있습니다:
 
