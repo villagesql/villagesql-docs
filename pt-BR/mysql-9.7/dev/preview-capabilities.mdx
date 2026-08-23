@@ -1,0 +1,1913 @@
+---
+audience: extension-author
+title: "Capabilities Preview"
+description: "As capabilities Preview dão às extensões acesso a recursos do servidor que ainda estão se estabilizando. Esta página cobre a habilitação do nível Preview e as capabilities auth, keyring, mysql_services, status_var, sys_var, thread_worker, sql_query e statement_event, além de padrões de registro."
+---
+
+As capabilities Preview são recursos fornecidos pelo servidor e expostos às
+extensões antes que suas APIs sejam finalizadas. Uma extensão que declara uma
+capability Preview requer `vsql_allow_preview_extensions = ON` para instalar
+(consulte [Habilitando o Nível Preview](#enabling-the-preview-tier)) — as
+extensões que não usam capabilities Preview instalam normalmente,
+independentemente dessa configuração.
+
+<Warning>
+As APIs das capabilities Preview não são estáveis. Uma extensão compilada
+contra uma capability Preview pode falhar ao carregar após uma atualização do
+servidor. Quando uma capability se estabiliza, seu cabeçalho é movido para um
+caminho versionado do SDK C++ estável.
+</Warning>
+
+## Habilitando o Nível Preview {#enabling-the-preview-tier}
+
+Defina `vsql_allow_preview_extensions = ON` com `SET PERSIST` antes de instalar
+qualquer extensão que use uma capability Preview:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+```
+
+`SET GLOBAL` é rejeitado para essa variável — o servidor requer `SET PERSIST`
+para que a configuração sobreviva à reinicialização. As extensões com
+capabilities Preview são carregadas na inicialização, então a variável deve
+estar configurada como ON quando o servidor iniciar.
+
+Se você estiver iniciando o mysqld diretamente (por exemplo, a partir de um
+script de instalação que inicia o servidor pela primeira vez), passe a flag na
+linha de comando — o `mysqld-auto.cnf` ainda não existirá para carregar o valor
+persistido:
+
+```bash
+mysqld --vsql_allow_preview_extensions=ON
+```
+
+Para desabilitar:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = OFF;
+```
+
+Isso falha se qualquer extensão que usa uma capability Preview estiver
+instalada no momento. Desinstale essas extensões primeiro e então desative a
+configuração.
+
+## Índice de Capabilities
+
+| Capability | Cabeçalho | Status |
+|---|---|---|
+| `vsql::preview::auth` | `<villagesql/preview/auth.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
+| `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview |
+| `vsql::preview::index_profile` | `<villagesql/preview/index_builder.h>` | Preview — consulte [Índices Personalizados](/pt-BR/mysql-9.7/dev/custom-indexes) |
+| `vsql::preview::index_type` | `<villagesql/preview/index_builder.h>` | Preview — consulte [Índices Personalizados](/pt-BR/mysql-9.7/dev/custom-indexes) |
+| `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
+| `vsql::preview::mysql_services` | `<villagesql/preview/mysql_services.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
+| `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | Preview |
+| `vsql::preview::statement_event` | `<villagesql/preview/statement_event.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
+| `vsql::status_var` | `<villagesql/preview/status_var.h>` | Preview |
+| `vsql::preview::storage` | `<villagesql/preview/storage_builder.h>` | Preview |
+| `vsql::sys_var` | `<villagesql/preview/sys_var.h>` | Preview |
+| `vsql::preview::thread_worker` | `<villagesql/preview/thread_worker.h>` | Preview |
+
+## Padrão de Registro {#registration-pattern}
+
+Para usar uma capability Preview, declare um objeto de capability por valor no
+escopo do arquivo e passe-o por referência para `.with()` dentro de
+`make_extension()`. O servidor popula o pointer `abi` do objeto durante o
+registro:
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(g_keyring))
+```
+
+`.with(capability)` informa ao servidor quais capabilities a extensão requer. Se
+`vsql_allow_preview_extensions` estiver em OFF quando a extensão for instalada, o
+servidor rejeita a instalação com um erro que nomeia a extensão:
+`ERROR 3219 (HY000): Failed to load VEF extension 'name': extension requires
+preview capabilities but vsql_allow_preview_extensions is OFF`. A mensagem não
+informa qual capability foi responsável.
+
+<Warning>
+Todo objeto de capability declarado em uma extensão deve ser passado para
+`.with()` exatamente uma vez. No momento do carregamento, o servidor verifica
+cada instância de capability declarada em relação ao que `.with()` recebeu e faz
+o `INSTALL EXTENSION` falhar se a regra for violada:
+
+- **Declarada, mas nunca passada para `.with()`:**
+  `capability '<Type>' was declared but never passed to .with(); every CapabilityBase-derived static must be registered via .with(cap) in the extension builder`
+- **Mesma instância passada para `.with()` mais de uma vez:**
+  `capability '<Type>' passed to .with() more than once`
+- **Objeto passado para `.with()` não é uma capability:**
+  `.with() received an object that does not inherit vsql::detail::CapabilityBase; not a registered capability`
+
+O erro completo aparece como: `Failed to load VEF extension '<name>': vef_register returned an error: <message above>`.
+</Warning>
+
+## Acesso ao Keyring {#keyring-access}
+
+A capability keyring (`vsql::preview::keyring`) permite que as extensões leiam e
+escrevam segredos armazenados no componente keyring do MySQL. As extensões a
+usam para coisas como chaves de API, chaves de criptografia ou outros segredos
+que não deveriam ficar em tabelas SQL.
+
+O nome da capability `VEF_PREVIEW_KEYRING_NAME` é `"vsql::preview::keyring"`.
+
+Um componente keyring deve estar instalado no servidor MySQL para que leituras e
+escritas tenham sucesso. Sem um, as operações retornam
+`KeyringCapability::Status::UNAVAILABLE`.
+
+### Valores de Status
+
+`KeyringCapability::Status` é um enum com escopo retornado por `read()` (dentro
+de `ReadResult`) e por `write()`:
+
+| Status | Significado |
+|---|---|
+| `Status::OK` | A operação teve sucesso. |
+| `Status::NOT_FOUND` | A chave não existe (apenas leitura). |
+| `Status::UNAVAILABLE` | Nenhum componente keyring está instalado. |
+| `Status::ERROR` | Outra falha. |
+
+### Declarando a Capability
+
+Inclua o cabeçalho, declare um objeto de capability no escopo do arquivo e
+passe-o para `.with()`:
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_keyring))
+```
+
+O objeto `g_keyring` é populado pelo servidor no momento do carregamento. Os
+métodos `read()` e `write()` retornam `Status::UNAVAILABLE` em tempo de execução
+quando nenhum componente keyring está instalado — verifique esse status em cada
+chamada em vez de depender de uma verificação de disponibilidade separada.
+
+### Lendo e Escrevendo
+
+```cpp
+struct KeyringCapability::ReadResult {
+  KeyringCapability::Status status;
+  std::string value;
+};
+
+[[nodiscard]] KeyringCapability::ReadResult
+KeyringCapability::read(std::string_view data_id,
+                        std::string_view auth_id = {}) const;
+
+[[nodiscard]] KeyringCapability::Status
+KeyringCapability::write(std::string_view data_id,
+                         std::string_view auth_id,
+                         std::string_view data) const;
+```
+
+`data_id` é o identificador da chave. `auth_id` é o usuário proprietário — passe
+uma string vazia (ou omita-o em `read`, que assume `{}` como padrão) para ler ou
+escrever chaves internas não associadas a um usuário específico.
+
+`read` retorna um `ReadResult` por valor. Vincule-o com structured bindings:
+
+```cpp
+auto [status, value] = g_keyring.read("my_secret");
+if (status == KeyringCapability::Status::OK) {
+  // value contains the secret bytes
+}
+```
+
+Em qualquer status diferente de `Status::OK`, `value` fica vazio.
+
+`write` retorna `Status` diretamente e armazena `data` sob `data_id` /
+`auth_id`.
+
+### Exemplo Completo
+
+Esta é uma versão simplificada da extensão de teste `vsql_keyring_reader`, na
+árvore `villagesql/test-extensions/` do servidor. Ela registra 2 VDFs: `keyring_read` e
+`keyring_store`.
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+void keyring_read(StringArg data_id, StringArg auth_id, StringResult out) {
+  if (data_id.is_null()) { out.set_null(); return; }
+
+  const auto [status, value] =
+      g_keyring.read(data_id.value(), auth_id.is_null() ? "" : auth_id.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  if (status != KeyringCapability::Status::OK) { out.set_null(); return; }
+
+  auto buf = out.buffer();
+  size_t len = std::min(value.size(), buf.size());
+  memcpy(buf.data(), value.data(), len);
+  out.set_length(len);
+}
+
+void keyring_store(StringArg data_id, StringArg auth_id, StringArg value,
+                   IntResult out) {
+  if (data_id.is_null() || value.is_null()) { out.set(1); return; }
+
+  KeyringCapability::Status status = g_keyring.write(
+      data_id.value(), auth_id.is_null() ? "" : auth_id.value(), value.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  out.set(status == KeyringCapability::Status::OK ? 0 : 1);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&keyring_read>("keyring_read")
+                  .returns(STRING).param(STRING).param(STRING).build())
+        .func(make_func<&keyring_store>("keyring_store")
+                  .returns(INT).param(STRING).param(STRING).param(STRING).build())
+        .with(g_keyring))
+```
+
+## Serviços do MySQL {#mysql-services}
+
+A capability mysql_services (`vsql::preview::mysql_services`) permite que uma
+extensão consuma serviços do registro do MySQL — os mesmos serviços que um
+componente do MySQL consome, fornecidos por um componente instalado ou pelo
+núcleo do servidor. A extensão declara em um único lugar todos os serviços de
+que precisa; o servidor adquire cada um quando a extensão é carregada e o libera
+quando a extensão é descarregada.
+
+O nome da capability `VEF_PREVIEW_MYSQL_SERVICES_NAME` é
+`"vsql::preview::mysql_services"`.
+
+Recorra a ela quando um recurso do servidor não tiver uma capability VEF
+própria. Os atributos de sessão e os próprios serviços de componente do keyring
+são alcançáveis por esse caminho. Somente o consumo é suportado: registrar a
+implementação da própria extensão no registro é um trabalho futuro planejado e
+não faz parte desta capability.
+
+### Declarando a Capability
+
+Declare um objeto `MysqlServices` no escopo do arquivo, nomeie cada serviço que
+você consome com `VSQL_REQUIRE_SERVICE` e passe o objeto para `.with()`. Inclua
+o cabeçalho do próprio MySQL para cada serviço — é nesse cabeçalho que o tipo e
+os métodos do serviço são declarados:
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(services))
+```
+
+`VSQL_REQUIRE_SERVICE(services, name, var)` declara `var`, a referência na qual
+o servidor escreve o serviço adquirido, e registra `name` em `services`. Ele
+declara `var` como `static` para você. O objeto `MysqlServices` também precisa
+ser `static`, assim como qualquer referência que você declare manualmente: o
+servidor escreve através deles no carregamento, e eles precisam sobreviver à
+extensão.
+
+### Fixando uma Implementação Específica
+
+`VSQL_REQUIRE_SERVICE` usa `name` duas vezes — como o `SERVICE_TYPE(name)` do
+C++ e como a string que o servidor procura no registro. Sob esse nome simples, o
+servidor adquire a implementação padrão do serviço.
+
+Para nomear uma implementação em vez disso, use seu nome qualificado no
+registro — `service.component`, a forma que o `PROVIDES_SERVICE(component,
+service)` do MySQL gera. Isto pede o leitor de keyring do componente
+`component_keyring_file` em vez do padrão:
+
+```cpp
+static preview_mysql_services::ServiceRef<SERVICE_TYPE(keyring_reader_with_status)>
+    reader;
+static const int reader_req =
+    (services.require<SERVICE_TYPE(keyring_reader_with_status)>(
+         "keyring_reader_with_status.component_keyring_file", reader),
+     0);
+```
+
+Um nome qualificado é adquirido da mesma maneira que um nome simples, então vale
+a regra de sempre: se aquela implementação exata não estiver registrada, a
+extensão falha ao instalar em vez de recorrer a outra.
+
+### Compilando com os Cabeçalhos do MySQL
+
+As definições de serviço pertencem ao framework de componentes do MySQL, e não
+ao VEF, e o servidor não as instala. Portanto, `mysql/components/services/*.h`
+está ausente do SDK de extensões e de tudo o que é gerado por `make install`, o
+que inclui o tarball de release e a imagem Docker. Uma extensão que consome
+serviços é compilada contra uma árvore de código-fonte do servidor VillageSQL:
+
+| Caminho de include | Fornece |
+|---|---|
+| `<source>/include` | as definições de serviço, `mysql/components/services/*.h` |
+| `<build>/include` | cabeçalhos gerados em tempo de compilação, como `mysqld_error.h` |
+
+As extensões de teste internas à árvore obtêm ambos a partir da flag
+`MYSQL_HEADERS` de `vsql_add_test_extension()`, que os repassa como
+`MYSQL_INCLUDE_DIR` e `MYSQL_GENERATED_INCLUDE_DIR`. Uma compilação fora da
+árvore define seus próprios caminhos de include.
+
+Duas falhas de compilação aparecem em um lugar diferente da linha que as causou.
+
+Omitir o cabeçalho MySQL de um serviço deixa `VSQL_REQUIRE_SERVICE` com um nome
+que não resolve para nada, então o erro aparece na macro em vez de no include
+ausente (clang 17):
+
+```text
+error: unknown type name 'mysql_service_mysql_current_thread_reader_t'
+```
+
+Algumas definições de serviço usam `size_t` sem incluir `<cstddef>`, então
+colocar um desses cabeçalhos antes de todos os cabeçalhos villagesql falha
+dentro do próprio cabeçalho do MySQL:
+
+```text
+error: unknown type name 'size_t'
+```
+
+Inclua `<cstddef>` primeiro, como fazem os exemplos desta página.
+
+### Chamando um Serviço
+
+Uma referência de serviço expõe o seu próprio `valid()`, e `->` encaminha para o
+serviço. Use `.` para a referência e `->` para o serviço:
+
+```cpp
+if (!thd_reader.valid()) { out.error("service unavailable"); return; }
+MYSQL_THD thd = nullptr;
+if (thd_reader->get(&thd) || thd == nullptr) { out.set_null(); return; }
+```
+
+Verifique `valid()` antes de cada chamada com `->`. `->` retorna o pointer
+adquirido, que é nulo quando o serviço não foi adquirido.
+
+Um serviço que falha ao ser adquirido faz a instalação falhar, então, dentro de
+uma função em execução, um serviço requerido é válido. A verificação ainda
+importa, porque um `ServiceRef` declarado manualmente e nunca passado para
+`require()` nunca é escrito: ele compila, a extensão instala, e `valid()` é
+falso por toda a vida da extensão.
+
+O que um serviço *é* — seus métodos, seus parâmetros e o que eles retornam — é
+documentado pelo MySQL, não aqui. Para um serviço chamado `NAME`, leia
+`include/mysql/components/services/NAME.h` na árvore do servidor: seu bloco
+`BEGIN_SERVICE_DEFINITION(NAME)` declara cada método com a sua própria
+documentação. Chame-os exatamente como aquele cabeçalho especifica, incluindo a
+convenção do MySQL de que um retorno `bool` `false` significa sucesso e `true`
+significa falha.
+
+### Falha na Aquisição
+
+Todo serviço declarado é adquirido quando a extensão é carregada, antes que
+qualquer uma de suas funções possa ser chamada, então um serviço que não está
+registrado faz o carregamento falhar em vez de aparecer mais tarde. O
+`INSTALL EXTENSION` falha e nomeia o serviço.
+
+`vsql_mysql_services_missing_test`, abaixo, é uma extensão de teste interna à
+árvore que requer um serviço que o registro não tem. Não é algo que você possa
+instalar — é como a falha foi capturada, e é o que a sua própria extensão produz
+se ela requerer um serviço que este servidor não fornece:
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mysql_services_missing_test': failed to acquire MySQL service 'vsql_intentionally_missing'
+```
+
+Outras duas falhas de instalação chegam a esta capability de fora dela: deixar o
+objeto `MysqlServices` fora de `.with()` e instalar em um servidor com
+`vsql_allow_preview_extensions` OFF. Ambas são cobertas em
+[Padrão de Registro](#registration-pattern).
+
+### Exemplo Completo
+
+Uma versão simplificada de `vsql_mysql_services_session_test`, na árvore
+`villagesql/test-extensions/` do servidor. Ela lê o comando SQL em execução na
+sessão que a chamou compondo dois serviços: um devolve o `THD` atual, o outro lê
+um atributo nomeado a partir dele. Ambos são serviços do núcleo do servidor,
+registrados em todo servidor, então nada precisa ser instalado antes:
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/defs/mysql_string_defs.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+VSQL_REQUIRE_SERVICE(services, mysql_thd_attributes, attrs);
+
+// session_sql_command() -> STRING: the name of the SQL command running on the
+// calling session, or NULL when the THD or the attribute cannot be read.
+void session_sql_command(StringResult out) {
+  if (!thd_reader.valid() || !attrs.valid()) {
+    out.error("MySQL session services are not available");
+    return;
+  }
+
+  MYSQL_THD thd = nullptr;
+  // MySQL convention: a false return means success.
+  if (thd_reader->get(&thd) || thd == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  mysql_cstring_with_length value{nullptr, 0};
+  if (attrs->get(thd, "sql_command", &value) || value.str == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  out.set(std::string_view(value.str, value.length));
+}
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(services).func(
+    make_func<&session_sql_command>("session_sql_command")
+        .returns(STRING)
+        .no_params()
+        .build()))
+```
+
+Instale-a e chame a função:
+
+```sql
+INSTALL EXTENSION vsql_mysql_services_session_test;
+SELECT vsql_mysql_services_session_test.session_sql_command() AS sql_command;
+```
+
+```text
++-------------+
+| sql_command |
++-------------+
+| select      |
++-------------+
+```
+
+## Variáveis de Status {#status-variables}
+
+A capability status_var (`vsql::status_var`) permite que uma extensão
+exponha contadores `long long` e `double` como variáveis de status do MySQL. A
+extensão é dona do armazenamento e escreve nele; o servidor lê através dos
+pointers cada vez que a variável de status é consultada.
+
+Construa a capability com `vsql::preview_status_var::make_capability()`, passando
+uma lista entre chaves de descritores de `make_int(name, value_ptr)` ou
+`make_double(name, value_ptr)`. O template deduz a contagem a partir da lista
+entre chaves, então nenhum tamanho explícito é necessário.
+
+### Exemplo Completo
+
+```cpp
+#include <villagesql/preview/status_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_status_var;
+
+static long long g_hits   = 0;
+static long long g_misses = 0;
+
+static auto STATUS_VARS = sv::make_capability({
+    sv::make_int("ext_hits",   &g_hits),
+    sv::make_int("ext_misses", &g_misses)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STATUS_VARS))
+```
+
+`make_int` requer um `long long *`; `make_double` requer um `double *`. Esses são
+os únicos dois tipos compatíveis.
+
+### Acessando a partir do SQL
+
+Após `INSTALL EXTENSION my_ext`, a variável fica visível com o nome da extensão
+como prefixo:
+
+```sql
+SHOW GLOBAL STATUS LIKE 'my_ext%';
+```
+```
+Variable_name       Value
+my_ext.ext_hits     0
+my_ext.ext_misses   0
+```
+
+Incrementos concorrentes de múltiplas threads de consulta usando um `++`
+não-atômico podem ocasionalmente ser perdidos; isso é aceitável para contadores
+aproximados de chamadas expostos via `SHOW STATUS`.
+
+## Variáveis de Sistema {#system-variables}
+
+A capability sys_var (`vsql::sys_var`) permite que uma extensão registre
+variáveis de sistema do MySQL respaldadas por armazenamento de propriedade da
+extensão. Há suporte para quatro tipos: `BOOL` (`bool *`), `INT`
+(`long long *`), `DOUBLE` (`double *`) e `STR` (`char **`). Os descritores `INT` e
+`DOUBLE` também carregam limites `min_val` e `max_val`; todos os descritores
+carregam um valor padrão e um comentário.
+
+Construa a capability com `vsql::preview_sys_var::make_capability()` e as funções
+de fábrica correspondentes `make_bool`, `make_int`, `make_double` e `make_str`. O objeto de
+capability também expõe `get()` e `set()` para acesso programático a partir do
+código da extensão. Ambos retornam `false` em caso de sucesso.
+
+Para reagir a mudanças de valor, encadeie `.on_change<&fn>()` em um descritor. O
+callback recebe um `sv::SysVarChange` com `var_name()` e acessadores tipados
+(`as_int()`, `as_real()`, `as_str()`).
+
+O servidor chama esse callback enquanto mantém o seu lock global de variáveis de
+sistema. Ler ou escrever outra variável desta extensão através do seu pointer de
+armazenamento é seguro ali, e as outras sessões veem o novo valor imediatamente,
+porque o servidor lê essas variáveis sob o mesmo lock.
+
+<Warning>
+Chamar o `get()` ou o `set()` da capability, executar SQL ou esperar por uma
+thread que faça uma dessas coisas causa deadlock nesse lock. Mantenha o callback
+curto e não bloqueante, entregue a uma [thread de trabalho](#thread-worker) o
+trabalho que precisa de SQL, ou libere o `LOCK_global_system_variables` em volta
+da parte bloqueante e retome-o antes de retornar, como o
+`event_scheduler_update()` faz em `sql/sys_vars.cc`.
+</Warning>
+
+O objeto de capability deve ter duração de armazenamento estática. O MySQL
+escreve diretamente nos pointers de armazenamento quando o usuário define uma
+variável.
+
+| Fábrica | Tipo de armazenamento | Parâmetros extras |
+|---------|--------------|------------------|
+| `sv::make_bool` | `bool *` | `def_val` |
+| `sv::make_int` | `long long *` | `def_val`, `min_val`, `max_val` |
+| `sv::make_double` | `double *` | `def_val`, `min_val`, `max_val` |
+| `sv::make_str` | `char **` | `def_val` |
+
+### Exemplo Completo
+
+```cpp
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_sys_var;
+
+static bool      g_enabled   = true;
+static long long g_threshold = 1000;
+static char     *g_log_file  = nullptr;
+
+static void on_threshold_change(sv::SysVarChange c) {
+  // c.var_name() identifies the variable; c.as_int() returns the new value
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled",      "Enable feature",  &g_enabled,   true),
+    sv::make_int ("threshold_ms", "Threshold in ms", &g_threshold, 1000, 0, 3600000)
+        .on_change<&on_threshold_change>(),
+    sv::make_str ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log")});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SYS_VARS))
+```
+
+### Acessando a partir do SQL
+
+Após `INSTALL EXTENSION my_ext`, as variáveis ficam acessíveis usando o nome da
+extensão como prefixo de componente:
+
+```sql
+SELECT @@global.my_ext.threshold_ms;
+SET GLOBAL my_ext.threshold_ms = 500;
+SET GLOBAL my_ext.log_file = '/var/log/myext.log';
+```
+
+### Lendo e Escrevendo a partir do Código da Extensão
+
+Para variáveis INT e BOOL, leia o pointer de armazenamento global diretamente —
+o MySQL atualiza esses valores atomicamente. Para atualizar uma variável através
+do MySQL (de forma que travamento, validação de intervalo e persistência sejam
+tratados pelo servidor), chame
+`SYS_VARS.set(extension_name, var_name, scope, value)`. Tanto `set` quanto `get`
+retornam `false` em caso de sucesso. Nenhum dos dois pode ser chamado a partir de
+um callback `on_change`: ambos causam deadlock no lock de variáveis de sistema.
+
+```cpp
+bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
+```
+
+O argumento `scope` controla a persistência:
+
+| Escopo | Comportamento |
+|-------|----------|
+| `nullptr` | Atualiza apenas o valor em execução, não persistido. |
+| `"PERSIST"` | Atualiza o valor em execução e escreve em `mysqld-auto.cnf`. |
+| `"PERSIST_ONLY"` | Escreve apenas em `mysqld-auto.cnf`; entra em vigor na próxima reinicialização. |
+
+## Thread de Trabalho {#thread-worker}
+
+A capability thread worker (`vsql::preview::thread_worker`) permite que uma
+extensão execute uma thread em segundo plano conduzida pelo servidor. A thread é
+iniciada e parada através de uma variável de sistema de controle que o servidor
+registra no carregamento da extensão; o servidor invoca a função de trabalho da
+extensão em um temporizador periódico, na prontidão de um descritor de arquivo,
+ou em resposta a eventos de habilitação/desabilitação.
+
+O nome da capability `VEF_PREVIEW_THREAD_WORKER_NAME` é
+`"vsql::preview::thread_worker"`.
+
+### Declarando a Capability
+
+Inclua o cabeçalho, declare um `ThreadWorkerCapability` instanciado sobre a sua
+função de trabalho no escopo do arquivo e passe-o para `.with()`:
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"suffix"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+A função de trabalho é fornecida como um argumento de template não-tipo
+(`ThreadWorkerCapability<&my_work>`), portanto deve ser uma função com a
+assinatura mostrada abaixo. O primeiro argumento do construtor é o sufixo do nome
+da thread; o segundo argumento, opcional, sobrescreve o nome da variável de
+sistema de controle.
+
+### Assinatura da Função de Trabalho
+
+```c
+typedef vef_next_wakeup_t (*vef_work_fn_t)(vef_wakeup_reason_t reason,
+                                           struct vef_thread_handle_t *thread,
+                                           void *arg);
+```
+
+`reason` indica por que o servidor chamou a função. `thread` é o handle de
+propriedade do servidor para este worker (NULL na chamada inicial de
+`VEF_WAKEUP_ENABLE` — veja abaixo). `arg` é o pointer opaco registrado no
+descritor; ele é repassado inalterado.
+
+### Ciclo de Vida do Wakeup
+
+O servidor chama a função de trabalho com um de quatro motivos:
+
+| Motivo | Significado |
+|---|---|
+| `VEF_WAKEUP_ENABLE` | O worker acabou de ser habilitado (variável de sistema de controle foi alterada para ON). O valor de retorno define o `poll_fd` e o `sleep_ms` iniciais. |
+| `VEF_WAKEUP_PERIODIC` | O temporizador periódico disparou (`sleep_ms` decorrido). |
+| `VEF_WAKEUP_POLL_FD` | Um descritor de arquivo monitorado tornou-se pronto para leitura. |
+| `VEF_WAKEUP_DISABLE` | Worker desabilitado (variável de sistema de controle em OFF) ou servidor desligando. O valor de retorno é ignorado. |
+
+O parâmetro `thread` é NULL quando o motivo é `VEF_WAKEUP_ENABLE`, porque o
+handle da thread ainda não existe nesse ponto. Para os outros três motivos,
+`thread` é não-nulo.
+
+### Valor de Retorno do Wakeup
+
+```c
+typedef struct {
+  unsigned int sleep_ms;
+  int poll_fd;
+} vef_next_wakeup_t;
+```
+
+A função de trabalho retorna um `vef_next_wakeup_t` para atualizar a configuração
+do próximo wakeup. Um valor zero em qualquer um dos campos significa "manter a
+configuração atual" — retorne uma struct inicializada por valor (`return {};`)
+para deixar ambos inalterados.
+
+Para definir um novo descritor de arquivo de poll, retorne seu valor (deve ser
+maior que zero). Para limpar um descritor de arquivo de poll existente, retorne
+`-1` em `poll_fd`.
+
+O valor de retorno é ignorado quando o motivo é `VEF_WAKEUP_DISABLE`.
+
+### Nome da Thread e Variável de Controle
+
+Dois campos no descritor controlam a nomenclatura:
+
+- `suffix` — o sufixo do nome da thread. O servidor antepõe o nome da extensão,
+  produzindo nomes de thread como `my_ext/monitor`.
+- `var_name` — opcional. Quando não-nulo, o servidor registra exatamente este
+  nome como a variável de sistema de controle. Quando nulo, o servidor usa o
+  padrão `{suffix}_enabled`.
+
+A variável de controle é uma variável de sistema registrada pelo servidor, então
+ela recebe o nome da extensão como prefixo de componente. Para a extensão
+`my_ext` com o sufixo `monitor`, a variável é `my_ext.monitor_enabled`.
+
+Defini-la como `ON` inicia o worker: o servidor chama a função de trabalho com
+`VEF_WAKEUP_ENABLE` e então cria a thread, de modo que a instrução só retorna
+depois que essa primeira chamada termina. Defini-la como `ON` de novo enquanto o
+worker já está em execução não faz nada. Defini-la como `OFF` retorna depois que
+a thread termina. O servidor libera o seu lock global de variáveis de sistema em
+volta das duas operações, então a função de trabalho pode ler variáveis de
+sistema e executar SQL.
+
+### Exemplo Completo
+
+Uma extensão mínima com um único worker periódico que incrementa um contador de
+heartbeat a cada tique do temporizador.
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+#include <atomic>
+
+static std::atomic<unsigned long long> g_heartbeat{0};
+
+static vef_next_wakeup_t heartbeat_work(vef_wakeup_reason_t reason,
+                                        struct vef_thread_handle_t *thread,
+                                        void *arg) {
+  switch (reason) {
+    case VEF_WAKEUP_ENABLE:
+      return {1000, 0};  // tick every 1000 ms, no poll fd
+    case VEF_WAKEUP_PERIODIC:
+      g_heartbeat.fetch_add(1, std::memory_order_relaxed);
+      return {};  // keep current sleep_ms and poll_fd
+    case VEF_WAKEUP_POLL_FD:
+      return {};  // not used in this example
+    case VEF_WAKEUP_DISABLE:
+      return {};  // ignored
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&heartbeat_work>
+    g_worker{"heartbeat"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+Com essa extensão instalada (e `vsql_allow_preview_extensions = ON`), o servidor
+registra uma variável de sistema `heartbeat_enabled` sob o nome da extensão. Para
+uma extensão chamada `my_ext`, habilite o worker com:
+
+```sql
+SET GLOBAL my_ext.heartbeat_enabled = ON;
+```
+
+## Consulta SQL
+
+A capability sql_query (`vsql::preview::sql_query`) permite que uma extensão
+execute instruções SQL a partir de uma thread em segundo plano. As consultas são
+executadas dentro do servidor através da vtable da capability — as extensões não
+são vinculadas a nenhuma biblioteca cliente do MySQL.
+
+O nome da capability `VEF_PREVIEW_SQL_QUERY_NAME` é
+`"vsql::preview::sql_query"`.
+
+<Warning>
+Uma sessão SQL deve ser aberta a partir de um callback de thread worker usando o
+`vef_thread_handle_t *` daquele callback. `open()` não é válido a partir de VDFs
+ou de threads arbitrárias criadas pela extensão — ele requer o contexto de sessão
+do worker.
+</Warning>
+
+### Declarando a Capability
+
+Inclua o cabeçalho, declare um `SqlQueryCapability` no escopo do arquivo e
+passe-o para `.with()`. Ele é tipicamente registrado junto de um
+`ThreadWorkerCapability`, já que as sessões são abertas a partir do callback do
+worker:
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
+
+`g_sql.open(handle)` retorna uma `Session`. Verifique-a com `operator bool` antes
+de usá-la; uma `Session` inválida indica que a vtable da capability não foi
+vinculada ou que o servidor não conseguiu alocar uma sessão. A `Session` é
+move-only e se fecha na destruição.
+
+### Executando Consultas
+
+Uma `Session` produz uma `SqlQuery` via `session.sql(sv)`. A consulta pode ser
+executada em dois modos:
+
+- `execute()` — executa a instrução e armazena em buffer todo o conjunto de
+  resultados em um `Result`. Itere as linhas chamando `next()` no ritmo do
+  chamador.
+- `for_each(fn)` — executa a instrução e invoca `fn` uma vez por linha à medida
+  que as linhas são produzidas, sem armazenar em buffer. O `Result` retornado
+  carrega apenas diagnósticos (nenhuma linha).
+
+Ambos retornam um `Result`. Um `Result` não-nulo não significa que a instrução
+teve sucesso — chame `has_error()` para descobrir.
+
+Em buffer (`execute`):
+
+```cpp
+auto result = session.sql("SELECT id, name FROM t").execute();
+if (result.has_error()) {
+  // result.error().message holds the server error string.
+  return {};
+}
+while (result.next()) {
+  long long id          = result.column_int(0);
+  std::string_view name = result.column_str(1);
+  // ...
+}
+```
+
+`column_str()` retorna um `string_view` que é válido apenas até a próxima chamada
+de `next()` ou até que o `Result` seja destruído. Copie-o se um tempo de vida
+mais longo for necessário. Um `string_view` com `data() == nullptr` indica SQL
+NULL.
+
+Em streaming (`for_each`):
+
+```cpp
+auto status = session.sql("SELECT 1").for_each(
+    [](const auto &row) {
+      // row.column_int(0), row.column_str(1), etc.
+    });
+if (status.has_error()) {
+  // status.error().message
+}
+```
+
+A `Row` passada para o callback é válida apenas durante a chamada — não armazene
+referências a ela entre as linhas. O `Result` retornado por `for_each` não contém
+linhas em buffer; `next()` nele não produzirá dados. Use-o apenas para
+`has_error()`, `error()`, `warning_count()` e `warning(i)`.
+
+### Diagnósticos
+
+Tanto `execute()` quanto `for_each()` expõem diagnósticos através do `Result`
+retornado. Um diagnóstico é um `Diag`:
+
+```cpp
+struct Diag {
+  uint32_t errno_;
+  vef_sql_diag_severity_t severity;   // NOTE | WARNING | ERROR
+  std::string_view sqlstate;          // 5-char SQLSTATE
+  std::string_view message;           // may be empty
+};
+```
+
+| Campo | Significado |
+|---|---|
+| `errno_` | Número do erro do MySQL. `0` em um `Diag` construído por padrão, retornado quando não há erro. |
+| `severity` | `VEF_SQL_DIAG_NOTE`, `VEF_SQL_DIAG_WARNING` ou `VEF_SQL_DIAG_ERROR`. |
+| `sqlstate` | SQLSTATE de 5 caracteres. |
+| `message` | Mensagem de diagnóstico fornecida pelo servidor; pode estar vazia. |
+
+`Result` expõe:
+
+```cpp
+bool         Result::has_error() const;
+Diag         Result::error() const;
+unsigned int Result::warning_count() const;
+Diag         Result::warning(unsigned int i) const;
+```
+
+`error()` retorna um `Diag` construído por padrão (`errno_ == 0`) quando a
+instrução teve sucesso. `warning(i)` retorna um `Diag` construído por padrão
+quando `i >= warning_count()`.
+
+Os views `sqlstate` e `message` apontam para armazenamento de propriedade do
+`Result` e se tornam inválidos quando o `Result` é destruído — copie-os se eles
+precisarem sobreviver a ele.
+
+### Exemplo Completo
+
+Um worker que executa uma consulta em buffer e uma consulta em streaming a cada
+tique, registrando diagnósticos de ambas:
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t sql_demo_work(vef_wakeup_reason_t reason,
+                                       struct vef_thread_handle_t *thread,
+                                       void *arg) {
+  if (reason == VEF_WAKEUP_ENABLE) return {5000, 0};
+  if (reason != VEF_WAKEUP_PERIODIC) return {};
+
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+
+  // Buffered: read a small result set.
+  auto rs = session.sql("SELECT id, name FROM mydb.t LIMIT 10").execute();
+  if (rs.has_error()) {
+    auto e = rs.error();
+    // Log e.errno_, e.sqlstate, e.message somewhere extension-owned.
+  } else {
+    while (rs.next()) {
+      long long id          = rs.column_int(0);
+      std::string_view name = rs.column_str(1);
+      (void)id; (void)name;
+    }
+  }
+
+  // Streaming: process rows without buffering.
+  auto status = session.sql("SELECT v FROM mydb.t").for_each(
+      [](const auto &row) {
+        long long v = row.column_int(0);
+        (void)v;
+      });
+  for (unsigned i = 0; i < status.warning_count(); ++i) {
+    auto w = status.warning(i);
+    (void)w;
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&sql_demo_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
+
+## Armazenamento de Colunas {#column-storage}
+
+O column storage permite que uma extensão registre um layout binário
+personalizado em disco diretamente com o InnoDB para um de seus tipos
+personalizados, em vez de rotear os bytes do tipo através do payload VARBINARY da
+linha. Use-o quando o seu tipo precisa de um formato em disco que o VARBINARY não
+consegue expressar — por exemplo, um array compactado de floats que precisa
+residir em páginas dedicadas. Este é um recurso de capability: ele habilita novos
+layouts de armazenamento, não é um botão de ajuste para os existentes.
+
+<Warning>
+  O column storage é uma ABI Preview — em desenvolvimento ativo e pode mudar
+  entre versões. Atualmente cobre apenas a persistência em nível de linha; a
+  indexação sobre colunas com armazenamento personalizado ainda não está
+  disponível.
+</Warning>
+
+### Declarando as Capabilities
+
+Duas capabilities Preview trabalham juntas:
+
+- `vsql::preview::storage` — abre acesso à infraestrutura de armazenamento do
+  InnoDB (mini-transações, segmentos, páginas). Declare uma `StorageCapability`
+  no escopo do arquivo.
+- `vsql::preview::column_store` — vincula uma implementação de armazenamento por
+  tipo a um dos tipos personalizados da extensão. Declare uma
+  `ColumnStoreCapability` no escopo do arquivo usando
+  `make_column_store<Ctx>(TYPE).…build()`.
+
+Ambas devem ser passadas para `.with()` em `make_extension()`:
+
+```cpp
+#include <villagesql/preview/storage_builder.h>
+#include <villagesql/preview/storage_api.h>
+#include <villagesql/vsql.h>
+
+namespace storage = vsql::preview_storage;
+using vsql::preview_storage_builder::ColumnStoreCapability;
+using vsql::preview_storage_builder::make_column_store;
+using vsql::preview_storage_builder::StorageCapability;
+
+struct MyCtx {
+  storage::Space::Ref space = 0;
+  storage::Segment::PageRef root_page = storage::Page::INVALID_REF;
+};
+
+static auto STORAGE = StorageCapability{};
+
+static constexpr auto kMyStorage =
+    make_column_store<MyCtx>(MY_TYPE)
+        .create<&MyStorage::create>()
+        .drop<&MyStorage::drop>()
+        .load<&MyStorage::load>()
+        .insert<&MyStorage::insert>()
+        .select<&MyStorage::select>()
+        .mark_delete<&MyStorage::mark_delete>()
+        .purge<&MyStorage::purge>()
+        .build();
+
+static auto COLUMN_STORE = ColumnStoreCapability().column_store(kMyStorage);
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STORAGE)
+        .with(COLUMN_STORE)
+        .type(MY_TYPE))
+```
+
+`make_column_store<MyCtx>(MY_TYPE)` liga a implementação a um tipo personalizado
+registrado na mesma extensão. Todos os sete slots são obrigatórios no momento do
+`build()`, porque cada um mapeia para um ponto distinto no ciclo de vida da
+coluna que o InnoDB alcançará durante a operação normal.
+
+### As Sete Funções de Armazenamento
+
+Toda função recebe `storage::Column::StorageCtx<MyCtx>*`, cujo acessador `user()`
+retorna o estado por coluna da extensão e cujo `arena()` fornece alocação
+gerenciada pelo servidor para objetos auxiliares. Toda função retorna `false` em
+caso de sucesso e `true` em caso de erro, escrevendo uma mensagem em `error_msg`
+(capacidade `error_msg_len`) para que as falhas apareçam ao cliente SQL.
+
+```cpp
+// CREATE TABLE / ALTER TABLE ADD COLUMN.
+// col_len is the type's persisted length. Reserve segments here and store
+// space + root_page in ctx->user() so DML functions can reach them.
+bool create(storage::Column::StorageCtx<MyCtx>*, storage::Space::Ref,
+            storage::Segment::TrxRef, uint32_t col_len,
+            char* error_msg, uint32_t error_msg_len);
+
+// DROP TABLE / ALTER TABLE DROP COLUMN.
+// Release any segments reserved in create(). Arena memory is freed by the
+// server after this call returns.
+bool drop(storage::Column::StorageCtx<MyCtx>*, storage::Segment::TrxRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// Called when the server reattaches to existing storage (e.g. after restart).
+// Recover space and root_page from the StorageRef set in create().
+bool load(storage::Column::StorageCtx<MyCtx>*, storage::Column::StorageRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// INSERT. col_data is the encoded value; rowid_prefix identifies the owning
+// row. Write into your storage layout and return a Column::Ref the server
+// stores in the row payload in place of the value bytes.
+bool insert(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Segment::TrxRef, storage::Column::Data col_data,
+            storage::Column::Data rowid_prefix, storage::Column::Ref* col_ref,
+            char* error_msg, uint32_t error_msg_len);
+
+// SELECT. Given the Column::Ref produced by insert, populate col_data and
+// rowid_prefix, and report the writing transaction and delete-mark status.
+bool select(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Column::Ref, storage::Column::Data* col_data,
+            storage::Column::Data* rowid_prefix, storage::Segment::TrxRef*,
+            bool* delete_marked, char* error_msg, uint32_t error_msg_len);
+
+// DELETE (in-transaction). Set or clear the delete-mark flag. The actual
+// bytes must remain readable until purge() runs.
+bool mark_delete(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+                 storage::Segment::TrxRef, storage::Column::Ref,
+                 bool delete_mark, char* error_msg, uint32_t error_msg_len);
+
+// InnoDB purge. Reclaim storage for entries whose deleting transaction is
+// no longer visible to any active snapshot.
+bool purge(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+           storage::Segment::TrxRef, storage::Column::Ref,
+           char* error_msg, uint32_t error_msg_len);
+```
+
+`mark_delete` e `purge` são distintos porque o MVCC do InnoDB requer que as
+linhas excluídas permaneçam legíveis por snapshots mais antigos até que o purge
+seja executado.
+
+### Contexto por Coluna e a Arena
+
+O SDK C++ constrói `MyCtx` por padrão antes de chamar `create` ou `load` —
+`ctx->user()` já está populado quando a sua função é acionada. `MyCtx` deve ser
+construível por padrão; o SDK C++ chama `T()` sem argumentos.
+
+Use `ctx->user()` diretamente para inicializar o estado. Não chame
+`ctx->arena().construct<MyCtx>()` — isso aloca uma segunda instância não utilizada
+e `ctx->user()` não aponta para ela.
+
+```cpp
+bool MyStorage::create(storage::Column::StorageCtx<MyCtx>* ctx,
+                       storage::Space::Ref space, storage::Segment::TrxRef trx,
+                       uint32_t col_len,
+                       char* error_msg, uint32_t error_msg_len) {
+  storage::Segment::PageRef root;
+  if (storage::Segment::create(space, 1, trx, root) != storage::Error::SUCCESS) {
+    snprintf(error_msg, error_msg_len, "%s", storage::last_error().data());
+    return true;
+  }
+
+  ctx->user()->space = space;
+  ctx->user()->root_page = root;
+  // Encode space and root into StorageRef so load() can recover both.
+  ctx->set_ref((static_cast<storage::Column::StorageRef>(space) << 32) |
+               static_cast<storage::Column::StorageRef>(root));
+  return false;
+}
+```
+
+`load` segue o mesmo padrão — `ctx->user()` é pré-populado e `storage_ref` carrega
+o valor compactado armazenado por `ctx->set_ref()` em `create`:
+
+```cpp
+bool MyStorage::load(storage::Column::StorageCtx<MyCtx>* ctx,
+                     storage::Column::StorageRef storage_ref,
+                     char* error_msg, uint32_t error_msg_len) {
+  ctx->user()->space =
+      static_cast<storage::Space::Ref>(storage_ref >> 32);
+  ctx->user()->root_page =
+      static_cast<storage::Segment::PageRef>(storage_ref & 0xFFFFFFFF);
+  ctx->set_ref(storage_ref);
+  return false;
+}
+```
+
+Use `ctx->arena()` apenas para alocar objetos auxiliares que são grandes demais ou
+dinâmicos demais para embutir diretamente em `MyCtx`. O SDK C++ destrói a arena
+(e chama `~MyCtx()`) automaticamente após o retorno de `drop`, independentemente
+de `drop` ter sucesso.
+
+### Utilitários de Acesso ao InnoDB
+
+Inclua `<villagesql/preview/storage_api.h>` para os primitivos do InnoDB. Todas as
+leituras e escritas de página devem ocorrer dentro de uma mini-transação:
+
+```cpp
+storage::MtrCtx mtr;
+storage::MtrCtx::Ref mtr_ref = mtr.start();
+if (mtr_ref == nullptr) { /* OOM — handle error */ return true; }
+// ... page operations ...
+mtr.commit();
+```
+
+Confirmar a mini-transação libera os latches de página e escreve os registros do
+redo log que tornam as mudanças duráveis.
+
+**Segmentos** são reservados no momento do `create` — veja os exemplos de
+`create` e `load` em Contexto por Coluna acima para o padrão completo de
+configuração. Durante as operações DML, obtenha uma referência de segmento a
+partir da página raiz para alocar novas páginas:
+
+```cpp
+storage::Page root;
+root.load(ctx->user()->space, ctx->user()->root_page,
+          storage::Page::Latch::EXCLUSIVE, mtr_ref);
+storage::Segment::Ref seg = storage::Segment::get_header(root, 0);
+storage::Page data_page;
+data_page.load_new(seg, mtr_ref);  // allocates a fresh page
+```
+
+**Páginas** são lidas com um latch compartilhado e escritas com um exclusivo.
+Passe `mtr_ref` para as chamadas de escrita para que o InnoDB registre a mudança:
+
+```cpp
+storage::Page page;
+
+// Read
+page.load(ctx->user()->space, page_num, storage::Page::Latch::SHARED, mtr_ref);
+uint32_t v = page.read_integer_4(storage::Page::HEADER_SIZE + offset);
+
+// Write
+page.load(ctx->user()->space, page_num, storage::Page::Latch::EXCLUSIVE, mtr_ref);
+page.write_integer_4(storage::Page::HEADER_SIZE + offset, v, mtr_ref);
+```
+
+Constantes de layout de página:
+
+| Constante | Valor | Notas |
+|---|---|---|
+| `storage::Page::HEADER_SIZE` | `38` | Os dados da extensão começam neste offset. |
+| `storage::Page::TRAILER_SIZE` | `8` | Não escreva além de `page_size - TRAILER_SIZE`. |
+| `storage::Page::get_size(space)` | runtime | Use em vez de codificar 16384 fixamente. |
+
+Ler ou escrever dentro das regiões de cabeçalho ou trailer corrompe a página — o
+InnoDB usa esses intervalos de bytes para sua própria contabilidade e checksum.
+
+## Eventos de Instrução
+
+A capability statement event (`vsql::preview::statement_event`) executa um handler
+fornecido pela extensão após cada consulta terminar de executar. O servidor invoca
+o handler sincronamente na própria thread da consulta e passa metadados de
+execução — o texto da consulta, tempo, contagens de linhas, identidade da conexão
+e indicadores de qualidade do otimizador. Use-o para registro de consultas lentas,
+auditoria ou coleta de métricas.
+
+O nome da capability `VEF_PREVIEW_STATEMENT_EVENT_NAME` é
+`"vsql::preview::statement_event"`.
+
+### Declarando a Capability
+
+Declare um `StatementEventCapability`, instanciado sobre a fase de disparo e a sua
+função handler, no escopo do arquivo e passe-o para `.with()`:
+
+```cpp
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/vsql.h>
+
+namespace se = vsql::preview_statement_event;
+
+static void on_statement(const se::StatementEventArgs &args,
+                         se::StatementEventResult &result) {
+  // inspect args; optionally write an advisory message via result
+}
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &on_statement>
+    g_statement_event;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_statement_event))
+```
+
+O primeiro argumento de template é a fase de disparo, um valor
+`vef_statement_event_phase_t`. `VEF_STATEMENT_EVENT_POSTEXECUTE` dispara após uma
+consulta terminar de executar, em caso de sucesso ou falha, e é a única fase
+implementada nesta versão. Os outros valores de `vef_statement_event_phase_t` são
+reservados; declarar um handler para um deles faz o servidor rejeitar o
+`INSTALL EXTENSION`.
+
+### Argumentos do Handler
+
+`StatementEventArgs` é um view somente leitura da consulta concluída; na fase
+POSTEXECUTE todos os campos estão populados. Acessadores selecionados:
+
+| Acessador | Significado |
+|---|---|
+| `query()` | Texto da consulta, como um `string_view`. Quando o servidor tem uma forma reescrita da instrução, este é aquela forma — o mesmo texto ofuscado que os logs geral, lento e binário registram. |
+| `query_time_secs()` | Tempo real de execução, em segundos. |
+| `lock_time_secs()` | Tempo gasto esperando por bloqueios, em segundos. |
+| `rows_sent()`, `rows_examined()`, `rows_affected()` | Contadores de linhas. |
+| `user()`, `client_ip()`, `connection_id()` | Identidade da conexão. |
+| `schema()` | Esquema padrão, ou `NULL` se nenhum estiver selecionado. |
+| `status()` | `0` em caso de sucesso, caso contrário o código de erro do MySQL. |
+| `digest_text()` | Forma normalizada da consulta, para agrupar consultas semelhantes. |
+| `no_index_used()` | `true` quando a consulta foi executada sem um índice utilizável. |
+| `digest_hash()` | Digest da instrução em 64 caracteres hexadecimais minúsculos — o valor que o `performance_schema` expõe como `DIGEST`. Uma chave compacta para agrupar instruções idênticas; é `NULL` sempre que `digest_text()` for. |
+| `read_first()`, `read_last()`, `read_key()`, `read_next()`, `read_prev()`, `read_rnd()`, `read_rnd_next()` | Contadores de acesso a linhas do handler por instrução (os campos `Read_*` do log de consultas lentas). Eles quantificam o método de acesso que `no_index_used()` apenas sinaliza — um `read_rnd_next()` alto, por exemplo, indica uma varredura completa de tabela. |
+
+Como `query()` retorna a forma reescrita do servidor quando existe uma, as
+instruções que carregam credenciais chegam com o segredo ofuscado em vez de em
+texto claro, correspondendo à forma como os logs geral, lento e binário já os
+ofuscam: `SET PASSWORD`, `CREATE`/`ALTER USER ... IDENTIFIED BY`,
+`CHANGE REPLICATION SOURCE ... SOURCE_PASSWORD` e
+`CREATE SERVER ... OPTIONS(PASSWORD ...)`. As instruções sem regra de reescrita
+são entregues literalmente.
+
+Os acessadores de string como `query()`, `sqlstate()` e `error_message()` apontam
+para armazenamento que é válido apenas durante a chamada do handler — copie os
+bytes se você precisar deles depois que o handler retornar.
+
+`StatementEventResult::error_msg(fmt, ...)` escreve uma mensagem formatada com
+printf. Na fase POSTEXECUTE a mensagem é informativa: o servidor a registra, mas
+não a propaga para o cliente.
+
+### Exemplo Completo
+
+Uma forma condensada da extensão de teste
+[`vsql_slow_query_log`](https://github.com/villagesql/villagesql-server/tree/main/villagesql/test-extensions/vsql-slow-query-log).
+Ela registra cada consulta cujo tempo de
+execução excede um limiar, combinando a capability statement event com
+[variáveis de sistema](#system-variables) para configuração em tempo de execução:
+
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+namespace sv = vsql::preview_sys_var;
+namespace se = vsql::preview_statement_event;
+
+static bool g_enabled;
+static long long g_threshold_ms;
+static char *g_log_filename;
+static std::mutex g_log_mutex;
+
+static void slow_query_hook(const se::StatementEventArgs &args,
+                            se::StatementEventResult &result) {
+  if (!g_enabled) return;
+  if (args.query_time_secs() * 1000.0 < static_cast<double>(g_threshold_ms))
+    return;
+
+  time_t now = static_cast<time_t>(args.query_start_utime() / 1000000);
+  char ts[32];
+  struct tm tm_utc;
+  gmtime_r(&now, &tm_utc);
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+  std::lock_guard<std::mutex> lock(g_log_mutex);
+  FILE *f = fopen(g_log_filename, "a");
+  if (f == nullptr) {
+    result.error_msg("failed to open '%s': %s", g_log_filename,
+                     strerror(errno));
+    return;
+  }
+
+  fprintf(f, "# Time: %s\n", ts);
+  fprintf(f, "# User@Host: %s @ %s  Id: %lu\n", args.user() ? args.user() : "",
+          args.client_ip() ? args.client_ip() : "", args.connection_id());
+  fprintf(f,
+          "# Schema: %s  Query_time: %.6f  Lock_time: %.6f"
+          "  Rows_sent: %llu  Rows_examined: %llu\n",
+          args.schema() ? args.schema() : "", args.query_time_secs(),
+          args.lock_time_secs(), (unsigned long long)args.rows_sent(),
+          (unsigned long long)args.rows_examined());
+  fprintf(f, "SET timestamp=%llu;\n", (unsigned long long)now);
+  auto q = args.query();
+  fprintf(f, "%.*s;\n", (int)q.size(), q.data());
+  fclose(f);
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled", "Enable the slow query log", &g_enabled, false),
+    sv::make_int("threshold_ms", "Minimum execution time to log, in ms",
+                 &g_threshold_ms, 1000, 0, 3600000),
+    sv::make_str("log_file", "Path to the slow query log file",
+                 &g_log_filename, "/tmp/vsql_slow_query.log")});
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &slow_query_hook>
+    STATEMENT_EVENT;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension().with(SYS_VARS).with(STATEMENT_EVENT))
+```
+
+#### Habilitando a partir do SQL
+
+Com o nível Preview habilitado (consulte
+[Habilitando o Nível Preview](#enabling-the-preview-tier)), instale a extensão
+e configure-a através de suas variáveis de sistema:
+
+```sql
+INSTALL EXTENSION vsql_slow_query_log;
+SET GLOBAL vsql_slow_query_log.enabled = ON;
+SET GLOBAL vsql_slow_query_log.threshold_ms = 500;
+```
+
+Cada consulta mais lenta que o limiar é anexada ao arquivo de log configurado:
+
+```
+# Time: 2026-06-22T22:53:44Z
+# User@Host: root @   Id: 27
+# Schema:   Query_time: 0.605084  Lock_time: 0.000000  Rows_sent: 1  Rows_examined: 1
+SET timestamp=1782168824;
+SELECT SLEEP(0.6);
+```
+
+## Métodos de Autenticação {#authentication-methods}
+
+A capability auth (`vsql::preview::auth`) permite que uma extensão forneça um
+método de autenticação do servidor. Uma conta opta por ele com
+`CREATE USER ... IDENTIFIED WITH <nome-do-metodo>`; no momento da conexão, quando
+esse nome não é um plugin de autenticação do MySQL carregado, o servidor consulta
+o registro de autenticação do VEF e invoca o handler da extensão sobre o
+handshake. Use-o para autenticar contas contra uma fonte de credenciais que o
+servidor não conhece — um token de portador, um provedor de identidade externo ou
+um desafio personalizado — sem escrever um plugin de autenticação do MySQL.
+
+O nome da capability `VEF_PREVIEW_AUTH_NAME` é `"vsql::preview::auth"`.
+
+O handler é uma função tipada que recebe um `AuthContext`: ele conversa com o
+cliente lendo e escrevendo pacotes do handshake através desse contexto de
+propriedade do servidor, e nunca vê as estruturas internas de autenticação do
+MySQL.
+
+<Warning>
+O resultado da autenticação é fail-closed. O servidor trata qualquer coisa
+diferente de `AuthResult::kOk` como uma conexão negada — deliberadamente não há
+resultado "talvez" nem fail-open. Um handler que retorna `AuthResult::kReject`,
+retorna `AuthResult::kError` ou nunca define a conta efetiva nega o login.
+</Warning>
+
+### Declarando a Capability
+
+Inclua o cabeçalho, escreva um handler tipado, construa um descritor com o
+construtor fluente `make_auth<>` e entregue o descritor a um token
+`AuthCapability` que você passa para `.with()`. Os cabeçalhos das capabilities
+Preview não fazem parte do guarda-chuva `<villagesql/vsql.h>`, então inclua
+`<villagesql/preview/auth.h>` explicitamente:
+
+```cpp
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+AuthResult authenticate(AuthContext &c) {
+  // ... validate the client and set the effective account ...
+  return AuthResult::kOk;
+}
+
+constexpr auto MY_AUTH =
+    vsql::preview_auth::make_auth<&authenticate>("my_auth")
+        .client_plugin("mysql_clear_password")
+        .build();
+
+static vsql::preview_auth::AuthCapability g_auth{MY_AUTH};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_auth))
+```
+
+O construtor tem seis peças:
+
+| Elemento | Significado |
+|---|---|
+| `make_auth<&handler>("name")` | Inicia o construtor. O handler é um argumento de template em tempo de compilação, então um handler nulo ou com assinatura errada é um erro de compilação em vez de uma falha em tempo de execução. `"name"` é o nome do método de autenticação ao qual as contas se vinculam (`IDENTIFIED WITH <name>`) e deve ter no máximo `VEF_AUTH_MAX_NAME_LEN` (64) bytes. |
+| `.client_plugin(name)` | Opcional. Substitui o plugin de autenticação do lado do cliente que o servidor anuncia durante o handshake. |
+| `.accepts_client_plugin(callback)` | Opcional. Recebe `bool (*)(const char *offered)`. Retornar `true` mantém o plugin que o cliente ofereceu; retornar `false` troca o cliente para `.client_plugin()`. |
+| `.auto_create(callback)` | Opcional. Faz o método aderir a logins de contas que não existem (consulte [Criando Contas Automaticamente](#auto-creating-accounts)). |
+| `.auto_grant(callback)` | Opcional. Permite que o servidor conceda os papéis que o handler prepara, em vez de apenas ativar aqueles que a conta já possui (consulte [Concedendo Papéis Automaticamente](#auto-granting-roles)). |
+| `.build()` | Produz o descritor que você entrega ao `AuthCapability`. |
+
+`AuthCapability g_auth{descriptor}` é o token autorregistrável consumido por
+`.with()`. Declare-o `static` para que ele sobreviva ao registro.
+
+`client_plugin` é opcional. `make_auth` define o plugin anunciado por padrão como
+`"mysql_clear_password"` — o menor denominador comum que todo cliente MySQL traz
+— então um método que nunca chama `.client_plugin()` ainda instala e um cliente
+ingênuo ainda se conecta. Chame `.client_plugin(name)` para pedir um plugin
+diferente; o `mysql_clear_password` recebe um token de portador literalmente no
+campo da senha.
+
+Um cliente que oferece um plugin diferente daquele que o método pede é trocado
+para o plugin pedido e reenvia sua credencial literalmente, o que custa um
+round trip e exige um cliente disposto a fazer essa troca.
+`.accepts_client_plugin(&callback)` permite que o método mantenha o plugin
+oferecido: o servidor passa cada nome oferecido ao callback, incluindo o plugin
+pedido, que é aceito independentemente do que o callback retornar. Um método que
+não define nenhum callback não aceita nenhuma outra oferta, então toda outra
+oferta é trocada pelo plugin pedido. Aceitar é definitivo — o servidor não volta
+depois para o plugin pedido — então aceite apenas um plugin cujo formato o
+handler realmente entenda. O servidor consulta o callback durante a negociação do
+handshake, antes da primeira leitura do handler, então ele deve ser um predicado
+puro: sem E/S de pacotes, sem bloqueio, sem efeitos colaterais.
+
+### O Contrato do Handler
+
+O handler corresponde ao tipo `AuthHandler` — ele recebe um `AuthContext &` e
+retorna um `AuthResult`:
+
+```cpp
+AuthResult authenticate(AuthContext &c);
+```
+
+Ele é invocado de forma síncrona na thread de conexão durante o handshake. O
+`AuthContext` envolve o contexto por tentativa de propriedade do servidor;
+mantenha-o apenas durante a chamada e não o retenha. Chame seus métodos em vez de
+encadear um pointer de contexto por uma tabela de funções. Os métodos que um
+handler baseado em token usa:
+
+| Método | Finalidade |
+|---|---|
+| `c.read_packet()` | Lê o próximo pacote que o cliente enviou. Retorna os bytes como um `Span<const unsigned char>` válido até a próxima leitura (vazio em caso de erro de protocolo ou de conexão). Combinado com `mysql_clear_password`, uma leitura entrega o token de portador. |
+| `c.write_packet(data)` | Envia um pacote ao cliente (por exemplo, um desafio). Recebe um `Span<const unsigned char>` e retorna `true` em caso de falha. |
+| `c.user_name()` | O nome da conta com a qual o cliente se conectou. |
+| `c.auth_string()` | A cláusula `AS '...'` de `IDENTIFIED WITH <m> AS '...'`, ou vazio. |
+| `c.host_or_ip()` | O host ou IP do cliente. |
+| `c.client_auth_plugin()` | O plugin de autenticação do lado do cliente que o cliente anunciou na sua resposta de handshake (por exemplo, `"mysql_clear_password"`). Quando o método aceitou aquela oferta, ele também é o plugin que formatou a credencial que o handler lê, então o handler pode analisar pelo nome em vez de farejar bytes. Uma troca forçada para `.client_plugin()` não o atualiza, então nesse caminho ele ainda informa o que o cliente ofereceu primeiro. Vazio se desconhecido. |
+| `c.authenticate_as(account)` | Define a conta efetiva com a qual a sessão é executada (mostrada por `CURRENT_USER()`). Obrigatório antes de retornar `AuthResult::kOk`. |
+| `c.set_external_user(identity)` | Define a identidade externa original para a trilha de auditoria (`@@external_user`). |
+| `c.set_active_roles(roles, n_roles)` | Prepara os papéis ativos da sessão (consulte [Preparando Papéis Ativos](#staging-active-roles)). |
+| `c.account_unknown()` | `true` quando a conta sendo autenticada não existe e este login foi roteado para o método pela adesão via `.auto_create()`. `false` para um login contra uma conta existente. |
+| `c.request_provision(account, roles, n_roles)` | Pede ao servidor que crie `account` e conceda a ela `roles` (consulte [Criando Contas Automaticamente](#auto-creating-accounts)). |
+
+O handler retorna um de três resultados:
+
+| Resultado | Significado |
+|---|---|
+| `AuthResult::kOk` | A autenticação teve sucesso. O handler deve ter chamado `authenticate_as()`; a sessão é executada como aquela conta. |
+| `AuthResult::kReject` | A autenticação falhou — credencial inválida ou rejeição por política. |
+| `AuthResult::kError` | Um erro interno impediu uma decisão (por exemplo, uma fonte de chaves estava indisponível). Tratado pelo servidor de forma idêntica a uma rejeição; ele existe apenas para distinguir "negado" de "não foi possível decidir" no registro de logs. |
+
+Tanto `AuthResult::kReject` quanto `AuthResult::kError` negam a conexão. Somente
+`AuthResult::kOk` tem sucesso.
+
+Quando o handler mapeia a conta que está se conectando para uma conta efetiva
+diferente — como o exemplo abaixo mapeia a conta que se conecta para
+`vsql_auth_test_user` — isso é proxying, e requer um `GRANT PROXY`, exatamente
+como no caminho de autenticação por plugin do MySQL.
+
+### Preparando Papéis Ativos {#staging-active-roles}
+
+`c.set_active_roles(roles, n_roles)` prepara os papéis que devem estar ativos na
+sessão, substituindo a ativação de papéis padrão da conta neste login. `roles` é
+um array de `n_roles` nomes terminados em NUL; as strings são copiadas, então
+quem chama não precisa mantê-las. O servidor as aplica *depois* da resolução da
+conta, usando a mesma ativação com verificação de concessão do `SET ROLE`: apenas
+papéis realmente concedidos à conta autenticada são ativados, e nomes que não
+foram concedidos são ignorados silenciosamente — de modo que um token nunca pode
+conceder ou escalar privilégios além do que o DBA provisionou. Passar
+`n_roles == 0` não ativa nenhum papel (equivalente a `SET ROLE NONE`).
+
+### Exemplo Completo
+
+Um autenticador mínimo, condensado a partir da extensão `vsql_auth_test` na
+árvore de código-fonte do servidor em
+`villagesql/test-extensions/vsql-auth-test/`, que nenhum release inclui. Ele
+aceita um token fixo, mapeia a conexão para `vsql_auth_test_user` e pede
+`mysql_clear_password` para que o token chegue literalmente no campo da senha. (A
+extensão interna à árvore adiciona caminhos de token extras, um callback
+`.accepts_client_plugin()` e as duas adesões descritas abaixo para conduzir a sua
+suíte de testes.)
+
+```cpp
+#include <cstring>
+
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+namespace {
+
+constexpr char kToken[] = "vsql-auth-test-token";
+constexpr char kMappedAccount[] = "vsql_auth_test_user";
+
+AuthResult authenticate(AuthContext &c) {
+  auto pkt = c.read_packet();
+  if (pkt.empty()) return AuthResult::kError;
+
+  // mysql_clear_password sends a NUL-terminated string; drop the trailing NUL.
+  size_t len = pkt.size();
+  if (len && pkt[len - 1] == '\0') --len;
+
+  if (len != std::strlen(kToken) ||
+      std::memcmp(pkt.data(), kToken, len) != 0) {
+    return AuthResult::kReject;
+  }
+
+  c.authenticate_as(kMappedAccount);
+  // @@external_user records the connecting identity, not the mapped account.
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .build();
+vsql::preview_auth::AuthCapability g_auth{AUTH_METHOD};
+
+}  // namespace
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(g_auth))
+```
+
+### Vinculando uma Conta e Conectando
+
+Com o nível Preview habilitado (consulte
+[Habilitando o Nível Preview](#enabling-the-preview-tier)), instale a extensão e
+vincule uma conta ao método. Como o handler mapeia para uma segunda conta, crie
+essa conta também e conceda a ela o privilégio `PROXY` que permite à conta que se
+conecta assumir a sua identidade:
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+```
+
+`CREATE USER ... IDENTIFIED WITH vsql_auth_test` é aceito porque
+`vsql_auth_test` é um método de autenticação VEF registrado — da mesma forma que
+o nome de um plugin instalado é aceito.
+
+Somente a forma `IDENTIFIED WITH <method>` é aceita, opcionalmente com
+`AS '...'`. Adicionar `BY '...'` pede ao método que transforme uma senha em uma
+credencial armazenada — o trabalho que um plugin do MySQL faz através de
+`generate_authentication_string()` — e nenhum método de autenticação VEF declara
+esse hook hoje, então o servidor o rejeita:
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test BY 'secret';
+```
+
+```text
+ERROR 1827 (HY000): The password hash doesn't have the expected format.
+```
+
+O nome do método vinculado é gravado na coluna `plugin` da conta em vez do padrão
+da tabela, e é isso que o próximo login da conta lê:
+
+```sql
+SELECT plugin FROM mysql.user WHERE user = 'auth_user';
+```
+
+```text
++----------------+
+| plugin         |
++----------------+
+| vsql_auth_test |
++----------------+
+```
+
+O método pede `mysql_clear_password`, então o cliente precisa passar
+`--enable-cleartext-plugin` para enviar o token em texto claro. Com um token
+correto, a sessão é executada como a conta mapeada e expõe a conta que se conecta
+através de `@@external_user`:
+
+```bash
+mysql --enable-cleartext-plugin --user=auth_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER(), @@external_user"
+```
+
+```
+CURRENT_USER()         @@external_user
+vsql_auth_test_user@%  auth_user
+```
+
+Desinstalar a extensão remove o método; as contas vinculadas a ele não conseguem
+mais se autenticar:
+
+```sql
+UNINSTALL EXTENSION vsql_auth_test;
+```
+
+### Criando Contas Automaticamente {#auto-creating-accounts}
+
+Um método também pode tratar logins de contas que ainda não existem e fazer o
+servidor criar a conta como parte do login bem-sucedido. Sem isso, uma conta
+desconhecida é rejeitada antes que qualquer método seja executado.
+
+Adira com `.auto_create(&callback)`. O callback não recebe argumentos e retorna
+`bool`; o servidor o chama a cada login de conta desconhecida em vez de lê-lo uma
+única vez no registro, então o método pode seguir uma configuração de tempo de
+execução própria em vez de congelar a escolha quando a extensão carrega:
+
+```cpp
+bool auto_create_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_create(&auto_create_enabled)
+        .build();
+```
+
+Deixar `.auto_create()` de fora, ou retornar `false` do callback, mantém o
+comportamento padrão: uma conta desconhecida é negada. Apenas um método instalado
+pode aderir por vez — se dois retornarem `true`, o servidor se recusa a adivinhar,
+registra um aviso no log de erros e rejeita contas desconhecidas como se nenhum
+tivesse aderido.
+
+No handler, `c.account_unknown()` distingue os dois casos. Valide a credencial
+primeiro, depois descreva o que criar e autentique-se como ela:
+
+```cpp
+if (c.account_unknown()) {
+  const char *roles[] = {"vsql_role_granted"};
+  c.request_provision(c.user_name(), roles, 1);
+  c.authenticate_as(c.user_name());
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+```
+
+`request_provision(account, roles, n_roles)` registra a intenção e não retorna
+nada. O servidor executa o DDL ele mesmo, depois que o handler retorna
+`AuthResult::kOk`, e apenas para um login que foi roteado como uma conta
+desconhecida — então um login que o handler acaba negando não cria nada, e um
+pedido que nomeia uma conta que já existe é ignorado. O que o servidor executa é
+`CREATE USER IF NOT EXISTS <account>@'%' IDENTIFIED WITH <method>`, seguido de um
+`GRANT` por papel nomeado: a conta é sempre criada para o host `%` e vinculada ao
+método que a autenticou, e `account` não precisa ser o nome do usuário que se
+conecta. Se a criação não puder ser feita — em um servidor `super_read_only`, por
+exemplo — o login falha em vez de prosseguir sem uma conta.
+
+Os papéis se comportam como em [Preparando Papéis Ativos](#staging-active-roles):
+o DBA é dono deles. Cada nome já deve existir como um papel concedível, e um que
+não puder ser concedido é registrado no log e ignorado em vez de fazer o login
+falhar, de modo que um token pode nomear um papel mas nunca criar ou escalar um.
+O nome da conta vem do cliente, então o servidor o delimita com aspas como um identificador —
+um nome forjado vira uma conta com nome estranho, nunca uma segunda instrução.
+
+A extensão `vsql_auth_test` provisiona o usuário que se conecta com o papel
+`vsql_role_granted` e coloca a adesão atrás de `vsql_auth_test.auto_create`, que
+começa em `OFF`. Ative-a e crie o papel primeiro, depois conecte-se como uma conta
+que não existe:
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+SET GLOBAL vsql_auth_test.auto_create = ON;
+CREATE ROLE vsql_role_granted;
+GRANT SELECT ON *.* TO vsql_role_granted;
+```
+
+```bash
+mysql --enable-cleartext-plugin --user=auto_created_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER() AS who, @@external_user AS ext"
+```
+
+```text
++---------------------+-------------------+
+| who                 | ext               |
++---------------------+-------------------+
+| auto_created_user@% | auto_created_user |
++---------------------+-------------------+
+```
+
+A conta agora existe, vinculada ao método, com o papel concedido:
+
+```sql
+SELECT user, host, plugin FROM mysql.user WHERE user = 'auto_created_user';
+```
+
+```text
++-------------------+------+----------------+
+| user              | host | plugin         |
++-------------------+------+----------------+
+| auto_created_user | %    | vsql_auth_test |
++-------------------+------+----------------+
+```
+
+```sql
+SHOW GRANTS FOR 'auto_created_user'@'%';
+```
+
+```text
++----------------------------------------------------------+
+| Grants for auto_created_user@%                           |
++----------------------------------------------------------+
+| GRANT USAGE ON *.* TO `auto_created_user`@`%`            |
+| GRANT `vsql_role_granted`@`%` TO `auto_created_user`@`%` |
++----------------------------------------------------------+
+```
+
+Um token errado ainda falha de forma fechada, e não provisiona nada:
+
+```bash
+mysql --enable-cleartext-plugin --user=never_created --password=wrong-token \
+      -e "SELECT 1"
+```
+
+```text
+ERROR 1045 (28000): Access denied for user 'never_created'@'localhost' (using password: YES)
+```
+
+<Warning>
+Aderir torna a diferença entre uma conta desconhecida e uma existente observável
+para qualquer pessoa que tenha uma credencial válida, algo que a rejeição padrão
+de contas desconhecidas esconde deliberadamente. Essa é a troca que este recurso
+faz; pondere-a antes de habilitar a adesão em um método cujas credenciais sejam
+amplamente distribuídas.
+</Warning>
+
+### Concedendo Papéis Automaticamente {#auto-granting-roles}
+
+Por padrão, um papel que um token nomeia só tem efeito se a conta já o possui, e
+um que ela não possui é registrado no log e ignorado. `.auto_grant(&callback)`
+muda isso: o servidor concede à conta os papéis preparados, de modo que o token
+decide quais papéis a sessão recebe, em vez de apenas quais dos papéis existentes
+da conta ativar.
+
+O callback tem o mesmo formato que o de `.auto_create()` — sem argumentos,
+retorna `bool` — e o servidor o chama a cada login, então ele pode seguir uma
+configuração de tempo de execução:
+
+```cpp
+bool auto_grant_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_grant(&auto_grant_enabled)
+        .build();
+```
+
+As duas adesões são independentes. `.auto_create()` governa logins de contas que
+não existem; `.auto_grant()` governa a concessão à conta para a qual um login se
+resolve, tenha essa conta acabado de ser criada ou não. Deixar `.auto_grant()` de
+fora, ou retornar `false`, mantém o padrão de apenas ativar.
+
+A concessão persiste — é um `GRANT` comum, não uma ativação apenas de sessão — e
+é aditiva: o servidor nunca revoga um papel que o token deixou de nomear.
+
+`vsql_auth_test` expõe isso como `vsql_auth_test.auto_grant`, também começando em
+`OFF`. O seu token `-token-roles` prepara `vsql_role_granted` e
+`vsql_role_denied`, e a conta abaixo não possui nenhum dos dois. Com a
+configuração desligada, o login deixa os papéis da conta em paz:
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+CREATE ROLE vsql_role_granted, vsql_role_denied;
+```
+
+Conectando-se como `auth_user` com aquele token, da mesma forma que acima, e
+perguntando o que está ativo:
+
+```text
++----------------+
+| CURRENT_ROLE() |
++----------------+
+| NONE           |
++----------------+
+```
+
+Ligue a configuração e repita o mesmo login:
+
+```sql
+SET GLOBAL vsql_auth_test.auto_grant = ON;
+```
+
+```text
++------------------------------------------------+
+| CURRENT_ROLE()                                 |
++------------------------------------------------+
+| `vsql_role_denied`@`%`,`vsql_role_granted`@`%` |
++------------------------------------------------+
+```
+
+Os dois papéis agora estão ativos, e o `SHOW GRANTS` mostra a concessão que o
+servidor adicionou:
+
+```sql
+SHOW GRANTS FOR vsql_auth_test_user;
+```
+
+```text
++-----------------------------------------------------------------------------------+
+| Grants for vsql_auth_test_user@%                                                  |
++-----------------------------------------------------------------------------------+
+| GRANT SELECT ON *.* TO `vsql_auth_test_user`@`%`                                  |
+| GRANT `vsql_role_denied`@`%`,`vsql_role_granted`@`%` TO `vsql_auth_test_user`@`%` |
++-----------------------------------------------------------------------------------+
+```
+
+<Warning>
+Com `.auto_grant()` ligado, um token válido basta para obter qualquer papel que
+ele nomeie. O papel já precisa existir, então um token ainda não pode inventar
+privilégios, mas o DBA deixa de decidir quais papéis existentes uma conta pode
+alcançar — quem decide é o método.
+</Warning>
