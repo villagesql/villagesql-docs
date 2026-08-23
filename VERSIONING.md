@@ -132,15 +132,24 @@ The slots are fixed, so hrefs no longer change at a cut. Only the version-number
 
 ## Placeholder products
 
-The "Coming Soon" MySQL 8.0 and 9.7 products in `docs.json` use a plain `Stable`
-label. Keep them in sync with that convention. Each is a single `index.mdx`
-under `mysql-8.0/0.0.1/` and `mysql-9.7/0.0.1/`, `noindex`ed, pointing readers
-at the MySQL 8.4 stable slot.
+The "Coming Soon" MySQL 8.0 product in `docs.json` uses a plain `Stable`
+label. Keep it in sync with that convention. It is a single `index.mdx`
+under `mysql-8.0/0.0.1/`, `noindex`ed, pointing readers at the MySQL 8.4
+stable slot. MySQL 9.7 was a placeholder of the same shape and is no longer
+one — see the next section.
 
-## Adding a MySQL version (planned — 9.7)
+## Adding a MySQL version (built — 9.7)
 
-Not yet executed. This section records the agreed shape so the decision is not
-re-litigated when 9.7 lands.
+Built 2026-08-22, on branch `adam/mysql-9.7-percona-docs`. This section
+records the agreed shape that build followed.
+
+**The MySQL 9.7 and Percona server builds are not shipped yet.** Both live on
+unmerged `villagesql-server` branches (`dbentley/mysql_9_7`,
+`dbentley/percona_8_4`). `mysql-8.4/dev/percona.mdx` says the Percona build
+isn't installable through any public path yet. The 9.7 tree carries no such
+caveat on `quickstart.mdx` or `source.mdx` — Adam asked for those notes to be
+removed 2026-08-22, so a reader following those two pages today will build
+MySQL 8.4, not 9.7, with no warning.
 
 **Model: parallel trees, like the upstream MySQL manual.** Each MySQL version
 gets a complete, independently editable doc set under its own product in the
@@ -173,12 +182,16 @@ The remaining ~24 pages — the whole C++ and Rust SDK surface, extension
 authoring, protocol, testing — contain no MySQL-version reference. They copy
 across unchanged and should stay identical until a real difference appears.
 
-**Reconciliation, kept deliberately minimal.** `freshness.py` reports every page
-whose 9.7 copy differs from its 8.4 twin after version-token substitution. It is
-a reminder to update both copies, not a rule forbidding difference: a page in
-the table above prints every run and is expected to. Start with the bare report.
-Only if that list grows too noisy to read is it worth adding a per-page
-"differs on purpose" marker — do not build that machinery up front.
+**Reconciliation is not built yet.** The plan was for `freshness.py` to report
+every page whose 9.7 copy differs from its 8.4 twin after version-token
+substitution, as a reminder to update both copies — not a rule forbidding
+difference, since a page in the table above is expected to differ every run.
+That check does not exist in `vsql-docs-validator/freshness.py` as of
+2026-08-23. Until it does, nothing catches a fix landing in one tree and not
+the other — three open PRs (#195, #196, #188) did exactly that and had to be
+found and patched into the 9.7 tree by hand. Start with the bare report when
+building it. Only if that list grows too noisy to read is it worth adding a
+per-page "differs on purpose" marker — do not build that machinery up front.
 
 **Version selection is a packaging decision first.** VillageSQL builds three
 flavors, each with its own build artifacts, and the install script offers all
@@ -212,14 +225,14 @@ The page structure follows the flag names.
 
 ## Percona branch
 
-Not yet executed. VillageSQL ships a second buildable 8.4 branch that
+Built 2026-08-22. VillageSQL ships a second buildable 8.4 branch that
 integrates Percona's MySQL improvements.
 
 **Do not document Percona's own changes.** Document that the branch exists, how
 to build and install it, and what VillageSQL supports about it. Send every
 question about the Percona improvements themselves to Percona's documentation.
-This lives in one page, `mysql-8.4/dev/percona.mdx`, linked from `install.mdx`
-and `source.mdx`.
+This lives in one page, `mysql-8.4/dev/percona.mdx`, linked from
+`quickstart.mdx` and `source.mdx`.
 
 **An index of the Percona changes is worth having only if a script generates
 it.** A hand-written summary of another project's feature set goes stale in
