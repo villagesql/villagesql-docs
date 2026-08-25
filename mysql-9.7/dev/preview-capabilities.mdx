@@ -1,0 +1,1878 @@
+---
+audience: extension-author
+title: "Preview Capabilities"
+description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the auth, keyring, mysql_services, status_var, sys_var, thread_worker, sql_query, and statement_event capabilities, and registration patterns."
+---
+
+Preview capabilities are server-provided features exposed to extensions before
+their APIs are finalized. An extension that declares a preview capability
+requires `vsql_allow_preview_extensions = ON` to install (see
+[Enabling the Preview Tier](#enabling-the-preview-tier)) — extensions that
+don't use preview capabilities install normally regardless of this setting.
+
+<Warning>
+Preview capability APIs are not stable. An extension built against a preview
+capability may fail to load after a server update. When a capability
+stabilizes, its header moves to a versioned stable C++ SDK path.
+</Warning>
+
+## Enabling the Preview Tier
+
+Set `vsql_allow_preview_extensions = ON` with `SET PERSIST` before installing
+any extension that uses a preview capability:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+```
+
+`SET GLOBAL` is rejected for this variable — the server requires `SET PERSIST`
+so the setting survives restart. Extensions with preview capabilities are
+loaded at startup, so the variable must be ON when the server starts.
+
+If you're launching mysqld directly (for example, from an install script that
+starts the server for the first time), pass the flag on the command line
+instead — `mysqld-auto.cnf` won't exist yet to carry the persisted value:
+
+```bash
+mysqld --vsql_allow_preview_extensions=ON
+```
+
+To disable:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = OFF;
+```
+
+This fails if any extension using a preview capability is currently installed.
+Uninstall those extensions first, then turn the setting off.
+
+## Capability Index
+
+| Capability | Header | Status |
+|---|---|---|
+| `vsql::preview::auth` | `<villagesql/preview/auth.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
+| `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview |
+| `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
+| `vsql::preview::mysql_services` | `<villagesql/preview/mysql_services.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
+| `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | Preview |
+| `vsql::preview::statement_event` | `<villagesql/preview/statement_event.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
+| `vsql::status_var` | `<villagesql/preview/status_var.h>` | Preview |
+| `vsql::preview::storage` | `<villagesql/preview/storage_builder.h>` | Preview |
+| `vsql::sys_var` | `<villagesql/preview/sys_var.h>` | Preview |
+| `vsql::preview::thread_worker` | `<villagesql/preview/thread_worker.h>` | Preview |
+
+## Registration Pattern
+
+To use a preview capability, declare a capability object by value at file
+scope and pass it by reference to `.with()` inside `make_extension()`. The
+server populates the object's `abi` pointer during registration:
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(g_keyring))
+```
+
+`.with(capability)` tells the server which capabilities the extension
+requires. If `vsql_allow_preview_extensions` is OFF when the extension is
+installed, the server rejects the install with an error naming the extension:
+`ERROR 3219 (HY000): Failed to load VEF extension 'name': extension requires
+preview capabilities but vsql_allow_preview_extensions is OFF`. The message does
+not say which capability was responsible.
+
+<Warning>
+Every capability object declared in an extension must be passed to `.with()`
+exactly once. At load time, the server cross-checks every declared capability
+instance against what `.with()` received and fails `INSTALL EXTENSION` if the
+rule is violated:
+
+- **Declared but never passed to `.with()`:**
+  `capability '<Type>' was declared but never passed to .with(); every CapabilityBase-derived static must be registered via .with(cap) in the extension builder`
+- **Same instance passed to `.with()` more than once:**
+  `capability '<Type>' passed to .with() more than once`
+- **Object passed to `.with()` is not a capability:**
+  `.with() received an object that does not inherit vsql::detail::CapabilityBase; not a registered capability`
+
+The full error surfaces as: `Failed to load VEF extension '<name>': vef_register returned an error: <message above>`.
+</Warning>
+
+## Keyring Access
+
+The keyring capability (`vsql::preview::keyring`) lets extensions read and
+write secrets stored in the MySQL keyring component. Extensions use it for
+things like API keys, encryption keys, or other secrets that shouldn't live
+in SQL tables.
+
+The capability name `VEF_PREVIEW_KEYRING_NAME` is `"vsql::preview::keyring"`.
+
+A keyring component must be installed on the MySQL server for reads and
+writes to succeed. Without one, operations return
+`KeyringCapability::Status::UNAVAILABLE`.
+
+### Status Values
+
+`KeyringCapability::Status` is a scoped enum returned by `read()` (inside
+`ReadResult`) and `write()`:
+
+| Status | Meaning |
+|---|---|
+| `Status::OK` | Operation succeeded. |
+| `Status::NOT_FOUND` | The key does not exist (read only). |
+| `Status::UNAVAILABLE` | No keyring component is installed. |
+| `Status::ERROR` | Other failure. |
+
+### Declaring the Capability
+
+Include the header, declare a capability object at file scope, and pass it
+to `.with()`:
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_keyring))
+```
+
+The `g_keyring` object is populated by the server at load time. The
+`read()` and `write()` methods return `Status::UNAVAILABLE` at runtime
+when no keyring component is installed — check that status on each call
+rather than gating on a separate availability probe.
+
+### Reading and Writing
+
+```cpp
+struct KeyringCapability::ReadResult {
+  KeyringCapability::Status status;
+  std::string value;
+};
+
+[[nodiscard]] KeyringCapability::ReadResult
+KeyringCapability::read(std::string_view data_id,
+                        std::string_view auth_id = {}) const;
+
+[[nodiscard]] KeyringCapability::Status
+KeyringCapability::write(std::string_view data_id,
+                         std::string_view auth_id,
+                         std::string_view data) const;
+```
+
+`data_id` is the key identifier. `auth_id` is the owning user — pass an
+empty string (or omit it on `read`, which defaults to `{}`) to read or write
+internal keys not associated with a specific user.
+
+`read` returns a `ReadResult` by value. Bind it with structured bindings:
+
+```cpp
+auto [status, value] = g_keyring.read("my_secret");
+if (status == KeyringCapability::Status::OK) {
+  // value contains the secret bytes
+}
+```
+
+On any status other than `Status::OK`, `value` is empty.
+
+`write` returns `Status` directly and stores `data` under `data_id` /
+`auth_id`.
+
+### Complete Example
+
+This is a simplified version of the `vsql_keyring_reader` test extension, in
+the server's `villagesql/test-extensions/` tree. It registers 2 VDFs:
+`keyring_read` and `keyring_store`.
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+void keyring_read(StringArg data_id, StringArg auth_id, StringResult out) {
+  if (data_id.is_null()) { out.set_null(); return; }
+
+  const auto [status, value] =
+      g_keyring.read(data_id.value(), auth_id.is_null() ? "" : auth_id.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  if (status != KeyringCapability::Status::OK) { out.set_null(); return; }
+
+  auto buf = out.buffer();
+  size_t len = std::min(value.size(), buf.size());
+  memcpy(buf.data(), value.data(), len);
+  out.set_length(len);
+}
+
+void keyring_store(StringArg data_id, StringArg auth_id, StringArg value,
+                   IntResult out) {
+  if (data_id.is_null() || value.is_null()) { out.set(1); return; }
+
+  KeyringCapability::Status status = g_keyring.write(
+      data_id.value(), auth_id.is_null() ? "" : auth_id.value(), value.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  out.set(status == KeyringCapability::Status::OK ? 0 : 1);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&keyring_read>("keyring_read")
+                  .returns(STRING).param(STRING).param(STRING).build())
+        .func(make_func<&keyring_store>("keyring_store")
+                  .returns(INT).param(STRING).param(STRING).param(STRING).build())
+        .with(g_keyring))
+```
+
+## MySQL Services
+
+The mysql_services capability (`vsql::preview::mysql_services`) lets an
+extension consume MySQL registry services — the same services a MySQL component
+consumes, provided either by an installed component or by the server core. The
+extension declares every service it needs in one place; the server acquires each
+one when the extension loads and releases it when the extension unloads.
+
+The capability name `VEF_PREVIEW_MYSQL_SERVICES_NAME` is
+`"vsql::preview::mysql_services"`.
+
+Reach for it when a server facility has no VEF capability of its own. Session
+attributes and the keyring's own component services are both reachable this
+way. Only consuming is supported: registering the extension's own
+implementation into the registry is a planned follow-up and is not part of this
+capability.
+
+### Declaring the Capability
+
+Declare one `MysqlServices` object at file scope, name each service you consume
+with `VSQL_REQUIRE_SERVICE`, and pass the object to `.with()`. Include MySQL's
+own header for each service — that header is where the service's type and
+methods are declared:
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(services))
+```
+
+`VSQL_REQUIRE_SERVICE(services, name, var)` declares `var`, the reference the
+server writes the acquired service into, and registers `name` on `services`. It
+declares `var` `static` for you. The `MysqlServices` object needs to be `static`
+too, and so does any reference you declare by hand: the server writes through
+them at load, and they must outlive the extension.
+
+### Pinning a Specific Implementation
+
+`VSQL_REQUIRE_SERVICE` uses `name` twice — as the C++ `SERVICE_TYPE(name)` and
+as the string the server looks up in the registry. Under that bare name the
+server acquires the service's default implementation.
+
+To name one implementation instead, use its qualified registry name —
+`service.component`, the form MySQL's `PROVIDES_SERVICE(component, service)`
+generates. This asks for the keyring reader from the `component_keyring_file`
+component rather than for the default:
+
+```cpp
+static preview_mysql_services::ServiceRef<SERVICE_TYPE(keyring_reader_with_status)>
+    reader;
+static const int reader_req =
+    (services.require<SERVICE_TYPE(keyring_reader_with_status)>(
+         "keyring_reader_with_status.component_keyring_file", reader),
+     0);
+```
+
+A qualified name is acquired the same way as a bare one, so the usual rule
+applies: if that exact implementation is not registered, the extension fails to
+install rather than falling back to another one.
+
+### Building Against MySQL's Headers
+
+Service definitions belong to MySQL's component framework rather than to VEF,
+and the server does not install them. `mysql/components/services/*.h` is
+therefore absent from the extension SDK and from anything built by
+`make install`, which includes the release tarball and the Docker image. An
+extension that consumes services builds against a VillageSQL server source
+tree:
+
+| Include path | Provides |
+|---|---|
+| `<source>/include` | the service definitions, `mysql/components/services/*.h` |
+| `<build>/include` | headers generated at build time, such as `mysqld_error.h` |
+
+The in-tree test extensions get both from the `MYSQL_HEADERS` flag on
+`vsql_add_test_extension()`, which passes them as `MYSQL_INCLUDE_DIR` and
+`MYSQL_GENERATED_INCLUDE_DIR`. An out-of-tree build sets its own include paths.
+
+Two build failures land somewhere other than the line that caused them.
+
+Omitting a service's MySQL header leaves `VSQL_REQUIRE_SERVICE` with a name
+that resolves to nothing, so the error appears on the macro rather than on the
+missing include (clang 17):
+
+```text
+error: unknown type name 'mysql_service_mysql_current_thread_reader_t'
+```
+
+Some service definitions use `size_t` without including `<cstddef>`, so putting
+one of those headers ahead of every villagesql header fails inside MySQL's own
+header:
+
+```text
+error: unknown type name 'size_t'
+```
+
+Include `<cstddef>` first, as the examples on this page do.
+
+### Calling a Service
+
+A service reference exposes `valid()` of its own, and `->` forwards to the
+service. Use `.` for the reference and `->` for the service:
+
+```cpp
+if (!thd_reader.valid()) { out.error("service unavailable"); return; }
+MYSQL_THD thd = nullptr;
+if (thd_reader->get(&thd) || thd == nullptr) { out.set_null(); return; }
+```
+
+Check `valid()` before every `->` call. `->` returns the acquired pointer, which
+is null when the service was not acquired.
+
+A service that fails to acquire fails the install, so inside a function that is
+running, a required service is valid. The check still matters, because a
+`ServiceRef` declared by hand and never passed to `require()` is never written
+to: it compiles, the extension installs, and `valid()` is false for the life of
+the extension.
+
+What a service *is* — its methods, their parameters, and what they return — is
+documented by MySQL rather than here. For a service named `NAME`, read
+`include/mysql/components/services/NAME.h` in the server tree: its
+`BEGIN_SERVICE_DEFINITION(NAME)` block declares every method with its own
+documentation. Call them exactly as that header specifies, including MySQL's
+convention that a `bool` return of `false` means success and `true` means
+failure.
+
+### Acquisition Failure
+
+Every declared service is acquired when the extension loads, before any of its
+functions can be called, so a service that is not registered fails the load
+rather than surfacing later. `INSTALL EXTENSION` fails and names the service.
+
+`vsql_mysql_services_missing_test` below is an in-tree test extension that
+requires a service the registry does not have. It is not something you can
+install — it is how the failure was captured, and what your own extension
+produces if it requires a service this server does not provide:
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mysql_services_missing_test': failed to acquire MySQL service 'vsql_intentionally_missing'
+```
+
+Two other install failures reach the same capability from outside it: leaving
+the `MysqlServices` object out of `.with()`, and installing on a server with
+`vsql_allow_preview_extensions` OFF. Both are covered under
+[Registration Pattern](#registration-pattern).
+
+### Complete Example
+
+A simplified version of `vsql_mysql_services_session_test`, in the server's
+`villagesql/test-extensions/` tree. It reads the SQL command running on the
+calling session by composing two services: one hands back the current `THD`,
+the other reads a named attribute off it. Both are server-core services
+registered on every server, so nothing has to be installed first:
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/defs/mysql_string_defs.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+VSQL_REQUIRE_SERVICE(services, mysql_thd_attributes, attrs);
+
+// session_sql_command() -> STRING: the name of the SQL command running on the
+// calling session, or NULL when the THD or the attribute cannot be read.
+void session_sql_command(StringResult out) {
+  if (!thd_reader.valid() || !attrs.valid()) {
+    out.error("MySQL session services are not available");
+    return;
+  }
+
+  MYSQL_THD thd = nullptr;
+  // MySQL convention: a false return means success.
+  if (thd_reader->get(&thd) || thd == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  mysql_cstring_with_length value{nullptr, 0};
+  if (attrs->get(thd, "sql_command", &value) || value.str == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  out.set(std::string_view(value.str, value.length));
+}
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(services).func(
+    make_func<&session_sql_command>("session_sql_command")
+        .returns(STRING)
+        .no_params()
+        .build()))
+```
+
+Install it and call the function:
+
+```sql
+INSTALL EXTENSION vsql_mysql_services_session_test;
+SELECT vsql_mysql_services_session_test.session_sql_command() AS sql_command;
+```
+
+```text
++-------------+
+| sql_command |
++-------------+
+| select      |
++-------------+
+```
+
+## Status Variables
+
+The status_var capability (`vsql::status_var`) lets an extension
+expose `long long` and `double` counters as MySQL status variables. The
+extension owns the storage and writes to it; the server reads through the
+pointers each time the status variable is queried.
+
+Build the capability with `vsql::preview_status_var::make_capability()`, passing
+a braced list of descriptors from `make_int(name, value_ptr)` or
+`make_double(name, value_ptr)`. The template deduces the count from the
+braced list, so no explicit size is required.
+
+### Complete Example
+
+```cpp
+#include <villagesql/preview/status_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_status_var;
+
+static long long g_hits   = 0;
+static long long g_misses = 0;
+
+static auto STATUS_VARS = sv::make_capability({
+    sv::make_int("ext_hits",   &g_hits),
+    sv::make_int("ext_misses", &g_misses)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STATUS_VARS))
+```
+
+`make_int` requires a `long long *`; `make_double` requires a `double *`.
+Those are the only two types supported.
+
+### Accessing from SQL
+
+After `INSTALL EXTENSION my_ext`, the variable is visible with the extension
+name as a prefix:
+
+```sql
+SHOW GLOBAL STATUS LIKE 'my_ext%';
+```
+```
+Variable_name       Value
+my_ext.ext_hits     0
+my_ext.ext_misses   0
+```
+
+Concurrent increments from multiple query threads using a non-atomic `++` may
+occasionally be lost; this is acceptable for approximate call counters exposed
+via `SHOW STATUS`.
+
+## System Variables
+
+The sys_var capability (`vsql::sys_var`) lets an extension register
+MySQL system variables backed by extension-owned storage. Four types are
+supported: `BOOL` (`bool *`), `INT` (`long long *`), `DOUBLE` (`double *`), and
+`STR` (`char **`). `INT` and `DOUBLE` descriptors also carry `min_val` and
+`max_val` bounds; all descriptors carry a default value and a comment.
+
+Build the capability with `vsql::preview_sys_var::make_capability()` and the
+matching factory functions `make_bool`, `make_int`, `make_double`, and
+`make_str`. The
+capability object also exposes `get()` and `set()` for
+programmatic access from extension code. Both return `false` on success.
+
+To react to value changes, chain `.on_change<&fn>()` on a descriptor. The
+callback receives a `sv::SysVarChange` with `var_name()` and typed accessors
+(`as_int()`, `as_real()`, `as_str()`).
+
+The server calls that callback while it holds its global system-variable lock.
+Reading or writing another of this extension's variables through its storage
+pointer is safe there, and other sessions see the new value immediately, because
+the server reads those variables under the same lock.
+
+<Warning>
+Calling the capability's `get()` or `set()`, running SQL, or waiting on a thread
+that does either deadlocks on that lock. Keep the callback short and
+non-blocking, hand work that needs SQL to a [thread worker](#thread-worker), or
+release `LOCK_global_system_variables` around the blocking part and retake it
+before returning, as `event_scheduler_update()` does in `sql/sys_vars.cc`.
+</Warning>
+
+The capability object must have static storage duration. MySQL writes directly
+to the storage pointers when the user sets a variable.
+
+| Factory | Storage type | Extra parameters |
+|---------|--------------|------------------|
+| `sv::make_bool` | `bool *` | `def_val` |
+| `sv::make_int` | `long long *` | `def_val`, `min_val`, `max_val` |
+| `sv::make_double` | `double *` | `def_val`, `min_val`, `max_val` |
+| `sv::make_str` | `char **` | `def_val` |
+
+### Complete Example
+
+```cpp
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_sys_var;
+
+static bool      g_enabled   = true;
+static long long g_threshold = 1000;
+static char     *g_log_file  = nullptr;
+
+static void on_threshold_change(sv::SysVarChange c) {
+  // c.var_name() identifies the variable; c.as_int() returns the new value
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled",      "Enable feature",  &g_enabled,   true),
+    sv::make_int ("threshold_ms", "Threshold in ms", &g_threshold, 1000, 0, 3600000)
+        .on_change<&on_threshold_change>(),
+    sv::make_str ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log")});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SYS_VARS))
+```
+
+### Accessing from SQL
+
+After `INSTALL EXTENSION my_ext`, variables are accessible using the extension
+name as a component prefix:
+
+```sql
+SELECT @@global.my_ext.threshold_ms;
+SET GLOBAL my_ext.threshold_ms = 500;
+SET GLOBAL my_ext.log_file = '/var/log/myext.log';
+```
+
+### Reading and Writing from Extension Code
+
+For INT and BOOL variables, read the global storage pointer directly — MySQL
+updates those atomically. To update a variable through MySQL (so locking, range
+validation, and persistence are handled by the server), call
+`SYS_VARS.set(extension_name, var_name, scope, value)`. Both `set` and `get`
+return `false` on success. Neither can be called from an `on_change` callback:
+both deadlock on the system-variable lock.
+
+```cpp
+bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
+```
+
+The `scope` argument controls persistence:
+
+| Scope | Behavior |
+|-------|----------|
+| `nullptr` | Update running value only, not persisted. |
+| `"PERSIST"` | Update running value and write to `mysqld-auto.cnf`. |
+| `"PERSIST_ONLY"` | Write to `mysqld-auto.cnf` only; takes effect on next restart. |
+
+## Thread Worker
+
+The thread worker capability (`vsql::preview::thread_worker`) lets an
+extension run a background thread driven by the server. The thread is started
+and stopped via a control system variable that the server registers at
+extension load; the server invokes the extension's work function on a periodic
+timer, on file-descriptor readiness, or in response to enable/disable events.
+
+The capability name `VEF_PREVIEW_THREAD_WORKER_NAME` is
+`"vsql::preview::thread_worker"`.
+
+### Declaring the Capability
+
+Include the header, declare a `ThreadWorkerCapability` instantiated on your
+work function at file scope, and pass it to `.with()`:
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"suffix"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+The work function is supplied as a non-type template argument
+(`ThreadWorkerCapability<&my_work>`), so it must be a function with the
+signature shown below. The first constructor argument is the thread-name
+suffix; the optional second argument overrides the control sys var name.
+
+### Work Function Signature
+
+```c
+typedef vef_next_wakeup_t (*vef_work_fn_t)(vef_wakeup_reason_t reason,
+                                           struct vef_thread_handle_t *thread,
+                                           void *arg);
+```
+
+`reason` indicates why the server called the function. `thread` is the
+server-owned handle for this worker (NULL on the initial `VEF_WAKEUP_ENABLE`
+call — see below). `arg` is the opaque pointer registered on the descriptor;
+it is passed through unchanged.
+
+### Wakeup Lifecycle
+
+The server calls the work function with one of four reasons:
+
+| Reason | Meaning |
+|---|---|
+| `VEF_WAKEUP_ENABLE` | Worker was just enabled (control sys var flipped ON). The return value sets the initial `poll_fd` and `sleep_ms`. |
+| `VEF_WAKEUP_PERIODIC` | Periodic timer fired (`sleep_ms` elapsed). |
+| `VEF_WAKEUP_POLL_FD` | A watched file descriptor became readable. |
+| `VEF_WAKEUP_DISABLE` | Worker disabled (control sys var OFF) or server shutting down. The return value is ignored. |
+
+The `thread` parameter is NULL when the reason is `VEF_WAKEUP_ENABLE`, because
+the thread handle does not exist yet at that point. For the other three
+reasons, `thread` is non-null.
+
+### Wakeup Return Value
+
+```c
+typedef struct {
+  unsigned int sleep_ms;
+  int poll_fd;
+} vef_next_wakeup_t;
+```
+
+The work function returns a `vef_next_wakeup_t` to update the next wakeup
+configuration. A zero value in either field means "keep the current setting"
+— return a value-initialized struct (`return {};`) to leave both unchanged.
+
+To set a new poll file descriptor, return its value (must be greater than
+zero). To clear an existing poll file descriptor, return `-1` in `poll_fd`.
+
+The return value is ignored when the reason is `VEF_WAKEUP_DISABLE`.
+
+### Thread Name and Control Variable
+
+Two fields on the descriptor control naming:
+
+- `suffix` — the thread-name suffix. The server prepends the extension name,
+  producing thread names like `my_ext/monitor`.
+- `var_name` — optional. When non-null, the server registers this exact name
+  as the control system variable. When null, the server uses the default
+  pattern `{suffix}_enabled`.
+
+The control variable is a server-registered system variable, so it takes the
+extension name as a component prefix. For extension `my_ext` with suffix
+`monitor`, the variable is `my_ext.monitor_enabled`.
+
+Setting it `ON` starts the worker: the server calls the work function with
+`VEF_WAKEUP_ENABLE`, then creates the thread, so the statement does not return
+until that first call has finished. Setting it `ON` again while the worker is
+already running does nothing. Setting it `OFF` returns after the thread has
+exited. The server releases its global system-variable lock around both, so the
+work function may read system variables and run SQL.
+
+### Complete Example
+
+A minimal extension with a single periodic worker that increments a
+heartbeat counter on each timer tick.
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+#include <atomic>
+
+static std::atomic<unsigned long long> g_heartbeat{0};
+
+static vef_next_wakeup_t heartbeat_work(vef_wakeup_reason_t reason,
+                                        struct vef_thread_handle_t *thread,
+                                        void *arg) {
+  switch (reason) {
+    case VEF_WAKEUP_ENABLE:
+      return {1000, 0};  // tick every 1000 ms, no poll fd
+    case VEF_WAKEUP_PERIODIC:
+      g_heartbeat.fetch_add(1, std::memory_order_relaxed);
+      return {};  // keep current sleep_ms and poll_fd
+    case VEF_WAKEUP_POLL_FD:
+      return {};  // not used in this example
+    case VEF_WAKEUP_DISABLE:
+      return {};  // ignored
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&heartbeat_work>
+    g_worker{"heartbeat"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+With this extension installed (and `vsql_allow_preview_extensions = ON`), the
+server registers a `heartbeat_enabled` system variable under the extension's
+name. For an extension named `my_ext`, enable the worker with:
+
+```sql
+SET GLOBAL my_ext.heartbeat_enabled = ON;
+```
+
+## SQL Query
+
+The sql_query capability (`vsql::preview::sql_query`) lets an extension
+execute SQL statements from a background thread. Queries run inside the
+server through the capability vtable — extensions do not link against any
+MySQL client library.
+
+The capability name `VEF_PREVIEW_SQL_QUERY_NAME` is
+`"vsql::preview::sql_query"`.
+
+<Warning>
+A SQL session must be opened from a thread-worker callback using that
+callback's `vef_thread_handle_t *`. `open()` is not valid from VDFs or from
+arbitrary extension-created threads — it requires the worker session
+context.
+</Warning>
+
+### Declaring the Capability
+
+Include the header, declare a `SqlQueryCapability` at file scope, and pass it
+to `.with()`. It is typically registered alongside a `ThreadWorkerCapability`,
+since sessions are opened from the worker callback:
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
+
+`g_sql.open(handle)` returns a `Session`. Check it with `operator bool` before
+use; an invalid `Session` indicates the capability vtable was not bound or the
+server could not allocate a session. The `Session` is move-only and closes
+itself on destruction.
+
+### Executing Queries
+
+A `Session` produces a `SqlQuery` via `session.sql(sv)`. The query can be run
+in two modes:
+
+- `execute()` — runs the statement and buffers the full result set in a
+  `Result`. Iterate rows by calling `next()` at the caller's pace.
+- `for_each(fn)` — runs the statement and invokes `fn` once per row as rows
+  are produced, without buffering. The returned `Result` carries diagnostics
+  only (no rows).
+
+Both return a `Result`. A non-null `Result` does not mean the statement
+succeeded — call `has_error()` to find out.
+
+Buffered (`execute`):
+
+```cpp
+auto result = session.sql("SELECT id, name FROM t").execute();
+if (result.has_error()) {
+  // result.error().message holds the server error string.
+  return {};
+}
+while (result.next()) {
+  long long id          = result.column_int(0);
+  std::string_view name = result.column_str(1);
+  // ...
+}
+```
+
+`column_str()` returns a `string_view` that is valid only until the next
+`next()` call or until `Result` is destroyed. Copy it if a longer lifetime is
+needed. A `string_view` with `data() == nullptr` indicates SQL NULL.
+
+Streaming (`for_each`):
+
+```cpp
+auto status = session.sql("SELECT 1").for_each(
+    [](const auto &row) {
+      // row.column_int(0), row.column_str(1), etc.
+    });
+if (status.has_error()) {
+  // status.error().message
+}
+```
+
+The `Row` passed to the callback is valid only for the duration of the call —
+do not store references to it across rows. The `Result` returned by
+`for_each` holds no buffered rows; `next()` on it will not yield data. Use it
+only for `has_error()`, `error()`, `warning_count()`, and `warning(i)`.
+
+### Diagnostics
+
+Both `execute()` and `for_each()` surface diagnostics through the returned
+`Result`. A diagnostic is one `Diag`:
+
+```cpp
+struct Diag {
+  uint32_t errno_;
+  vef_sql_diag_severity_t severity;   // NOTE | WARNING | ERROR
+  std::string_view sqlstate;          // 5-char SQLSTATE
+  std::string_view message;           // may be empty
+};
+```
+
+| Field | Meaning |
+|---|---|
+| `errno_` | MySQL error number. `0` on a default-constructed `Diag` returned when there is no error. |
+| `severity` | `VEF_SQL_DIAG_NOTE`, `VEF_SQL_DIAG_WARNING`, or `VEF_SQL_DIAG_ERROR`. |
+| `sqlstate` | 5-character SQLSTATE. |
+| `message` | Server-supplied diagnostic message; may be empty. |
+
+`Result` exposes:
+
+```cpp
+bool         Result::has_error() const;
+Diag         Result::error() const;
+unsigned int Result::warning_count() const;
+Diag         Result::warning(unsigned int i) const;
+```
+
+`error()` returns a default-constructed `Diag` (`errno_ == 0`) when the
+statement succeeded. `warning(i)` returns a default-constructed `Diag` when
+`i >= warning_count()`.
+
+The `sqlstate` and `message` views point into storage owned by the `Result`
+and become invalid when the `Result` is destroyed — copy them if they need to
+outlive it.
+
+### Complete Example
+
+A worker that runs one buffered query and one streaming query on each tick,
+logging diagnostics from both:
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t sql_demo_work(vef_wakeup_reason_t reason,
+                                       struct vef_thread_handle_t *thread,
+                                       void *arg) {
+  if (reason == VEF_WAKEUP_ENABLE) return {5000, 0};
+  if (reason != VEF_WAKEUP_PERIODIC) return {};
+
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+
+  // Buffered: read a small result set.
+  auto rs = session.sql("SELECT id, name FROM mydb.t LIMIT 10").execute();
+  if (rs.has_error()) {
+    auto e = rs.error();
+    // Log e.errno_, e.sqlstate, e.message somewhere extension-owned.
+  } else {
+    while (rs.next()) {
+      long long id          = rs.column_int(0);
+      std::string_view name = rs.column_str(1);
+      (void)id; (void)name;
+    }
+  }
+
+  // Streaming: process rows without buffering.
+  auto status = session.sql("SELECT v FROM mydb.t").for_each(
+      [](const auto &row) {
+        long long v = row.column_int(0);
+        (void)v;
+      });
+  for (unsigned i = 0; i < status.warning_count(); ++i) {
+    auto w = status.warning(i);
+    (void)w;
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&sql_demo_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
+
+## Column Storage
+
+Column storage lets an extension register a custom binary on-disk layout
+directly with InnoDB for one of its custom types, instead of routing the
+type's bytes through the row's VARBINARY payload. Use it when your type
+needs an on-disk shape VARBINARY cannot express — for example, a packed
+array of floats that must live in dedicated pages. This is a capability
+feature: it enables new storage layouts, not a tuning knob for existing ones.
+
+<Warning>
+  Column storage is a preview ABI — under active development and may change
+  between releases. It currently covers row-level persistence only; indexing
+  over custom-stored columns is not yet available.
+</Warning>
+
+### Declaring the Capabilities
+
+Two preview capabilities work together:
+
+- `vsql::preview::storage` — opens access to InnoDB storage infrastructure
+  (mini-transactions, segments, pages). Declare a `StorageCapability` at file
+  scope.
+- `vsql::preview::column_store` — binds a per-type storage implementation to
+  one of the extension's custom types. Declare a `ColumnStoreCapability` at
+  file scope using `make_column_store<Ctx>(TYPE).…build()`.
+
+Both must be passed to `.with()` on `make_extension()`:
+
+```cpp
+#include <villagesql/preview/storage_builder.h>
+#include <villagesql/preview/storage_api.h>
+#include <villagesql/vsql.h>
+
+namespace storage = vsql::preview_storage;
+using vsql::preview_storage_builder::ColumnStoreCapability;
+using vsql::preview_storage_builder::make_column_store;
+using vsql::preview_storage_builder::StorageCapability;
+
+struct MyCtx {
+  storage::Space::Ref space = 0;
+  storage::Segment::PageRef root_page = storage::Page::INVALID_REF;
+};
+
+static auto STORAGE = StorageCapability{};
+
+static constexpr auto kMyStorage =
+    make_column_store<MyCtx>(MY_TYPE)
+        .create<&MyStorage::create>()
+        .drop<&MyStorage::drop>()
+        .load<&MyStorage::load>()
+        .insert<&MyStorage::insert>()
+        .select<&MyStorage::select>()
+        .mark_delete<&MyStorage::mark_delete>()
+        .purge<&MyStorage::purge>()
+        .build();
+
+static auto COLUMN_STORE = ColumnStoreCapability().column_store(kMyStorage);
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STORAGE)
+        .with(COLUMN_STORE)
+        .type(MY_TYPE))
+```
+
+`make_column_store<MyCtx>(MY_TYPE)` ties the implementation to one custom
+type registered on the same extension. All seven slots are required at
+`build()` time because each maps to a distinct point in the column lifecycle
+that InnoDB will reach during normal operation.
+
+### The Seven Storage Functions
+
+Every function takes `storage::Column::StorageCtx<MyCtx>*`, whose `user()`
+accessor returns the extension's per-column state and whose `arena()` provides
+server-managed allocation for auxiliary objects. Every function returns `false`
+on success and `true` on error, writing a message into `error_msg` (capacity
+`error_msg_len`) so failures surface to the SQL client.
+
+```cpp
+// CREATE TABLE / ALTER TABLE ADD COLUMN.
+// col_len is the type's persisted length. Reserve segments here and store
+// space + root_page in ctx->user() so DML functions can reach them.
+bool create(storage::Column::StorageCtx<MyCtx>*, storage::Space::Ref,
+            storage::Segment::TrxRef, uint32_t col_len,
+            char* error_msg, uint32_t error_msg_len);
+
+// DROP TABLE / ALTER TABLE DROP COLUMN.
+// Release any segments reserved in create(). Arena memory is freed by the
+// server after this call returns.
+bool drop(storage::Column::StorageCtx<MyCtx>*, storage::Segment::TrxRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// Called when the server reattaches to existing storage (e.g. after restart).
+// Recover space and root_page from the StorageRef set in create().
+bool load(storage::Column::StorageCtx<MyCtx>*, storage::Column::StorageRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// INSERT. col_data is the encoded value; rowid_prefix identifies the owning
+// row. Write into your storage layout and return a Column::Ref the server
+// stores in the row payload in place of the value bytes.
+bool insert(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Segment::TrxRef, storage::Column::Data col_data,
+            storage::Column::Data rowid_prefix, storage::Column::Ref* col_ref,
+            char* error_msg, uint32_t error_msg_len);
+
+// SELECT. Given the Column::Ref produced by insert, populate col_data and
+// rowid_prefix, and report the writing transaction and delete-mark status.
+bool select(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Column::Ref, storage::Column::Data* col_data,
+            storage::Column::Data* rowid_prefix, storage::Segment::TrxRef*,
+            bool* delete_marked, char* error_msg, uint32_t error_msg_len);
+
+// DELETE (in-transaction). Set or clear the delete-mark flag. The actual
+// bytes must remain readable until purge() runs.
+bool mark_delete(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+                 storage::Segment::TrxRef, storage::Column::Ref,
+                 bool delete_mark, char* error_msg, uint32_t error_msg_len);
+
+// InnoDB purge. Reclaim storage for entries whose deleting transaction is
+// no longer visible to any active snapshot.
+bool purge(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+           storage::Segment::TrxRef, storage::Column::Ref,
+           char* error_msg, uint32_t error_msg_len);
+```
+
+`mark_delete` and `purge` are distinct because InnoDB MVCC requires deleted
+rows to remain readable by older snapshots until purge runs.
+
+### Per-Column Context and the Arena
+
+The C++ SDK default-constructs `MyCtx` before calling either `create` or `load` —
+`ctx->user()` is already populated when your function is entered. `MyCtx` must
+be default-constructible; the C++ SDK calls `T()` with no arguments.
+
+Use `ctx->user()` directly to initialize state. Do not call
+`ctx->arena().construct<MyCtx>()` — that allocates a second, unused instance
+and `ctx->user()` does not point to it.
+
+```cpp
+bool MyStorage::create(storage::Column::StorageCtx<MyCtx>* ctx,
+                       storage::Space::Ref space, storage::Segment::TrxRef trx,
+                       uint32_t col_len,
+                       char* error_msg, uint32_t error_msg_len) {
+  storage::Segment::PageRef root;
+  if (storage::Segment::create(space, 1, trx, root) != storage::Error::SUCCESS) {
+    snprintf(error_msg, error_msg_len, "%s", storage::last_error().data());
+    return true;
+  }
+
+  ctx->user()->space = space;
+  ctx->user()->root_page = root;
+  // Encode space and root into StorageRef so load() can recover both.
+  ctx->set_ref((static_cast<storage::Column::StorageRef>(space) << 32) |
+               static_cast<storage::Column::StorageRef>(root));
+  return false;
+}
+```
+
+`load` follows the same pattern — `ctx->user()` is pre-populated and
+`storage_ref` carries the packed value stored by `ctx->set_ref()` in `create`:
+
+```cpp
+bool MyStorage::load(storage::Column::StorageCtx<MyCtx>* ctx,
+                     storage::Column::StorageRef storage_ref,
+                     char* error_msg, uint32_t error_msg_len) {
+  ctx->user()->space =
+      static_cast<storage::Space::Ref>(storage_ref >> 32);
+  ctx->user()->root_page =
+      static_cast<storage::Segment::PageRef>(storage_ref & 0xFFFFFFFF);
+  ctx->set_ref(storage_ref);
+  return false;
+}
+```
+
+Use `ctx->arena()` only to allocate auxiliary objects that are too large or
+dynamic to embed directly in `MyCtx`. The C++ SDK destroys the arena — and calls
+`~MyCtx()` — automatically after `drop` returns, regardless of whether `drop`
+succeeds.
+
+### InnoDB Access Utilities
+
+Include `<villagesql/preview/storage_api.h>` for the InnoDB primitives.
+All page reads and writes must occur inside a mini-transaction:
+
+```cpp
+storage::MtrCtx mtr;
+storage::MtrCtx::Ref mtr_ref = mtr.start();
+if (mtr_ref == nullptr) { /* OOM — handle error */ return true; }
+// ... page operations ...
+mtr.commit();
+```
+
+Committing the mini-transaction releases page latches and writes the redo log
+records that make changes durable.
+
+**Segments** are reserved at `create` time — see the `create` and `load`
+examples in Per-Column Context above for the complete setup pattern. During
+DML operations, get a segment reference from the root page to allocate new
+pages:
+
+```cpp
+storage::Page root;
+root.load(ctx->user()->space, ctx->user()->root_page,
+          storage::Page::Latch::EXCLUSIVE, mtr_ref);
+storage::Segment::Ref seg = storage::Segment::get_header(root, 0);
+storage::Page data_page;
+data_page.load_new(seg, mtr_ref);  // allocates a fresh page
+```
+
+**Pages** are read with a shared latch and written with an exclusive one.
+Pass `mtr_ref` to write calls so InnoDB logs the change:
+
+```cpp
+storage::Page page;
+
+// Read
+page.load(ctx->user()->space, page_num, storage::Page::Latch::SHARED, mtr_ref);
+uint32_t v = page.read_integer_4(storage::Page::HEADER_SIZE + offset);
+
+// Write
+page.load(ctx->user()->space, page_num, storage::Page::Latch::EXCLUSIVE, mtr_ref);
+page.write_integer_4(storage::Page::HEADER_SIZE + offset, v, mtr_ref);
+```
+
+Page layout constants:
+
+| Constant | Value | Notes |
+|---|---|---|
+| `storage::Page::HEADER_SIZE` | `38` | Extension data begins at this offset. |
+| `storage::Page::TRAILER_SIZE` | `8` | Do not write past `page_size - TRAILER_SIZE`. |
+| `storage::Page::get_size(space)` | runtime | Use instead of hard-coding 16384. |
+
+Reading or writing inside the header or trailer regions corrupts the page —
+InnoDB uses those byte ranges for its own bookkeeping and checksum.
+
+## Statement Events
+
+The statement event capability (`vsql::preview::statement_event`) runs an
+extension-provided handler after each query finishes executing. The server
+invokes the handler synchronously on the query's own thread and passes
+execution metadata — the query text, timing, row counts, connection identity,
+and optimizer quality indicators. Use it for slow-query logging, auditing, or
+metrics collection.
+
+The capability name `VEF_PREVIEW_STATEMENT_EVENT_NAME` is
+`"vsql::preview::statement_event"`.
+
+### Declaring the Capability
+
+Declare a `StatementEventCapability`, instantiated on the firing phase and your
+handler function, at file scope and pass it to `.with()`:
+
+```cpp
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/vsql.h>
+
+namespace se = vsql::preview_statement_event;
+
+static void on_statement(const se::StatementEventArgs &args,
+                         se::StatementEventResult &result) {
+  // inspect args; optionally write an advisory message via result
+}
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &on_statement>
+    g_statement_event;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_statement_event))
+```
+
+The first template argument is the firing phase, a `vef_statement_event_phase_t`
+value. `VEF_STATEMENT_EVENT_POSTEXECUTE` fires after a query finishes executing,
+on success or failure, and is the only phase implemented in this version. The
+other `vef_statement_event_phase_t` values are reserved; declaring a handler for
+one of them causes the server to reject `INSTALL EXTENSION`.
+
+### Handler Arguments
+
+`StatementEventArgs` is a read-only view of the completed query; at the
+POSTEXECUTE phase every field is populated. Selected accessors:
+
+| Accessor | Meaning |
+|---|---|
+| `query()` | Query text, as a `string_view`. When the server has a rewritten form of the statement, this is that form — the same redacted text the general, slow, and binary logs record. |
+| `query_time_secs()` | Wall-clock execution time, in seconds. |
+| `lock_time_secs()` | Time spent waiting on locks, in seconds. |
+| `rows_sent()`, `rows_examined()`, `rows_affected()` | Row counters. |
+| `user()`, `client_ip()`, `connection_id()` | Connection identity. |
+| `schema()` | Default schema, or `NULL` if none is selected. |
+| `status()` | `0` on success, otherwise the MySQL error code. |
+| `digest_text()` | Normalized query form, for grouping similar queries. |
+| `no_index_used()` | `true` when the query ran without a usable index. |
+| `digest_hash()` | Statement digest as 64 lowercase hex characters — the value `performance_schema` exposes as `DIGEST`. A compact key for grouping identical statements; `NULL` whenever `digest_text()` is. |
+| `read_first()`, `read_last()`, `read_key()`, `read_next()`, `read_prev()`, `read_rnd()`, `read_rnd_next()` | Per-statement handler row-access counters (the slow log's `Read_*` fields). They quantify the access method that `no_index_used()` only flags — a high `read_rnd_next()`, for example, indicates a full table scan. |
+
+Because `query()` returns the server's rewritten form when one exists,
+credential-bearing statements arrive with the secret obfuscated rather than in
+cleartext, matching how the general, slow, and binary logs already redact them:
+`SET PASSWORD`, `CREATE`/`ALTER USER ... IDENTIFIED BY`, `CHANGE REPLICATION
+SOURCE ... SOURCE_PASSWORD`, and `CREATE SERVER ... OPTIONS(PASSWORD ...)`.
+Statements with no rewrite rule are delivered verbatim.
+
+String accessors such as `query()`, `sqlstate()`, and `error_message()` point
+into storage that is valid only for the duration of the handler call — copy the
+bytes if you need them after the handler returns.
+
+`StatementEventResult::error_msg(fmt, ...)` writes a printf-formatted message.
+At the POSTEXECUTE phase the message is advisory: the server logs it but does
+not propagate it to the client.
+
+### Complete Example
+
+A condensed form of the
+[`vsql_slow_query_log`](https://github.com/villagesql/villagesql-server/tree/main/villagesql/test-extensions/vsql-slow-query-log)
+test extension. It logs each query whose execution
+time exceeds a threshold, combining the statement event capability with
+[system variables](#system-variables) for runtime configuration:
+
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+namespace sv = vsql::preview_sys_var;
+namespace se = vsql::preview_statement_event;
+
+static bool g_enabled;
+static long long g_threshold_ms;
+static char *g_log_filename;
+static std::mutex g_log_mutex;
+
+static void slow_query_hook(const se::StatementEventArgs &args,
+                            se::StatementEventResult &result) {
+  if (!g_enabled) return;
+  if (args.query_time_secs() * 1000.0 < static_cast<double>(g_threshold_ms))
+    return;
+
+  time_t now = static_cast<time_t>(args.query_start_utime() / 1000000);
+  char ts[32];
+  struct tm tm_utc;
+  gmtime_r(&now, &tm_utc);
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+  std::lock_guard<std::mutex> lock(g_log_mutex);
+  FILE *f = fopen(g_log_filename, "a");
+  if (f == nullptr) {
+    result.error_msg("failed to open '%s': %s", g_log_filename,
+                     strerror(errno));
+    return;
+  }
+
+  fprintf(f, "# Time: %s\n", ts);
+  fprintf(f, "# User@Host: %s @ %s  Id: %lu\n", args.user() ? args.user() : "",
+          args.client_ip() ? args.client_ip() : "", args.connection_id());
+  fprintf(f,
+          "# Schema: %s  Query_time: %.6f  Lock_time: %.6f"
+          "  Rows_sent: %llu  Rows_examined: %llu\n",
+          args.schema() ? args.schema() : "", args.query_time_secs(),
+          args.lock_time_secs(), (unsigned long long)args.rows_sent(),
+          (unsigned long long)args.rows_examined());
+  fprintf(f, "SET timestamp=%llu;\n", (unsigned long long)now);
+  auto q = args.query();
+  fprintf(f, "%.*s;\n", (int)q.size(), q.data());
+  fclose(f);
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled", "Enable the slow query log", &g_enabled, false),
+    sv::make_int("threshold_ms", "Minimum execution time to log, in ms",
+                 &g_threshold_ms, 1000, 0, 3600000),
+    sv::make_str("log_file", "Path to the slow query log file",
+                 &g_log_filename, "/tmp/vsql_slow_query.log")});
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &slow_query_hook>
+    STATEMENT_EVENT;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension().with(SYS_VARS).with(STATEMENT_EVENT))
+```
+
+#### Enabling from SQL
+
+With the preview tier enabled (see
+[Enabling the Preview Tier](#enabling-the-preview-tier)), install the extension
+and configure it through its system variables:
+
+```sql
+INSTALL EXTENSION vsql_slow_query_log;
+SET GLOBAL vsql_slow_query_log.enabled = ON;
+SET GLOBAL vsql_slow_query_log.threshold_ms = 500;
+```
+
+Each query slower than the threshold is appended to the configured log file:
+
+```
+# Time: 2026-06-22T22:53:44Z
+# User@Host: root @   Id: 27
+# Schema:   Query_time: 0.605084  Lock_time: 0.000000  Rows_sent: 1  Rows_examined: 1
+SET timestamp=1782168824;
+SELECT SLEEP(0.6);
+```
+
+## Authentication Methods
+
+The auth capability (`vsql::preview::auth`) lets an extension provide a server
+authentication method. An account opts in with `CREATE USER ... IDENTIFIED WITH
+<method-name>`; at connection time, when that name is not a loaded MySQL auth
+plugin, the server consults the VEF auth registry and invokes the extension's
+handler over the handshake. Use it to authenticate accounts against a credential
+source the server does not know about — a bearer token, an external identity
+provider, or a custom challenge — without writing a MySQL authentication plugin.
+
+The capability name `VEF_PREVIEW_AUTH_NAME` is `"vsql::preview::auth"`.
+
+The handler is a typed function that receives an `AuthContext`: it talks to the
+client by reading and writing handshake packets through that server-owned
+context, and it never sees MySQL's internal auth structures.
+
+<Warning>
+The auth result is fail-closed. The server treats anything other than
+`AuthResult::kOk` as a denied connection — there is deliberately no "maybe" or
+fail-open result. A handler that returns `AuthResult::kReject`, returns
+`AuthResult::kError`, or never sets the effective account denies the login.
+</Warning>
+
+### Declaring the Capability
+
+Include the header, write a typed handler, build a descriptor with the fluent
+`make_auth<>` builder, and hand the descriptor to an `AuthCapability` token that
+you pass to `.with()`. Preview capability headers are not part of the
+`<villagesql/vsql.h>` umbrella, so include `<villagesql/preview/auth.h>`
+explicitly:
+
+```cpp
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+AuthResult authenticate(AuthContext &c) {
+  // ... validate the client and set the effective account ...
+  return AuthResult::kOk;
+}
+
+constexpr auto MY_AUTH =
+    vsql::preview_auth::make_auth<&authenticate>("my_auth")
+        .client_plugin("mysql_clear_password")
+        .build();
+
+static vsql::preview_auth::AuthCapability g_auth{MY_AUTH};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_auth))
+```
+
+The builder has six pieces:
+
+| Element | Meaning |
+|---|---|
+| `make_auth<&handler>("name")` | Starts the builder. The handler is a compile-time template argument, so a null or wrong-signature handler is a compile error rather than a runtime failure. `"name"` is the auth-method name accounts bind to (`IDENTIFIED WITH <name>`) and must be at most `VEF_AUTH_MAX_NAME_LEN` (64) bytes. |
+| `.client_plugin(name)` | Optional. Overrides the client-side auth plugin the server advertises during the handshake. |
+| `.accepts_client_plugin(callback)` | Optional. Takes `bool (*)(const char *offered)`. Returning `true` keeps the plugin the client offered; returning `false` switches the client to `.client_plugin()`. |
+| `.auto_create(callback)` | Optional. Opts the method in to logins for accounts that do not exist (see [Auto-Creating Accounts](#auto-creating-accounts)). |
+| `.auto_grant(callback)` | Optional. Lets the server grant the roles the handler stages, instead of only activating ones the account already holds (see [Auto-Granting Roles](#auto-granting-roles)). |
+| `.build()` | Yields the descriptor you hand to `AuthCapability`. |
+
+`AuthCapability g_auth{descriptor}` is the self-registering token consumed by
+`.with()`. Declare it `static` so it outlives registration.
+
+`client_plugin` is optional. `make_auth` defaults the advertised plugin to
+`"mysql_clear_password"` — the lowest common denominator every MySQL client
+ships — so a method that never calls `.client_plugin()` still installs and a
+naive client still connects. Call `.client_plugin(name)` to request a different
+plugin; `mysql_clear_password` receives a bearer token verbatim in the password
+slot.
+
+A client that offers a plugin other than the one the method requests is switched
+to the requested plugin and resends its credential verbatim, which costs a round
+trip and needs a client willing to make that switch.
+`.accepts_client_plugin(&callback)` lets the method keep the offered plugin
+instead: the server passes each offered name to the callback, including the
+requested plugin, which is accepted whatever the callback returns. A method that
+sets no callback accepts no other offer, so every other offer switches to the
+requested plugin. Accepting is final — the server does not switch back to the
+requested plugin afterwards — so accept only a plugin whose framing the handler
+really parses. The server queries the callback during handshake negotiation,
+before the handler's first read, so it must be a pure predicate: no packet I/O,
+no blocking, no side effects.
+
+### The Handler Contract
+
+The handler matches the `AuthHandler` type — it takes an `AuthContext &` and
+returns an `AuthResult`:
+
+```cpp
+AuthResult authenticate(AuthContext &c);
+```
+
+It is invoked synchronously on the connecting thread during the handshake. The
+`AuthContext` wraps the server-owned per-attempt context; hold it only for the
+duration of the call and do not retain it. Call its methods instead of threading
+a context pointer through a function table. The methods a token-based handler
+uses:
+
+| Method | Purpose |
+|---|---|
+| `c.read_packet()` | Read the next packet the client sent. Returns the bytes as a `Span<const unsigned char>` valid until the next read (empty on a protocol or connection error). Paired with `mysql_clear_password`, one read yields the bearer token. |
+| `c.write_packet(data)` | Send a packet to the client (e.g. a challenge). Takes a `Span<const unsigned char>` and returns `true` on failure. |
+| `c.user_name()` | The account name the client connected as. |
+| `c.auth_string()` | The `AS '...'` clause from `IDENTIFIED WITH <m> AS '...'`, or empty. |
+| `c.host_or_ip()` | The client host or IP. |
+| `c.client_auth_plugin()` | The client-side auth plugin the client advertised in its handshake reply (for example `"mysql_clear_password"`). When the method accepted that offer, it is also the plugin that framed the credential the handler reads, so the handler can parse by name instead of sniffing bytes. A forced switch to `.client_plugin()` does not update it, so on that path it still reports what the client first offered. Empty if unknown. |
+| `c.authenticate_as(account)` | Set the effective account the session runs as (shown by `CURRENT_USER()`). Required before returning `AuthResult::kOk`. |
+| `c.set_external_user(identity)` | Set the original external identity for the audit trail (`@@external_user`). |
+| `c.set_active_roles(roles, n_roles)` | Stage the session's active roles (see [Staging Active Roles](#staging-active-roles)). |
+| `c.account_unknown()` | `true` when the account being authenticated does not exist and this login was routed to the method by its `.auto_create()` opt-in. `false` for a login against an existing account. |
+| `c.request_provision(account, roles, n_roles)` | Ask the server to create `account` and grant it `roles` (see [Auto-Creating Accounts](#auto-creating-accounts)). |
+
+The handler returns one of three results:
+
+| Result | Meaning |
+|---|---|
+| `AuthResult::kOk` | Authentication succeeded. The handler must have called `authenticate_as()`; the session runs as that account. |
+| `AuthResult::kReject` | Authentication failed — bad credential or policy rejection. |
+| `AuthResult::kError` | An internal error prevented a decision (for example, a key source was unavailable). Treated identically to a rejection by the server; it exists only to distinguish "denied" from "couldn't decide" in logging. |
+
+Both `AuthResult::kReject` and `AuthResult::kError` deny the connection. Only
+`AuthResult::kOk` succeeds.
+
+When the handler maps the connecting account to a different effective account —
+as the example below maps the connecting account to `vsql_auth_test_user` — that
+is proxying, and it requires a `GRANT PROXY`, exactly as on the MySQL plugin auth
+path.
+
+### Staging Active Roles
+
+`c.set_active_roles(roles, n_roles)` stages the roles that should be active on
+the session, replacing the account's default-role activation for this login.
+`roles` is an array of `n_roles` NUL-terminated names; the strings are copied,
+so the caller need not keep them. The server applies them *after* account
+resolution, using the same grant-checked activation as `SET ROLE`: only roles
+actually granted to the authenticated account activate, and names that are not
+granted are silently skipped — so a token can never grant or escalate privileges
+beyond what the DBA provisioned. Passing `n_roles == 0` activates no roles
+(equivalent to `SET ROLE NONE`).
+
+### Complete Example
+
+A minimal authenticator, condensed from the `vsql_auth_test` extension in the
+server source tree at `villagesql/test-extensions/vsql-auth-test/`, which no
+release includes. It accepts one fixed token, maps the connection to
+`vsql_auth_test_user`, and requests `mysql_clear_password` so the token arrives
+verbatim in the password slot. (The in-tree extension adds extra token paths, an
+`.accepts_client_plugin()` callback, and both opt-ins described below to drive
+its test suite.)
+
+```cpp
+#include <cstring>
+
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+namespace {
+
+constexpr char kToken[] = "vsql-auth-test-token";
+constexpr char kMappedAccount[] = "vsql_auth_test_user";
+
+AuthResult authenticate(AuthContext &c) {
+  auto pkt = c.read_packet();
+  if (pkt.empty()) return AuthResult::kError;
+
+  // mysql_clear_password sends a NUL-terminated string; drop the trailing NUL.
+  size_t len = pkt.size();
+  if (len && pkt[len - 1] == '\0') --len;
+
+  if (len != std::strlen(kToken) ||
+      std::memcmp(pkt.data(), kToken, len) != 0) {
+    return AuthResult::kReject;
+  }
+
+  c.authenticate_as(kMappedAccount);
+  // @@external_user records the connecting identity, not the mapped account.
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .build();
+vsql::preview_auth::AuthCapability g_auth{AUTH_METHOD};
+
+}  // namespace
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(g_auth))
+```
+
+### Binding an Account and Connecting
+
+With the preview tier enabled (see
+[Enabling the Preview Tier](#enabling-the-preview-tier)), install the extension
+and bind an account to the method. Because the handler maps to a second account,
+create that account too and grant it the `PROXY` privilege that lets the
+connecting account assume its identity:
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+```
+
+`CREATE USER ... IDENTIFIED WITH vsql_auth_test` is accepted because
+`vsql_auth_test` is a registered VEF auth method — the same way an installed
+plugin name is accepted.
+
+Only the `IDENTIFIED WITH <method>` form is accepted, optionally with
+`AS '...'`. Adding `BY '...'` asks the method to turn a password into a stored
+credential — the job a MySQL plugin does through
+`generate_authentication_string()` — and no VEF auth method declares that hook
+today, so the server rejects it:
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test BY 'secret';
+```
+
+```text
+ERROR 1827 (HY000): The password hash doesn't have the expected format.
+```
+
+The bound method name is written to the account's `plugin` column rather than
+the table default, which is what the account's next login reads:
+
+```sql
+SELECT plugin FROM mysql.user WHERE user = 'auth_user';
+```
+
+```text
++----------------+
+| plugin         |
++----------------+
+| vsql_auth_test |
++----------------+
+```
+
+The method requests `mysql_clear_password`, so the client must pass
+`--enable-cleartext-plugin` to send the token in cleartext. On a correct token,
+the session runs as the mapped account and exposes the connecting account
+through `@@external_user`:
+
+```bash
+mysql --enable-cleartext-plugin --user=auth_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER(), @@external_user"
+```
+
+```
+CURRENT_USER()         @@external_user
+vsql_auth_test_user@%  auth_user
+```
+
+Uninstalling the extension removes the method; accounts bound to it can no
+longer authenticate:
+
+```sql
+UNINSTALL EXTENSION vsql_auth_test;
+```
+
+### Auto-Creating Accounts
+
+A method can also handle logins for accounts that do not exist yet, and have the
+server create the account as part of the successful login. Without this, an
+unknown account is rejected before any method runs.
+
+Opt in with `.auto_create(&callback)`. The callback takes no arguments and
+returns `bool`; the server calls it on each unknown-account login rather than
+reading it once at registration, so the method can follow a runtime setting of
+its own instead of freezing the choice when the extension loads:
+
+```cpp
+bool auto_create_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_create(&auto_create_enabled)
+        .build();
+```
+
+Leaving `.auto_create()` off, or returning `false` from the callback, keeps the
+standard behavior: an unknown account is denied. Only one installed method may
+opt in at a time — if two return `true`, the server declines to guess, logs a
+warning to the error log, and rejects unknown accounts as if none had opted in.
+
+In the handler, `c.account_unknown()` distinguishes the two cases. Validate the
+credential first, then describe what to create and authenticate as it:
+
+```cpp
+if (c.account_unknown()) {
+  const char *roles[] = {"vsql_role_granted"};
+  c.request_provision(c.user_name(), roles, 1);
+  c.authenticate_as(c.user_name());
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+```
+
+`request_provision(account, roles, n_roles)` records intent and returns nothing.
+The server runs the DDL itself, after the handler returns `AuthResult::kOk`, and
+only for a login that was routed in as an unknown account — so a login the
+handler goes on to deny creates nothing, and a request naming an account that
+already exists is ignored. What the server runs is
+`CREATE USER IF NOT EXISTS <account>@'%' IDENTIFIED WITH <method>`, followed by
+one `GRANT` per named role: the account is always created for host `%` and bound
+to the method that authenticated it, and `account` need not be the connecting
+user name. If the creation cannot be done — on a `super_read_only` server, for
+example — the login fails rather than proceeding without an account.
+
+Roles behave as they do for [Staging Active Roles](#staging-active-roles): the
+DBA owns them. Each name must already exist as a grantable role, and one that
+cannot be granted is logged and skipped rather than failing the login, so a
+token can name a role but never create or escalate one. The account name comes
+from the client, so the server quotes it as an identifier — a crafted name
+becomes one oddly-named account, never a second statement.
+
+The `vsql_auth_test` extension provisions the connecting user with the role
+`vsql_role_granted`, and gates the opt-in behind `vsql_auth_test.auto_create`,
+which starts `OFF`. Turn it on and create the role first, then connect as an
+account that does not exist:
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+SET GLOBAL vsql_auth_test.auto_create = ON;
+CREATE ROLE vsql_role_granted;
+GRANT SELECT ON *.* TO vsql_role_granted;
+```
+
+```bash
+mysql --enable-cleartext-plugin --user=auto_created_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER() AS who, @@external_user AS ext"
+```
+
+```text
++---------------------+-------------------+
+| who                 | ext               |
++---------------------+-------------------+
+| auto_created_user@% | auto_created_user |
++---------------------+-------------------+
+```
+
+The account now exists, bound to the method, holding the granted role:
+
+```sql
+SELECT user, host, plugin FROM mysql.user WHERE user = 'auto_created_user';
+```
+
+```text
++-------------------+------+----------------+
+| user              | host | plugin         |
++-------------------+------+----------------+
+| auto_created_user | %    | vsql_auth_test |
++-------------------+------+----------------+
+```
+
+```sql
+SHOW GRANTS FOR 'auto_created_user'@'%';
+```
+
+```text
++----------------------------------------------------------+
+| Grants for auto_created_user@%                           |
++----------------------------------------------------------+
+| GRANT USAGE ON *.* TO `auto_created_user`@`%`            |
+| GRANT `vsql_role_granted`@`%` TO `auto_created_user`@`%` |
++----------------------------------------------------------+
+```
+
+A wrong token still fails closed, and provisions nothing:
+
+```bash
+mysql --enable-cleartext-plugin --user=never_created --password=wrong-token \
+      -e "SELECT 1"
+```
+
+```text
+ERROR 1045 (28000): Access denied for user 'never_created'@'localhost' (using password: YES)
+```
+
+<Warning>
+Opting in makes the difference between an unknown and an existing account
+observable to anyone holding a valid credential, which the standard
+unknown-account rejection deliberately hides. That is the trade this feature
+makes; weigh it before enabling the opt-in on a method whose credentials are
+widely held.
+</Warning>
+
+### Auto-Granting Roles
+
+By default a role a token names takes effect only if the account already holds
+it, and one it does not hold is logged and skipped. `.auto_grant(&callback)`
+changes that: the server grants the staged roles to the account, so the token
+decides which roles the session gets rather than only which of the account's
+existing roles to switch on.
+
+The callback matches `.auto_create()` in shape — no arguments, returns `bool`,
+and the server calls it on each login, so it can follow a runtime setting:
+
+```cpp
+bool auto_grant_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_grant(&auto_grant_enabled)
+        .build();
+```
+
+The two opt-ins are independent. `.auto_create()` governs logins for accounts
+that do not exist; `.auto_grant()` governs granting to the account a login
+resolves to, whether or not that account was just created. Leaving
+`.auto_grant()` off, or returning `false`, keeps the activate-only default.
+
+The grant persists — it is an ordinary `GRANT`, not a session-only activation —
+and it is additive: the server never revokes a role the token stopped naming.
+
+`vsql_auth_test` exposes this as `vsql_auth_test.auto_grant`, also `OFF` to start.
+Its `-token-roles` token stages `vsql_role_granted` and `vsql_role_denied`, and
+the account below holds neither. With the setting off, the login leaves the
+account's roles alone:
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+CREATE ROLE vsql_role_granted, vsql_role_denied;
+```
+
+Connecting as `auth_user` with that token, in the same way as above, and asking
+what is active:
+
+```text
++----------------+
+| CURRENT_ROLE() |
++----------------+
+| NONE           |
++----------------+
+```
+
+Turn the setting on and repeat the same login:
+
+```sql
+SET GLOBAL vsql_auth_test.auto_grant = ON;
+```
+
+```text
++------------------------------------------------+
+| CURRENT_ROLE()                                 |
++------------------------------------------------+
+| `vsql_role_denied`@`%`,`vsql_role_granted`@`%` |
++------------------------------------------------+
+```
+
+Both roles are now active, and `SHOW GRANTS` shows the grant the server added:
+
+```sql
+SHOW GRANTS FOR vsql_auth_test_user;
+```
+
+```text
++-----------------------------------------------------------------------------------+
+| Grants for vsql_auth_test_user@%                                                  |
++-----------------------------------------------------------------------------------+
+| GRANT SELECT ON *.* TO `vsql_auth_test_user`@`%`                                  |
+| GRANT `vsql_role_denied`@`%`,`vsql_role_granted`@`%` TO `vsql_auth_test_user`@`%` |
++-----------------------------------------------------------------------------------+
+```
+
+<Warning>
+With `.auto_grant()` on, a valid token is enough to gain any role it names. The
+role must already exist, so a token still cannot invent privileges, but the DBA
+no longer decides which existing roles an account may reach — the method does.
+</Warning>
