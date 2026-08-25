@@ -1,0 +1,680 @@
+---
+audience: extension-author
+title: Rust 拡張の例
+description: Rust SDK を使用した vsql_rot13、vsql_rational、vsql_agg_sum、および vsql_varargs の参照実装から学ぶ
+---
+
+このページでは、Rust SDK リポジトリにある参照拡張のうち 4 つを取り上げます。関数のみの最小限の例、算術演算、順序付け、ハッシュ化を備えた完全なカスタム型、集約関数、そして可変長引数関数です。リポジトリの `examples/` ディレクトリには、サポートされている[Rustにおけるプレビュー機能](/ja/mysql-9.7/stable/rust-preview-capabilities)ごとの例も 1 つずつ含まれています。
+
+**ソース:** [vsql-rust-sdk](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples) の `examples/`
+
+---
+
+## vsql_rot13 — 関数のみの拡張
+
+考えられる最も単純な Rust 拡張です。STRING を受け取り STRING を返す 1 つの VDF です。
+
+**使用例:**
+```sql
+INSTALL EXTENSION vsql_rot13;
+
+SELECT rot13('Hello, World!');
+-- 'Uryyb, Jbeyq!'
+
+SELECT rot13(rot13('Hello, World!'));
+-- 'Hello, World!' (rot13 is its own inverse)
+
+SELECT rot13(NULL);
+-- NULL
+```
+
+### ディレクトリ構造
+
+```
+vsql_rot13/
+├── Cargo.toml          # cdylib crate, depends on villagesql
+├── manifest.json       # Extension metadata
+├── src/
+│   └── lib.rs          # Implementation + extension! registration
+└── mysql-test/
+    └── t/*.test        # MTR test cases
+```
+
+### 実装
+
+**ファイル: `src/lib.rs`**
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// SQL: rot13(s STRING) -> STRING
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rot13_impl, "rot13",
+            [villagesql::Type::String] -> villagesql::Type::String),
+    ]
+}
+```
+
+**主要なパターン:**
+- VDF は `&[InValue]` を受け取り `VdfReturn` を返します。どちらも安全な Rust の列挙型です
+- NULL は両側で第一級のバリアントです。直接パターンマッチできます
+- `extension!` マクロは、サーバーがロード時に呼び出す C エントリポイントを生成します
+- `func!` は SQL シグネチャを宣言します。引数と戻り値の型には `villagesql::Type::*` を使用します
+
+### マニフェスト
+
+**ファイル: `manifest.json`**
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "Example VillageSQL extension: provides rot13(STRING) -> STRING",
+  "author": "VillageSQL Community",
+  "license": "GPL-2.0"
+}
+```
+
+---
+
+## vsql_rational — 算術演算を備えたカスタム型
+
+完全なカスタム型です。有理数を約分された形の `(numerator, denominator)` として格納し、算術関数、順序付け、ハッシュ化を備えています。
+
+**使用例:**
+```sql
+INSTALL EXTENSION vsql_rational;
+
+CREATE TABLE measurements (id INT, ratio rational);
+INSERT INTO measurements VALUES
+    (1, '1/2'),
+    (2, '2/4'),   -- normalizes to '1/2' on storage
+    (3, '-3/6'),  -- normalizes to '-1/2'
+    (4, '0/1');
+
+SELECT id, ratio FROM measurements ORDER BY ratio;
+
+SELECT rational_add('1/2', '1/3');     -- '5/6'
+SELECT rational_mul('2/3', '3/4');     -- '1/2'
+SELECT rational_to_real('22/7');       -- 3.142857...
+```
+
+### バイナリ格納形式
+
+`rational` は **16 バイト** (リトルエンディアン) を格納します。
+- バイト 0–7: 分子 (`i64`)
+- バイト 8–15: 分母 (`i64`)
+
+値は常に、正の分母を持つ約分された形 (GCD = 1) で格納されます。
+
+### 型システム関数
+
+**ファイル: `src/lib.rs`**
+
+この型は 4 つの操作を登録します。エンコード (文字列 → バイト)、デコード (バイト → 文字列)、比較 (ORDER BY 用)、ハッシュ (インデックス作成用) です。
+
+```rust
+pub fn rational_encode(s: &str) -> Result<Vec<u8>, String> {
+    let (num_s, den_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("rational: expected 'n/d', got {s:?}"))?;
+    let num: i64 = num_s.trim().parse().map_err(|e| format!("numerator: {e}"))?;
+    let den: i64 = den_s.trim().parse().map_err(|e| format!("denominator: {e}"))?;
+    let (n, d) = normalize(i128::from(num), i128::from(den))
+        .ok_or_else(|| "rational: zero or overflowing denominator".to_string())?;
+    Ok(to_bytes(n, d))
+}
+
+pub fn rational_decode(b: &[u8]) -> Result<String, String> {
+    if b.len() < BYTES {
+        return Err(format!("rational: expected {} bytes, got {}", BYTES, b.len()));
+    }
+    let (n, d) = from_bytes(b);
+    Ok(format!("{n}/{d}"))
+}
+
+pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (n1, d1) = from_bytes(a);
+    let (n2, d2) = from_bytes(b);
+    // Cross-multiply; denominators are always positive after normalization
+    let lhs = i128::from(n1) * i128::from(d2);
+    let rhs = i128::from(n2) * i128::from(d1);
+    lhs.cmp(&rhs)
+}
+```
+
+### VDF の実装
+
+カスタム型を受け取る VDF は `InValue::Custom(&[u8])` を受け取り、バイトを自身でデコードします。
+
+```rust
+fn rational_add_impl(args: &[InValue]) -> VdfReturn {
+    match (arg(args, 0), arg(args, 1)) {
+        (Ok(Some((n1, d1))), Ok(Some((n2, d2)))) => {
+            match normalize(
+                i128::from(n1) * i128::from(d2) + i128::from(n2) * i128::from(d1),
+                i128::from(d1) * i128::from(d2),
+            ) {
+                Some((n, d)) => VdfReturn::Binary(to_bytes(n, d)),
+                None => VdfReturn::error("rational_add: overflow"),
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => VdfReturn::error(format!("rational_add: {e}")),
+        _ => VdfReturn::null(),
+    }
+}
+```
+
+### 登録
+
+`extension!` マクロは、型とその関数の両方を 1 つの宣言で登録します。
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rational_add_impl, "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_sub_impl, "rational_sub",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_mul_impl, "rational_mul",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_div_impl, "rational_div",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_numer_impl, "rational_numer",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_denom_impl, "rational_denom",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_to_real_impl, "rational_to_real",
+            [villagesql::custom!("rational")] -> villagesql::Type::Real,
+            deterministic: true),
+    ],
+    types: [
+        villagesql::custom_type!(
+            type_name: "rational",
+            persisted_length: 16,
+            max_decode_buffer_length: 42,
+            encode: rational_encode,
+            decode: rational_decode,
+            compare: rational_compare,
+            hash: rational_hash,
+            default: "0/1",
+        ),
+    ]
+}
+```
+
+**主要なパターン:**
+- `villagesql::custom!("name")` は、引数または戻り値としてカスタム型を参照します
+- `custom_type!` は、型をその encode/decode/compare/hash 関数とともに登録します
+- `default: "0/1"` は組み込みのデフォルト値です。サーバーは型の初期化時にこの文字列に対して `encode()` を呼び出すため、有効な値である必要があります
+- `persisted_length` は `encode()` が返すバイト長と一致する必要があります
+- `deterministic: true` により、オプティマイザは定数呼び出しを畳み込むことができます
+
+---
+
+## vsql_agg_sum — 集約関数
+
+`INT` 列に対する `SUM` を再実装した集約 VDF です。集約に必要な 3 つのフック — `clear`、`accumulate`、および結果関数 — と、それぞれが同じアキュムレーターをどのように参照するかを示します。
+
+**使用例:**
+```sql
+INSTALL EXTENSION vsql_agg_sum;
+
+CREATE TABLE t (grp INT, val INT);
+INSERT INTO t VALUES (1, 10), (1, 20), (2, 100), (2, 200), (2, 300);
+
+SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin FROM t GROUP BY grp ORDER BY grp;
+```
+
+```
+grp	mine	builtin
+1	30	30
+2	600	600
+```
+
+すべて NULL のグループを追加すると、アキュムレーターがグループ間で引き継がれるのではなく、リセットされることがわかります。
+
+```sql
+INSERT INTO t VALUES (3, NULL), (3, NULL);
+SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin FROM t GROUP BY grp ORDER BY grp;
+```
+
+```
+grp	mine	builtin
+1	30	30
+2	600	600
+3	NULL	NULL
+```
+
+### アキュムレーターのライフサイクル
+
+アキュムレーターはステートメントごとに 1 つの値であり、すべてのグループで再利用されます。サーバーは決まった順序でこれを駆動します。
+
+| 段階 | 対応する関数 | 実行タイミング |
+|---|---|---|
+| 割り当て | なし — `agg_func!` が生成します | ステートメントごとに 1 回、最初の行の前。SDK は状態を `Default::default()` で割り当てます。状態の型が `Default` を実装しなければならないのはこのためです。 |
+| クリア | `clear:` — `fn(&mut State)` | 各グループの開始時。 |
+| 累積 | `accumulate:` — `fn(&mut State, &[InValue])` | グループ内の行ごとに 1 回。何も返しません。効果は状態に対してのみです。 |
+| 結果 | `agg_func!` の最初の引数 — `fn(&State) -> VdfReturn` | グループごとに 1 回、最後の行が畳み込まれた後。 |
+| 破棄 | なし — `agg_func!` が生成します | ステートメントの終了後。 |
+
+`clear` は各グループの開始時にアキュムレーターをリセットします。リセットし忘れたフィールドは前のグループから漏れます。
+
+サーバーは、引数が NULL の行を含むすべての行に対して `accumulate` を呼び出します。NULL のスキップは関数の仕事です。必要なバリアントのみをマッチさせ、それ以外は無視してください。
+
+### 実装
+
+**ファイル: `src/lib.rs`**
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// Accumulator for `agg_sum`: the running total for the current group.
+#[derive(Default)]
+struct SumState {
+    total: i64,
+    seen: bool,
+}
+
+/// clear: reset the total at the start of each group.
+fn agg_sum_clear(state: &mut SumState) {
+    state.total = 0;
+    state.seen = false;
+}
+
+/// accumulate: fold one row's int into the running total.
+fn agg_sum_acc(state: &mut SumState, args: &[InValue]) {
+    if let Some(InValue::Int(n)) = args.first() {
+        state.total += *n;
+        state.seen = true;
+    }
+}
+
+/// result: emit the group's total once every row has been folded in.
+fn agg_sum_result(state: &SumState) -> VdfReturn {
+    if state.seen {
+        VdfReturn::int(state.total)
+    } else {
+        VdfReturn::Null
+    }
+}
+```
+
+`seen` フラグは、合計が 0 になったグループと、合計するものが何もなかったグループを区別します。これがないと、空のグループやすべて NULL のグループは、組み込みの `SUM` が NULL を返すところで `0` を返してしまいます。
+
+### 登録
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::agg_func!(agg_sum_result, "agg_sum",
+            [villagesql::Type::Int] -> villagesql::Type::Int,
+            state: SumState, clear: agg_sum_clear, accumulate: agg_sum_acc),
+    ]
+}
+```
+
+**主要なパターン:**
+- 最初の識別子は**結果**関数であり、行関数ではありません。集約の行ごとの処理は `accumulate:` にあります
+- `state:` はアキュムレーターの型を指定します。この型は `Default` を実装している必要があります
+- 宣言されたパラメータリストは行ごとの引数リストです。`[villagesql::Type::Int]` は `accumulate` が受け取るもので、戻り値の型は結果関数が生成するものです
+- `agg_func!` は、`accumulate:` の後に `buffer_size:` と `deterministic:` も（両方一緒に、この順序で）受け入れます
+
+---
+
+## vsql_varargs — 可変長引数関数
+
+それぞれが任意の数の引数を受け取る 4 つの VDF です。これらを合わせると、`varargs_func!` がサポートする 3 つの登録形式（prerun 付きの状態あり、prerun のみ、ベア）に加えて、カスタム型引数の検証をカバーします。
+
+**使用例:**
+```sql
+INSTALL EXTENSION vsql_varargs;
+
+SELECT vsql_varargs.str_join('alpha', 'beta');
+SELECT vsql_varargs.str_join('a', 'b', 'c', 'd');
+```
+
+```
+vsql_varargs.str_join('alpha', 'beta')
+#1: alpha, beta
+vsql_varargs.str_join('a', 'b', 'c', 'd')
+#1: a, b, c, d
+```
+
+同じ関数が両方の引数の数に対応します。`#1` プレフィックスはステートメントごとの呼び出しカウンターで、1 つのステートメントの行にわたって増加します。
+
+```sql
+CREATE TABLE t (x VARCHAR(16), y VARCHAR(16));
+INSERT INTO t VALUES ('1a', '1b'), ('2a', '2b'), ('3a', '3b');
+SELECT vsql_varargs.str_join(x, y) AS joined FROM t ORDER BY x;
+```
+
+```
+joined
+#1: 1a, 1b
+#2: 2a, 2b
+#3: 3a, 3b
+```
+
+### 可変長引数の検証はすべて prerun が担う
+
+可変長引数関数に対して、サーバーは引数のチェックを一切行いません。数も型もです。通常は、宣言されたシグネチャによってサーバーが不正な呼び出しをコードの実行前に拒否しますが、可変長引数関数にはそれがありません。prerun フックが拒否しなかったものはすべて行関数に到達します。
+
+prerun は、どの行よりも前に 1 回だけ、*呼び出し*を拒否します。オプティマイザーが解決した引数の型を確認し、ステートメントを失敗させます。行関数は、それでも各*値*を処理しなければなりません。検証を通過した型の列でも、どの行でも NULL を保持し得るためです。
+
+prerun による拒否は、ステートメントの初期化を失敗させます。
+
+```sql
+SELECT vsql_varargs.str_join();
+```
+
+```
+ERROR 1123 (HY000): Can't initialize function 'str_join'; str_join requires at least one argument
+```
+
+```sql
+SELECT vsql_varargs.str_join('ok', 123);
+```
+
+```
+ERROR 1123 (HY000): Can't initialize function 'str_join'; str_join: every argument must be a string
+```
+
+prerun を省略することは、すべての呼び出しを受け入れることを意味します。`arg_count` はベア形式で登録されているため、引数ゼロの呼び出しも有効です。
+
+```sql
+SELECT vsql_varargs.arg_count();
+SELECT vsql_varargs.arg_count(1, 2.5, 'mix');
+```
+
+```
+vsql_varargs.arg_count()
+0
+vsql_varargs.arg_count(1, 2.5, 'mix')
+3
+```
+
+### 実装
+
+**ファイル: `src/lib.rs`**
+
+prerun は `PrerunArgs` と、`T` が状態の型と一致する `PrerunResult<T>` を受け取ります。`PrerunArgs::len()` は引数の数で、`type_at(i)` は引数 `i` の型を `ArgType` として返します。
+
+```rust
+use villagesql::{InValue, PrerunArgs, PrerunResult, VdfReturn};
+
+/// Per-statement state: how many times the row handler has run this statement.
+#[derive(Default)]
+struct JoinState {
+    calls: i64,
+}
+
+/// Validate the call and set up the statement. The server does no validation for
+/// varargs, so this is the only gate.
+fn str_join_prerun(args: PrerunArgs, mut out: PrerunResult<JoinState>) {
+    // Reject a zero-argument call.
+    if args.is_empty() {
+        out.error("str_join requires at least one argument");
+        return;
+    }
+
+    // Every argument must be a string.
+    for i in 0..args.len() {
+        if !args.type_at(i).is_some_and(|t| t.is_str()) {
+            out.error("str_join: every argument must be a string");
+            return;
+        }
+    }
+
+    // Size the result buffer from the arg count.
+    out.request_buffer_size(32 + args.len() * 64);
+
+    // Hand the fresh counter to the server.
+    out.set_state(JoinState::default());
+}
+
+/// Join a variable number of string arguments, prefixed with the per-statement
+/// call count. `args` length varies with how many arguments the SQL call passed.
+fn str_join(state: &mut JoinState, args: &[InValue]) -> VdfReturn {
+    state.calls += 1;
+
+    let mut joined = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        match arg {
+            InValue::String(s) => {
+                if i > 0 {
+                    joined.push_str(", ");
+                }
+                joined.push_str(s);
+            }
+            // A string column can carry NULL. SQL-style: NULL in -> NULL out.
+            InValue::Null => return VdfReturn::Null,
+            _ => return VdfReturn::error("str_join: non-string argument at runtime"),
+        }
+    }
+    VdfReturn::string(format!("#{}: {joined}", state.calls))
+}
+
+/// Bare varargs: no prerun, no state, no validation. Returns how many arguments
+/// it was called with, including zero.
+fn arg_count(args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(i64::try_from(args.len()).unwrap_or(i64::MAX))
+}
+```
+
+可変長引数では、prerun 内で `request_buffer_size` を使い、`args.len()` に応じてバッファーサイズを設定してください。固定の `buffer_size` は引数の数に応じて大きくなれません。
+
+`ArgType` は 4 つの述語 — `is_int()`、`is_real()`、`is_str()`、`is_custom()` — を公開しているため、すべての引数が行関数の処理できる形のいずれかである限り、prerun は異種の引数が混在する呼び出しを受け入れられます。`describe` は 3 つのスカラーの任意の組み合わせを受け入れ、それ以外を拒否します。
+
+```rust
+fn describe_prerun(args: PrerunArgs, mut out: PrerunResult<()>) {
+    if args.is_empty() {
+        out.error("describe requires at least one argument");
+        return;
+    }
+    for i in 0..args.len() {
+        let ok = args
+            .type_at(i)
+            .is_some_and(|t| t.is_int() || t.is_real() || t.is_str());
+        if !ok {
+            out.error("describe: arguments must be INT, REAL, or STRING");
+            return;
+        }
+    }
+    out.request_buffer_size(32 + args.len() * 48);
+}
+```
+
+```sql
+SELECT vsql_varargs.describe(42, 3.14e0, 'hello');
+```
+
+```
+vsql_varargs.describe(42, 3.14e0, 'hello')
+int:42, real:3.14, str:hello
+```
+
+状態の型が `()` なのは、この prerun が何も保持しないためです。検証とバッファーサイズの設定だけを行い、`set_state` は決して呼び出しません。
+
+### カスタム型の可変長引数
+
+`is_custom()` だけでは、引数が*何らかの*カスタム型であることしかわかりません。`custom_name()` はどの型かを返すため、prerun は可変長引数の呼び出しを単一の型に制限できます。この拡張機能は `point2d` カスタム型を登録し、可変個の `point2d` 値を受け入れます。
+
+```rust
+fn point_path_prerun(args: PrerunArgs, mut out: PrerunResult<()>) {
+    if args.is_empty() {
+        out.error("point_path requires at least one point");
+        return;
+    }
+    for i in 0..args.len() {
+        let ok = args
+            .type_at(i)
+            .is_some_and(|t| t.is_custom() && t.custom_name() == Some("point2d"));
+        if !ok {
+            out.error("point_path: every argument must be a point2d");
+            return;
+        }
+    }
+    out.request_buffer_size(16 + args.len() * 32);
+}
+```
+
+```sql
+SELECT vsql_varargs.point_path(point2d::from_string('0,0'), point2d::from_string('1,2'), point2d::from_string('3,5'));
+```
+
+```
+vsql_varargs.point_path(point2d::from_string('0,0'), point2d::from_string('1,2'), point2d::from_string('3,5'))
+(0,0) -> (1,2) -> (3,5)
+```
+
+プレーンな文字列は、そのバイト列が点として解析可能であっても、最初の行の前に拒否されます。
+
+```sql
+SELECT vsql_varargs.point_path('1,2');
+```
+
+```
+ERROR 1123 (HY000): Can't initialize function 'point_path'; point_path: every argument must be a point2d
+```
+
+行関数は `InValue::Custom(b)` をマッチさせ、他のカスタム型 VDF と同様にバイト列を自身でデコードします。
+
+### 登録
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::varargs_func!(str_join, "str_join", [..] -> villagesql::Type::String,
+            state: JoinState, prerun: str_join_prerun),
+        villagesql::varargs_func!(arg_count, "arg_count", [..] -> villagesql::Type::Int),
+        villagesql::varargs_func!(describe, "describe", [..] -> villagesql::Type::String,
+            prerun: describe_prerun),
+        villagesql::varargs_func!(point_path, "point_path", [..] -> villagesql::Type::String,
+            prerun: point_path_prerun),
+    ],
+    types: [
+        villagesql::custom_type!(
+            type_name: "point2d",
+            persisted_length: 8,
+            max_decode_buffer_length: 32,
+            encode: point_encode,
+            decode: point_decode,
+            compare: point_compare,
+            default: "0,0",
+        ),
+    ]
+}
+```
+
+`describe`、`point_path`、および `point2d` の `encode`/`decode`/`compare` は、上で `str_join` と `rational` について示したのと同じ `InValue` のマッチングとバイトエンコードのパターンに従います。完全なソースは [Rust SDK リポジトリ](https://github.com/villagesql/vsql-rust-sdk)の `examples/vsql_varargs/src/lib.rs` を参照してください。
+
+**主要なパターン:**
+- パラメータリストの代わりに `[..]` を書くことで、関数が可変長引数としてマークされます
+- 3 つの形式があり、それぞれ行関数のシグネチャが異なります。`state:` + `prerun:` は `fn(&mut State, &[InValue]) -> VdfReturn`、`prerun:` のみとベア形式はどちらも `fn(&[InValue]) -> VdfReturn` です
+- ステートメントごとの状態を割り当てて破棄するのは `state:` 形式のみです
+- 戻り値の型は宣言されるため、可変なのは引数リストだけです
+- 各形式は、末尾のペアとして `buffer_size:` と `deterministic:` も受け入れます
+- `point2d` は `hash` を登録していません。これはオプションです。`ORDER BY` には `compare` だけで十分です
+
+---
+
+## 主要な実装パターン
+
+| パターン | 使用法 |
+|---------|-------|
+| **VDF シグネチャ** | `fn impl(args: &[InValue]) -> VdfReturn` |
+| **NULL の処理** | `InValue::Null` と `None` を明示的にパターンマッチします |
+| **エラー報告** | `VdfReturn::error("message")` はステートメントを中止します |
+| **カスタム型のエンコード** | `Result<Vec<u8>, String>` を返します |
+| **カスタム型のデコード** | `Result<String, String>` を返します |
+| **型を認識する引数** | `func!` 内で `villagesql::custom!("name")` を使用します |
+| **集約関数** | `agg_func!(result_fn, ..., state: T, clear: f, accumulate: f)`。`T` は `Default` を実装する必要があります |
+| **可変長引数関数** | `varargs_func!(f, "name", [..] -> ret)`。prerun が唯一の引数検証です |
+| **prerun での型検査** | `PrerunArgs::type_at(i)` → `ArgType::is_int`/`is_real`/`is_str`/`is_custom`/`custom_name` |
+| **登録** | 単一の `extension!` ブロックで関数と型を宣言します |
+
+---
+
+## テスト
+
+4 つの例はすべて、C++ 拡張と同様に MTR (MySQL Test Runner) を使用します。
+
+```bash
+# From inside the example directory -- cargo-vsql passes the suite's full path:
+cargo vsql test
+
+# Or point mysql-test-run.pl at the suite directly. A bare --suite=vsql_rot13
+# fails: that form only finds suites staged inside the server's own
+# mysql-test/suite/ tree, and these live in the SDK repo.
+cd /path/to/villagesql/build/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_rot13/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_rational/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_agg_sum/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_varargs/mysql-test
+```
+
+`--record` を使用して期待される結果を生成または更新します。
+
+---
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card
+    title="Rust で拡張機能を作成する"
+    icon="rust"
+    href="/ja/mysql-9.7/stable/rust-sdk"
+  >
+    SDK のインストール、ビルド、および extension! マクロ
+  </Card>
+  <Card
+    title="Rust カスタム型"
+    icon="cube"
+    href="/ja/mysql-9.7/stable/rust-custom-types"
+  >
+    encode、decode、compare、hash の詳細
+  </Card>
+  <Card
+    title="Rust API リファレンス"
+    icon="book"
+    href="/ja/mysql-9.7/stable/rust-api-reference"
+  >
+    InValue、VdfReturn、およびマクロの API サーフェス
+  </Card>
+  <Card
+    title="サンプルソース"
+    icon="github"
+    href="https://github.com/villagesql/vsql-rust-sdk/tree/main/examples"
+  >
+    4 つの例すべての完全なソース
+  </Card>
+</CardGroup>

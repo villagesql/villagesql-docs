@@ -1,0 +1,680 @@
+---
+audience: extension-author
+title: Rust Extension Examples
+description: Learn from the vsql_rot13, vsql_rational, vsql_agg_sum, and vsql_varargs reference implementations using the Rust SDK
+---
+
+This page walks through four of the reference extensions in the Rust SDK repository — a minimal function-only example, a complete custom type with arithmetic, ordering, and hashing, an aggregate function, and a varargs function. The repository's `examples/` directory also carries one example per supported [preview capability](/mysql-9.7/stable/rust-preview-capabilities).
+
+**Source:** `examples/` in [vsql-rust-sdk](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples)
+
+---
+
+## vsql_rot13 — Function-Only Extension
+
+The simplest possible Rust extension: one VDF that takes a STRING and returns a STRING.
+
+**Usage:**
+```sql
+INSTALL EXTENSION vsql_rot13;
+
+SELECT rot13('Hello, World!');
+-- 'Uryyb, Jbeyq!'
+
+SELECT rot13(rot13('Hello, World!'));
+-- 'Hello, World!' (rot13 is its own inverse)
+
+SELECT rot13(NULL);
+-- NULL
+```
+
+### Directory Structure
+
+```
+vsql_rot13/
+├── Cargo.toml          # cdylib crate, depends on villagesql
+├── manifest.json       # Extension metadata
+├── src/
+│   └── lib.rs          # Implementation + extension! registration
+└── mysql-test/
+    └── t/*.test        # MTR test cases
+```
+
+### Implementation
+
+**File: `src/lib.rs`**
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// SQL: rot13(s STRING) -> STRING
+fn rot13_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::String(s)) => VdfReturn::string(rot13(s)),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("rot13: expected a STRING argument"),
+    }
+}
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => (c as u8 + 13) as char,
+            'n'..='z' | 'N'..='Z' => (c as u8 - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rot13_impl, "rot13",
+            [villagesql::Type::String] -> villagesql::Type::String),
+    ]
+}
+```
+
+**Key patterns:**
+- VDFs receive `&[InValue]` and return `VdfReturn` — both are safe Rust enums
+- NULL is a first-class variant on both sides; pattern-match it directly
+- The `extension!` macro generates the C entry points the server calls at load time
+- `func!` declares the SQL signature; argument and return types use `villagesql::Type::*`
+
+### Manifest
+
+**File: `manifest.json`**
+```json
+{
+  "name": "vsql_rot13",
+  "version": "0.1.0",
+  "description": "Example VillageSQL extension: provides rot13(STRING) -> STRING",
+  "author": "VillageSQL Community",
+  "license": "GPL-2.0"
+}
+```
+
+---
+
+## vsql_rational — Custom Type with Arithmetic
+
+A complete custom type: rational numbers stored as `(numerator, denominator)` in reduced form, with arithmetic functions, ordering, and hashing.
+
+**Usage:**
+```sql
+INSTALL EXTENSION vsql_rational;
+
+CREATE TABLE measurements (id INT, ratio rational);
+INSERT INTO measurements VALUES
+    (1, '1/2'),
+    (2, '2/4'),   -- normalizes to '1/2' on storage
+    (3, '-3/6'),  -- normalizes to '-1/2'
+    (4, '0/1');
+
+SELECT id, ratio FROM measurements ORDER BY ratio;
+
+SELECT rational_add('1/2', '1/3');     -- '5/6'
+SELECT rational_mul('2/3', '3/4');     -- '1/2'
+SELECT rational_to_real('22/7');       -- 3.142857...
+```
+
+### Binary Storage Format
+
+`rational` stores **16 bytes** (little-endian):
+- Bytes 0–7: numerator (`i64`)
+- Bytes 8–15: denominator (`i64`)
+
+Values are always stored in reduced form (GCD = 1) with a positive denominator.
+
+### Type-System Functions
+
+**File: `src/lib.rs`**
+
+The type registers four operations: encode (string → bytes), decode (bytes → string), compare (for ORDER BY), and hash (for indexing).
+
+```rust
+pub fn rational_encode(s: &str) -> Result<Vec<u8>, String> {
+    let (num_s, den_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("rational: expected 'n/d', got {s:?}"))?;
+    let num: i64 = num_s.trim().parse().map_err(|e| format!("numerator: {e}"))?;
+    let den: i64 = den_s.trim().parse().map_err(|e| format!("denominator: {e}"))?;
+    let (n, d) = normalize(i128::from(num), i128::from(den))
+        .ok_or_else(|| "rational: zero or overflowing denominator".to_string())?;
+    Ok(to_bytes(n, d))
+}
+
+pub fn rational_decode(b: &[u8]) -> Result<String, String> {
+    if b.len() < BYTES {
+        return Err(format!("rational: expected {} bytes, got {}", BYTES, b.len()));
+    }
+    let (n, d) = from_bytes(b);
+    Ok(format!("{n}/{d}"))
+}
+
+pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (n1, d1) = from_bytes(a);
+    let (n2, d2) = from_bytes(b);
+    // Cross-multiply; denominators are always positive after normalization
+    let lhs = i128::from(n1) * i128::from(d2);
+    let rhs = i128::from(n2) * i128::from(d1);
+    lhs.cmp(&rhs)
+}
+```
+
+### VDF Implementations
+
+VDFs that take a custom type receive `InValue::Custom(&[u8])` and decode the bytes themselves:
+
+```rust
+fn rational_add_impl(args: &[InValue]) -> VdfReturn {
+    match (arg(args, 0), arg(args, 1)) {
+        (Ok(Some((n1, d1))), Ok(Some((n2, d2)))) => {
+            match normalize(
+                i128::from(n1) * i128::from(d2) + i128::from(n2) * i128::from(d1),
+                i128::from(d1) * i128::from(d2),
+            ) {
+                Some((n, d)) => VdfReturn::Binary(to_bytes(n, d)),
+                None => VdfReturn::error("rational_add: overflow"),
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => VdfReturn::error(format!("rational_add: {e}")),
+        _ => VdfReturn::null(),
+    }
+}
+```
+
+### Registration
+
+The `extension!` macro registers both the type and its functions in a single declaration:
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(rational_add_impl, "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_sub_impl, "rational_sub",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_mul_impl, "rational_mul",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_div_impl, "rational_div",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")]
+            -> villagesql::custom!("rational"),
+            deterministic: true),
+        villagesql::func!(rational_numer_impl, "rational_numer",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_denom_impl, "rational_denom",
+            [villagesql::custom!("rational")] -> villagesql::Type::Int,
+            deterministic: true),
+        villagesql::func!(rational_to_real_impl, "rational_to_real",
+            [villagesql::custom!("rational")] -> villagesql::Type::Real,
+            deterministic: true),
+    ],
+    types: [
+        villagesql::custom_type!(
+            type_name: "rational",
+            persisted_length: 16,
+            max_decode_buffer_length: 42,
+            encode: rational_encode,
+            decode: rational_decode,
+            compare: rational_compare,
+            hash: rational_hash,
+            default: "0/1",
+        ),
+    ]
+}
+```
+
+**Key patterns:**
+- `villagesql::custom!("name")` references a custom type as an argument or return
+- `custom_type!` registers the type alongside its encode/decode/compare/hash functions
+- `default: "0/1"` is the intrinsic default — the server calls `encode()` on this string at type initialization, so it must be a valid value
+- `persisted_length` must match the byte length `encode()` returns
+- `deterministic: true` lets the optimizer fold constant calls
+
+---
+
+## vsql_agg_sum — Aggregate Function
+
+An aggregate VDF that reimplements `SUM` over an `INT` column. It shows the three hooks an aggregate needs — `clear`, `accumulate`, and the result function — and how each one sees the same accumulator.
+
+**Usage:**
+```sql
+INSTALL EXTENSION vsql_agg_sum;
+
+CREATE TABLE t (grp INT, val INT);
+INSERT INTO t VALUES (1, 10), (1, 20), (2, 100), (2, 200), (2, 300);
+
+SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin FROM t GROUP BY grp ORDER BY grp;
+```
+
+```
+grp	mine	builtin
+1	30	30
+2	600	600
+```
+
+Adding an all-NULL group shows that the accumulator is reset between groups rather than carried forward:
+
+```sql
+INSERT INTO t VALUES (3, NULL), (3, NULL);
+SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin FROM t GROUP BY grp ORDER BY grp;
+```
+
+```
+grp	mine	builtin
+1	30	30
+2	600	600
+3	NULL	NULL
+```
+
+### Accumulator Lifecycle
+
+The accumulator is one value per statement, reused across every group. The server drives it in a fixed order:
+
+| Stage | Your function | When it runs |
+|---|---|---|
+| Allocate | none — `agg_func!` generates it | Once per statement, before the first row. The SDK allocates the state at `Default::default()`, which is why the state type must implement `Default`. |
+| Clear | `clear:` — `fn(&mut State)` | At the start of each group. |
+| Accumulate | `accumulate:` — `fn(&mut State, &[InValue])` | Once per row in the group. Returns nothing; its only effect is on the state. |
+| Result | the first argument to `agg_func!` — `fn(&State) -> VdfReturn` | Once per group, after the last row has been folded in. |
+| Drop | none — `agg_func!` generates it | After the statement ends. |
+
+`clear` resets the accumulator at the start of each group. A field it forgets to reset leaks from the previous group.
+
+The server calls `accumulate` for every row, including rows where the argument is NULL. Skipping NULLs is the function's job: match only the variant you want and ignore the rest.
+
+### Implementation
+
+**File: `src/lib.rs`**
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// Accumulator for `agg_sum`: the running total for the current group.
+#[derive(Default)]
+struct SumState {
+    total: i64,
+    seen: bool,
+}
+
+/// clear: reset the total at the start of each group.
+fn agg_sum_clear(state: &mut SumState) {
+    state.total = 0;
+    state.seen = false;
+}
+
+/// accumulate: fold one row's int into the running total.
+fn agg_sum_acc(state: &mut SumState, args: &[InValue]) {
+    if let Some(InValue::Int(n)) = args.first() {
+        state.total += *n;
+        state.seen = true;
+    }
+}
+
+/// result: emit the group's total once every row has been folded in.
+fn agg_sum_result(state: &SumState) -> VdfReturn {
+    if state.seen {
+        VdfReturn::int(state.total)
+    } else {
+        VdfReturn::Null
+    }
+}
+```
+
+The `seen` flag is what distinguishes a group that summed to zero from a group with nothing to sum. Without it, an empty or all-NULL group would return `0` where built-in `SUM` returns NULL.
+
+### Registration
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::agg_func!(agg_sum_result, "agg_sum",
+            [villagesql::Type::Int] -> villagesql::Type::Int,
+            state: SumState, clear: agg_sum_clear, accumulate: agg_sum_acc),
+    ]
+}
+```
+
+**Key patterns:**
+- The first identifier is the **result** function, not the row function — an aggregate's per-row work lives in `accumulate:`
+- `state:` names the accumulator type, which must implement `Default`
+- The declared parameter list is the per-row argument list: `[villagesql::Type::Int]` is what `accumulate` receives, and the return type is what the result function produces
+- `agg_func!` also accepts `buffer_size:` and `deterministic:` after `accumulate:`, supplied together, in that order
+
+---
+
+## vsql_varargs — Varargs Function
+
+Four VDFs that each take any number of arguments. Together they cover the three registration forms `varargs_func!` supports — stateful with a prerun, prerun-only, and bare — plus validation of custom-typed arguments.
+
+**Usage:**
+```sql
+INSTALL EXTENSION vsql_varargs;
+
+SELECT vsql_varargs.str_join('alpha', 'beta');
+SELECT vsql_varargs.str_join('a', 'b', 'c', 'd');
+```
+
+```
+vsql_varargs.str_join('alpha', 'beta')
+#1: alpha, beta
+vsql_varargs.str_join('a', 'b', 'c', 'd')
+#1: a, b, c, d
+```
+
+The same function serves both arities. The `#1` prefix is the per-statement call counter, which climbs across the rows of one statement:
+
+```sql
+CREATE TABLE t (x VARCHAR(16), y VARCHAR(16));
+INSERT INTO t VALUES ('1a', '1b'), ('2a', '2b'), ('3a', '3b');
+SELECT vsql_varargs.str_join(x, y) AS joined FROM t ORDER BY x;
+```
+
+```
+joined
+#1: 1a, 1b
+#2: 2a, 2b
+#3: 3a, 3b
+```
+
+### Prerun Owns All Varargs Validation
+
+For a varargs function the server does no argument checking at all — not the count, not the types. A declared signature is what normally makes the server reject a bad call before your code runs, and a varargs function has none. Whatever the prerun hook does not reject reaches the row function.
+
+Prerun rejects the *call*, once, before any row: it sees the argument types the optimizer resolved and fails the statement. The row function still has to handle each *value*, because a column whose type passed validation can still carry NULL on any given row.
+
+A prerun rejection fails statement initialization:
+
+```sql
+SELECT vsql_varargs.str_join();
+```
+
+```
+ERROR 1123 (HY000): Can't initialize function 'str_join'; str_join requires at least one argument
+```
+
+```sql
+SELECT vsql_varargs.str_join('ok', 123);
+```
+
+```
+ERROR 1123 (HY000): Can't initialize function 'str_join'; str_join: every argument must be a string
+```
+
+Omitting the prerun means accepting every call. `arg_count` is registered bare, so a zero-argument call is legal:
+
+```sql
+SELECT vsql_varargs.arg_count();
+SELECT vsql_varargs.arg_count(1, 2.5, 'mix');
+```
+
+```
+vsql_varargs.arg_count()
+0
+vsql_varargs.arg_count(1, 2.5, 'mix')
+3
+```
+
+### Implementation
+
+**File: `src/lib.rs`**
+
+A prerun receives `PrerunArgs` and a `PrerunResult<T>` whose `T` matches the state type. `PrerunArgs::len()` is the argument count, and `type_at(i)` returns the type of argument `i` as an `ArgType`:
+
+```rust
+use villagesql::{InValue, PrerunArgs, PrerunResult, VdfReturn};
+
+/// Per-statement state: how many times the row handler has run this statement.
+#[derive(Default)]
+struct JoinState {
+    calls: i64,
+}
+
+/// Validate the call and set up the statement. The server does no validation for
+/// varargs, so this is the only gate.
+fn str_join_prerun(args: PrerunArgs, mut out: PrerunResult<JoinState>) {
+    // Reject a zero-argument call.
+    if args.is_empty() {
+        out.error("str_join requires at least one argument");
+        return;
+    }
+
+    // Every argument must be a string.
+    for i in 0..args.len() {
+        if !args.type_at(i).is_some_and(|t| t.is_str()) {
+            out.error("str_join: every argument must be a string");
+            return;
+        }
+    }
+
+    // Size the result buffer from the arg count.
+    out.request_buffer_size(32 + args.len() * 64);
+
+    // Hand the fresh counter to the server.
+    out.set_state(JoinState::default());
+}
+
+/// Join a variable number of string arguments, prefixed with the per-statement
+/// call count. `args` length varies with how many arguments the SQL call passed.
+fn str_join(state: &mut JoinState, args: &[InValue]) -> VdfReturn {
+    state.calls += 1;
+
+    let mut joined = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        match arg {
+            InValue::String(s) => {
+                if i > 0 {
+                    joined.push_str(", ");
+                }
+                joined.push_str(s);
+            }
+            // A string column can carry NULL. SQL-style: NULL in -> NULL out.
+            InValue::Null => return VdfReturn::Null,
+            _ => return VdfReturn::error("str_join: non-string argument at runtime"),
+        }
+    }
+    VdfReturn::string(format!("#{}: {joined}", state.calls))
+}
+
+/// Bare varargs: no prerun, no state, no validation. Returns how many arguments
+/// it was called with, including zero.
+fn arg_count(args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(i64::try_from(args.len()).unwrap_or(i64::MAX))
+}
+```
+
+For varargs, size the buffer in the prerun with `request_buffer_size`, scaled to `args.len()` — a fixed `buffer_size` can't grow with the argument count.
+
+`ArgType` exposes four predicates — `is_int()`, `is_real()`, `is_str()`, and `is_custom()` — so a prerun can accept a heterogeneous call as long as every argument is one of the shapes the row function handles. `describe` accepts any mix of the three scalars and rejects anything else:
+
+```rust
+fn describe_prerun(args: PrerunArgs, mut out: PrerunResult<()>) {
+    if args.is_empty() {
+        out.error("describe requires at least one argument");
+        return;
+    }
+    for i in 0..args.len() {
+        let ok = args
+            .type_at(i)
+            .is_some_and(|t| t.is_int() || t.is_real() || t.is_str());
+        if !ok {
+            out.error("describe: arguments must be INT, REAL, or STRING");
+            return;
+        }
+    }
+    out.request_buffer_size(32 + args.len() * 48);
+}
+```
+
+```sql
+SELECT vsql_varargs.describe(42, 3.14e0, 'hello');
+```
+
+```
+vsql_varargs.describe(42, 3.14e0, 'hello')
+int:42, real:3.14, str:hello
+```
+
+The state type is `()` because this prerun keeps nothing: it validates and sizes the buffer, and never calls `set_state`.
+
+### Custom-Typed Varargs
+
+`is_custom()` alone only says the argument is *some* custom type. `custom_name()` returns which one, so a prerun can restrict a varargs call to a single type. The extension registers a `point2d` custom type and accepts a variable number of `point2d` values:
+
+```rust
+fn point_path_prerun(args: PrerunArgs, mut out: PrerunResult<()>) {
+    if args.is_empty() {
+        out.error("point_path requires at least one point");
+        return;
+    }
+    for i in 0..args.len() {
+        let ok = args
+            .type_at(i)
+            .is_some_and(|t| t.is_custom() && t.custom_name() == Some("point2d"));
+        if !ok {
+            out.error("point_path: every argument must be a point2d");
+            return;
+        }
+    }
+    out.request_buffer_size(16 + args.len() * 32);
+}
+```
+
+```sql
+SELECT vsql_varargs.point_path(point2d::from_string('0,0'), point2d::from_string('1,2'), point2d::from_string('3,5'));
+```
+
+```
+vsql_varargs.point_path(point2d::from_string('0,0'), point2d::from_string('1,2'), point2d::from_string('3,5'))
+(0,0) -> (1,2) -> (3,5)
+```
+
+A plain string is rejected before the first row, even though its bytes would parse as a point:
+
+```sql
+SELECT vsql_varargs.point_path('1,2');
+```
+
+```
+ERROR 1123 (HY000): Can't initialize function 'point_path'; point_path: every argument must be a point2d
+```
+
+The row function then matches `InValue::Custom(b)` and decodes the bytes itself, the same as any other custom-typed VDF.
+
+### Registration
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::varargs_func!(str_join, "str_join", [..] -> villagesql::Type::String,
+            state: JoinState, prerun: str_join_prerun),
+        villagesql::varargs_func!(arg_count, "arg_count", [..] -> villagesql::Type::Int),
+        villagesql::varargs_func!(describe, "describe", [..] -> villagesql::Type::String,
+            prerun: describe_prerun),
+        villagesql::varargs_func!(point_path, "point_path", [..] -> villagesql::Type::String,
+            prerun: point_path_prerun),
+    ],
+    types: [
+        villagesql::custom_type!(
+            type_name: "point2d",
+            persisted_length: 8,
+            max_decode_buffer_length: 32,
+            encode: point_encode,
+            decode: point_decode,
+            compare: point_compare,
+            default: "0,0",
+        ),
+    ]
+}
+```
+
+`describe`, `point_path`, and `point2d`'s `encode`/`decode`/`compare` follow the same `InValue`-matching and byte-encoding patterns already shown for `str_join` and `rational` above — see `examples/vsql_varargs/src/lib.rs` in the [Rust SDK repo](https://github.com/villagesql/vsql-rust-sdk) for their full source.
+
+**Key patterns:**
+- `[..]` in place of a parameter list is what marks the function varargs
+- Three forms, each with a different row-function signature: `state:` + `prerun:` gives `fn(&mut State, &[InValue]) -> VdfReturn`; `prerun:` alone and the bare form both give `fn(&[InValue]) -> VdfReturn`
+- Only the `state:` form allocates and drops per-statement state
+- The return type is still declared, so only the argument list is variable
+- Each form also accepts `buffer_size:` and `deterministic:` as a trailing pair
+- `point2d` registers no `hash`, which is optional — `compare` alone is enough for `ORDER BY`
+
+---
+
+## Key Implementation Patterns
+
+| Pattern | Usage |
+|---------|-------|
+| **VDF signature** | `fn impl(args: &[InValue]) -> VdfReturn` |
+| **NULL handling** | Match `InValue::Null` and `None` explicitly |
+| **Error reporting** | `VdfReturn::error("message")` aborts the statement |
+| **Custom type encode** | Returns `Result<Vec<u8>, String>` |
+| **Custom type decode** | Returns `Result<String, String>` |
+| **Type-aware arguments** | Use `villagesql::custom!("name")` in `func!` |
+| **Aggregate function** | `agg_func!(result_fn, ..., state: T, clear: f, accumulate: f)`; `T` must implement `Default` |
+| **Varargs function** | `varargs_func!(f, "name", [..] -> ret)`; the prerun is the only argument validation |
+| **Prerun type inspection** | `PrerunArgs::type_at(i)` → `ArgType::is_int`/`is_real`/`is_str`/`is_custom`/`custom_name` |
+| **Registration** | Single `extension!` block declares funcs and types |
+
+---
+
+## Testing
+
+All four examples use MTR (the MySQL Test Runner) just like C++ extensions:
+
+```bash
+# From inside the example directory -- cargo-vsql passes the suite's full path:
+cargo vsql test
+
+# Or point mysql-test-run.pl at the suite directly. A bare --suite=vsql_rot13
+# fails: that form only finds suites staged inside the server's own
+# mysql-test/suite/ tree, and these live in the SDK repo.
+cd /path/to/villagesql/build/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_rot13/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_rational/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_agg_sum/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_varargs/mysql-test
+```
+
+Generate or update expected results with `--record`.
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Creating Extensions in Rust"
+    icon="rust"
+    href="/mysql-9.7/stable/rust-sdk"
+  >
+    SDK installation, build, and the extension! macro
+  </Card>
+  <Card
+    title="Rust Custom Types"
+    icon="cube"
+    href="/mysql-9.7/stable/rust-custom-types"
+  >
+    Deep dive on encode, decode, compare, and hash
+  </Card>
+  <Card
+    title="Rust API Reference"
+    icon="book"
+    href="/mysql-9.7/stable/rust-api-reference"
+  >
+    InValue, VdfReturn, and the macro surface
+  </Card>
+  <Card
+    title="Example Source"
+    icon="github"
+    href="https://github.com/villagesql/vsql-rust-sdk/tree/main/examples"
+  >
+    Complete source for all four examples
+  </Card>
+</CardGroup>
