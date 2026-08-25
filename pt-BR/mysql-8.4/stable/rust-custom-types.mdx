@@ -5,15 +5,15 @@ description: "Defina novos tipos de coluna no SDK Rust do VillageSQL — layout 
 ---
 
 <Warning>
-  O SDK Rust está em alfa — espere mudanças incompatíveis na API entre
-  versões. Extensões que contêm apenas funções e tipos personalizados (encode, decode,
-  compare, hash) têm suporte. Agregações, `prerun()`, `VarArgs`, variáveis de sistema
-  e de status, acesso ao keyring e a ABI de armazenamento em coluna são
-  exclusivos de C++ hoje — use o [Criando Extensões em C++](/pt-BR/mysql-8.4/stable/create) se você
-  precisar de qualquer um deles.
+  O SDK Rust está em alpha — espere mudanças incompatíveis de API entre
+  versões. Extensões apenas de funções, funções de agregação, funções varargs
+  e tipos personalizados (encode, decode, compare, hash) são compatíveis,
+  assim como as capabilities Preview `sys_var`, `status_var`, `thread_worker`
+  e `keyring`. A ABI de armazenamento de coluna é exclusiva do C++ hoje — use
+  o [SDK C++](/pt-BR/mysql-8.4/stable/create) se você precisar dela.
 </Warning>
 
-Tipos personalizados permitem que você defina novos tipos de coluna, como `RATIONAL`, `VECTOR` ou `INET`, que funcionam com `ORDER BY`, índices e funções de agregação. O SDK Rust oferece suporte a isso por meio da macro `custom_type!`.
+Tipos personalizados permitem que você defina novos tipos de coluna, como `RATIONAL`, `VECTOR` ou `INET`, que funcionam com `ORDER BY`, índices e funções de agregação. O SDK Rust oferece suporte a isso por meio da macro `custom_type!` e, para tipos cujo tamanho de armazenamento depende de parâmetros de coluna, por meio de `parameterized_type!` (consulte [Tipos parametrizados](#parameterized-types)).
 
 Esta página pressupõe que você já tenha trabalhado com [Criando Extensões em Rust](/pt-BR/mysql-8.4/stable/rust-sdk). A configuração (Cargo.toml, manifest.json, cargo-vsql) é a mesma.
 
@@ -204,6 +204,125 @@ SELECT rational_to_real('1/3');
 
 `rational_to_real(r RATIONAL) -> REAL` converte um valor `RATIONAL` em uma aproximação de ponto flutuante de 64 bits, dividindo o numerador pelo denominador. Útil quando você precisa de um decimal aproximado para exibição ou comparação, mas não quer armazenar a representação com perda na coluna.
 
+## Tipos parametrizados {#parameterized-types}
+
+Um tipo parametrizado precisa de um valor lido no momento do `CREATE TABLE` — como
+o `3` em `VECTOR(3)` — para saber seu tamanho de armazenamento. `custom_type!` não
+consegue expressar isso: seu `persisted_length` é uma única constante fixa para toda
+coluna. `parameterized_type!` é a contraparte parametrizada: o comprimento persistido
+é calculado por coluna a partir dos parâmetros declarados, através de `int_to_params`
+e `resolve_params`, em vez de ser fixo.
+
+```rust
+villagesql::parameterized_type!(
+    type_name: "type_name_in_sql",
+    max_persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: your_encode_fn,
+    decode: your_decode_fn,
+    compare: your_compare_fn,
+    int_to_params: your_int_to_params_fn,
+    resolve_params: your_resolve_params_fn,
+    params_type: YourParamsType,
+    params_parse: your_params_parse_fn,
+    params_to_strings: your_params_to_strings_fn,
+    hash: your_hash_fn,
+    default: "a_valid_string_literal",
+)
+```
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `type_name` | literal de string | O nome do tipo SQL. Não diferencia maiúsculas de minúsculas em SQL. |
+| `max_persisted_length` | `i64` | Limite superior do comprimento em bytes em disco, considerando todas as parametrizações válidas. |
+| `max_decode_buffer_length` | `usize` | Comprimento máximo em bytes da representação de string decodificada. |
+| `encode` | fn | Converte um `&str` mais um `&mut MaybeParams<P>` em bytes binários no momento do INSERT. |
+| `decode` | fn | Converte bytes binários mais um `&P` de volta em uma `String` para exibição. |
+| `compare` | fn | Retorna `Ordering` para `ORDER BY`, `MIN`, `MAX`, dado um `&P`. |
+| `int_to_params` | fn | Converte a sintaxe de inteiro `TYPE(N)` em uma string de parâmetros canônica. |
+| `resolve_params` | fn | Valida um `Params` analisado e retorna um `Resolved` (tamanhos de armazenamento e, opcionalmente, parâmetros reescritos). |
+| `params_type` | tipo | Sua struct de parâmetros analisados, por exemplo `PadintParams`. |
+| `params_parse` | fn | Analisa `Params` em `params_type`. É executada no máximo uma vez por combinação única de parâmetros — o SDK armazena o resultado em cache. |
+| `params_to_strings` | fn | O inverso de `params_parse`: escreve `params_type` de volta em pares `(key, value)` canônicos. |
+| `hash` | fn | Retorna um hash `usize` dado um `&P`. Opcional, mas recomendado para colunas indexadas. |
+| `default` | literal de string | Uma string válida que o servidor consegue codificar na inicialização do tipo. Opcional, mas recomendado. |
+
+`type_name`, `max_persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`, `int_to_params`, `resolve_params`, `params_type`, `params_parse` e `params_to_strings` são obrigatórios. `hash` e `default` são opcionais; `intrinsic_default_fn` (uma função que calcula o padrão a partir de `&P`, para quando o padrão depende dos parâmetros) também é opcional e mutuamente exclusiva com `default`.
+
+Aqui está `padint` — um `i64` armazenado em 8 bytes fixos, com um parâmetro `width` que controla a largura de exibição preenchida com zeros:
+
+```rust
+pub struct PadintParams {
+    pub width: u32,
+}
+
+pub fn padint_parse(params: Params) -> PadintParams {
+    let width = params.get("width").and_then(|s| s.parse().ok()).unwrap_or(1);
+    PadintParams { width }
+}
+
+pub fn padint_to_strings(p: &PadintParams) -> Vec<(String, String)> {
+    vec![("width".to_string(), p.width.to_string())]
+}
+
+pub fn padint_int_to_params(n: i64) -> Result<String, String> {
+    if n < 1 {
+        return Err(format!("padint: width must be >= 1, got {n}"));
+    }
+    Ok(format!("width={n}"))
+}
+
+pub fn padint_resolve_params(params: Params) -> Result<Resolved, String> {
+    let width: i64 = params
+        .get("width")
+        .ok_or_else(|| "padint: missing 'width' param".to_string())?
+        .parse()
+        .map_err(|e| format!("padint: bad width: {e}"))?;
+    // Fixed 8-byte i64 storage; the decode buffer must fit the widest
+    // rendering, which is the larger of an i64's digits and the padded width.
+    Ok(Resolved::new(8, width.max(20)))
+}
+
+pub fn padint_encode(s: &str, params: &mut MaybeParams<PadintParams>) -> Result<Vec<u8>, String> {
+    let n: i64 = s.trim().parse().map_err(|e| format!("padint: {e}"))?;
+    if !params.is_known() {
+        // Bare constant with no column to anchor it: infer width from digits.
+        let digits = s.trim().trim_start_matches('-').len().max(1);
+        params.set(PadintParams { width: u32::try_from(digits).unwrap_or(u32::MAX) });
+    }
+    Ok(n.to_le_bytes().to_vec())
+}
+
+pub fn padint_decode(b: &[u8], p: &PadintParams) -> Result<String, String> {
+    let n = i64::from_le_bytes(b[..8].try_into().unwrap());
+    Ok(format!("{n:0width$}", width = p.width as usize))
+}
+
+pub fn padint_compare(a: &[u8], b: &[u8], _p: &PadintParams) -> std::cmp::Ordering {
+    i64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(b[..8].try_into().unwrap()))
+}
+
+villagesql::parameterized_type!(
+    type_name: "padint",
+    max_persisted_length: 8,
+    max_decode_buffer_length: 32,
+    encode: padint_encode,
+    decode: padint_decode,
+    compare: padint_compare,
+    int_to_params: padint_int_to_params,
+    resolve_params: padint_resolve_params,
+    params_type: PadintParams,
+    params_parse: padint_parse,
+    params_to_strings: padint_to_strings,
+    default: "0",
+)
+```
+
+Uma função que recebe um argumento de tipo personalizado parametrizado vê
+`InValue::CustomWithParams { bytes, params }` em vez do simples
+`InValue::Custom(bytes)` — `params` é um [`TypeParams`], uma visão somente de
+leitura e sem cópia sobre os pares `key=value` declarados da coluna.
+
 ## O bloco extension! com tipos
 
 Ao registrar tanto funções quanto tipos, o bloco `extension!` tem duas seções:
@@ -219,7 +338,7 @@ villagesql::extension! {
 }
 ```
 
-Qualquer uma das seções pode ser omitida se estiver vazia. Uma extensão que contém apenas tipos omite `funcs:`; uma extensão que contém apenas funções omite `types:`.
+Uma extensão que contém apenas funções omite `types:`. Uma extensão que contém apenas tipos mantém `funcs: []` e não omite mais nada.
 
 ## Próximos passos
 

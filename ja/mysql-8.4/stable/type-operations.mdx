@@ -30,6 +30,8 @@ using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
 using TypeHashFunc = size_t (*)(vsql::CustomArg in);
 ```
 
+カスタムハッシュ関数を省略すると、タイプの生の格納バイトをハッシュする方式にフォールバックします。これは、エンコード関数が、論理的に等しい値に対して複数のバイナリ表現を生成しうるタイプでは安全ではありません。よくあるケースは浮動小数点フィールドで、`-0.0`と`+0.0`は等しいと比較されるにもかかわらずビット単位では異なるため、`GROUP BY`と`COUNT(DISTINCT)`がそれらを異なる値として扱ってしまいます。
+
 これらの操作は、`vsql::make_type<kTypeName>()`を使用して登録します。タイプ名は、非型テンプレートパラメータ（NTTP）として渡されます。`static constexpr const char[]`配列です。ビルダーは、このNTTPから`TYPE::method`形式（例：`"MYTYPE::from_string"`）のVDF名を自動生成するため、手動での文字列マッチングは不要です。ビルドされたタイプオブジェクトを、拡張ビルダーの`.type()`に渡します。タイプ操作用の個別の`.func()`呼び出しは必要ありません。
 
 <Warning>
@@ -56,7 +58,7 @@ constexpr auto MYTYPE =
         .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
         .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
         .compare<&my_compare>()      // auto: "MYTYPE::compare"
-        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash" — required for types storing floating-point values
         .intrinsic_default_str("0")  // string-literal intrinsic default
         .build();
 
@@ -66,6 +68,14 @@ VEF_GENERATE_ENTRY_POINTS(
 ```
 
 `from_string`、`to_string`、または`compare`が欠落している場合、`build()`はコンパイル時に失敗します。各テンプレートメソッドは、`static_assert`を使用して関数ポインタのシグネチャを検証します。
+
+カスタムタイプが宣言できるストレージは、値ごとに最大**65532バイト**です。カスタムカラムは`VARBINARY`フィールドによって支えられており、MySQLの1行あたり65535バイトの予算からは、そのフィールドの長さを表す2バイトと行のNULLバイトも支払われます。カラムがNULL可能かどうかは`CREATE TABLE`時にカラムごとに決まり、NULL可能がデフォルトであるため、この上限はNULLバイトの分を残しておく必要があります。`persisted_length`と`max_persisted_length`の両方がこの上限に対してチェックされ、そのチェックは`CREATE TABLE`時ではなく`INSTALL EXTENSION`時に実行されます。そのため、幅が大きすぎるタイプは拡張機能全体とともに拒否されます。
+
+```text
+ERROR HY000: Failed to install extension 'vsql_huge_fixed_test': type 'HUGE_FIELD' declares 70000 bytes of storage per value, which exceeds the maximum of 65532 bytes supported for custom-type columns today
+```
+
+上限を下回っていても、カラムが収まることが保証されるわけではありません。テーブル内の他のすべてのカラムも同じ65535バイトの行予算から引き出され、それを判断できるのは`CREATE TABLE`だけです。そのため、上限またはその付近のタイプは、そこで`ER_TOO_BIG_ROWSIZE`により失敗する可能性があります。同じ幅の通常の`VARBINARY`も同じ動作をします。
 
 ## 組み込みデフォルト {#intrinsic-default}
 
@@ -81,6 +91,8 @@ default input '' to N bytes, expected persisted_length=M
 
 固定長タイプの場合、デフォルト文字列は正確に`persisted_length`バイトにエンコードされる必要があります。空の文字列が有効な入力ではないタイプには、明示的なデフォルトを設定してください。
 </Note>
+
+組み込みデフォルトは、次の2つの方法のいずれかで指定します。この2つは相互に排他的です。`.intrinsic_default_str()`と`.intrinsic_default_vdf()`の両方を宣言すると、コンパイルエラーになります。
 
 **文字列リテラル：`.intrinsic_default_str()`**
 
@@ -184,9 +196,23 @@ bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
 
 タイプビルダーに`.params<>()`を登録します。`MYTYPE(N)`整数構文を処理するには`.int_to_params<&mytype_int_to_params_fn>()`を、パラメータを検証してストレージサイズを計算するには`.resolve_params<&mytype_resolve_params_fn>()`を使用します。すべての有効なパラメータ化にわたる永続化されるバイトサイズの上限を指定して`.max_persisted_length(N)`を呼び出します。サーバーはこれをタイプパラメータ推論のパスでのみ使用します。そこではまだパラメータを推論しておらず、エンコードバッファーのサイズを決定するために`resolve_params`を参照できないためです。VDFベースの組み込みデフォルトの場合は、VDF名を指定して`.intrinsic_default_vdf()`を使用し、`make_intrinsic_default<&mytype_default>()`を介してVDFを個別に登録します。
 
+`.params<>()`または`.int_to_params<>()`が登録されている場合、`build()`は常に
+`.resolve_params<>()`を必要とします。`int_to_params`は`MYTYPE(N)`という短縮形を
+パラメータ文字列に書き換えるだけであり、パラメータを検証してストレージサイズを
+解決するゲートは`resolve_params`です。これを省略すると、コンパイルエラーになります。
+
 <Warning>
-`.max_persisted_length()`にはVEFプロトコル3以上が必要です。これを使用するタイプは、プロトコル3より前のサーバーではロードできません。
+`.max_persisted_length()`にはVEFプロトコル3以上が必要です。これを使用するタイプは、プロトコル3より前のサーバーではロードできません。これは、可変長タイプまたはパラメータ化されたタイプでのみ有効です。パラメータ化されていない固定長タイプがこれを設定すると、コンパイルに失敗します。
 </Warning>
+
+`resolve_params`が報告するサイズは、カラムのパラメータが判明した`CREATE TABLE`時にも
+検証されます。固定長タイプの場合、解決された`persisted_length`は、宣言された
+`max_persisted_length`を超えてはなりません。計算されたフットプリント（例えば
+`dimension * 4`によるサイズ決定）がその上限を超えるパラメータ化は、構文エラーで
+拒否されます。長さの種類とは無関係に、`resolve_params`はゼロより大きい
+`max_decode_buffer_length`を解決する必要があります。この値はデコード用の
+スクラッチバッファーのサイズを決定するためであり、正でない結果は同じ種類のエラーで
+拒否されます。
 
 ```cpp
 static constexpr const char kMyTypeName[] = "MYTYPE";
@@ -239,7 +265,13 @@ VEF_GENERATE_ENTRY_POINTS(
   `.resolve_params<>()`が登録されていれば常に利用可能です — 追加のビルダー呼び出しは不要です。
 
 `.resolve_params<>()`のみを登録するタイプは、文字列形式を受け入れ、
-`MYTYPE(N)`を拒否します。`SHOW CREATE TABLE`は、書き込まれた形式を保持します。
+`MYTYPE(N)`を拒否します。
+
+`SHOW CREATE TABLE`は、作者が書いた内容をそのまま繰り返すわけではありません。サーバーは
+解決済みのパラメータマップを保持し、そこから表示形式を再構築します。`int_to_params(N)`が
+マップ全体を再現できる場合は`MYTYPE(N)`が優先され、そうでない場合はキーをソートした
+正規形式の`MYTYPE('key=value,...')`にフォールバックします。したがって、
+`MYTYPE('dimension=8')`と書かれたカラムは、`MYTYPE(8)`として読み戻されます。
 
 ```sql
 CREATE TABLE t (v ext.MYTYPE(8));              -- integer form (.int_to_params)
@@ -302,7 +334,9 @@ SHOW CREATE TABLE bits;   -- b persists as BITFIELD('max_number_of_bits=4096')
 
 可変長タイプは、`.max_persisted_length(N)`も呼び出す必要があります。これが省略されると、
 `build()`はコンパイル時に失敗します — サーバーは、バッキングフィールドのバッファーを
-割り当てるために上限を必要とします。
+割り当てるために上限を必要とします。可変長タイプは、`.persisted_length()`を併せて
+呼び出してはなりません。そのサイズは値ごとに決まるため、`build()`はこの組み合わせを
+コンパイル時に拒否します。
 
 `.variable_length_type()`は一方向で、一度引き上げられたプロトコル要件は下がりません。プロトコル3のセッター
 （`max_persisted_length()`、`params()`、`int_to_params()`）の前後に呼び出しても、

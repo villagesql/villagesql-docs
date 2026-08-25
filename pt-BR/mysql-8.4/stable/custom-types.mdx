@@ -162,8 +162,11 @@ SET val = MYTYPE::from_string(
 Aqui está um exemplo completo implementando um tipo de número COMPLEX:
 
 ```cpp
-#include <cstdio>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <system_error>
 #include <villagesql/vsql.h>
 
 using namespace vsql;
@@ -172,11 +175,20 @@ using namespace vsql;
 void encode_complex(std::string_view from, CustomResult out) {
     auto buf = out.buffer();
     if (buf.size() < 16) return;
+    // strtod needs a null-terminated string; string_view is not one.
+    const std::string input(from);
+    const char *p = input.c_str();
     double real, imag;
-    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+    auto fail = [&] {
         out.warning("invalid complex format: expected (real,imag)");
-        return;
-    }
+    };
+    if (*p++ != '(') return fail();
+    char *endptr = nullptr;
+    real = strtod(p, &endptr);
+    if (endptr == p || *endptr != ',') return fail();
+    p = endptr + 1;
+    imag = strtod(p, &endptr);
+    if (endptr == p || *endptr != ')') return fail();
     memcpy(buf.data(), &real, 8);
     memcpy(buf.data() + 8, &imag, 8);
     out.set_length(16);
@@ -190,9 +202,19 @@ void decode_complex(CustomArg in, StringResult out) {
     memcpy(&real, data.data(), 8);
     memcpy(&imag, data.data() + 8, 8);
     auto buf = out.buffer();
-    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
-    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
-    out.set_length(static_cast<size_t>(len));
+    char *p = buf.data();
+    char *const end = p + buf.size();
+    if (p == end) return;
+    *p++ = '(';
+    auto re = std::to_chars(p, end, real);
+    if (re.ec != std::errc() || re.ptr == end) return;
+    p = re.ptr;
+    *p++ = ',';
+    auto im = std::to_chars(p, end, imag);
+    if (im.ec != std::errc() || im.ptr == end) return;
+    p = im.ptr;
+    *p++ = ')';
+    out.set_length(static_cast<size_t>(p - buf.data()));
 }
 
 // Compare for ORDER BY: real part first, then imaginary
@@ -212,6 +234,14 @@ int compare_complex(CustomArg a, CustomArg b) {
     return 0;
 }
 ```
+
+A decodificação usa `std::to_chars` em vez de `snprintf`: um formato de precisão fixa
+como `"%.6f"` descarta dígitos de que um `double` precisa, de modo que `0.1234567891` é lido de volta como
+`0.123457`. A codificação copia a entrada antes de chamar `strtod`, porque
+`std::string_view` não carrega um null terminador. As sobrecargas de ponto flutuante de
+`std::from_chars` evitariam a cópia, mas a libc++ as marca como disponíveis apenas
+a partir do macOS 26, portanto uma extensão que as utiliza falha ao compilar para alvos
+anteriores.
 
 Depois de definir essas operações, os usuários podem criar tabelas com o seu tipo personalizado:
 

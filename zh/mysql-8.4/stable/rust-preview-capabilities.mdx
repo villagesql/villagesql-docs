@@ -1,0 +1,336 @@
+---
+audience: extension-author
+title: "Rust 中的预览功能"
+description: "从 Rust SDK 使用 VillageSQL 预览功能——通过 extension! 中的 requires: 列表声明状态变量、系统变量、后台线程工作器和密钥环访问。"
+---
+
+<Warning>
+  Rust SDK 处于 alpha 阶段——各版本之间可能出现破坏性的 API 变更。预览功能在服务器端还额外具有不稳定性：其 ABI 可能在各服务器版本之间发生变化。基于预览功能构建的扩展在服务器更新后可能无法加载。
+</Warning>
+
+预览功能是服务器提供的功能，在最终确定其 API 之前，会将其暴露给扩展。Rust SDK 封装了其中四项：状态变量、系统变量、后台线程工作器和密钥环访问。本页介绍如何从 Rust 声明和使用其中的每一项。有关该概念、预览层以及仅在 C++ 中存在的功能，请参阅[预览功能](/zh/mysql-8.4/stable/preview-capabilities)。
+
+## 前提条件 {#prerequisites}
+
+使用任何预览功能的扩展，只有在 `vsql_allow_preview_extensions` 为 `ON` 时才能安装：
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+```
+
+有关详细信息，包括为什么此变量会拒绝 `SET GLOBAL`，请参阅[启用预览层](/zh/mysql-8.4/stable/preview-capabilities#启用预览层)。
+
+您还需要一套可用的 Rust 扩展设置——[使用 Rust 构建扩展](/zh/mysql-8.4/stable/rust-sdk)演练涵盖了工具链、`cargo-vsql` 以及您的第一个 `extension!` 块。
+
+## Rust SDK 封装了什么 {#what-the-rust-sdk-wraps}
+
+| 功能 | Rust 模块 | SDK 示例 |
+|---|---|---|
+| `vsql::status_var` | `villagesql::preview::status_var` | [`vsql_status_var`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_status_var) |
+| `vsql::sys_var` | `villagesql::preview::sys_var` | [`vsql_sys_var`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_sys_var) |
+| `vsql::preview::thread_worker` | `villagesql::preview::thread_worker` | [`vsql_thread_worker`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_thread_worker) |
+| `vsql::preview::keyring` | `villagesql::preview::keyring` | [`vsql_keyring`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_keyring) |
+
+其余的预览功能——`auth`、`mysql_services`、`sql_query`、`statement_event` 以及列存储 ABI——目前仅支持 C++。如果您需要其中之一，请使用 [C++ SDK](/zh/mysql-8.4/stable/preview-capabilities)。
+
+## 注册模式 {#registration-pattern}
+
+将每个功能声明为 `static`，然后在 `extension!` 的 `requires:` 部分中按引用列出它——这相当于 C++ SDK 中的 `.with()`：
+
+```rust
+use villagesql::preview::keyring::KeyringCapability;
+
+static KEYRING: KeyringCapability = KeyringCapability::new();
+
+villagesql::extension! {
+    funcs: [
+        // ...
+    ],
+    requires: [
+        &KEYRING,
+    ]
+}
+```
+
+服务器在加载时填充功能对象；在此之前，其访问器方法会报告该功能不可用，而不是崩溃。`static` 是必需的——服务器在扩展的整个生命周期内都持有指向该功能的指针。
+
+## 状态变量 {#status-variables}
+
+`status_var` 功能通过 `SHOW GLOBAL STATUS` 公开由扩展拥有的计数器。您的扩展以 `'static` 原子类型拥有存储空间并写入其中；服务器每次查询状态变量时，都会通过指针读取。
+
+将每个变量声明为一个 `StatusVarSpec`——`Int` 由 `AtomicI64` 支持，或 `Double` 由 SDK 的 `AtomicF64` 支持（Rust 标准库没有原子 `f64`，因此 SDK 提供了一个，带有 `new`、`load` 和 `store`）：
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use villagesql::preview::status_var::{AtomicF64, StatusVarCapability, StatusVarSpec};
+use villagesql::{InValue, VdfReturn};
+
+static REQUESTS: AtomicI64 = AtomicI64::new(0);
+static LOAD: AtomicF64 = AtomicF64::new(0.5);
+
+static SPECS: &[StatusVarSpec] = &[
+    StatusVarSpec::Int {
+        name: c"requests",
+        value: &REQUESTS,
+    },
+    StatusVarSpec::Double {
+        name: c"load",
+        value: &LOAD,
+    },
+];
+
+static STATUS_VAR: StatusVarCapability = StatusVarCapability::new(SPECS);
+
+fn bump_impl(_args: &[InValue]) -> VdfReturn {
+    let n = REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    VdfReturn::int(n)
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(bump_impl, "bump", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &STATUS_VAR,
+    ]
+}
+```
+
+执行 `INSTALL EXTENSION` 之后，这些变量会以扩展名称作为前缀出现：
+
+```sql
+SELECT vsql_status_var.bump();
+-- 1
+SHOW GLOBAL STATUS LIKE 'vsql_status_var%';
+```
+
+```
+Variable_name	Value
+vsql_status_var.load	0.500000
+vsql_status_var.requests	1
+```
+
+## 系统变量 {#system-variables}
+
+`sys_var` 功能注册由您的扩展拥有的 MySQL 系统变量。支持三种类型：`Bool`、`Int`（带 `min`/`max` 边界）和 `Str`。每个描述符都携带一个名称、一条在 `SHOW VARIABLES` 元数据中显示的注释、一个默认值以及一个可选的 `on_change` 回调。
+
+名称和字符串默认值是 `&'static CStr` 值——请将它们写为 C 字符串字面量（`c"enabled"`）：
+
+```rust
+use villagesql::preview::sys_var::{SysVarCapability, SysVarSpec};
+
+static SPECS: &[SysVarSpec] = &[
+    SysVarSpec::Bool {
+        name: c"enabled",
+        comment: c"Enable the feature",
+        default: true,
+        on_change: None,
+    },
+    SysVarSpec::Int {
+        name: c"threshold",
+        comment: c"Threshold in milliseconds",
+        default: 1000,
+        min: 0,
+        max: 60000,
+        on_change: None,
+    },
+    SysVarSpec::Str {
+        name: c"log_path",
+        comment: c"Path to the log file",
+        default: c"/tmp/vsql_sys_var.log",
+        on_change: None,
+    },
+];
+
+static SYS_VAR: SysVarCapability = SysVarCapability::new(SPECS);
+
+villagesql::extension! {
+    funcs: [],
+    requires: [
+        &SYS_VAR,
+    ]
+}
+```
+
+即使 `funcs:` 部分为空，它也必须出现在 `requires:` 之前。
+
+安装之后，可以使用扩展名称作为前缀来访问这些变量：
+
+```sql
+SELECT @@global.vsql_sys_var.enabled;
+-- 1
+SELECT @@global.vsql_sys_var.threshold;
+-- 1000
+SET GLOBAL vsql_sys_var.enabled = 0;
+```
+
+### 响应变更 {#reacting-to-changes}
+
+`on_change` 是一个原始 C 回调，由服务器在变量被设置之后调用。服务器在持有其全局系统变量锁时调用它，因此请让它保持快速，并且不要 panic——此处的 panic 会跨越 FFI 边界。该回调接收来自原始 ABI 层的 `*const vef_sys_var_change_t`：
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+use villagesql::sys::vef_sys_var_change_t;
+
+static CHANGE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn on_enabled_change(_change: *const vef_sys_var_change_t) {
+    CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+```
+
+<Warning>
+调用 `SysVarCapability::get` 或 `SysVarCapability::set`、运行 SQL，或等待一个执行上述任一操作的线程，都会在该锁上造成死锁。请让回调只在您自己的静态变量中做记账工作（如上所示），并将需要 SQL 的工作交给[线程工作器](#thread-worker)。
+</Warning>
+
+使用 `on_change: Some(on_enabled_change)` 将它接入某个描述符。
+
+### 从扩展代码读取和写入 {#reading-and-writing-from-extension-code}
+
+`SysVarCapability` 还公开了 `get()` 和 `set()`，用于通过服务器进行编程访问（因此范围验证和持久化都会为您处理）。`set()` 接受一个 `scope` 参数来选择持久化方式：`null` 只更改运行中的值，因此它在重启后会回退；`"PERSIST"` 更改运行中的值并将其写入持久化配置；`"PERSIST_ONLY"` 写入持久化配置而不改动运行中的值，因此它在下次重启时生效。两者都是接受 NUL 结尾 C 字符串的 `unsafe` FFI 方法，并且两者都使用相反的 C 约定：`Some(false)` 表示成功，`Some(true)` 表示服务器报告了错误，而 `None` 表示该功能不可用。在 `get` 成功时，服务器会写入一个 `malloc` 分配的字符串，您必须使用 C 的 `free()` 释放它。[`vsql_sys_var` 示例](https://github.com/villagesql/vsql-rust-sdk/blob/main/examples/vsql_sys_var/src/lib.rs)展示了完整的模式，包括 `free` extern 和安全性注释。
+
+## 线程工作器 {#thread-worker}
+
+`thread_worker` 功能在服务器管理的后台线程上运行您提供的函数。服务器在加载时注册一个控制系统变量；当它为 `ON` 时，您的工作函数会在定期计时器上、在文件描述符准备就绪时，或在启用/禁用转换时被调用。
+
+您的工作函数是普通的安全 Rust 代码：
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+use villagesql::preview::thread_worker::{
+    NextWakeup, ThreadHandle, ThreadWorkerCapability, WakeupReason,
+};
+use villagesql::{InValue, VdfReturn};
+
+static TICKS: AtomicI64 = AtomicI64::new(0);
+
+fn worker(reason: WakeupReason, _handle: ThreadHandle) -> NextWakeup {
+    if reason == WakeupReason::Periodic {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    NextWakeup::unchanged()
+}
+
+static WORKER: ThreadWorkerCapability =
+    ThreadWorkerCapability::new(worker, "ticker", Duration::from_millis(100), None);
+
+fn ticks_impl(_args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(TICKS.load(Ordering::Relaxed))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(ticks_impl, "ticks", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &WORKER,
+    ]
+}
+```
+
+`ThreadWorkerCapability::new` 接受工作函数、一个线程名称后缀、初始睡眠间隔，以及一个可选的控制变量名称覆盖值。当该覆盖值为 `None` 时，控制变量被命名为 `{suffix}_enabled`，并注册在扩展的前缀之下：
+
+```sql
+SHOW GLOBAL VARIABLES LIKE '%ticker%';
+```
+
+```
+Variable_name	Value
+vsql_thread_worker.ticker_enabled	OFF
+```
+
+```sql
+SET GLOBAL vsql_thread_worker.ticker_enabled = ON;
+SELECT SLEEP(0.5);
+SELECT vsql_thread_worker.ticks();
+-- 4  (varies with timing — one tick per 100 ms while enabled)
+SET GLOBAL vsql_thread_worker.ticker_enabled = OFF;
+```
+
+### 唤醒 {#wakeups}
+
+`WakeupReason` 告诉您服务器为什么进行调用：`Enable`、`Periodic`、`PollFd` 或 `Disable`。您的返回值会调整下一次唤醒：
+
+- `NextWakeup::unchanged()`——保持当前的睡眠间隔和轮询文件描述符。
+- `NextWakeup::after(duration)`——在 `duration` 之后再次唤醒。
+- 将 `poll_fd` 字段设置为一个大于零的文件描述符，以便在它变为可读时也唤醒；或设置为 `-1` 以清除先前设置的文件描述符。
+
+长度为零的 `Duration` 会退化为“无变化”——底层 C ABI 将 `0` 保留给该含义，因此无法表达立即唤醒。
+
+如果工作函数发生 panic，SDK 会在 FFI 边界捕获该 panic，并将该次调用视为返回了 `NextWakeup::unchanged()`——工作器会继续运行。
+
+`ThreadHandle` 参数是保留的，用于在 `sql_query` 功能移植到 Rust 之后从工作器打开 SQL 会话；它目前还没有任何方法。
+
+## 密钥环访问 {#keyring-access}
+
+`keyring` 功能读取和写入存储在 MySQL 密钥环组件中的密钥——API 密钥、加密密钥，以及任何不应存储在表中的内容。服务器上必须安装一个密钥环组件（例如 `component_keyring_file`）；如果没有，每次读取和写入都会以 `KeyringError::NoComponent` 失败。
+
+```rust
+use std::ffi::CString;
+
+use villagesql::preview::keyring::KeyringCapability;
+use villagesql::{InValue, VdfReturn};
+
+static KEYRING: KeyringCapability = KeyringCapability::new();
+
+const MAX_SECRET_LEN: usize = 1024;
+
+fn keyring_read_impl(args: &[InValue]) -> VdfReturn {
+    let Some(&InValue::String(data_id)) = args.first() else {
+        return VdfReturn::null();
+    };
+    let Ok(data_id) = CString::new(data_id) else {
+        return VdfReturn::null();
+    };
+
+    let mut buf = [0u8; MAX_SECRET_LEN];
+    match KEYRING.read(&data_id, None, &mut buf) {
+        Ok(Some(n)) => match std::str::from_utf8(&buf[..n]) {
+            Ok(s) => VdfReturn::string(s),
+            Err(_) => VdfReturn::null(),
+        },
+        Ok(None) | Err(_) => VdfReturn::null(),
+    }
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(
+            keyring_read_impl, "keyring_read",
+            [villagesql::Type::String] -> villagesql::Type::String,
+            buffer_size: MAX_SECRET_LEN
+        ),
+    ],
+    requires: [
+        &KEYRING,
+    ]
+}
+```
+
+`read(data_id, auth_id, buf)` 会填充您传入的缓冲区，并返回带有密钥长度的 `Ok(Some(n))`；或者当 `data_id` 下不存在密钥时返回 `Ok(None)`——这是一种正常结果，而不是错误。`write(data_id, auth_id, data)` 在成功时返回 `Ok(())`。`auth_id` 是所有者用户；对于与特定用户无关的内部密钥，请传递 `None`。
+
+两者在失败时都返回 `Err(KeyringError)`：`CapabilityUnavailable`（该功能从未被接入）、`NoComponent`（服务器上没有密钥环组件）或 `Other`。
+
+密钥环没有大小探测：如果某个密钥大于您传给 `read` 的缓冲区，返回结果为 `Ok(None)`，与密钥缺失无法区分。请按您预期存储的最大密钥来确定缓冲区大小。
+
+## 后续步骤 {#next-steps}
+
+<CardGroup cols={2}>
+  <Card
+    title="预览功能 (C++)"
+    icon="flask"
+    href="/zh/mysql-8.4/stable/preview-capabilities"
+  >
+    完整的功能索引、预览层，以及仅支持 C++ 的功能：auth、mysql_services、sql_query、statement_event 和列存储。
+  </Card>
+  <Card
+    title="Rust API 参考"
+    icon="book"
+    href="/zh/mysql-8.4/stable/rust-api-reference"
+  >
+    InValue、VdfReturn、extension!、func! 和 custom_type!——所有字段。
+  </Card>
+</CardGroup>

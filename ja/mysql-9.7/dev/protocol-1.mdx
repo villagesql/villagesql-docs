@@ -1,0 +1,142 @@
+---
+audience: extension-author
+title: "プロトコル 1 API"
+description: "プロトコル 1 の関数ポインタ型 API および生の ABI スタイルに関するリファレンス — これは元の VEF インターフェースであり、v0.0.1 で安定していますが、将来のリリースで非推奨になる可能性があります。"
+---
+
+プロトコル 1 は元の VEF インターフェースです。v0.0.1 で安定しており、引き続きサポートされていますが、将来のリリースで非推奨になる可能性があります。新しい拡張機能では、プロトコル 3 API（[C++ での拡張機能の作成](/ja/mysql-9.7/dev/create) および [C++ 開発](/ja/mysql-9.7/dev/development) ガイドにあるテンプレートベースの型ビルダー）を使用してください。
+
+このページは、プロトコル 1 を使用して構築された既存の拡張機能を扱う際に参照するために存在します。
+
+## 関数ポインタ型 API
+
+プロトコル 1 のカスタム型は、`vsql::make_type<>` テンプレートの代わりに、明示的な関数ポインタを使用して登録されます。関数シグネチャは、プロトコル 3 の同等物とは異なり、`Arg` および `Result` オブジェクトではなく、生のポインタと長さを引数として受け取ります。
+
+### 関数シグネチャ
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+### 登録
+
+この形式では、`#include <villagesql/extension.h>`（`<villagesql/vsql.h>` ではありません）と `using namespace villagesql;` が必要です。
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+constexpr const char* MYTYPE = "mytype";
+
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()` (コンパイル時の文字列 NTTP を使用) が推奨される形式です。`make_type(MYTYPE)` (テンプレートパラメータなし) はプロトコル 1 の形式であり、引き続きサポートされていますが、将来のリリースで非推奨になる可能性があります。
+
+## 生の ABI スタイル (関数)
+
+プロトコル 1 の VDF 実装では、型付きラッパーを使用する代わりに、生の C 構造体を直接渡すことができます。このスタイルは引き続きサポートされていますが、将来のリリースで非推奨になる可能性があります。すべての新しいコードでは、[型付き引数/結果 API](/ja/mysql-9.7/dev/development#argument-and-result-types) を使用してください。
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&add_impl>("add_impl")
+                  .returns(INT)
+                  .param(INT)
+                  .param(INT)
+                  .build()))
+```
+
+この引数ごとの生のシグネチャ — `void(vef_context_t*, vef_invalue_t* arg0, ..., vef_vdf_result_t*)` — は、`<villagesql/extension.h>` の `make_func<>()` によってのみ検出されます。`<villagesql/vsql.h>` の `make_func<>()` は、生の `vef_context_t*`/`vef_invalue_t*`/`vef_vdf_result_t*` シグネチャをコンパイル時にすべて拒否します。
+
+### 結果定数
+
+生の ABI は、`result->type` に設定された `vef_return_value_type_t` を介して結果の状態を伝達します。
+
+| 定数 | 値 | 意味 |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | 成功 — 出力は適切な共用体フィールドに格納されます |
+| `VEF_RESULT_NULL` | 1 | 結果は SQL NULL です |
+| `VEF_RESULT_WARNING` | 2 | 行レベルの警告 — 実行は継続され、この行には NULL が返され、SQL 警告が追加されます。厳格モードでは、MySQL は INSERT/UPDATE でこれをエラーに昇格させます |
+| `VEF_RESULT_ERROR` | 3 | 致命的なエラー — ステートメントの実行は中止されます。メッセージは `result->error_msg` に格納されます |
+
+プロトコル 3 では、`out.set()`、`out.set_null()`、`out.warning()`、`out.error()` がこれを自動的に処理します。
+
+### プロトコル 1 における集計関数の登録
+
+生の ABI による集計関数の登録パスはありません。`make_func<>()` には `.clear<>()` や `.accumulate<>()` のメンバーはありません。これらのメソッドは、`<villagesql/vsql.h>` にある別のビルダー `make_aggregate_func<State, &result_fn>()` にのみ存在し、生の `vef_context_t*`/`vef_vdf_args_t*` ポインタではなく、`State&` ベースの型付きシグネチャを使用します。プロトコル 1 の拡張機能であっても、この方法で集計関数を登録する必要があります。すべての新しいコードでは、[型付き集計関数のアプローチ](/ja/mysql-9.7/dev/development#aggregate-vdfs) を使用してください。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <optional>
+using namespace vsql;
+
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+make_aggregate_func<SumState, &my_result>("my_agg")
+    .returns(INT).param(INT)
+    .clear<&my_clear>()        // void(SumState&)
+    .accumulate<&my_acc>()     // void(SumState&, IntArg)
+    .build()
+```
