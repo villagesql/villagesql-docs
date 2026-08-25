@@ -1,0 +1,340 @@
+---
+audience: extension-author
+title: "Rust에서의 미리보기 기능"
+description: "Rust SDK에서 VillageSQL 미리보기 기능을 사용합니다 — extension!의 requires: 목록으로 상태 변수, 시스템 변수, 백그라운드 스레드 워커, 키링 접근을 선언합니다."
+---
+
+<Warning>
+  Rust SDK는 알파 단계입니다 — 릴리스 간에 호환성이 깨지는 API 변경이
+  발생할 수 있습니다. 미리보기 기능은 서버 측에서도 불안정합니다: 서버
+  릴리스 간에 ABI가 변경될 수 있습니다. 미리보기 기능을 기반으로 빌드된
+  확장은 서버 업데이트 후 로드에 실패할 수 있습니다.
+</Warning>
+
+미리보기 기능은 API가 최종화되기 전에 확장에 노출되는 서버 기능입니다. Rust SDK는 그중 네 가지를 감쌉니다: 상태 변수, 시스템 변수, 백그라운드 스레드 워커, 키링 접근입니다. 이 페이지는 각각을 Rust에서 선언하고 사용하는 방법을 다룹니다. 개념, 미리보기 계층, 그리고 C++에만 존재하는 기능에 대해서는 [미리보기 기능](/ko/mysql-8.4/stable/preview-capabilities)을 참조하세요.
+
+## 사전 요구 사항 {#prerequisites}
+
+미리보기 기능을 사용하는 확장은 `vsql_allow_preview_extensions`가 `ON`일 때만 설치됩니다:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+```
+
+이 변수에 대해 `SET GLOBAL`이 거부되는 이유를 포함한 자세한 내용은 [미리보기 계층 활성화](/ko/mysql-8.4/stable/preview-capabilities#enabling-the-preview-tier)를 참조하세요.
+
+작동하는 Rust 확장 환경도 필요합니다 — [Rust로 확장 만들기](/ko/mysql-8.4/stable/rust-sdk) 안내서가 툴체인, `cargo-vsql`, 그리고 첫 번째 `extension!` 블록을 다룹니다.
+
+## Rust SDK가 감싸는 기능 {#what-the-rust-sdk-wraps}
+
+| 기능 | Rust 모듈 | SDK 예제 |
+|---|---|---|
+| `vsql::status_var` | `villagesql::preview::status_var` | [`vsql_status_var`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_status_var) |
+| `vsql::sys_var` | `villagesql::preview::sys_var` | [`vsql_sys_var`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_sys_var) |
+| `vsql::preview::thread_worker` | `villagesql::preview::thread_worker` | [`vsql_thread_worker`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_thread_worker) |
+| `vsql::preview::keyring` | `villagesql::preview::keyring` | [`vsql_keyring`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_keyring) |
+
+나머지 미리보기 기능인 `auth`, `mysql_services`, `sql_query`, `statement_event`, 그리고 열 저장소 ABI는 현재 C++ 전용입니다. 이 중 하나가 필요하다면 [C++ SDK](/ko/mysql-8.4/stable/preview-capabilities)를 사용하세요.
+
+## 등록 패턴 {#registration-pattern}
+
+각 기능을 `static`으로 선언한 다음, `extension!`의 `requires:` 섹션에 참조로 나열합니다 — C++ SDK의 `.with()`에 해당하는 Rust 방식입니다:
+
+```rust
+use villagesql::preview::keyring::KeyringCapability;
+
+static KEYRING: KeyringCapability = KeyringCapability::new();
+
+villagesql::extension! {
+    funcs: [
+        // ...
+    ],
+    requires: [
+        &KEYRING,
+    ]
+}
+```
+
+서버는 로드 시점에 기능 객체를 채웁니다. 그 이전에는 접근자 메서드가 충돌하지 않고 기능을 사용할 수 없다고 보고합니다. `static`은 필수입니다 — 서버가 확장의 전체 라이프사이클 동안 그 기능을 가리키는 포인터를 보유하기 때문입니다.
+
+## 상태 변수 {#status-variables}
+
+`status_var` 기능은 확장이 소유한 카운터를 `SHOW GLOBAL STATUS`를 통해 노출합니다. 확장은 저장소를 `'static` 원자 값으로 소유하고 여기에 씁니다. 서버는 상태 변수가 쿼리될 때마다 포인터를 통해 읽습니다.
+
+각 변수를 `StatusVarSpec`으로 선언합니다 — `Int`는 `AtomicI64`로, `Double`은 SDK의 `AtomicF64`로 뒷받침됩니다(Rust 표준 라이브러리에는 원자 `f64`가 없으므로, SDK가 `new`, `load`, `store`를 갖춘 것을 제공합니다):
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use villagesql::preview::status_var::{AtomicF64, StatusVarCapability, StatusVarSpec};
+use villagesql::{InValue, VdfReturn};
+
+static REQUESTS: AtomicI64 = AtomicI64::new(0);
+static LOAD: AtomicF64 = AtomicF64::new(0.5);
+
+static SPECS: &[StatusVarSpec] = &[
+    StatusVarSpec::Int {
+        name: c"requests",
+        value: &REQUESTS,
+    },
+    StatusVarSpec::Double {
+        name: c"load",
+        value: &LOAD,
+    },
+];
+
+static STATUS_VAR: StatusVarCapability = StatusVarCapability::new(SPECS);
+
+fn bump_impl(_args: &[InValue]) -> VdfReturn {
+    let n = REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    VdfReturn::int(n)
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(bump_impl, "bump", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &STATUS_VAR,
+    ]
+}
+```
+
+`INSTALL EXTENSION` 이후, 변수는 확장 이름을 접두사로 하여 나타납니다:
+
+```sql
+SELECT vsql_status_var.bump();
+-- 1
+SHOW GLOBAL STATUS LIKE 'vsql_status_var%';
+```
+
+```
+Variable_name	Value
+vsql_status_var.load	0.500000
+vsql_status_var.requests	1
+```
+
+## 시스템 변수 {#system-variables}
+
+`sys_var` 기능은 확장이 소유한 MySQL 시스템 변수를 등록합니다. 세 가지 타입이 지원됩니다: `Bool`, `Int`(`min`/`max` 경계 포함), 그리고 `Str`입니다. 모든 스펙은 이름, `SHOW VARIABLES` 메타데이터에 표시되는 주석, 기본값, 그리고 선택적 `on_change` 콜백을 포함합니다.
+
+이름과 문자열 기본값은 `&'static CStr` 값입니다 — C 문자열 리터럴(`c"enabled"`)로 작성하세요:
+
+```rust
+use villagesql::preview::sys_var::{SysVarCapability, SysVarSpec};
+
+static SPECS: &[SysVarSpec] = &[
+    SysVarSpec::Bool {
+        name: c"enabled",
+        comment: c"Enable the feature",
+        default: true,
+        on_change: None,
+    },
+    SysVarSpec::Int {
+        name: c"threshold",
+        comment: c"Threshold in milliseconds",
+        default: 1000,
+        min: 0,
+        max: 60000,
+        on_change: None,
+    },
+    SysVarSpec::Str {
+        name: c"log_path",
+        comment: c"Path to the log file",
+        default: c"/tmp/vsql_sys_var.log",
+        on_change: None,
+    },
+];
+
+static SYS_VAR: SysVarCapability = SysVarCapability::new(SPECS);
+
+villagesql::extension! {
+    funcs: [],
+    requires: [
+        &SYS_VAR,
+    ]
+}
+```
+
+`funcs:` 섹션은 비어 있더라도 `requires:` 앞에 있어야 합니다.
+
+설치 후, 변수는 확장 이름을 접두사로 하여 지정할 수 있습니다:
+
+```sql
+SELECT @@global.vsql_sys_var.enabled;
+-- 1
+SELECT @@global.vsql_sys_var.threshold;
+-- 1000
+SET GLOBAL vsql_sys_var.enabled = 0;
+```
+
+### 변경에 반응하기 {#reacting-to-changes}
+
+`on_change`는 원시 C 콜백이며, 변수가 설정된 후 서버가 호출합니다. 서버는 전역 시스템 변수 잠금을 보유한 상태에서 이를 호출하므로, 짧게 유지하고 패닉을 일으키지 마세요 — 여기서의 패닉은 FFI 경계를 넘어갑니다. 콜백은 원시 ABI 계층에서 `*const vef_sys_var_change_t`를 받습니다:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+use villagesql::sys::vef_sys_var_change_t;
+
+static CHANGE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn on_enabled_change(_change: *const vef_sys_var_change_t) {
+    CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+```
+
+<Warning>
+`SysVarCapability::get` 또는 `SysVarCapability::set`을 호출하거나, SQL을 실행하거나, 둘 중 하나를 수행하는 스레드를 기다리면 그 잠금에서 교착 상태가 발생합니다. 콜백은 위와 같이 자체 static에 대한 기록 작업으로 제한하고, SQL이 필요한 작업은 [스레드 워커](#thread-worker)에 넘기세요.
+</Warning>
+
+`on_change: Some(on_enabled_change)`로 스펙에 연결합니다.
+
+### 확장 코드에서 읽고 쓰기 {#reading-and-writing-from-extension-code}
+
+`SysVarCapability`는 서버를 통한 프로그래밍 방식 접근을 위해 `get()`과 `set()`도 노출합니다(따라서 범위 검증과 지속성이 대신 처리됩니다). `set()`은 지속성을 선택하는 `scope` 인자를 받습니다: `null`은 실행 중인 값만 변경하므로 재시작 시 되돌아갑니다. `"PERSIST"`는 실행 중인 값을 변경하고 지속되는 구성에도 씁니다. `"PERSIST_ONLY"`는 실행 중인 값은 건드리지 않고 지속되는 구성에만 쓰므로 다음 재시작 시 적용됩니다. 두 메서드 모두 NUL로 끝나는 C 문자열을 받는 `unsafe` FFI 메서드이며, 둘 다 반전된 C 규약을 따릅니다: `Some(false)`는 성공, `Some(true)`는 서버가 오류를 보고했음, `None`은 기능을 사용할 수 없음을 의미합니다. `get`이 성공하면 서버는 `malloc`으로 할당한 문자열을 쓰며, 이는 C의 `free()`로 해제해야 합니다. [`vsql_sys_var` 예제](https://github.com/villagesql/vsql-rust-sdk/blob/main/examples/vsql_sys_var/src/lib.rs)가 `free` extern과 안전성 주석을 포함한 전체 패턴을 보여줍니다.
+
+## 스레드 워커 {#thread-worker}
+
+`thread_worker` 기능은 사용자가 제공한 함수를 서버가 관리하는 백그라운드 스레드에서 실행합니다. 서버는 로드 시점에 제어 시스템 변수를 등록하며, 그것이 `ON`인 동안 작업 함수는 주기적 타이머, 파일 디스크립터 준비, 또는 활성/비활성 전환 시 호출됩니다.
+
+작업 함수는 일반적인 안전한 Rust입니다:
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+use villagesql::preview::thread_worker::{
+    NextWakeup, ThreadHandle, ThreadWorkerCapability, WakeupReason,
+};
+use villagesql::{InValue, VdfReturn};
+
+static TICKS: AtomicI64 = AtomicI64::new(0);
+
+fn worker(reason: WakeupReason, _handle: ThreadHandle) -> NextWakeup {
+    if reason == WakeupReason::Periodic {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    NextWakeup::unchanged()
+}
+
+static WORKER: ThreadWorkerCapability =
+    ThreadWorkerCapability::new(worker, "ticker", Duration::from_millis(100), None);
+
+fn ticks_impl(_args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(TICKS.load(Ordering::Relaxed))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(ticks_impl, "ticks", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &WORKER,
+    ]
+}
+```
+
+`ThreadWorkerCapability::new`는 작업 함수, 스레드 이름 접미사, 초기 대기 간격, 그리고 선택적 제어 변수 이름 오버라이드를 받습니다. 오버라이드가 `None`이면 제어 변수의 이름은 `{suffix}_enabled`이며 확장의 접두사 아래에 등록됩니다:
+
+```sql
+SHOW GLOBAL VARIABLES LIKE '%ticker%';
+```
+
+```
+Variable_name	Value
+vsql_thread_worker.ticker_enabled	OFF
+```
+
+```sql
+SET GLOBAL vsql_thread_worker.ticker_enabled = ON;
+SELECT SLEEP(0.5);
+SELECT vsql_thread_worker.ticks();
+-- 4  (varies with timing — one tick per 100 ms while enabled)
+SET GLOBAL vsql_thread_worker.ticker_enabled = OFF;
+```
+
+### 웨이크업 {#wakeups}
+
+`WakeupReason`은 서버가 호출한 이유를 알려줍니다: `Enable`, `Periodic`, `PollFd`, 또는 `Disable`입니다. 반환 값이 다음 웨이크업을 조정합니다:
+
+- `NextWakeup::unchanged()` — 현재 대기 간격과 poll fd를 유지합니다.
+- `NextWakeup::after(duration)` — `duration` 후에 다시 깨어납니다.
+- `poll_fd` 필드를 0보다 큰 파일 디스크립터로 설정하면 그것이 읽기 가능해질 때도 깨어나며, `-1`로 설정하면 이전에 설정한 값을 지웁니다.
+
+길이가 0인 `Duration`은 "변경 없음"으로 축소됩니다 — 기본 C ABI가 `0`을 그 용도로 예약하므로, 즉시 웨이크업은 표현할 수 없습니다.
+
+작업 함수가 패닉을 일으키면 SDK가 FFI 경계에서 그 패닉을 잡아 호출이 `NextWakeup::unchanged()`를 반환한 것으로 처리합니다 — 워커는 계속 실행됩니다.
+
+`ThreadHandle` 인자는 `sql_query` 기능이 Rust로 이식된 후 워커에서 SQL 세션을 여는 용도로 예약되어 있습니다. 아직 메서드가 없습니다.
+
+## 키링 접근 {#keyring-access}
+
+`keyring` 기능은 MySQL 키링 구성 요소에 저장된 비밀을 읽고 씁니다 — API 키, 암호화 키, 그리고 테이블에 두어서는 안 되는 모든 것입니다. 서버에 키링 구성 요소(예: `component_keyring_file`)가 설치되어 있어야 합니다. 없으면 모든 읽기와 쓰기가 `KeyringError::NoComponent`로 실패합니다.
+
+```rust
+use std::ffi::CString;
+
+use villagesql::preview::keyring::KeyringCapability;
+use villagesql::{InValue, VdfReturn};
+
+static KEYRING: KeyringCapability = KeyringCapability::new();
+
+const MAX_SECRET_LEN: usize = 1024;
+
+fn keyring_read_impl(args: &[InValue]) -> VdfReturn {
+    let Some(&InValue::String(data_id)) = args.first() else {
+        return VdfReturn::null();
+    };
+    let Ok(data_id) = CString::new(data_id) else {
+        return VdfReturn::null();
+    };
+
+    let mut buf = [0u8; MAX_SECRET_LEN];
+    match KEYRING.read(&data_id, None, &mut buf) {
+        Ok(Some(n)) => match std::str::from_utf8(&buf[..n]) {
+            Ok(s) => VdfReturn::string(s),
+            Err(_) => VdfReturn::null(),
+        },
+        Ok(None) | Err(_) => VdfReturn::null(),
+    }
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(
+            keyring_read_impl, "keyring_read",
+            [villagesql::Type::String] -> villagesql::Type::String,
+            buffer_size: MAX_SECRET_LEN
+        ),
+    ],
+    requires: [
+        &KEYRING,
+    ]
+}
+```
+
+`read(data_id, auth_id, buf)`는 전달한 버퍼를 채우고 비밀의 길이와 함께 `Ok(Some(n))`을 반환하거나, `data_id` 아래에 비밀이 없으면 `Ok(None)`을 반환합니다 — 이는 오류가 아니라 정상적인 결과입니다. `write(data_id, auth_id, data)`는 성공 시 `Ok(())`를 반환합니다. `auth_id`는 소유 사용자입니다. 특정 사용자와 연결되지 않은 내부 키에는 `None`을 전달하세요.
+
+둘 다 실패 시 `Err(KeyringError)`를 반환합니다: `CapabilityUnavailable`(기능이 연결된 적 없음), `NoComponent`(서버에 키링 구성 요소 없음), 또는 `Other`입니다.
+
+키링에는 크기 조회 수단이 없습니다: `read`에 전달한 버퍼보다 큰 비밀은 `Ok(None)`으로 돌아오며, 이는 없는 키와 구별되지 않습니다. 저장할 것으로 예상되는 가장 큰 비밀에 맞춰 버퍼 크기를 정하세요.
+
+## 다음 단계 {#next-steps}
+
+<CardGroup cols={2}>
+  <Card
+    title="미리보기 기능(C++)"
+    icon="flask"
+    href="/ko/mysql-8.4/stable/preview-capabilities"
+  >
+    전체 기능 인덱스, 미리보기 계층, 그리고 C++ 전용 기능: auth,
+    mysql_services, sql_query, statement_event, 그리고 열 저장소.
+  </Card>
+  <Card
+    title="Rust API 참조"
+    icon="book"
+    href="/ko/mysql-8.4/stable/rust-api-reference"
+  >
+    InValue, VdfReturn, extension!, func!, custom_type! — 모든 필드.
+  </Card>
+</CardGroup>

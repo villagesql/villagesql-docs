@@ -5,13 +5,10 @@ description: "在 VillageSQL Rust SDK 中定义新的列类型——二进制布
 ---
 
 <Warning>
-  Rust SDK 处于 alpha 阶段——各版本之间可能出现破坏性的 API 变更。已支持
-  仅含函数的扩展和自定义类型（编码、解码、比较、哈希）。聚合、`prerun()`、
-  `VarArgs`、系统变量和状态变量、密钥环访问以及列存储 ABI 目前仅在 C++
-  中可用——如果您需要其中任何功能，请使用 [C++ SDK](/zh/mysql-8.4/stable/create)。
+  Rust SDK 处于 alpha 阶段——各版本之间可能出现破坏性的 API 变更。支持纯函数扩展、聚合函数、变长参数函数以及自定义类型（encode、decode、compare、hash），同时也支持 `sys_var`、`status_var`、`thread_worker` 和 `keyring` 预览功能。列存储 ABI 目前仅在 C++ SDK 中提供——如果您需要它，请使用 [C++ SDK](/zh/mysql-8.4/stable/create)。
 </Warning>
 
-自定义类型允许您定义新的列类型——例如 `RATIONAL`、`VECTOR` 或 `INET`——这些类型可以与 `ORDER BY`、索引和聚合函数一起使用。Rust SDK 通过 `custom_type!` 宏支持此功能。
+自定义类型允许您定义新的列类型——例如 `RATIONAL`、`VECTOR` 或 `INET`——这些类型可以与 `ORDER BY`、索引和聚合函数一起使用。Rust SDK 通过 `custom_type!` 宏支持此功能，并且对于存储大小取决于列参数的类型，还通过 `parameterized_type!` 提供支持（请参阅[参数化类型](#parameterized-types)）。
 
 本页假设您已经完成了 [使用 Rust 构建扩展](/zh/mysql-8.4/stable/rust-sdk) 的相关步骤。设置（Cargo.toml、manifest.json、cargo-vsql）与之前相同。
 
@@ -20,7 +17,7 @@ description: "在 VillageSQL Rust SDK 中定义新的列类型——二进制布
 在以下情况下使用自定义类型：
 
 - 您需要一种二进制的磁盘布局，而标准的 SQL 类型无法表达这种布局（打包的浮点数、固定宽度的整数、二进制标识符）
-- 您的类型具有其自身的排序语义，该语义与词法字符串排序不同
+- 您的类型具有其自身的排序语义，该语义与字符串字典序不同
 - 您希望服务器正确地索引和哈希值，以便进行 `ORDER BY`、`COUNT(DISTINCT)` 和集合操作
 
 如果您只需要可从 SQL 调用的函数，并且您的数据可以轻松地放入 `STRING`、`INT` 或 `REAL` 列中，则不需要自定义类型。
@@ -202,7 +199,125 @@ SELECT rational_to_real('1/3');
 
 `rational_to_real(r RATIONAL) -> REAL` 将 `RATIONAL` 值转换为 64 位浮点近似值，方法是将分子除以分母。当您需要用于显示或比较的近似十进制数，但又不想在列中存储有损表示形式时，此函数很有用。
 
-## 包含类型和函数的 `extension!` 块
+## 参数化类型 {#parameterized-types}
+
+参数化类型需要一个在 `CREATE TABLE` 时读取的值——例如 `VECTOR(3)` 中的
+`3`——才能确定其存储大小。`custom_type!` 无法表达这一点：它的
+`persisted_length` 对于每一列都是单个固定常量。`parameterized_type!` 是其
+参数化的对应物：持久化长度不再固定，而是通过 `int_to_params` 和
+`resolve_params`，根据声明的参数为每一列计算得出。
+
+```rust
+villagesql::parameterized_type!(
+    type_name: "type_name_in_sql",
+    max_persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: your_encode_fn,
+    decode: your_decode_fn,
+    compare: your_compare_fn,
+    int_to_params: your_int_to_params_fn,
+    resolve_params: your_resolve_params_fn,
+    params_type: YourParamsType,
+    params_parse: your_params_parse_fn,
+    params_to_strings: your_params_to_strings_fn,
+    hash: your_hash_fn,
+    default: "a_valid_string_literal",
+)
+```
+
+| 字段 | 类型 | 描述 |
+|---|---|---|
+| `type_name` | 字符串字面量 | SQL 类型名称。在 SQL 中不区分大小写。 |
+| `max_persisted_length` | `i64` | 在所有有效的参数化组合中，磁盘上字节长度的上限。 |
+| `max_decode_buffer_length` | `usize` | 解码后的字符串表示形式的最大字节长度。 |
+| `encode` | 函数 | 在 INSERT 时将 `&str` 加上 `&mut MaybeParams<P>` 转换为二进制字节。 |
+| `decode` | 函数 | 将二进制字节加上 `&P` 转换回 `String` 以进行显示。 |
+| `compare` | 函数 | 在给定 `&P` 的情况下，为 `ORDER BY`、`MIN`、`MAX` 返回 `Ordering`。 |
+| `int_to_params` | 函数 | 将 `TYPE(N)` 整数语法转换为规范的参数字符串。 |
+| `resolve_params` | 函数 | 验证已解析的 `Params` 并返回一个 `Resolved`（存储大小，以及可选的重写后的参数）。 |
+| `params_type` | 类型 | 您解析后的参数结构体，例如 `PadintParams`。 |
+| `params_parse` | 函数 | 将 `Params` 解析为 `params_type`。对于每个唯一的参数组合最多运行一次——SDK 会缓存结果。 |
+| `params_to_strings` | 函数 | `params_parse` 的逆操作：将 `params_type` 写回规范的 `(key, value)` 对。 |
+| `hash` | 函数 | 在给定 `&P` 的情况下返回一个 `usize` 哈希值。可选，但建议为索引列使用。 |
+| `default` | 字符串字面量 | 一个有效的字符串，服务器可以在类型初始化时对其进行编码。可选，但建议使用。 |
+
+`type_name`、`max_persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、`compare`、`int_to_params`、`resolve_params`、`params_type`、`params_parse` 和 `params_to_strings` 是必需的。`hash` 和 `default` 是可选的；`intrinsic_default_fn`（一个根据 `&P` 计算默认值的函数，用于默认值取决于参数的情况）也是可选的，并且与 `default` 互斥。
+
+下面是 `padint`——一个以固定 8 个字节存储的 `i64`，带有一个控制补零显示宽度的 `width` 参数：
+
+```rust
+pub struct PadintParams {
+    pub width: u32,
+}
+
+pub fn padint_parse(params: Params) -> PadintParams {
+    let width = params.get("width").and_then(|s| s.parse().ok()).unwrap_or(1);
+    PadintParams { width }
+}
+
+pub fn padint_to_strings(p: &PadintParams) -> Vec<(String, String)> {
+    vec![("width".to_string(), p.width.to_string())]
+}
+
+pub fn padint_int_to_params(n: i64) -> Result<String, String> {
+    if n < 1 {
+        return Err(format!("padint: width must be >= 1, got {n}"));
+    }
+    Ok(format!("width={n}"))
+}
+
+pub fn padint_resolve_params(params: Params) -> Result<Resolved, String> {
+    let width: i64 = params
+        .get("width")
+        .ok_or_else(|| "padint: missing 'width' param".to_string())?
+        .parse()
+        .map_err(|e| format!("padint: bad width: {e}"))?;
+    // Fixed 8-byte i64 storage; the decode buffer must fit the widest
+    // rendering, which is the larger of an i64's digits and the padded width.
+    Ok(Resolved::new(8, width.max(20)))
+}
+
+pub fn padint_encode(s: &str, params: &mut MaybeParams<PadintParams>) -> Result<Vec<u8>, String> {
+    let n: i64 = s.trim().parse().map_err(|e| format!("padint: {e}"))?;
+    if !params.is_known() {
+        // Bare constant with no column to anchor it: infer width from digits.
+        let digits = s.trim().trim_start_matches('-').len().max(1);
+        params.set(PadintParams { width: u32::try_from(digits).unwrap_or(u32::MAX) });
+    }
+    Ok(n.to_le_bytes().to_vec())
+}
+
+pub fn padint_decode(b: &[u8], p: &PadintParams) -> Result<String, String> {
+    let n = i64::from_le_bytes(b[..8].try_into().unwrap());
+    Ok(format!("{n:0width$}", width = p.width as usize))
+}
+
+pub fn padint_compare(a: &[u8], b: &[u8], _p: &PadintParams) -> std::cmp::Ordering {
+    i64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(b[..8].try_into().unwrap()))
+}
+
+villagesql::parameterized_type!(
+    type_name: "padint",
+    max_persisted_length: 8,
+    max_decode_buffer_length: 32,
+    encode: padint_encode,
+    decode: padint_decode,
+    compare: padint_compare,
+    int_to_params: padint_int_to_params,
+    resolve_params: padint_resolve_params,
+    params_type: PadintParams,
+    params_parse: padint_parse,
+    params_to_strings: padint_to_strings,
+    default: "0",
+)
+```
+
+接收参数化自定义类型参数的函数看到的是
+`InValue::CustomWithParams { bytes, params }`，而不是普通的
+`InValue::Custom(bytes)`——`params` 是一个 [`TypeParams`]，它是对该列所声明的
+`key=value` 对的只读、零拷贝视图。
+
+## 包含类型的 `extension!` 块
 
 在注册函数和类型时，`extension!` 块有两个部分：
 
@@ -217,7 +332,7 @@ villagesql::extension! {
 }
 ```
 
-如果为空，则可以省略任一部分。仅包含类型的扩展会省略 `funcs:`；仅包含函数的扩展会省略 `types:`。
+仅包含函数的扩展会省略 `types:`。仅包含类型的扩展会保留 `funcs: []`，其他部分都不省略。
 
 ## 后续步骤
 
@@ -230,7 +345,7 @@ villagesql::extension! {
     关于 `InValue`、`VdfReturn` 和所有宏的完整参考。
   </Card>
   <Card
-    title="用 Rust 构建扩展"
+    title="使用 Rust 构建扩展"
     icon="wrench"
     href="/zh/mysql-8.4/stable/rust-sdk"
   >

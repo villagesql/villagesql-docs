@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "C++ 开发"
-description: "C++ 扩展的 VDF 编写深度参考——参数和结果类型、聚合、prerun/postrun、可变参数以及注册。"
+description: "C++ 扩展的 VDF 编写深度参考——参数和结果类型、异常安全、聚合、prerun/postrun、可变参数以及注册。"
 ---
 
 本指南是编写 C++ VDF 实现的深度参考。它是 [使用 C++ 创建扩展](/zh/mysql-8.4/stable/create) 的补充，后者涵盖端到端的构建步骤；也是 [C++ 测试](/zh/mysql-8.4/stable/testing) 的补充，后者涵盖测试与迭代循环。
@@ -17,6 +17,32 @@ VEF 协议 3 自 v0.0.4 版本起已稳定。协议 4 正在开发中，并且�
 ```cpp
 #include <villagesql/vsql.h>
 ```
+
+## 异常安全 {#exception-safety}
+
+控制异常是扩展的责任。SDK 不会将您的实现包装在 `try`/`catch` 中，服务器也不会，因此从入口点逃逸的异常会跨越 C ABI 边界展开，在其之上没有任何处理程序，服务器进程会终止。普通的 SQL 输入就会触发这一点：`std::stoi()` 在遇到非数字字符串时会抛出异常，而 `nlohmann::json::dump()` 在遇到非有效 UTF-8 的文本时会抛出异常。
+
+请包装您注册的每一个入口点的主体：VDF、聚合结果函数，以及自定义类型的 `from_string`/`to_string` 操作。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <string>
+
+using namespace vsql;
+
+void to_int_impl(StringArg in, IntResult out) {
+  if (in.is_null()) { out.set_null(); return; }
+  try {
+    out.set(std::stoi(std::string(in.value())));  // throws on bad input
+  } catch (const std::exception &e) {
+    out.warning(e.what());
+  } catch (...) {
+    out.warning("unexpected error");
+  }
+}
+```
+
+除了 `const std::exception &` 之外，还要捕获 `...`：依赖库可能会抛出一个不派生自 `std::exception` 的类型，而那种异常仍然会终止服务器。在 `warning()` 和 `error()` 之间的选择依据与其他任何失败相同——`warning()` 用于语句应当继续执行的错误输入，`error()` 用于继续操作不安全的情况。
 
 ## 参数和结果类型 {#argument-and-result-types}
 
@@ -114,7 +140,7 @@ void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
 void count_result(const CountState &s, IntResult out) { out.set(s); }
 ```
 
-`StringResult` 聚合 VDF 返回文本：结果报告 `utf8mb4_bin` 字符集和排序规则，因此客户端将其显示为字符而不是十六进制——与标量 VDF STRING 路径相同。它还以相同的方式支持 `.max_result_length(n)`，调整物化聚合结果（`GROUP BY`/`DISTINCT` 临时表、`CREATE TABLE ... SELECT` 或 UNION）的大小，使其不会在参数宽度处被截断。有关调整大小的规则和上限，请参阅 [自定义缓冲区大小](/zh/mysql-8.4/stable/create#custom-buffer-sizes)。
+`StringResult` 聚合 VDF 返回文本：结果报告 `utf8mb4_bin` 字符集和排序规则，因此客户端将其显示为字符而不是十六进制——与标量 VDF STRING 路径相同。它还以相同的方式支持 `.max_result_length(n)`——这需要选择加入的开发 ABI 标头 (`-DVSQL_USE_DEV_ABI=ON`) 和协议 4——调整物化聚合结果（`GROUP BY`/`DISTINCT` 临时表、`CREATE TABLE ... SELECT` 或 UNION）的大小，使其不会在参数宽度处被截断。有关调整大小的规则和上限，请参阅 [自定义缓冲区大小](/zh/mysql-8.4/stable/create#custom-buffer-sizes)。
 
 ## 每个语句的状态（Prerun 和 Postrun） {#per-statement-state-prerun-and-postrun}
 
@@ -158,7 +184,7 @@ void ba_call_index_postrun(PostrunArgs args) {
 //     .build()
 ```
 
-## 可变参数 VDF
+## 可变参数 VDF {#varargs-vdfs}
 
 **varargs** VDF 接受任意数量的任何 SQL 类型的参数。使用 `.varargs()` 在函数生成器上声明一个，这与 `.no_params()` 和 `.param(TYPE)` 互斥。主体接收一个 `vsql::VarArgs` 参数，而不是通常的固定参数个数的参数类型。
 
@@ -178,6 +204,66 @@ Varargs 注册需要 VEF 协议 3。旧服务器会在安装时拒绝该扩展�
 | `is_custom()` | `as_custom()` | `vsql::Span<const unsigned char>` |
 
 在任何访问器之前检查 `is_null()`——所有四个访问器在 null 参数上都是未定义的。
+
+`PrerunArgType::custom_type()` 以 `std::string_view` 形式返回参数的自定义类型名称——对于非自定义参数则为空。单独使用 `is_custom()` 会接受服务器上注册的每一个自定义类型；将它与 `custom_type()` 比较搭配使用，可以将可变参数调用收窄到某一个特定类型：
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+// POINT2D stores two little-endian int32 (x, y) in 8 bytes — registration
+// omitted here; see Custom Types for make_type<>().
+
+void point_path_prerun(PrerunArgs args, PrerunResult out) {
+  if (args.size() == 0) {
+    out.error("point_path requires at least one point");
+    return;
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    auto t = args.type_at(i);
+    if (!t.is_custom() || t.custom_type() != "POINT2D") {
+      out.error("point_path: every argument must be a POINT2D");
+      return;
+    }
+  }
+  out.request_buffer_size(16 + args.size() * 32);
+}
+
+void point_path(VarArgs args, StringResult out) {
+  auto buf = out.buffer();
+  size_t off = 0;
+  bool first = true;
+  for (auto a : args) {
+    if (a.is_null()) { out.set_null(); return; }
+    auto bytes = a.as_custom();
+    int x, y;
+    memcpy(&x, bytes.data(), 4);
+    memcpy(&y, bytes.data() + 4, 4);
+    if (!first) {
+      memcpy(buf.data() + off, " -> ", 4);
+      off += 4;
+    }
+    first = false;
+    off += static_cast<size_t>(
+        snprintf(buf.data() + off, buf.size() - off, "(%d,%d)", x, y));
+  }
+  out.set_length(off);
+}
+
+// Registration:
+// make_func<&point_path>("point_path")
+//     .returns(STRING).varargs()
+//     .prerun<&point_path_prerun>()
+//     .build()
+```
+
+```sql
+SELECT point_path(POINT2D::from_string('0,0'), POINT2D::from_string('1,2'));
+-- (0,0) -> (1,2)
+SELECT point_path('1,2');
+-- ERROR 1123 (HY000): Can't initialize function 'point_path'; point_path: every argument must be a POINT2D
+```
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -220,6 +306,59 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .prerun<&ba_concat_all_prerun>()
 //     .build()
 ```
+
+## 扩展加载和卸载钩子 {#extension-load-and-unload-hooks}
+
+扩展有时需要在每次加载时执行一些工作，而不是在每次调用时执行——例如选择针对特定 CPU 的实现，或者构建一个供 VDF 随后读取的查找表。使用扩展生成器上的 `.on_init<&Fn>()` 注册该工作，并使用 `.on_deinit<&Fn>()` 注册与之匹配的清理工作。两者都接受一个签名为 `void()` 的函数。
+
+<Warning>
+`.on_init<&Fn>()` 和 `.on_deinit<&Fn>()` 仅在选择加入的开发 ABI 标头中声明 (`-DVSQL_USE_DEV_ABI=ON`)。默认的稳定 ABI 构建没有这两个方法，因此注册钩子会导致编译失败。
+</Warning>
+
+`on_init` 在每次扩展加载时运行：在 `INSTALL EXTENSION` 时，以及在每次服务器启动时——都是在服务器验证并接受该扩展之后。对于被服务器拒绝的扩展，它绝不会运行。`on_deinit` 在卸载时运行——`UNINSTALL EXTENSION` 或服务器关闭。
+
+这两个钩子都在扩展进程内运行，且**无法访问服务器**：它们不能运行 SQL、读取系统变量或访问服务器状态。因此，对于必须与服务器通信的初始化工作，它们不是合适的位置——请改用预览功能的 populate 步骤。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cmath>
+using namespace vsql;
+
+static float *g_sqrt_table = nullptr;
+
+void build_table() {
+  g_sqrt_table = new float[256];
+  for (int i = 0; i < 256; i++) g_sqrt_table[i] = std::sqrt(float(i));
+}
+
+void free_table() {
+  delete[] g_sqrt_table;
+  g_sqrt_table = nullptr;
+}
+
+void fast_sqrt(IntArg n, RealResult out) {
+  if (n.is_null() || n.value() < 0 || n.value() > 255) {
+    out.set_null();
+    return;
+  }
+  out.set(g_sqrt_table[n.value()]);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .on_init<&build_table>()
+        .on_deinit<&free_table>()
+        .func(make_func<&fast_sqrt>("fast_sqrt")
+                  .returns(REAL)
+                  .param(INT)
+                  .build()))
+```
+
+在 `INSTALL EXTENSION my_extension` 之后，`SELECT fast_sqrt(16)` 返回 `4`——只有在 `build_table` 已经运行的情况下才能得到这个结果。
+
+<Note>
+`on_deinit` 是从 `VEF_GENERATE_ENTRY_POINTS` 生成的 `vef_unregister` 入口点调用的。`VEF_GENERATE_REGISTRATION` 不定义该入口点，因此使用它的扩展必须从其自行编写的 `vef_unregister` 中调用自己的清理函数。
+</Note>
 
 ## VEF_GENERATE_REGISTRATION
 

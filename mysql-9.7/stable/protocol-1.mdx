@@ -1,0 +1,142 @@
+---
+audience: extension-author
+title: "Protocol 1 API"
+description: "Reference for the Protocol 1 function-pointer type API and raw ABI style — the original VEF interface, stable as of v0.0.1 and likely to be deprecated in a future release."
+---
+
+Protocol 1 is the original VEF interface. It was stable as of v0.0.1 and remains supported, but is likely to be deprecated in a future release. New extensions should use the Protocol 3 API — the template-based type builders in the [Creating Extensions in C++](/mysql-9.7/stable/create) and [C++ Development](/mysql-9.7/stable/development) guides.
+
+This page exists for reference when working with existing extensions built against Protocol 1.
+
+## Function-Pointer Type API
+
+Protocol 1 custom types are registered using explicit function pointers instead of the `vsql::make_type<>` template. The function signatures differ from the Protocol 3 equivalents — they take raw pointers and lengths rather than `Arg` and `Result` objects.
+
+### Function Signatures
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+### Registration
+
+This form requires `#include <villagesql/extension.h>` (not `<villagesql/vsql.h>`) and `using namespace villagesql;`.
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+constexpr const char* MYTYPE = "mytype";
+
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()` (with a compile-time string NTTP) is the preferred form. `make_type(MYTYPE)` (no template parameter) is the Protocol 1 form — it remains supported but is likely to be deprecated in a future release.
+
+## Raw ABI Style (Functions)
+
+Protocol 1 VDF implementations can pass the raw C structs directly instead of using typed wrappers. This style remains supported but is likely to be deprecated in a future release — use the [typed argument/result API](/mysql-9.7/stable/development#argument-and-result-types) for all new code.
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&add_impl>("add_impl")
+                  .returns(INT)
+                  .param(INT)
+                  .param(INT)
+                  .build()))
+```
+
+This per-argument raw signature — `void(vef_context_t*, vef_invalue_t* arg0, ..., vef_vdf_result_t*)` — is only detected by `make_func<>()` from `<villagesql/extension.h>`. The `make_func<>()` from `<villagesql/vsql.h>` rejects any raw `vef_context_t*`/`vef_invalue_t*`/`vef_vdf_result_t*` signature at compile time.
+
+### Result Constants
+
+The raw ABI communicates result state via `vef_return_value_type_t` set on `result->type`:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | Success — the output is in the appropriate union field |
+| `VEF_RESULT_NULL` | 1 | The result is SQL NULL |
+| `VEF_RESULT_WARNING` | 2 | Row-level warning — execution continues, NULL is returned for this row, a SQL warning is added; in strict mode MySQL promotes this to an error on INSERT/UPDATE |
+| `VEF_RESULT_ERROR` | 3 | Fatal error — statement execution is aborted; message is in `result->error_msg` |
+
+In Protocol 3, `out.set()`, `out.set_null()`, `out.warning()`, and `out.error()` handle this automatically.
+
+### Aggregate Registration in Protocol 1
+
+There is no raw ABI aggregate registration path. `make_func<>()` has no `.clear<>()` or `.accumulate<>()` member — those methods exist only on the separate `make_aggregate_func<State, &result_fn>()` builder from `<villagesql/vsql.h>`, which uses `State&`-based typed signatures rather than raw `vef_context_t*`/`vef_vdf_args_t*` pointers. Even a Protocol 1 extension must register aggregates this way. Use the [typed aggregate approach](/mysql-9.7/stable/development#aggregate-vdfs) for all new code.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <optional>
+using namespace vsql;
+
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+make_aggregate_func<SumState, &my_result>("my_agg")
+    .returns(INT).param(INT)
+    .clear<&my_clear>()        // void(SumState&)
+    .accumulate<&my_acc>()     // void(SumState&, IntArg)
+    .build()
+```

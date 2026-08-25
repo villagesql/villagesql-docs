@@ -1,0 +1,516 @@
+---
+audience: extension-author
+title: "Rust API 참조"
+description: "VillageSQL Rust SDK의 완전한 참조 — InValue, VdfReturn, extension!, func!, agg_func!, varargs_func!, custom_type!, custom!, manifest.json 필드."
+---
+
+<Warning>
+  Rust SDK는 알파 단계입니다 — 릴리스 간에 호환성이 깨지는 API 변경이
+  발생할 수 있습니다. 함수 전용 확장, 집계 함수, 가변 인자 함수, 그리고
+  사용자 정의 타입(encode, decode, compare, hash)이 지원되며, `sys_var`,
+  `status_var`, `thread_worker`, `keyring` 미리보기 기능도 지원됩니다.
+  컬럼 저장 ABI는 현재 C++ 전용입니다 — 이 기능이 필요하다면
+  [C++ SDK](/ko/mysql-9.7/stable/create)를 사용하세요.
+</Warning>
+
+이 페이지는 `villagesql` 크레이트 API에 대한 참조입니다. 시작하기 가이드는 [Rust로 확장 만들기](/ko/mysql-9.7/stable/rust-sdk)를 참조하세요. 사용자 정의 타입에 대해서는 [Rust에서의 사용자 정의 타입](/ko/mysql-9.7/stable/rust-custom-types)을 참조하세요.
+
+## InValue
+
+`InValue`는 서버가 각 함수 인수에 대해 전달하는 열거형입니다. 함수는 `args: &[InValue]`를 받으며, 값을 사용하기 전에 각 인수를 확인해야 합니다.
+
+```rust
+pub enum InValue<'a> {
+    String(&'a str),
+    Real(f64),
+    Int(i64),
+    Null,
+    Custom(&'a [u8]),
+    CustomWithParams { bytes: &'a [u8], params: TypeParams<'a> },
+}
+```
+
+| 배리언트(Variant) | Rust 타입 | 해당 SQL 타입 |
+|---|---|---|
+| `String(&str)` | UTF-8 문자열 슬라이스 | `STRING` / `VARCHAR` / `TEXT` |
+| `Real(f64)` | 64비트 부동소수점 | `REAL` / `DOUBLE` / `FLOAT` |
+| `Int(i64)` | 64비트 부호 있는 정수 | `INT` / `BIGINT` / `TINYINT` |
+| `Null` | — | 모든 타입의 SQL `NULL` |
+| `Custom(&[u8])` | 원시 바이너리 바이트 | `custom_type!`을 통해 등록된 사용자 정의 타입 |
+| `CustomWithParams { bytes, params }` | 원시 바이트 + `TypeParams` | [`parameterized_type!`](/ko/mysql-9.7/stable/rust-custom-types#parameterized-types)을 통해 등록된 매개변수화된 사용자 정의 타입 |
+
+항상 `Null`을 명시적으로 매치해야 합니다. `.unwrap()`을 호출하거나 값 배리언트만 패턴 매칭하는 것은 버그입니다 — SQL NULL은 오류가 아닌 정상적인 입력입니다.
+
+## VdfReturn
+
+`VdfReturn`은 함수가 서버에 반환하는 것입니다. 연관 함수 중 하나로 구성합니다:
+
+| 생성자 | SQL 효과 |
+|---|---|
+| `VdfReturn::null()` | 이 행에 SQL NULL을 반환합니다 |
+| `VdfReturn::string(s)` | `String` 값을 반환합니다; `s`는 `impl Into<String>`입니다 |
+| `VdfReturn::real(v)` | `f64` 값을 반환합니다 |
+| `VdfReturn::int(v)` | `i64` 값을 반환합니다 |
+| `VdfReturn::binary(bytes)` | 사용자 정의 타입 열에 대한 바이너리 바이트를 반환합니다; `bytes`는 `Vec<u8>`입니다 |
+| `VdfReturn::warning(msg)` | 이 행에 NULL을 반환하고 SQL 경고를 추가합니다(실행은 계속됩니다) |
+| `VdfReturn::error(msg)` | 치명적 오류로 문을 중단합니다 |
+
+**경고 vs 오류:**
+
+사용자 입력 검증 실패 시 결과 집합의 나머지 부분을 계속 처리하는 것이 합리적인 경우 `warning`을 사용하세요. 엄격 모드에서는 MySQL이 `INSERT` 및 `UPDATE`에서 경고를 오류로 승격시킵니다. 데이터가 손상되거나 내부 불변 조건 위반과 같은 안전하지 않은 상황에서는 `error`를 사용하세요. 치명적 오류는 전체 문을 중단합니다.
+
+```rust
+fn validate_impl(args: &[InValue]) -> VdfReturn {
+    match args.first() {
+        Some(InValue::Int(n)) if *n >= 0 => VdfReturn::int(*n),
+        Some(InValue::Int(_)) => VdfReturn::warning("value must be non-negative"),
+        Some(InValue::Null) | None => VdfReturn::null(),
+        _ => VdfReturn::error("validate: expected an INT argument"),
+    }
+}
+```
+
+## extension! 매크로
+
+`extension!`은 서버가 VEB 파일을 로드할 때 호출하는 VEF 엔트리 포인트를 생성합니다. 이는 크레이트 내에서 정확히 한 번만 나타나야 합니다.
+
+```rust
+villagesql::extension! {
+    funcs: [
+        // One or more villagesql::func!(...) declarations
+    ],
+    types: [
+        // One or more villagesql::custom_type!(...) declarations
+    ],
+    requires: [
+        // Zero or more &'static capability references, e.g. &KEYRING
+    ]
+}
+```
+
+`types:`와 `requires:`는 각각 단독으로는 선택 사항이지만, `funcs:`는 항상 존재해야 합니다 — 타입만 있는 확장에는 `funcs: []`를 작성하세요. 순수 함수 확장은 `types:`를 생략합니다. `funcs: []`가 있고 타입이 없는 `extension!` 블록은 유효하지만 아무 작업도 하지 않는 확장을 생성합니다.
+
+`requires:`는 확장이 사용하는 [Rust에서의 미리보기 기능](/ko/mysql-9.7/stable/rust-preview-capabilities)을 `static` 기능 객체에 대한 참조로 선언합니다. 이는 `funcs:` 섹션 뒤에 마지막으로 와야 합니다 — 확장이 함수를 등록하지 않는다면 `funcs: []`를 포함하세요.
+
+## func! 매크로
+
+`func!`는 SQL 호출 가능한 함수를 선언합니다. 여섯 가지 형태가 있습니다 — 문장별 상태가 없는 네 가지(매개변수 없음, `buffer_size`만, `deterministic`만, 둘 다)와 `prerun` 함수를 통해 문장별 상태를 붙이는 두 가지입니다:
+
+```rust
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+```
+
+<Note>
+  `buffer_size` 매개변수는 `villagesql` 크레이트 **0.0.2 이상**을
+  요구합니다. 현재 [crates.io](https://crates.io/crates/villagesql) 릴리스
+  (`0.0.1`)는 이를 노출하지 않습니다 — `0.0.2`가 출시되기 전까지는
+  `buffer_size` 없는 형태를 사용하세요.
+</Note>
+
+| 인수 | 설명 |
+|---|---|
+| `rust_fn` | VDF를 구현하는 Rust 함수입니다. 서명: `fn(&[InValue]) -> VdfReturn`, `state:` / `prerun:` 형태에서는 `fn(&mut StateType, &[InValue]) -> VdfReturn`. |
+| `"sql_name"` | SQL 함수 이름을 문자열 리터럴로 지정합니다. 사용자가 SQL에서 호출할 때 사용하는 이름입니다. |
+| `[param_types]` | `,`로 구분된 `villagesql::Type::*` 또는 `villagesql::custom!("name")` 값 목록입니다. 0개 인수 함수에는 `[]`를 사용합니다. |
+| `return_type` | `villagesql::Type::*` 또는 `villagesql::custom!("name")`입니다. |
+| `buffer_size: N` | 선택 사항입니다. 문자열/바이너리 반환값에 대한 결과 버퍼의 바이트 크기입니다. 서버 기본값(256바이트)을 사용하려면 `0`을 사용하세요. 함수가 `buffer_size`보다 큰 문자열 또는 바이너리 값을 반환하면, 함수는 잘라내지 않고 오류를 발생시킵니다 — 더 큰 결과를 처리하려면 더 큰 `buffer_size`를 선언하세요. |
+| `deterministic: true` | 선택 사항입니다. 함수가 결정적임을 선언합니다 — 동일한 입력은 항상 동일한 출력을 생성하며, 부작용이 없습니다. 최적화 도구는 동일한 입력에 대한 결과를 캐시할 수 있습니다. 이 값이 참일 때만 설정하세요. |
+
+**타입 상수** (`func!`에서 사용):
+
+| `villagesql::Type::*` | SQL 타입 |
+|---|---|
+| `villagesql::Type::String` | `STRING` |
+| `villagesql::Type::Real` | `REAL` |
+| `villagesql::Type::Int` | `INT` |
+
+### 문장별 상태 {#per-statement-state}
+
+일부 함수는 단일 문장의 모든 행에 걸치는 상태를 필요로 합니다 — 호출 카운터, 누산기 같은 것입니다. 상태 타입은 `state:`로, 설정 함수는 `prerun:`으로 선언합니다. prerun 함수는 첫 번째 행 이전에 한 번 실행되고, 그다음 행 함수가 그 상태에 대한 `&mut` 접근 권한을 가지고 행마다 한 번씩 실행됩니다.
+
+prerun 함수의 서명은 `fn(PrerunArgs, PrerunResult<T>)`이며, 이 함수가 공급하는 행 함수는 상태를 먼저 받습니다: `fn(state: &mut T, args: &[InValue]) -> VdfReturn`. `T`는 `state:`가 지정한 타입이며, 컴파일러는 prerun 함수와 행 함수가 그 타입에 대해 일치하는지 확인합니다.
+
+| `PrerunResult<T>` 메서드 | 효과 |
+|---|---|
+| `set_state(self, state: T)` | 문장별 상태를 할당하고 서버에 넘깁니다. `self`를 빌리지 않고 소비하므로 컴파일러가 두 번째 호출을 거부합니다. |
+| `request_buffer_size(&mut self, n: usize)` | 서버에 특정 결과 버퍼 크기를 요청합니다. |
+| `error(self, msg: &str)` | 메시지와 함께 전체 문장을 실패시킵니다. |
+
+`PrerunArgs::len()`은 각 행이 받게 될 인수의 개수이며, `PrerunArgs::is_empty()`는 함수가 인수 없이 호출되었을 때 참입니다.
+
+상태를 직접 해제해서는 안 됩니다: `func!`가 문장이 끝날 때 상태를 드롭하는 postrun을 생성합니다. 이는 postrun에서 `delete_state<T>()`를 호출해야 하는 C++ SDK와는 반대입니다 — [문장별 상태](/ko/mysql-9.7/stable/development#per-statement-state-prerun-and-postrun)를 참조하세요.
+
+<Note>
+  `state` 및 `prerun` 매개변수는 아직 게시된 릴리스에 포함되어 있지
+  않습니다. 현재 [crates.io](https://crates.io/crates/villagesql) 릴리스
+  (`0.0.1`)는 이를 노출하지 않습니다.
+</Note>
+
+문장 내에서 자신의 호출 인덱스를 반환하는 함수를 가진 완전한 확장입니다:
+
+```rust
+use villagesql::{InValue, PrerunArgs, PrerunResult, VdfReturn};
+
+/// Per-statement state: how many times the row function has been called.
+struct CallCounter {
+    n: i64,
+}
+
+/// Runs once, before the first row: allocate the counter at zero.
+fn call_index_prerun(_args: PrerunArgs, out: PrerunResult<CallCounter>) {
+    out.set_state(CallCounter { n: 0 });
+}
+
+/// Runs once per row: bump the counter and return its new value.
+fn call_index(state: &mut CallCounter, _args: &[InValue]) -> VdfReturn {
+    state.n += 1;
+    VdfReturn::int(state.n)
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(call_index, "call_index", [] -> villagesql::Type::Int,
+            state: CallCounter, prerun: call_index_prerun),
+    ]
+}
+```
+
+[Rust로 확장 만들기](/ko/mysql-9.7/stable/rust-sdk)에 설명된 대로 빌드하고 설치한 다음:
+
+```sql
+INSTALL EXTENSION vsql_call_index;
+CREATE TABLE t (id INT);
+INSERT INTO t VALUES (10), (20), (30);
+SELECT SUM(vsql_call_index.call_index()) AS total FROM t;
+-- → 6
+SELECT SUM(vsql_call_index.call_index()) AS total FROM t;
+-- → 6
+```
+
+테이블에 세 개의 행이 있으므로 `call_index()`는 세 번 실행되어 `1`, 그다음 `2`, 그다음 `3`을 반환합니다 — 행마다 하나의 값입니다. `SUM`은 이 세 값을 더하여 `6`을 만듭니다.
+
+두 번째 `SELECT`는 첫 번째보다 큰 값이 아니라 동일한 합계를 반환합니다: 카운터는 하나의 문장에 대해 할당되고 그 문장이 끝나면 삭제됩니다.
+
+## agg_func! 매크로
+
+`agg_func!`는 집계 SQL 함수를 선언합니다 — 행마다 한 번씩이 아니라 각 그룹의 행 전체에 대해 호출되는 SUM/COUNT 스타일의 함수입니다. 두 가지 형태가 있습니다:
+
+```rust
+villagesql::agg_func!(result_fn, "sql_name", [param_types] -> return_type,
+    state: StateType, clear: clear_fn, accumulate: accumulate_fn)
+villagesql::agg_func!(result_fn, "sql_name", [param_types] -> return_type,
+    state: StateType, clear: clear_fn, accumulate: accumulate_fn,
+    buffer_size: N, deterministic: true)
+```
+
+| 인수 | 설명 |
+|---|---|
+| `result_fn` | `fn(&State) -> VdfReturn`. 완성된 누산기에서 한 그룹의 출력을 만들어 냅니다. 그룹마다 한 번, 해당 그룹의 마지막 행이 반영된 후에 실행됩니다. `&mut`가 아니라 `&State`를 받습니다 — 결과 함수는 누산기를 읽을 뿐, 재설정하지 않습니다. |
+| `"sql_name"` | 문자열 리터럴로 된 SQL 함수 이름. |
+| `[param_types]` | `func!`와 동일한 인수 목록 — `villagesql::Type::*` 또는 `villagesql::custom!("name")` 값. |
+| `return_type` | `villagesql::Type::*` 또는 `villagesql::custom!("name")`. |
+| `state: StateType` | 누산기 타입. `Default`를 구현해야 합니다: `agg_func!`가 prerun을 대신 생성하며, 그 prerun이 `StateType::default()`로 누산기를 값 초기화합니다. `Default`를 derive하거나 직접 구현하세요. |
+| `clear: clear_fn` | `fn(&mut State)`. 각 그룹이 시작될 때 누산기를 재설정합니다. |
+| `accumulate: accumulate_fn` | `fn(&mut State, &[InValue])`. 한 행을 누산기에 반영합니다. 행마다 한 번 실행됩니다. 아무것도 반환하지 않습니다 — 값은 오직 `result_fn`을 통해서만 나옵니다. |
+| `buffer_size: N` / `deterministic: true` | 선택 사항이지만 함께 제공하거나 아예 제공하지 않아야 합니다 — `agg_func!`에는 `func!`와 같은 단일 옵션 형태가 없습니다. 제공하면 `func!`에서와 같은 의미입니다. |
+
+<Note>
+  `agg_func!`는 아직 게시된 릴리스에 포함되어 있지 않습니다. 현재
+  [crates.io](https://crates.io/crates/villagesql) 릴리스
+  (`0.0.1`)는 이를 노출하지 않습니다.
+</Note>
+
+누산기는 문장마다 한 번 할당되고 문장이 끝나면 드롭됩니다 — `agg_func!`가 누산기를 생성하는 prerun과 드롭하는 postrun을 모두 생성하므로, 둘 중 어느 것도 직접 작성하지 않습니다. 그룹별 동작을 만들어 주는 것이 `clear_fn`입니다: `GROUP BY`에서는 같은 누산기가 그룹 사이에서 재사용되므로, 그룹 간에 누출되어서는 안 되는 필드는 반드시 여기에서 재설정해야 합니다.
+
+SDK 리포지토리의 `vsql_agg_sum` 예제인, 완전한 SUM 대응 집계입니다:
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// Accumulator for `agg_sum`: the running total for the current group.
+#[derive(Default)]
+struct SumState {
+    total: i64,
+    seen: bool,
+}
+
+/// clear: reset the total at the start of each group.
+fn agg_sum_clear(state: &mut SumState) {
+    state.total = 0;
+    state.seen = false;
+}
+
+/// accumulate: fold one row's int into the running total.
+fn agg_sum_acc(state: &mut SumState, args: &[InValue]) {
+    if let Some(InValue::Int(n)) = args.first() {
+        state.total += *n;
+        state.seen = true;
+    }
+}
+
+/// result: emit the group's total once every row has been folded in.
+fn agg_sum_result(state: &SumState) -> VdfReturn {
+    if state.seen {
+        VdfReturn::int(state.total)
+    } else {
+        VdfReturn::Null
+    }
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::agg_func!(agg_sum_result, "agg_sum",
+            [villagesql::Type::Int] -> villagesql::Type::Int,
+            state: SumState, clear: agg_sum_clear, accumulate: agg_sum_acc),
+    ]
+}
+```
+
+`accumulate`가 `InValue::Int`만 매치하는 것이 NULL을 건너뛰게 하며, 이는 내장 `SUM`과 동일한 동작입니다. `seen` 플래그는 전부 NULL인 그룹과 빈 그룹이 `0`이 아니라 NULL을 반환하게 만듭니다:
+
+```sql
+INSTALL EXTENSION vsql_agg_sum;
+CREATE TABLE t (grp INT, val INT);
+INSERT INTO t VALUES (1, 10), (1, 20), (2, 100), (2, 200), (2, 300);
+SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin
+  FROM t GROUP BY grp ORDER BY grp;
+-- grp  mine  builtin
+--   1    30       30
+--   2   600      600
+```
+
+## varargs_func! 매크로
+
+`varargs_func!`는 임의 개수의, 임의 타입의 인수를 받는 VDF를 선언합니다. 매개변수 목록은 `[..]`로 씁니다 — 이는 필수 리터럴이며, 인수가 없는 `func!`에 쓰는 `[]`와는 다릅니다.
+
+<Warning>
+  서버는 가변 인자 VDF에 대해 인수 개수 검증도 인수 타입 검증도 수행하지
+  않습니다. 호출을 대조할 선언된 매개변수 목록이 없으므로, 인수가 0개인
+  호출과 전혀 예상하지 못한 타입을 포함해 SQL 텍스트가 전달한 모든 것이
+  그대로 함수에 도달합니다. 검증은 전적으로 `prerun` 훅의 몫입니다. 또한
+  가변 인자 등록은 VEF 프로토콜 3을 필요로 합니다 — 이전 서버는 설치 시
+  확장을 거부합니다. 이는 C++ SDK와 동일하며, C++에서도 [프레임워크가
+  가변 인자 VDF의 인자 개수 또는 타입을 검증할 수
+  없습니다](/ko/mysql-9.7/stable/development#varargs-vdfs).
+</Warning>
+
+여섯 가지 형태 — 세 가지 모양이 있고, 각각 축약형과 `buffer_size` 및 `deterministic`을 (단독이 아니라) 함께 추가하는 전체형이 있습니다:
+
+```rust
+// Per-statement state plus a validating prerun.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+
+// Validating prerun, no state.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    prerun: prerun_fn)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    prerun: prerun_fn, buffer_size: N, deterministic: true)
+
+// Bare: no prerun, no state, no validation.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    buffer_size: N, deterministic: true)
+```
+
+| 인수 | 설명 |
+|---|---|
+| `impl_fn` | 행 함수. prerun 전용 형태와 기본(bare) 형태에서는 `fn(&[InValue]) -> VdfReturn`이고, `state:` 형태에서는 `fn(&mut StateType, &[InValue]) -> VdfReturn`입니다. `args` 슬라이스의 길이는 호출마다 달라집니다. |
+| `"sql_name"` | 문자열 리터럴로 된 SQL 함수 이름. |
+| `[..]` | 함수를 가변 인자로 표시합니다. 타입 목록은 없습니다. |
+| `return_type` | `villagesql::Type::*` 또는 `villagesql::custom!("name")`. 인수는 고정되어 있지 않지만 반환 타입은 고정입니다. |
+| `state: StateType` | 선택 사항. 문장별 상태로, `prerun`이 할당하고 각 행 호출이 `&mut`로 빌립니다. `prerun:`을 필요로 합니다. `agg_func!`와 달리 `Default` 바운드가 없습니다 — prerun이 값을 직접 만듭니다. |
+| `prerun: prerun_fn` | 선택 사항이며, 인수 검증이 일어날 수 있는 유일한 곳입니다. `fn(PrerunArgs, PrerunResult<T>)`이고, `T`는 `state:`가 지정한 타입이거나 prerun 전용 형태에서는 `()`입니다. |
+| `buffer_size: N` / `deterministic: true` | 선택 사항이며, 함께 제공하거나 아예 제공하지 않아야 합니다. 제공하면 `func!`에서와 같은 의미입니다 — 가변 인자에서는 결과가 보통 인수 개수에 따라 커지므로 고정 값이 잘못된 선택인 경우가 많습니다. 대신 prerun에서 `request_buffer_size`로 크기를 정하세요. |
+
+기본(bare) 형태는 검증이 없고 인수가 0개인 호출도 받아들입니다 — 모든 입력에 대해 정의되는 함수라면 정당한 선택이지만, 이는 전달될 수 있는 모든 입력을 행 함수 혼자 책임진다는 뜻입니다. 문장별 상태를 할당하고 드롭하는 것은 `state:` 형태뿐입니다. prerun 전용 형태는 `PrerunResult<()>`를 사용하고 아무것도 저장하지 않으므로 그에 대한 postrun도 없습니다 — 그런 prerun은 `PrerunResult`를 `error`와 `request_buffer_size`에만 사용하며, `set_state`는 절대 호출하지 않습니다.
+
+### prerun에서의 인수 타입 검사
+
+서버가 아무것도 검증하지 않으므로, 가변 인자 prerun은 첫 번째 행이 실행되기 전에 인수 타입을 볼 수 있어야 합니다. `PrerunArgs::type_at`이 그 시야를 제공하며, `len()`/`is_empty()` 및 [문장별 상태](#per-statement-state)에서 설명한 `PrerunResult` 메서드와 함께 사용합니다.
+
+| `PrerunArgs` 메서드 | 반환값 |
+|---|---|
+| `type_at(i: usize)` | `Option<ArgType>` — 인수 `i`의 선언된 타입. `i`가 범위를 벗어나면 `None`. |
+
+| `ArgType` 메서드 | 반환값 |
+|---|---|
+| `is_str()` | `STRING` 인수이면 `true`. |
+| `is_real()` | `REAL` 인수이면 `true`. |
+| `is_int()` | `INT` 인수이면 `true`. |
+| `is_custom()` | 설치된 어느 확장이든 등록한 사용자 정의 타입의 인수이면 `true`. |
+| `custom_name()` | `Option<&str>` — 사용자 정의 타입의 이름. `is_custom()`이 참일 때만 `Some`이고, 스칼라 타입에서는 `None`. |
+
+정확히 하나의 사용자 정의 타입만 받아들이려면 `is_custom()`을 `custom_name()`과 짝지으세요: `is_custom()`만으로는 서버의 모든 사용자 정의 타입을 받아들입니다.
+
+<Note>
+  `varargs_func!`와 `PrerunArgs::type_at`은 아직 게시된 릴리스에 포함되어
+  있지 않습니다. 현재 [crates.io](https://crates.io/crates/villagesql)
+  릴리스(`0.0.1`)는 이를 노출하지 않습니다.
+</Note>
+
+SDK 리포지토리의 `vsql_varargs` 예제는 형태마다 함수를 하나씩 선언합니다. prerun에서 검증하고 문장별 호출 카운터를 유지하는, 상태 있는 가변 인자 함수입니다:
+
+```rust
+use villagesql::{InValue, PrerunArgs, PrerunResult, VdfReturn};
+
+/// Per-statement state: how many times the row handler has run this statement.
+#[derive(Default)]
+struct JoinState {
+    calls: i64,
+}
+
+/// Validate the call and set up the statement. The server does no validation for
+/// varargs, so this is the only gate.
+fn str_join_prerun(args: PrerunArgs, mut out: PrerunResult<JoinState>) {
+    // Reject a zero-argument call.
+    if args.is_empty() {
+        out.error("str_join requires at least one argument");
+        return;
+    }
+
+    // Every argument must be a string.
+    for i in 0..args.len() {
+        if !args.type_at(i).is_some_and(|t| t.is_str()) {
+            out.error("str_join: every argument must be a string");
+            return;
+        }
+    }
+
+    // Size the result buffer from the arg count.
+    out.request_buffer_size(32 + args.len() * 64);
+
+    // Hand the fresh counter to the server.
+    out.set_state(JoinState::default());
+}
+
+/// Join a variable number of string arguments, prefixed with the per-statement
+/// call count.
+fn str_join(state: &mut JoinState, args: &[InValue]) -> VdfReturn {
+    state.calls += 1;
+
+    let mut joined = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        match arg {
+            InValue::String(s) => {
+                if i > 0 {
+                    joined.push_str(", ");
+                }
+                joined.push_str(s);
+            }
+            // A string column can carry NULL. SQL-style: NULL in -> NULL out.
+            InValue::Null => return VdfReturn::Null,
+            _ => return VdfReturn::error("str_join: non-string argument at runtime"),
+        }
+    }
+    VdfReturn::string(format!("#{}: {joined}", state.calls))
+}
+
+/// Bare varargs: no prerun, no state, no validation. Returns how many arguments
+/// it was called with, including zero.
+fn arg_count(args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(i64::try_from(args.len()).unwrap_or(i64::MAX))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::varargs_func!(str_join, "str_join", [..] -> villagesql::Type::String,
+            state: JoinState, prerun: str_join_prerun),
+        villagesql::varargs_func!(arg_count, "arg_count", [..] -> villagesql::Type::Int),
+    ]
+}
+```
+
+prerun이 모든 인수가 문자열임을 증명했는데도 `str_join`은 여전히 행 함수에서 `InValue`를 매치합니다: prerun이 보는 것은 값이 아니라 선언된 타입이며, `STRING` 컬럼은 어느 행에서든 NULL을 담을 수 있습니다.
+
+```sql
+INSTALL EXTENSION vsql_varargs;
+SELECT vsql_varargs.str_join('alpha', 'beta');
+-- #1: alpha, beta
+SELECT vsql_varargs.str_join('a', 'b', 'c', 'd');
+-- #1: a, b, c, d
+SELECT vsql_varargs.str_join('ok', 123);
+-- ERROR 1123 (HY000): Can't initialize function 'str_join'; str_join: every argument must be a string
+SELECT vsql_varargs.arg_count();
+-- 0
+SELECT vsql_varargs.arg_count(1, 2.5, 'mix');
+-- 3
+```
+
+이 예제는 `describe`(인수가 0개이거나 스칼라가 아닌 인수를 거부한 다음, 이질적인 인수 목록을 형식화하는 prerun 전용 함수)와 `point_path`(`is_custom()`과 `custom_name()`으로 검증)도 선언합니다. [Rust SDK 리포지토리](https://github.com/villagesql/vsql-rust-sdk)의 `examples/vsql_varargs/src/lib.rs`를 참조하세요.
+
+## custom_type! 매크로
+
+`custom_type!`은 새로운 열 타입을 등록합니다. `type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`는 필수이며, `hash`와 `default`는 선택적이지만 권장됩니다.
+
+```rust
+villagesql::custom_type!(
+    type_name: "sql_type_name",
+    persisted_length: N,
+    max_decode_buffer_length: M,
+    encode: encode_fn,
+    decode: decode_fn,
+    compare: compare_fn,
+    hash: hash_fn,
+    default: "default_string",
+)
+```
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `type_name` | `&str` 리터럴 | 타입에 대한 SQL 이름입니다. SQL에서 대소문자 구분이 없습니다. 모든 설치된 확장 프로그램 간에 고유해야 합니다. |
+| `persisted_length` | `usize` | 디스크에 저장할 때 고정된 바이트 길이입니다. 모든 인코딩된 값은 정확히 이 길이의 바이트를 생성해야 합니다. |
+| `max_decode_buffer_length` | `usize` | 디코딩된 문자열의 최대 바이트 길이입니다. `decode` 호출 전 출력 버퍼 크기를 결정하는 데 사용됩니다. |
+| `encode` | `fn(&str) -> Result<Vec<u8>, String>` | `INSERT` 시 호출됩니다. SQL 문자열 리터럴을 바이너리로 변환합니다. 입력을 거부하려면 `Err(msg)`를 반환하세요. |
+| `decode` | `fn(&[u8]) -> Result<String, String>` | 값 표시 시 호출됩니다. 바이너리를 문자열로 변환합니다. |
+| `compare` | `fn(&[u8], &[u8]) -> std::cmp::Ordering` | `ORDER BY`, `MIN`, `MAX`에 호출됩니다. `Less`, `Equal`, 또는 `Greater`를 반환합니다. |
+| `hash` | `fn(&[u8]) -> usize` | 선택 사항입니다. `COUNT(DISTINCT)` 및 집합 연산에 호출됩니다. 비교 결과가 `Equal`인 값은 동일한 해시 값을 가져야 합니다. 인덱스 열에 권장됩니다. |
+| `default` | `&str` 리터럴 | 선택 사항입니다. 서버가 타입 초기화 시 인코딩하여 콜백이 작동하는지 검증하는 데 사용하는 유효한 문자열입니다. 정확히 `persisted_length` 바이트로 인코딩되어야 합니다. |
+
+`default` 필드는 열 기본값이 아닙니다 — 시작 확인입니다. 서버는 확장 프로그램을 로드할 때 `encode(default)`를 호출하여 콜백이 작동하는지 확인합니다. `encode`가 기본값에 대해 `Err`를 반환하면 확장 프로그램이 로드되지 않습니다.
+
+## custom! 매크로
+
+`villagesql::custom!("type_name")`은 `func!` 선언에서 사용자 정의 타입을 이름으로 참조합니다:
+
+```rust
+villagesql::func!(
+    my_fn,
+    "my_sql_func",
+    [villagesql::custom!("mytype")] -> villagesql::custom!("mytype"),
+    deterministic: true
+)
+```
+
+`villagesql::Type::*`이 매개변수 목록이나 반환 타입 위치에 나타나는 곳이라면 어디서든 사용할 수 있습니다. 문자열은 해당 `custom_type!`에서 선언된 `type_name`과 일치해야 합니다.
+
+## manifest.json 필드
+
+모든 확장 프로그램은 `Cargo.toml`과 함께 `manifest.json`이 필요합니다:
+
+```json
+{
+  "name": "vsql_my_extension",
+  "version": "0.1.0",
+  "description": "Brief description of what the extension does",
+  "author": "Your Name",
+  "license": "GPL-2.0"
+}
+```
+
+| 필드 | 필수 | 형식 | 설명 |
+|---|---|---|---|
+| `name` | 예 | 소문자, 숫자, `_`, `-` | 확장 프로그램 식별자입니다. `INSTALL EXTENSION` 이름과 일치해야 합니다. 언더스코어를 사용하세요 — 하이픈은 SQL에서 백틱으로 인용해야 합니다. |
+| `version` | 예 | MAJOR.MINOR.PATCH | 시맨틱 버전입니다. |
+| `description` | 아니요 | String | `INFORMATION_SCHEMA.EXTENSIONS`에 표시됩니다. |
+| `author` | 아니요 | String | 저자 이름 또는 조직입니다. |
+| `license` | 아니요 | String | 라이선스 식별자입니다. 오픈소스 확장 프로그램에는 `GPL-2.0`이 권장됩니다. |
+
+`name` 검증 규칙: 첫 글자는 알파벳, 마지막 글자는 알파벳 또는 숫자여야 하며, 최대 64자입니다. 유효하지 않은 매니페스트는 `INSTALL EXTENSION`을 실패시킵니다.

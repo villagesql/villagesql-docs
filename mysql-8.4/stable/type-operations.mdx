@@ -30,6 +30,12 @@ using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
 using TypeHashFunc = size_t (*)(vsql::CustomArg in);
 ```
 
+Omitting a custom hash function falls back to hashing the type's raw stored
+bytes. This is unsafe for a type whose encode function can produce more than
+one binary representation of an equal logical value — the common case is a
+floating-point field, where `-0.0` and `+0.0` compare equal but differ
+bit-for-bit, so `GROUP BY` and `COUNT(DISTINCT)` would treat them as different.
+
 Register these operations using `vsql::make_type<kTypeName>()`. The type name
 is passed as a non-type template parameter (NTTP) — a `static constexpr const char[]`
 array. The builder auto-generates VDF names in the `TYPE::method` format
@@ -61,7 +67,7 @@ constexpr auto MYTYPE =
         .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
         .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
         .compare<&my_compare>()      // auto: "MYTYPE::compare"
-        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash" — required for types storing floating-point values
         .intrinsic_default_str("0")  // string-literal intrinsic default
         .build();
 
@@ -73,6 +79,24 @@ VEF_GENERATE_ENTRY_POINTS(
 `build()` fails at compile time if `from_string`, `to_string`, or `compare`
 is missing. Each template method checks the function pointer signature via
 `static_assert`.
+
+A custom type may declare at most **65532 bytes** of storage per value. A custom
+column is backed by a `VARBINARY` field, and MySQL's 65535-byte per-row budget
+also pays for that field's two length bytes and the row's null byte; because
+whether a column is nullable is decided per column at `CREATE TABLE`, and
+nullable is the default, the cap has to leave room for the null byte. Both
+`persisted_length` and `max_persisted_length` are checked against it, and the
+check runs at `INSTALL EXTENSION` rather than at `CREATE TABLE`, so a type that
+is too wide is rejected with the whole extension:
+
+```text
+ERROR HY000: Failed to install extension 'vsql_huge_fixed_test': type 'HUGE_FIELD' declares 70000 bytes of storage per value, which exceeds the maximum of 65532 bytes supported for custom-type columns today
+```
+
+Staying under the cap does not guarantee a column fits. Every other column in
+the table draws on the same 65535-byte row budget, which only `CREATE TABLE` can
+weigh, so a type at or near the cap can still fail there with
+`ER_TOO_BIG_ROWSIZE`. A plain `VARBINARY` of the same width behaves the same way.
 
 ## Intrinsic Default
 
@@ -98,6 +122,10 @@ For fixed-length types, the default string must encode to exactly
 `persisted_length` bytes. Set an explicit default for any type where
 empty string is not a valid input.
 </Note>
+
+Provide the intrinsic default one of two ways. The two are mutually exclusive:
+declaring both `.intrinsic_default_str()` and `.intrinsic_default_vdf()` is a
+compile-time error.
 
 **String literal: `.intrinsic_default_str()`**
 
@@ -224,10 +252,27 @@ the params and so cannot consult `resolve_params` to size the encode buffer.
 For a VDF-based intrinsic default, use `.intrinsic_default_vdf()` with the VDF name and
 register the VDF separately via `make_intrinsic_default<&mytype_default>()`.
 
+`build()` requires `.resolve_params<>()` whenever `.params<>()` or
+`.int_to_params<>()` is registered: `int_to_params` only rewrites the
+`MYTYPE(N)` shorthand into a parameter string, while `resolve_params` is the
+gate that validates the parameters and resolves storage size. Omitting it is a
+compile-time error.
+
 <Warning>
 `.max_persisted_length()` requires VEF Protocol 3 or higher. A type using it
-cannot be loaded by pre-Protocol-3 servers.
+cannot be loaded by pre-Protocol-3 servers. It is valid only for variable-length
+or parameterized types; a fixed non-parameterized type that sets it fails to
+compile.
 </Warning>
+
+The sizes `resolve_params` reports are also validated at `CREATE TABLE` time,
+once a column's parameters are known. For a fixed-length type, the resolved
+`persisted_length` must not exceed the declared `max_persisted_length`: a
+parameterization whose computed footprint (for example a `dimension * 4` sizing)
+overruns that bound is rejected with a syntax error. Independently of length
+kind, `resolve_params` must resolve a `max_decode_buffer_length` greater than
+zero, since that value sizes the decode scratch buffer; a non-positive result is
+rejected with the same class of error.
 
 ```cpp
 static constexpr const char kMyTypeName[] = "MYTYPE";
@@ -281,7 +326,13 @@ variants take `vsql::CustomArgWith<P>`, whose `params()` accessor returns
   whenever `.resolve_params<>()` is registered — no extra builder call.
 
 A type that registers only `.resolve_params<>()` accepts the string form and
-rejects `MYTYPE(N)`. `SHOW CREATE TABLE` preserves whichever form was written.
+rejects `MYTYPE(N)`.
+
+`SHOW CREATE TABLE` does not repeat what the author wrote. The server keeps the
+resolved parameter map and rebuilds a display form from it, preferring
+`MYTYPE(N)` when `int_to_params(N)` reproduces the whole map and falling back to
+the canonical `MYTYPE('key=value,...')` with the keys sorted. A column written as
+`MYTYPE('dimension=8')` therefore reads back as `MYTYPE(8)`.
 
 ```sql
 CREATE TABLE t (v ext.MYTYPE(8));              -- integer form (.int_to_params)
@@ -343,7 +394,9 @@ not read the flag.
 
 Variable-length types must also call `.max_persisted_length(N)`. `build()` fails
 at compile time if it is omitted — the server needs the upper bound to allocate
-a buffer for the backing field.
+a buffer for the backing field. A variable-length type must not also call
+`.persisted_length()`: its size is decided per value, so `build()` rejects the
+combination at compile time.
 
 `.variable_length_type()` is monotonic: calling it before or after the Protocol 3
 setters (`max_persisted_length()`, `params()`, `int_to_params()`) does not lower
