@@ -140,16 +140,38 @@ one — see the next section.
 
 ## Adding a MySQL version (built — 9.7)
 
-Built 2026-08-22, on branch `adam/mysql-9.7-percona-docs`. This section
-records the agreed shape that build followed.
+Built 2026-08-22. This section records the agreed shape that build followed.
 
-**The MySQL 9.7 and Percona server builds are not shipped yet.** Both live on
-unmerged `villagesql-server` branches (`dbentley/mysql_9_7`,
-`dbentley/percona_8_4`). `mysql-8.4/dev/percona.mdx` says the Percona build
-isn't installable through any public path yet. The 9.7 tree carries no such
-caveat on `quickstart.mdx` or `source.mdx` — Adam asked for those notes to be
-removed 2026-08-22, so a reader following those two pages today will build
-MySQL 8.4, not 9.7, with no warning.
+**Both server builds shipped in 0.0.6, on 2026-08-25.** The `release/0.0.6`
+release carries three tarballs for each codebase, and Docker Hub carries one
+image for each codebase and architecture.
+
+**Refer to the branches of record, never a personal branch.** Engineering work
+on the two newer codebases happens on `mysql-9.7` and `percona-8.4` in
+`villagesql-server`, and those branches keep taking commits. What each release
+delivered is marked by a tag instead: `publish/mysql-8.4_0.0.6`,
+`publish/mysql-9.7_0.0.6`, `publish/percona-8.4_0.0.6`. A `dbentley/*` or
+`adam/*` branch may hold the same commits and is still not the source of truth.
+
+**Every artifact names the codebase and the VillageSQL version, joined by an
+underscore** — `mysql-8.4_0.0.6`, `mysql-9.7_0.0.6`, `percona-8.4_0.0.6`. A
+running server reports the same string in `@@villagesql_server_version`, and it
+is how a reader confirms which codebase they installed.
+
+| Artifact | Pattern |
+|---|---|
+| Git tag for a shipped release | `publish/<codebase>_<version>` |
+| Release tarball | `villagesql-dev-server-<codebase>_<version>-<os>-<arch>.tar.gz` |
+| Docker image | `villagesql/server:<codebase>_<version>-<arch>` |
+
+**Every Docker command in the docs names an architecture.** Docker Hub carries
+one image per codebase and architecture, and nothing else: no combined tag such
+as `mysql-8.4_0.0.6`, and no floating tag such as `stable` or `latest`, both of
+which were deleted on 2026-08-25. That is a decision, not a gap (Lee,
+2026-08-25) — a combined tag can be added after launch if it proves useful. So
+a Docker command must end in `-amd64` or `-arm64`, and the version number is
+part of every one of them. Expect to rewrite each Docker command in the docs at
+every release until a floating tag exists.
 
 **Model: parallel trees, like the upstream MySQL manual.** Each MySQL version
 gets a complete, independently editable doc set under its own product in the
@@ -225,8 +247,8 @@ The page structure follows the flag names.
 
 ## Percona branch
 
-Built 2026-08-22. VillageSQL ships a second buildable 8.4 branch that
-integrates Percona's MySQL improvements.
+Built 2026-08-22. VillageSQL ships a second buildable 8.4 codebase that
+integrates Percona's MySQL improvements, on the `percona-8.4` branch.
 
 **Do not document Percona's own changes.** Document that the branch exists, how
 to build and install it, and what VillageSQL supports about it. Send every
