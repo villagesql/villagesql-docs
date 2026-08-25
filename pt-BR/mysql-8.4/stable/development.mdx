@@ -242,7 +242,7 @@ void ba_call_index_postrun(PostrunArgs args) {
 //     .build()
 ```
 
-## VDFs com Varargs
+## VDFs com Varargs {#varargs-vdfs}
 
 Uma VDF com **varargs** aceita qualquer número de argumentos de qualquer tipo SQL. Declare uma
 com `.varargs()` no construtor da função, o que é mutuamente exclusivo com
@@ -270,6 +270,70 @@ tipo antes de ler seu valor:
 | `is_custom()` | `as_custom()` | `vsql::Span<const unsigned char>` |
 
 Verifique `is_null()` antes de qualquer acessador — todos os quatro são indefinidos em um argumento nulo.
+
+`PrerunArgType::custom_type()` retorna o nome do tipo personalizado do argumento
+como um `std::string_view` — vazio para argumentos que não são de tipo
+personalizado. `is_custom()` sozinho aceita todo tipo personalizado registrado no
+servidor; combiná-lo com uma comparação de `custom_type()` restringe uma chamada
+varargs a um tipo específico:
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+// POINT2D stores two little-endian int32 (x, y) in 8 bytes — registration
+// omitted here; see Custom Types for make_type<>().
+
+void point_path_prerun(PrerunArgs args, PrerunResult out) {
+  if (args.size() == 0) {
+    out.error("point_path requires at least one point");
+    return;
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    auto t = args.type_at(i);
+    if (!t.is_custom() || t.custom_type() != "POINT2D") {
+      out.error("point_path: every argument must be a POINT2D");
+      return;
+    }
+  }
+  out.request_buffer_size(16 + args.size() * 32);
+}
+
+void point_path(VarArgs args, StringResult out) {
+  auto buf = out.buffer();
+  size_t off = 0;
+  bool first = true;
+  for (auto a : args) {
+    if (a.is_null()) { out.set_null(); return; }
+    auto bytes = a.as_custom();
+    int x, y;
+    memcpy(&x, bytes.data(), 4);
+    memcpy(&y, bytes.data() + 4, 4);
+    if (!first) {
+      memcpy(buf.data() + off, " -> ", 4);
+      off += 4;
+    }
+    first = false;
+    off += static_cast<size_t>(
+        snprintf(buf.data() + off, buf.size() - off, "(%d,%d)", x, y));
+  }
+  out.set_length(off);
+}
+
+// Registration:
+// make_func<&point_path>("point_path")
+//     .returns(STRING).varargs()
+//     .prerun<&point_path_prerun>()
+//     .build()
+```
+
+```sql
+SELECT point_path(POINT2D::from_string('0,0'), POINT2D::from_string('1,2'));
+-- (0,0) -> (1,2)
+SELECT point_path('1,2');
+-- ERROR 1123 (HY000): Can't initialize function 'point_path'; point_path: every argument must be a POINT2D
+```
 
 ```cpp
 #include <villagesql/vsql.h>

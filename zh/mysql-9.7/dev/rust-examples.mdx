@@ -1,10 +1,10 @@
 ---
 audience: extension-author
 title: Rust 扩展示例
-description: 通过 vsql_rot13 和 vsql_rational 参考实现学习使用 Rust SDK
+description: 通过 vsql_rot13、vsql_rational、vsql_agg_sum 和 vsql_varargs 参考实现学习使用 Rust SDK
 ---
 
-本页介绍 Rust SDK 仓库中的两个参考扩展——一个仅包含函数的最小示例，以及一个包含算术运算、排序和哈希的完整自定义类型。该仓库的 `examples/` 目录还为每一项受支持的[预览功能](/zh/mysql-9.7/dev/rust-preview-capabilities)提供了一个示例。
+本页介绍 Rust SDK 仓库中的四个参考扩展——一个仅包含函数的最小示例，一个包含算术运算、排序和哈希的完整自定义类型，一个聚合函数，以及一个变长参数函数。该仓库的 `examples/` 目录还为每一项受支持的[预览功能](/zh/mysql-9.7/dev/rust-preview-capabilities)提供了一个示例。
 
 **源码：** [vsql-rust-sdk](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples) 中的 `examples/`
 
@@ -240,6 +240,373 @@ villagesql::extension! {
 
 ---
 
+## vsql_agg_sum — 聚合函数
+
+一个重新实现对 `INT` 列求 `SUM` 的聚合 VDF。它展示了聚合所需的三个钩子——`clear`、`accumulate` 和结果函数——以及每个钩子如何看到同一个累加器。
+
+**用法：**
+```sql
+INSTALL EXTENSION vsql_agg_sum;
+
+CREATE TABLE t (grp INT, val INT);
+INSERT INTO t VALUES (1, 10), (1, 20), (2, 100), (2, 200), (2, 300);
+
+SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin FROM t GROUP BY grp ORDER BY grp;
+```
+
+```
+grp	mine	builtin
+1	30	30
+2	600	600
+```
+
+添加一个全为 NULL 的分组可以看出，累加器在分组之间会被重置，而不是被带到下一个分组：
+
+```sql
+INSERT INTO t VALUES (3, NULL), (3, NULL);
+SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin FROM t GROUP BY grp ORDER BY grp;
+```
+
+```
+grp	mine	builtin
+1	30	30
+2	600	600
+3	NULL	NULL
+```
+
+### 累加器生命周期
+
+累加器是每个语句一个值，并在所有分组之间复用。服务器按固定顺序驱动它：
+
+| 阶段 | 您的函数 | 运行时机 |
+|---|---|---|
+| 分配 | 无——由 `agg_func!` 生成 | 每个语句一次，在第一行之前。SDK 以 `Default::default()` 分配状态，这正是状态类型必须实现 `Default` 的原因。 |
+| 清除 | `clear:`——`fn(&mut State)` | 在每个分组开始时。 |
+| 累加 | `accumulate:`——`fn(&mut State, &[InValue])` | 对分组中的每一行运行一次。不返回任何内容；它唯一的作用是修改状态。 |
+| 结果 | `agg_func!` 的第一个参数——`fn(&State) -> VdfReturn` | 每个分组一次，在最后一行被折叠进累加器之后。 |
+| 丢弃 | 无——由 `agg_func!` 生成 | 在语句结束之后。 |
+
+`clear` 在每个分组开始时重置累加器。它忘记重置的字段会从上一个分组泄漏过来。
+
+服务器会对每一行调用 `accumulate`，包括参数为 NULL 的行。跳过 NULL 是该函数自己的职责：只匹配您想要的变体，忽略其余部分。
+
+### 实现
+
+**文件：`src/lib.rs`**
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// Accumulator for `agg_sum`: the running total for the current group.
+#[derive(Default)]
+struct SumState {
+    total: i64,
+    seen: bool,
+}
+
+/// clear: reset the total at the start of each group.
+fn agg_sum_clear(state: &mut SumState) {
+    state.total = 0;
+    state.seen = false;
+}
+
+/// accumulate: fold one row's int into the running total.
+fn agg_sum_acc(state: &mut SumState, args: &[InValue]) {
+    if let Some(InValue::Int(n)) = args.first() {
+        state.total += *n;
+        state.seen = true;
+    }
+}
+
+/// result: emit the group's total once every row has been folded in.
+fn agg_sum_result(state: &SumState) -> VdfReturn {
+    if state.seen {
+        VdfReturn::int(state.total)
+    } else {
+        VdfReturn::Null
+    }
+}
+```
+
+`seen` 标志用于区分求和结果为零的分组和没有内容可求和的分组。没有它，空分组或全为 NULL 的分组会返回 `0`，而内置 `SUM` 返回的是 NULL。
+
+### 注册
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::agg_func!(agg_sum_result, "agg_sum",
+            [villagesql::Type::Int] -> villagesql::Type::Int,
+            state: SumState, clear: agg_sum_clear, accumulate: agg_sum_acc),
+    ]
+}
+```
+
+**关键模式：**
+- 第一个标识符是**结果**函数，而不是行函数——聚合的按行工作位于 `accumulate:` 中
+- `state:` 命名累加器类型，该类型必须实现 `Default`
+- 声明的参数列表就是按行的参数列表：`[villagesql::Type::Int]` 是 `accumulate` 接收的内容，返回类型则是结果函数生成的内容
+- `agg_func!` 还接受 `buffer_size:` 和 `deterministic:`，位于 `accumulate:` 之后，必须一起提供，并按此顺序
+
+---
+
+## vsql_varargs — 变长参数函数
+
+四个各自接受任意数量参数的 VDF。它们合起来覆盖了 `varargs_func!` 支持的三种注册形式——带 prerun 的有状态形式、仅 prerun 形式和裸形式——外加对自定义类型参数的验证。
+
+**用法：**
+```sql
+INSTALL EXTENSION vsql_varargs;
+
+SELECT vsql_varargs.str_join('alpha', 'beta');
+SELECT vsql_varargs.str_join('a', 'b', 'c', 'd');
+```
+
+```
+vsql_varargs.str_join('alpha', 'beta')
+#1: alpha, beta
+vsql_varargs.str_join('a', 'b', 'c', 'd')
+#1: a, b, c, d
+```
+
+同一个函数同时服务于两种参数数量。`#1` 前缀是每个语句的调用计数器，它会随着一条语句的各行递增：
+
+```sql
+CREATE TABLE t (x VARCHAR(16), y VARCHAR(16));
+INSERT INTO t VALUES ('1a', '1b'), ('2a', '2b'), ('3a', '3b');
+SELECT vsql_varargs.str_join(x, y) AS joined FROM t ORDER BY x;
+```
+
+```
+joined
+#1: 1a, 1b
+#2: 2a, 2b
+#3: 3a, 3b
+```
+
+### prerun 负责变长参数的全部验证
+
+对于变长参数函数，服务器完全不做参数检查——既不检查数量，也不检查类型。通常正是已声明的签名让服务器在您的代码运行之前拒绝错误的调用，而变长参数函数没有签名。凡是 prerun 钩子没有拒绝的内容都会到达行函数。
+
+prerun 对*调用*进行拒绝，在任何行之前只执行一次：它看到优化器解析出的参数类型，并使语句失败。行函数仍然必须处理每个*值*，因为类型通过了验证的列在任何一行上仍可能携带 NULL。
+
+prerun 拒绝会使语句初始化失败：
+
+```sql
+SELECT vsql_varargs.str_join();
+```
+
+```
+ERROR 1123 (HY000): Can't initialize function 'str_join'; str_join requires at least one argument
+```
+
+```sql
+SELECT vsql_varargs.str_join('ok', 123);
+```
+
+```
+ERROR 1123 (HY000): Can't initialize function 'str_join'; str_join: every argument must be a string
+```
+
+省略 prerun 意味着接受每一次调用。`arg_count` 以裸形式注册，因此零参数调用是合法的：
+
+```sql
+SELECT vsql_varargs.arg_count();
+SELECT vsql_varargs.arg_count(1, 2.5, 'mix');
+```
+
+```
+vsql_varargs.arg_count()
+0
+vsql_varargs.arg_count(1, 2.5, 'mix')
+3
+```
+
+### 实现
+
+**文件：`src/lib.rs`**
+
+prerun 接收 `PrerunArgs` 和一个 `T` 与状态类型匹配的 `PrerunResult<T>`。`PrerunArgs::len()` 是参数数量，`type_at(i)` 以 `ArgType` 的形式返回参数 `i` 的类型：
+
+```rust
+use villagesql::{InValue, PrerunArgs, PrerunResult, VdfReturn};
+
+/// Per-statement state: how many times the row handler has run this statement.
+#[derive(Default)]
+struct JoinState {
+    calls: i64,
+}
+
+/// Validate the call and set up the statement. The server does no validation for
+/// varargs, so this is the only gate.
+fn str_join_prerun(args: PrerunArgs, mut out: PrerunResult<JoinState>) {
+    // Reject a zero-argument call.
+    if args.is_empty() {
+        out.error("str_join requires at least one argument");
+        return;
+    }
+
+    // Every argument must be a string.
+    for i in 0..args.len() {
+        if !args.type_at(i).is_some_and(|t| t.is_str()) {
+            out.error("str_join: every argument must be a string");
+            return;
+        }
+    }
+
+    // Size the result buffer from the arg count.
+    out.request_buffer_size(32 + args.len() * 64);
+
+    // Hand the fresh counter to the server.
+    out.set_state(JoinState::default());
+}
+
+/// Join a variable number of string arguments, prefixed with the per-statement
+/// call count. `args` length varies with how many arguments the SQL call passed.
+fn str_join(state: &mut JoinState, args: &[InValue]) -> VdfReturn {
+    state.calls += 1;
+
+    let mut joined = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        match arg {
+            InValue::String(s) => {
+                if i > 0 {
+                    joined.push_str(", ");
+                }
+                joined.push_str(s);
+            }
+            // A string column can carry NULL. SQL-style: NULL in -> NULL out.
+            InValue::Null => return VdfReturn::Null,
+            _ => return VdfReturn::error("str_join: non-string argument at runtime"),
+        }
+    }
+    VdfReturn::string(format!("#{}: {joined}", state.calls))
+}
+
+/// Bare varargs: no prerun, no state, no validation. Returns how many arguments
+/// it was called with, including zero.
+fn arg_count(args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(i64::try_from(args.len()).unwrap_or(i64::MAX))
+}
+```
+
+对于变长参数，请在 prerun 中使用 `request_buffer_size`、按 `args.len()` 的比例确定缓冲区大小——固定的 `buffer_size` 无法随参数数量增长。
+
+`ArgType` 公开四个谓词——`is_int()`、`is_real()`、`is_str()` 和 `is_custom()`——因此只要每个参数都是行函数能处理的形态之一，prerun 就可以接受一次混合类型的调用。`describe` 接受三种标量类型的任意组合，并拒绝其他任何类型：
+
+```rust
+fn describe_prerun(args: PrerunArgs, mut out: PrerunResult<()>) {
+    if args.is_empty() {
+        out.error("describe requires at least one argument");
+        return;
+    }
+    for i in 0..args.len() {
+        let ok = args
+            .type_at(i)
+            .is_some_and(|t| t.is_int() || t.is_real() || t.is_str());
+        if !ok {
+            out.error("describe: arguments must be INT, REAL, or STRING");
+            return;
+        }
+    }
+    out.request_buffer_size(32 + args.len() * 48);
+}
+```
+
+```sql
+SELECT vsql_varargs.describe(42, 3.14e0, 'hello');
+```
+
+```
+vsql_varargs.describe(42, 3.14e0, 'hello')
+int:42, real:3.14, str:hello
+```
+
+状态类型是 `()`，因为这个 prerun 不保存任何内容：它只做验证并确定缓冲区大小，从不调用 `set_state`。
+
+### 自定义类型的变长参数
+
+单独使用 `is_custom()` 只能说明该参数是*某个*自定义类型。`custom_name()` 返回具体是哪一个，因此 prerun 可以将变长参数调用限制为单一类型。该扩展注册了一个 `point2d` 自定义类型，并接受任意数量的 `point2d` 值：
+
+```rust
+fn point_path_prerun(args: PrerunArgs, mut out: PrerunResult<()>) {
+    if args.is_empty() {
+        out.error("point_path requires at least one point");
+        return;
+    }
+    for i in 0..args.len() {
+        let ok = args
+            .type_at(i)
+            .is_some_and(|t| t.is_custom() && t.custom_name() == Some("point2d"));
+        if !ok {
+            out.error("point_path: every argument must be a point2d");
+            return;
+        }
+    }
+    out.request_buffer_size(16 + args.len() * 32);
+}
+```
+
+```sql
+SELECT vsql_varargs.point_path(point2d::from_string('0,0'), point2d::from_string('1,2'), point2d::from_string('3,5'));
+```
+
+```
+vsql_varargs.point_path(point2d::from_string('0,0'), point2d::from_string('1,2'), point2d::from_string('3,5'))
+(0,0) -> (1,2) -> (3,5)
+```
+
+普通字符串会在第一行之前被拒绝，即使其字节可以解析为一个点：
+
+```sql
+SELECT vsql_varargs.point_path('1,2');
+```
+
+```
+ERROR 1123 (HY000): Can't initialize function 'point_path'; point_path: every argument must be a point2d
+```
+
+随后行函数匹配 `InValue::Custom(b)` 并自行解码这些字节，与任何其他自定义类型 VDF 相同。
+
+### 注册
+
+```rust
+villagesql::extension! {
+    funcs: [
+        villagesql::varargs_func!(str_join, "str_join", [..] -> villagesql::Type::String,
+            state: JoinState, prerun: str_join_prerun),
+        villagesql::varargs_func!(arg_count, "arg_count", [..] -> villagesql::Type::Int),
+        villagesql::varargs_func!(describe, "describe", [..] -> villagesql::Type::String,
+            prerun: describe_prerun),
+        villagesql::varargs_func!(point_path, "point_path", [..] -> villagesql::Type::String,
+            prerun: point_path_prerun),
+    ],
+    types: [
+        villagesql::custom_type!(
+            type_name: "point2d",
+            persisted_length: 8,
+            max_decode_buffer_length: 32,
+            encode: point_encode,
+            decode: point_decode,
+            compare: point_compare,
+            default: "0,0",
+        ),
+    ]
+}
+```
+
+`describe`、`point_path` 以及 `point2d` 的 `encode`/`decode`/`compare` 遵循上文已为 `str_join` 和 `rational` 展示过的同样的 `InValue` 匹配和字节编码模式——完整源码请参阅 [Rust SDK 仓库](https://github.com/villagesql/vsql-rust-sdk)中的 `examples/vsql_varargs/src/lib.rs`。
+
+**关键模式：**
+- 用 `[..]` 取代参数列表，正是将函数标记为变长参数的方式
+- 三种形式各有不同的行函数签名：`state:` 加 `prerun:` 给出 `fn(&mut State, &[InValue]) -> VdfReturn`；仅 `prerun:` 和裸形式都给出 `fn(&[InValue]) -> VdfReturn`
+- 只有 `state:` 形式会分配和丢弃每个语句的状态
+- 返回类型仍然要声明，因此只有参数列表是可变的
+- 每种形式还接受作为尾部成对参数的 `buffer_size:` 和 `deterministic:`
+- `point2d` 没有注册 `hash`，它是可选的——仅 `compare` 就足以支持 `ORDER BY`
+
+---
+
 ## 关键实现模式
 
 | 模式 | 用法 |
@@ -250,13 +617,16 @@ villagesql::extension! {
 | **自定义类型 encode** | 返回 `Result<Vec<u8>, String>` |
 | **自定义类型 decode** | 返回 `Result<String, String>` |
 | **类型感知参数** | 在 `func!` 中使用 `villagesql::custom!("name")` |
+| **聚合函数** | `agg_func!(result_fn, ..., state: T, clear: f, accumulate: f)`；`T` 必须实现 `Default` |
+| **变长参数函数** | `varargs_func!(f, "name", [..] -> ret)`；prerun 是唯一的参数验证 |
+| **prerun 类型检查** | `PrerunArgs::type_at(i)` → `ArgType::is_int`/`is_real`/`is_str`/`is_custom`/`custom_name` |
 | **注册** | 单个 `extension!` 块声明函数和类型 |
 
 ---
 
 ## 测试
 
-这两个示例都像 C++ 扩展一样使用 MTR（MySQL Test Runner）：
+这四个示例都像 C++ 扩展一样使用 MTR（MySQL Test Runner）：
 
 ```bash
 # From inside the example directory -- cargo-vsql passes the suite's full path:
@@ -268,6 +638,8 @@ cargo vsql test
 cd /path/to/villagesql/build/mysql-test
 ./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_rot13/mysql-test
 ./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_rational/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_agg_sum/mysql-test
+./mysql-test-run.pl --suite=/path/to/vsql-rust-sdk/examples/vsql_varargs/mysql-test
 ```
 
 使用 `--record` 生成或更新预期结果。
@@ -303,6 +675,6 @@ cd /path/to/villagesql/build/mysql-test
     icon="github"
     href="https://github.com/villagesql/vsql-rust-sdk/tree/main/examples"
   >
-    vsql_rot13 和 vsql_rational 的完整源码
+    全部四个示例的完整源码
   </Card>
 </CardGroup>

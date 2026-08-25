@@ -1,11 +1,11 @@
 ---
 audience: extension-author
 title: "Rust API 参考"
-description: "VillageSQL Rust SDK 的完整参考 — InValue、VdfReturn、extension!、func!、custom_type!、custom! 以及 manifest.json 字段。"
+description: "VillageSQL Rust SDK 的完整参考 — InValue、VdfReturn、extension!、func!、agg_func!、varargs_func!、custom_type!、custom! 以及 manifest.json 字段。"
 ---
 
 <Warning>
-  Rust SDK 处于 alpha 阶段——各版本之间可能出现破坏性的 API 变更。支持纯函数扩展和自定义类型（encode、decode、compare、hash），同时也支持 `sys_var`、`status_var`、`thread_worker` 和 `keyring` 预览功能。聚合、`VarArgs` 以及列存储 ABI 目前仅在 C++ SDK 中提供——如果您需要其中任何一项，请使用 [C++ SDK](/zh/mysql-8.4/stable/create)。
+  Rust SDK 处于 alpha 阶段——各版本之间可能出现破坏性的 API 变更。支持纯函数扩展、聚合函数、变长参数函数以及自定义类型（encode、decode、compare、hash），同时也支持 `sys_var`、`status_var`、`thread_worker` 和 `keyring` 预览功能。列存储 ABI 目前仅在 C++ SDK 中提供——如果您需要它，请使用 [C++ SDK](/zh/mysql-8.4/stable/create)。
 </Warning>
 
 本页是 `villagesql` crate API 的参考。有关入门教程，请参阅 [使用 Rust 构建扩展](/zh/mysql-8.4/stable/rust-sdk)。有关自定义类型，请参阅 [Rust 中的自定义类型](/zh/mysql-8.4/stable/rust-custom-types)。
@@ -187,6 +187,249 @@ SELECT SUM(vsql_call_index.call_index()) AS total FROM t;
 该表有三行，因此 `call_index()` 运行三次，依次返回 `1`、`2`、`3`——每行一个值。`SUM` 将这三个值相加，得到 `6`。
 
 第二个 `SELECT` 返回与第一个相同的总和，而不是更大的值：该计数器为一个语句分配，并在该语句结束时被丢弃。
+
+## agg_func! 宏
+
+`agg_func!` 声明一个聚合 SQL 函数——类似 SUM/COUNT 的风格，对每个分组的各行调用，而不是每行调用一次。有两种形式：
+
+```rust
+villagesql::agg_func!(result_fn, "sql_name", [param_types] -> return_type,
+    state: StateType, clear: clear_fn, accumulate: accumulate_fn)
+villagesql::agg_func!(result_fn, "sql_name", [param_types] -> return_type,
+    state: StateType, clear: clear_fn, accumulate: accumulate_fn,
+    buffer_size: N, deterministic: true)
+```
+
+| 参数 | 描述 |
+|---|---|
+| `result_fn` | `fn(&State) -> VdfReturn`。从完成累加的累加器生成一个分组的输出。在该分组的最后一行被折叠进累加器之后，每个分组运行一次。接收 `&State` 而不是 `&mut`——结果函数只读取累加器，不会重置它。 |
+| `"sql_name"` | SQL 函数名，作为一个字符串字面量。 |
+| `[param_types]` | 参数列表，与 `func!` 相同——`villagesql::Type::*` 或 `villagesql::custom!("name")` 值。 |
+| `return_type` | `villagesql::Type::*` 或 `villagesql::custom!("name")`。 |
+| `state: StateType` | 累加器类型。它必须实现 `Default`：`agg_func!` 会为您生成 prerun，该 prerun 使用 `StateType::default()` 对累加器进行值初始化。请派生 `Default` 或手动实现它。 |
+| `clear: clear_fn` | `fn(&mut State)`。在每个分组开始时重置累加器。 |
+| `accumulate: accumulate_fn` | `fn(&mut State, &[InValue])`。将一行折叠进累加器。每行运行一次。不返回任何内容——值只能通过 `result_fn` 输出。 |
+| `buffer_size: N` / `deterministic: true` | 可选，但必须一起提供或都不提供——`agg_func!` 没有像 `func!` 那样的单选项形式。给出时，含义与 `func!` 中相同。 |
+
+<Note>
+  `agg_func!` 尚未包含在已发布的版本中。当前的
+  [crates.io](https://crates.io/crates/villagesql) 发布版本（`0.0.1`）
+  尚未公开它。
+</Note>
+
+累加器在每个语句中分配一次，并在语句结束时被丢弃——`agg_func!` 会同时生成创建它的 prerun 和丢弃它的 postrun，因此这两者您都无需编写。`clear_fn` 是实现按分组行为的机制：使用 `GROUP BY` 时，同一个累加器会在各分组之间复用，因此任何不得在分组之间泄漏的字段都必须在那里重置。
+
+一个完整的、等价于 SUM 的聚合——SDK 仓库中的 `vsql_agg_sum` 示例：
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// Accumulator for `agg_sum`: the running total for the current group.
+#[derive(Default)]
+struct SumState {
+    total: i64,
+    seen: bool,
+}
+
+/// clear: reset the total at the start of each group.
+fn agg_sum_clear(state: &mut SumState) {
+    state.total = 0;
+    state.seen = false;
+}
+
+/// accumulate: fold one row's int into the running total.
+fn agg_sum_acc(state: &mut SumState, args: &[InValue]) {
+    if let Some(InValue::Int(n)) = args.first() {
+        state.total += *n;
+        state.seen = true;
+    }
+}
+
+/// result: emit the group's total once every row has been folded in.
+fn agg_sum_result(state: &SumState) -> VdfReturn {
+    if state.seen {
+        VdfReturn::int(state.total)
+    } else {
+        VdfReturn::Null
+    }
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::agg_func!(agg_sum_result, "agg_sum",
+            [villagesql::Type::Int] -> villagesql::Type::Int,
+            state: SumState, clear: agg_sum_clear, accumulate: agg_sum_acc),
+    ]
+}
+```
+
+`accumulate` 只匹配 `InValue::Int`，这正是跳过 NULL 的方式，与内置 `SUM` 一致。`seen` 标志使得全为 NULL 的分组和空分组返回 NULL 而不是 `0`：
+
+```sql
+INSTALL EXTENSION vsql_agg_sum;
+CREATE TABLE t (grp INT, val INT);
+INSERT INTO t VALUES (1, 10), (1, 20), (2, 100), (2, 200), (2, 300);
+SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin
+  FROM t GROUP BY grp ORDER BY grp;
+-- grp  mine  builtin
+--   1    30       30
+--   2   600      600
+```
+
+## varargs_func! 宏
+
+`varargs_func!` 声明一个接受任意数量、任意类型参数的 VDF。参数列表写作 `[..]`——这是一个必需的字面量，而不是零参数 `func!` 所使用的 `[]`。
+
+<Warning>
+  对于变长参数 VDF，服务器不执行任何参数数量和参数类型的验证。没有已声明的参数列表可用来检查调用，因此每次调用都会把 SQL 文本传入的任何内容原样送达您的函数，包括零个参数和您从未预期的类型。验证完全是 `prerun` 钩子的职责。变长参数注册还需要 VEF Protocol 3——较旧的服务器会在安装时拒绝该扩展。这与 C++ SDK 一致，在 C++ SDK 中，[框架同样无法为变长参数 VDF 验证参数数量或类型](/zh/mysql-8.4/stable/development#varargs-vdfs)。
+</Warning>
+
+共有六种形式——三种形态，每种形态都有一个简写形式和一个完整形式，完整形式同时添加 `buffer_size` 和 `deterministic`（决不单独添加）：
+
+```rust
+// Per-statement state plus a validating prerun.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+
+// Validating prerun, no state.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    prerun: prerun_fn)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    prerun: prerun_fn, buffer_size: N, deterministic: true)
+
+// Bare: no prerun, no state, no validation.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    buffer_size: N, deterministic: true)
+```
+
+| 参数 | 描述 |
+|---|---|
+| `impl_fn` | 行函数。对于仅 prerun 形式和裸形式，签名为 `fn(&[InValue]) -> VdfReturn`；对于 `state:` 形式，签名为 `fn(&mut StateType, &[InValue]) -> VdfReturn`。`args` 切片的长度在每次调用之间会变化。 |
+| `"sql_name"` | SQL 函数名，作为一个字符串字面量。 |
+| `[..]` | 将该函数标记为变长参数；没有类型列表。 |
+| `return_type` | `villagesql::Type::*` 或 `villagesql::custom!("name")`。即使参数不固定，返回类型也是固定的。 |
+| `state: StateType` | 可选。每个语句的状态，由 `prerun` 分配，并由每次行调用以 `&mut` 借用。需要 `prerun:`。与 `agg_func!` 不同，这里没有 `Default` 约束——由您的 prerun 构建该值。 |
+| `prerun: prerun_fn` | 可选，并且是唯一能进行参数验证的地方。签名为 `fn(PrerunArgs, PrerunResult<T>)`，其中 `T` 是 `state:` 命名的类型，在仅 prerun 形式中为 `()`。 |
+| `buffer_size: N` / `deterministic: true` | 可选，必须一起提供或都不提供。给出时，含义与 `func!` 中相同——对于变长参数，固定值往往是错误的选择，因为结果通常随参数数量增长；请改为在 prerun 中使用 `request_buffer_size` 确定其大小。 |
+
+裸形式没有任何验证，并且接受零参数调用——对于一个对每种输入都有定义的函数来说，这是一个合理的选择，但这意味着行函数必须独自处理它可能收到的每一种输入。只有 `state:` 形式会分配和丢弃每个语句的状态；仅 prerun 形式使用 `PrerunResult<()>` 且不存储任何内容，因此它没有 postrun——这样的 prerun 只将 `PrerunResult` 用于 `error` 和 `request_buffer_size`，决不调用 `set_state`。
+
+### 在 prerun 中检查参数类型
+
+由于服务器不做任何验证，变长参数的 prerun 需要在第一行运行之前查看参数类型。`PrerunArgs::type_at` 提供了这一视图，此外还有 `len()`/`is_empty()`，以及[每个语句的状态](#per-statement-state)中描述的 `PrerunResult` 方法。
+
+| `PrerunArgs` 方法 | 返回值 |
+|---|---|
+| `type_at(i: usize)` | `Option<ArgType>`——参数 `i` 的已声明类型；当 `i` 超出范围时为 `None`。 |
+
+| `ArgType` 方法 | 返回值 |
+|---|---|
+| `is_str()` | 对 `STRING` 参数返回 `true`。 |
+| `is_real()` | 对 `REAL` 参数返回 `true`。 |
+| `is_int()` | 对 `INT` 参数返回 `true`。 |
+| `is_custom()` | 对任何已安装扩展所注册的自定义类型的参数返回 `true`。 |
+| `custom_name()` | `Option<&str>`——自定义类型的名称。仅当 `is_custom()` 为真时为 `Some`；对标量类型为 `None`。 |
+
+将 `is_custom()` 与 `custom_name()` 搭配使用，可以只接受某一个自定义类型：单独使用 `is_custom()` 会接受服务器中的每一个自定义类型。
+
+<Note>
+  `varargs_func!` 和 `PrerunArgs::type_at` 尚未包含在已发布的版本中。当前的
+  [crates.io](https://crates.io/crates/villagesql) 发布版本（`0.0.1`）
+  尚未公开它们。
+</Note>
+
+SDK 仓库中的 `vsql_varargs` 示例为每种形式各声明了一个函数。下面是一个有状态的变长参数函数，它在 prerun 中进行验证，并携带一个每个语句的调用计数器：
+
+```rust
+use villagesql::{InValue, PrerunArgs, PrerunResult, VdfReturn};
+
+/// Per-statement state: how many times the row handler has run this statement.
+#[derive(Default)]
+struct JoinState {
+    calls: i64,
+}
+
+/// Validate the call and set up the statement. The server does no validation for
+/// varargs, so this is the only gate.
+fn str_join_prerun(args: PrerunArgs, mut out: PrerunResult<JoinState>) {
+    // Reject a zero-argument call.
+    if args.is_empty() {
+        out.error("str_join requires at least one argument");
+        return;
+    }
+
+    // Every argument must be a string.
+    for i in 0..args.len() {
+        if !args.type_at(i).is_some_and(|t| t.is_str()) {
+            out.error("str_join: every argument must be a string");
+            return;
+        }
+    }
+
+    // Size the result buffer from the arg count.
+    out.request_buffer_size(32 + args.len() * 64);
+
+    // Hand the fresh counter to the server.
+    out.set_state(JoinState::default());
+}
+
+/// Join a variable number of string arguments, prefixed with the per-statement
+/// call count.
+fn str_join(state: &mut JoinState, args: &[InValue]) -> VdfReturn {
+    state.calls += 1;
+
+    let mut joined = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        match arg {
+            InValue::String(s) => {
+                if i > 0 {
+                    joined.push_str(", ");
+                }
+                joined.push_str(s);
+            }
+            // A string column can carry NULL. SQL-style: NULL in -> NULL out.
+            InValue::Null => return VdfReturn::Null,
+            _ => return VdfReturn::error("str_join: non-string argument at runtime"),
+        }
+    }
+    VdfReturn::string(format!("#{}: {joined}", state.calls))
+}
+
+/// Bare varargs: no prerun, no state, no validation. Returns how many arguments
+/// it was called with, including zero.
+fn arg_count(args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(i64::try_from(args.len()).unwrap_or(i64::MAX))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::varargs_func!(str_join, "str_join", [..] -> villagesql::Type::String,
+            state: JoinState, prerun: str_join_prerun),
+        villagesql::varargs_func!(arg_count, "arg_count", [..] -> villagesql::Type::Int),
+    ]
+}
+```
+
+即使 prerun 已证明每个参数都是字符串，`str_join` 仍在行函数中对 `InValue` 进行匹配：prerun 看到的是已声明的类型，而不是值，并且 `STRING` 列在任何一行上都可能携带 NULL。
+
+```sql
+INSTALL EXTENSION vsql_varargs;
+SELECT vsql_varargs.str_join('alpha', 'beta');
+-- #1: alpha, beta
+SELECT vsql_varargs.str_join('a', 'b', 'c', 'd');
+-- #1: a, b, c, d
+SELECT vsql_varargs.str_join('ok', 123);
+-- ERROR 1123 (HY000): Can't initialize function 'str_join'; str_join: every argument must be a string
+SELECT vsql_varargs.arg_count();
+-- 0
+SELECT vsql_varargs.arg_count(1, 2.5, 'mix');
+-- 3
+```
+
+该示例还声明了 `describe`（一个仅 prerun 的函数，它拒绝零参数和非标量参数，然后格式化一个混合类型的参数列表）和 `point_path`（它使用 `is_custom()` 和 `custom_name()` 进行验证）。请参阅 [Rust SDK 仓库](https://github.com/villagesql/vsql-rust-sdk)中的 `examples/vsql_varargs/src/lib.rs`。
 
 ## custom_type! 宏
 

@@ -1,17 +1,16 @@
 ---
 audience: extension-author
 title: "Referência da API Rust"
-description: "Referência completa do SDK Rust do VillageSQL — InValue, VdfReturn, extension!, func!, custom_type!, custom! e campos do manifest.json."
+description: "Referência completa do SDK Rust do VillageSQL — InValue, VdfReturn, extension!, func!, agg_func!, varargs_func!, custom_type!, custom! e campos do manifest.json."
 ---
 
 <Warning>
   O SDK Rust está em alpha — espere mudanças incompatíveis de API entre
-  versões. Extensões apenas de funções e tipos personalizados (encode, decode,
-  compare, hash) são compatíveis, assim como as capabilities Preview `sys_var`,
-  `status_var`, `thread_worker` e `keyring`. Agregações, `VarArgs` e a ABI de
-  armazenamento de coluna são
-  exclusivos do C++ hoje — use o [SDK C++](/pt-BR/mysql-8.4/stable/create) se você
-  precisar de qualquer um desses.
+  versões. Extensões apenas de funções, funções de agregação, funções varargs
+  e tipos personalizados (encode, decode, compare, hash) são compatíveis,
+  assim como as capabilities Preview `sys_var`, `status_var`, `thread_worker`
+  e `keyring`. A ABI de armazenamento de coluna é exclusiva do C++ hoje — use
+  o [SDK C++](/pt-BR/mysql-8.4/stable/create) se você precisar dela.
 </Warning>
 
 Esta página é uma referência da API do crate `villagesql`. Para o tutorial de introdução, consulte [Criando Extensões em Rust](/pt-BR/mysql-8.4/stable/rust-sdk). Para tipos personalizados, consulte [Tipos Personalizados em Rust](/pt-BR/mysql-8.4/stable/rust-custom-types).
@@ -196,6 +195,257 @@ SELECT SUM(vsql_call_index.call_index()) AS total FROM t;
 A tabela tem três linhas, então `call_index()` é executada três vezes e retorna `1`, depois `2`, depois `3` — um valor por linha. `SUM` soma esses três valores, o que dá `6`.
 
 O segundo `SELECT` retorna o mesmo total do primeiro, não um maior: o contador é alocado para uma instrução e descartado quando ela termina.
+
+## macro agg_func!
+
+`agg_func!` declara uma função SQL de agregação — no estilo de SUM/COUNT, chamada sobre as linhas de cada grupo em vez de uma vez por linha. Duas formas:
+
+```rust
+villagesql::agg_func!(result_fn, "sql_name", [param_types] -> return_type,
+    state: StateType, clear: clear_fn, accumulate: accumulate_fn)
+villagesql::agg_func!(result_fn, "sql_name", [param_types] -> return_type,
+    state: StateType, clear: clear_fn, accumulate: accumulate_fn,
+    buffer_size: N, deterministic: true)
+```
+
+| Argumento | Descrição |
+|---|---|
+| `result_fn` | `fn(&State) -> VdfReturn`. Produz a saída de um grupo a partir do acumulador finalizado. É executada uma vez por grupo, depois que a última linha desse grupo foi incorporada. Recebe `&State`, não `&mut` — a função de resultado lê o acumulador, ela não o redefine. |
+| `"sql_name"` | O nome da função SQL como um literal de string. |
+| `[param_types]` | A lista de argumentos, igual à de `func!` — valores `villagesql::Type::*` ou `villagesql::custom!("name")`. |
+| `return_type` | `villagesql::Type::*` ou `villagesql::custom!("name")`. |
+| `state: StateType` | O tipo do acumulador. Ele deve implementar `Default`: `agg_func!` gera a prerun para você, e essa prerun inicializa o acumulador com `StateType::default()`. Derive `Default` ou implemente-o manualmente. |
+| `clear: clear_fn` | `fn(&mut State)`. Redefine o acumulador no início de cada grupo. |
+| `accumulate: accumulate_fn` | `fn(&mut State, &[InValue])`. Incorpora uma linha ao acumulador. É executada uma vez por linha. Não retorna nada — o valor só sai por meio de `result_fn`. |
+| `buffer_size: N` / `deterministic: true` | Opcionais, mas fornecidos juntos ou não fornecidos — `agg_func!` não tem formas de opção única como `func!` tem. Mesmo significado que em `func!` quando fornecidos. |
+
+<Note>
+  `agg_func!` ainda não está em uma versão publicada. A versão atual do
+  [crates.io](https://crates.io/crates/villagesql) (`0.0.1`) não o expõe.
+</Note>
+
+O acumulador é alocado uma vez por instrução e descartado quando a instrução termina — `agg_func!` gera tanto a prerun que o cria quanto a postrun que o descarta, então você nunca escreve nenhuma das duas. `clear_fn` é o que dá a você o comportamento por grupo: com `GROUP BY`, o mesmo acumulador é reutilizado entre os grupos, então qualquer campo que não deva vazar entre grupos tem que ser redefinido ali.
+
+Uma agregação completa equivalente a SUM — o exemplo `vsql_agg_sum` no repositório do SDK:
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+/// Accumulator for `agg_sum`: the running total for the current group.
+#[derive(Default)]
+struct SumState {
+    total: i64,
+    seen: bool,
+}
+
+/// clear: reset the total at the start of each group.
+fn agg_sum_clear(state: &mut SumState) {
+    state.total = 0;
+    state.seen = false;
+}
+
+/// accumulate: fold one row's int into the running total.
+fn agg_sum_acc(state: &mut SumState, args: &[InValue]) {
+    if let Some(InValue::Int(n)) = args.first() {
+        state.total += *n;
+        state.seen = true;
+    }
+}
+
+/// result: emit the group's total once every row has been folded in.
+fn agg_sum_result(state: &SumState) -> VdfReturn {
+    if state.seen {
+        VdfReturn::int(state.total)
+    } else {
+        VdfReturn::Null
+    }
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::agg_func!(agg_sum_result, "agg_sum",
+            [villagesql::Type::Int] -> villagesql::Type::Int,
+            state: SumState, clear: agg_sum_clear, accumulate: agg_sum_acc),
+    ]
+}
+```
+
+`accumulate` fazer a correspondência apenas de `InValue::Int` é o que pula os NULLs, correspondendo ao `SUM` embutido. O flag `seen` é o que faz um grupo todo de NULLs e um grupo vazio retornarem NULL em vez de `0`:
+
+```sql
+INSTALL EXTENSION vsql_agg_sum;
+CREATE TABLE t (grp INT, val INT);
+INSERT INTO t VALUES (1, 10), (1, 20), (2, 100), (2, 200), (2, 300);
+SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin
+  FROM t GROUP BY grp ORDER BY grp;
+-- grp  mine  builtin
+--   1    30       30
+--   2   600      600
+```
+
+## macro varargs_func!
+
+`varargs_func!` declara uma VDF que aceita qualquer número de argumentos, de qualquer tipo. A lista de parâmetros é escrita `[..]` — um literal obrigatório, não o `[]` usado para uma `func!` de aridade zero.
+
+<Warning>
+  O servidor não realiza nenhuma validação de contagem nem de tipo de
+  argumentos para uma VDF varargs. Não há uma lista de parâmetros declarada
+  contra a qual verificar uma chamada, então toda chamada chega à sua função
+  com o que quer que o texto SQL tenha passado, incluindo zero argumentos e
+  tipos que você nunca esperou. A validação é inteiramente trabalho do gancho
+  `prerun`. O registro de varargs também requer o Protocol 3 do VEF —
+  servidores mais antigos rejeitam a extensão no momento da instalação. Isso
+  corresponde ao SDK C++, onde [o framework também não pode validar a contagem
+  ou os tipos de argumento para VDFs com
+  varargs](/pt-BR/mysql-8.4/stable/development#varargs-vdfs).
+</Warning>
+
+Seis formas — três formatos, cada um com uma forma abreviada e uma forma completa que adiciona `buffer_size` e `deterministic` juntos (nunca isoladamente):
+
+```rust
+// Per-statement state plus a validating prerun.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+
+// Validating prerun, no state.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    prerun: prerun_fn)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    prerun: prerun_fn, buffer_size: N, deterministic: true)
+
+// Bare: no prerun, no state, no validation.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    buffer_size: N, deterministic: true)
+```
+
+| Argumento | Descrição |
+|---|---|
+| `impl_fn` | A função de linha. `fn(&[InValue]) -> VdfReturn` para a forma apenas com prerun e para a forma básica; `fn(&mut StateType, &[InValue]) -> VdfReturn` para as formas com `state:`. O comprimento da fatia `args` varia de chamada para chamada. |
+| `"sql_name"` | O nome da função SQL como um literal de string. |
+| `[..]` | Marca a função como varargs; não há lista de tipos. |
+| `return_type` | `villagesql::Type::*` ou `villagesql::custom!("name")`. O tipo de retorno é fixo mesmo que os argumentos não sejam. |
+| `state: StateType` | Opcional. Estado por instrução, alocado pela `prerun` e tomado emprestado como `&mut` por cada chamada de linha. Requer `prerun:`. Diferente de `agg_func!`, não há a exigência de `Default` — a sua prerun constrói o valor. |
+| `prerun: prerun_fn` | Opcional, e o único lugar onde a validação de argumentos pode acontecer. `fn(PrerunArgs, PrerunResult<T>)`, onde `T` é o tipo nomeado por `state:`, ou `()` na forma apenas com prerun. |
+| `buffer_size: N` / `deterministic: true` | Opcionais, fornecidos juntos ou não fornecidos. Mesmo significado que em `func!` quando fornecidos — para varargs, um valor fixo costuma ser a escolha errada, já que o resultado normalmente cresce com a contagem de argumentos; dimensione-o na prerun com `request_buffer_size` em vez disso. |
+
+A forma básica não tem validação e aceita uma chamada com zero argumentos — uma escolha legítima para uma função que é total sobre toda entrada, mas isso significa que a função de linha sozinha é responsável por toda entrada que pode receber. Apenas a forma com `state:` aloca e descarta o estado por instrução; a forma apenas com prerun usa `PrerunResult<()>` e não armazena nada, então não há postrun para ela — uma prerun dessas usa `PrerunResult` apenas para `error` e `request_buffer_size`, nunca para `set_state`.
+
+### Inspecionando tipos de argumento em uma prerun
+
+Como o servidor não valida nada, uma prerun de varargs precisa ver os tipos dos argumentos antes que a primeira linha seja executada. `PrerunArgs::type_at` fornece essa visão, junto com `len()`/`is_empty()` e os métodos de `PrerunResult` descritos em [Estado por instrução](#per-statement-state).
+
+| Método de `PrerunArgs` | Retorna |
+|---|---|
+| `type_at(i: usize)` | `Option<ArgType>` — o tipo declarado do argumento `i`, ou `None` se `i` estiver fora do intervalo. |
+
+| Método de `ArgType` | Retorna |
+|---|---|
+| `is_str()` | `true` para um argumento `STRING`. |
+| `is_real()` | `true` para um argumento `REAL`. |
+| `is_int()` | `true` para um argumento `INT`. |
+| `is_custom()` | `true` para um argumento de um tipo personalizado registrado por qualquer extensão instalada. |
+| `custom_name()` | `Option<&str>` — o nome do tipo personalizado. `Some` apenas quando `is_custom()` é verdadeiro; `None` para os tipos escalares. |
+
+Combine `is_custom()` com `custom_name()` para aceitar exatamente um tipo personalizado: `is_custom()` sozinho aceita todo tipo personalizado no servidor.
+
+<Note>
+  `varargs_func!` e `PrerunArgs::type_at` ainda não estão em uma versão
+  publicada. A versão atual do
+  [crates.io](https://crates.io/crates/villagesql) (`0.0.1`) não os expõe.
+</Note>
+
+O exemplo `vsql_varargs` no repositório do SDK declara uma função por forma. Uma função varargs com estado, validada na prerun e carregando um contador de chamadas por instrução:
+
+```rust
+use villagesql::{InValue, PrerunArgs, PrerunResult, VdfReturn};
+
+/// Per-statement state: how many times the row handler has run this statement.
+#[derive(Default)]
+struct JoinState {
+    calls: i64,
+}
+
+/// Validate the call and set up the statement. The server does no validation for
+/// varargs, so this is the only gate.
+fn str_join_prerun(args: PrerunArgs, mut out: PrerunResult<JoinState>) {
+    // Reject a zero-argument call.
+    if args.is_empty() {
+        out.error("str_join requires at least one argument");
+        return;
+    }
+
+    // Every argument must be a string.
+    for i in 0..args.len() {
+        if !args.type_at(i).is_some_and(|t| t.is_str()) {
+            out.error("str_join: every argument must be a string");
+            return;
+        }
+    }
+
+    // Size the result buffer from the arg count.
+    out.request_buffer_size(32 + args.len() * 64);
+
+    // Hand the fresh counter to the server.
+    out.set_state(JoinState::default());
+}
+
+/// Join a variable number of string arguments, prefixed with the per-statement
+/// call count.
+fn str_join(state: &mut JoinState, args: &[InValue]) -> VdfReturn {
+    state.calls += 1;
+
+    let mut joined = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        match arg {
+            InValue::String(s) => {
+                if i > 0 {
+                    joined.push_str(", ");
+                }
+                joined.push_str(s);
+            }
+            // A string column can carry NULL. SQL-style: NULL in -> NULL out.
+            InValue::Null => return VdfReturn::Null,
+            _ => return VdfReturn::error("str_join: non-string argument at runtime"),
+        }
+    }
+    VdfReturn::string(format!("#{}: {joined}", state.calls))
+}
+
+/// Bare varargs: no prerun, no state, no validation. Returns how many arguments
+/// it was called with, including zero.
+fn arg_count(args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(i64::try_from(args.len()).unwrap_or(i64::MAX))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::varargs_func!(str_join, "str_join", [..] -> villagesql::Type::String,
+            state: JoinState, prerun: str_join_prerun),
+        villagesql::varargs_func!(arg_count, "arg_count", [..] -> villagesql::Type::Int),
+    ]
+}
+```
+
+`str_join` ainda faz a correspondência de `InValue` na função de linha mesmo que a prerun tenha provado que todo argumento é uma string: a prerun vê tipos declarados, não valores, e uma coluna `STRING` pode carregar NULL em qualquer linha.
+
+```sql
+INSTALL EXTENSION vsql_varargs;
+SELECT vsql_varargs.str_join('alpha', 'beta');
+-- #1: alpha, beta
+SELECT vsql_varargs.str_join('a', 'b', 'c', 'd');
+-- #1: a, b, c, d
+SELECT vsql_varargs.str_join('ok', 123);
+-- ERROR 1123 (HY000): Can't initialize function 'str_join'; str_join: every argument must be a string
+SELECT vsql_varargs.arg_count();
+-- 0
+SELECT vsql_varargs.arg_count(1, 2.5, 'mix');
+-- 3
+```
+
+O exemplo também declara `describe` (uma função apenas com prerun que rejeita zero argumentos e argumentos não escalares e, em seguida, formata uma lista heterogênea de argumentos) e `point_path` (que valida com `is_custom()` e `custom_name()`). Consulte `examples/vsql_varargs/src/lib.rs` no [repositório do SDK Rust](https://github.com/villagesql/vsql-rust-sdk).
 
 ## macro custom_type!
 
