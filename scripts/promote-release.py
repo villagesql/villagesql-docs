@@ -264,10 +264,11 @@ def main():
         rewrite_prefix(en_stable, f"{PRODUCT}/dev/", f"{PRODUCT}/stable/")
 
     # 3. scaffold new dev from new stable (dev is self-canonical, no re-stamp)
-    print(f"{tag}scaffold {PRODUCT}/dev from new stable")
+    print(f"{tag}scaffold {PRODUCT}/dev from new stable (stable/ -> dev/ links)")
     if not dry:
         shutil.rmtree(en_dev)
         shutil.copytree(en_stable, en_dev)
+        rewrite_prefix(en_dev, f"{PRODUCT}/stable/", f"{PRODUCT}/dev/")
 
     # 4. docs.json: archived version entry, labels, and redirect lifecycle
     docs_path = repo / "docs.json"

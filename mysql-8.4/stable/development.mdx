@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "C++ Development"
-description: "VDF authoring depth for C++ extensions — argument and result types, aggregates, prerun/postrun, varargs, and registration."
+description: "VDF authoring depth for C++ extensions — argument and result types, exception safety, aggregates, prerun/postrun, varargs, and registration."
 ---
 
 This guide is the deep reference for writing C++ VDF implementations. It is the companion to [Creating Extensions in C++](/mysql-8.4/stable/create), which covers the end-to-end build steps, and [C++ Testing](/mysql-8.4/stable/testing), which covers the test-and-iterate loop.
@@ -18,6 +18,42 @@ single header to access the full SDK:
 ```cpp
 #include <villagesql/vsql.h>
 ```
+
+## Exception Safety
+
+Containing exceptions is the extension's responsibility. The SDK does not wrap
+your implementation in a `try`/`catch`, and neither does the server, so an
+exception that escapes an entry point unwinds across the C ABI boundary with no
+handler anywhere above it and the server process terminates. Ordinary SQL input
+reaches this: `std::stoi()` throws on a non-numeric string, and
+`nlohmann::json::dump()` throws on text that is not valid UTF-8.
+
+Wrap the body of every entry point you register: VDFs, aggregate result
+functions, and the `from_string`/`to_string` operations of a custom type.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <string>
+
+using namespace vsql;
+
+void to_int_impl(StringArg in, IntResult out) {
+  if (in.is_null()) { out.set_null(); return; }
+  try {
+    out.set(std::stoi(std::string(in.value())));  // throws on bad input
+  } catch (const std::exception &e) {
+    out.warning(e.what());
+  } catch (...) {
+    out.warning("unexpected error");
+  }
+}
+```
+
+Catch `...` in addition to `const std::exception &`: a dependency may throw a
+type that does not derive from `std::exception`, and that one still terminates
+the server. Choose between `warning()` and `error()` on the same basis as any
+other failure — `warning()` for bad input the statement should survive,
+`error()` where continuing is unsafe.
 
 ## Argument and Result Types
 
@@ -235,6 +271,69 @@ check before reading its value:
 
 Check `is_null()` before any accessor — all four are undefined on a null argument.
 
+`PrerunArgType::custom_type()` returns the argument's custom type name as a
+`std::string_view` — empty for non-custom arguments. `is_custom()` alone
+accepts every custom type registered on the server; pairing it with a
+`custom_type()` comparison narrows a varargs call to one specific type:
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+// POINT2D stores two little-endian int32 (x, y) in 8 bytes — registration
+// omitted here; see Custom Types for make_type<>().
+
+void point_path_prerun(PrerunArgs args, PrerunResult out) {
+  if (args.size() == 0) {
+    out.error("point_path requires at least one point");
+    return;
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    auto t = args.type_at(i);
+    if (!t.is_custom() || t.custom_type() != "POINT2D") {
+      out.error("point_path: every argument must be a POINT2D");
+      return;
+    }
+  }
+  out.request_buffer_size(16 + args.size() * 32);
+}
+
+void point_path(VarArgs args, StringResult out) {
+  auto buf = out.buffer();
+  size_t off = 0;
+  bool first = true;
+  for (auto a : args) {
+    if (a.is_null()) { out.set_null(); return; }
+    auto bytes = a.as_custom();
+    int x, y;
+    memcpy(&x, bytes.data(), 4);
+    memcpy(&y, bytes.data() + 4, 4);
+    if (!first) {
+      memcpy(buf.data() + off, " -> ", 4);
+      off += 4;
+    }
+    first = false;
+    off += static_cast<size_t>(
+        snprintf(buf.data() + off, buf.size() - off, "(%d,%d)", x, y));
+  }
+  out.set_length(off);
+}
+
+// Registration:
+// make_func<&point_path>("point_path")
+//     .returns(STRING).varargs()
+//     .prerun<&point_path_prerun>()
+//     .build()
+```
+
+```sql
+SELECT point_path(POINT2D::from_string('0,0'), POINT2D::from_string('1,2'));
+-- (0,0) -> (1,2)
+SELECT point_path('1,2');
+-- ERROR 1123 (HY000): Can't initialize function 'point_path'; point_path: every argument must be a POINT2D
+```
+
 ```cpp
 #include <villagesql/vsql.h>
 #include <cstring>
@@ -276,6 +375,75 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .prerun<&ba_concat_all_prerun>()
 //     .build()
 ```
+
+## Extension Load and Unload Hooks
+
+An extension sometimes has work to do once per load rather than once per call —
+picking a CPU-specific implementation, or building a lookup table the VDFs then
+read. Register that work with `.on_init<&Fn>()` on the extension builder, and
+the matching teardown with `.on_deinit<&Fn>()`. Both take a function with the
+signature `void()`.
+
+<Warning>
+`.on_init<&Fn>()` and `.on_deinit<&Fn>()` are declared only in the opt-in dev ABI
+headers (`-DVSQL_USE_DEV_ABI=ON`). A default stable-ABI build has neither method,
+so registering a hook fails to compile.
+</Warning>
+
+`on_init` runs at every extension load: at `INSTALL EXTENSION` and again on each
+server startup, after the server has validated and accepted the extension. It
+never runs for an extension the server rejected. `on_deinit` runs at unload —
+`UNINSTALL EXTENSION` or server shutdown.
+
+Both hooks run inside the extension process with **no access to the server**:
+they cannot run SQL, read system variables, or reach server state. That is why
+they are the wrong place for setup that has to talk to the server — use a
+preview capability's populate step for that.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cmath>
+using namespace vsql;
+
+static float *g_sqrt_table = nullptr;
+
+void build_table() {
+  g_sqrt_table = new float[256];
+  for (int i = 0; i < 256; i++) g_sqrt_table[i] = std::sqrt(float(i));
+}
+
+void free_table() {
+  delete[] g_sqrt_table;
+  g_sqrt_table = nullptr;
+}
+
+void fast_sqrt(IntArg n, RealResult out) {
+  if (n.is_null() || n.value() < 0 || n.value() > 255) {
+    out.set_null();
+    return;
+  }
+  out.set(g_sqrt_table[n.value()]);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .on_init<&build_table>()
+        .on_deinit<&free_table>()
+        .func(make_func<&fast_sqrt>("fast_sqrt")
+                  .returns(REAL)
+                  .param(INT)
+                  .build()))
+```
+
+After `INSTALL EXTENSION my_extension`, `SELECT fast_sqrt(16)` returns `4` —
+a result that is only reachable if `build_table` already ran.
+
+<Note>
+`on_deinit` is called from the `vef_unregister` entry point that
+`VEF_GENERATE_ENTRY_POINTS` generates. `VEF_GENERATE_REGISTRATION` does not
+define that entry point, so an extension using it must call its teardown from
+the `vef_unregister` it writes itself.
+</Note>
 
 ## VEF_GENERATE_REGISTRATION
 
