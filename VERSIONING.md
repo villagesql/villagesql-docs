@@ -50,6 +50,11 @@ python3 scripts/promote-release.py \
     --old-stable 0.0.5 --new-stable 0.0.6 --new-dev 0.0.7-dev
 ```
 
+The script cuts one product. It defaults to `mysql-8.4`; add
+`--product mysql-9.7` to cut that one. Each product is cut on its own release
+cadence, and every `docs.json` edit is scoped to the product named, so cutting
+one never relabels another.
+
 This performs, in order:
 - **Snapshot** `mysql-8.4/stable/` (and each locale mirror) → `mysql-8.4/0.0.5/`,
   rewriting the archive's self-links `stable/` → `0.0.5/` so the frozen copy

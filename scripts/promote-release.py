@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Cut a release under the fixed stable/dev slot model.
 
+Works on one product at a time — `--product mysql-8.4` (the default) or
+`--product mysql-9.7`. docs.json holds several products whose version labels
+repeat, so every docs.json edit here is scoped to the chosen product's block.
+
 The version number is NOT in the URL: current stable always lives at
-`mysql-8.4/stable/`, dev at `mysql-8.4/dev/`. Cutting a release does not move
+`<product>/stable/`, dev at `<product>/dev/`. Cutting a release does not move
 any live URL — it freezes the outgoing stable into a numbered archive and
 promotes dev into the stable slot. It also keeps every version *number*
 resolving: the current stable's number redirects to /stable/, and a superseded
@@ -10,12 +14,12 @@ number becomes its own frozen archive — nothing ever 404s. (`gen-redirects.py`
 is only for one-off structural URL moves.)
 
 Steps (example: stable 0.0.5 -> 0.0.6, dev opens 0.0.7-dev):
-  1. snapshot mysql-8.4/stable (+ locales) -> mysql-8.4/0.0.5, freeze its
+  1. snapshot <product>/stable (+ locales) -> <product>/0.0.5, freeze its
      self-links stable/ -> 0.0.5/, and noindex it.
-  2. promote: mysql-8.4/dev -> mysql-8.4/stable (EN), rewrite dev/ -> stable/
+  2. promote: <product>/dev -> <product>/stable (EN), rewrite dev/ -> stable/
      links. Locale stable dirs keep the previous translations until
      re-translated (VERSIONING.md step: Translate).
-  3. scaffold new mysql-8.4/dev from the new stable (dev is indexed and
+  3. scaffold new <product>/dev from the new stable (dev is indexed and
      self-canonical — no cross-canonical, so new features stay findable).
   4. docs.json: insert the archived version entry, bump the two version labels,
      and update redirects — drop the outgoing number's redirect (freeing its
@@ -24,7 +28,7 @@ Steps (example: stable 0.0.5 -> 0.0.6, dev opens 0.0.7-dev):
 
 Usage:
     python3 scripts/promote-release.py --old-stable 0.0.5 --new-stable 0.0.6 \
-        --new-dev 0.0.7-dev [--dry-run] [--repo PATH]
+        --new-dev 0.0.7-dev [--product mysql-9.7] [--dry-run] [--repo PATH]
 
 --dry-run prints the plan (and the archived-entry JSON) without touching disk.
 """
@@ -36,14 +40,35 @@ import subprocess
 import sys
 from pathlib import Path
 
-PRODUCT = "mysql-8.4"
+DEFAULT_PRODUCT = "mysql-8.4"
 LOCALES = ["", "ja", "ko", "zh", "pt-BR"]  # "" = English tree at repo root
 
 
-def slot_dirs(repo: Path, slot: str):
-    """Existing <locale>/mysql-8.4/<slot> dirs across locales."""
+def product_label(product: str) -> str:
+    """Directory name -> the name docs.json shows: mysql-9.7 -> MySQL 9.7."""
+    return product.replace("mysql-", "MySQL ", 1)
+
+
+def product_span(text: str, product: str):
+    """(start, end) of one product's object in the raw docs.json text.
+
+    Label substitutions and the archived-entry splice run inside this span
+    only. Without it, cutting 9.7 would rewrite the identically-labelled 8.4
+    entries too.
+    """
+    marker = f'"product": "{product_label(product)}"'
+    m = text.index(marker)
+    open_pos = text.rfind("{", 0, m)
+    close_pos = _matching_brace(text, open_pos)
+    if close_pos == -1:
+        raise ValueError(f"could not find the end of the {product} product block")
+    return open_pos, close_pos + 1
+
+
+def slot_dirs(repo: Path, product: str, slot: str):
+    """Existing <locale>/<product>/<slot> dirs across locales."""
     for loc in LOCALES:
-        d = (repo / loc / PRODUCT / slot) if loc else (repo / PRODUCT / slot)
+        d = (repo / loc / product / slot) if loc else (repo / product / slot)
         if d.is_dir():
             yield d
 
@@ -58,12 +83,27 @@ def rewrite_prefix(d: Path, old: str, new: str) -> int:
     return n
 
 
-def archived_entry(repo: Path, old_stable: str) -> str:
+def archived_entry(repo: Path, product: str, old_stable: str) -> str:
     """Derive the archived version entry from the current stable entry:
     relabel to the bare number, drop default, repoint stable/ paths to the
     numbered dir. Returned as a JSON block to paste into navigation.versions."""
     docs = json.loads((repo / "docs.json").read_text())
     stable_label = f"Stable ({old_stable})"
+
+    def find_product(node):
+        if isinstance(node, dict):
+            if node.get("product") == product_label(product):
+                return node
+            for v in node.values():
+                r = find_product(v)
+                if r:
+                    return r
+        elif isinstance(node, list):
+            for v in node:
+                r = find_product(v)
+                if r:
+                    return r
+        return None
 
     def find(node):
         if isinstance(node, dict):
@@ -80,7 +120,10 @@ def archived_entry(repo: Path, old_stable: str) -> str:
                     return r
         return None
 
-    entry = find(docs["navigation"])
+    scope = find_product(docs["navigation"])
+    if scope is None:
+        return f"// could not find product {product_label(product)!r}"
+    entry = find(scope)
     if entry is None:
         return f"// could not find version entry {stable_label!r}"
     entry = json.loads(json.dumps(entry))  # deep copy
@@ -93,7 +136,7 @@ def archived_entry(repo: Path, old_stable: str) -> str:
         if isinstance(node, list):
             return [repath(v) for v in node]
         if isinstance(node, str):
-            return node.replace(f"{PRODUCT}/stable/", f"{PRODUCT}/{old_stable}/")
+            return node.replace(f"{product}/stable/", f"{product}/{old_stable}/")
         return node
 
     entry = repath(entry)
@@ -148,11 +191,13 @@ def _matching_bracket(text: str, open_pos: int) -> int:
     return -1
 
 
-def insert_archived_entry(text: str, old_stable: str, entry_json: str) -> str:
-    """Splice the archived version entry into docs.json right after the Stable
-    entry, preserving surrounding formatting (no full reserialize)."""
+def insert_archived_entry(text: str, product: str, old_stable: str,
+                          entry_json: str) -> str:
+    """Splice the archived version entry into docs.json right after this
+    product's Stable entry, preserving surrounding formatting."""
+    lo, hi = product_span(text, product)
     marker = f'"Stable ({old_stable})"'
-    m = text.index(marker)
+    m = text.index(marker, lo, hi)
     open_pos = text.rfind("{", 0, m)
     close_pos = _matching_brace(text, open_pos)
     if close_pos == -1:
@@ -161,17 +206,26 @@ def insert_archived_entry(text: str, old_stable: str, entry_json: str) -> str:
     j = close_pos + 1
     while j < len(text) and text[j] in " \t":
         j += 1
-    if j >= len(text) or text[j] != ",":
-        raise ValueError("expected a comma after the Stable entry")
+    if j >= len(text):
+        raise ValueError("docs.json ends after the Stable entry")
     indented = "\n".join(indent + ln for ln in entry_json.split("\n"))
-    return text[:j + 1] + "\n" + indented + "," + text[j + 1:]
+    if text[j] == ",":
+        # archives follow, so the new entry slots in between
+        return text[:j + 1] + "\n" + indented + "," + text[j + 1:]
+    if text[j] in "\n]":
+        # Stable is the last version, which is the shape of a product whose
+        # first release is being archived — append rather than insert.
+        return text[:close_pos + 1] + ",\n" + indented + text[close_pos + 1:]
+    raise ValueError("unexpected character after the Stable entry: "
+                     f"{text[j]!r}")
 
 
-def manage_redirects(text: str, repo: Path, old_stable: str, new_stable: str):
+def manage_redirects(text: str, repo: Path, product: str, old_stable: str,
+                     new_stable: str):
     """Update the docs.json redirect array for a cut. Returns (new_text, stats).
 
     - Remove the outgoing stable's number redirects, so its freshly-frozen
-      archive is reachable at /mysql-8.4/<old>/ instead of shadowed.
+      archive is reachable at /<product>/<old>/ instead of shadowed.
     - Repoint the outgoing dev's -dev redirects from /dev/ to the shipped
       number, so old dev links track what actually released.
     - Add the incoming stable's number redirects -> /stable/, so the current
@@ -180,9 +234,9 @@ def manage_redirects(text: str, repo: Path, old_stable: str, new_stable: str):
     Re-emits the array in the established format so unchanged entries diff clean.
     """
     redirects = json.loads(text).get("redirects", [])
-    old_pref = f"/{PRODUCT}/{old_stable}"
-    dev_pref = f"/{PRODUCT}/{new_stable}-dev"
-    dev_dest = f"/{PRODUCT}/dev"
+    old_pref = f"/{product}/{old_stable}"
+    dev_pref = f"/{product}/{new_stable}-dev"
+    dev_dest = f"/{product}/dev"
     removed = repointed = 0
     out = []
     for r in redirects:
@@ -194,15 +248,15 @@ def manage_redirects(text: str, repo: Path, old_stable: str, new_stable: str):
             d = r["destination"]
             if d == dev_dest or d.startswith(dev_dest + "/"):
                 r = {"source": s,
-                     "destination": f"/{PRODUCT}/{new_stable}" + d[len(dev_dest):]}
+                     "destination": f"/{product}/{new_stable}" + d[len(dev_dest):]}
                 repointed += 1
         out.append(r)
 
-    stable_dir = repo / PRODUCT / "stable"
-    adds = [(f"/{PRODUCT}/{new_stable}", f"/{PRODUCT}/stable")]
+    stable_dir = repo / product / "stable"
+    adds = [(f"/{product}/{new_stable}", f"/{product}/stable")]
     for p in sorted(stable_dir.rglob("*.mdx")):
         slug = str(p.relative_to(stable_dir)).removesuffix(".mdx")
-        adds.append((f"/{PRODUCT}/{new_stable}/{slug}", f"/{PRODUCT}/stable/{slug}"))
+        adds.append((f"/{product}/{new_stable}/{slug}", f"/{product}/stable/{slug}"))
     out.extend({"source": s, "destination": d} for s, d in adds)
 
     arr_open = text.index("[", text.index('"redirects": ['))
@@ -225,6 +279,8 @@ def main():
     ap.add_argument("--old-stable", required=True, help="outgoing stable number, e.g. 0.0.5")
     ap.add_argument("--new-stable", required=True, help="incoming stable number, e.g. 0.0.6")
     ap.add_argument("--new-dev", required=True, help="new dev label body, e.g. 0.0.7-dev")
+    ap.add_argument("--product", default=DEFAULT_PRODUCT,
+                    help="product directory to cut, e.g. mysql-9.7 (default mysql-8.4)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--repo", default=None)
     args = ap.parse_args()
@@ -232,62 +288,69 @@ def main():
     repo = Path(args.repo).resolve() if args.repo else Path(__file__).resolve().parent.parent
     scripts = repo / "scripts"
     old, new, ndev = args.old_stable, args.new_stable, args.new_dev
+    product = args.product
     dry = args.dry_run
     tag = "[plan] " if dry else ""
+    print(f"{tag}product: {product} ({product_label(product)})")
 
-    en_stable = repo / PRODUCT / "stable"
-    en_dev = repo / PRODUCT / "dev"
+    en_stable = repo / product / "stable"
+    en_dev = repo / product / "dev"
     if not en_stable.is_dir() or not en_dev.is_dir():
-        print("error: mysql-8.4/stable and mysql-8.4/dev must both exist", file=sys.stderr)
+        print(f"error: {product}/stable and {product}/dev must both exist",
+              file=sys.stderr)
         return 1
-    if (repo / PRODUCT / old).exists():
-        print(f"error: archive {PRODUCT}/{old} already exists", file=sys.stderr)
+    if (repo / product / old).exists():
+        print(f"error: archive {product}/{old} already exists", file=sys.stderr)
         return 1
 
     # 1. snapshot stable -> numbered archive, freeze self-links, noindex
-    for d in slot_dirs(repo, "stable"):
+    for d in slot_dirs(repo, product, "stable"):
         dest = d.parent / old
         print(f"{tag}snapshot {d.relative_to(repo)} -> {dest.relative_to(repo)}")
         if not dry:
             shutil.copytree(d, dest)
-            rewrite_prefix(dest, f"{PRODUCT}/stable/", f"{PRODUCT}/{old}/")
+            rewrite_prefix(dest, f"{product}/stable/", f"{product}/{old}/")
     print(f"{tag}noindex archive {old} (via noindex-version.py)")
     if not dry:
         subprocess.run([sys.executable, str(scripts / "noindex-version.py"), old,
-                        "--repo", str(repo)], check=True)
+                        "--product", product, "--repo", str(repo)], check=True)
 
     # 2. promote dev -> stable (EN only; locales keep prior translations)
-    print(f"{tag}promote {PRODUCT}/dev -> {PRODUCT}/stable (dev/ -> stable/ links)")
+    print(f"{tag}promote {product}/dev -> {product}/stable (dev/ -> stable/ links)")
     if not dry:
         shutil.rmtree(en_stable)
         shutil.copytree(en_dev, en_stable)
-        rewrite_prefix(en_stable, f"{PRODUCT}/dev/", f"{PRODUCT}/stable/")
+        rewrite_prefix(en_stable, f"{product}/dev/", f"{product}/stable/")
 
     # 3. scaffold new dev from new stable (dev is self-canonical, no re-stamp)
-    print(f"{tag}scaffold {PRODUCT}/dev from new stable (stable/ -> dev/ links)")
+    print(f"{tag}scaffold {product}/dev from new stable (stable/ -> dev/ links)")
     if not dry:
         shutil.rmtree(en_dev)
         shutil.copytree(en_stable, en_dev)
-        rewrite_prefix(en_dev, f"{PRODUCT}/stable/", f"{PRODUCT}/dev/")
+        rewrite_prefix(en_dev, f"{product}/stable/", f"{product}/dev/")
 
     # 4. docs.json: archived version entry, labels, and redirect lifecycle
     docs_path = repo / "docs.json"
     text = docs_path.read_text()
-    entry_json = archived_entry(repo, old)
-    text = insert_archived_entry(text, old, entry_json)
+    entry_json = archived_entry(repo, product, old)
+    text = insert_archived_entry(text, product, old, entry_json)
     print(f"{tag}insert archived version entry {old!r} after the Stable entry")
     subs = [(f"Stable ({old})", f"Stable ({new})"),
             (f"Development ({new}-dev)", f"Development ({ndev})")]
     for a, b in subs:
-        if a not in text:
-            print(f"error: label {a!r} not found in docs.json", file=sys.stderr)
+        # scoped to this product: the same labels exist under the others
+        lo, hi = product_span(text, product)
+        block = text[lo:hi]
+        if a not in block:
+            print(f"error: label {a!r} not found in the "
+                  f"{product_label(product)} block of docs.json", file=sys.stderr)
             return 1
-        text = text.replace(a, b)
+        text = text[:lo] + block.replace(a, b) + text[hi:]
         print(f"{tag}label: {a!r} -> {b!r}")
-    text, rstats = manage_redirects(text, repo, old, new)
-    print(f"{tag}redirects: remove {rstats['removed']} (/{PRODUCT}/{old}/*), "
+    text, rstats = manage_redirects(text, repo, product, old, new)
+    print(f"{tag}redirects: remove {rstats['removed']} (/{product}/{old}/*), "
           f"repoint {rstats['repointed']} ({new}-dev -> {new}), "
-          f"add {rstats['added']} (/{PRODUCT}/{new}/*)")
+          f"add {rstats['added']} (/{product}/{new}/*)")
     json.loads(text)  # validate the full transformation (runs in dry-run too)
     if dry:
         print(f"{tag}archived entry that would be inserted:\n{entry_json}")
