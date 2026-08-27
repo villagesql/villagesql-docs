@@ -137,11 +137,10 @@ The slots are fixed, so hrefs no longer change at a cut. Only the version-number
 
 ## Placeholder products
 
-The "Coming Soon" MySQL 8.0 product in `docs.json` uses a plain `Stable`
-label. Keep it in sync with that convention. It is a single `index.mdx`
-under `mysql-8.0/0.0.1/`, `noindex`ed, pointing readers at the MySQL 8.4
-stable slot. MySQL 9.7 was a placeholder of the same shape and is no longer
-one — see the next section.
+MySQL 9.7 was a placeholder of this shape and is no longer one — see the next
+section. MySQL 8.0 was the same shape; the product was dropped from
+`docs.json` and its files removed (2026-08-27), since VillageSQL does not
+build MySQL 8.0.
 
 ## Adding a MySQL version (built — 9.7)
 
