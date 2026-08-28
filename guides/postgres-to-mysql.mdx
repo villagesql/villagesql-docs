@@ -1,8 +1,8 @@
 ---
-title: "Migrating from PostgreSQL to MySQL"
+title: "Convert PostgreSQL to MySQL: Migration Guide"
 sidebarTitle: "Migrating from PostgreSQL"
-description: "How to migrate a PostgreSQL database to MySQL: schema translation, data type mapping, SQL dialect differences, sequence vs AUTO_INCREMENT, and common migration pitfalls."
-keywords: "postgresql to mysql migration, postgres to mysql, mysql vs postgresql differences, mysql auto_increment vs sequence, mysql migration guide, convert postgresql schema to mysql, mysql dialect differences"
+description: "How to migrate a PostgreSQL database to MySQL: data type mapping, AUTO_INCREMENT vs sequences, SQL dialect differences, and migration pitfalls to avoid."
+keywords: "postgresql to mysql migration, postgres to mysql, mysql vs postgresql differences, mysql auto_increment vs sequence, mysql migration guide, convert postgresql schema to mysql, mysql dialect differences, convert postgresql to mysql, postgresql to mysql converter, convert postgres to mysql, migrate data from postgres to mysql, migrate postgres database to mysql"
 ---
 
 import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
@@ -10,6 +10,29 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 <VillagesqlBanner />
 
 PostgreSQL and MySQL share ANSI SQL syntax but diverge in enough ways that a migration requires careful attention to data types, default behaviors, and SQL dialect differences. Most of the work is schema translation and fixing queries that rely on PostgreSQL-specific features.
+
+This guide covers migrating PostgreSQL to MySQL, the common direction when moving onto a MySQL-compatible server such as [VillageSQL](https://villagesql.com/install) — an open-source, drop-in replacement for MySQL that adds a PostgreSQL-style extension framework on top. That framework is why this guide has a place for your PostgreSQL extensions to land, not just your schema and data; see [Bringing Your Extensions](#bringing-your-extensions) below. If you are moving data the other way, the type mapping and dialect differences below still apply in reverse, but the migration tooling section does not.
+
+## Which Approach Should I Use
+
+- **One-time cutover** — dump/restore with `pg_dump` and `LOAD DATA INFILE`. See [Migration Tools](#migration-tools) and [Migration Approach](#migration-approach) below.
+- **Need the source database to stay live and writable during migration, or an ongoing sync** — set up Debezium with a JDBC sink connector for continuous replication instead of a one-time dump.
+
+## Migration Tools
+
+**`pg_dump` + manual schema conversion** is the primary path and needs nothing beyond the standard PostgreSQL and MySQL client tools:
+
+```bash
+# Schema only, plain SQL text
+pg_dump -s -f schema.sql mydb
+
+# Data only, as INSERT statements (portable, but slower to load than COPY)
+pg_dump -a --inserts -f data.sql mydb
+```
+
+`pg_dump`'s schema output uses PostgreSQL syntax (`SERIAL`, `BOOLEAN`, PostgreSQL-specific `CREATE TABLE` clauses), so the schema file needs manual translation using the type mapping table above before it will run against MySQL. There is no tool that does this translation automatically and correctly for every case — treat this as the default path for most migrations.
+
+**Debezium with a JDBC sink connector** ([debezium.io](https://debezium.io), Apache-2.0 license, actively maintained) reads PostgreSQL's write-ahead log and streams changes into MySQL through Kafka Connect, giving continuous replication instead of a one-time copy. This is the right tool when the source database must stay live and writable during migration, or when you need ongoing sync rather than a cutover. It requires a running Kafka and Kafka Connect cluster, which is more infrastructure than a one-off migration needs — for a single cutover, use `pg_dump` instead.
 
 ## Data Type Mapping
 
@@ -115,6 +138,27 @@ MySQL supports CTEs including recursive CTEs. See [CTEs in MySQL](/guides/ctes-i
 **Window functions:**
 MySQL supports window functions. See [Window Functions in MySQL](/guides/window-functions).
 
+**Stored procedures and functions:**
+PostgreSQL writes procedural logic in PL/pgSQL, with exception handling and rich control flow. MySQL uses its own procedural SQL dialect, has no PL/pgSQL support, and requires a `DELIMITER` change in client tools so the semicolons inside the procedure body aren't parsed as the end of the statement:
+
+```sql
+-- MySQL: a stored procedure with an OUT parameter
+DELIMITER ;;
+CREATE PROCEDURE total_orders(IN cust_id INT, OUT total INT)
+BEGIN
+    SELECT COUNT(*) INTO total FROM orders WHERE customer_id = cust_id;
+END;;
+DELIMITER ;
+
+CALL total_orders(1, @t);
+SELECT @t;
+```
+
+There is no automated translation from PL/pgSQL to MySQL's procedural syntax — rewrite each procedure by hand, and expect exception-handling logic (`EXCEPTION WHEN ...` blocks) to need the most rework, since MySQL's `DECLARE ... HANDLER` works differently. See [Stored Procedures in MySQL](/guides/stored-procedures).
+
+**Case sensitivity of identifiers:**
+PostgreSQL folds unquoted identifiers to lowercase and treats quoted identifiers (`"MyTable"`) as case-sensitive. MySQL's rule is different: whether database and table names are case-sensitive depends on the `lower_case_table_names` system variable and the underlying filesystem, not on quoting. Column, index, and stored routine names are never case-sensitive for lookup purposes, regardless of platform. Don't assume a schema that relied on case-sensitive PostgreSQL table names will behave identically after migration — check `lower_case_table_names` on the target server.
+
 ## Features Without MySQL Equivalents
 
 Some PostgreSQL features have no direct equivalent:
@@ -128,6 +172,19 @@ Some PostgreSQL features have no direct equivalent:
 | Partial indexes (`WHERE` clause on index) | Not supported; use generated columns to index a subset |
 | Materialized views | Not supported natively; approximate with tables + stored procedures |
 | `COPY` command for bulk load | Use `LOAD DATA INFILE` or MySQL Shell's `loadDump` |
+
+## Bringing Your Extensions
+
+PostgreSQL relies on extensions like `pgcrypto`, `pg_trgm`, and `uuid-ossp` for functionality it doesn't ship natively. Stock MySQL has no equivalent mechanism for adding this kind of functionality — but VillageSQL does: the VillageSQL Extension Framework (VEF) lets you install custom SQL functions and types into the server with `INSTALL EXTENSION`. Some of VillageSQL's extensions are direct ports of the PostgreSQL extensions above:
+
+| PostgreSQL extension | VillageSQL extension | Covers |
+|:----------------------|:----------------------|:-------|
+| `pgcrypto` | `vsql_crypto` | Hashing, HMAC, AES encryption, password hashing. See [Hashing Data in MySQL](/guides/hashing-data). |
+| `uuid-ossp` | `vsql_uuid` | A native UUID column type plus v1–v7 generation functions. See [UUIDs in MySQL](/guides/uuids). |
+| — (built-in `inet`/`cidr`/`macaddr` types) | `vsql_network_address` | IPv4, IPv6, and MAC address types. See [Storing IP Addresses in MySQL](/guides/storing-ip-addresses). |
+| `pg_trgm` | `vsql_trgm` | Trigram-based string similarity search. See [Trigram Similarity in MySQL](/guides/trigram-similarity). |
+
+If your PostgreSQL database depends on an extension not listed here, it may not have a VillageSQL equivalent yet — check the extension catalog in the VillageSQL docs before assuming the functionality is gone for good. And if the dependency is a custom PostgreSQL extension your own team wrote, VEF is also the tool for porting it: the [`vsql-extension-builder`](https://github.com/villagesql/villagesql-skills/tree/main/skills/vsql-extension-builder) skill walks an AI coding agent through rebuilding a custom extension on VillageSQL, from requirements through a tested, documented `.veb` package.
 
 ## Migration Approach
 
@@ -157,8 +214,6 @@ Use `TINYINT(1)`. Store 1 for true and 0 for false. Most MySQL client libraries 
 | `RETURNING` clause not working | Use `LAST_INSERT_ID()` after INSERT; there's no MySQL equivalent |
 | `SERIAL` behaves differently than in Postgres | MySQL does accept `SERIAL` — it is an alias for `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE`, wider than Postgres's `SERIAL` and carrying an implicit unique key. Use explicit `INT AUTO_INCREMENT` for the narrower Postgres equivalent |
 | Array columns failing | Normalize to a child table with a foreign key |
-
-If extensions are what you will miss most from PostgreSQL, [VillageSQL](https://villagesql.com/install) closes that gap: it is a drop-in replacement for MySQL with pgcrypto-compatible functions, INET and UUID types, and an extension framework for building your own.
 
 ## See also
 
