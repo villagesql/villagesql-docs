@@ -1,0 +1,349 @@
+---
+title: "Next.js and Drizzle with MySQL"
+sidebarTitle: "Next.js with Drizzle"
+description: "How to connect a Next.js App Router application to MySQL using Drizzle ORM and the mysql2 driver: schema definition, migrations with drizzle-kit, Server Components, Server Actions, and the static-rendering trap that serves stale database rows."
+keywords: "nextjs mysql drizzle, drizzle orm mysql, drizzle-kit migrate, nextjs server action mysql, mysql2 nextjs, drizzle mysql2 driver, nextjs app router database, drizzle orm mysql2"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Drizzle ORM is a TypeScript query builder that generates SQL migrations from a schema file and gives you a typed query API, without an intermediate query language of its own. This guide connects a Next.js App Router application to MySQL through Drizzle and the `mysql2` driver, covering schema, migrations, reads from a Server Component, and writes from a Server Action. It assumes an existing app scaffolded with `create-next-app --src-dir`, which sets up the `@/*` import alias the code samples use.
+
+## Install Drizzle and the MySQL Driver
+
+Drizzle needs the `mysql2` driver to talk to MySQL, plus `drizzle-kit` for generating and running migrations:
+
+```bash
+npm install drizzle-orm mysql2
+npm install -D drizzle-kit tsx dotenv
+```
+
+`drizzle-kit` moves quickly and has published pre-release tags (`beta`, `rc`) under `dist-tags` alongside `latest`. Check `npm view drizzle-orm dist-tags` and `npm view drizzle-kit dist-tags` before installing to confirm `latest` actually points at a stable release rather than a release candidate.
+
+Set the connection string in `.env`:
+
+```bash
+DATABASE_URL="mysql://drizzle_app:your_password@127.0.0.1:3306/your_database"
+```
+
+## Create the Database User
+
+Create a dedicated database and a user scoped to it, rather than connecting the application as `root`:
+
+```sql
+CREATE DATABASE drizzle_guide;
+CREATE USER 'drizzle_app'@'127.0.0.1' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON drizzle_guide.* TO 'drizzle_app'@'127.0.0.1';
+FLUSH PRIVILEGES;
+```
+
+A connection through the Unix socket is always matched against the `'localhost'` host, regardless of which IP-based grants exist; a user created only as `'drizzle_app'@'127.0.0.1'` cannot authenticate over the socket. A TCP connection to `127.0.0.1` is matched by reverse DNS lookup, so whether it also satisfies a `'localhost'` grant depends on how the server resolves `127.0.0.1`, not on a fixed MySQL rule. Grant the host your application actually uses, and don't rely on `127.0.0.1` and `localhost` being interchangeable.
+
+## Define the Schema
+
+Drizzle's MySQL schema uses functions from `drizzle-orm/mysql-core` to describe each column:
+
+```typescript src/db/schema.ts
+import { int, mysqlTable, text, timestamp, varchar } from "drizzle-orm/mysql-core";
+
+export const posts = mysqlTable("posts", {
+  id: int("id").autoincrement().primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+```
+
+`varchar` requires an explicit `length`. MySQL stores `VARCHAR` with a maximum length baked into the column type, unlike PostgreSQL, so Drizzle has no default to fall back on and needs the value up front.
+
+## Configure drizzle-kit
+
+`drizzle-kit` reads a config file to know where the schema lives and how to reach the database:
+
+```typescript drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+export default defineConfig({
+  out: "./drizzle",
+  schema: "./src/db/schema.ts",
+  dialect: "mysql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL,
+  },
+});
+```
+
+`drizzle-kit` reads `.env` itself before your config file runs, so `process.env.DATABASE_URL` is already populated here with no `dotenv` import needed. This is specific to `drizzle-kit`: a plain Node or `tsx` script has no such loader built in, as the verification script later in this guide shows.
+
+Add the migration scripts to `package.json`:
+
+```json package.json
+{
+  "scripts": {
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
+  }
+}
+```
+
+## Generate and Run the Migration
+
+`drizzle-kit generate` diffs the schema file against the last generated migration and writes a new SQL file:
+
+```bash
+npm run db:generate
+```
+
+```
+Reading config file 'drizzle.config.ts'
+Reading schema files:
+src/db/schema.ts
+
+1 tables
+posts 4 columns 0 indexes 0 fks
+
+[✓] Your SQL migration file ➜ drizzle/0000_premium_tiger_shark.sql 🚀
+```
+
+The generated file name includes a random two-word suffix; only the numeric prefix (`0000`) is meaningful for ordering. The migration itself is plain SQL:
+
+```sql drizzle/0000_premium_tiger_shark.sql
+CREATE TABLE `posts` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`title` varchar(255) NOT NULL,
+	`body` text NOT NULL,
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `posts_id` PRIMARY KEY(`id`)
+);
+```
+
+Apply it:
+
+```bash
+npm run db:migrate
+```
+
+`drizzle-kit migrate` creates a `__drizzle_migrations` table the first time it runs, to track which migration files have already been applied. Confirm both tables exist:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u drizzle_app -p drizzle_guide -e "SHOW TABLES;"
+```
+
+```
+Tables_in_drizzle_guide
+__drizzle_migrations
+posts
+```
+
+## Create the Database Client
+
+The `mysql2` driver connects through a pool, and Drizzle wraps that pool:
+
+```typescript src/db/index.ts
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import * as schema from "./schema";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+const poolConnection = mysql.createPool(process.env.DATABASE_URL);
+
+export const db = drizzle(poolConnection, { schema, mode: "default" });
+```
+
+The `mode: "default"` option is specific to the `mysql2` driver and has no equivalent on Drizzle's PostgreSQL or SQLite drivers. Omitting it is a type error, not a silent default.
+
+## Read Posts in a Server Component
+
+A Server Component can call `db.select()` directly during rendering, with no API route in between:
+
+```typescript src/app/page.tsx
+import { db } from "@/db";
+import { posts } from "@/db/schema";
+import { desc } from "drizzle-orm";
+import { createPost } from "./actions";
+
+export const dynamic = "force-dynamic";
+
+export default async function Home() {
+  const allPosts = await db.select().from(posts).orderBy(desc(posts.createdAt));
+
+  return (
+    <main>
+      <h1>Posts</h1>
+      <form action={createPost}>
+        <div>
+          <label htmlFor="title">Title</label>
+          <input id="title" name="title" type="text" required />
+        </div>
+        <div>
+          <label htmlFor="body">Body</label>
+          <textarea id="body" name="body" required />
+        </div>
+        <button type="submit">Create post</button>
+      </form>
+      <ul>
+        {allPosts.map((post) => (
+          <li key={post.id}>
+            <strong>{post.title}</strong>
+            <p>{post.body}</p>
+            <small>{post.createdAt.toISOString()}</small>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+## Insert Posts with a Server Action
+
+A Server Action runs on the server and can be passed directly to a form's `action` prop:
+
+```typescript src/app/actions.ts
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { db } from "@/db";
+import { posts } from "@/db/schema";
+
+export async function createPost(formData: FormData) {
+  const title = formData.get("title");
+  const body = formData.get("body");
+
+  if (typeof title !== "string" || title.trim() === "") {
+    throw new Error("Title is required");
+  }
+  if (typeof body !== "string" || body.trim() === "") {
+    throw new Error("Body is required");
+  }
+
+  await db.insert(posts).values({ title, body });
+
+  revalidatePath("/");
+}
+```
+
+`revalidatePath("/")` is necessary even on a route that renders on every request. Without it, a Server Action's response is not guaranteed to include a refreshed copy of the page it was called from.
+
+## The Static Rendering Trap
+
+`npm run build` compiles the application, but it also decides, per route, whether a page can be prerendered once at build time or must be rendered on every request. A Server Component that reads the database with no other dynamic API in the same route (no `cookies()`, no `headers()`, no `searchParams`) gives Next.js nothing that forces per-request rendering, so it prerenders the page once during the build and serves that same HTML to every visitor afterward.
+
+This was reproducible: removing `export const dynamic = "force-dynamic";` from `page.tsx` and rebuilding produced a route marked static:
+
+```
+Route (app)
+┌ ○ /
+└ ○ /_not-found
+
+○  (Static)  prerendered as static content
+```
+
+A row inserted directly into the database after that build did not appear when the built application was started with `npm run start`. The page kept serving the row count and content captured at build time. Adding `export const dynamic = "force-dynamic";` to `page.tsx` and rebuilding changed the route to dynamic:
+
+```
+Route (app)
+┌ ƒ /
+└ ○ /_not-found
+
+ƒ  (Dynamic)  server-rendered on demand
+```
+
+After that change, a row inserted post-build appeared immediately on the next request, with no rebuild required. Any page that reads from the database and needs to reflect writes made after the build needs `export const dynamic = "force-dynamic";`, or another Next.js API (like reading `cookies()`) that has the same effect of forcing per-request rendering.
+
+## Verify the Write Path Independently of the ORM
+
+A script that inserts through Drizzle and only checks Drizzle's own return value does not prove the row reached the database; it proves the driver returned without throwing. Verify with a separate query:
+
+```typescript src/db/verify-insert.ts
+import "dotenv/config";
+import { db } from "./index";
+import { posts } from "./schema";
+
+async function main() {
+  const [inserted] = await db.insert(posts).values({
+    title: "Verification post",
+    body: "Inserted by verify-insert.ts to confirm the write path works.",
+  });
+
+  console.log("Insert result:", inserted);
+  process.exit(0);
+}
+
+main();
+```
+
+Run it with `tsx`, which executes TypeScript directly:
+
+```bash
+npx tsx src/db/verify-insert.ts
+```
+
+```
+Insert result: ResultSetHeader {
+  fieldCount: 0,
+  affectedRows: 1,
+  insertId: 1,
+  info: '',
+  serverStatus: 2,
+  warningStatus: 0,
+  changedRows: 0
+}
+```
+
+`import "dotenv/config"` at the top of the script is required here. Next.js loads `.env` for the application automatically, but a standalone script run with `tsx` is a plain Node process with no framework wiring, and Node itself does not read `.env` files.
+
+Then confirm the row exists with a query that never went through the application:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u drizzle_app -p drizzle_guide -e "SELECT id, title, body, created_at FROM posts;"
+```
+
+```
+id	title	body	created_at
+1	Verification post	Inserted by verify-insert.ts to confirm the write path works.	2026-08-28 11:59:54
+```
+
+## Frequently Asked Questions
+
+#### Does this work the same way with VillageSQL as with MySQL?
+
+Yes. Drizzle's MySQL dialect and the `mysql2` driver speak the standard MySQL wire protocol, and VillageSQL is a drop-in replacement for MySQL with the same protocol and client tools. Nothing in the schema, migration, or query code above is MySQL-version-specific.
+
+#### Should I use `drizzle-kit generate` and `migrate`, or `drizzle-kit push`?
+
+`generate` plus `migrate` writes a SQL migration file you can review and commit before it runs against a database, which is what this guide uses. `drizzle-kit push` compares the schema file to the live database and applies the difference directly, with no migration file. `push` is faster for early prototyping but leaves no record of what changed or when, and is not a substitute for migration files once other developers or environments depend on the schema.
+
+#### Why does the migration folder have a table called `__drizzle_migrations`?
+
+`drizzle-kit migrate` creates this table on first run to record which migration files it has already applied, by hash. It is how `migrate` knows to skip a migration that already ran instead of applying it twice.
+
+#### Can I call `db.insert()` directly from a Server Component instead of a Server Action?
+
+A Server Component only runs during rendering; there is no request from the browser to trigger a write in response to a user action. A write path needs a Server Action, a Route Handler, or client-side code calling an API route.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `Access denied for user 'drizzle_app'@'localhost' (using password: YES)` | The password in `DATABASE_URL` is wrong. The host shown in the error can read `localhost` even when the connection was made to `127.0.0.1`; it doesn't mean the account's host part is the problem. Re-check the password first. |
+| `ERROR 1146 (42S02): Table 'drizzle_guide.posts' doesn't exist` | The migration was never run against this database. Run `npm run db:migrate`. |
+| A row inserted after `npm run build` doesn't show up on the page | The route was prerendered at build time. Add `export const dynamic = "force-dynamic";` to the page and rebuild. |
+| `DATABASE_URL is not set` when running `drizzle-kit generate` or `migrate` | `.env` is missing, or the command was run from a directory other than the project root, so `drizzle-kit` never found it. |
+| Type error on the `mode` option when calling `drizzle()` | The `mysql2` driver requires `mode: "default"` (or `"planetscale"` for PlanetScale-specific behavior); this option doesn't exist on Drizzle's PostgreSQL or SQLite drivers. |
+
+## See also
+
+- [Next.js and Prisma with MySQL](/guides/mysql-with-prisma) — the same app built on Prisma instead of Drizzle
+- [Next.js with MySQL](/guides/nextjs-mysql) — connection setup, Server Actions, and Route Handler patterns with no ORM at all
+- [Using MySQL with ORMs: Django, Rails, and Prisma](/guides/mysql-with-orms) — configuring MySQL-specific settings across ORMs beyond Drizzle
+- [MySQL Connection Pooling](/guides/connection-pooling) — how the connection pool `mysql2` creates fits into MySQL's connection limits

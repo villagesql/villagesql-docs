@@ -1,0 +1,286 @@
+---
+title: "Next.js with MySQL"
+sidebarTitle: "Next.js"
+description: "Connecting a Next.js App Router application to MySQL with the raw mysql2 driver: a connection pool singleton, querying from a Server Component, writing with a Server Action, and a JSON Route Handler, with no ORM in between."
+keywords: "nextjs mysql, mysql2 nextjs, next.js server action mysql, next.js route handler mysql, mysql connection pool nextjs, nextjs app router mysql, mysql2 connection pool singleton"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Next.js App Router applications talk to MySQL from three different places: Server Components, Server Actions, and Route Handlers. This guide connects to MySQL from all three using the raw `mysql2` driver and a single shared connection pool, with no ORM in between. Because VillageSQL is a drop-in replacement for MySQL, every statement here runs unchanged against it.
+
+## Setting Up the Database
+
+Create a dedicated database and application user rather than connecting as root:
+
+```sql
+CREATE DATABASE nextjs_guide;
+
+CREATE USER 'nextjs_app'@'127.0.0.1' IDENTIFIED BY 'nextjs_dev_pw';
+GRANT ALL PRIVILEGES ON nextjs_guide.* TO 'nextjs_app'@'127.0.0.1';
+FLUSH PRIVILEGES;
+```
+
+Create a table to work with:
+
+```sql
+CREATE TABLE notes (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  body VARCHAR(280) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Scaffold the app and install the driver:
+
+```bash
+npx create-next-app@latest nextjs-mysql --typescript --app --src-dir
+npm install mysql2
+```
+
+Store the connection details in `.env.local`, not in source:
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=nextjs_app
+DB_PASSWORD=nextjs_dev_pw
+DB_NAME=nextjs_guide
+```
+
+## The Connection Pool
+
+Every place in the app that talks to MySQL imports the same pool from one module, `src/lib/db.ts`:
+
+```typescript
+import mysql from "mysql2/promise";
+
+// Next.js dev mode reloads route modules on every file save, but it keeps the
+// Node.js process alive between reloads. A pool created at module scope gets
+// re-created on every reload unless it is cached somewhere that survives the
+// reload. `globalThis` survives; module-level variables do not.
+const globalForPool = globalThis as unknown as {
+  vsqlPool: mysql.Pool | undefined;
+};
+
+export const pool =
+  globalForPool.vsqlPool ??
+  mysql.createPool({
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT ?? 3306),
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPool.vsqlPool = pool;
+}
+```
+
+This is the same pattern used to cache a Prisma or Drizzle client across hot reloads, applied directly to a `mysql2` pool. `connectionLimit`, `waitForConnections`, and `queueLimit` are explained in [MySQL Connection Pooling](/guides/connection-pooling); this guide focuses on what changes when the pool lives inside a Next.js process.
+
+The `globalThis` cache is not optional in dev mode. A test on this app proves why: running `npm run dev` with the cache in place and saving `src/app/page.tsx` four times in a row (four real Turbopack recompiles) left exactly one `nextjs_app` connection open the whole time, checked with:
+
+```sql
+SELECT COUNT(*) FROM information_schema.processlist WHERE user = 'nextjs_app';
+```
+
+Removing the `globalThis` cache and repeating the same four saves against a fresh `next dev` process grew that count to five. Each hot reload re-ran the module top level, and each run called `mysql.createPool()` again without ever closing the previous pool. In production this does not happen, because `next build` compiles the app once and `next start` runs it without reloading modules, but the guard costs nothing in production and prevents a real, reproducible connection leak in development.
+
+## Querying from a Server Component
+
+`src/app/page.tsx` reads from `notes` directly in a Server Component, with a parameterized query:
+
+```typescript
+import { pool } from "@/lib/db";
+import { addNote } from "./actions";
+import type { RowDataPacket } from "mysql2";
+
+interface Note extends RowDataPacket {
+  id: number;
+  body: string;
+  created_at: Date;
+}
+
+async function getNotes(): Promise<Note[]> {
+  const [rows] = await pool.query<Note[]>(
+    "SELECT id, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
+    [20],
+  );
+  return rows;
+}
+
+export default async function Home() {
+  const notes = await getNotes();
+  // ...renders `notes`, including note.created_at.toISOString()
+}
+```
+
+Never build the query string by concatenating or interpolating user input. The `LIMIT ?` placeholder above is filled in by `mysql2`, not by string concatenation, which is what keeps a value like `20; DROP TABLE notes` from doing anything but failing to parse as a number.
+
+`mysql2` returns a MySQL `TIMESTAMP` column as a JavaScript `Date` object, not a string. With the `Note` interface above typing `created_at` as `Date`, rendering it directly as JSX (`{note.created_at}`) fails `npm run build`'s type check before the app ever runs:
+
+```
+error TS2322: Type 'Date' is not assignable to type 'ReactNode'.
+```
+
+Without that type annotation, the same mistake surfaces later and worse, as a runtime crash instead of a build-time error: `Error: Objects are not valid as a React child (found: [object Date])`. Either way, the fix is the same: call `.toISOString()` (or a formatting library) on the value where it is rendered, rather than treating it as a string.
+
+Building the app with `npm run build` shows that this page has no dependency on request-time data (no `cookies()`, no `headers()`, nothing marked dynamic), so Next.js prerenders it as static content at build time:
+
+```
+Route (app)
+┌ ○ /
+├ ○ /_not-found
+└ ƒ /api/notes
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+```
+
+That means the query in `getNotes()` runs once, during `next build`, and the database must be reachable at build time. The Server Action below keeps the page's content current by revalidating it after each write, rather than by re-running the query on every request.
+
+## Writing with a Server Action
+
+`src/app/actions.ts` performs the insert through the same pool:
+
+```typescript
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { pool } from "@/lib/db";
+
+export async function addNote(formData: FormData) {
+  const body = formData.get("body");
+
+  if (typeof body !== "string" || body.trim().length === 0) {
+    return;
+  }
+
+  await pool.execute("INSERT INTO notes (body) VALUES (?)", [body.trim()]);
+
+  revalidatePath("/");
+}
+```
+
+The form on the home page passes this function directly as its `action`:
+
+```tsx
+<form action={addNote}>
+  <input type="text" name="body" maxLength={280} required />
+  <button type="submit">Add</button>
+</form>
+```
+
+Submitting this form through a real browser, filling in "Server Action verified end to end" and clicking Add, inserted a new row without a full page navigation, and the row appeared in the rendered list immediately because of `revalidatePath("/")`. Querying the database directly afterward confirmed the write:
+
+```sql
+SELECT * FROM notes;
+```
+
+```
+id  body                                 created_at
+1   First note, inserted while setting up the guide.   2026-08-28 12:17:51
+2   Server Action verified end to end                  2026-08-28 12:19:37
+```
+
+`revalidatePath("/")` invalidates the cached static render from the previous section, so the next request re-runs `getNotes()` instead of serving the build-time snapshot. Without this call, a static page's data cache would never notice the new row.
+
+## A JSON Route Handler
+
+Server Components and Server Actions cover pages rendered by Next.js itself. A Route Handler is the piece an ORM-focused guide usually skips, because it is the plain HTTP API surface rather than a page: `src/app/api/notes/route.ts` responds to a `GET` request with JSON, for a mobile client, a webhook, or any caller that is not the Next.js frontend.
+
+```typescript
+import { NextResponse } from "next/server";
+import { pool } from "@/lib/db";
+import type { RowDataPacket } from "mysql2";
+
+interface Note extends RowDataPacket {
+  id: number;
+  body: string;
+  created_at: Date;
+}
+
+export async function GET() {
+  const [rows] = await pool.query<Note[]>(
+    "SELECT id, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
+    [20],
+  );
+
+  return NextResponse.json({ notes: rows });
+}
+```
+
+Running the built app with `npm run start` (port 3000 by default) and requesting this route returns real rows from `notes`, not placeholder data, including the row the Server Action inserted above:
+
+```bash
+curl http://localhost:3000/api/notes
+```
+
+```json
+{"notes":[{"id":2,"body":"Server Action verified end to end","created_at":"2026-08-28T19:19:37.000Z"},{"id":1,"body":"First note, inserted while setting up the guide.","created_at":"2026-08-28T19:17:51.000Z"}]}
+```
+
+Unlike the home page, this route reads request-time data indirectly (it queries the database on every call rather than at build time), so the same build output above marks it `ƒ` for dynamic rather than `○` for static.
+
+## Connection Pool Sizing in Next.js
+
+A Route Handler runs once per incoming request, and under concurrent load several requests can be in flight at the same time. The pool exists so those requests share a bounded number of MySQL connections instead of each request opening its own.
+
+Firing 20 concurrent requests at `/api/notes` against the running app and immediately checking the server:
+
+```sql
+SHOW STATUS LIKE 'Threads_connected';
+```
+
+showed only 4 connections in use for the `nextjs_app` user, against a pool configured with `connectionLimit: 10`. The exact number depends on how fast each query completes relative to when the burst lands, so a slower query or a busier server would show a higher count, up to the configured limit. What it confirms either way is the pool queuing and reusing connections across the burst instead of opening 20. Raising `connectionLimit` raises how many requests can run their queries in parallel before the rest wait in the pool's internal queue (bounded by `queueLimit`, or unbounded if `queueLimit` is `0`); it does not change how many requests the app can accept, only how many can be mid-query against MySQL at once.
+
+Two things specific to Next.js affect this number in practice:
+
+- **Every server process gets its own pool.** A Next.js deployment that runs multiple instances (multiple `next start` processes, or multiple serverless function instances) multiplies `connectionLimit` by however many instances are running. Size `connectionLimit` and MySQL's `max_connections` together, not `connectionLimit` alone.
+- **Dev mode can multiply pools within a single process**, as shown in the connection pool section above, if the pool is not cached on `globalThis`. This does not happen in a production build, but it is worth checking for during development, because the symptom (MySQL reporting far more open connections than the app should need) looks identical to a production sizing problem.
+
+## Choosing an ORM Instead
+
+This guide uses `mysql2` directly because a raw connection pool is the piece every Next.js and MySQL integration shares, regardless of what sits on top of it. If the application would benefit from generated types, migrations, or a query builder, see [Next.js and Prisma with MySQL](/guides/mysql-with-prisma) or [Next.js and Drizzle with MySQL](/guides/mysql-with-drizzle) for MySQL-specific setup, and [Using MySQL with ORMs](/guides/mysql-with-orms) for the settings that matter across ORMs generally.
+
+## Frequently Asked Questions
+
+#### Why does rendering `note.created_at` fail instead of just printing as text?
+
+`mysql2` decodes a MySQL `TIMESTAMP` or `DATETIME` column into a JavaScript `Date` object, and neither TypeScript's `ReactNode` type nor React itself can render one directly as JSX. With the column typed as `Date`, `npm run build` catches `{note.created_at}` at type-check time with `error TS2322: Type 'Date' is not assignable to type 'ReactNode'`. Without that type, the same mistake reaches runtime instead and throws `Error: Objects are not valid as a React child (found: [object Date])`. Call `.toISOString()`, `.toLocaleString()`, or a formatting library on the value before rendering it.
+
+#### Do I need a connection pool if I only expect a few users?
+
+Yes. Even with light traffic, Next.js can run several requests concurrently (a page load that also calls a Route Handler, two browser tabs, a bot crawling the site), and each MySQL connection is a real thread on the server. A pool with a small `connectionLimit`, ten is a reasonable default for a small app, costs nothing when idle and prevents a burst of concurrent requests from opening one connection each.
+
+#### Can I call a Server Action from a Route Handler, or the other way around?
+
+A Route Handler can call the same function a Server Action calls, since both are just asynchronous functions that use the pool. What differs is the calling convention: a Server Action is invoked by a `<form action>` or by React's `useActionState`, and a Route Handler is invoked by an HTTP request. Share the database logic in a plain function and call it from both, rather than having one call the other directly.
+
+#### Why is the home page static but the API route is not?
+
+Next.js decides this per route, based on whether the route reads request-time data. `src/app/page.tsx` in this guide calls no runtime API like `cookies()` or `headers()`, so `next build` prerenders it once and serves that snapshot until `revalidatePath` invalidates it. The Route Handler in this guide has no such caching applied, so it queries the database on every request.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `error TS2322: Type 'Date' is not assignable to type 'ReactNode'` (build) or `Error: Objects are not valid as a React child (found: [object Date])` (runtime, if untyped) | A `TIMESTAMP` or `DATETIME` column came back as a `Date` object. Call `.toISOString()` or format it before rendering. |
+| MySQL connection count keeps climbing during `next dev` | The pool is not cached on `globalThis`, so each hot reload creates a new pool. Add the `globalForPool` guard shown in this guide. |
+| A Server Action runs but the page never shows the new data | Add `revalidatePath` (or `revalidateTag`) for the path that reads the changed data. Without it, a statically rendered page keeps serving its build-time snapshot. |
+| `Error: connect ECONNREFUSED 127.0.0.1:3306` (port varies) from a Route Handler or Server Action | The MySQL server is not reachable from the process running Next.js. Confirm the server is running and that `.env.local` points at the right host and port. |
+| Too many connections under load | Raise MySQL's `max_connections`, lower `connectionLimit` per process, or reduce the number of running Next.js instances. See [Connection pooling](/guides/connection-pooling). |
+
+## See also
+
+- [Next.js and Prisma with MySQL](/guides/mysql-with-prisma) — the same app built on Prisma instead of a raw driver
+- [Next.js and Drizzle with MySQL](/guides/mysql-with-drizzle) — the same app built on Drizzle instead of a raw driver
+- [MySQL Connection Pooling](/guides/connection-pooling) — how `connectionLimit`, `waitForConnections`, and `queueLimit` work, independent of any framework
+- [Using MySQL with ORMs](/guides/mysql-with-orms) — the settings that matter when an ORM sits between the application and MySQL
