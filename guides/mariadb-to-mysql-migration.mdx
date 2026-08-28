@@ -1,0 +1,173 @@
+---
+title: "Migrating from MariaDB to MySQL"
+sidebarTitle: "Migrating from MariaDB"
+description: "How to migrate a MariaDB database to MySQL: the schema and dump differences that actually break a load, including JSON columns, sequences, INET6, and foreign key constraint names."
+keywords: "mariadb to mysql migration, migrate mariadb to mysql, mariadb vs mysql differences, mariadb dump mysql, mariadb json vs mysql json, mariadb sequence mysql, mysqldump mariadb"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MariaDB and MySQL share the same wire protocol and most of the same SQL surface, so a migration looks deceptively simple: dump, then load. In practice, a handful of MariaDB-specific types, objects, and dump behaviors will stop a plain load partway through, and one of them changes a column's stored type without raising an error at all. This guide covers what actually breaks and how to fix it, based on a real dump taken from MariaDB 12.3.3 and loaded into MySQL.
+
+## Data Type and Default Differences
+
+| MariaDB feature | MySQL situation | Notes |
+|:-----------------|:-----------------|:------|
+| `JSON` column type | `LONGTEXT` with a `CHECK (json_valid(...))` constraint on the MariaDB side | MariaDB's `JSON` is an alias, not a native type. `SHOW CREATE TABLE` on MariaDB shows the real column as `longtext ... CHECK (json_valid(...))`. MySQL has a native `JSON` type, but a column created this way on MariaDB loads into MySQL as `LONGTEXT`, not `JSON`, because the dump carries the literal column definition. |
+| `INET6` column type | Not supported | MySQL and VillageSQL have no `INET6` type. Loading a table with an `INET6` column fails outright; store the value as `VARCHAR(45)` or use an INET extension. |
+| `SEQUENCE` objects and `NEXTVAL()` | Not supported | MariaDB's `CREATE SEQUENCE` and `NEXTVAL()` column defaults have no MySQL equivalent. Use `AUTO_INCREMENT` instead. |
+| `INSERT ... RETURNING` | Not supported | MariaDB accepts `RETURNING` on `INSERT`; MySQL does not. Use `SELECT LAST_INSERT_ID()` after the insert instead. |
+| Default collation | `utf8mb4_general_ci` (MariaDB 12.3.3) vs. `utf8mb4_0900_ai_ci` (MySQL 8.4 and VillageSQL) | Verified with `SHOW VARIABLES LIKE 'collation_server'` on both servers. A dumped table keeps whatever collation it was created with, since `mysqldump` writes it explicitly into `CREATE TABLE`. The default only matters for tables you create fresh on the target without specifying a collation. |
+| Integer display widths in `SHOW CREATE TABLE` | Dropped | MariaDB shows `int(11)` and `bigint(20)`. MySQL 8.4 and VillageSQL show bare `int` and `bigint`. This is cosmetic and does not affect stored data, but it means a diff between a MariaDB and a MySQL `SHOW CREATE TABLE` is not proof that a table was altered. |
+
+## MariaDB-Only Schema Objects Break the Load
+
+A schema that uses `CREATE SEQUENCE` fails immediately when loaded into MySQL, before any table is created, because `mysqldump` writes sequence definitions ahead of tables. Loading an unmodified dump containing a sequence produces this, where the `at line N` values track where the statement sits in your own dump and will not match the numbers shown here:
+
+```
+ERROR 1064 (42000) at line 23: You have an error in your SQL syntax; check the manual
+that corresponds to your MySQL server version for the right syntax to use near
+'SEQUENCE IF EXISTS `invoice_seq`' at line 1
+```
+
+Remove the `DROP SEQUENCE` / `CREATE SEQUENCE` / `DO SETVAL(...)` block from the dump, and replace any column default that reads `DEFAULT nextval(...)` with a plain `AUTO_INCREMENT` column or an application-assigned value.
+
+A column typed `INET6` fails the same way, later in the same load, once the loader reaches the table that declares it. This is the one error in this guide whose wording depends on which server you load into. VillageSQL names the type, because its grammar accepts custom type names in that position and reports the one it could not resolve:
+
+```
+ERROR 1064 (42000) at line 26: Expected a type or a custom type instead of "inet6"
+near 'inet6 DEFAULT NULL, `created_at` timestamp NULL DEFAULT current_timestamp(), '
+at line 5
+```
+
+Stock MySQL 8.4 rejects the same statement with the generic syntax error instead:
+
+```
+ERROR 1064 (42000) at line 26: You have an error in your SQL syntax; check the manual
+that corresponds to your MySQL server version for the right syntax to use
+near 'inet6 DEFAULT NULL, `created_at` timestamp NULL DEFAULT current_timestamp(), '
+at line 5
+```
+
+Both are `ERROR 1064`, and both name the offending line, so the fix is the same either way. Change the column type to `VARCHAR(45)` (long enough for an IPv6 address in text form) before loading, or to an INET type provided by an extension if one is installed on the target.
+
+## Foreign Key Constraint Names Collide Across Tables
+
+`mysqldump` on MariaDB auto-names an unnamed foreign key constraint with a plain integer, starting from `1` again for every table. Two tables in the same schema can both end up with a constraint literally named `1`:
+
+```sql
+CREATE TABLE `order_items` (
+  ...
+  CONSTRAINT `1` FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`),
+  CONSTRAINT `2` FOREIGN KEY (`product_id`) REFERENCES `products` (`id`)
+) ENGINE=InnoDB ...;
+
+CREATE TABLE `orders` (
+  ...
+  CONSTRAINT `1` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)
+) ENGINE=InnoDB ...;
+```
+
+MySQL requires foreign key constraint names to be unique across the whole schema, not just within a table. Loading the second `CONSTRAINT `1`` fails with:
+
+```
+ERROR 1826 (HY000) at line 96: Duplicate foreign key constraint name '1'
+```
+
+This only happens when the original tables relied on MariaDB's auto-naming (no `CONSTRAINT name` given in the `CREATE TABLE`). Rename each colliding constraint to something unique, for example `order_items_ibfk_1` and `orders_ibfk_1`, before loading.
+
+## The JSON Column Loads Without Error, as a Different Type
+
+Unlike the three issues above, a `JSON` column loads into MySQL with no error and no warning. The dumped `CREATE TABLE` for a MariaDB `JSON` column looks like this:
+
+```sql
+CREATE TABLE `products` (
+  ...
+  `attributes` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+    DEFAULT NULL CHECK (json_valid(`attributes`))
+) ENGINE=InnoDB ...;
+```
+
+MySQL supports `CHECK` constraints and the `JSON_VALID()` function, so this statement runs as written. The column ends up as `LONGTEXT` with a `CHECK` constraint on the MySQL side, not as MySQL's native `JSON` type. Reading it back with `JSON_EXTRACT()` and `JSON_LENGTH()` gives identical results to the source data, so nothing is lost, but the column's declared type is different from what a fresh MySQL schema would use. If you want the native `JSON` type on the target, alter the column after loading:
+
+```sql
+ALTER TABLE products MODIFY attributes JSON;
+```
+
+This leaves the original `CHECK (json_valid(...))` constraint attached to the column. The dump does not name that constraint, so the server named it when the `CREATE TABLE` ran, something like `products_chk_1`; it is already there before the `ALTER`. It's harmless on a native `JSON` column, since MySQL already rejects invalid JSON at the type level, but it's dead weight left over from the LONGTEXT definition. Drop it if you want a clean schema:
+
+```sql
+ALTER TABLE products DROP CHECK products_chk_1;
+```
+
+## Authentication Differences
+
+MariaDB and MySQL clients speak the same wire protocol, and a plain password-authenticated connection from one to the other works. What does not carry over is the account definition itself. `mysqldump` does not dump the `mysql.user` table by default, so accounts and grants have to be recreated by hand on the target, and the syntax for doing so differs.
+
+A MariaDB account created with a password shows up like this:
+
+```sql
+-- MariaDB
+SHOW CREATE USER 'appuser'@'%';
+-- CREATE USER `appuser`@`%` IDENTIFIED BY PASSWORD '*E6867A710B62E46C7948C1936692C0E9EAB160C5'
+```
+
+The same statement on MySQL or VillageSQL, using the default `caching_sha2_password` plugin, looks like this instead:
+
+```sql
+-- MySQL / VillageSQL
+SHOW CREATE USER 'appuser'@'%';
+-- CREATE USER `appuser`@`%` IDENTIFIED WITH 'caching_sha2_password' AS '...'
+--   REQUIRE NONE PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK ...
+```
+
+Don't copy a `SHOW CREATE USER` statement from MariaDB into MySQL. Create the account fresh with `CREATE USER ... IDENTIFIED BY '<password>'` on the target and let it pick its own default plugin, then reissue the `GRANT` statements.
+
+If you're testing a migration against a MariaDB install you just set up (a fresh Homebrew install, for example), and a named account with a password gets rejected with "Access denied" even though the password is right, check for anonymous accounts first:
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = '';
+```
+
+An unsecured MariaDB install can leave `''@'localhost'` and `''@'<hostname>'` in place. Because host matching is more specific than username matching, a connection that resolves to `localhost` matches the anonymous account before it matches your named one, and gets rejected because the anonymous account expects no password. This is a MariaDB source-install issue, not something that follows the data into MySQL, but it can make source-side testing confusing until the anonymous accounts are dropped.
+
+## Migration Approach
+
+1. **Dump the schema and data** with `mysqldump` (on a MariaDB host this is usually a symlink to MariaDB's own `mariadb-dump`; run `mysqldump --version` to confirm which one you have).
+2. **Scan the dump for `CREATE SEQUENCE`, `INET6`, and `RETURNING`** before attempting a load. None of the three produce a useful error until the load is already partway through.
+3. **Attempt a load into a scratch database first.** A `CREATE SEQUENCE` or `INET6` failure aborts the whole script at that statement, so tables defined earlier in the file are already loaded and tables defined later are not. Fix the dump and reload into a fresh database rather than patching a half-loaded one.
+4. **Check for foreign key constraint name collisions** if the source schema relied on unnamed foreign keys. `grep -o 'CONSTRAINT \`[0-9]*\`' dump.sql` finds them.
+5. **Recreate accounts and grants by hand.** `mysqldump` does not carry them, and the `CREATE USER` / `SHOW CREATE USER` syntax differs between the two servers.
+6. **Verify row counts and spot-check any JSON columns.** A `JSON` column loads silently as `LONGTEXT`; confirm the data round-trips with `JSON_EXTRACT()` before deciding whether to convert it to a native `JSON` column.
+
+## Frequently Asked Questions
+
+#### Does a MariaDB `mysqldump` file need any edits for a same-version-family MySQL target?
+
+If the schema doesn't use sequences, `INET6`, `RETURNING`, or unnamed foreign keys, the same dump often loads without changes. Test the load against a scratch database first rather than assuming it will succeed based on the schema being "just tables and data."
+
+#### Will a native MySQL `JSON` column round-trip through a MariaDB dump correctly?
+
+Values round-trip correctly. The column type does not: MariaDB dumps its `JSON` columns as `LONGTEXT` with a `CHECK` constraint, and that is exactly what loads into MySQL, unless you explicitly `ALTER TABLE ... MODIFY` the column to `JSON` afterward.
+
+#### Can I connect to a MariaDB server with a MySQL client, or the reverse?
+
+Yes, for ordinary password-authenticated connections. Both use the same wire protocol, and a client built against one library can authenticate against an account on the other server, once the account itself exists with a password. The SQL each server accepts is where they diverge, not the connection.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `ERROR 1064 ... near 'SEQUENCE IF EXISTS ...'` | Remove the `CREATE SEQUENCE`/`DROP SEQUENCE`/`DO SETVAL(...)` statements and any `DEFAULT nextval(...)` column default; use `AUTO_INCREMENT` instead |
+| `ERROR 1064` naming `inet6` (VillageSQL says `Expected a type or a custom type instead of "inet6"`; stock MySQL gives the generic syntax error) | Change the column to `VARCHAR(45)` or a supported INET type before loading |
+| `ERROR 1064 ... near 'RETURNING id'` | Remove `RETURNING` from the statement and use `SELECT LAST_INSERT_ID()` afterward |
+| `ERROR 1826 (HY000) ... Duplicate foreign key constraint name '1'` | Rename the colliding `CONSTRAINT` names in the dump so each is unique across the whole schema |
+| A `JSON` column loads with no error but the target schema shows `LONGTEXT` | Expected: MariaDB's `JSON` is `LONGTEXT` with a `CHECK` constraint. Run `ALTER TABLE ... MODIFY <col> JSON` if you want the native type on the target |
+| "Access denied" for a named account that should have the right password | Check `mysql.user` on the MariaDB source for anonymous accounts (`user = ''`) that may be intercepting the connection |
+
+## See also
+
+- [Migrating from PostgreSQL to MySQL](/guides/postgres-to-mysql) — the equivalent guide for a PostgreSQL source
+- [Schema Migrations in MySQL](/guides/schema-migrations) — running the DDL changes a migration requires
