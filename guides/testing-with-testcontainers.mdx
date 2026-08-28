@@ -1,0 +1,326 @@
+---
+title: "Testing Against MySQL with Testcontainers"
+sidebarTitle: "Testcontainers Testing"
+description: "How to run real integration tests against an ephemeral MySQL or VillageSQL container instead of mocking the database, using Testcontainers: setup, schema loading, teardown, and what a mock database can't catch."
+keywords: "testcontainers mysql, testcontainers go mysql, integration testing mysql, ephemeral database testing, mysql docker test, ci database testing, testcontainers-go, mock database vs real database"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Mocking a database driver lets a test run fast, but it can only return what you told it to return. It cannot enforce a unique constraint, reject a value that violates strict mode, or apply your real schema. Testcontainers starts a real, throwaway MySQL container for the test and removes it afterward, so the test runs against the same server your application runs against in production.
+
+## How Testcontainers Fits Into a Test Suite
+
+Testcontainers is a library, not a separate service. It talks to the Docker daemon already running on your machine or CI runner, starts a container before your test body runs, waits until the container is actually ready to accept connections, and tears it down when the test finishes. Each test (or each test file, depending on how you scope it) gets its own container, so tests don't share state and don't need a shared test database that someone has to remember to reset.
+
+This guide uses Go and the official `testcontainers-go` MySQL module, because Go's `testing` package makes the container lifecycle easy to show in full. Testcontainers has equivalent modules for Java, Python, and Node.js/TypeScript; the setup differs by language, but the pattern (start container, wait for readiness, run schema, run test, tear down) is the same.
+
+## Project Setup
+
+```bash
+go mod init villagesql/testcontainers-guide
+go get github.com/testcontainers/testcontainers-go/modules/mysql
+go get github.com/go-sql-driver/mysql
+```
+
+This pulls in `testcontainers-go` itself as a transitive dependency of the MySQL module, along with the `go-sql-driver/mysql` driver the test uses to actually connect and run queries.
+
+## The Schema and the Code Under Test
+
+A minimal schema with a constraint worth testing against:
+
+```sql
+-- schema.sql
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    age TINYINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_users_email (email)
+);
+```
+
+And a small data access layer with two methods, using the standard library's `database/sql`:
+
+```go
+// store.go
+package store
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+type User struct {
+	ID    int
+	Email string
+	Name  string
+	Age   int
+}
+
+type UserStore struct {
+	db *sql.DB
+}
+
+func NewUserStore(db *sql.DB) *UserStore {
+	return &UserStore{db: db}
+}
+
+func (s *UserStore) CreateUser(email, name string, age int) (int, error) {
+	result, err := s.db.Exec(
+		"INSERT INTO users (email, name, age) VALUES (?, ?, ?)",
+		email, name, age,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert user: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("read generated id: %w", err)
+	}
+	return int(id), nil
+}
+
+func (s *UserStore) GetUserByEmail(email string) (*User, error) {
+	row := s.db.QueryRow(
+		"SELECT id, email, name, age FROM users WHERE email = ?",
+		email,
+	)
+	var u User
+	if err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Age); err != nil {
+		return nil, fmt.Errorf("query user: %w", err)
+	}
+	return &u, nil
+}
+```
+
+Nothing here is aware it is being tested. The test that follows exercises this code exactly as the application would call it.
+
+## Starting the Container and Loading the Schema
+
+```go
+// store_test.go
+package store
+
+import (
+	"context"
+	"database/sql"
+	"path/filepath"
+	"testing"
+
+	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
+)
+
+func newTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+
+	ctx := context.Background()
+
+	container, err := tcmysql.Run(ctx,
+		"mysql:8.0.36",
+		tcmysql.WithDatabase("appdb"),
+		tcmysql.WithUsername("appuser"),
+		tcmysql.WithPassword("apppass"),
+		tcmysql.WithScripts(filepath.Join("schema.sql")),
+	)
+	if err != nil {
+		t.Fatalf("failed to start MySQL container: %s", err)
+	}
+	t.Cleanup(func() {
+		if err := container.Terminate(ctx); err != nil {
+			t.Logf("failed to terminate container: %s", err)
+		}
+	})
+
+	connStr, err := container.ConnectionString(ctx, "parseTime=true")
+	if err != nil {
+		t.Fatalf("failed to build connection string: %s", err)
+	}
+
+	db, err := sql.Open("mysql", connStr)
+	if err != nil {
+		t.Fatalf("failed to open database connection: %s", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("failed to ping database: %s", err)
+	}
+
+	return db
+}
+```
+
+`tcmysql.WithScripts` mounts `schema.sql` into the container's `/docker-entrypoint-initdb.d/` directory, which the official MySQL image runs automatically once, the first time the container starts with an empty data directory. `container.ConnectionString` returns a ready-to-use DSN with the username, password, host, and mapped port already filled in. The `t.Cleanup` calls run in last-in-first-out order regardless of whether the test passes or fails, which is what tears the container down: no separate teardown step to forget.
+
+## Running a Test Against the Real Database
+
+```go
+func TestCreateAndGetUser(t *testing.T) {
+	db := newTestDB(t)
+	s := NewUserStore(db)
+
+	id, err := s.CreateUser("ada@example.com", "Ada Lovelace", 36)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %s", err)
+	}
+	if id == 0 {
+		t.Fatalf("expected a nonzero generated id")
+	}
+
+	got, err := s.GetUserByEmail("ada@example.com")
+	if err != nil {
+		t.Fatalf("GetUserByEmail failed: %s", err)
+	}
+	if got.Name != "Ada Lovelace" || got.Age != 36 {
+		t.Fatalf("got unexpected user: %+v", got)
+	}
+}
+```
+
+Running this with `go test -v` starts a real container, applies the schema, inserts a row through `CreateUser`, reads it back through `GetUserByEmail`, and tears the container down:
+
+```
+=== RUN   TestCreateAndGetUser
+2026/08/28 12:53:15 🐳 Creating container for image mysql:8.0.36
+2026/08/28 12:53:16 ⏳ Waiting for container id ec9a06c2dd5d image: mysql:8.0.36. Waiting for: all of: [log message "port: 3306  MySQL Community Server"]
+2026/08/28 12:53:21 🔔 Container is ready: ec9a06c2dd5d
+2026/08/28 12:53:23 🐳 Terminating container: ec9a06c2dd5d
+--- PASS: TestCreateAndGetUser (7.51s)
+PASS
+```
+
+That run used an already-pulled `mysql:8.0.36` image. The first run on a machine that has never pulled that image takes noticeably longer: in one measured run here, the first test in the suite took 25.95 seconds end to end (image pull included), and every test after it in the same `go test` invocation took 6.8 to 7.5 seconds, because Docker only pulls an image once and Testcontainers starts a fresh container from the already-local image on each subsequent `Run` call. From "container started" to "container is ready" specifically, the MySQL container in this run took about 5 seconds to accept connections.
+
+## Why Not Mock the Database
+
+A mock of `database/sql` returns whatever you told it to return. It has no constraint engine and no strict mode, so it cannot reproduce what MySQL actually does when your code sends it a value MySQL rejects. Two tests against the real container in this project's `store_test.go` demonstrate that directly.
+
+The schema declares `UNIQUE KEY uq_users_email (email)`. Inserting the same email twice against the real container fails with a specific, real MySQL error:
+
+```go
+func TestDuplicateEmailIsRejected(t *testing.T) {
+	db := newTestDB(t)
+	s := NewUserStore(db)
+
+	if _, err := s.CreateUser("grace@example.com", "Grace Hopper", 40); err != nil {
+		t.Fatalf("first CreateUser failed: %s", err)
+	}
+
+	_, err := s.CreateUser("grace@example.com", "Grace Hopper Duplicate", 41)
+	if err == nil {
+		t.Fatalf("expected an error inserting a duplicate email, got nil")
+	}
+
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		t.Fatalf("expected a *mysql.MySQLError, got %T: %s", err, err)
+	}
+	if mysqlErr.Number != 1062 {
+		t.Fatalf("expected MySQL error 1062 (ER_DUP_ENTRY), got %d: %s", mysqlErr.Number, mysqlErr.Message)
+	}
+}
+```
+
+This passed against the real container with `mysqlErr.Number` equal to `1062`, the actual `ER_DUP_ENTRY` code MySQL returns for a unique key violation. A mock would need to be told in advance to return exactly this error in exactly this shape; the real database enforces it because the constraint exists in the schema, not in the test.
+
+The `age` column is `TINYINT UNSIGNED`, so it cannot hold a negative number. Under MySQL's default strict mode (the default since MySQL 5.7), the server rejects an out-of-range value rather than silently clamping it to zero:
+
+```go
+func TestOutOfRangeAgeIsRejected(t *testing.T) {
+	db := newTestDB(t)
+	s := NewUserStore(db)
+
+	_, err := s.CreateUser("negative-age@example.com", "Out Of Range", -1)
+	if err == nil {
+		t.Fatalf("expected an error inserting a negative age into TINYINT UNSIGNED, got nil")
+	}
+
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		t.Fatalf("expected a *mysql.MySQLError, got %T: %s", err, err)
+	}
+	if mysqlErr.Number != 1264 {
+		t.Fatalf("expected MySQL error 1264 (ER_WARN_DATA_OUT_OF_RANGE), got %d: %s", mysqlErr.Number, mysqlErr.Message)
+	}
+}
+```
+
+This also passed against the real container with error `1264`, `ER_WARN_DATA_OUT_OF_RANGE`. Neither of these behaviors comes from application code. Both come from MySQL itself, which is exactly why a database-level mock cannot reproduce them without being hand-coded to fake this one specific case.
+
+## Pointing Testcontainers at a VillageSQL Image Instead
+
+VillageSQL speaks the same wire protocol as MySQL, so the same `testcontainers-go` MySQL module can drive a `villagesql/server` container instead of a stock `mysql` one. Doing this required one change. The module's default readiness check waits for the literal log line `port: 3306  MySQL Community Server`, which VillageSQL's startup log never prints; VillageSQL's own ready line reads `... ready for connections. Version: '8.4.11-villagesql-0.0.6' ... port: 3306 ...`. Overriding the wait strategy to match that line is enough:
+
+```go
+import (
+	"github.com/testcontainers/testcontainers-go"
+	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
+	"github.com/testcontainers/testcontainers-go/wait"
+)
+
+container, err := tcmysql.Run(ctx,
+	"villagesql/server:latest",
+	tcmysql.WithDatabase("appdb"),
+	tcmysql.WithUsername("appuser"),
+	tcmysql.WithPassword("apppass"),
+	tcmysql.WithScripts(filepath.Join("schema.sql")),
+	testcontainers.WithWaitStrategy(
+		wait.ForLog("ready for connections").WithOccurrence(2),
+	),
+)
+```
+
+`WithOccurrence(2)` is needed because the entrypoint script starts a temporary server first (to run the init scripts), then starts the real server the container keeps running; both print a "ready for connections" line, and the second one is the one to wait for. With this wait strategy in place, the container started, applied `schema.sql`, and accepted a connection in 6.81 seconds in a run captured here, and `SELECT VERSION()` returned `8.4.11-villagesql-0.0.6`. Everything else, `WithDatabase`, `WithUsername`, `WithPassword`, `WithScripts`, and `ConnectionString`, worked unchanged.
+
+## Choosing an Image and Version
+
+Pin an exact tag rather than `latest` for any test that runs in CI, so a new upstream image release can't change your test results out from under you:
+
+```go
+tcmysql.Run(ctx, "mysql:8.0.36", ...)
+```
+
+For VillageSQL, pin the same way once you have a version you want to stay on:
+
+```go
+tcmysql.Run(ctx, "villagesql/server:mysql-8.4_0.0.6", ...)
+```
+
+Check `docker manifest inspect <image>:<tag>` before committing to a tag to confirm it exists and to see which architectures it publishes; both `mysql:8.0.36` and `villagesql/server:latest` published `amd64` and `arm64` manifests as of this writing, so the same tag runs on Intel and Apple Silicon CI runners without a platform override.
+
+## Frequently Asked Questions
+
+#### Does Testcontainers need a real Docker daemon, or does it work with a mock?
+
+It needs a real Docker daemon reachable from wherever the test runs: Docker Desktop locally, or a Docker-in-Docker or Docker-socket-mounted runner in CI. If `docker info` fails on the machine running the test, Testcontainers fails to start the container and the test fails with a connection error before it ever reaches your code.
+
+#### Does each test get its own container, or can tests share one?
+
+That is a choice you make in your test code, not something Testcontainers imposes. Calling the container-starting helper from inside each `Test...` function, as shown above, gives every test its own container and the strongest isolation. Starting the container once in `TestMain` and sharing it across tests in a package is faster, but then each test is responsible for cleaning up the rows it inserted so it doesn't see another test's data.
+
+#### How long does a container take to become ready?
+
+In the runs captured for this guide, a `mysql:8.0.36` container took about 5 seconds from "container started" to "ready for connections" once the image was already pulled locally, and a `villagesql/server:latest` container took a comparable amount of time. The first container to start in a `go test` run that has never pulled the image before takes substantially longer, because it pays for the image pull as well; one measured run here took 25.95 seconds for that first container.
+
+#### Can I run the schema migration tool I already use instead of a plain SQL file?
+
+Yes. `WithScripts` just mounts files into `/docker-entrypoint-initdb.d/`, which accepts `.sql` and `.sh` files. A shell script in that directory can invoke any migration tool that can run against a host and port, as long as the tool is available inside the container or you install it as part of the script.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `failed to start MySQL container` with a Docker connection error | Run `docker info` to confirm the Docker daemon is running and reachable before running the test |
+| Container starts but the wait strategy never matches, then the test fails on a deadline | The default `testcontainers-go` MySQL wait strategy looks for a MySQL-specific log line; a non-stock image with different startup logging needs its own `testcontainers.WithWaitStrategy(...)` as shown in the VillageSQL section above |
+| `WithScripts` file doesn't seem to run | Init scripts only run once, the first time a container starts with an empty data directory; a stopped-and-restarted container with an existing volume won't re-run them |
+| Tests are slow in CI specifically | Confirm the CI runner has the image cached or can pull it quickly; also confirm the runner has a Docker socket available, since some sandboxed CI environments block direct Docker access |
+| `*mysql.MySQLError` type assertion fails even though the insert clearly failed | Confirm the import is `github.com/go-sql-driver/mysql`, and use `errors.As`, not a direct type assertion, since `database/sql` may wrap the driver error |
+
+## See also
+
+- [MySQL on Docker](/guides/mysql-on-docker) — the image, environment variables, and volume behavior Testcontainers builds on
+- [Schema Migrations in MySQL](/guides/schema-migrations) — running the same schema changes this guide loads through `WithScripts` in production
+- [MySQL with ORMs](/guides/mysql-with-orms) — using an ORM's own connection pool and migration tooling against a Testcontainers-managed database

@@ -1,0 +1,320 @@
+---
+title: "MySQL on a Serverless Runtime with Drizzle"
+sidebarTitle: "Serverless with Drizzle"
+description: "Why connection pooling works differently on a serverless runtime than on a long-lived Node server, and how a fresh connection per function invocation exhausts MySQL's connection limit under concurrent load."
+keywords: "mysql serverless, drizzle orm serverless, mysql connection pooling serverless, hono mysql, mysql2 serverless, mysql too many connections, serverless cold start database, max_user_connections mysql, mysql lambda connections"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A long-lived Node server opens one connection pool when the process starts and reuses it for every request until the process shuts down. A serverless function does not have that guarantee: each invocation can run in a fresh execution environment with no memory of the last one, so code that creates a pool "the normal way" can end up creating a brand new pool, or a brand new connection, on every single request. This guide builds a small Hono application with Drizzle ORM and `mysql2`, then measures what happens to MySQL's connection count under concurrent load with each pattern.
+
+## What This Guide Tested, and What It Did Not
+
+Everything below ran against a real, local VillageSQL server and a real Node process. The application is a Hono app built with the `nodejs` template (`npm create hono@latest`), which runs as an ordinary long-lived Node process during this guide's testing, not deployed to Cloudflare Workers, AWS Lambda, or Vercel's edge runtime.
+
+That matters for one specific claim this guide makes and one it does not:
+
+- **What was tested for real**: a request handler that opens a fresh MySQL connection every time it runs, versus a handler that reuses a connection pool created once at module load. Firing concurrent HTTP requests at each version and watching MySQL's connection count is a faithful reproduction of what happens inside a single serverless function instance handling concurrent invocations, or a cold-starting instance whose module-level code re-runs.
+- **What was not tested**: the multiplication effect of many separate execution environments cold-starting at once, each running its own copy of this process and opening its own pool. A real burst of traffic on AWS Lambda or Cloudflare Workers can spin up dozens of isolated instances simultaneously, and a pool of 10 connections in each of them adds up fast even with the fix in this guide applied. The "Beyond a Single Instance" section below covers what to do about that, but it was not something this guide's Node process, which is a single instance by definition, could reproduce.
+
+## Set Up the Database
+
+Create a dedicated database and a user scoped to it:
+
+```sql
+CREATE DATABASE serverless_guide;
+CREATE USER 'serverless_app'@'127.0.0.1' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON serverless_guide.* TO 'serverless_app'@'127.0.0.1';
+FLUSH PRIVILEGES;
+```
+
+## Scaffold the Application
+
+This guide uses Hono's `nodejs` template, which runs on `@hono/node-server` and does not require a specific cloud platform to develop against:
+
+```bash
+npm create hono@latest serverless-mysql-drizzle -- --template nodejs
+```
+
+Install Drizzle, the `mysql2` driver, and `drizzle-kit`:
+
+```bash
+npm install drizzle-orm mysql2 dotenv
+npm install -D drizzle-kit tsx
+```
+
+`drizzle-orm` and `drizzle-kit` both publish pre-release tags (`beta`, `rc`) under `dist-tags` alongside `latest`. Check before installing:
+
+```bash
+npm view drizzle-orm dist-tags
+npm view drizzle-kit dist-tags
+```
+
+At the time of writing, `latest` for `drizzle-orm` resolves to `0.45.2` and for `drizzle-kit` to `0.31.10`, both stable releases, not release candidates.
+
+Set the connection string in `.env`:
+
+```bash
+DATABASE_URL="mysql://serverless_app:your_password@127.0.0.1:3306/serverless_guide"
+```
+
+## Define the Schema and Run the Migration
+
+```typescript src/db/schema.ts
+import { int, mysqlTable, text, timestamp, varchar } from "drizzle-orm/mysql-core";
+
+export const posts = mysqlTable("posts", {
+  id: int("id").autoincrement().primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+```
+
+```typescript drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+export default defineConfig({
+  out: "./drizzle",
+  schema: "./src/db/schema.ts",
+  dialect: "mysql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL,
+  },
+});
+```
+
+Generate and apply the migration:
+
+```bash
+npx drizzle-kit generate
+npx drizzle-kit migrate
+```
+
+```
+Reading config file 'drizzle.config.ts'
+Reading schema files:
+src/db/schema.ts
+
+1 tables
+posts 4 columns 0 indexes 0 fks
+
+[✓] Your SQL migration file ➜ drizzle/0000_eminent_corsair.sql 🚀
+```
+
+Confirm the table exists:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u serverless_app -p serverless_guide -e "SHOW TABLES; DESCRIBE posts;"
+```
+
+```
+Tables_in_serverless_guide
+__drizzle_migrations
+posts
+Field	Type	Null	Key	Default	Extra
+id	int	NO	PRI	NULL	auto_increment
+title	varchar(255)	NO		NULL	
+body	text	NO		NULL	
+created_at	timestamp	NO		now()	DEFAULT_GENERATED
+```
+
+## The Anti-Pattern: A Connection Per Request
+
+The most common way this problem shows up is code that looks reasonable in isolation. It opens a `mysql2` connection, runs a query, and closes the connection, all inside the request handler:
+
+```typescript src/index.bad.ts
+import "dotenv/config";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import { desc } from "drizzle-orm";
+import { posts } from "./db/schema.js";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+const app = new Hono();
+
+// Anti-pattern: a fresh connection is opened inside the handler, on every
+// request. This is what naively porting a "just create a pool" snippet
+// into a function-per-invocation runtime produces.
+app.get("/posts", async (c) => {
+  try {
+    const connection = await mysql.createConnection(process.env.DATABASE_URL as string);
+    const db = drizzle(connection, { schema: { posts }, mode: "default" });
+
+    const rows = await db.select().from(posts).orderBy(desc(posts.createdAt)).limit(5);
+
+    await connection.end();
+    return c.json(rows);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) }, 503);
+  }
+});
+
+serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
+  console.log(`[bad] listening on http://localhost:${info.port}`);
+});
+```
+
+At low concurrency this works. Five concurrent clients hitting it for three seconds returned zero failed responses. The problem only appears once concurrent invocations outnumber what the database will allow for that user.
+
+## Demonstrating the Exhaustion
+
+MySQL's `max_connections` is a server-wide ceiling, and lowering it on a shared server to force a failure would affect every other connection on that instance. A more targeted way to reproduce a connection ceiling for a single application, and one cloud MySQL providers use for exactly this reason, is `MAX_USER_CONNECTIONS` on the account itself:
+
+```sql
+ALTER USER 'serverless_app'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 15;
+```
+
+```sql
+SELECT user, host, max_user_connections FROM mysql.user WHERE user = 'serverless_app';
+```
+
+```
+user	host	max_user_connections
+serverless_app	127.0.0.1	15
+```
+
+With the anti-pattern server running and `serverless_app` capped at 15 connections, a burst of 30 concurrent requests for 5 seconds (using [autocannon](https://github.com/mcollina/autocannon)) produced this:
+
+```bash
+npx autocannon -c 30 -d 5 http://localhost:3000/posts
+```
+
+```
+20916 2xx responses, 3614 non 2xx responses
+25k requests in 5.01s, 6.6 MB read
+```
+
+Sampling the number of active connections for `serverless_app` during the burst, taken every 150ms with `SELECT COUNT(*) FROM information_schema.processlist WHERE user = 'serverless_app'`, showed the count climbing to and past the 15-connection cap (15, 15, 16, 17, 17, 17, 17, 25 across the highest samples). Once past it, the server's own log filled with:
+
+```
+Error: User 'serverless_app' has exceeded the 'max_user_connections' resource (current value: 15)
+    code: 'ER_USER_LIMIT_REACHED',
+    errno: 1226,
+    sqlState: '42000',
+```
+
+Nothing about this is specific to `MAX_USER_CONNECTIONS`. A server with no per-user limit at all would show the same climbing count against `max_connections` instead, and the same error under a different name (`ERROR 1040 (08004): Too many connections`) once the server-wide ceiling was reached. The per-user cap is what makes this reproducible without disturbing anything else running against the same server.
+
+## The Fix: Create the Pool Once, Outside the Handler
+
+The fix is not to stop pooling. It is to make sure the pool is created exactly once, at module load, rather than inside the function that handles each request:
+
+```typescript src/db/index.ts
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import * as schema from "./schema.js";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+// Module-level pool: created once when this module is first loaded, not
+// inside a request handler. A warm serverless invocation reuses the same
+// module instance and therefore the same pool; only a cold start re-runs
+// this file and opens a fresh one.
+const poolConnection = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  connectionLimit: 10,
+  waitForConnections: true,
+  queueLimit: 0,
+});
+
+export const db = drizzle(poolConnection, { schema, mode: "default" });
+```
+
+```typescript src/index.ts
+import "dotenv/config";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { desc } from "drizzle-orm";
+import { db } from "./db/index.js";
+import { posts } from "./db/schema.js";
+
+const app = new Hono();
+
+app.get("/posts", async (c) => {
+  const rows = await db.select().from(posts).orderBy(desc(posts.createdAt)).limit(20);
+  return c.json(rows);
+});
+
+app.post("/posts", async (c) => {
+  const body = await c.req.json();
+  if (typeof body.title !== "string" || body.title.trim() === "") {
+    return c.json({ error: "title is required" }, 400);
+  }
+  if (typeof body.body !== "string" || body.body.trim() === "") {
+    return c.json({ error: "body is required" }, 400);
+  }
+  const [result] = await db.insert(posts).values({ title: body.title, body: body.body });
+  return c.json({ insertId: result.insertId }, 201);
+});
+
+serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
+  console.log(`Server is running on http://localhost:${info.port}`);
+});
+```
+
+`db/index.ts` runs its top-level `mysql.createPool()` call exactly once, whenever the module is first imported. In a long-lived Node server that means once at process startup. On a serverless runtime whose provider reuses the execution environment for a later request without a cold start, the imported module is still in memory, so the pool from the first invocation is reused rather than recreated. Only a genuine cold start, which reloads the module from scratch, opens a new pool.
+
+Running the same 30-concurrent, 5-second burst against this version, still with `serverless_app` capped at 15 connections:
+
+```
+77k requests in 5.01s, 20.7 MB read
+```
+
+No non-2xx responses at all. Sampling the same per-user connection count during this burst held steady at exactly 10, the pool's own `connectionLimit`, for every sample taken. The pool never asked MySQL for more connections than it was configured to hold open, regardless of how many concurrent requests arrived. Total throughput was also roughly three times higher over the same 5-second window (77,000 requests against 25,000). Part of that gap is the pooled version skipping a full TCP handshake and authentication round trip on every request; part of it is that many of the anti-pattern version's 25,000 requests were fast `503` failures once the connection cap was hit, rather than a completed query, which inflates its request count without doing real work.
+
+## Beyond a Single Instance
+
+The fix above solves the problem this guide could reproduce: concurrent requests within one running instance. It does not solve a second problem that only shows up on a real serverless platform: many separate instances cold-starting at once under a traffic spike, each running its own copy of this code and therefore opening its own pool. A pool opens connections lazily, only as concurrent requests actually need them, so ten idle instances do not open 100 connections just by existing. But once each instance is handling even modest, ordinary traffic, ten instances with a `connectionLimit` of 10 each can add up to 100 connections well before the workload looks like anything unusual. This guide's Node process could not reproduce that, because it is one process, not many.
+
+Two approaches address it, and neither substitutes for the fix above; they are additive:
+
+- **Set a much smaller `connectionLimit` per instance**, often 1 or 2 rather than 10, since each concurrently running instance handles a small number of requests at a time on most serverless platforms.
+- **Put a connection-pooling proxy in front of MySQL**, such as ProxySQL, so that many separate serverless instances share a much smaller number of actual MySQL connections. See [MySQL Connection Pooling](/guides/connection-pooling) for how ProxySQL fits into this.
+
+## Frequently Asked Questions
+
+#### Why not just increase `max_connections`?
+
+It raises the ceiling but does not remove it, and every connection carries a real memory cost on the server (see [MySQL Connection Pooling](/guides/connection-pooling) for the per-connection cost breakdown). A serverless workload that can scale to hundreds of concurrent instances will eventually reach any fixed ceiling; the fix is to stop each instance from opening more connections than it needs, not to raise the number those instances are allowed to exhaust.
+
+#### Does this apply to Express as well as Hono?
+
+Yes. The failure mode is about where the pool or connection is created relative to the request handler, not about which web framework routes the request. An Express app with `mysql.createConnection()` called inside a route handler has the identical problem, and `mysql.createPool()` called once at module scope has the identical fix.
+
+#### Is `mysql2`'s built-in pool enough, or do I need something like ProxySQL?
+
+For a single long-lived server, `mysql2`'s pool is enough on its own; that is what [MySQL Connection Pooling](/guides/connection-pooling) covers. On a serverless platform, the module-level pool pattern in this guide keeps one instance from opening more connections than its `connectionLimit`, but it cannot coordinate across separate concurrently running instances. A proxy like ProxySQL is what coordinates across instances.
+
+#### Why did the fixed version's connection count sit exactly at 10 instead of climbing to 30, matching the concurrency of the test?
+
+Because the pool has `waitForConnections: true` and a `connectionLimit` of 10. Once 10 connections are checked out, the eleventh concurrent request waits for one to be returned to the pool rather than opening a new one. Requests queue briefly instead of the pool growing without bound.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `ERROR 1226 (42000): User '<user>' has exceeded the 'max_user_connections' resource` | The account has hit its `MAX_USER_CONNECTIONS` cap. Move connection or pool creation out of the request handler, or raise the cap with `ALTER USER ... WITH MAX_USER_CONNECTIONS n` if the workload genuinely needs more. |
+| `ERROR 1040 (08004): Too many connections` | The server-wide `max_connections` ceiling was reached. Same underlying cause as the per-user error above when no per-user cap is set; fix the connection pattern first before raising the limit. |
+| Connections climb steadily and never come back down after a burst ends | A connection or pool is being created but never closed on some code path. Every code path in the handler, including error paths, must either close the connection or let a bounded pool manage its own lifecycle. |
+| Pool works locally but instances still pile up connections in production | The single-instance fix in this guide does not coordinate across separate concurrently running serverless instances. See "Beyond a Single Instance" above. |
+
+## See also
+
+- [MySQL Connection Pooling](/guides/connection-pooling) — how pooling works on a long-lived server, and how ProxySQL coordinates pooling across multiple application servers
+- [Next.js and Drizzle with MySQL](/guides/mysql-with-drizzle) — the same schema and Drizzle setup on a long-lived Next.js server, without the serverless connection lifecycle
+- [Using MySQL with ORMs: Django, Rails, and Prisma](/guides/mysql-with-orms) — configuring MySQL-specific pool settings across ORMs beyond Drizzle

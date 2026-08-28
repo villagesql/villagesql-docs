@@ -1,0 +1,396 @@
+---
+title: "Connecting an AI Agent to MySQL with MCP"
+sidebarTitle: "Connecting AI Agents (MCP)"
+description: "How to expose a VillageSQL database to an AI agent over the Model Context Protocol using the vsql_mcp extension — installation, a least-privilege database account, guardrails, and a real client connection."
+keywords: "mysql mcp, model context protocol mysql, vsql_mcp, mysql ai agent, claude code mysql, mcp server mysql, ai agent database access, mcp streamable http"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+An AI agent that needs to query a database usually talks to it through a hand-written tool or a sidecar process. The `vsql_mcp` extension removes that layer: it runs a Model Context Protocol server inside the VillageSQL process itself, so any MCP client can discover the schema and run queries directly.
+
+## What vsql_mcp Does
+
+`vsql_mcp` is a Rust extension that serves MCP over the Streamable HTTP transport (spec revision `2025-06-18`) from a background worker inside the server process. It exposes six tools: `list_schemas`, `list_tables`, `describe_table`, `query`, `explain`, and `write`. The `write` tool only appears once you enable it, and it is disabled by default.
+
+`vsql_mcp` is a preview extension. It uses the VEF preview capabilities `thread_worker`, `sys_var`, `status_var`, and `sql_query`, so the server must be started with preview extensions allowed:
+
+```bash
+mysqld --vsql_allow_preview_extensions=ON ...
+```
+
+Check the flag before installing:
+
+```sql
+SHOW VARIABLES LIKE 'vsql_allow_preview_extensions';
+```
+
+```
++--------------------------------+-------+
+| Variable_name                  | Value |
++--------------------------------+-------+
+| vsql_allow_preview_extensions  | ON    |
++--------------------------------+-------+
+```
+
+## Creating Sample Data
+
+This guide uses a dedicated database and a small `posts` table so the agent has something real to query.
+
+```sql
+CREATE DATABASE mcp_guide;
+
+CREATE TABLE mcp_guide.posts (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  title VARCHAR(200) NOT NULL,
+  author VARCHAR(100) NOT NULL,
+  views INT NOT NULL DEFAULT 0
+);
+
+INSERT INTO mcp_guide.posts (title, author, views) VALUES
+  ('Getting started with VillageSQL', 'Adam', 1520),
+  ('Custom types in VEF', 'Priya', 890),
+  ('Why we built the MCP extension', 'Tomas', 430);
+```
+
+## Installing the Extension
+
+```sql
+INSTALL EXTENSION vsql_mcp;
+```
+
+Installing it registers its configuration and status variables. Nothing listens on a port until you turn it on in the next section.
+
+## Creating a Least-Privilege Account
+
+`vsql_mcp` runs most tool calls, including `query`, `write`, `explain`, and the table-DDL resource, over a loopback connection to the server using an account you configure. Only `list_schemas`, `list_tables`, and `describe_table` run in-process without that account. Create a dedicated account scoped to the one database this guide uses, with `SELECT` only:
+
+```sql
+CREATE USER 'mcp_user'@'127.0.0.1' IDENTIFIED BY 'ChangeMe-guide-2026!';
+GRANT SELECT ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+The account's grants are the real access boundary. `vsql_mcp`'s own guardrails, covered below, are enforced on top of these grants, not instead of them.
+
+## Configuring and Enabling the Server
+
+All `vsql_mcp` settings are `SET GLOBAL vsql_mcp.<name>` variables. Point `db_url` at the account created above, scope the server to one schema, require a bearer token, and turn it on:
+
+```sql
+SET GLOBAL vsql_mcp.db_url = 'mysql://mcp_user:ChangeMe-guide-2026!@127.0.0.1:3306';
+SET GLOBAL vsql_mcp.schema = 'mcp_guide';
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'a-long-random-token';
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+```
+
+Confirm it is listening:
+
+```sql
+SHOW STATUS LIKE 'vsql_mcp%';
+```
+
+```
++----------------------------+-------+
+| Variable_name              | Value |
++----------------------------+-------+
+| vsql_mcp.http_port         | 3100  |
+| vsql_mcp.https_port        | 0     |
+| vsql_mcp.rows_returned_total | 0   |
+| vsql_mcp.sessions_active   | 0     |
+| vsql_mcp.tool_calls_total  | 0     |
+| vsql_mcp.tool_errors_total | 0     |
++----------------------------+-------+
+```
+
+`http_port` shows `3100`, the default. The server listens on `http://127.0.0.1:3100/mcp` and binds to `127.0.0.1` only. It never accepts remote connections directly; putting it behind a reverse proxy is your responsibility if you need that.
+
+## Verifying the Server Speaks MCP
+
+Before connecting a real client, verify the HTTP endpoint directly with the MCP handshake. A request with no bearer token is rejected:
+
+```bash
+curl -i -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
+```
+
+```
+HTTP/1.1 401 Unauthorized
+```
+
+With the token, `initialize` succeeds and returns an `Mcp-Session-Id` header:
+
+```bash
+curl -i -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
+```
+
+```
+HTTP/1.1 200 OK
+Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606
+
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.6"}}}
+```
+
+Every following request on this connection needs that session ID. Omitting it fails with a JSON-RPC error, not a silent default:
+
+```bash
+curl -i -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -d '{"jsonrpc":"2.0","id":99,"method":"tools/list"}'
+```
+
+```
+HTTP/1.1 400 Bad Request
+
+{"error":{"code":-32600,"message":"missing Mcp-Session-Id header"},"id":99,"jsonrpc":"2.0"}
+```
+
+Send `notifications/initialized`, then list the available tools using the session ID from the `initialize` response:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+```
+
+```json
+{"id":2,"jsonrpc":"2.0","result":{"tools":[
+  {"name":"list_schemas","description":"List schemas visible to the extension.","inputSchema":{"properties":{},"type":"object"}},
+  {"name":"list_tables","description":"List tables and views in a schema, with row estimates.","inputSchema":{"properties":{"schema":{"type":"string"}},"type":"object"}},
+  {"name":"describe_table","description":"Columns, types, and keys for a table.","inputSchema":{"properties":{"schema":{"type":"string"},"table":{"type":"string"}},"required":["table"],"type":"object"}},
+  {"name":"query","description":"Run a single read-only SELECT and return JSON rows.","inputSchema":{"properties":{"sql":{"type":"string"}},"required":["sql"],"type":"object"}},
+  {"name":"explain","description":"Return EXPLAIN FORMAT=JSON for a candidate query.","inputSchema":{"properties":{"sql":{"type":"string"}},"required":["sql"],"type":"object"}}
+]}}
+```
+
+Five tools are listed, not six. `write` is missing because `allow_write` is still OFF, so an agent connecting right now never plans around a tool it cannot use.
+
+## Calling Tools Over MCP
+
+`list_tables` shows the one table in the exposed schema:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_tables","arguments":{"schema":"mcp_guide"}}}'
+```
+
+```json
+{"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"{\"schema\":\"mcp_guide\",\"tables\":[{\"name\":\"posts\",\"row_estimate\":3,\"type\":\"BASE TABLE\"}]}","type":"text"}],"isError":false}}
+```
+
+`query` runs a `SELECT` and returns the actual rows:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT id, title, author, views FROM mcp_guide.posts ORDER BY views DESC"}}}'
+```
+
+```json
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"{\"columns\":[\"id\",\"title\",\"author\",\"views\"],\"row_count\":3,\"rows\":[{\"author\":\"Adam\",\"id\":1,\"title\":\"Getting started with VillageSQL\",\"views\":1520},{\"author\":\"Priya\",\"id\":2,\"title\":\"Custom types in VEF\",\"views\":890},{\"author\":\"Tomas\",\"id\":3,\"title\":\"Why we built the MCP extension\",\"views\":430}],\"truncated\":false}","type":"text"}],"isError":false}}
+```
+
+That is the real sample data from the `posts` table, returned through the MCP protocol rather than a direct SQL connection.
+
+`query` only accepts a single read-only statement. Anything else is refused before it reaches the database:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"query","arguments":{"sql":"DELETE FROM mcp_guide.posts"}}}'
+```
+
+```json
+{"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"only a single read-only statement is allowed by the query tool","type":"text"}],"isError":true}}
+```
+
+## Connecting a Real Client
+
+The steps above prove the server responds correctly to a raw HTTP client. To prove an agent can actually use it, register the server with Claude Code and let it manage the session:
+
+```bash
+claude mcp add --transport http vsql http://127.0.0.1:3100/mcp \
+  --header "Authorization: Bearer a-long-random-token"
+```
+
+```
+Added HTTP MCP server vsql with URL: http://127.0.0.1:3100/mcp to local config
+Headers: {
+  "Authorization": "[REDACTED]"
+}
+File modified: /Users/villageadam/.claude.json [project: /path/to/your/project]
+```
+
+`local config` scopes the server to this one project. Pass `--scope user` instead to make it available in every project. `claude mcp list` shows the connection status:
+
+```
+vsql: http://127.0.0.1:3100/mcp (HTTP) - ✔ Connected
+```
+
+Claude Code performed its own `initialize` handshake, negotiated a session, and confirmed the server answers over MCP, the same server this guide configured with `SET GLOBAL` statements and tested by hand above. From here, asking the agent a question about the `mcp_guide` database routes through `list_tables`, `describe_table`, and `query`, exactly as demonstrated with curl.
+
+`vsql_mcp` has no stdio transport. The server runs inside the database process, so there is no child process for a client to spawn. A client that only speaks stdio, or a remote client that proxies through a vendor cloud and cannot reach `127.0.0.1`, needs a stdio-to-HTTP bridge or a tunnel in front of the endpoint.
+
+## The write Tool
+
+`allow_write` is OFF by default, and calling `write` while it is off fails immediately, without touching the database:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"write","arguments":{"sql":"UPDATE mcp_guide.posts SET views = 9999 WHERE id = 1"}}}'
+```
+
+```json
+{"id":6,"jsonrpc":"2.0","result":{"content":[{"text":"the write tool is disabled (set vsql_mcp.allow_write = ON)","type":"text"}],"isError":true}}
+```
+
+Turning `allow_write` ON makes the tool appear in `tools/list`, but the account's own grants still apply. With `mcp_user` still holding only `SELECT`, the same call now fails at the database layer instead:
+
+```sql
+SET GLOBAL vsql_mcp.allow_write = ON;
+```
+
+```json
+{"id":8,"jsonrpc":"2.0","result":{"content":[{"text":"ERROR 1142 (42000): UPDATE command denied to user 'mcp_user'@'localhost' for table 'posts'","type":"text"}],"isError":true}}
+```
+
+Granting `UPDATE` on the database lets the same call through, and it genuinely changes the row:
+
+```sql
+GRANT UPDATE ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+```json
+{"id":9,"jsonrpc":"2.0","result":{"content":[{"text":"{\"affected_rows\":1}","type":"text"}],"isError":false}}
+```
+
+```sql
+SELECT id, title, views FROM mcp_guide.posts WHERE id = 1;
+```
+
+```
++----+----------------------------------+-------+
+| id | title                            | views |
++----+----------------------------------+-------+
+|  1 | Getting started with VillageSQL | 9999  |
++----+----------------------------------+-------+
+```
+
+`allow_write` and the account's grants are two separate gates, and a real write requires both open. There is no row ceiling on a write the way `max_rows` caps a read: an unqualified `DELETE` empties the table regardless of any other setting. An agent with write access to a production database carries the same risk as any other autonomous process with broad write access: it can act on a plan that made sense to it and not to you, faster than a human review step can catch it. Give `db_url` an account whose grants match exactly the blast radius you are willing to accept, and treat `allow_write` as a decision made per database, not a default to leave on because a demo needed it.
+
+This guide turns `allow_write` back off and revokes `UPDATE` before continuing, which is also the safer resting state for a database an agent has standing access to.
+
+```sql
+REVOKE UPDATE ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+```
+
+## Narrowing What an Agent Can Reach
+
+Two settings narrow an agent's reach further than the account's grants alone, useful when one account serves more than `vsql_mcp`.
+
+`max_rows` caps how many rows a single `query` call returns and marks the result `truncated`:
+
+```sql
+SET GLOBAL vsql_mcp.max_rows = 2;
+```
+
+```json
+{"id":10,"jsonrpc":"2.0","result":{"content":[{"text":"{\"columns\":[\"id\",\"title\"],\"row_count\":2,\"rows\":[{\"id\":1,\"title\":\"Getting started with VillageSQL\"},{\"id\":2,\"title\":\"Custom types in VEF\"}],\"truncated\":true}","type":"text"}],"isError":false}}
+```
+
+`allowed_tables` restricts which tables a statement may touch, checked by planning the statement with `EXPLAIN FORMAT=JSON`. Add a second table to see it enforced:
+
+```sql
+CREATE TABLE mcp_guide.secrets (id INT PRIMARY KEY AUTO_INCREMENT, api_key VARCHAR(200) NOT NULL);
+INSERT INTO mcp_guide.secrets (api_key) VALUES ('sk-do-not-expose-this');
+GRANT SELECT ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+With `secrets` present in the same schema and `allowed_tables` set to `posts` only, `posts` still works and `secrets` is refused:
+
+```sql
+SET GLOBAL vsql_mcp.allowed_tables = 'posts';
+```
+
+```json
+{"id":12,"jsonrpc":"2.0","result":{"content":[{"text":"table 'secrets' is not in vsql_mcp.allowed_tables","type":"text"}],"isError":true}}
+```
+
+`list_tables` also stops naming the excluded table, so an agent working from `list_tables` alone never learns `secrets` exists:
+
+```json
+{"id":13,"jsonrpc":"2.0","result":{"content":[{"text":"{\"schema\":\"mcp_guide\",\"tables\":[{\"name\":\"posts\",\"row_estimate\":3,\"type\":\"BASE TABLE\"}]}","type":"text"}],"isError":false}}
+```
+
+The allowlist is planned from the statement's tables, not read from the account's grants, so it does not see through a stored function and it does not stop a read tool from calling any function the `db_url` account may call. Treat `allowed_tables` and `max_rows` as guardrails layered on top of the account's grants, not a substitute for scoping the grants themselves.
+
+## Frequently Asked Questions
+
+#### Does an agent need direct access to the database credentials?
+
+No. The agent authenticates to `vsql_mcp` with the bearer token set in `vsql_mcp.bearer_token`. The database account named by `vsql_mcp.db_url` is only used internally by the extension to run tool queries; the agent never sees that account's password.
+
+#### Can I expose more than one schema?
+
+Yes. Leave `vsql_mcp.schema` empty to expose every non-system schema the `db_url` account can see, instead of scoping to one.
+
+#### Does vsql_mcp support TLS?
+
+Yes. Setting both `vsql_mcp.ssl_cert` and `vsql_mcp.ssl_key` to PEM file paths serves HTTPS on `vsql_mcp.ssl_port` (default `3143`). Leaving either one empty turns TLS off regardless of the port setting.
+
+#### Why does changing the port not take effect immediately?
+
+Port and TLS settings take effect the next time the server is enabled. Toggle `vsql_mcp.vsql_mcp_enabled` OFF and then ON after changing them.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `INSTALL EXTENSION vsql_mcp` fails with a preview capabilities error | Start the server with `--vsql_allow_preview_extensions=ON`, or run `SET PERSIST vsql_allow_preview_extensions = ON` and restart. |
+| `SHOW STATUS LIKE 'vsql_mcp.http_port'` returns `0` | The server is not listening. Confirm `vsql_mcp.vsql_mcp_enabled = ON` and check that nothing else is already bound to the configured port. |
+| Every request returns `401 Unauthorized` | `require_auth` is ON and the request is missing `Authorization: Bearer <token>`, or the token does not match `vsql_mcp.bearer_token`. |
+| A `tools/call` returns `400` with `missing Mcp-Session-Id header` | Every request after `initialize` must carry the `Mcp-Session-Id` value returned by the `initialize` response. |
+| `query` or `write` fails with a MySQL grant error | The account named in `vsql_mcp.db_url` does not have the privilege the statement needs. Grant it there, not just in `allowed_tables`. |
+| `write` is missing from `tools/list` | `vsql_mcp.allow_write` is OFF. Set it to `ON` to enable the tool. |
+| A client can't connect at all | Confirm the client is reaching `127.0.0.1` and the configured port; `vsql_mcp` does not bind to any other interface. |
+
+## See also
+
+- [MySQL User Management](/guides/user-management) — `CREATE USER`, `GRANT`, and least-privilege account design
+- [MySQL Security Hardening](/guides/security-hardening) — broader server hardening beyond a single extension's guardrails
+- [Connecting MySQL to AI APIs](/guides/ai-api-setup) — the other direction: calling an AI API from inside MySQL with `vsql_ai`

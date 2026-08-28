@@ -1,0 +1,223 @@
+---
+title: "Zero-Downtime Schema Changes in MySQL"
+sidebarTitle: "Zero-Downtime Schema Changes"
+description: "How to run ALTER TABLE against a live MySQL table without blocking reads or writes, when online DDL cannot help, and how gh-ost fills the gap."
+keywords: "mysql zero downtime, mysql online ddl, alter table lock none, algorithm inplace, algorithm instant, gh-ost, mysql alter table blocking, mysql schema change production"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Running `ALTER TABLE` on a table with live traffic raises one question: will this statement block the application while it runs? This guide measures that directly, on a real table, with a concurrent connection watching the whole time. [Schema Migrations in MySQL](/guides/schema-migrations) covers how to organize and version migration files. This guide covers what a live table actually does while one of those migration files runs against it.
+
+## Test Setup
+
+Every number in this guide came from the same table: an `orders` table loaded with 3,276,802 rows (168.7 MB of data) on a local VillageSQL server.
+
+```sql
+CREATE TABLE orders (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  amount_cents INT NOT NULL,
+  created_at DATETIME NOT NULL
+) ENGINE=InnoDB;
+```
+
+Rows were generated with a numbers-table cross join and then doubled a few times with `INSERT ... SELECT` from itself to reach a few million rows. The exact size does not matter for the conclusions below, but the table needs to be big enough that a full table rebuild takes longer than a fraction of a second, or you cannot observe anything running concurrently with it.
+
+## An Online ALTER Does Not Block Traffic
+
+Adding a secondary index with `ALGORITHM=INPLACE, LOCK=NONE` on the 3.27 million row table above:
+
+```sql
+ALTER TABLE orders ADD INDEX idx_customer_id (customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+took 1.003 seconds end to end. While it was running, `SHOW PROCESSLIST` on a second connection showed it as a real, in-progress operation:
+
+```
+Id   User  Host       db        Command  Time  State           Info
+325  root  localhost  zdt_demo  Query    0     altering table  ALTER TABLE orders ADD INDEX idx_customer_id (customer_id), ALGORITHM=INPLACE, LOCK=NONE
+```
+
+`information_schema.INNODB_TRX` shows the same statement as a running transaction from a separate `ADD INDEX` on the same table:
+
+```
+trx_id: 6472
+trx_state: RUNNING
+trx_query: ALTER TABLE orders ADD INDEX idx_status (status), ALGORITHM=INPLACE, LOCK=NONE
+```
+
+From a third connection, opened and run while the `ALTER` above was still in the `altering table` state, an `INSERT` and a `SELECT` against the same table both completed immediately:
+
+```sql
+INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
+VALUES (999999, 'pending', 500, NOW(), 0, 0);
+-- 0.009s
+SELECT COUNT(*) FROM orders WHERE status='paid';
+-- 0.271s
+```
+
+Neither statement waited for the `ALTER` to finish. This is the entire point of `LOCK=NONE`: the table rebuild happens in the background using InnoDB's online DDL log to capture concurrent changes, and DML against the table proceeds against the original data structures until the rebuild catches up and swaps in.
+
+## ALGORITHM=INSTANT vs. ALGORITHM=INPLACE
+
+Not every online operation costs the same. Adding a column at the end of the table with `ALGORITHM=INSTANT` only changes table metadata; it never reads or rewrites a single row:
+
+```sql
+ALTER TABLE orders ADD COLUMN priority TINYINT NOT NULL DEFAULT 0, ALGORITHM=INSTANT;
+-- 0.011s
+```
+
+Forcing the same shape of change, adding a nullable-default column, through `ALGORITHM=INPLACE` instead:
+
+```sql
+ALTER TABLE orders ADD COLUMN priority2 TINYINT NOT NULL DEFAULT 0, ALGORITHM=INPLACE, LOCK=NONE;
+-- 0.244s
+```
+
+On this 3.27 million row table, `INSTANT` was roughly 20 times faster than `INPLACE` for what is functionally the same column addition. `INPLACE` still has to touch the table's data dictionary entries and coordinate with any concurrent DML; `INSTANT` does neither. The gap grows with table size: `INSTANT` stays constant regardless of row count, while `INPLACE` scales with it.
+
+`INSTANT` is not available for every operation. Adding a column in the middle of a table, adding a column with a `BLOB`/`TEXT` default, or changing an existing column's type all fall back to `INPLACE` or `COPY`.
+
+## When Online DDL Cannot Help: A Column Type Change
+
+Not every `ALTER TABLE` can avoid a lock. Changing a column's data type requires MySQL to rewrite every row, and `INPLACE` cannot do that:
+
+```sql
+ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+```
+ERROR 1846 (0A000) at line 2: ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.
+```
+
+Requesting `ALGORITHM=INSTANT` for the same change fails the same way, with a different reason:
+
+```
+ERROR 1846 (0A000) at line 2: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table to change column type. Try ALGORITHM=COPY/INPLACE.
+```
+
+The only algorithm MySQL will accept for this statement is `COPY`, which rebuilds the entire table and takes an exclusive lock for the duration. Running it against the same table and inserting a row from a second connection during the rebuild demonstrates the difference directly:
+
+```sql
+ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=COPY;
+-- 6.776s
+```
+
+The concurrent `INSERT`, issued 0.3 seconds after the `ALTER` started, did not return until the `ALTER` was nearly done:
+
+```sql
+INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
+VALUES (1, 'pending', 1, NOW(), 0, 0);
+-- 6.466s
+```
+
+`SHOW PROCESSLIST` during this window showed the `ALTER` in the `copy to tmp table` state, and the `INSERT` was not visible in `SHOW PROCESSLIST` at all until the `ALTER` released its lock; it was simply waiting to acquire the table. Trying to fail fast with `LOCK=NONE` on this same statement is exactly how you find out, before you run it against a production table, that it is going to block writers for however long the rewrite takes.
+
+## Foreign Keys and Online DDL
+
+Foreign keys add restrictions that are independent of `ALGORITHM` and `LOCK`. On a child table `order_items` with `FOREIGN KEY (order_id) REFERENCES orders(id)`, an ordinary `ADD COLUMN` still completes with `ALGORITHM=INSTANT` in milliseconds, foreign keys included. But two operations fail outright, regardless of algorithm:
+
+Dropping the parent's primary key that the foreign key depends on:
+
+```sql
+ALTER TABLE orders DROP PRIMARY KEY, ADD PRIMARY KEY (id, customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+```
+ERROR 1553 (HY000) at line 2: Cannot drop index 'PRIMARY': needed in a foreign key constraint
+```
+
+Changing the child column's type independently of the parent column it references:
+
+```sql
+ALTER TABLE order_items MODIFY COLUMN order_id INT NOT NULL, ALGORITHM=COPY;
+```
+
+```
+ERROR 3780 (HY000) at line 2: Referencing column 'order_id' and referenced column 'id' in foreign key constraint 'fk_order' are incompatible.
+```
+
+Both errors happen at parse and validation time, before MySQL picks an algorithm. If a migration needs to change a column involved in a foreign key, the foreign key has to be dropped and recreated as part of the same migration, and the parent and child column types have to stay compatible on both sides at every step.
+
+## gh-ost for Changes Online DDL Cannot Do Safely
+
+The `MODIFY COLUMN ... ALGORITHM=COPY` case above is the one online DDL cannot help with: it needs the full row rewrite, but you do not want to hold a lock for the duration on a live table. `gh-ost` handles this by building a copy of the table (a "ghost" table) with the new schema, then copying existing rows into it in the background while streaming the binary log, instead of using triggers, to replay every write made to the original table during the copy. It finishes with a brief atomic rename to cut over.
+
+`gh-ost` refuses to migrate a table that another table references with a foreign key: the `order_items` table from the previous section has a `FOREIGN KEY (order_id) REFERENCES orders(id)`, and running `gh-ost` against `orders` with that constraint still in place fails immediately with `FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out`. Drop that foreign key first (or pass `--discard-foreign-keys`, which drops it for you and does not recreate it) before running `gh-ost` against a table other tables reference.
+
+This was installed and run, with `order_items`'s foreign key dropped, against the same 3,276,802-row table for exactly this kind of change:
+
+```bash
+brew install gh-ost
+```
+
+```bash
+gh-ost \
+  --user=root --password= \
+  --host=127.0.0.1 --port=3306 \
+  --database=zdt_demo --table=orders \
+  --alter="MODIFY COLUMN customer_id BIGINT NOT NULL" \
+  --allow-on-master \
+  --initially-drop-ghost-table \
+  --exact-rowcount \
+  --chunk-size=2000 \
+  --default-retries=5 \
+  --execute
+```
+
+Without `--execute`, `gh-ost` runs in dry-run mode: it connects, streams the binlog, and prints the `CREATE TABLE` statement it would use for the ghost table, but makes no changes. With `--execute`, it ran the full migration in 13.112 seconds, printing progress as it went:
+
+```
+Copy: 596000/3276802 18.2%; Applied: 0; Backlog: 1/1000; Time: 3s(total), 3s(copy); ...; ETA: 8s
+Copy: 1762000/3276802 53.8%; Applied: 0; Backlog: 0/1000; Time: 7s(total), 7s(copy); ...; ETA: 5s
+Copy: 3276802/3276802 100.0%; Applied: 0; Backlog: 0/1000; Time: 12s(total), 12s(copy); ...; ETA: due
+```
+
+Three seconds into a second run of the same migration, a concurrent `INSERT` against the live `orders` table returned in 0.007 seconds, and `gh-ost`'s own progress line confirmed it had picked the write up and replayed it (`Applied: 1`):
+
+```
+Copy: 1812000/3276803 55.3%; Applied: 1; Backlog: 1/1000; Time: 7s(total), 7s(copy); ...
+```
+
+After cutover, `SHOW CREATE TABLE orders` showed `customer_id` as `bigint`, the row count matched exactly (3,276,803, the original count plus the one row inserted during the migration), and the row inserted mid-migration was present with its correct value. `gh-ost` renamed the original table to `_orders_del` rather than dropping it, so the pre-migration table is still there to compare against or drop manually once you have confirmed the cutover.
+
+This ran against a standalone server with `binlog_format=ROW` and `log_bin=ON` already set, which `gh-ost` requires to stream changes; it does not work with statement-based replication. It also requires the table to have a primary key. Neither of those needed any extra setup here because they are common defaults, but confirm both before relying on `gh-ost` against a table you have not checked.
+
+## Frequently Asked Questions
+
+#### How do I know in advance whether an ALTER TABLE will block my table?
+
+Add `ALGORITHM=INPLACE, LOCK=NONE` (or just `LOCK=NONE`) to the statement before running it. If MySQL can do the change without blocking, it runs. If it cannot, it returns an error immediately instead of running and blocking. Either way, you get a definitive answer without guessing or reading source code.
+
+#### Why did ALGORITHM=INSTANT fail for a column type change?
+
+`INSTANT` only works when MySQL can express the change as a metadata update alone. Changing a column's stored type means every existing row's on-disk representation is wrong for the new type, which requires reading and rewriting rows. That rules out `INSTANT` and, for a type change specifically, also rules out `INPLACE`; only `COPY` can do it.
+
+#### Does gh-ost need replication set up?
+
+No. It reads the binary log of the server it is migrating, which any server with `binlog_format=ROW` already produces regardless of whether it has replicas. `gh-ost` also supports running against a replica and cutting over on the master, which is the safer pattern for very large or very hot tables, but that is a deployment choice, not a requirement to get it working at all.
+
+#### What happens to the old table after gh-ost finishes?
+
+By default `gh-ost` renames the original table with a suffix (`_del` in the run captured above) instead of dropping it. It stays in the schema, unused, until you drop it yourself.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `ERROR 1846: ALGORITHM=INPLACE is not supported` | The operation requires a full rewrite. Use `ALGORITHM=COPY` on a maintenance window, or `gh-ost`/`pt-online-schema-change` on a live table. |
+| `ERROR 1846: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table...` | The change is not metadata-only. Try `ALGORITHM=INPLACE, LOCK=NONE` first, then fall back to `COPY` if that also fails. |
+| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | Drop the referencing foreign key first, make the index change, then recreate the foreign key. |
+| `ERROR 3780: Referencing column ... and referenced column ... are incompatible` | The child and parent columns in a foreign key must stay type-compatible. Change both sides together, or drop the foreign key for the duration of the migration. |
+| A `COPY`-algorithm `ALTER` is holding up writers with no end in sight | Check `SHOW PROCESSLIST` for its state and `information_schema.INNODB_TRX` for how long it has run. If it is unacceptable to wait it out, kill it and switch to `gh-ost`. |
+| `gh-ost` refuses to start | Confirm `binlog_format=ROW` and that the target table has a primary key; both are required. |
+
+## See also
+
+- [Schema Migrations in MySQL](/guides/schema-migrations) — organizing and version-controlling the migration files that produce the `ALTER TABLE` statements this guide runs
+- [Understanding MySQL Indexes](/guides/mysql-indexes) — how the index MySQL builds during an online `ADD INDEX` affects query performance afterward
+- [Reading EXPLAIN Output in MySQL](/guides/reading-explain) — checking that a newly added index is actually being used once the migration completes
