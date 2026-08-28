@@ -1,0 +1,200 @@
+---
+title: "Next.js and Prisma with MySQL"
+sidebarTitle: "Next.js + Prisma"
+description: "Build a Next.js App Router application on Prisma 7 and MySQL end to end: schema, migrations, the driver adapter Prisma 7 now requires, and a working read/write page. Every command in this guide runs unchanged against VillageSQL."
+keywords: "nextjs prisma mysql, prisma driver adapter mysql, prisma 7 mysql, prisma migrate mysql, prisma server action, villagesql prisma"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Prisma is one of the most widely used TypeScript ORMs, and Next.js's App Router is a common way new projects reach a database. This guide builds a small Next.js app that lists and creates rows in MySQL through Prisma 7, covering the parts that changed since older Prisma tutorials: connection URLs moved out of the schema file, and a driver adapter is no longer optional. Because VillageSQL is a drop-in replacement for MySQL, every command here works against it unchanged.
+
+## Create the database
+
+Prisma needs two databases: the one your app uses, and a second "shadow" database it uses internally to compute migrations. Create both, and a dedicated user with rights to each:
+
+```sql
+CREATE DATABASE prisma_guide CHARACTER SET utf8mb4;
+CREATE DATABASE prisma_guide_shadow CHARACTER SET utf8mb4;
+CREATE USER 'prisma_app'@'127.0.0.1' IDENTIFIED BY 'change-me';
+GRANT ALL PRIVILEGES ON prisma_guide.* TO 'prisma_app'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON prisma_guide_shadow.* TO 'prisma_app'@'127.0.0.1';
+FLUSH PRIVILEGES;
+```
+
+The shadow database only needs to exist. Prisma creates and drops tables in it automatically. Giving your app user rights to create its own shadow database, instead of granting broader `CREATE`/`DROP` privileges on `*.*`, keeps the blast radius of a leaked password to two databases instead of the whole server.
+
+## Scaffold the app
+
+```bash
+npx create-next-app@latest my-app --typescript --app --src-dir
+cd my-app
+npm install prisma@7 @prisma/client@7
+```
+
+Pin the major version. At the time of writing, npm's `latest` tag for `prisma` points at an 8.0 release candidate: fine to try, but the wrong default for a guide meant to keep working.
+
+## Initialize Prisma
+
+```bash
+npx prisma init --datasource-provider mysql --no-skills
+```
+
+`prisma init` runs a postinstall step by default that scaffolds Claude Code, Cursor, and Windsurf agent skills into your repo (`.claude/`, `.windsurf/`, `.agents/`, plus a `skills-lock.json`). `--no-skills` skips it. It's a genuinely useful feature if you're using an AI coding agent alongside Prisma, just not part of this guide's scope.
+
+This creates `prisma/schema.prisma`, a `.env` file, and `prisma7.config.ts` (the config filename is version-suffixed in Prisma 7). Set the connection strings:
+
+```bash .env
+DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide"
+SHADOW_DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide_shadow"
+```
+
+Older Prisma tutorials put the datasource URL directly in `schema.prisma`. As of Prisma 7, connection URLs, including the shadow database URL, live in `prisma7.config.ts`, not the schema file:
+
+```ts prisma7.config.ts
+import "dotenv/config";
+import { defineConfig } from "prisma/config";
+
+export default defineConfig({
+  schema: "prisma/schema.prisma",
+  migrations: { path: "prisma/migrations" },
+  datasource: {
+    url: process.env["DATABASE_URL"],
+    shadowDatabaseUrl: process.env["SHADOW_DATABASE_URL"],
+  },
+});
+```
+
+`schema.prisma` keeps the `generator` block `prisma init` created and now only declares the provider on the datasource, with no connection URL:
+
+```prisma prisma/schema.prisma
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String   @db.VarChar(255)
+  body      String   @db.Text
+  createdAt DateTime @default(now())
+}
+```
+
+## Run the migration
+
+```bash
+npx prisma migrate dev --name init
+```
+
+This applies the schema, generates `prisma/migrations/<timestamp>_init/migration.sql`, and calls `prisma generate` for you. Confirm the table exists:
+
+```sql
+SHOW TABLES FROM prisma_guide;
+-- _prisma_migrations, Post
+```
+
+## Connect with a driver adapter
+
+Prisma 7's generated client no longer connects on its own: `new PrismaClient()` with no arguments now fails a type check. You pass it a driver adapter, one package per database:
+
+```bash
+npm install @prisma/adapter-mariadb mariadb
+```
+
+`@prisma/adapter-mariadb` is the adapter for both MariaDB and MySQL: the wire protocol is shared, so it works against VillageSQL the same way it works against stock MySQL. Set up a singleton so Next.js's dev-mode hot reload doesn't open a new connection pool on every file save:
+
+```ts src/lib/prisma.ts
+import { PrismaClient } from "@/generated/prisma/client";
+import { PrismaMariaDb } from "@prisma/adapter-mariadb";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+const adapter = new PrismaMariaDb(process.env.DATABASE_URL!);
+
+export const prisma = globalForPrisma.prisma ?? new PrismaClient({ adapter });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+The generated client's import path has two quirks. It has no `index.ts`, so you import `@/generated/prisma/client` (the file), not `@/generated/prisma` (the directory). And every export in that file is typed `@ts-nocheck`, since it's generated code you're meant to import, not read.
+
+## Read and write from a Server Component
+
+```tsx src/app/page.tsx
+import { prisma } from "@/lib/prisma";
+import { revalidatePath } from "next/cache";
+
+async function createPost(formData: FormData) {
+  "use server";
+  const title = formData.get("title") as string;
+  const body = formData.get("body") as string;
+  await prisma.post.create({ data: { title, body } });
+  revalidatePath("/");
+}
+
+export default async function Home() {
+  const posts = await prisma.post.findMany({ orderBy: { createdAt: "desc" } });
+
+  return (
+    <main>
+      <form action={createPost}>
+        <input name="title" placeholder="Title" required />
+        <textarea name="body" placeholder="Body" required />
+        <button type="submit">Create post</button>
+      </form>
+      <ul>
+        {posts.map((post) => (
+          <li key={post.id}>
+            <strong>{post.title}</strong>
+            <p>{post.body}</p>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+`prisma.post.findMany()` runs as a Server Component, so the list renders with data already in the HTML, with no client-side fetch. The form posts to a Server Action (`"use server"`), which writes through the same Prisma client and calls `revalidatePath("/")` so the new post shows up without a client-side refresh.
+
+Running `npm run build` at this point actually queries the database: because the home page uses no dynamic APIs, Next.js prerenders it as static content at build time, which means `findMany()` runs during the build, not just at request time. If your database isn't reachable during `npm run build`, the build fails there, so a CI pipeline for this app needs a reachable database at build time, not just at runtime.
+
+## Frequently Asked Questions
+
+#### Do I need the shadow database in production?
+
+No. `prisma migrate dev` uses it to detect schema drift while you're developing. In production, use `prisma migrate deploy`, which applies existing migration files without touching a shadow database at all.
+
+#### Why does my standalone script fail with "Cannot read properties of undefined (reading 'prepareCacheLength')"?
+
+`process.env.DATABASE_URL` is `undefined` in that script's environment. Next.js loads `.env` automatically for `next dev` and `next build`, but a plain `node` or `tsx` script does not. Add `import "dotenv/config"` at the top of the script.
+
+#### Can I use `@prisma/adapter-pg`'s MySQL equivalent instead?
+
+There isn't a MySQL-specific adapter name. `@prisma/adapter-mariadb` is the one Prisma ships for both MariaDB and MySQL, including VillageSQL.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `Error: P3014` / "User was denied access on the database `prisma_migrate_shadow_db_...`" | Your app user can't create databases. Create a dedicated shadow database up front and grant rights to it, or grant broader `CREATE`/`DROP` privileges if you accept the tradeoff. |
+| `error: The datasource property 'shadowDatabaseUrl' is no longer supported in schema files` | You're using a Prisma 5/6-style `schema.prisma` with connection URLs inline. Move both `url` and `shadowDatabaseUrl` into `prisma7.config.ts`'s `datasource` block. |
+| `Expected 1 arguments, but got 0` on `new PrismaClient()` | Prisma 7 requires a driver adapter. Install `@prisma/adapter-mariadb` and pass `new PrismaClient({ adapter })`. |
+| `info You don't have any generators defined in your schema.prisma, so nothing will be generated.` | Your `schema.prisma` is missing the `generator client` block. Add it back; deleting it (even by accident, trimming the file down) means `prisma generate` produces nothing. |
+| `Module not found: Can't resolve '@/generated/prisma'` | Import `@/generated/prisma/client` instead. The generated output has no `index.ts` barrel file. |
+
+## See also
+
+- [Using MySQL with ORMs](/guides/mysql-with-orms) — the settings that matter across every ORM, not just Prisma
+- [Connection pooling](/guides/connection-pooling) — how a driver adapter's pool size interacts with your process count
