@@ -1,0 +1,268 @@
+---
+title: "Laravel 12 with MySQL"
+sidebarTitle: "Laravel with MySQL"
+description: "Setting up Laravel 12 against MySQL: the .env connection block, running migrations, Eloquent models, mass assignment protection with $fillable, and verifying writes against a live database."
+keywords: "laravel mysql, laravel 12 mysql, laravel eloquent mysql, laravel migrate mysql, laravel .env database, laravel fillable, laravel database connection, villagesql laravel"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A new Laravel 12 project ships with a commented-out MySQL connection block sitting directly under the active `DB_CONNECTION` line in `.env`, using the same host, port, database, username, and password shape every MySQL client expects. Uncommenting it and filling in real values is the entire integration. This guide walks through that setup end to end: connecting, running a migration, and reading and writing through Eloquent.
+
+## Creating the Project
+
+```bash
+composer create-project laravel/laravel laravel-mysql "12.*"
+```
+
+This installs Laravel 12 and its dependencies, generates an application key, and creates a default SQLite database so the app runs immediately with no configuration. Confirm the version:
+
+```bash
+php artisan --version
+```
+
+```
+Laravel Framework 12.68.0
+```
+
+Laravel 12 requires PHP 8.2 or later. On macOS without PHP already installed, `brew install php composer` installs both; the Homebrew build of PHP 8.5 includes `pdo_mysql` and `mysqli` by default, so no extra extension setup is needed for MySQL.
+
+## Creating the Database and User
+
+Create a dedicated database and a scoped user rather than pointing the application at `root`:
+
+```sql
+CREATE DATABASE laravel_guide;
+CREATE USER 'laravel_app'@'127.0.0.1' IDENTIFIED BY 'your-password';
+GRANT ALL PRIVILEGES ON laravel_guide.* TO 'laravel_app'@'127.0.0.1';
+FLUSH PRIVILEGES;
+```
+
+## Configuring the Connection
+
+Open `.env` and switch `DB_CONNECTION` from `sqlite` to `mysql`, then fill in the connection details:
+
+```bash
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=laravel_guide
+DB_USERNAME=laravel_app
+DB_PASSWORD=your-password
+```
+
+Laravel connects over TCP to `127.0.0.1` here, the same host the `CREATE USER` statement above granted. VillageSQL is a drop-in replacement for MySQL, so nothing in `config/database.php` or the `.env` keys changes.
+
+`config/database.php` sets `'strict' => true` on the `mysql` connection by default. This puts the session in MySQL's standard strict SQL mode:
+
+```sql
+SELECT @@sql_mode;
+```
+
+```
+ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+That mode set runs unchanged against VillageSQL. There is no strict-mode flag to disable or work around for compatibility.
+
+## Running Migrations
+
+Laravel's default migrations create the `users`, `cache`, and `jobs` tables. Run them against the configured connection:
+
+```bash
+php artisan migrate:fresh
+```
+
+```
+INFO  Preparing database.
+
+Creating migration table ....................................... 2.76ms DONE
+
+INFO  Running migrations.
+
+0001_01_01_000000_create_users_table ........................... 8.69ms DONE
+0001_01_01_000001_create_cache_table ........................... 4.42ms DONE
+0001_01_01_000002_create_jobs_table ............................ 6.31ms DONE
+```
+
+Generate a model with its own migration for a `posts` table:
+
+```bash
+php artisan make:model Post -m
+```
+
+```
+INFO  Model [app/Models/Post.php] created successfully.
+
+INFO  Migration [database/migrations/..._create_posts_table.php] created successfully.
+```
+
+Add the `title` and `body` columns to the generated migration:
+
+```php
+Schema::create('posts', function (Blueprint $table) {
+    $table->id();
+    $table->string('title');
+    $table->text('body');
+    $table->timestamps();
+});
+```
+
+Run it, then confirm the table's shape directly against the server:
+
+```bash
+php artisan migrate
+```
+
+```sql
+DESCRIBE posts;
+```
+
+```
+Field       Type              Null  Key  Default  Extra
+id          bigint unsigned   NO    PRI  NULL     auto_increment
+title       varchar(255)      NO         NULL
+body        text              NO         NULL
+created_at  timestamp         YES        NULL
+updated_at  timestamp         YES        NULL
+```
+
+## Eloquent and Mass Assignment Protection
+
+Laravel's Eloquent models block mass assignment by default unless a field is listed in `$fillable`:
+
+```php
+class Post extends Model
+{
+    protected $fillable = ['title', 'body'];
+}
+```
+
+`id`, `created_at`, and `updated_at` are deliberately left out. Passing an `id` into `create()` doesn't raise an error and doesn't overwrite the value; Eloquent silently drops any key that isn't in `$fillable`:
+
+```php
+$post = Post::create(['title' => 'Tinker test', 'body' => 'via fillable', 'id' => 999]);
+echo $post->id;
+```
+
+```
+1
+```
+
+The row got the next auto-increment value, not `999`. This matters when a `store()` method accepts a request body directly: without `$fillable` scoping the columns, a client could pass `id` or a timestamp field and have it accepted at face value. `$fillable` guards the model; request validation is a separate concern that checks the shape of the incoming data.
+
+## Routes and a Controller
+
+Laravel 12's default skeleton keeps routing minimal: `routes/web.php` holds the routes, and `bootstrap/app.php` wires up middleware and exception handling without the old `Http/Kernel.php` file. Generate a controller:
+
+```bash
+php artisan make:controller PostController
+```
+
+```php
+class PostController extends Controller
+{
+    public function index(): JsonResponse
+    {
+        return response()->json(Post::latest()->get());
+    }
+
+    public function store(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'body' => 'required|string',
+        ]);
+
+        $post = Post::create($validated);
+
+        return response()->json($post, 201);
+    }
+}
+```
+
+Register the routes:
+
+```php
+use App\Http\Controllers\PostController;
+
+Route::get('/posts', [PostController::class, 'index']);
+Route::post('/posts', [PostController::class, 'store']);
+```
+
+`routes/web.php` runs behind Laravel's session-based CSRF middleware, which rejects a plain `curl -X POST` with `419 Page Expired` because the request carries no CSRF token. That is expected for a browser-facing form route; a real form posts the token via a hidden field. For a route meant to be called directly, without a form or a token, exclude it in `bootstrap/app.php`:
+
+```php
+->withMiddleware(function (Middleware $middleware): void {
+    $middleware->validateCsrfTokens(except: [
+        'posts',
+    ]);
+})
+```
+
+## Verifying End to End
+
+Start the built-in server and exercise both routes. The table already has the row from the `$fillable` demo above, so the index route returns it:
+
+```bash
+php artisan serve --port=8123
+```
+
+```bash
+curl -s http://127.0.0.1:8123/posts
+```
+
+```json
+[{"id":1,"title":"Tinker test","body":"via fillable","created_at":"2026-08-28T19:49:05.000000Z","updated_at":"2026-08-28T19:49:05.000000Z"}]
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8123/posts -d "title=Hello VillageSQL" -d "body=First post from curl"
+```
+
+```json
+{"title":"Hello VillageSQL","body":"First post from curl","updated_at":"2026-08-28T19:49:21.000000Z","created_at":"2026-08-28T19:49:21.000000Z","id":2}
+```
+
+Confirm both rows landed by querying the database directly, rather than trusting the JSON responses alone:
+
+```sql
+SELECT * FROM laravel_guide.posts;
+```
+
+```
+id  title              body                    created_at           updated_at
+1   Tinker test        via fillable            2026-08-28 19:49:05  2026-08-28 19:49:05
+2   Hello VillageSQL   First post from curl    2026-08-28 19:49:21  2026-08-28 19:49:21
+```
+
+## Frequently Asked Questions
+
+#### Why does Laravel default to SQLite instead of MySQL?
+
+Recent Laravel versions default new projects to SQLite so `php artisan serve` works immediately with zero configuration. The `.env` file still carries the MySQL connection keys directly beneath the active `DB_CONNECTION` line, commented out. Switching to MySQL is a matter of uncommenting and filling in five values, not a new configuration section.
+
+#### Does Eloquent need any special configuration to work with VillageSQL?
+
+No. VillageSQL is a drop-in replacement for MySQL and speaks the same wire protocol, so Laravel's `mysql` driver, its strict SQL mode setting, and its query grammar all work unchanged.
+
+#### What's the difference between `$fillable` and request validation?
+
+`$request->validate()` decides which fields are accepted from the incoming request and rejects malformed input with a 422 response. `$fillable` on the model decides which of the fields you pass to `create()` or `fill()` are actually written to the database. Using `$request->validate()` alone still leaves the model open to mass assignment if a controller elsewhere calls `Post::create($request->all())`; `$fillable` protects the model regardless of which controller calls it.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `419 Page Expired` on a POST request | The route runs behind CSRF middleware. Submit a real form with `@csrf`, or exclude the route in `bootstrap/app.php` with `validateCsrfTokens(except: [...])` if it's meant to be called directly. |
+| `SQLSTATE[HY000] [2002] Connection refused` | `DB_PORT` in `.env` doesn't match a port VillageSQL is actually listening on. Confirm the port the server was started with. |
+| `SQLSTATE[HY000] [1045] Access denied for user '<user>'@'localhost' (using password: YES)` | `DB_USERNAME` or `DB_PASSWORD` is wrong, or the user has no grant reaching `DB_DATABASE`. The error can say `'localhost'` even when `DB_HOST` is `127.0.0.1`: MySQL resolves the connecting IP by reverse DNS unless `skip_name_resolve` is on, and reports whichever hostname it matched. Confirm the grant was created for the host the error actually names, which may not be the value in `DB_HOST`. |
+| A field passed to `create()` doesn't save | It isn't listed in the model's `$fillable` array. With `$fillable` non-empty, Eloquent drops the field silently rather than throwing; add it to `$fillable`, or use `forceFill()` if you're intentionally bypassing the guard. |
+
+## See also
+
+- [Using MySQL with ORMs: Django, Rails, and Prisma](/guides/mysql-with-orms) — the same connection-level settings and N+1 patterns from an ORM-agnostic angle
+- [Schema Migrations in MySQL](/guides/schema-migrations) — what Laravel's migration files are doing to the table underneath `ALTER TABLE`
+- [MySQL Connection Pooling](/guides/connection-pooling) — configuring persistent connections for a Laravel app under real traffic
