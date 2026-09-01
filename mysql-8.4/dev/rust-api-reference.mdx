@@ -94,7 +94,7 @@ villagesql::extension! {
 
 ## func! macro
 
-`func!` declares a SQL-callable function. Six forms — four without per-statement state (no parameters, `buffer_size` only, `deterministic` only, both), and two that attach per-statement state through a `prerun` function:
+`func!` declares a SQL-callable function. Eight forms — four without per-statement state (no parameters, `buffer_size` only, `deterministic` only, both), two that attach per-statement state through a `prerun` function, and two more that add an optional `postrun:` on top of those. See [Per-statement state](#per-statement-state) below.
 
 ```rust
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type)
@@ -103,6 +103,8 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, determinist
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N, deterministic: true)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, postrun: postrun_fn)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, postrun: postrun_fn, buffer_size: N, deterministic: true)
 ```
 
 <Note>
@@ -120,6 +122,7 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: Stat
 | `return_type` | `villagesql::Type::*` or `villagesql::custom!("name")`. |
 | `buffer_size: N` | Optional. Size in bytes of the result buffer for string/binary returns. Use `0` for the server default (256 bytes). When a function returns a string or binary value larger than `buffer_size`, the function errors rather than truncating — declare a larger `buffer_size` to handle larger results. |
 | `deterministic: true` | Optional. Declares the function deterministic — same inputs always produce the same output, no side effects. The optimizer can cache results for identical inputs. Only set this when it's true. |
+| `postrun: postrun_fn` | Optional, only on the `state:`/`prerun:` forms. `fn(&mut StateType)`, called once after the last row, before the SDK drops the state. |
 
 **Type constants** for use in `func!`:
 
@@ -143,7 +146,9 @@ A prerun function has the signature `fn(PrerunArgs, PrerunResult<T>)`, and the r
 
 `PrerunArgs::len()` is the number of arguments each row will receive, and `PrerunArgs::is_empty()` is true when the function was called with no arguments.
 
-You must not free the state yourself: `func!` generates the postrun that drops it when the statement ends. This is the opposite of the C++ SDK, where your postrun has to call `delete_state<T>()` — see [Per-Statement State](/mysql-8.4/dev/development#per-statement-state-prerun-and-postrun).
+You must not free the state yourself: `func!` always generates the postrun that drops it when the statement ends, so freeing it is not your responsibility even when you supply your own teardown. That drop step is the opposite of the C++ SDK, where your postrun has to call `delete_state<T>()` — see [Per-Statement State](/mysql-8.4/dev/development#per-statement-state-prerun-and-postrun).
+
+Name a `postrun: postrun_fn`, `fn(&mut StateType)`, to run your own teardown first: it runs once after the last row, while the state is still borrowable, and before the SDK's own drop. See `examples/vsql_postrun_order/src/lib.rs` in the [Rust SDK repo](https://github.com/villagesql/vsql-rust-sdk), whose recorded test output includes the line `prerun,postrun,drop|rows_seen=3`, confirming the order.
 
 <Note>
   The `state` and `prerun` parameters are not in a published release yet. The
@@ -299,7 +304,10 @@ SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin
   types for varargs VDFs](/mysql-8.4/dev/development#varargs-vdfs) either.
 </Warning>
 
-Six forms — three shapes, each with a shorthand and a full form that adds `buffer_size` and `deterministic` together (never singly):
+Eight forms — three shapes, each with a shorthand and a full form that adds
+`buffer_size` and `deterministic` together (never singly). The `state:`/
+`prerun:` shape has two more on top of that, adding an optional `postrun:` —
+same meaning as in `func!`:
 
 ```rust
 // Per-statement state plus a validating prerun.
@@ -307,6 +315,13 @@ villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
     state: StateType, prerun: prerun_fn)
 villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
     state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+
+// Per-statement state, validating prerun, and author postrun.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn, postrun: postrun_fn)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn, postrun: postrun_fn,
+    buffer_size: N, deterministic: true)
 
 // Validating prerun, no state.
 villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
@@ -328,6 +343,7 @@ villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
 | `return_type` | `villagesql::Type::*` or `villagesql::custom!("name")`. The return type is fixed even though the arguments are not. |
 | `state: StateType` | Optional. Per-statement state, allocated by `prerun` and borrowed `&mut` by each row call. Requires `prerun:`. Unlike `agg_func!`, no `Default` bound — your prerun builds the value. |
 | `prerun: prerun_fn` | Optional, and the only place argument validation can happen. `fn(PrerunArgs, PrerunResult<T>)`, where `T` is the type named by `state:`, or `()` in the prerun-only form. |
+| `postrun: postrun_fn` | Optional, only on the `state:`/`prerun:` forms — means the same as it does in `func!`: `fn(&mut StateType)`, run once after the last row and before the SDK drops the state. |
 | `buffer_size: N` / `deterministic: true` | Optional, supplied together or not at all. Same meaning as in `func!` when given — for varargs, a fixed value is often the wrong choice, since the result usually grows with the argument count; size it in the prerun with `request_buffer_size` instead. |
 
 The bare form has no validation and accepts a zero-argument call — a legitimate choice for a function that's total over every input, but it means the row function alone is responsible for every input it can be handed. Only the `state:` form allocates and drops per-statement state; the prerun-only form uses `PrerunResult<()>` and stores nothing, so there is no postrun for it — such a prerun uses `PrerunResult` only for `error` and `request_buffer_size`, never `set_state`.
