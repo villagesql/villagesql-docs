@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "Preview Capabilities in Rust"
-description: "Use VillageSQL preview capabilities from the Rust SDK — declare status variables, system variables, background thread workers, and keyring access with the requires: list in extension!."
+description: "Use VillageSQL preview capabilities from the Rust SDK — declare status variables, system variables, background thread workers, SQL queries, and keyring access with the requires: list in extension!."
 ---
 
 <Warning>
@@ -12,10 +12,10 @@ description: "Use VillageSQL preview capabilities from the Rust SDK — declare 
 </Warning>
 
 Preview capabilities are server features exposed to extensions before their
-APIs are finalized. The Rust SDK wraps four of them: status variables, system
-variables, background thread workers, and keyring access. This page covers
-declaring and using each one from Rust. For the concept, the preview tier,
-and the capabilities that exist only in C++, see
+APIs are finalized. The Rust SDK wraps five of them: status variables, system
+variables, background thread workers, SQL queries from a worker thread, and
+keyring access. This page covers declaring and using each one from Rust. For
+the concept, the preview tier, and the capabilities that exist only in C++, see
 [Preview Capabilities](/mysql-8.4/dev/preview-capabilities).
 
 ## Prerequisites
@@ -41,9 +41,10 @@ toolchain, `cargo-vsql`, and your first `extension!` block.
 | `vsql::status_var` | `villagesql::preview::status_var` | [`vsql_status_var`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_status_var) |
 | `vsql::sys_var` | `villagesql::preview::sys_var` | [`vsql_sys_var`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_sys_var) |
 | `vsql::preview::thread_worker` | `villagesql::preview::thread_worker` | [`vsql_thread_worker`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_thread_worker) |
+| `vsql::preview::sql_query` | `villagesql::preview::sql_query` | [`vsql_sql_query`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_sql_query) |
 | `vsql::preview::keyring` | `villagesql::preview::keyring` | [`vsql_keyring`](https://github.com/villagesql/vsql-rust-sdk/tree/main/examples/vsql_keyring) |
 
-The remaining preview capabilities — `auth`, `mysql_services`, `sql_query`,
+The remaining preview capabilities — `auth`, `mysql_services`,
 `statement_event`, and the column storage ABI — are C++-only today. Use the
 [C++ SDK](/mysql-8.4/dev/preview-capabilities) if you need one of those.
 
@@ -262,7 +263,7 @@ use villagesql::{InValue, VdfReturn};
 
 static TICKS: AtomicI64 = AtomicI64::new(0);
 
-fn worker(reason: WakeupReason, _handle: ThreadHandle) -> NextWakeup {
+fn worker(reason: WakeupReason, _handle: &ThreadHandle) -> NextWakeup {
     if reason == WakeupReason::Periodic {
         TICKS.fetch_add(1, Ordering::Relaxed);
     }
@@ -325,9 +326,89 @@ If the work function panics, the SDK catches the panic at the FFI boundary
 and treats the call as returning `NextWakeup::unchanged()` — the worker
 keeps running.
 
-The `ThreadHandle` parameter is reserved for opening SQL sessions from the
-worker once the `sql_query` capability is ported to Rust; it has no methods
-yet.
+Pass the `handle` parameter to [`SqlQueryCapability::open`](#sql-query) to
+run SQL from inside the worker.
+
+## SQL Query
+
+The `sql_query` capability opens a SQL session from a `thread_worker`
+callback, so a background worker can run statements against the server it's
+loaded into. Declare it alongside `ThreadWorkerCapability` and open a session
+with the `ThreadHandle` the worker receives:
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+use villagesql::preview::sql_query::SqlQueryCapability;
+use villagesql::preview::thread_worker::{
+    NextWakeup, ThreadHandle, ThreadWorkerCapability, WakeupReason,
+};
+use villagesql::{InValue, VdfReturn};
+
+static USER_COUNT: AtomicI64 = AtomicI64::new(-1);
+
+static SQL_QUERY: SqlQueryCapability = SqlQueryCapability::new();
+
+fn worker(reason: WakeupReason, handle: &ThreadHandle) -> NextWakeup {
+    if reason == WakeupReason::Periodic {
+        if let Some(session) = SQL_QUERY.open(handle) {
+            if let Some(mut result) = session.execute("SELECT COUNT(*) FROM mysql.user") {
+                if !result.has_error() {
+                    if let Some(n) = result.next_row().and_then(|row| row.get_int(0)) {
+                        USER_COUNT.store(n, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+    NextWakeup::unchanged()
+}
+
+static WORKER: ThreadWorkerCapability =
+    ThreadWorkerCapability::new(worker, "user_count", Duration::from_secs(5), None);
+
+fn user_count_impl(_args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(USER_COUNT.load(Ordering::Relaxed))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(user_count_impl, "user_count", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &WORKER,
+        &SQL_QUERY,
+    ]
+}
+```
+
+`SqlQueryCapability::open(handle)` returns `None` if the capability wasn't
+populated (preview off or not requested), the ABI is too old, or the server
+failed to open a session — check it before using the result.
+
+A `Session` offers two ways to run a statement:
+
+- `execute(sql)` buffers the full result set and returns a `QueryResult`.
+  Call `next_row()` repeatedly until it returns `None`; each `Row` reads
+  columns with `get_int(i)`, `get_str(i)`, `get_real(i)`, or `get_bytes(i)`.
+  `get_bytes`/`get_str` return `None` for SQL `NULL` or an out-of-range
+  index (plus non-UTF-8 bytes for `get_str`); `get_int`/`get_real` parse the
+  column as text first, so they also return `None` for unparseable text.
+  `execute` itself returns `None` only on setup failure (no session, or out
+  of memory).
+- `for_each(sql, |row: Row<'_>| { ... })` streams rows to a closure instead
+  of buffering the full result set. Its returned `QueryResult` carries
+  diagnostics only — no buffered rows to iterate — and also returns `None`
+  on setup failure.
+
+Check `has_error()` and `error()` (an `Option<Diag>` with `errno`,
+`severity`, `sqlstate`, and `message`) on either result before trusting a
+statement succeeded. `warnings()` returns all warnings and notes attached to
+the result.
+
+A `Session` and a `QueryResult` each close their underlying handle when
+dropped — there is no close method to call yourself.
 
 ## Keyring Access
 
@@ -402,8 +483,8 @@ your buffer for the largest secret you expect to store.
     href="/mysql-8.4/dev/preview-capabilities"
   >
     The full capability index, the preview tier, and the C++-only
-    capabilities: auth, mysql_services, sql_query, statement_event, and
-    column storage.
+    capabilities: auth, mysql_services, statement_event, and column
+    storage.
   </Card>
   <Card
     title="Rust API Reference"
