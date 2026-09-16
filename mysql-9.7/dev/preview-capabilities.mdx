@@ -54,6 +54,7 @@ Uninstall those extensions first, then turn the setting off.
 | `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview |
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
 | `vsql::preview::mysql_services` | `<villagesql/preview/mysql_services.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
+| `vsql::session_var` | `<villagesql/preview/session_var.h>` | Preview |
 | `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | Preview |
 | `vsql::preview::statement_event` | `<villagesql/preview/statement_event.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
 | `vsql::status_var` | `<villagesql/preview/status_var.h>` | Preview |
@@ -621,6 +622,127 @@ The `scope` argument controls persistence:
 | `nullptr` | Update running value only, not persisted. |
 | `"PERSIST"` | Update running value and write to `mysqld-auto.cnf`. |
 | `"PERSIST_ONLY"` | Write to `mysqld-auto.cnf` only; takes effect on next restart. |
+
+## Session Variables
+
+The session_var capability (`vsql::session_var`) lets an extension register
+per-session (THD-local) system variables — the functional equivalent of a
+plugin's `MYSQL_THDVAR_*`. It is the session-scoped sibling of
+[`vsql::sys_var`](#system-variables): a sys_var has one value shared by every
+connection, while a session_var gives each connection its own value, set with
+`SET SESSION`, with the descriptor's default as the starting point for every
+new session and as the value read by `SET GLOBAL`. A variable's scope is fixed
+at registration — use this capability for per-session variables, `vsql::sys_var`
+for global ones.
+
+Only two types are supported: `INT` (`long long`) and `STR` (`std::string`).
+There is no `BOOL` or `DOUBLE` session variable, and there is no `on_change`
+callback mechanism — unlike `vsql::sys_var`, an extension observes a session
+variable's value only by reading it back, not by being notified when it
+changes.
+
+### Declaring the Capability
+
+Build the capability with `vsql::preview_session_var::make_capability()`,
+passing a braced list of descriptors from `make_int(name, comment)` or
+`make_str(name, comment)`, each configured with the fluent `.default_()`,
+`.min()`, and `.max()` setters (`min`/`max` apply to `INT` only):
+
+```cpp
+#include <villagesql/preview/session_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_session_var;
+
+static auto SESSION_VARS = sv::make_capability({
+    sv::make_int("session_int_var", "Search width")
+        .default_(20)
+        .min(1)
+        .max(4096),
+    sv::make_str("label", "Per-session label")
+        .default_("default"),
+});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SESSION_VARS))
+```
+
+`make_int` starts unconstrained (default `0`, full `long long` range);
+`make_str` starts with an empty-string default. The capability object needs
+static storage duration, matching every other preview capability on this page.
+
+### Reading Session Values
+
+There are two read paths, both resolved against the *calling* connection's
+thread — so both **must be called on the connection thread (a VDF or callback
+running on the connection), never from a background thread worker**:
+
+- `SESSION_VARS.get_session_int(name, out)` / `get_session_str(name, out)` —
+  name-keyed, re-resolves the variable on every call. Use this for occasional
+  reads, and for `STR` variables it is the only path: there is no lock-free
+  string fast path, because a `STR` slot holds a pointer to a separately
+  allocated buffer that a concurrent `SET SESSION` or `UNINSTALL` can free.
+- `SESSION_VARS.int_var(name)` returns an `IntVar` that resolves itself lazily
+  on its first `read()` and caches the result, so it can be declared at
+  file/static scope before the capability has loaded. Each subsequent `read()`
+  is a lock-free per-thread offset load — no name lookup, no global lock — the
+  equivalent of a plugin's `THDVAR(thd, var)`. This fast path is `INT`-only.
+
+```cpp
+static auto SESSION_INT = SESSION_VARS.int_var("session_int_var");
+
+void read_session_int_var_impl(IntResult out) {
+  long long val = 0;
+  if (SESSION_INT.read(val)) { out.set_null(); return; }
+  out.set(val);
+}
+```
+
+### Accessing from SQL
+
+After `INSTALL EXTENSION my_ext`, each variable takes the extension name as a
+component prefix and is readable/settable with both `@@session.` and
+`@@global.`:
+
+```sql
+SELECT @@global.my_ext.session_int_var;
+SELECT @@session.my_ext.session_int_var;
+SET SESSION my_ext.session_int_var = 100;
+```
+
+A second connection is unaffected by the first connection's `SET SESSION`, and
+sees the compiled default until it sets its own value; `SET GLOBAL` changes the
+default that new or reset sessions pick up, not any session's already-set
+value.
+
+Out-of-range `INT` assignments clamp to the bound and warn, and a wrong-typed
+assignment is rejected, exactly as for an ordinary MySQL system variable:
+
+```sql
+SET SESSION my_ext.session_int_var = 999999;  -- max is 4096
+```
+```text
+Warning	1292	Truncated incorrect my_ext.session_int_var value: '999999'
+```
+```sql
+SET SESSION my_ext.session_int_var = "hello";
+```
+```text
+ERROR 1232 (42000): Incorrect argument type to variable 'my_ext.session_int_var'
+```
+
+### Restart Behavior
+
+Session variables are **not** persisted the way `SET PERSIST` makes an ordinary
+sys_var durable — there is no `SET PERSIST` support for a session_var's own
+value. Across a server restart with the extension still installed, each
+variable reappears at its compiled default, not at whatever value a session
+had set before the restart: a `SET SESSION` value is per-connection state, and
+connections do not survive a restart in the first place, so there is nothing to
+lose — the variable's *global default* was never changed by that session's
+`SET SESSION` either, so restart simply reinstalls the variable at the same
+default it always had.
 
 ## Thread Worker
 
