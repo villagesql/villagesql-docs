@@ -1,0 +1,192 @@
+---
+title: "How to Authenticate MySQL Users with a JWT"
+sidebarTitle: "JWT Authentication"
+description: "How to let MySQL accounts sign in with a JSON Web Token using VillageSQL's vsql_oauth2 extension — signing keys, claim mapping, role grants, and why a rejected token looks like a wrong password."
+keywords: "mysql jwt authentication, mysql oauth login, mysql oidc, jwks mysql, mysql token login, vsql_oauth2"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  This guide uses a preview capability. Start the server with
+  `--vsql_allow_preview_extensions=ON`, or `INSTALL EXTENSION` is refused.
+</Note>
+
+Database passwords are awkward to manage once an identity provider already exists. They are issued separately, rotated separately, and they outlive the person who was given one. VillageSQL's `vsql_oauth2` extension lets an account sign in with a JSON Web Token instead: the provider issues it, the server verifies the signature and the expiry, and a claim inside the token names the account.
+
+## Set up a signing key
+
+The extension verifies signatures either against keys fetched from a JWKS endpoint, which is what you use with a real provider, or against one public key you paste in. The static key is the quickest way to see the whole path working, so this guide starts there.
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt_private.pem
+openssl rsa -pubout -in jwt_private.pem -out jwt_public.pem
+```
+
+```sql
+INSTALL EXTENSION vsql_oauth2;
+
+SET GLOBAL vsql_oauth2.public_key = '-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----';
+SET GLOBAL vsql_oauth2.username_claim = 'sub';
+```
+
+`username_claim` names the claim that carries the account name. It defaults to `sub`, which is what the example token below uses.
+
+With a real provider you set `jwks_url` instead. The extension fetches the keys, refetches them on the interval in `jwks_refresh_interval`, and refetches at once when a token names a key id the cache does not hold. Set `issuer` and `audience` too, so a token minted for some other system is not accepted here.
+
+## Create the account
+
+The account is an ordinary MySQL account, named at creation as one that authenticates with the extension. It carries its own grants:
+
+```sql
+CREATE USER 'analyst'@'%' IDENTIFIED WITH vsql_oauth2;
+GRANT SELECT ON shop.* TO 'analyst'@'%';
+```
+
+There is no password to set, and none to rotate.
+
+The session runs as the account the token names, not as the account that connected. That name comes from the claim in `username_claim`, `sub` by default. The statement above is enough while that claim says `analyst`. When your provider puts something else there, an email address for instance, create that account as well and let the connecting account proxy onto it:
+
+```sql
+CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
+CREATE USER 'alice@example.com';
+GRANT SELECT ON shop.* TO 'alice@example.com';
+GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
+```
+
+Nobody signs in as `alice@example.com` directly, so it needs no password of its own. A server running `validate_password` refuses to create an account without one, answering `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`. Where that applies, give the account a password nobody holds, or an authentication plugin that permits no login at all.
+
+Without the proxy grant the login is refused with `ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing proxy privilege.`
+
+## Log in
+
+The token travels where the password normally goes, through the built-in `mysql_clear_password` plugin, which the client must opt into:
+
+```bash
+MYSQL_PWD="$TOKEN" mysql -h 127.0.0.1 -u analyst --enable-cleartext-plugin
+```
+
+Passing the token with `--password=` puts it in the process list, which is why the token goes in the environment instead.
+
+Inside the session, `CURRENT_USER()` is the database account and `@@external_user` keeps the identity the token carried, which is what you want in an audit trail:
+
+```sql
+SELECT CURRENT_USER() AS logged_in_as, @@external_user AS token_identity;
+```
+
+```
++--------------+----------------+
+| logged_in_as | token_identity |
++--------------+----------------+
+| analyst@%    | analyst        |
++--------------+----------------+
+```
+
+<Warning>
+  `mysql_clear_password` sends the token in the clear at the protocol level. Use
+  TLS on every connection that authenticates this way, or the token is readable
+  by anything on the path and replayable until it expires.
+</Warning>
+
+## Mapping roles from the token
+
+An account can also take its privileges from the token. Point the extension at the claim that carries roles, and turn on the grant:
+
+```sql
+SET GLOBAL vsql_oauth2.roles_claim = 'roles';
+SET GLOBAL vsql_oauth2.auto_grant = ON;
+```
+
+Create a role and an account with no privileges of its own:
+
+```sql
+CREATE ROLE 'shop_reader';
+GRANT SELECT ON shop.* TO 'shop_reader';
+
+CREATE USER 'dana'@'%' IDENTIFIED WITH vsql_oauth2;
+```
+
+A token carrying `"roles": ["shop_reader"]` logs in with that role active:
+
+```sql
+SELECT CURRENT_USER() AS account, CURRENT_ROLE() AS roles_now;
+```
+
+```
++---------+-------------------+
+| account | roles_now         |
++---------+-------------------+
+| dana@%  | `shop_reader`@`%` |
++---------+-------------------+
+```
+
+`roles_filter` narrows which role names are considered, and `roles_transform_pattern` with `roles_transform_replacement` rewrites a provider's name into a database role name, for providers whose group names do not look like role names.
+
+<Warning>
+  `auto_grant` writes a real grant, and it outlives the login. After the login
+  above, the grant is in the server:
+
+```sql
+SELECT FROM_USER AS role_granted, TO_USER AS to_account
+FROM mysql.role_edges WHERE TO_USER = 'dana';
+```
+
+```
++--------------+------------+
+| role_granted | to_account |
++--------------+------------+
+| shop_reader  | dana       |
++--------------+------------+
+```
+
+  Turning `auto_grant` off afterwards does not take it back. One token, seen
+  once, widens that account until someone revokes the role. Scope
+  `roles_filter` before you enable it, and treat the claim as something your
+  provider must be trusted to set.
+</Warning>
+
+With `auto_grant` off, the same token logs in, the role is skipped rather than granted, and `CURRENT_ROLE()` is `NONE`. Each skipped role is written to the error log: `VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`. `auto_create` behaves the same way for accounts, creating one at first login for a subject the server has never seen. Both are off by default, and both hand your provider authority over this server.
+
+## A rejected token looks like a wrong password
+
+Every failure produces one error, and it is the ordinary one:
+
+```
+ERROR 1045 (28000): Access denied for user 'analyst'@'localhost' (using password: NO)
+```
+
+An expired token, a token signed by the wrong key, and an ordinary password typed by mistake all produce exactly that, including the `using password: NO` — which is misleading, since a token was sent. Nothing distinguishing appears in the server error log either, even at `log_error_verbosity=3`.
+
+So debug from the token rather than from the error. Decode it and check four things in this order:
+
+1. **`exp`** is in the future. Clock skew between the provider and the server counts here.
+2. **The signing key matches.** Check that the token's `kid` is one the JWKS document still publishes. A key the document no longer carries looks exactly like a forged token.
+3. **`iss` and `aud`** match the values you configured, if you configured them.
+4. **The claim in `username_claim` names an account that exists**, spelled the way the account is spelled.
+
+Decoding the payload needs no tools beyond a shell:
+
+```bash
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null
+```
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `ERROR 3219 ... requires preview capabilities` on install | Start the server with `--vsql_allow_preview_extensions=ON` |
+| `Access denied` on every attempt | Work through the four checks above. The message is the same for every cause |
+| The client never sends the token | Pass `--enable-cleartext-plugin`. Other clients have their own opt-in for `mysql_clear_password` |
+| Logins worked, then stopped together | The provider rotated its keys. Check `jwks_url` is reachable and that the token's `kid` appears in the document it returns |
+| An account has privileges nobody granted | `auto_grant` granted them from a token claim. Check `mysql.role_edges` and revoke |
+| Settings vanished after reinstalling the extension | `UNINSTALL EXTENSION` deletes persisted settings. Re-apply them |
+
+## See also
+
+- [MySQL User Management](/guides/user-management) — the grants a token-authenticated account still needs
+- [MySQL Security Hardening](/guides/security-hardening) — TLS and the rest of the connection surface
+- [Signing Data with HMAC](/guides/hmac-mysql) — verifying a signature inside SQL rather than at login

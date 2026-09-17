@@ -1,0 +1,248 @@
+---
+title: "How to Store a Real Boolean in MySQL"
+sidebarTitle: "Boolean Columns"
+description: "How to store true and false in MySQL with VillageSQL's vsql_boolean extension — why TINYINT(1) accepts 5 and -1, and how STRICTBOOL rejects them."
+keywords: "mysql boolean, mysql tinyint 1 boolean, mysql bool column, mysql true false column, strictbool, vsql_boolean"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL has no boolean type. `BOOL` and `BOOLEAN` are spellings of `TINYINT(1)`, which stores any number that fits in a byte. The column will hold `5` and `-1` as readily as `0` and `1`, and it gives them back exactly as they went in. VillageSQL's `vsql_boolean` extension adds a `STRICTBOOL` column type that holds two values and refuses everything else.
+
+## Why TINYINT(1) bites
+
+Here is the column MySQL gives you, with four rows inserted:
+
+```sql
+CREATE TABLE accounts_tinyint (id INT PRIMARY KEY, active BOOL);
+
+INSERT INTO accounts_tinyint VALUES (1, TRUE), (2, FALSE), (3, 5), (4, -1);
+
+SELECT id, active FROM accounts_tinyint;
+```
+
+```
++----+--------+
+| id | active |
++----+--------+
+|  1 |      1 |
+|  2 |      0 |
+|  3 |      5 |
+|  4 |     -1 |
++----+--------+
+```
+
+Nothing objected. Now ask the same question two ways:
+
+```sql
+SELECT COUNT(*) AS rows_that_are_truthy FROM accounts_tinyint WHERE active;
+SELECT COUNT(*) AS matches_equals_true  FROM accounts_tinyint WHERE active = TRUE;
+```
+
+```
++----------------------+
+| rows_that_are_truthy |
++----------------------+
+|                    3 |
++----------------------+
++---------------------+
+| matches_equals_true |
++---------------------+
+|                   1 |
++---------------------+
+```
+
+Three rows are truthy, and one equals `TRUE`. Both queries look correct and they disagree, because `TRUE` is the literal `1` and `WHERE active` tests for any non-zero value. A row holding `5` is active under one query and inactive under the other. Nothing in the schema stopped the `5` from being written, so the disagreement is discovered later, by a report that does not add up.
+
+## The STRICTBOOL column
+
+```sql
+INSTALL EXTENSION vsql_boolean;
+```
+
+```sql
+CREATE TABLE accounts (
+    id     INT PRIMARY KEY,
+    email  VARCHAR(64),
+    active STRICTBOOL NOT NULL DEFAULT 'false'
+);
+```
+
+The column accepts the strings `'true'`/`'false'`, `'t'`/`'f'`, `'yes'`/`'no'`, `'on'`/`'off'` and `'1'`/`'0'`, in any letter case. Pass them as strings; a bare number is refused. Whichever spelling goes in, `true` or `false` comes back:
+
+```sql
+INSERT INTO accounts (id, email, active) VALUES
+    (1, 'ana@example.com',  'true'),
+    (2, 'ben@example.com',  'no'),
+    (3, 'cleo@example.com', 'on'),
+    (4, 'dev@example.com',  '0');
+
+INSERT INTO accounts (id, email) VALUES (5, 'eve@example.com');
+
+SELECT id, email, active FROM accounts;
+```
+
+```
++----+------------------+--------+
+| id | email            | active |
++----+------------------+--------+
+|  1 | ana@example.com  | true   |
+|  2 | ben@example.com  | false  |
+|  3 | cleo@example.com | true   |
+|  4 | dev@example.com  | false  |
+|  5 | eve@example.com  | false  |
++----+------------------+--------+
+```
+
+Row 5 supplied no value and took the column default. Anything outside the accepted spellings is refused where it belongs, at the insert:
+
+```sql
+INSERT INTO accounts (id, email, active) VALUES (6, 'f@example.com', 'maybe');
+```
+
+```
+ERROR 1366 (HY000): Incorrect STRICTBOOL value: 'maybe' for column 'active' at row 1
+```
+
+Filter on the value the same way you wrote it:
+
+```sql
+SELECT email FROM accounts WHERE active = 'true';
+```
+
+```
++------------------+
+| email            |
++------------------+
+| ana@example.com  |
+| cleo@example.com |
++------------------+
+```
+
+## Counting
+
+Two aggregates come with the type. `boolean_sum` counts the true rows and `boolean_avg` gives the share of them:
+
+```sql
+SELECT boolean_sum(active) AS active_accounts,
+       ROUND(boolean_avg(active), 2) AS active_share,
+       COUNT(*) AS total
+FROM accounts;
+```
+
+```
++-----------------+--------------+-------+
+| active_accounts | active_share | total |
++-----------------+--------------+-------+
+|               2 |          0.4 |     5 |
++-----------------+--------------+-------+
+```
+
+Both aggregates ignore NULL, so the share is computed over the rows that answered:
+
+```sql
+CREATE TABLE survey (id INT PRIMARY KEY, agreed STRICTBOOL);
+INSERT INTO survey VALUES (1, 'true'), (2, 'false'), (3, NULL);
+
+SELECT boolean_sum(agreed) AS yes,
+       ROUND(boolean_avg(agreed), 2) AS share,
+       COUNT(*) AS rows_total
+FROM survey;
+```
+
+```
++------+-------+------------+
+| yes  | share | rows_total |
++------+-------+------------+
+|    1 |   0.5 |          3 |
++------+-------+------------+
+```
+
+One yes out of two answers is a share of 0.5, across three rows. If you want NULL counted as false, say so in the query rather than expecting the aggregate to assume it.
+
+## Indexing
+
+A `STRICTBOOL` column indexes like any other:
+
+```sql
+CREATE INDEX idx_active ON accounts (active);
+```
+
+Whether the index earns its place is the usual question. A column with two values is selective only when one of them is rare, such as a `locked` flag on an account table where almost nothing is locked.
+
+## Migrating an existing column
+
+You cannot convert a `TINYINT` column in place. The server refuses it:
+
+```sql
+ALTER TABLE accounts_tinyint MODIFY active STRICTBOOL;
+```
+
+```
+ERROR 3219 (HY000): Cannot convert column 'active' to custom type 'STRICTBOOL'
+```
+
+Add a second column and fill it instead:
+
+```sql
+ALTER TABLE accounts_tinyint ADD COLUMN active_bool STRICTBOOL NOT NULL DEFAULT 'false';
+
+UPDATE accounts_tinyint SET active_bool = 'true'  WHERE active <> 0;
+UPDATE accounts_tinyint SET active_bool = 'false' WHERE active = 0;
+
+SELECT id, active, active_bool FROM accounts_tinyint;
+```
+
+```
++----+--------+-------------+
+| id | active | active_bool |
++----+--------+-------------+
+|  1 |      1 | true        |
+|  2 |      0 | false       |
+|  3 |      5 | true        |
+|  4 |     -1 | true        |
++----+--------+-------------+
+```
+
+Those two statements each assign a literal. A statement that computes the value is refused, because a `STRICTBOOL` column does not take a string expression:
+
+```sql
+UPDATE accounts_tinyint SET active_bool = IF(active <> 0, 'true', 'false');
+```
+
+```
+ERROR 3219 (HY000): Incorrect STRICTBOOL value: cannot implicitly cast string expression. Use explicit conversion for column 'active_bool' at row 1
+```
+
+The explicit conversion the error asks for is the type's own function, so one statement does work:
+
+```sql
+UPDATE accounts_tinyint SET active_bool = STRICTBOOL::from_string(IF(active <> 0, 'true', 'false'));
+```
+
+The migration is also the moment to decide what those `5` and `-1` rows meant. Everything non-zero became `true` above, which is what `WHERE active` would have said. If some report in your system used `active = 1` instead, it disagreed, and now is when you find out.
+
+Once the new column is right, drop the old one and rename:
+
+```sql
+ALTER TABLE accounts_tinyint DROP COLUMN active;
+ALTER TABLE accounts_tinyint RENAME COLUMN active_bool TO active;
+```
+
+## Troubleshooting
+
+| Error | Fix |
+|---|---|
+| `Incorrect STRICTBOOL value: '<value>'` | The value is not one of the accepted spellings. Use `'true'`/`'false'`, `'t'`/`'f'`, `'yes'`/`'no'`, `'on'`/`'off'` or `'1'`/`'0'`, quoted |
+| `Incorrect STRICTBOOL value: cannot implicitly cast string expression` | The right-hand side is computed. Wrap it in `STRICTBOOL::from_string(...)`, or assign a literal per outcome |
+| `Cannot convert column '<col>' to custom type 'STRICTBOOL'` | `ALTER ... MODIFY` cannot reach the type. Add a new column and fill it |
+| `FUNCTION <db>.boolean_sum does not exist` | Run `INSTALL EXTENSION vsql_boolean` |
+| A `NOT NULL` column rejects an insert that omits it | Give the column an explicit `DEFAULT`, as the examples above do |
+
+## See also
+
+- [Choosing Data Types](/guides/choosing-data-types) — when a narrower column earns its place
+- [NULL in MySQL](/guides/null-in-mysql) — what the boolean aggregates skip
+- [CHECK Constraints in MySQL](/guides/check-constraints) — the other way to refuse bad values
