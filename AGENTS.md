@@ -79,6 +79,23 @@ VillageSQL's key differentiator is its extension framework. When documenting ext
 
 - Refer to the [docs.json schema](https://mintlify.com/docs.json) when building the docs.json file and site navigation
 
+## Extension pages
+
+Each extension has one body in `snippets/extensions/<slug>.mdx` and one page
+per live version slot under `<slot>/extensions/<slug>.mdx`. The pages are
+generated: edit the body, or the title and See also list in
+`scripts/extension-pages.json`, then run `scripts/gen-extension-pages.py`.
+
+Two Mintlify constraints put the See also list in the generated page instead of
+the shared body, and both were measured:
+
+- An `.mdx` snippet does not receive properties. `{props.x}` inside one yields
+  an empty string, so a link built from it renders as `href=""`. Only `.jsx`
+  snippets take properties.
+- A relative link such as `../install` renders correctly, but
+  `mint broken-links` reads the snippet on its own and exits 1. That check
+  gates CI. Relative links in ordinary pages are unaffected.
+
 ## Frontmatter requirements for pages
 - title: Clear, descriptive page title
 - description: Concise summary for SEO/navigation
