@@ -526,20 +526,22 @@ via `SHOW STATUS`.
 ## System Variables
 
 The sys_var capability (`vsql::sys_var`) lets an extension register
-MySQL system variables backed by extension-owned storage. Four types are
-supported: `BOOL` (`bool *`), `INT` (`long long *`), `DOUBLE` (`double *`), and
-`STR` (`char **`). `INT` and `DOUBLE` descriptors also carry `min_val` and
-`max_val` bounds; all descriptors carry a default value and a comment.
+MySQL system variables backed by extension-owned storage. Five types are
+supported: `BOOL` (`bool *`), `INT` (`long long *`), `DOUBLE` (`double *`),
+`STR` (`char **`), and `ENUM` (`unsigned long *`, storing a zero-based index
+into a fixed, ordered list of names). `INT` and `DOUBLE` descriptors also
+carry `min_val` and `max_val` bounds; all descriptors carry a default value
+and a comment.
 
 Build the capability with `vsql::preview_sys_var::make_capability()` and the
-matching factory functions `make_bool`, `make_int`, `make_double`, and
-`make_str`. The
+matching factory functions `make_bool`, `make_int`, `make_double`, `make_str`,
+and `make_enum`. The
 capability object also exposes `get()` and `set()` for
 programmatic access from extension code. Both return `false` on success.
 
 To react to value changes, chain `.on_change<&fn>()` on a descriptor. The
 callback receives a `sv::SysVarChange` with `var_name()` and typed accessors
-(`as_int()`, `as_real()`, `as_str()`).
+(`as_int()`, `as_real()`, `as_str()`, `as_enum()`).
 
 The server calls that callback while it holds its global system-variable lock.
 Reading or writing another of this extension's variables through its storage
@@ -563,6 +565,23 @@ to the storage pointers when the user sets a variable.
 | `sv::make_int` | `long long *` | `def_val`, `min_val`, `max_val` |
 | `sv::make_double` | `double *` | `def_val`, `min_val`, `max_val` |
 | `sv::make_str` | `char **` | `def_val` |
+| `sv::make_enum` | `unsigned long *` | `names`, `name_count`, `def_val` |
+
+An enum variable is set by name (`SET GLOBAL my_ext.mode = 'sync'`) or by the
+name's zero-based index; either way the server validates the value against
+`names` before accepting it, rejecting an unrecognized name or an
+out-of-range index rather than storing it:
+
+```
+ERROR 1231 (42000): Variable 'my_ext.mode' can't be set to the value of 'bogus'
+```
+
+That validation is what distinguishes it from a free-form `make_str`: the
+value space is closed and enforced at `SET` time. `names` and its strings
+must have static storage duration — the server keeps a `TYPELIB` pointing at
+them for as long as the variable is registered. A convenience overload
+deduces `name_count` from a `static const char *const NAMES[] = {...}` array,
+so the count argument can be omitted.
 
 ### Complete Example
 
@@ -575,6 +594,9 @@ namespace sv = vsql::preview_sys_var;
 static bool      g_enabled   = true;
 static long long g_threshold = 1000;
 static char     *g_log_file  = nullptr;
+static unsigned long g_mode  = 0;  // index into MODE_NAMES; default "off"
+
+static const char *const MODE_NAMES[] = {"off", "on", "sync"};
 
 static void on_threshold_change(sv::SysVarChange c) {
   // c.var_name() identifies the variable; c.as_int() returns the new value
@@ -584,7 +606,8 @@ static auto SYS_VARS = sv::make_capability({
     sv::make_bool("enabled",      "Enable feature",  &g_enabled,   true),
     sv::make_int ("threshold_ms", "Threshold in ms", &g_threshold, 1000, 0, 3600000)
         .on_change<&on_threshold_change>(),
-    sv::make_str ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log")});
+    sv::make_str ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log"),
+    sv::make_enum("mode",         "Operating mode",  &g_mode,      MODE_NAMES, 0)});
 
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()
@@ -600,6 +623,7 @@ name as a component prefix:
 SELECT @@global.my_ext.threshold_ms;
 SET GLOBAL my_ext.threshold_ms = 500;
 SET GLOBAL my_ext.log_file = '/var/log/myext.log';
+SET GLOBAL my_ext.mode = 'sync';
 ```
 
 ### Reading and Writing from Extension Code
@@ -1392,6 +1416,7 @@ POSTEXECUTE phase every field is populated. Selected accessors:
 | `no_index_used()` | `true` when the query ran without a usable index. |
 | `digest_hash()` | Statement digest as 64 lowercase hex characters — the value `performance_schema` exposes as `DIGEST`. A compact key for grouping identical statements; `NULL` whenever `digest_text()` is. |
 | `read_first()`, `read_last()`, `read_key()`, `read_next()`, `read_prev()`, `read_rnd()`, `read_rnd_next()` | Per-statement handler row-access counters (the slow log's `Read_*` fields). They quantify the access method that `no_index_used()` only flags — a high `read_rnd_next()`, for example, indicates a full table scan. |
+| `client_pid()`, `client_name()`, `program_name()` | Client-supplied connection attributes sent once at handshake (`_pid`, `_client_name`, `program_name`): the client's OS process id, connector/driver library (e.g. `libmysql`, `mysql-connector-j`), and application name (e.g. `mysql`, `mysqldump`). Each is `NULL` when the client did not send that attribute. |
 
 Because `query()` returns the server's rewritten form when one exists,
 credential-bearing statements arrive with the secret obfuscated rather than in
