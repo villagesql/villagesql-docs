@@ -1597,7 +1597,7 @@ The builder has six pieces:
 | `.client_plugin(name)` | Optional. Overrides the client-side auth plugin the server advertises during the handshake. |
 | `.accepts_client_plugin(callback)` | Optional. Takes `bool (*)(const char *offered)`. Returning `true` keeps the plugin the client offered; returning `false` switches the client to `.client_plugin()`. |
 | `.auto_create(callback)` | Optional. Opts the method in to logins for accounts that do not exist (see [Auto-Creating Accounts](#auto-creating-accounts)). |
-| `.auto_grant(callback)` | Optional. Lets the server grant the roles the handler stages, instead of only activating ones the account already holds (see [Auto-Granting Roles](#auto-granting-roles)). |
+| `.roles_mode(callback)` | Optional. Chooses how the server reconciles the roles the handler stages with the account's granted roles — activate-only, also grant, or fully sync (see [Auto-Granting Roles](#auto-granting-roles)). |
 | `.build()` | Yields the descriptor you hand to `AuthCapability`. |
 
 `AuthCapability g_auth{descriptor}` is the self-registering token consumed by
@@ -1939,35 +1939,50 @@ widely held.
 ### Auto-Granting Roles
 
 By default a role a token names takes effect only if the account already holds
-it, and one it does not hold is logged and skipped. `.auto_grant(&callback)`
-changes that: the server grants the staged roles to the account, so the token
-decides which roles the session gets rather than only which of the account's
-existing roles to switch on.
+it; one it does not hold is skipped, and the server logs why (`VEF auth: role
+'<role>'@'<host>' requested for account '<user>'@'<host>' is not granted;
+skipping`). `.roles_mode(&callback)` changes that: the callback returns a
+`vef_auth_roles_mode_t` — `VEF_AUTH_ROLES_ACTIVATE` (the default),
+`VEF_AUTH_ROLES_GRANT`, or `VEF_AUTH_ROLES_SYNC` — and the server reconciles
+the staged roles with the account's granted roles accordingly on each login.
 
-The callback matches `.auto_create()` in shape — no arguments, returns `bool`,
-and the server calls it on each login, so it can follow a runtime setting:
+The callback matches `.auto_create()` in shape — no arguments — but returns the
+mode enum instead of a `bool`, and the server calls it on each login, reading
+whatever backs it live:
 
 ```cpp
-bool auto_grant_enabled() { return true; }
+unsigned long g_auto_grant = 0;  // 0=ACTIVATE, 1=GRANT, 2=SYNC
+vef_auth_roles_mode_t roles_mode_cb() {
+  return static_cast<vef_auth_roles_mode_t>(g_auto_grant);
+}
 
 constexpr auto AUTH_METHOD =
     vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
         .client_plugin("mysql_clear_password")
-        .auto_grant(&auto_grant_enabled)
+        .roles_mode(&roles_mode_cb)
         .build();
 ```
 
-The two opt-ins are independent. `.auto_create()` governs logins for accounts
-that do not exist; `.auto_grant()` governs granting to the account a login
-resolves to, whether or not that account was just created. Leaving
-`.auto_grant()` off, or returning `false`, keeps the activate-only default.
+The two opt-ins run at different points in a login. `.auto_create()` decides
+whether a login for an account that does not yet exist is allowed to provision
+one; `.roles_mode()` runs afterward, against whatever account the login
+resolved to — the one just provisioned or one that already existed — so the
+same reconciliation applies either way. `VEF_AUTH_ROLES_ACTIVATE`, or no
+callback at all, keeps the activate-only default.
 
-The grant persists — it is an ordinary `GRANT`, not a session-only activation —
-and it is additive: the server never revokes a role the token stopped naming.
+`VEF_AUTH_ROLES_GRANT` is additive: it grants a staged role the account lacks,
+and never runs the revoke step at all. `VEF_AUTH_ROLES_SYNC` runs that step:
+it revokes every granted role the token did not claim, so a role dropped from
+the token is dropped from the account too on the next login — except a role
+set as the account's `DEFAULT ROLE` by an operator's `ALTER USER`, which SYNC
+never revokes. Under either mode, a staged role that does not exist as a DB
+role fails its `GRANT` and is logged and skipped rather than failing the
+login.
 
-`vsql_auth_test` exposes this as `vsql_auth_test.auto_grant`, also `OFF` to start.
-Its `-token-roles` token stages `vsql_role_granted` and `vsql_role_denied`, and
-the account below holds neither. With the setting off, the login leaves the
+`vsql_auth_test` exposes this as `vsql_auth_test.auto_grant`, an `OFF`/`ON`/`SYNC`
+enum (also `OFF` to start) whose index order matches the mode order above. Its
+`-token-roles` token stages `vsql_role_granted` and `vsql_role_denied`, and the
+account below holds neither. With the setting off, the login leaves the
 account's roles alone:
 
 ```sql
@@ -2019,7 +2034,15 @@ SHOW GRANTS FOR vsql_auth_test_user;
 ```
 
 <Warning>
-With `.auto_grant()` on, a valid token is enough to gain any role it names. The
-role must already exist, so a token still cannot invent privileges, but the DBA
-no longer decides which existing roles an account may reach — the method does.
+With `vsql_auth_test.auto_grant` set to `ON` or `SYNC`, a valid token is enough
+to gain any role it names. A role that does not already exist as a DB role
+fails its `GRANT` and is skipped, so a token still cannot invent a role that
+was never created, but the DBA no longer decides which of the roles that do
+exist an account may reach — the auth method does. `SYNC` goes further: it
+also revokes a role a DBA granted out of band but the token never claims, when
+the account next logs in — an operator can still pin one role past that by
+setting it as the account's `DEFAULT ROLE`, which SYNC leaves alone. A role
+revoked from `vsql_auth_test_user` does not disappear from a session that
+already activated it: querying `CURRENT_ROLE()` again in that same session,
+after the revoke, still lists the role.
 </Warning>
