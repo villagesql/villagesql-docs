@@ -376,6 +376,133 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .build()
 ```
 
+## Deciding a Function's Type Parameters at Resolution Time
+
+The server's built-in rules usually work out a return type's parameters from
+its arguments' declared types. Sometimes they can't — for example, deriving a
+parameterized custom type's parameters from a constant string-literal
+argument (`TYPEID('user') -> typeid(prefix=user)`), or combining two
+arguments' parameters into the return type's parameters
+(`vector_concat(vector(M), vector(N)) -> vector(M+N)`). For these, register a
+**bind-and-check-types hook** with `.bind_and_check_types<&Hook>()` on the
+func builder. It runs once at analysis time (`fix_fields`), before any row is
+read, with the signature:
+
+```cpp
+void my_hook(vsql::BindArgs args, vsql::BindResult out);
+```
+
+`.bind_and_check_types()` and `.varargs()` are mutually exclusive on the same
+function — a varargs VDF has no fixed argument list for the hook to reason
+about. Declaring `.varargs()` before `.bind_and_check_types<&Hook>()` in the
+builder chain is a compile-time `static_assert` failure. Declaring them in
+the other order compiles, but the extension is rejected when the server loads
+it: registration walks every function's final built state and rejects the
+first one that is both varargs and has a bind hook, with:
+
+```text
+VDF '%s' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
+```
+
+<Warning>
+`.bind_and_check_types<&Hook>()` and `<villagesql/vsql/bind_check_types.h>`
+are declared only in the opt-in dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`) and
+require VEF Protocol 4. A default stable-ABI build has neither, so
+registering a hook fails to compile.
+</Warning>
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+// TYPEID(prefix=...) persists its prefix string verbatim.
+struct TypeIdParams {
+  std::string prefix;
+  static TypeIdParams parse(const std::map<std::string, std::string> &p) {
+    return {.prefix = p.at("prefix")};
+  }
+  static void to_strings(const TypeIdParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["prefix"] = p.prefix;
+  }
+};
+
+void typeid_from_string(MaybeParams<TypeIdParams> &params,
+                        std::string_view from, CustomResult out) {
+  const TypeIdParams &p = params.value();
+  auto buf = out.buffer();
+  if (buf.size() < p.prefix.size()) { out.error("TYPEID: buffer too small"); return; }
+  std::memcpy(buf.data(), p.prefix.data(), p.prefix.size());
+  out.set_length(p.prefix.size());
+}
+
+void typeid_to_string(CustomArgWith<TypeIdParams> in, StringResult out) {
+  auto bytes = in.value();
+  auto buf = out.buffer();
+  size_t n = std::min(buf.size(), bytes.size());
+  std::memcpy(buf.data(), bytes.data(), n);
+  out.set_length(n);
+}
+
+int typeid_compare(CustomArgWith<TypeIdParams> a, CustomArgWith<TypeIdParams> b) {
+  auto av = a.value(), bv = b.value();
+  size_t n = std::min(av.size(), bv.size());
+  int c = std::memcmp(av.data(), bv.data(), n);
+  if (c != 0) return c < 0 ? -1 : 1;
+  return av.size() == bv.size() ? 0 : (av.size() < bv.size() ? -1 : 1);
+}
+
+bool typeid_resolve_params(const std::map<std::string, std::string> &params,
+                          ResolvedTypeParams *result, char *error_msg) {
+  result->persisted_length = static_cast<int64_t>(params.at("prefix").size());
+  result->max_decode_buffer_length = 256;
+  return false;  // success
+}
+
+constexpr int64_t kTypeIdMaxPersistedLength = 256;
+static constexpr const char kTypeIdName[] = "TYPEID";
+
+constexpr auto TYPEID =
+    make_type<kTypeIdName>()
+        .variable_length_type()
+        .max_decode_buffer_length(256)
+        .max_persisted_length(kTypeIdMaxPersistedLength)
+        .params<TypeIdParams, &TypeIdParams::parse, &TypeIdParams::to_strings>()
+        .resolve_params<&typeid_resolve_params>()
+        .from_string<&typeid_from_string>()
+        .to_string<&typeid_to_string>()
+        .compare<&typeid_compare>()
+        .build();
+
+// TYPEID('user') should return typeid(prefix=user). The built-in rules can't
+// work this out on their own -- the return parameters come from the *value*
+// of a constant argument, not its declared type -- so the function supplies
+// them itself.
+void typeid_ctor_bind(BindArgs args, BindResult out) {
+  BindArgType name_arg = args.at(0);
+  if (!name_arg.has_const_value()) {
+    out.error("TYPEID(name) requires a constant string argument");
+    return;
+  }
+  TypeIdParams p{.prefix = std::string(name_arg.const_value())};
+  out.set_return<TypeIdParams>(p);
+}
+
+void typeid_ctor(StringArg name, CustomResultWith<TypeIdParams> out) {
+  const TypeIdParams &p = out.params();
+  auto buf = out.buffer();
+  std::memcpy(buf.data(), p.prefix.data(), p.prefix.size());
+  out.set_length(p.prefix.size());
+}
+
+// Registration:
+// make_func<&typeid_ctor>("TYPEID")
+//     .returns(TYPEID).param(STRING)
+//     .bind_and_check_types<&typeid_ctor_bind>()
+//     .build()
+```
+
 ## Extension Load and Unload Hooks
 
 An extension sometimes has work to do once per load rather than once per call —
