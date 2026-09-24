@@ -67,13 +67,13 @@ SELECT vsql_complex.complex_abs(impedance) FROM signals;
 
 ## 前提条件
 
-開始する前に、VillageSQLをソースからビルドします。拡張機能は、サーバーのSDKヘッダーとビルドツリーに対してリンクされます。最初に[ソースからのビルド](/ja/mysql-8.4/stable/source)ガイドに従ってください。
+開始する前に、VillageSQL Extension SDKが必要です。CMakeにSDKを指定する方法は2つあります。VillageSQLのビルドツリーがある場合は、`-DVillageSQL_BUILD_DIR=/path/to/villagesql/build`を渡します。[ソースからのビルド](/ja/mysql-8.4/stable/source)ガイドに従うと、このツリーが生成されます。展開済みのSDKディレクトリ（`include/villagesql/vsql.h`を含むもの）がある場合は、それだけで十分です。`-DVillageSQL_SDK_DIR=/path/to/sdk`を渡してください。サーバーをビルドせずにSDKを入手する方法については、[拡張機能テンプレートのREADME](https://github.com/villagesql/vsql-extension-template)を参照してください。VEBのインストール先ディレクトリを設定するのはビルドツリー形式だけなので、SDKのみのパスでは、ビルドしたVEBファイルを`SHOW VARIABLES LIKE 'veb_dir'`が示すディレクトリに自分でコピーしてください。
 
 また、次のものも必要です。
 
 - **Git** - クローニングとバージョン管理用
 - **CMake** 3.18以降 - ビルドシステム
-- **C++コンパイラ** - GCC 8+、Clang 8+、またはC++17サポートを備えたMSVC 2019+
+- **C++コンパイラ** - C++17のサポートが必要です。テンプレートは`CMAKE_CXX_STANDARD 17`を設定しており、SDKのCMakeパッケージはこれより低い規格を拒否します。
 - **基本的なC++の知識** - C++と関数ポインタの理解
 
 <Tip>
@@ -280,7 +280,7 @@ make_func<&large_result_impl>("large_result")
   .build()
 ```
 
-`buffer()`と`set_length()`を使用して値を自分で構築する場合、バッファは`buffer().size()`バイトに固定されます。それを超えて書き込むとメモリオーバーフローが発生するため、超過しないようにガードしてください。
+`buffer()`と`set_length()`を使用して値を自分で構築する場合、`buffer().size()`を超えて書き込まないでください。メモリオーバーフローが発生します。ただし、大きすぎる値でも失敗させないでください。書き込もうとしたサイズを報告して戻り、サーバーにバッファを拡張させて再度呼び出させてください。
 
 ```cpp
 void large_result_impl(StringArg input, StringResult out) {
@@ -289,7 +289,10 @@ void large_result_impl(StringArg input, StringResult out) {
 
     auto buf = out.buffer();
     if (needed > buf.size()) {
-        out.error("Output exceeds buffer size");
+        // Too small this time. Report what is needed and return: the server
+        // grows the buffer to `needed` and re-invokes this function, and the
+        // second call takes the branch below.
+        out.set_length(needed);
         return;
     }
 
@@ -298,7 +301,11 @@ void large_result_impl(StringArg input, StringResult out) {
 }
 ```
 
-`STRING`結果の場合、`out.set(sv)`はsnprintfスタイルのオーバーフロー契約に従います。収まる分だけバイトをコピーし、`set_length`を介して値の完全なサイズを報告します。報告されたサイズがバッファを超えると、サーバーは結果バッファを拡張して関数を再呼び出しするため、要求されたバッファより大きい`STRING`値は切り捨てられなくなります。
+`STRING`結果の場合、`out.set(sv)`はsnprintfスタイルのオーバーフロー契約に従います。`out.buffer()`に収まる分だけバイトをコピーしますが、値の*完全な*サイズを報告します。サーバーは報告された長さがバッファを超えていることを検出し、バッファを拡張して関数を 2 回目に呼び出します。そのため、`.buffer_size()`より大きい値は切り捨てられずに全体が返されます。報告された長さがバッファに必要な大きさを正確に示すため、再試行は常に 1 回で十分です。
+
+拡張は`max_allowed_packet`によって制限されます。それより大きい値は切り捨てられるのではなく、`NULL`として返されます。
+
+`out.buffer()`に自分で書き込んで`out.set_length()`を呼び出す場合も、同じ契約に従います。収まったバイト数ではなく、書き込もうとした完全なサイズを報告してください。切り捨てられた長さを報告すると再試行が行われず、残りが黙って失われます。
 
 その契約は行の評価時に適用されます。*マテリアライズされた*`STRING`結果（GROUP BY/DISTINCTの一時テーブル、`CREATE TABLE ... SELECT`、またはUNION内）は、関数が`.max_result_length(n)`を宣言しない限り、引数の幅で切り捨てられます。これは結果列のサイズを設定します（文字数単位で、`VEF_MAX_RESULT_LENGTH`（16 MiB）が上限です）。
 
@@ -319,7 +326,7 @@ make_func<&large_result_impl>("large_result")
 
 ## ステップ4：カスタム型を作成する
 
-カスタム型を使用すると、`ORDER BY`、インデックス、および集約関数で機能する`COMPLEX`、`UUID`、または`VECTOR`などの新しい列タイプを定義できます。拡張機能にのみ関数を登録する場合は、ステップ5に進みます。
+カスタム型を使用すると、`ORDER BY`、インデックス、および集約関数で機能する`COMPLEX`、`UUID`、または`VECTOR`などの新しい列タイプを定義できます。作成する拡張機能が関数のみを登録する場合は、ステップ5に進みます。
 
 完全な実装のウォークスルーについては、[C++でのカスタム型](/ja/mysql-8.4/stable/custom-types)を参照してください。型にパラメータがある場合（例：`VECTOR(1536)`）、[パラメータ化された型](/ja/mysql-8.4/stable/type-operations#parameterized-types)を参照してください。
 
@@ -382,13 +389,13 @@ cd build
 
 ```bash
 # Configure the build
-cmake ..
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
 # Or, if building against VillageSQL source:
-cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
 
 # Or, to build against the unstable dev ABI headers:
-cmake .. -DVSQL_USE_DEV_ABI=ON
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVSQL_USE_DEV_ABI=ON
 
 # Build the extension
 make

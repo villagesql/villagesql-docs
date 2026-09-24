@@ -1,10 +1,10 @@
 ---
 audience: extension-author
 title: "API do Protocol 1"
-description: "Referência para a API de tipos baseada em pointers de função do Protocol 1 e o estilo de ABI bruta — a interface original do VEF, estável desde a v0.0.1 e que será removida após a 0.0.5."
+description: "Referência para a API de tipos baseada em pointers de função do Protocol 1 e o estilo de ABI bruta — a interface original do VEF, estável desde a v0.0.1 e que provavelmente será descontinuada em uma versão futura."
 ---
 
-O Protocol 1 é a interface original do VEF. Ele é estável desde a v0.0.1 e será removido após a 0.0.5. Novas extensões devem usar a API do Protocol 3 — os construtores de tipos baseados em templates dos guias [Criando Extensões em C++](/pt-BR/mysql-8.4/stable/create) e [Desenvolvimento em C++](/pt-BR/mysql-8.4/stable/development).
+O Protocol 1 é a interface original do VEF. Ele é estável desde a v0.0.1 e continua com suporte, mas provavelmente será descontinuado em uma versão futura. Novas extensões devem usar a API do Protocol 3 — os construtores de tipos baseados em templates dos guias [Criando Extensões em C++](/pt-BR/mysql-8.4/stable/create) e [Desenvolvimento em C++](/pt-BR/mysql-8.4/stable/development).
 
 Esta página existe como referência ao trabalhar com extensões existentes compiladas com o Protocol 1.
 
@@ -47,7 +47,14 @@ size_t hash_mytype(const unsigned char* data, size_t len) {
 
 ### Registro
 
+Esta forma exige `#include <villagesql/extension.h>` (não `<villagesql/vsql.h>`) e `using namespace villagesql;`.
+
 ```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+constexpr const char* MYTYPE = "mytype";
+
 VEF_GENERATE_ENTRY_POINTS(
   make_extension()
     .type(make_type(MYTYPE)
@@ -66,22 +73,33 @@ VEF_GENERATE_ENTRY_POINTS(
 );
 ```
 
-`vsql::make_type<kMyTypeName>()` (com um NTTP de string em tempo de compilação) é a forma preferida. `make_type(MYTYPE)` (sem parâmetro de template) é a forma do Protocol 1 — o suporte a ela será removido após a 0.0.5.
+`vsql::make_type<kMyTypeName>()` (com um NTTP de string em tempo de compilação) é a forma preferida. `make_type(MYTYPE)` (sem parâmetro de template) é a forma do Protocol 1 — ela continua com suporte, mas provavelmente será descontinuada em uma versão futura.
 
 ## Estilo de ABI Bruta (Funções)
 
-As implementações de VDF do Protocol 1 podem passar as structs C brutas diretamente em vez de usar wrappers tipados. Este estilo será removido após a 0.0.5 — use a [API tipada de argumento/resultado](/pt-BR/mysql-8.4/stable/development#argument-and-result-types) para todo código novo.
+As implementações de VDF do Protocol 1 podem passar as structs C brutas diretamente em vez de usar wrappers tipados. Este estilo continua com suporte, mas provavelmente será descontinuado em uma versão futura — use a [API tipada de argumento/resultado](/pt-BR/mysql-8.4/stable/development#argument-and-result-types) para todo código novo.
 
 ```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
 void add_impl(vef_context_t* ctx,
               vef_invalue_t* a, vef_invalue_t* b,
               vef_vdf_result_t* result) {
   result->int_value = a->int_value + b->int_value;
   result->type = VEF_RESULT_VALUE;
 }
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&add_impl>("add_impl")
+                  .returns(INT)
+                  .param(INT)
+                  .param(INT)
+                  .build()))
 ```
 
-O registro é idêntico à abordagem tipada — o construtor detecta a assinatura automaticamente.
+Esta assinatura bruta por argumento — `void(vef_context_t*, vef_invalue_t* arg0, ..., vef_vdf_result_t*)` — é detectada apenas pelo `make_func<>()` de `<villagesql/extension.h>`. O `make_func<>()` de `<villagesql/vsql.h>` rejeita em tempo de compilação qualquer assinatura bruta `vef_context_t*`/`vef_invalue_t*`/`vef_vdf_result_t*`.
 
 ### Constantes de Resultado
 
@@ -98,15 +116,27 @@ No Protocol 3, `out.set()`, `out.set_null()`, `out.warning()` e `out.error()` tr
 
 ### Registro de Agregados no Protocol 1
 
-Para agregados, `.clear<>()` e `.accumulate<>()` aceitam assinaturas de pointers de função de ABI bruta. `.prerun<>()` e `.postrun<>()` não aceitam — o construtor exige assinaturas tipadas (`void(PrerunArgs, PrerunResult)` e `void(PostrunArgs)`) mesmo para extensões do Protocol 1. Use a [abordagem tipada de agregados](/pt-BR/mysql-8.4/stable/development#aggregate-vdfs) para todo código novo.
+Não existe caminho de registro de agregados com ABI bruta. `make_func<>()` não possui os membros `.clear<>()` ou `.accumulate<>()` — esses métodos existem apenas no construtor separado `make_aggregate_func<State, &result_fn>()` de `<villagesql/vsql.h>`, que usa assinaturas tipadas baseadas em `State&` em vez de pointers brutos `vef_context_t*`/`vef_vdf_args_t*`. Mesmo uma extensão do Protocol 1 deve registrar agregados dessa forma. Use a [abordagem tipada de agregados](/pt-BR/mysql-8.4/stable/development#aggregate-vdfs) para todo código novo.
 
 ```cpp
-make_func<&raw_result>("my_agg")
+#include <villagesql/vsql.h>
+#include <optional>
+using namespace vsql;
+
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+make_aggregate_func<SumState, &my_result>("my_agg")
     .returns(INT).param(INT)
-    // prerun/postrun require typed signatures even in Protocol 1 mode:
-    .prerun<&my_prerun>()      // void(vsql::PrerunArgs, vsql::PrerunResult)
-    .postrun<&my_postrun>()    // void(vsql::PostrunArgs)
-    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
-    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
+    .clear<&my_clear>()        // void(SumState&)
+    .accumulate<&my_acc>()     // void(SumState&, IntArg)
     .build()
 ```

@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "C++ 開発"
-description: "C++ 拡張機能向けの VDF 作成の詳細 — 引数と結果の型、集計、prerun/postrun、可変長引数、および登録。"
+description: "C++ 拡張機能向けの VDF 作成の詳細 — 引数と結果の型、例外安全性、集計、prerun/postrun、可変長引数、および登録。"
 ---
 
 このガイドは、C++ VDF 実装を作成するための詳細なリファレンスです。エンドツーエンドのビルド手順をカバーする [Creating Extensions in C++](/ja/mysql-8.4/stable/create) と、テストと反復のループをカバーする [C++ Testing](/ja/mysql-8.4/stable/testing) の補完資料です。
@@ -17,6 +17,32 @@ VEF Protocol 3 は v0.0.4 で安定版となりました。Protocol 4 は開発�
 ```cpp
 #include <villagesql/vsql.h>
 ```
+
+## 例外安全性 {#exception-safety}
+
+例外の封じ込めは拡張機能の責任です。SDK は実装を `try`/`catch` でラップせず、サーバーもラップしません。そのため、エントリポイントから抜け出した例外は、上位のどこにもハンドラーがないまま C ABI 境界を越えてスタックを巻き戻し、サーバープロセスが終了します。通常の SQL 入力でもこれに到達します: `std::stoi()` は数値以外の文字列でスローし、`nlohmann::json::dump()` は有効な UTF-8 ではないテキストでスローします。
+
+登録するすべてのエントリポイントの本体をラップしてください: VDF、集計結果関数、およびカスタム型の `from_string`/`to_string` 演算です。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <string>
+
+using namespace vsql;
+
+void to_int_impl(StringArg in, IntResult out) {
+  if (in.is_null()) { out.set_null(); return; }
+  try {
+    out.set(std::stoi(std::string(in.value())));  // throws on bad input
+  } catch (const std::exception &e) {
+    out.warning(e.what());
+  } catch (...) {
+    out.warning("unexpected error");
+  }
+}
+```
+
+`const std::exception &` に加えて `...` もキャッチしてください: 依存ライブラリが `std::exception` を継承しない型をスローする場合があり、それもサーバーを終了させます。`warning()` と `error()` の選択は、他の失敗の場合と同じ基準で行ってください — ステートメントが継続すべき不正な入力には `warning()`、続行が安全でない場合には `error()` です。
 
 ## 引数と結果の型 {#argument-and-result-types}
 
@@ -114,7 +140,7 @@ void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
 void count_result(const CountState &s, IntResult out) { out.set(s); }
 ```
 
-`StringResult` の集計 VDF はテキストを返します。結果は `utf8mb4_bin` の文字セットと照合順序を報告するため、クライアントは 16 進数ではなく文字として表示します — スカラー VDF の STRING パスと同じです。また、`.max_result_length(n)` も同様に適用し、マテリアライズされた集計結果（`GROUP BY`/`DISTINCT` の一時テーブル、`CREATE TABLE ... SELECT`、または UNION）のサイズを設定して引数幅で切り捨てられないようにします。サイズ設定のルールと上限については [Custom Buffer Sizes](/ja/mysql-8.4/stable/create#custom-buffer-sizes) を参照してください。
+`StringResult` の集計 VDF はテキストを返します。結果は `utf8mb4_bin` の文字セットと照合順序を報告するため、クライアントは 16 進数ではなく文字として表示します — スカラー VDF の STRING パスと同じです。また、`.max_result_length(n)`（オプトイン形式の dev ABI ヘッダー（`-DVSQL_USE_DEV_ABI=ON`）と Protocol 4 が必要）も同様に適用し、マテリアライズされた集計結果（`GROUP BY`/`DISTINCT` の一時テーブル、`CREATE TABLE ... SELECT`、または UNION）のサイズを設定して引数幅で切り捨てられないようにします。サイズ設定のルールと上限については [Custom Buffer Sizes](/ja/mysql-8.4/stable/create#custom-buffer-sizes) を参照してください。
 
 ## ステートメントごとの状態（Prerun と Postrun） {#per-statement-state-prerun-and-postrun}
 
@@ -122,7 +148,7 @@ void count_result(const CountState &s, IntResult out) { out.set(s); }
 
 `.prerun<&Hook>()` と `.postrun<&Hook>()` で登録します。必要なシグネチャは次の通りです：
 
-| Hook | Required signature |
+| フック | 必要なシグネチャ |
 |------|--------------------|
 | Prerun | `void(vsql::PrerunArgs, vsql::PrerunResult)` |
 | Postrun | `void(vsql::PostrunArgs)` |
@@ -158,7 +184,7 @@ void ba_call_index_postrun(PostrunArgs args) {
 //     .build()
 ```
 
-## 可変長引数 VDF
+## 可変長引数 VDF {#varargs-vdfs}
 
 **可変長引数** VDF は、任意の SQL 型の任意の数の引数を受け入れます。func ビルダーで `.varargs()` を宣言し、これは `.no_params()` および `.param(TYPE)` と排他です。本体は通常の固定引数型の代わりに `vsql::VarArgs` 引数を受け取ります。
 
@@ -170,7 +196,7 @@ void ba_call_index_postrun(PostrunArgs args) {
 
 範囲 for ループで引数を反復処理します。各 `AnyArg` 要素は値を読み取る前に型チェックが必要です：
 
-| Predicate | Accessor | Return type |
+| 述語 | アクセサ | 戻り値の型 |
 |-----------|----------|-------------|
 | `is_int()` | `as_int()` | `long long` |
 | `is_real()` | `as_real()` | `double` |
@@ -178,6 +204,66 @@ void ba_call_index_postrun(PostrunArgs args) {
 | `is_custom()` | `as_custom()` | `vsql::Span<const unsigned char>` |
 
 いずれのアクセサを呼び出す前にも `is_null()` をチェックしてください — 4 つすべてで null 引数に対する動作は未定義です。
+
+`PrerunArgType::custom_type()` は、引数のカスタム型名を `std::string_view` として返します。カスタム型でない引数に対しては空になります。`is_custom()` だけでは、サーバーに登録されているすべてのカスタム型を受け入れます。`custom_type()` の比較と組み合わせることで、可変長引数の呼び出しを特定の 1 つの型に絞り込めます。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cstring>
+using namespace vsql;
+
+// POINT2D stores two little-endian int32 (x, y) in 8 bytes — registration
+// omitted here; see Custom Types for make_type<>().
+
+void point_path_prerun(PrerunArgs args, PrerunResult out) {
+  if (args.size() == 0) {
+    out.error("point_path requires at least one point");
+    return;
+  }
+  for (size_t i = 0; i < args.size(); i++) {
+    auto t = args.type_at(i);
+    if (!t.is_custom() || t.custom_type() != "POINT2D") {
+      out.error("point_path: every argument must be a POINT2D");
+      return;
+    }
+  }
+  out.request_buffer_size(16 + args.size() * 32);
+}
+
+void point_path(VarArgs args, StringResult out) {
+  auto buf = out.buffer();
+  size_t off = 0;
+  bool first = true;
+  for (auto a : args) {
+    if (a.is_null()) { out.set_null(); return; }
+    auto bytes = a.as_custom();
+    int x, y;
+    memcpy(&x, bytes.data(), 4);
+    memcpy(&y, bytes.data() + 4, 4);
+    if (!first) {
+      memcpy(buf.data() + off, " -> ", 4);
+      off += 4;
+    }
+    first = false;
+    off += static_cast<size_t>(
+        snprintf(buf.data() + off, buf.size() - off, "(%d,%d)", x, y));
+  }
+  out.set_length(off);
+}
+
+// Registration:
+// make_func<&point_path>("point_path")
+//     .returns(STRING).varargs()
+//     .prerun<&point_path_prerun>()
+//     .build()
+```
+
+```sql
+SELECT point_path(POINT2D::from_string('0,0'), POINT2D::from_string('1,2'));
+-- (0,0) -> (1,2)
+SELECT point_path('1,2');
+-- ERROR 1123 (HY000): Can't initialize function 'point_path'; point_path: every argument must be a POINT2D
+```
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -221,6 +307,59 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .build()
 ```
 
+## 拡張機能のロードフックとアンロードフック {#extension-load-and-unload-hooks}
+
+拡張機能には、呼び出しごとではなくロードごとに 1 回だけ実行する作業が必要になることがあります — CPU 固有の実装の選択や、VDF が後で読み取るルックアップテーブルの構築などです。その作業は拡張機能ビルダーの `.on_init<&Fn>()` で登録し、対応する後処理は `.on_deinit<&Fn>()` で登録します。どちらもシグネチャが `void()` の関数を取ります。
+
+<Warning>
+`.on_init<&Fn>()` と `.on_deinit<&Fn>()` は、オプトイン形式の dev ABI ヘッダー（`-DVSQL_USE_DEV_ABI=ON`）でのみ宣言されています。デフォルトの安定版 ABI ビルドにはどちらのメソッドもないため、フックを登録するとコンパイルに失敗します。
+</Warning>
+
+`on_init` は拡張機能のロードのたびに実行されます: `INSTALL EXTENSION` 時と、サーバー起動のたびに、サーバーが拡張機能を検証して受け入れた後に実行されます。サーバーが拒否した拡張機能に対しては決して実行されません。`on_deinit` はアンロード時 — `UNINSTALL EXTENSION` またはサーバーシャットダウン時 — に実行されます。
+
+どちらのフックも拡張機能プロセス内で **サーバーへのアクセスなし** で実行されます: SQL の実行、システム変数の読み取り、サーバー状態への到達はできません。そのため、サーバーとやり取りする必要があるセットアップには適していません — その場合はプレビュー機能の populate ステップを使用してください。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <cmath>
+using namespace vsql;
+
+static float *g_sqrt_table = nullptr;
+
+void build_table() {
+  g_sqrt_table = new float[256];
+  for (int i = 0; i < 256; i++) g_sqrt_table[i] = std::sqrt(float(i));
+}
+
+void free_table() {
+  delete[] g_sqrt_table;
+  g_sqrt_table = nullptr;
+}
+
+void fast_sqrt(IntArg n, RealResult out) {
+  if (n.is_null() || n.value() < 0 || n.value() > 255) {
+    out.set_null();
+    return;
+  }
+  out.set(g_sqrt_table[n.value()]);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .on_init<&build_table>()
+        .on_deinit<&free_table>()
+        .func(make_func<&fast_sqrt>("fast_sqrt")
+                  .returns(REAL)
+                  .param(INT)
+                  .build()))
+```
+
+`INSTALL EXTENSION my_extension` の後、`SELECT fast_sqrt(16)` は `4` を返します — これは `build_table` がすでに実行されている場合にのみ得られる結果です。
+
+<Note>
+`on_deinit` は `VEF_GENERATE_ENTRY_POINTS` が生成する `vef_unregister` エントリポイントから呼び出されます。`VEF_GENERATE_REGISTRATION` はそのエントリポイントを定義しないため、それを使用する拡張機能は、自身が記述する `vef_unregister` から後処理を呼び出す必要があります。
+</Note>
+
 ## VEF_GENERATE_REGISTRATION
 
 `VEF_GENERATE_REGISTRATION` は拡張機能登録を実行しますが `extern "C"` エントリポイントを定義しない内部ヘルパー `_vef_do_register()` を作成します。テストビルドで登録後に記述子をパッチするなど、`vef_register` の動作をカスタマイズする必要がある場合に使用してください。通常の拡張機能には代わりに `VEF_GENERATE_ENTRY_POINTS` を使用します。
@@ -257,7 +396,7 @@ FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION
 WHERE EXTENSION_NAME = 'my_ext';
 ```
 
-| Column | Type | Description |
+| 列 | 型 | 説明 |
 |--------|------|-------------|
 | `EXTENSION_NAME` | `VARCHAR(64)` | インストールされた拡張機能の名前。 |
 | `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | 拡張機能とサーバー間でネゴシエートされた VEF プロトコルバージョン。 |

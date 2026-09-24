@@ -67,13 +67,13 @@ Extensões podem adicionar:
 
 ## Pré-requisitos
 
-Antes de começar, compile o VillageSQL a partir do código-fonte — extensões são vinculadas aos cabeçalhos do SDK e à árvore de compilação do servidor. Siga primeiro o guia [Compilar a Partir do Código-Fonte](/pt-BR/mysql-8.4/stable/source).
+Antes de começar, você precisa do SDK de Extensões do VillageSQL, e há duas formas de apontar o CMake para um deles. Se você tem uma árvore de compilação do VillageSQL, passe `-DVillageSQL_BUILD_DIR=/path/to/villagesql/build` — o guia [Compilar a Partir do Código-Fonte](/pt-BR/mysql-8.4/stable/source) produz essa árvore. Se você tem um diretório de SDK descompactado — um que contenha `include/villagesql/vsql.h` —, isso basta por si só: passe `-DVillageSQL_SDK_DIR=/path/to/sdk`. O [README do template de extensão](https://github.com/villagesql/vsql-extension-template) explica como obter um SDK sem compilar o servidor. Somente a forma com árvore de compilação define um diretório de instalação de VEB, então, no caminho apenas com SDK, copie você mesmo o arquivo VEB compilado para o diretório que `SHOW VARIABLES LIKE 'veb_dir'` informar.
 
 Você também precisa de:
 
 - **Git** - Para clonagem e controle de versão
 - **CMake** 3.18 ou superior - Sistema de compilação
-- **Compilador C++** - GCC 8+, Clang 8+ ou MSVC 2019+ com suporte a C++17
+- **Compilador C++** - Com suporte a C++17: o template define `CMAKE_CXX_STANDARD 17`, e o pacote CMake do SDK rejeita um padrão inferior
 - **Conhecimento básico de C++** - Compreensão de C++ e pointers de função
 
 <Tip>
@@ -287,9 +287,10 @@ make_func<&large_result_impl>("large_result")
   .build()
 ```
 
-Quando você mesmo constrói o valor com `buffer()` e `set_length()`, o buffer
-tem tamanho fixo de `buffer().size()` bytes — escrever além dele causa estouro de memória, então proteja-se
-contra isso:
+Quando você mesmo constrói o valor com `buffer()` e `set_length()`, nunca escreva
+além de `buffer().size()` — isso causa estouro de memória. Mas também não falhe diante de um valor
+grande demais: informe o tamanho que você teria escrito e deixe o servidor aumentar
+o buffer e chamar você novamente.
 
 ```cpp
 void large_result_impl(StringArg input, StringResult out) {
@@ -298,7 +299,10 @@ void large_result_impl(StringArg input, StringResult out) {
 
     auto buf = out.buffer();
     if (needed > buf.size()) {
-        out.error("Output exceeds buffer size");
+        // Too small this time. Report what is needed and return: the server
+        // grows the buffer to `needed` and re-invokes this function, and the
+        // second call takes the branch below.
+        out.set_length(needed);
         return;
     }
 
@@ -308,9 +312,19 @@ void large_result_impl(StringArg input, StringResult out) {
 ```
 
 Para resultados STRING, `out.set(sv)` segue um contrato de estouro no estilo snprintf: ele
-copia quantos bytes couberem e informa o tamanho total do valor via `set_length`.
-Quando o tamanho informado excede o buffer, o servidor aumenta o buffer de resultado e
-reinvoca a função, de modo que um valor STRING maior que o buffer solicitado deixa de ser truncado.
+copia quantos bytes couberem em `out.buffer()`, mas informa o tamanho *total* do
+valor. O servidor detecta que o tamanho informado excede o buffer, aumenta o
+buffer e chama a função uma segunda vez — de modo que um valor maior que
+`.buffer_size()` é retornado por inteiro em vez de truncado. Uma única nova tentativa sempre
+basta, porque o tamanho informado diz exatamente qual deve ser a capacidade do buffer.
+
+O crescimento é limitado por `max_allowed_packet`. Um valor maior que isso é retornado
+como `NULL`, e não truncado.
+
+Escrever em `out.buffer()` e chamar `out.set_length()` por conta própria participa
+do mesmo contrato: informe o tamanho total que você teria escrito, e não o número
+de bytes que couberam. Informar o tamanho truncado anula a nova tentativa e descarta
+silenciosamente o restante.
 
 Esse contrato se aplica no momento da linha. Um resultado STRING *materializado* (em uma
 tabela temporária de GROUP BY/DISTINCT, `CREATE TABLE ... SELECT` ou UNION) ainda
@@ -402,13 +416,13 @@ Configure e compile sua extensão:
 
 ```bash
 # Configure the build
-cmake ..
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
 # Or, if building against VillageSQL source:
-cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
 
 # Or, to build against the unstable dev ABI headers:
-cmake .. -DVSQL_USE_DEV_ABI=ON
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVSQL_USE_DEV_ABI=ON
 
 # Build the extension
 make

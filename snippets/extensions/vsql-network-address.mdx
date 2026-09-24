@@ -1,0 +1,153 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+An IP address kept in a `VARCHAR` sorts alphabetically, accepts typos, and
+cannot answer whether an address falls inside a network. `vsql_network_address` adds four column types that
+validate their input, sort correctly, and come with the containment and netmask
+functions that go with them. It follows PostgreSQL's `inet`, `cidr`, `macaddr`,
+and `macaddr8` types.
+
+| | |
+|---|---|
+| **Maintainer** | VillageSQL |
+| **Source and full documentation** | [villagesql/vsql-network-address](https://github.com/villagesql/vsql-network-address) |
+| **License** | GPL-2.0 |
+
+## Install
+
+`vsql_network_address.veb` is already in the server's `lib/veb/` directory if
+you installed VillageSQL with the install script, the Docker image, or a release
+tarball. Install it into the server with one statement:
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+Confirm it is there:
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_network_address';
+```
+
+```
++----------------------+
+| EXTENSION_NAME       |
++----------------------+
+| vsql_network_address |
++----------------------+
+```
+
+To build it yourself, follow the build instructions in the
+[repository](https://github.com/villagesql/vsql-network-address).
+
+## What it adds
+
+### The types
+
+| Type | Holds | Bytes |
+|---|---|---|
+| `INET` | A host address with an optional netmask, IPv4 or IPv6 | 19 |
+| `CIDR` | A network address | 19 |
+| `MACADDR` | A 6-byte hardware address | 6 |
+| `MACADDR8` | An 8-byte hardware address | 8 |
+
+```sql
+CREATE TABLE hosts (
+    id    INT PRIMARY KEY,
+    label VARCHAR(16),
+    addr  INET,
+    mac   MACADDR
+);
+```
+
+### Functions
+
+| Function | Returns | What it does |
+|---|---|---|
+| `inet_from_string(s)`, `inet_to_string(a)` | `INET`, text | Converts between text and `INET` |
+| `cidr_from_string(s)`, `cidr_to_string(c)` | `CIDR`, text | The same for `CIDR` |
+| `macaddr_from_string(s)`, `macaddr_to_string(m)` | `MACADDR`, text | The same for `MACADDR` |
+| `macaddr8_from_string(s)`, `macaddr8_to_string(m)` | `MACADDR8`, text | The same for `MACADDR8` |
+| `inet_compare(a, b)`, `cidr_compare(a, b)`, `macaddr_compare(a, b)`, `macaddr8_compare(a, b)` | int | -1, 0, or 1 |
+| `inet_contains(a, b)` | int | 1 when `a` strictly contains `b` |
+| `inet_contains_or_equals(a, b)` | int | 1 when `a` contains `b` or equals it |
+| `inet_contained_by(a, b)` | int | 1 when `a` sits strictly inside `b` |
+| `inet_contained_by_or_equals(a, b)` | int | 1 when `a` sits inside `b` or equals it |
+| `inet_overlaps(a, b)` | int | 1 when either contains the other, or they are equal |
+| `inet_family(a)` | int | 4 or 6 |
+| `inet_masklen(a)` | int | The netmask length |
+| `inet_set_masklen(a, n)`, `cidr_set_masklen(c, n)` | `INET`, `CIDR` | The same address with a different netmask |
+| `inet_host(a)`, `inet_text(a)`, `inet_abbrev(a)`, `cidr_abbrev(c)` | text | The address without the mask, with it, and in abbreviated forms |
+| `inet_netmask(a)`, `inet_hostmask(a)` | `INET` | The netmask and its complement |
+| `inet_broadcast(a)` | `INET` | The broadcast address of the containing network |
+| `inet_network(a)` | `CIDR` | The network the address belongs to |
+| `macaddr_trunc(m)` | `MACADDR` | The last three bytes zeroed, leaving the manufacturer prefix |
+
+## Example
+
+```sql
+INSERT INTO hosts VALUES
+    (1, 'gateway', '192.168.1.1/24',  '00:1b:63:84:45:e6'),
+    (2, 'printer', '192.168.1.50/24', '3c:22:fb:aa:01:02'),
+    (3, 'vpn',     '10.8.0.7/16',     '00:1b:63:84:45:e7');
+
+SELECT label, addr, inet_masklen(addr) AS mask, inet_family(addr) AS family
+FROM hosts ORDER BY addr;
+```
+
+```
++---------+-----------------+------+--------+
+| label   | addr            | mask | family |
++---------+-----------------+------+--------+
+| vpn     | 10.8.0.7/16     |   16 |      4 |
+| gateway | 192.168.1.1/24  |   24 |      4 |
+| printer | 192.168.1.50/24 |   24 |      4 |
++---------+-----------------+------+--------+
+```
+
+The rows come back in address order rather than alphabetical order, which is
+why `10.8.0.7` sorts first.
+
+Ask which hosts are on a network:
+
+```sql
+SELECT label FROM hosts
+WHERE inet_contained_by_or_equals(addr, inet_from_string('192.168.1.0/24')) = 1;
+```
+
+```
++---------+
+| label   |
++---------+
+| gateway |
+| printer |
++---------+
+```
+
+Derive the network and its broadcast address:
+
+```sql
+SELECT inet_network(inet_from_string('192.168.1.50/24')) AS network,
+       inet_broadcast(inet_from_string('192.168.1.50/24')) AS broadcast;
+```
+
+```
++----------------+------------------+
+| network        | broadcast        |
++----------------+------------------+
+| 192.168.1.0/24 | 192.168.1.255/24 |
++----------------+------------------+
+```
+
+<Note>
+  `inet_contained_by` is strict, so an address carrying the same netmask as the
+  network is not contained by it. `192.168.1.5/32` inside `192.168.1.0/24`
+  returns 1, while `192.168.1.5/24` inside the same network returns 0. Use
+  `inet_contained_by_or_equals` when the stored rows carry the network's own
+  mask, as the example above does.
+</Note>

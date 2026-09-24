@@ -35,10 +35,6 @@ mint dev
 
 View your local preview at `http://localhost:3000`.
 
-## Publishing changes
-
-Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app) to propagate changes from your repo to the live site. Changes are deployed to production automatically after pushing to the default branch.
-
 ## Contributing
 
 We welcome contributions to improve our documentation! Please see our [contributing guidelines](./CONTRIBUTING.md) for more information.

@@ -1,10 +1,10 @@
 ---
 audience: extension-author
 title: "协议 1 API"
-description: "协议 1 函数指针类型 API 和原始 ABI 样式的参考——这是原始 VEF 接口，自 v0.0.1 版本起稳定，将在 0.0.5 版本后移除。"
+description: "协议 1 函数指针类型 API 和原始 ABI 样式的参考——这是原始 VEF 接口，自 v0.0.1 版本起稳定，可能在未来版本中被弃用。"
 ---
 
-协议 1 是原始 VEF 接口。自 v0.0.1 版本起稳定，将在 0.0.5 版本后移除。新的扩展应使用协议 3 API——基于模板的类型构建器，请参阅 [使用 C++ 创建扩展](/zh/mysql-8.4/stable/create) 和 [C++ 开发](/zh/mysql-8.4/stable/development) 指南。
+协议 1 是原始 VEF 接口。自 v0.0.1 版本起稳定，并仍受支持，但可能在未来版本中被弃用。新的扩展应使用协议 3 API——基于模板的类型构建器，请参阅 [使用 C++ 创建扩展](/zh/mysql-8.4/stable/create) 和 [C++ 开发](/zh/mysql-8.4/stable/development) 指南。
 
 本页面用于在处理基于协议 1 构建的现有扩展时提供参考。
 
@@ -47,7 +47,14 @@ size_t hash_mytype(const unsigned char* data, size_t len) {
 
 ### 注册
 
+这种形式需要 `#include <villagesql/extension.h>`（而不是 `<villagesql/vsql.h>`）以及 `using namespace villagesql;`。
+
 ```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+constexpr const char* MYTYPE = "mytype";
+
 VEF_GENERATE_ENTRY_POINTS(
   make_extension()
     .type(make_type(MYTYPE)
@@ -66,22 +73,33 @@ VEF_GENERATE_ENTRY_POINTS(
 );
 ```
 
-`vsql::make_type<kMyTypeName>()`（带有编译时字符串 NTTP）是首选形式。`make_type(MYTYPE)`（没有模板参数）是协议 1 形式——对它的支持将在 0.0.5 版本后移除。
+`vsql::make_type<kMyTypeName>()`（带有编译时字符串 NTTP）是首选形式。`make_type(MYTYPE)`（没有模板参数）是协议 1 形式——它仍受支持，但可能在未来版本中被弃用。
 
 ## 原始 ABI 样式（函数）
 
-协议 1 VDF 实现可以直接传递原始 C 结构体，而不是使用类型化包装器。这种样式将在 0.0.5 版本后移除——对于所有新代码，请使用 [类型化参数/结果 API](/zh/mysql-8.4/stable/development#argument-and-result-types)。
+协议 1 VDF 实现可以直接传递原始 C 结构体，而不是使用类型化包装器。这种样式仍受支持，但可能在未来版本中被弃用——对于所有新代码，请使用 [类型化参数/结果 API](/zh/mysql-8.4/stable/development#argument-and-result-types)。
 
 ```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
 void add_impl(vef_context_t* ctx,
               vef_invalue_t* a, vef_invalue_t* b,
               vef_vdf_result_t* result) {
   result->int_value = a->int_value + b->int_value;
   result->type = VEF_RESULT_VALUE;
 }
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&add_impl>("add_impl")
+                  .returns(INT)
+                  .param(INT)
+                  .param(INT)
+                  .build()))
 ```
 
-注册与类型化方法相同——构建器会自动检测签名。
+这种按参数的原始签名——`void(vef_context_t*, vef_invalue_t* arg0, ..., vef_vdf_result_t*)`——只有来自 `<villagesql/extension.h>` 的 `make_func<>()` 才会检测到。来自 `<villagesql/vsql.h>` 的 `make_func<>()` 会在编译时拒绝任何原始的 `vef_context_t*`/`vef_invalue_t*`/`vef_vdf_result_t*` 签名。
 
 ### 结果常量
 
@@ -98,15 +116,27 @@ void add_impl(vef_context_t* ctx,
 
 ### 协议 1 中的聚合注册
 
-对于聚合，`.clear<>()` 和 `.accumulate<>()` 接受原始 ABI 函数指针签名。`.prerun<>()` 和 `.postrun<>()` 不接受——构建器需要类型化签名（`void(PrerunArgs, PrerunResult)` 和 `void(PostrunArgs)`），即使对于协议 1 扩展也是如此。对于所有新代码，请使用 [类型化聚合方法](/zh/mysql-8.4/stable/development#aggregate-vdfs)。
+不存在原始 ABI 的聚合注册路径。`make_func<>()` 没有 `.clear<>()` 或 `.accumulate<>()` 成员——这些方法只存在于来自 `<villagesql/vsql.h>` 的独立构建器 `make_aggregate_func<State, &result_fn>()` 上，该构建器使用基于 `State&` 的类型化签名，而不是原始的 `vef_context_t*`/`vef_vdf_args_t*` 指针。即使是协议 1 扩展也必须以这种方式注册聚合。对于所有新代码，请使用 [类型化聚合方法](/zh/mysql-8.4/stable/development#aggregate-vdfs)。
 
 ```cpp
-make_func<&raw_result>("my_agg")
+#include <villagesql/vsql.h>
+#include <optional>
+using namespace vsql;
+
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+make_aggregate_func<SumState, &my_result>("my_agg")
     .returns(INT).param(INT)
-    // prerun/postrun require typed signatures even in Protocol 1 mode:
-    .prerun<&my_prerun>()      // void(vsql::PrerunArgs, vsql::PrerunResult)
-    .postrun<&my_postrun>()    // void(vsql::PostrunArgs)
-    .clear<&my_clear>()        // void(vef_context_t*, vef_vdf_args_t*)
-    .accumulate<&my_acc>()     // void(vef_context_t*, vef_vdf_args_t*, vef_vdf_result_t*)
+    .clear<&my_clear>()        // void(SumState&)
+    .accumulate<&my_acc>()     // void(SumState&, IntArg)
     .build()
 ```

@@ -1,0 +1,134 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+`vsql_oauth2` lets an account sign in with a JWT instead of a password. The
+extension verifies the token's signature, against keys fetched from a JWKS
+endpoint or one static public key, checks that the token has not expired, and
+maps a claim inside it to a VillageSQL account. Your identity provider stays the only place that issues
+credentials.
+
+| | |
+|---|---|
+| **Maintainer** | VillageSQL |
+| **Source and full documentation** | [villagesql/vsql-oauth2](https://github.com/villagesql/vsql-oauth2) |
+| **License** | GPL-2.0 |
+| **Capability** | Preview |
+
+<Warning>
+  This extension uses a preview capability, so the server must be started with
+  `--vsql_allow_preview_extensions=ON`. `INSTALL EXTENSION` is refused
+  otherwise.
+</Warning>
+
+## Install
+
+`vsql_oauth2.veb` is already in the server's `lib/veb/` directory if you
+installed VillageSQL with the install script, the Docker image, or a release
+tarball. Install it into the server with one statement:
+
+```sql
+INSTALL EXTENSION vsql_oauth2;
+```
+
+Confirm it is there:
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_oauth2';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_oauth2    |
++----------------+
+```
+
+To build it yourself, follow the build instructions in the
+[repository](https://github.com/villagesql/vsql-oauth2).
+
+## What it adds
+
+It adds an authentication plugin rather than SQL functions. Name the plugin
+when you create the account, and that account then authenticates by presenting
+a token:
+
+```sql
+CREATE USER 'analyst'@'%' IDENTIFIED WITH vsql_oauth2;
+```
+
+```sql
+SELECT user, plugin FROM mysql.user WHERE user = 'analyst';
+```
+
+```
++---------+-------------+
+| user    | plugin      |
++---------+-------------+
+| analyst | vsql_oauth2 |
++---------+-------------+
+```
+
+The session runs as the account the token names, not as the account that
+connected. The claim in `username_claim`, `sub` by default, supplies that name.
+When its value is `analyst`, the statement above is all you need. When it names
+something else, such as an email address, create that account too and let the
+connecting account proxy onto it:
+
+```sql
+CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
+CREATE USER 'alice@example.com';
+GRANT SELECT ON app.* TO 'alice@example.com';
+GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
+```
+
+Nobody signs in as `alice@example.com` directly, so it needs no password of its
+own. A server running `validate_password` refuses to create an account without
+one, answering
+`ERROR 1819 (HY000): Your password does not satisfy the current policy
+requirements`. Where that applies, give the account a password nobody holds, or
+an authentication plugin that permits no login at all.
+
+Without the proxy grant the login is refused with
+`ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing
+proxy privilege.`
+
+Everything else is configuration.
+
+| Setting | Default | What it controls |
+|---|---|---|
+| `vsql_oauth2.jwks_url` | empty | Where signing keys are fetched from. Takes precedence over a static key |
+| `vsql_oauth2.public_key` | empty | A static public key, for a provider with no JWKS endpoint |
+| `vsql_oauth2.jwks_refresh_interval` | `3600` | How often those keys are refetched, in seconds |
+| `vsql_oauth2.jwks_http_timeout` | `5` | How long a fetch may take, in seconds |
+| `vsql_oauth2.issuer` | empty | The `iss` claim a token must carry, when set |
+| `vsql_oauth2.audience` | empty | The `aud` claim a token must carry, when set |
+| `vsql_oauth2.username_claim` | `sub` | Which claim names the account |
+| `vsql_oauth2.roles_claim` | empty | Which claim carries roles |
+| `vsql_oauth2.roles_filter` | empty | Which of those roles are considered |
+| `vsql_oauth2.roles_transform_pattern`, `vsql_oauth2.roles_transform_replacement` | empty | How a provider's role name becomes a database role name |
+| `vsql_oauth2.auto_create` | `OFF` | Whether an unknown subject gets an account at first login |
+| `vsql_oauth2.auto_grant` | `OFF` | `OFF`/`ON`/`SYNC` — `OFF` activates only already-granted roles; `ON` also grants the claimed roles that exist as DB roles; `SYNC` does that and revokes granted roles the token no longer claims, except default roles |
+
+RSA signatures are accepted as RS256, RS384, and RS512, and ECDSA as ES256,
+ES384, and ES512.
+
+<Warning>
+  `auto_create` and `auto_grant` are off by default, and that default is the
+  safe one. Turning them on means your identity provider decides who has an
+  account here and what it can reach, so scope `roles_filter` before you do.
+  `auto_grant = SYNC` goes further: it also revokes any role the account holds
+  that the token does not claim, except roles set as the account's
+  `DEFAULT ROLE` by an operator.
+</Warning>
+
+<Note>
+  A setting written with `SET PERSIST` survives a restart, but
+  `UNINSTALL EXTENSION` deletes it. After an uninstall and reinstall every
+  setting is back at its default, and no restart brings the old value back.
+</Note>

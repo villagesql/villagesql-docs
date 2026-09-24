@@ -84,7 +84,7 @@ VEF_GENERATE_ENTRY_POINTS(
 
 `ALTER TABLE ... MODIFY COLUMN`および`CHANGE COLUMN`は、カスタムタイプが関与する場合、これらのルールを適用します。
 
-| 元 | 宛先 | 結果 |
+| 変換元 | 変換先 | 結果 |
 |------|----|--------|
 | 非カスタム | カスタム | エラー: `Cannot convert column 'col' to custom type 'MYTYPE'` |
 | カスタム | 文字列タイプ | 許可 |
@@ -121,11 +121,14 @@ SET val = MYTYPE::from_string(
 
 ## 例：COMPLEXタイプ
 
-COMPLEX数を実装する完全な例を以下に示します。
+COMPLEX数値型を実装する完全な例を以下に示します。
 
 ```cpp
-#include <cstdio>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <system_error>
 #include <villagesql/vsql.h>
 
 using namespace vsql;
@@ -134,11 +137,20 @@ using namespace vsql;
 void encode_complex(std::string_view from, CustomResult out) {
     auto buf = out.buffer();
     if (buf.size() < 16) return;
+    // strtod needs a null-terminated string; string_view is not one.
+    const std::string input(from);
+    const char *p = input.c_str();
     double real, imag;
-    if (sscanf(from.data(), "(%lf,%lf)", &real, &imag) != 2) {
+    auto fail = [&] {
         out.warning("invalid complex format: expected (real,imag)");
-        return;
-    }
+    };
+    if (*p++ != '(') return fail();
+    char *endptr = nullptr;
+    real = strtod(p, &endptr);
+    if (endptr == p || *endptr != ',') return fail();
+    p = endptr + 1;
+    imag = strtod(p, &endptr);
+    if (endptr == p || *endptr != ')') return fail();
     memcpy(buf.data(), &real, 8);
     memcpy(buf.data() + 8, &imag, 8);
     out.set_length(16);
@@ -152,9 +164,19 @@ void decode_complex(CustomArg in, StringResult out) {
     memcpy(&real, data.data(), 8);
     memcpy(&imag, data.data() + 8, 8);
     auto buf = out.buffer();
-    int len = snprintf(buf.data(), buf.size(), "(%.6f,%.6f)", real, imag);
-    if (len < 0 || static_cast<size_t>(len) >= buf.size()) return;
-    out.set_length(static_cast<size_t>(len));
+    char *p = buf.data();
+    char *const end = p + buf.size();
+    if (p == end) return;
+    *p++ = '(';
+    auto re = std::to_chars(p, end, real);
+    if (re.ec != std::errc() || re.ptr == end) return;
+    p = re.ptr;
+    *p++ = ',';
+    auto im = std::to_chars(p, end, imag);
+    if (im.ec != std::errc() || im.ptr == end) return;
+    p = im.ptr;
+    *p++ = ')';
+    out.set_length(static_cast<size_t>(p - buf.data()));
 }
 
 // Compare for ORDER BY: real part first, then imaginary
@@ -174,6 +196,8 @@ int compare_complex(CustomArg a, CustomArg b) {
     return 0;
 }
 ```
+
+デコードには`snprintf`ではなく`std::to_chars`を使用します。`"%.6f"`のような固定精度の書式では`double`に必要な桁が失われ、`0.1234567891`が`0.123457`として読み戻されるためです。エンコードでは`strtod`を呼び出す前に入力をコピーします。`std::string_view`は終端のヌル文字を持たないためです。`std::from_chars`の浮動小数点オーバーロードを使えばこのコピーを回避できますが、libc++ではmacOS 26以降でのみ利用可能とマークされているため、これらを使用する拡張機能はそれより前のターゲット向けにビルドできません。
 
 これらの操作を定義した後、ユーザーはカスタムタイプを持つテーブルを作成できます。
 
@@ -230,7 +254,7 @@ CREATE TABLE signals (
 );
 ```
 
-オプティマイザは、同じVDF式が`WHERE`、`ORDER BY`、または`GROUP BY`に含まれる場合に、インデックスを使用します。比較値をVDFの戻り値のタイプにキャストして、オプティマイザが式を一致させます。
+オプティマイザは、同じVDF式が`WHERE`、`ORDER BY`、または`GROUP BY`に含まれる場合に、インデックスを使用します。オプティマイザが式を一致させられるように、比較値をVDFの戻り値のタイプにキャストします。
 
 ```sql
 SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);

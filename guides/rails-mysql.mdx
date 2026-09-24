@@ -1,0 +1,298 @@
+---
+title: "Rails 8 with MySQL"
+sidebarTitle: "Rails with ActiveRecord"
+description: "How to scaffold a Rails 8 application on MySQL instead of the SQLite default: the --database flag, database.yml for a dedicated user, migrations, and a working ActiveRecord CRUD path against a live server."
+keywords: "rails 8 mysql, rails mysql2, rails database.yml mysql, rails new database mysql, activerecord mysql, rails db:create mysql, rails mysql2 gem, rails max_connections"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Running `rails new` with no flags gives you SQLite in development, not MySQL. Pointing a Rails 8 application at MySQL takes one explicit flag at scaffold time, a `database.yml` that names a real user and host, and a gem that needs a native MySQL client library to compile. This guide walks through all three against a live MySQL-compatible server, using VillageSQL as the database everything below actually ran against.
+
+## Confirm the Toolchain Before Scaffolding
+
+Rails 8 requires Ruby 3.2 or later. Check what is on the machine before running `rails new`:
+
+```bash
+ruby -v
+which rails
+```
+
+On a fresh macOS install with only the system Ruby, this can return something like:
+
+```
+ruby 2.6.10p210 (2022-04-12 revision 67958) [universal.arm64e-darwin25]
+```
+
+Ruby 2.6 cannot run Rails 8. Install a current Ruby with Homebrew and put it ahead of the system Ruby on `PATH`:
+
+```bash
+brew install ruby
+export PATH="/opt/homebrew/opt/ruby/bin:/opt/homebrew/lib/ruby/gems/4.0.0/bin:$PATH"
+ruby -v
+```
+
+This produced `ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25]`, well above the Rails 8 floor. Install Rails itself with a version constraint rather than trusting whatever `gem install rails` resolves to:
+
+```bash
+gem install rails -v '~> 8.0'
+rails -v
+```
+
+This installed Rails 8.1.3.1. Rails 8.1 satisfies the `~> 8.0` constraint because that operator means "at least 8.0, less than 9.0."
+
+## Scaffold with the MySQL Adapter
+
+Rails 8 does not default to MySQL or PostgreSQL. Running `rails new --help` shows the actual default:
+
+```
+-d, [--database=DATABASE]  # Preconfigure for selected database
+                            # Default: sqlite3
+                            # Possible values: mysql, trilogy, postgresql, sqlite3, mariadb-mysql, mariadb-trilogy
+```
+
+`mysql` is still the correct value in Rails 8, it selects the `mysql2` gem and adapter. `trilogy` is a separate, pure-Ruby MySQL-protocol adapter Rails also supports, and is a different choice from the one this guide makes. Scaffold the app with the `mysql` value:
+
+```bash
+rails new . --database=mysql --skip-git
+```
+
+This writes `mysql2` into the `Gemfile` and generates a `config/database.yml` preconfigured with `adapter: mysql2`. `--skip-git` is optional and only relevant if the app directory is not going to be its own git repository.
+
+The `mysql2` gem has a native extension and needs a MySQL client library with headers to compile against. Without one, `bundle install` fails at the `mysql2` step. On macOS with Homebrew:
+
+```bash
+brew install mysql-client
+bundle config set build.mysql2 --with-mysql-dir=/opt/homebrew/opt/mysql-client
+bundle install
+```
+
+`mysql-client` is keg-only on Homebrew (it is not symlinked into `/opt/homebrew` because it conflicts with the full `mysql` formula), which is exactly why `bundle config` needs to be told where to find it explicitly rather than relying on `PATH`. With that set, `bundle install` compiled and installed `mysql2 0.5.7` alongside the rest of the Rails 8.1.3.1 dependency set.
+
+## Create a Dedicated Database and User
+
+Do not point a new application at the `root` account. Create a database and a scoped user on the running server:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -e "
+CREATE DATABASE IF NOT EXISTS rails_guide;
+CREATE USER IF NOT EXISTS 'rails_app'@'127.0.0.1' IDENTIFIED BY 'railspass123';
+GRANT ALL PRIVILEGES ON rails_guide.* TO 'rails_app'@'127.0.0.1';
+"
+```
+
+Point `config/database.yml` at this user over TCP rather than the Unix socket, since `rails_app` was granted access from `127.0.0.1`, not from `localhost`:
+
+```yaml
+default: &default
+  adapter: mysql2
+  encoding: utf8mb4
+  max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+  username: rails_app
+  password: railspass123
+  host: 127.0.0.1
+  port: 3306
+
+development:
+  <<: *default
+  database: rails_guide
+
+test:
+  <<: *default
+  database: rails_guide_test
+```
+
+## What `rails db:create` Actually Needs
+
+`rails db:create` does not create only the database named under the current `RAILS_ENV`. With `rails_app` granted privileges on `rails_guide.*` alone, running it produced this:
+
+```
+Mysql2::Error::ConnectionError: Access denied for user 'rails_app'@'127.0.0.1' to database 'rails_guide_test'
+Couldn't create 'rails_guide_test' database. Please check your configuration.
+Created database 'rails_guide'
+```
+
+`rails_guide` was created successfully: `GRANT ALL PRIVILEGES ON rails_guide.*` is enough to create a database that does not exist yet, because the grant is scoped to the database name, not to an existing object. But `rails db:create` also tries to create the `test` environment's database in the same run, and `rails_guide_test` was never granted. The task creates both `development` and `test` databases by default, only `production` is excluded.
+
+Granting the second database name resolves it:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -e "
+GRANT ALL PRIVILEGES ON rails_guide_test.* TO 'rails_app'@'127.0.0.1';
+"
+rails db:create
+```
+
+```
+Database 'rails_guide' already exists
+Created database 'rails_guide_test'
+```
+
+A scoped, non-privileged user is sufficient for `rails db:create` as long as it is granted on every database name Rails will try to create, not just the one named in `RAILS_ENV`. No superuser or global `CREATE` privilege is required.
+
+## Migrate and Verify Against the Server Directly
+
+Generate a `Post` model and migrate:
+
+```bash
+rails generate model Post title:string body:text
+rails db:migrate
+```
+
+The generated migration:
+
+```ruby
+class CreatePosts < ActiveRecord::Migration[8.1]
+  def change
+    create_table :posts do |t|
+      t.string :title
+      t.text :body
+
+      t.timestamps
+    end
+  end
+end
+```
+
+Confirm the table exists by querying the server directly, not by trusting Rails' own migration output:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D rails_guide -e "SHOW TABLES; DESCRIBE posts;"
+```
+
+```
+Tables_in_rails_guide
+ar_internal_metadata
+posts
+schema_migrations
+
+Field       Type          Null  Key  Default  Extra
+id          bigint        NO    PRI  NULL     auto_increment
+title       varchar(255)  YES        NULL
+body        text          YES        NULL
+created_at  datetime(6)   NO         NULL
+updated_at  datetime(6)   NO         NULL
+```
+
+## Wire Up a Route, a Controller, and Test Against the Server
+
+Add a resourceful route for `index` and `create`:
+
+```ruby
+# config/routes.rb
+Rails.application.routes.draw do
+  resources :posts, only: [:index, :create]
+end
+```
+
+A minimal JSON controller:
+
+```ruby
+# app/controllers/posts_controller.rb
+class PostsController < ApplicationController
+  skip_forgery_protection only: :create
+
+  def index
+    posts = Post.order(created_at: :desc)
+    render json: posts.as_json(only: [:id, :title, :body, :created_at])
+  end
+
+  def create
+    post = Post.create!(post_params)
+    render json: post.as_json(only: [:id, :title, :body, :created_at]), status: :created
+  end
+
+  private
+
+  def post_params
+    params.require(:post).permit(:title, :body)
+  end
+end
+```
+
+Start the server and exercise both actions with `curl`:
+
+```bash
+rails server -p 3210
+```
+
+```bash
+curl -s http://127.0.0.1:3210/posts
+# []
+
+curl -s -X POST http://127.0.0.1:3210/posts \
+  -H "Content-Type: application/json" \
+  -d '{"post":{"title":"Hello VillageSQL","body":"First post from Rails"}}'
+# {"id":1,"title":"Hello VillageSQL","body":"First post from Rails","created_at":"2026-08-28T19:40:37.844Z"}
+
+curl -s http://127.0.0.1:3210/posts
+# [{"id":1,"title":"Hello VillageSQL","body":"First post from Rails","created_at":"2026-08-28T19:40:37.844Z"}]
+```
+
+Do not stop at the HTTP response. Confirm the write landed in the actual table:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D rails_guide -e "SELECT id, title, body, created_at FROM posts;"
+```
+
+```
+id  title              body                     created_at
+1   Hello VillageSQL   First post from Rails    2026-08-28 19:40:37.844329
+```
+
+The row is present with the same content ActiveRecord reported, and the timestamp confirms `created_at` round-tripped through `mysql2` correctly.
+
+## Connection Pool Size and Puma's Thread Count Are the Same Number
+
+Rails 8.1's generated `database.yml` no longer uses the `pool` key you may know from older Rails versions. It uses `max_connections`:
+
+```yaml
+max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+```
+
+A `pool:` key still works and raises no warning: `max_connections` falls back to it when `max_connections` is absent, as a plain lookup with no deprecation path. What Rails 8.1 did deprecate is the Ruby method `HashConfig#pool`, now an alias for `HashConfig#max_connections`, which is a different thing from the `database.yml` key. Setting both keys to different values is not silently resolved. It raises at boot:
+
+```
+RuntimeError: Ambiguous configuration: 'pool' (10) and 'max_connections' (20) are set to different values. Prefer just 'max_connections'.
+```
+
+This matters because the same environment variable also sizes Puma's thread pool. `config/puma.rb` reads it directly, with a comment that says so explicitly:
+
+```ruby
+# threads. This includes Active Record's `pool` parameter in `database.yml`.
+threads_count = ENV.fetch("RAILS_MAX_THREADS", 3)
+threads threads_count, threads_count
+```
+
+The two defaults are not the same number: `database.yml` falls back to 5 connections if `RAILS_MAX_THREADS` is unset, while `puma.rb` falls back to 3 threads. Left at their defaults, the pool has more connections than Puma has threads to use them, which is safe but slightly wasteful. Set `RAILS_MAX_THREADS` explicitly once you know your target thread count, and both settings move together. A pool smaller than the thread count is the dangerous direction: threads will queue waiting for a free connection, and under load that shows up as request latency with no error in the log to explain it.
+
+## Frequently Asked Questions
+
+#### Does `--database=mysql` install the same gem in every Rails 8 version?
+
+Within Rails 8, yes. It resolves to the `mysql2` gem and the `mysql2` adapter, confirmed against `rails new --help` on Rails 8.1.3.1. `trilogy` is a separate, valid value for the same flag: it is a pure-Ruby MySQL wire-protocol client with no native extension to compile, which removes the `mysql-client` header dependency at the cost of using a different gem. Choose one at scaffold time; they are not interchangeable adapters you can swap later without touching `database.yml` and the `Gemfile`.
+
+#### Why does `rails db:create` need a database-specific grant instead of just `CREATE` privilege?
+
+A MySQL `GRANT ... ON dbname.* TO user` works even when `dbname` does not exist yet, and it authorizes creating that specific database. It does not authorize creating a database with a different name. Since `rails db:create` creates both the `development` and `test` databases from `config/database.yml` in one run, a scoped user needs a grant naming each one, not a single grant on the environment you expect to use day to day.
+
+#### Do I need to run migrations against VillageSQL any differently than against stock MySQL?
+
+No. Every command in this guide, `rails db:create`, `rails db:migrate`, `rails generate model`, ran unmodified against a VillageSQL server. VillageSQL is a drop-in replacement for MySQL, so `mysql2` and ActiveRecord's MySQL adapter see the same wire protocol and the same `SHOW`/`DESCRIBE` output as they would against MySQL itself.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `rails new` picks SQLite even though you meant MySQL | The `--database` flag was omitted; the Rails 8 default is `sqlite3`. Re-run with `--database=mysql`. |
+| `bundle install` fails compiling `mysql2` | No MySQL client library is installed. `brew install mysql-client` and set `bundle config set build.mysql2 --with-mysql-dir=/opt/homebrew/opt/mysql-client` before retrying. |
+| `Mysql2::Error::ConnectionError: Access denied for user ... to database '..._test'` during `rails db:create` | The scoped user was only granted on the development database name. Grant the same privileges on `<database>_test` as well. |
+| `RuntimeError: Ambiguous configuration: 'pool' ... and 'max_connections' ...` | `database.yml` sets both keys to different values. Keep only `max_connections`. |
+| Connecting with `host: localhost` fails but `host: 127.0.0.1` works | The MySQL user was created for a specific host (`'user'@'127.0.0.1'`), which does not match connections that go over the Unix socket via `localhost`. Match the `database.yml` host to the host the `CREATE USER` statement named. |
+
+## See also
+
+- [Using MySQL with ORMs: Django, Rails, and Prisma](/guides/mysql-with-orms) — Rails configuration at a settings level, across three frameworks
+- [MySQL Connection Pooling](/guides/connection-pooling) — how connection pooling behaves independent of any one framework

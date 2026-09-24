@@ -1,0 +1,155 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+`vsql_duckdb` runs DuckDB inside the server process, so a SQL statement can read
+Parquet, CSV, and JSON files straight from object storage or disk. Analytical
+files stay where they are, and you query them beside your tables without an
+export step or a second engine to operate.
+
+| | |
+|---|---|
+| **Maintainer** | VillageSQL |
+| **Source and full documentation** | [villagesql/vsql-duckdb](https://github.com/villagesql/vsql-duckdb) |
+| **License** | GPL-2.0 |
+| **Capability** | Preview |
+
+<Warning>
+  This extension declares two preview capabilities, so the server must be
+  started with `--vsql_allow_preview_extensions=ON`. It also needs a VillageSQL
+  server newer than 0.0.6.
+</Warning>
+
+## Install
+
+`vsql_duckdb` is not bundled with the server, so build it from the repository
+first and copy the resulting `vsql_duckdb.veb` into the directory named by the
+`veb_dir` system variable. Then install it:
+
+```sql
+INSTALL EXTENSION vsql_duckdb;
+```
+
+Confirm it is there:
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_duckdb';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_duckdb    |
++----------------+
+```
+
+The build instructions are in the
+[repository](https://github.com/villagesql/vsql-duckdb).
+
+## What it adds
+
+| Function | Returns | What it does |
+|---|---|---|
+| `duckdb_query(sql)` | text | Runs a DuckDB query and returns the rows as a JSON array |
+| `duckdb_scalar(sql)` | text | Runs a DuckDB query and returns the first value of the first row |
+| `duckdb_status()` | text | Reports the DuckDB version, the readers linked in, and the current settings |
+
+| Setting | Default | What it controls |
+|---|---|---|
+| `vsql_duckdb.allow_local_files` | `OFF` | Whether a query may read files on the server's own disk |
+| `vsql_duckdb.enable_external_access` | `ON` | Whether a query may reach the network |
+| `vsql_duckdb.s3_endpoint`, `vsql_duckdb.s3_region`, `vsql_duckdb.s3_url_style`, `vsql_duckdb.s3_use_ssl` | see `duckdb_status()` | Where object storage lives and how to address it |
+| `vsql_duckdb.s3_key_id`, `vsql_duckdb.s3_secret_keyring_id`, `vsql_duckdb.s3_secret_keyring_auth_id` | empty | The object storage credentials, with the secret held in the keyring |
+| `vsql_duckdb.memory_limit_mb` | `1024` | The memory ceiling for the embedded engine |
+| `vsql_duckdb.threads` | `2` | How many threads it may use |
+| `vsql_duckdb.timeout_ms` | `30000` | How long one query may run |
+| `vsql_duckdb.max_result_bytes` | `1048576` | The size ceiling on a returned result |
+| `vsql_duckdb.temp_directory` | empty | Where it spills to disk when a query outgrows memory, which happens only while `allow_local_files` is on |
+
+## Example
+
+Ask it what it is:
+
+```sql
+SELECT duckdb_status() AS status\G
+```
+
+```
+*************************** 1. row ***************************
+status: {
+  "duckdb_version": "v1.5.5",
+  "readers": ["core_functions", "httpfs", "json", "parquet"],
+  "engine_error": "",
+  "object_storage_credential": "not configured",
+  "s3_endpoint": "",
+  "s3_region": "",
+  "s3_url_style": "vhost",
+  "s3_use_ssl": true,
+  "enable_external_access": true,
+  "allow_local_files": false,
+  "memory_limit_mb": 1024,
+  "threads": 2,
+  "timeout_ms": 30000,
+  "max_result_bytes": 1048576
+}
+```
+
+Run a query that touches no files:
+
+```sql
+SELECT duckdb_scalar('SELECT 6 * 7') AS answer;
+```
+
+```
++--------+
+| answer |
++--------+
+| 42     |
++--------+
+```
+
+Read a CSV and get the rows back as JSON. Reading from the server's own disk is
+off by default, so turn it on first:
+
+```sql
+SET GLOBAL vsql_duckdb.allow_local_files = ON;
+
+SELECT duckdb_query(
+    'SELECT sku, units * unit_price AS total
+     FROM read_csv_auto(''/path/to/sales.csv'')
+     ORDER BY total DESC') AS rows_json\G
+```
+
+```
+*************************** 1. row ***************************
+rows_json: [{"sku":"A-100","total":59.97},{"sku":"A-101","total":24.5},{"sku":"A-102","total":21.7}]
+```
+
+Turn it off again when you are done, because it stays on until you do:
+
+```sql
+SET GLOBAL vsql_duckdb.allow_local_files = OFF;
+```
+
+Because the result is JSON, `JSON_TABLE` turns it back into rows you can join
+against your own tables.
+
+<Warning>
+  `allow_local_files` opens every file the server account can read, and
+  `enable_external_access` is on by default, so a query can also reach the
+  network. Extension functions are not grantable the way stored functions are,
+  so anyone who can run SQL here can call them: installing the extension gives
+  every account the reach of both switches. The object storage secret lives in
+  the keyring, and `vsql_duckdb.s3_secret_keyring_id` only names it.
+</Warning>
+
+<Note>
+  A setting written with `SET PERSIST` survives a restart, but
+  `UNINSTALL EXTENSION` deletes it. After an uninstall and reinstall every
+  setting is back at its default, and no restart brings the old value back.
+</Note>

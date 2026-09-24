@@ -3,22 +3,24 @@
 
 Used at release-cut time (VERSIONING.md step 4) to de-index the version that
 just lost `default: true`. Idempotent — safe to re-run. Covers the English
-tree (`mysql-8.4/<version>/`) and the ja/ko/zh mirrors.
+tree (`<product>/<version>/`) and its locale mirrors.
 
 Usage:
-    python3 scripts/noindex-version.py 0.0.4 [--dry-run] [--repo PATH]
+    python3 scripts/noindex-version.py 0.0.4 [--product mysql-9.7]
+        [--dry-run] [--repo PATH]
 """
 
 import argparse
 import sys
 from pathlib import Path
 
+DEFAULT_PRODUCT = "mysql-8.4"
 LOCALES = ["", "ja", "ko", "zh", "pt-BR"]  # "" = English tree at repo root
 
 
-def version_dirs(repo: Path, version: str):
+def version_dirs(repo: Path, product: str, version: str):
     for locale in LOCALES:
-        base = repo / locale / "mysql-8.4" / version if locale else repo / "mysql-8.4" / version
+        base = repo / locale / product / version if locale else repo / product / version
         if base.is_dir():
             yield base
 
@@ -47,14 +49,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("version", help="version dir to noindex, e.g. 0.0.4")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--product", default=DEFAULT_PRODUCT,
+                    help="product directory, e.g. mysql-9.7 (default mysql-8.4)")
     ap.add_argument("--repo", default=None, help="repo root (default: script's parent)")
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve() if args.repo else Path(__file__).resolve().parent.parent
 
-    dirs = list(version_dirs(repo, args.version))
+    dirs = list(version_dirs(repo, args.product, args.version))
     if not dirs:
-        print(f"error: no version dirs found for {args.version} under {repo}", file=sys.stderr)
+        print(f"error: no {args.product} version dirs found for {args.version} "
+              f"under {repo}", file=sys.stderr)
         return 1
 
     changed = skipped = 0

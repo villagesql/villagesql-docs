@@ -1,0 +1,213 @@
+---
+title: "How to Expose MySQL Tables as a REST API"
+sidebarTitle: "REST API from Tables"
+description: "How to serve MySQL tables over HTTP with VillageSQL's vsql_rest extension — filters, column selection, pagination, per-table methods, and the defaults you must change first."
+keywords: "mysql rest api, expose mysql over http, mysql json api, postgrest for mysql, vsql_rest, mysql http endpoint"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  This guide uses a preview capability. Start the server with
+  `--vsql_allow_preview_extensions=ON`, or `INSTALL EXTENSION` is refused.
+</Note>
+
+Putting a read-only JSON endpoint in front of a few tables usually means writing a small service, deploying it, giving it a database account, and keeping it alive. VillageSQL's `vsql_rest` extension serves those tables from inside the server process instead, so there is no second process and no new deployment.
+
+The defaults are built for a developer machine, not for a network. Read "Before you expose the port" below before you open it to anything.
+
+## Turning it on
+
+```sql
+INSTALL EXTENSION vsql_rest;
+```
+
+Create the database and its tables first. The listener reads the database layout when it starts and caches it for `vsql_rest.schema_ttl` seconds, 60 by default, so a table created afterwards answers `table not found` until that cache expires.
+
+```sql
+CREATE DATABASE shop;
+USE shop;
+
+CREATE TABLE products (
+    id       INT PRIMARY KEY,
+    name     VARCHAR(40),
+    category VARCHAR(20),
+    price    DECIMAL(8,2),
+    in_stock INT
+);
+
+INSERT INTO products VALUES
+    (1, 'Budget Widget',   'widget', 29.99, 120),
+    (2, 'Standard Widget', 'widget', 79.99,  40),
+    (3, 'Premium Widget',  'widget', 149.99,  4),
+    (4, 'Cable, 2m',       'cable',   9.99, 500),
+    (5, 'Cable, 5m',       'cable',  14.99,   0);
+```
+
+Then name the database, name the tables you are willing to serve, and start the listener:
+
+```sql
+SET GLOBAL vsql_rest.schema = 'shop';
+SET GLOBAL vsql_rest.allowed_tables = 'products';
+SET GLOBAL vsql_rest.vsql_rest_enabled = ON;
+```
+
+## Reading
+
+A table is a path, and the query string does the filtering. Each filter is `column=operator.value`:
+
+```bash
+curl 'http://127.0.0.1:3000/products?category=eq.widget&order=price.desc&limit=2'
+```
+
+```json
+[{"id":3,"name":"Premium Widget","category":"widget","price":"149.99","in_stock":4},{"id":2,"name":"Standard Widget","category":"widget","price":"79.99","in_stock":40}]
+```
+
+Ask for the columns you want, and nothing else:
+
+```bash
+curl 'http://127.0.0.1:3000/products?select=name,price&in_stock=eq.0'
+```
+
+```json
+[{"name":"Cable, 5m","price":"14.99"}]
+```
+
+Combine conditions with `or=(...)`:
+
+```bash
+curl 'http://127.0.0.1:3000/products?or=(category.eq.cable,price.gt.100)&select=id,name'
+```
+
+```json
+[{"id":3,"name":"Premium Widget"},{"id":4,"name":"Cable, 2m"},{"id":5,"name":"Cable, 5m"}]
+```
+
+Page through with `limit` and `offset`:
+
+```bash
+curl 'http://127.0.0.1:3000/products?order=id.asc&limit=2&offset=2'
+```
+
+```json
+[{"id":3,"name":"Premium Widget","category":"widget","price":"149.99","in_stock":4},{"id":4,"name":"Cable, 2m","category":"cable","price":"9.99","in_stock":500}]
+```
+
+The operators are `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `like`, `cs_like`, `in` and `is`. `in` takes a list, as in `?id=in.(1,3)`, and `is` takes null, as in `?price=is.null` or `?price=is.not.null`. A request with no `limit` returns at most `vsql_rest.max_rows` rows, which starts at 1000.
+
+## The allowlist
+
+A table that is not on `allowed_tables` does not exist as far as the API is concerned:
+
+```bash
+curl 'http://127.0.0.1:3000/orders'
+```
+
+```json
+{"message":"table not found: orders","details":null,"hint":null,"code":"VSQL0001"}
+```
+
+The response is 404, and it reads the same whether the table is absent or merely withheld.
+
+<Warning>
+  Leaving `allowed_tables` empty does not mean no tables. It means **all** of
+  them. Set it to the tables you intend to publish before you enable the
+  listener.
+</Warning>
+
+## Restricting methods per table
+
+`table_methods` says which HTTP methods each table accepts, as `table:METHOD,METHOD` with a `|` between tables:
+
+```sql
+SET GLOBAL vsql_rest.table_methods = 'products:GET';
+```
+
+By default every table accepts every method, so set this before the listener starts. A method the table does not grant is refused:
+
+```json
+{"message":"method not allowed: POST","details":null,"hint":null,"code":"VSQL0001"}
+```
+
+Granting writes is the same setting:
+
+```sql
+SET GLOBAL vsql_rest.table_methods = 'products:GET,POST';
+```
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"id":6,"name":"Cable, 10m","category":"cable","price":19.99,"in_stock":10}' \
+     'http://127.0.0.1:3000/products'
+```
+
+A successful insert answers 201 with an empty body. A duplicate key comes back as 409:
+
+```json
+{"message":"Duplicate entry '6' for key 'products.PRIMARY'","details":null,"hint":null,"code":"VSQL0001"}
+```
+
+## Watching it work
+
+Five status counters report on the listener, including the port it actually bound:
+
+```sql
+SHOW STATUS LIKE 'vsql_rest%';
+```
+
+```
++-----------------------------+-------+
+| Variable_name               | Value |
++-----------------------------+-------+
+| vsql_rest.connections_total | 0     |
+| vsql_rest.http_port         | 3000  |
+| vsql_rest.https_port        | 0     |
+| vsql_rest.requests_active   | 0     |
+| vsql_rest.requests_total    | 16    |
++-----------------------------+-------+
+```
+
+`http_port` reads 0 when nothing is listening, which is the quickest way to tell whether the listener started. Setting `vsql_rest.port` to 0 asks the operating system to choose a port, and this counter is where you read which one it chose.
+
+## Before you expose the port
+
+The defaults leave the door open, and each one is reasonable alone.
+
+`require_auth` starts at `OFF`, so no request carries or needs a token. An empty `allowed_tables` publishes the whole schema. An empty `table_methods` allows every method, including `DELETE`, and a `DELETE` against a listener in that state succeeds:
+
+```bash
+curl -X DELETE 'http://127.0.0.1:3000/products?id=eq.6'
+```
+
+It answers 204, and the row is gone.
+
+Put together, a listener switched on with nothing else configured lets anyone who can reach the port read, insert, update, and delete every table in the schema. On a laptop that is convenient. Anywhere else, change four things before enabling it:
+
+```sql
+SET GLOBAL vsql_rest.allowed_tables = 'products';
+SET GLOBAL vsql_rest.table_methods  = 'products:GET';
+SET GLOBAL vsql_rest.require_auth   = ON;
+SET GLOBAL vsql_rest.jwt_secret     = '...';
+```
+
+Then serve it over HTTPS by setting `ssl_cert` and `ssl_key`. There is no bind-address setting, and the listener binds every interface from the moment it starts, so block the port at the firewall and let only a reverse proxy reach it.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `ERROR 3219 ... requires preview capabilities` on install | Start the server with `--vsql_allow_preview_extensions=ON` |
+| Connection refused | The listener is off. Check `vsql_rest.vsql_rest_enabled`, then read `vsql_rest.http_port` in `SHOW STATUS` |
+| `table not found` for a table that exists | It is missing from `allowed_tables`, or `vsql_rest.schema` names a different database |
+| A write returns 405 | `table_methods` does not grant that method for the table |
+| Settings vanished after reinstalling the extension | `UNINSTALL EXTENSION` deletes persisted settings. Re-apply them |
+
+## See also
+
+- [vsql_rest](/mysql-8.4/stable/extensions/vsql-rest) — the extension's reference page, with every setting it adds
+- [Making HTTP Requests from SQL](/guides/http-requests-in-mysql) — the same server calling out instead of answering
+- [Enriching Rows with External API Data](/guides/rest-api-enrichment) — joining a query to someone else's API
+- [MySQL Security Hardening](/guides/security-hardening) — what else to close before a port is reachable

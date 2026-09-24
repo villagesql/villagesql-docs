@@ -1,0 +1,350 @@
+---
+title: "FastAPI and SQLAlchemy 2.0 with MySQL"
+sidebarTitle: "FastAPI with SQLAlchemy"
+description: "Building an async FastAPI app on MySQL with SQLAlchemy 2.0's typed ORM, an async driver, and Alembic migrations, including the greenlet dependency and other real setup gotchas."
+keywords: "fastapi mysql, sqlalchemy 2.0 async, fastapi sqlalchemy, asyncmy, aiomysql, alembic async migration, sqlalchemy mapped_column, fastapi depends session, villagesql fastapi"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+FastAPI's async request handling only pays off if the database calls underneath it are also async. SQLAlchemy 2.0 supports this with a typed ORM style and an async engine, but wiring the two together against MySQL has a few setup steps that are easy to get wrong on the first try.
+
+## Choosing an Async Driver
+
+SQLAlchemy 2.0 ships dialects for two async MySQL drivers: `asyncmy` and `aiomysql`. Neither is documented as the official recommendation over the other. `asyncmy` is a compiled driver written in Cython and ships prebuilt wheels for current Python versions, which is why it is used in this guide:
+
+```bash
+pip install "sqlalchemy[asyncio]" asyncmy cryptography
+```
+
+Installing plain `sqlalchemy` instead of `sqlalchemy[asyncio]` is the first real trap. SQLAlchemy's async ORM layer bridges async and sync code with the `greenlet` library, and it is not a dependency of the base package. Skipping the `[asyncio]` extra produces this error the first time you touch the async engine:
+
+```
+ValueError: the greenlet library is required to use this function. No module named 'greenlet'
+```
+
+The fix is `pip install greenlet` or, better, always installing SQLAlchemy with the `[asyncio]` extra so it is pulled in automatically.
+
+The second trap is `cryptography`. MySQL 8 and VillageSQL default new accounts to the `caching_sha2_password` authentication plugin, which needs an RSA key exchange to send the password the first time a given account authenticates from a given client library. `asyncmy` does not bundle an RSA implementation, so a connection that has to do this full handshake fails with:
+
+```
+RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods
+```
+
+Once an account has completed one full authentication (from any client, including the `mysql` CLI), the server caches the result and later connections use a faster path that skips the RSA step, which is why this error can appear to come and go depending on what connected to the account most recently. Installing `cryptography` up front removes the dependency on that cache entirely and is the reliable fix.
+
+## Creating the Database and User
+
+Create a dedicated database and application user rather than connecting as root:
+
+```sql
+CREATE DATABASE IF NOT EXISTS fastapi_guide CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS 'fastapi_app'@'127.0.0.1' IDENTIFIED BY 'fastapi_pw_123!';
+GRANT ALL PRIVILEGES ON fastapi_guide.* TO 'fastapi_app'@'127.0.0.1';
+```
+
+The user is scoped to `127.0.0.1`, not `localhost`. The connection string in this guide connects over TCP to `127.0.0.1`, so the grant has to match that host; a Unix-socket connection is matched against `localhost` instead, regardless of the account's IP-based grants.
+
+## Project Layout
+
+```
+fastapi-sqlalchemy-mysql/
+├── alembic/
+│   ├── env.py
+│   └── versions/
+├── alembic.ini
+├── app/
+│   ├── __init__.py
+│   ├── database.py
+│   ├── models.py
+│   ├── schemas.py
+│   └── main.py
+└── requirements.txt
+```
+
+`requirements.txt`:
+
+```
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]>=2.0
+asyncmy
+cryptography
+alembic
+pydantic
+```
+
+## The Async Engine and Session
+
+`app/database.py` creates the async engine, a session factory, and the declarative base used by every model:
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+DATABASE_URL = "mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide"
+
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+
+`expire_on_commit=False` matters for FastAPI. With the default `expire_on_commit=True`, every attribute on a committed object is marked stale, and the next read of that attribute issues a fresh `SELECT` to refresh it. Triggered from outside an `await`, that refresh fails with:
+
+```
+sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() here. Was IO attempted in an unexpected place?
+```
+
+and once the session has closed entirely, the same attribute read instead fails with:
+
+```
+sqlalchemy.orm.exc.DetachedInstanceError: Instance <Post at 0x...> is not bound to a Session; attribute refresh operation cannot proceed
+```
+
+`expire_on_commit=False` keeps the already-loaded values on the object usable after commit, which avoids both.
+
+`get_session()` is a generator function, which lets FastAPI's `Depends()` close the session automatically after the request finishes, whether it succeeds or raises.
+
+## The Model
+
+`app/models.py` defines a `Post` table using SQLAlchemy 2.0's typed declarative style, `Mapped` and `mapped_column`, instead of the legacy `Column`-only style:
+
+```python
+import datetime
+
+from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database import Base
+
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+```
+
+`server_default=func.now()` pushes the timestamp default to MySQL itself, so it is set correctly even for rows inserted outside the application.
+
+## Setting Up Alembic
+
+Initialize Alembic with the async template, which generates an `env.py` already wired for an async engine:
+
+```bash
+alembic init -t async alembic
+```
+
+Run this from inside the project directory. Alembic writes `alembic.ini` to the current working directory regardless of the path given to `init`, even though the `alembic/` scripts folder itself is created at the given path. Running it from the wrong directory leaves a stray `alembic.ini` somewhere unexpected.
+
+Point `alembic.ini` at the live database:
+
+```ini
+sqlalchemy.url = mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide
+```
+
+Then edit `alembic/env.py` to import the models so autogenerate can see them:
+
+```python
+from app.database import Base
+from app.models import Post  # noqa: F401  (registers Post on Base.metadata)
+
+target_metadata = Base.metadata
+```
+
+Generate and run the migration:
+
+```bash
+alembic revision --autogenerate -m "create posts table"
+alembic upgrade head
+```
+
+The autogenerate step detected the new table and wrote the migration:
+
+```
+INFO  [alembic.autogenerate.compare.tables] Detected added table 'posts'
+Generating alembic/versions/4f5ba2a8774a_create_posts_table.py ...  done
+```
+
+Applying it against VillageSQL succeeded:
+
+```
+INFO  [alembic.runtime.migration] Running upgrade  -> 4f5ba2a8774a, create posts table
+```
+
+Confirming against the live server directly:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SHOW TABLES;"
+```
+
+```
+Tables_in_fastapi_guide
+alembic_version
+posts
+```
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "DESCRIBE posts;"
+```
+
+```
+Field       Type          Null    Key     Default    Extra
+id          int           NO      PRI     NULL       auto_increment
+title       varchar(200)  NO              NULL
+body        text          NO              NULL
+created_at  datetime      NO              now()      DEFAULT_GENERATED
+```
+
+## The Pydantic Schemas
+
+`app/schemas.py` defines the request and response shapes separately from the ORM model:
+
+```python
+import datetime
+
+from pydantic import BaseModel, ConfigDict
+
+
+class PostCreate(BaseModel):
+    title: str
+    body: str
+
+
+class PostRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    body: str
+    created_at: datetime.datetime
+```
+
+`from_attributes=True` lets `PostRead` build its response directly from a `Post` ORM instance instead of a dictionary.
+
+## The FastAPI Routes
+
+`app/main.py` wires the session into each route through `Depends()`, so every request gets its own session rather than sharing one global connection:
+
+```python
+from fastapi import Depends, FastAPI
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_session
+from app.models import Post
+from app.schemas import PostCreate, PostRead
+
+app = FastAPI(title="FastAPI + SQLAlchemy 2.0 + VillageSQL")
+
+
+@app.get("/posts", response_model=list[PostRead])
+async def list_posts(session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Post).order_by(Post.id))
+    return result.scalars().all()
+
+
+@app.post("/posts", response_model=PostRead, status_code=201)
+async def create_post(payload: PostCreate, session: AsyncSession = Depends(get_session)):
+    post = Post(title=payload.title, body=payload.body)
+    session.add(post)
+    await session.commit()
+    await session.refresh(post)
+    return post
+```
+
+A global session shared across requests eventually leads to interleaved queries hitting the same connection out of order under concurrent load. A session created per request through `Depends()` avoids that, since each request gets its own session and its own connection checked out from the pool.
+
+## Running and Verifying
+
+Start the app:
+
+```bash
+uvicorn app.main:app --host 127.0.0.1 --port 8010
+```
+
+An empty table returns an empty list:
+
+```bash
+curl -s http://127.0.0.1:8010/posts
+```
+
+```json
+[]
+```
+
+Creating a post:
+
+```bash
+curl -s -X POST http://127.0.0.1:8010/posts \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Hello VillageSQL", "body": "First post via FastAPI + SQLAlchemy 2.0"}'
+```
+
+```json
+{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}
+```
+
+with an HTTP 201 status. Listing again shows the new row:
+
+```json
+[{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}]
+```
+
+Querying the database directly confirms the write landed, not just the API response:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SELECT * FROM posts;"
+```
+
+```
+id  title             body                                       created_at
+1   Hello VillageSQL  First post via FastAPI + SQLAlchemy 2.0     2026-08-28 12:04:36
+```
+
+## Frequently Asked Questions
+
+#### Why does the async engine need a different connection string than a sync one?
+
+The driver name in the connection string tells SQLAlchemy which DBAPI to load. A sync setup uses `mysql+pymysql://` or `mysql+mysqldb://`; an async setup needs a driver built on `asyncio`, so the string uses `mysql+asyncmy://` instead. Using a sync driver name with `create_async_engine` fails immediately, since that driver has no async interface for SQLAlchemy to call into.
+
+#### Do I need `expire_on_commit=False`?
+
+Not strictly, but skip it and every attribute access on a committed object triggers a fresh database round trip to reload it, and that round trip only works if it happens inside an active async context. Depending on exactly where the attribute is read, that surfaces as `MissingGreenlet` or, once the session has closed, `DetachedInstanceError`. The safer default for a web application is `expire_on_commit=False`.
+
+#### Can I still use Alembic's synchronous autogenerate workflow?
+
+Yes. The async template's `env.py` still runs `revision --autogenerate` and `upgrade` from the regular command line; the async part only affects how `env.py` opens its own connection to inspect and modify the schema. Nothing about the Alembic CLI commands themselves changes.
+
+## Troubleshooting
+
+| Problem | Solution |
+|:---|:---|
+| `ValueError: the greenlet library is required to use this function` | Install `sqlalchemy[asyncio]` instead of plain `sqlalchemy`, or `pip install greenlet` directly |
+| `RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods` | Run `pip install cryptography`; `asyncmy` needs it for the RSA step in MySQL's default `caching_sha2_password` auth |
+| `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` | An ORM attribute was read outside an `await`ed call, usually because the session expired the object on commit; set `expire_on_commit=False` on the session factory |
+| `sqlalchemy.orm.exc.DetachedInstanceError` | The object's session already closed before an attribute was read; keep `expire_on_commit=False`, or read every needed attribute before the request ends |
+| `alembic.ini` appears in the wrong directory after `alembic init -t async <path>` | Run `alembic init` from inside the project directory; the ini file follows the current working directory, not the path argument |
+| `alembic revision --autogenerate` produces an empty migration | `target_metadata` in `alembic/env.py` is still `None`, or the models were never imported so they never registered on `Base.metadata` |
+| `Access denied for user 'fastapi_app'@'127.0.0.1'` | The user was created for a different host, such as `localhost`; this guide's connection string uses TCP to `127.0.0.1`, so the grant must match that host |
+| FastAPI response is missing fields present on the model | `PostRead` needs `model_config = ConfigDict(from_attributes=True)` to read from an ORM object instead of a dictionary |
+
+## See also
+
+- [Using MySQL with ORMs: Django, Rails, and Prisma](/guides/mysql-with-orms) — the same charset and strict mode configuration applies to SQLAlchemy
+- [MySQL Connection Pooling](/guides/connection-pooling) — tuning pool size for an async engine under concurrent FastAPI requests
