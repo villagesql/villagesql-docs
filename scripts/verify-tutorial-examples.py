@@ -29,8 +29,12 @@ USER = os.environ.get("VSQL_USER", "root")
 DB = os.environ.get("VSQL_DB", "sakila")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-PLACEHOLDER = re.compile(r"\b[A-Z][A-Z_]{3,}\b")
-KEYWORDS = r"\b(SELECT|FROM|INNER|JOIN|CROSS|ON|USING|AS|USE|COUNT)\b"
+# A syntax skeleton is recognised by its placeholders, which are upper case and
+# always contain an underscore (COLUMN_LIST, SORT_COLUMN). Matching bare upper
+# case words instead would swallow DISTINCT, ORDER BY and LIMIT, and silently
+# leave most of the real examples unverified.
+PLACEHOLDER = re.compile(r"\b[A-Z]+_[A-Z_]+\b")
+REAL_KEYWORDS = {"GROUP_CONCAT"}
 
 
 def run(statement, cols=200):
@@ -110,7 +114,8 @@ def main():
         name = os.path.basename(path)
         for sql, shown in pairs(open(path).read()):
             sql = sql.strip()
-            if PLACEHOLDER.search(re.sub(KEYWORDS, "", sql)) or sql.upper().startswith("USE "):
+            found = set(PLACEHOLDER.findall(sql)) - REAL_KEYWORDS
+            if found or sql.upper().startswith("USE "):
                 skipped += 1
                 continue
             want = significant(shown)
