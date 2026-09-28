@@ -21,13 +21,32 @@ Blocks using UPPER_SNAKE placeholders are syntax skeletons and are skipped, as
 is anything that is not a query. Examples shown as shell commands are not
 covered here and have to be run by hand.
 
+A lesson that works in a different database says so with an MDX comment near the
+top, and every statement in it runs there instead:
+
+    {/* verify-db: sakila_practice */}
+
+The lessons that change data need this, because they must not write into the
+sample database every other lesson reads. Those lessons also change what the
+next statement sees, so each one says
+
+    {/* verify-reset */}
+
+and scripts/tutorial-practice.sql is loaded again before the lesson runs. The
+lesson's statements then run in the order the page prints them, from the state
+the page tells the reader to start in.
+
+A ```sql block holding more than one statement is compared whole, line for
+line, rather than by header and row count. A transaction has to be typed into
+one session, so it cannot be split into a block per statement.
+
     VSQL_CLIENT=/path/to/mysql VSQL_SOCKET=/tmp/mysql.sock \
         python3 scripts/verify-tutorial-examples.py
 
 Exits non-zero when any example disagrees with the page.
 """
 
-import fcntl, glob, os, pty, re, struct, sys, termios, time
+import fcntl, glob, os, pty, re, select, struct, subprocess, sys, termios, time
 
 CLIENT = os.environ.get("VSQL_CLIENT", "mysql")
 SOCKET = os.environ.get("VSQL_SOCKET", "/tmp/mysql.sock")
@@ -40,17 +59,43 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # case words instead would swallow DISTINCT, ORDER BY and LIMIT, and silently
 # leave most of the real examples unverified.
 PLACEHOLDER = re.compile(r"\b[A-Z]+_[A-Z_]+\b")
-REAL_KEYWORDS = {"GROUP_CONCAT"}
+REAL_KEYWORDS = {"GROUP_CONCAT", "LAST_INSERT_ID"}
 
 
-def run(statement, cols=200):
+VERIFY_DB = re.compile(r"\{/\*\s*verify-db:\s*([A-Za-z0-9_$]+)\s*\*/\}")
+VERIFY_RESET = re.compile(r"\{/\*\s*verify-reset\s*\*/\}")
+PRACTICE = os.path.join(REPO, "scripts", "tutorial-practice.sql")
+
+
+def reset():
+    """Drop and rebuild the practice database from its seed."""
+    with open(PRACTICE) as seed:
+        subprocess.run([CLIENT, "-S", SOCKET, "-u", USER], stdin=seed,
+                       stdout=subprocess.DEVNULL, check=True)
+
+
+def run(statement, cols=200, db=None):
     """Type a statement into the client under a pty and return the screen."""
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["TERM"] = "dumb"
-        os.execvp(CLIENT, [CLIENT, "-S", SOCKET, "-u", USER, DB])
+        os.execvp(CLIENT, [CLIENT, "-S", SOCKET, "-u", USER, db or DB])
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, cols, 0, 0))
-    time.sleep(1.5)
+    # Wait for the prompt rather than guessing how long the client takes to
+    # start. Typing into it too early puts the terminal echo of the whole block
+    # above the banner, and the results then have no prompt in front of them.
+    banner = b""
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.2)
+        if not ready:
+            continue
+        try:
+            banner += os.read(fd, 65536)
+        except OSError:
+            break
+        if banner.rstrip().endswith(b"mysql>"):
+            break
     for line in statement.splitlines():
         os.write(fd, line.encode() + b"\n")
         time.sleep(0.25)
@@ -67,7 +112,11 @@ def run(statement, cols=200):
     except OSError:
         pass
     os.waitpid(pid, 0)
-    return buf.decode(errors="replace").replace("\r\n", "\n")
+    # The client rings the terminal bell after an error, and that byte lands in
+    # front of the next prompt, which would otherwise hide it from the prompt
+    # filtering below.
+    text = (banner + buf).decode(errors="replace").replace("\r\n", "\n")
+    return text.replace("\x07", "")
 
 
 def printed(raw, statement):
@@ -78,6 +127,42 @@ def printed(raw, statement):
     out = lines[start + 1:]
     end = [i for i, l in enumerate(out) if l.startswith("mysql> exit")]
     return "\n".join(out[:end[0]] if end else out).strip("\n")
+
+
+def is_multi(sql):
+    """True when a block holds more than 1 statement.
+
+    A statement ends in a semicolon, or in \\G when the client is being asked
+    for vertical output.
+    """
+    ends = [l.rstrip() for l in sql.splitlines()]
+    return len([l for l in ends if l.endswith(";") or l.endswith("\\G")]) > 1
+
+
+def printed_session(raw, statement):
+    """Every line the client printed for a block of several statements.
+
+    The pty echoes what is typed, so the prompt lines are dropped and what is
+    left is the run of results in the order the page shows them.
+    """
+    lines = raw.split("\n")
+    first = statement.splitlines()[0].strip()
+    start = min(i for i, l in enumerate(lines) if l.strip().endswith(first))
+    out = lines[start + 1:]
+    end = [i for i, l in enumerate(out) if l.startswith("mysql> exit")]
+    out = out[:end[0]] if end else out
+    kept = [l for l in out if not l.startswith("mysql> ") and not l.startswith("    -> ")]
+    return "\n".join(kept).strip("\n")
+
+
+def session_text(block):
+    """A session transcript with the timings and the blank runs taken out."""
+    lines = []
+    for line in block.strip().split("\n"):
+        line = re.sub(r"\(\d+\.\d+ sec\)", "", line).rstrip()
+        if line or (lines and lines[-1]):
+            lines.append(line)
+    return "\n".join(lines).strip("\n")
 
 
 def pairs(text):
@@ -142,13 +227,31 @@ def main():
     ok = bad = skipped = 0
     for path in sorted(glob.glob(os.path.join(REPO, "tutorial", "*.mdx"))):
         name = os.path.basename(path)
-        for sql, shown in pairs(open(path).read()):
+        text = open(path).read()
+        found_db = VERIFY_DB.search(text)
+        db = found_db.group(1) if found_db else None
+        if VERIFY_RESET.search(text):
+            reset()
+        for sql, shown in pairs(text):
             sql = sql.strip()
             found = set(PLACEHOLDER.findall(sql)) - REAL_KEYWORDS
             if found or sql.upper().startswith("USE "):
                 skipped += 1
                 continue
-            live = printed(run(sql), sql)
+            raw = run(sql, db=db)
+            if is_multi(sql):
+                live = session_text(printed_session(raw, sql))
+                if session_text(shown) == live:
+                    ok += 1
+                    continue
+                bad += 1
+                print(f"MISMATCH {name}: {sql.splitlines()[0][:60]}")
+                print("   page:")
+                print(session_text(shown))
+                print("   live:")
+                print(live)
+                continue
+            live = printed(raw, sql)
             want, got = significant(shown), significant(live)
             gone = missing_rows(shown, live)
             if want == got and not gone:

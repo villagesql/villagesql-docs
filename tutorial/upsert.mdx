@@ -1,0 +1,224 @@
+---
+title: "MySQL INSERT ON DUPLICATE KEY UPDATE"
+sidebarTitle: "Upsert"
+description: "How INSERT ... ON DUPLICATE KEY UPDATE writes a row or changes the one already there, why it reports 2 rows affected, and the alias form that replaced VALUES()."
+keywords: "mysql insert on duplicate key update, mysql on duplicate key update, mysql insert or update, insert or update mysql, mysql duplicate key update alias, mysql values function deprecated"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+{/* verify-db: sakila_practice */}
+{/* verify-reset */}
+
+Sometimes you do not know whether a row is there. `INSERT ... ON DUPLICATE KEY
+UPDATE` writes it if it is not and changes it if it is, in 1 statement and
+without a check first. It is the statement behind every "save this setting" and
+every counter that has to be created before it can be raised.
+
+These examples use the `sakila_practice` database from
+[INSERT](/tutorial/insert). Run the setup block there again before you start,
+then open the client with `mysql -u root -p sakila_practice`.
+
+## How it works
+
+```sql
+INSERT INTO TABLE_NAME (COLUMN_LIST) VALUES (VALUE_LIST) AS ROW_ALIAS
+ON DUPLICATE KEY UPDATE COLUMN_NAME = ROW_ALIAS.COLUMN_NAME;
+```
+
+Replace `TABLE_NAME` with the table, `COLUMN_LIST` and `VALUE_LIST` with the
+columns and values as in an ordinary insert, `ROW_ALIAS` with a name for the
+row you are offering, and `COLUMN_NAME` with the column to change when the row
+is already there.
+
+The `ON DUPLICATE KEY UPDATE` clause runs only when the insert would break a
+`PRIMARY KEY` or a `UNIQUE` index. The alias names the row you tried to insert,
+so `ROW_ALIAS.COLUMN_NAME` is the value you offered and the bare column name is
+the value already stored.
+
+## Examples
+
+### 1) The collision this avoids
+
+`rating_count` has `rating` as its primary key. Write a row.
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 178);
+```
+
+```text
+Query OK, 1 row affected (0.00 sec)
+```
+
+Write it again with a new count and the insert fails.
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 999);
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'G' for key 'rating_count.PRIMARY'
+```
+
+### 2) Insert, or update what is in the way
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 179) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 2 rows affected (0.00 sec)
+```
+
+```sql
+SELECT * FROM rating_count;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   179 |
++--------+-------+
+1 row in set (0.00 sec)
+```
+
+One row is stored and the statement says `2 rows affected`. That count is the
+statement's way of saying which branch it took: 1 for a row inserted, 2 for a
+row updated, and 0 when the update found the value already correct.
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 179) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 0 rows affected (0.00 sec)
+```
+
+The row was found and already held 179, so there was nothing to write. Never
+read the affected-row count as a count of rows in the table.
+
+### 3) The same statement on a row that is not there
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('R', 195) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 1 row affected (0.00 sec)
+```
+
+```sql
+SELECT * FROM rating_count ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   179 |
+| R      |   195 |
++--------+-------+
+2 rows in set (0.00 sec)
+```
+
+`1 row affected` is the insert branch. Nothing about the statement changed
+except the values, which is the point of it: the caller does not have to know
+whether the row is there.
+
+## Refreshing a whole summary
+
+The rows can come from a query, which is how a summary table is brought up to
+date in 1 statement. The alias form is not allowed there.
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT rating, COUNT(*) FROM sakila.film GROUP BY rating
+AS new ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'AS new ON DUPLICATE KEY UPDATE films = new.films' at line 3
+```
+
+Give the query its own alias instead, by wrapping it in a
+[derived table](/tutorial/derived-tables), and read the offered values from
+that.
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT r, c FROM (SELECT rating AS r, COUNT(*) AS c FROM sakila.film GROUP BY rating) AS new
+ON DUPLICATE KEY UPDATE films = new.c;
+```
+
+```text
+Query OK, 5 rows affected (0.01 sec)
+Records: 5  Duplicates: 1  Warnings: 0
+```
+
+```sql
+SELECT * FROM rating_count ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| NC-17  |   210 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+`Duplicates: 1` is the `G` row, which was stored as 179 and is now 178. The 3
+new ratings account for 3 of the 5 affected rows and that single update for the
+other 2. `R` already held 195, so it counted nothing at all.
+
+## Older code uses VALUES() instead of an alias
+
+Older statements read the offered value with `VALUES(films)` in place of the
+alias. That form still works, and it raises a warning.
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 178)
+ON DUPLICATE KEY UPDATE films = VALUES(films);
+SHOW WARNINGS\G
+```
+
+```text
+Query OK, 0 rows affected, 1 warning (0.00 sec)
+
+*************************** 1. row ***************************
+  Level: Warning
+   Code: 1287
+Message: 'VALUES function' is deprecated and will be removed in a future release. Please use an alias (INSERT INTO ... VALUES (...) AS alias) and replace VALUES(col) in the ON DUPLICATE KEY UPDATE clause with alias.col instead
+1 row in set (0.00 sec)
+```
+
+`\G` ends a statement the way a semicolon does and prints 1 column per line,
+which is how you read a message too wide for a table. Write new statements with
+an alias, and expect to meet `VALUES()` in code written earlier.
+
+## Summary
+
+- Use `INSERT ... ON DUPLICATE KEY UPDATE` when the row may or may not be there.
+- Expect the clause to run only on a `PRIMARY KEY` or `UNIQUE` collision.
+- Read the affected-row count as 1 for an insert, 2 for an update and 0 for no change.
+- Name the offered row with `AS alias` and read its values as `alias.column`.
+- Wrap the query in a derived table when the rows come from a `SELECT`.
+- Replace `VALUES(col)` with the alias form, which is what warning 1287 asks for.
+
+## See also
+
+- [INSERT](/tutorial/insert): the plain form and `ERROR 1062`
+- [INSERT SELECT](/tutorial/insert-select): rows from a query
+- [UPDATE](/tutorial/update): changing a row you know is there
+- [UPSERT in MySQL](/guides/upsert): REPLACE, INSERT IGNORE and which to reach for
