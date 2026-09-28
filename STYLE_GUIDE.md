@@ -259,6 +259,15 @@ villagesql-docs/
   another publication. The other MySQL tutorial sites reserve all rights too.
   So get the facts by running statements against a live server and write from
   the output you captured. Do not draft next to any of those sources.
+- **Re-run the examples before you ship a change to them.** Two scripts do it,
+  both against a live server with Sakila loaded, and both are run by hand
+  because CI has no server:
+  `python3 scripts/verify-tutorial-examples.py` covers every lesson, and
+  `python3 scripts/verify-guide-examples.py` covers the guides listed at the top
+  of that file. They compare the column header, the row count and every printed
+  row; where the statement has an `ORDER BY` they compare the row order too.
+  `EXPLAIN` costs and row estimates are ignored, because they differ per
+  machine. Add a guide to that list once you have checked its examples by hand.
 - **Don't back-port syntax to a version that predates the feature.** Before
   changing an older version's page to reference a newer API, confirm that API
   existed when that version was released.

@@ -200,19 +200,20 @@ def significant(block):
 
 
 def data_rows(block):
-    """Every printed row except the header, as a sorted list.
-
-    Sorted rather than positional because a query with no ORDER BY may come back
-    in a different order on a different server, which is not a documentation
-    defect. A wrong value still changes the list.
-    """
+    """Every printed row except the header, in the order it was printed."""
     lines = [l.rstrip() for l in block.strip().split("\n")]
     body = [l for l in lines if l.startswith("|")]
-    return sorted(body[1:])
+    return body[1:]
 
 
 def missing_rows(page_block, live_block):
-    """Page rows that the server did not print. Elided rows are not required."""
+    """Page rows the server did not print, comparing them as a multiset.
+
+    A multiset rather than a sequence, because a query with no ORDER BY may come
+    back in a different order on a different server, which is not a
+    documentation defect. A wrong value still changes the multiset. Row order is
+    checked separately, by out_of_order() below.
+    """
     live = list(data_rows(live_block))
     gone = []
     for row in data_rows(page_block):
@@ -223,8 +224,37 @@ def missing_rows(page_block, live_block):
     return gone
 
 
+def out_of_order(page_block, live_block):
+    """True when the page prints rows in an order the server did not produce.
+
+    A page may elide rows with "...", so the test is whether the rows it does
+    print appear in the live output in the same relative order. Rows that are
+    not in the live output at all are missing_rows()'s problem, not this one.
+    """
+    live = data_rows(live_block)
+    at = 0
+    for row in data_rows(page_block):
+        if row not in live[at:]:
+            if row in live:
+                return True
+            continue
+        at = live.index(row, at) + 1
+    return False
+
+
+def orders_rows(sql):
+    """True when the statement asks for a defined order.
+
+    Only then is a printed order something the page can get wrong. Without
+    ORDER BY the server may return the rows any way it likes, so a page that
+    prints one order is making a claim nothing guarantees; that is a writing
+    problem rather than a reproducible failure, and it is reported as a note.
+    """
+    return "ORDER BY" in sql.upper()
+
+
 def main():
-    ok = bad = skipped = 0
+    ok = bad = skipped = notes = 0
     for path in sorted(glob.glob(os.path.join(REPO, "tutorial", "*.mdx"))):
         name = os.path.basename(path)
         text = open(path).read()
@@ -254,8 +284,16 @@ def main():
             live = printed(raw, sql)
             want, got = significant(shown), significant(live)
             gone = missing_rows(shown, live)
-            if want == got and not gone:
+            shuffled = out_of_order(shown, live)
+            ordered = orders_rows(sql)
+            if want == got and not gone and not (shuffled and ordered):
                 ok += 1
+                if shuffled:
+                    notes += 1
+                    print(f"NOTE {name}: {sql.splitlines()[0][:60]}")
+                    print("   the page prints these rows in an order the server "
+                          "did not return, and the statement has no ORDER BY, "
+                          "so no order is guaranteed. Elide them or sort them.")
             else:
                 bad += 1
                 print(f"MISMATCH {name}: {sql.splitlines()[0][:60]}")
@@ -264,7 +302,10 @@ def main():
                     print(f"   live: {got}")
                 for row in gone:
                     print(f"   page row not returned by the server: {row}")
-    print(f"\nmatched {ok}, mismatched {bad}, skipped {skipped}")
+                if shuffled and ordered:
+                    print("   the page prints the rows in an order the server "
+                          "did not return, and the statement has an ORDER BY")
+    print(f"\nmatched {ok}, mismatched {bad}, skipped {skipped}, order notes {notes}")
     return 1 if bad else 0
 
 
