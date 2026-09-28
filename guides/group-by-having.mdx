@@ -21,6 +21,11 @@ sample database: [aggregate functions](/tutorial/aggregate-functions),
 [COUNT DISTINCT](/tutorial/count-distinct),
 [GROUP_CONCAT](/tutorial/group-concat) and [WITH ROLLUP](/tutorial/with-rollup).
 
+Every query and plan on this page came from 1 server against the Sakila sample
+database. Costs and row estimates come from InnoDB's sampled statistics and from
+your `optimizer_switch` settings, so your numbers will differ. The shape of each
+plan is the part that transfers.
+
 ## Grouping without an index builds a temporary table
 
 To group rows, the server has to bring the rows of each group together. With no
@@ -50,9 +55,16 @@ SELECT @@internal_tmp_mem_storage_engine AS engine,
        @@temptable_max_ram, @@temptable_max_mmap, @@tmp_table_size;
 ```
 
-With `TempTable`, the budget is `temptable_max_ram` and `temptable_max_mmap`.
-`tmp_table_size` applies only when the engine is `MEMORY`, so raising it on a
-`TempTable` server changes nothing at all.
+They do different jobs and all of them apply under `TempTable`.
+`temptable_max_ram` and `temptable_max_mmap` cap what the engine may hold across
+all sessions. `tmp_table_size` caps each individual internal temporary table: at
+1 KB a grouped query over 1,000 rows took `Created_tmp_disk_tables` from 0 to 1,
+and at 64 MB the same query stayed in memory. Watch that counter rather than
+guessing:
+
+```sql
+SHOW SESSION STATUS LIKE 'Created_tmp_disk_tables';
+```
 
 An index on the grouping column removes the step entirely, because the index is
 already in that order:
@@ -75,8 +87,10 @@ never touched the table itself.
 
 So the first thing to check on a slow `GROUP BY` is whether an index leads with
 the grouping columns, in the same order you grouped them. A composite index on
-`(a, b)` serves `GROUP BY a` and `GROUP BY a, b`, and does nothing for
-`GROUP BY b`.
+`(a, b)` serves `GROUP BY a` and `GROUP BY a, b`. For `GROUP BY b` the server
+can still scan it as a covering index, reported as `type: index` with
+`Using index`, but the rows arrive out of group order so `Using temporary` comes
+back with them.
 
 ## WHERE and HAVING are not a style choice
 
@@ -153,10 +167,21 @@ and costs the same.
 Turning `only_full_group_by` off globally converts every one of these errors
 into a wrong answer nobody sees. It is the wrong fix.
 
-The check does see through an expression built on the grouping column, so
-`SELECT COALESCE(rating, 'unrated') ... GROUP BY rating` is accepted. What it
-rejects is an expression over a column you did not group, which is the ordinary
-case above wearing a function.
+The check sees through an expression built on a grouped **column**, so
+`SELECT COALESCE(rating, 'unrated') ... GROUP BY rating` is accepted. It does
+not see through an expression built on a grouped **expression**. Group by
+`DATE_FORMAT(payment_date, '%Y-%m')` and select
+`COALESCE(DATE_FORMAT(payment_date, '%Y-%m'), 'ALL')`, and the same `ERROR 1055`
+names `payment_date`, because the server compares the 2 expressions rather than
+the columns inside them. That is the common reporting case, and the way out is
+to group in a derived table and wrap the result outside it:
+
+```sql
+SELECT COALESCE(month, 'ALL') AS month, payments
+FROM (SELECT DATE_FORMAT(payment_date, '%Y-%m') AS month, COUNT(*) AS payments
+      FROM payment GROUP BY DATE_FORMAT(payment_date, '%Y-%m')) AS m
+ORDER BY month;
+```
 
 ## Aggregating a one-to-many join
 
@@ -200,7 +225,7 @@ FROM payment;
 | Problem | Cause and fix |
 |:--------|:---------|
 | `GROUP BY` is slow | No index leads with the grouping columns. Check `EXPLAIN` for `Using temporary`. |
-| Slow, and the disk is busy | The temporary table outgrew its memory budget and spilled. Narrow the rows first, then check the setting that matches your `internal_tmp_mem_storage_engine`. |
+| Slow, and the disk is busy | The temporary table outgrew its memory budget and spilled. Narrow the rows first, then raise `tmp_table_size` for the single table or `temptable_max_ram` for the server's total. |
 | `ERROR 1055` | A selected column is neither grouped nor aggregated. Group it, aggregate it, or drop it. |
 | A `HAVING` filter is slow | It has no aggregate in it, so it belongs in `WHERE`. |
 | A total is too high | A one-to-many join multiplied the rows before the grouping. |

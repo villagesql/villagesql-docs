@@ -19,15 +19,15 @@ CREATE TABLE member (
   last_name  VARCHAR(45) NOT NULL,
   email      VARCHAR(100) DEFAULT NULL,
   joined     DATE NOT NULL,
-  active     TINYINT(1) NOT NULL DEFAULT 1,
+  active     TINYINT NOT NULL DEFAULT 1,
   PRIMARY KEY (member_id),
   UNIQUE KEY uq_member_email (email)
 );
 
 INSERT INTO member (first_name, last_name, email, joined, active) VALUES
-  ('Mary',     'Smith',    'mary.smith@example.com',     '2026-01-04', 1),
+  ('Mary',     'Smith',    'mary.smith@example.com',       '2026-01-04', 1),
   ('Patricia', 'Johnson',  'patricia.johnson@example.com', '2026-02-11', 1),
-  ('Linda',    'Williams', 'linda.williams@example.com', '2026-03-02', 0);
+  ('Linda',    'Williams', 'linda.williams@example.com',   '2026-03-02', 0);
 
 CREATE TABLE rating_count (
   rating VARCHAR(10) NOT NULL,
