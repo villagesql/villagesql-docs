@@ -1,106 +1,216 @@
 ---
-title: "CTEs in MySQL"
-sidebarTitle: "Using CTEs"
-description: "How to use Common Table Expressions in MySQL: WITH clause syntax, multiple CTEs, recursive CTEs for hierarchical data, and CTEs vs subqueries."
-keywords: "mysql cte, mysql with clause, mysql common table expression, mysql recursive cte, mysql 8 cte, mysql hierarchical query, mysql with recursive"
+title: "When a MySQL CTE beats a derived table"
+sidebarTitle: "CTE performance"
+description: "Whether the MySQL optimizer inlines a CTE or materializes it, how to tell from EXPLAIN, and when a CTE is the wrong shape for the query you are writing."
+keywords: "mysql cte performance, mysql cte vs derived table, mysql materialize cte, mysql cte slow, mysql cte optimizer, mysql recursive cte cycles, cte_max_recursion_depth"
 ---
 
 import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 
 <VillagesqlBanner />
 
-A Common Table Expression (CTE) is a named temporary result set defined at the top of a query with the `WITH` keyword. CTEs are fully supported in MySQL 8.4 and 9.x.
+A CTE and a derived table return the same rows, so the choice between them is
+usually about reading. It stops being only about reading when the optimizer
+materializes one, which it does more often than most write-ups suggest. This
+guide is about telling which you got, and about the cases where a CTE is the
+wrong shape.
 
-## Basic CTE Syntax
+The tutorial teaches the syntax itself:
+[common table expressions](/tutorial/cte), [recursive CTEs](/tutorial/recursive-cte)
+and [derived tables](/tutorial/derived-tables).
 
-```sql
-WITH cte_name AS (
-    SELECT ...
-)
-SELECT * FROM cte_name;
-```
+Every plan on this page came from 1 server against the Sakila sample database.
+Costs and row estimates come from InnoDB's sampled statistics and from your
+`optimizer_switch` settings, so your numbers will differ. The shape of each
+plan is the part that transfers.
 
-A practical example — find the top 5 customers by total spend, then join their names:
+## The rule: mergeable or not
 
-```sql
-WITH top_customers AS (
-    SELECT customer_id, SUM(amount) AS total_spent
-    FROM orders
-    GROUP BY customer_id
-    ORDER BY total_spent DESC
-    LIMIT 5
-)
-SELECT c.name, tc.total_spent
-FROM top_customers tc
-JOIN customers c ON c.id = tc.customer_id;
-```
+A CTE is either folded into the outer query or built as a temporary table
+first, and which you get is decided by what the CTE contains rather than by how
+many times you name it.
 
-You can define multiple CTEs in one `WITH` clause, and each can reference the ones defined before it:
+A CTE whose body is a plain `SELECT` with `WHERE` and `JOIN` merges, and
+disappears from the plan entirely:
 
 ```sql
-WITH
-monthly_totals AS (
-    SELECT DATE_FORMAT(created_at, '%Y-%m') AS month, SUM(amount) AS total
-    FROM orders
-    GROUP BY month
-),
-avg_monthly AS (
-    SELECT AVG(total) AS avg_total FROM monthly_totals
-)
-SELECT mt.month, mt.total, am.avg_total
-FROM monthly_totals mt
-CROSS JOIN avg_monthly am;
+EXPLAIN FORMAT=TREE WITH g AS (SELECT film_id, title, rating FROM film WHERE rating = 'G')
+SELECT title FROM g WHERE film_id < 50\G
 ```
 
-## CTEs vs Subqueries
+```text
+-> Filter: ((film.rating = 'G') and (film.film_id < 50))  (cost=10.1 rows=9.8)
+    -> Index range scan on film using PRIMARY over (film_id < 50)  (cost=10.1 rows=49)
+```
 
-| | CTE | Subquery |
-|:--|:----|:---------|
-| Readability | Named, defined once at the top | Inline, can nest deeply |
-| Reuse | Reference the same CTE multiple times | Must repeat the subquery |
-| Debugging | Easy to run the CTE definition in isolation | Have to extract and run the subquery manually |
-| Performance | Generally the same; optimizer often inlines CTEs | Same |
-| MySQL version | 8.0+ | All versions |
+No CTE node, and the outer condition reached the index. A CTE containing
+`GROUP BY`, `DISTINCT`, `LIMIT`, `UNION` or a window function cannot merge,
+because the outer query's conditions are not equivalent when applied before
+those operations. Such a CTE is materialized.
 
-Use CTEs when the subquery is complex, when you reference the same result more than once, or when nesting would make the query hard to follow. For a comparison of when inline subqueries are better, see [Subqueries vs JOINs in MySQL](/guides/subqueries-vs-joins).
+The plans below show that second case. Read them as being about the CTE's
+contents, not about the word `WITH`.
 
-## Recursive CTEs
+## Check which one you got
 
-A recursive CTE references itself. This is the standard SQL pattern for querying hierarchical data — org charts, category trees, threaded comments.
+`EXPLAIN FORMAT=TREE` says so in as many words. The default `EXPLAIN` does not:
+its `Extra` column does not carry the word on the queries here.
+
+```sql
+EXPLAIN FORMAT=TREE WITH counts AS (SELECT rating, COUNT(*) AS films FROM film GROUP BY rating)
+SELECT rating, films FROM counts WHERE films > 200\G
+```
+
+```text
+-> Table scan on counts  (cost=2.5..2.5 rows=0)
+    -> Materialize CTE counts  (cost=0..0 rows=0)
+        -> Filter: (count(0) > 200)
+            -> Table scan on <temporary>
+                -> Aggregate using temporary table
+                    -> Table scan on film  (cost=103 rows=1000)
+```
+
+`Materialize CTE counts`, even though the CTE is named once. The `GROUP BY`
+inside it is what forces that, and the server writes the rows to a temporary
+table and reads them back.
+
+**A derived table containing the same `GROUP BY` gets the same plan.** Written
+as `FROM (SELECT rating, COUNT(*) ... GROUP BY rating) AS counts`, the tree is
+identical apart from the node's name, and the cost is the same. So on a
+single-reference query the CTE beats the derived table by nothing: the 2 forms
+differ in how they read, and the optimizer treats them alike.
+
+Reference the same CTE twice and the wording changes to `if needed`, with the
+second reference reusing the same materialized result:
+
+```sql
+EXPLAIN FORMAT=TREE WITH counts AS (SELECT rating, COUNT(*) AS films FROM film GROUP BY rating)
+SELECT a.rating, a.films FROM counts AS a JOIN counts AS b ON a.films = b.films\G
+```
+
+```text
+-> Nested loop inner join  (cost=2502 rows=0)
+    -> Table scan on a  (cost=2.5..2.5 rows=0)
+        -> Materialize CTE counts if needed  (cost=0..0 rows=0)
+            -> Table scan on <temporary>
+                -> Aggregate using temporary table
+                    -> Table scan on film  (cost=103 rows=1000)
+    -> Index lookup on b using <auto_key0> (films=a.films)  (cost=0.25..2.5 rows=10)
+        -> Materialize CTE counts if needed (query plan printed elsewhere)  (cost=0..0 rows=0)
+```
+
+That is where the 2 forms genuinely part company. The expensive inner query
+runs once and both references read the result. Written as derived tables the
+same query names the subquery twice, and computes it twice.
+
+## What materializing costs you
+
+A materialized CTE is a temporary table, which means 2 things worth knowing.
+
+It gives up the base tables' indexes. Once the rows sit in a temporary table,
+the outer query scans that table. The server may build an `auto_key` on the
+fly, as it did for the join above, and that is not the index you had on the
+real table. Compare the merged plan at the top of this page, where the outer
+condition reached `PRIMARY`.
+
+Pushdown softens this. `derived_condition_pushdown` is on by default and moves
+what it can inside, which is why `Filter: (count(0) > 200)` appears *inside*
+the `Materialize` node above rather than outside it. It cannot move everything,
+so when a plan shows the CTE producing far more rows than the result keeps,
+write the restriction inside the CTE yourself.
+
+## When a CTE is the wrong shape
+
+- **A single short step.** A derived table keeps it where it is used. Naming a
+  1-line subquery adds a hop for the reader.
+- **A filter the optimizer did not push down.** If the plan shows the CTE
+  materializing every row and the outer query discarding most of them, write
+  the filter inside.
+- **Row-by-row work against an index.** A correlated subquery or a join can use
+  the index on each lookup. A materialized CTE has already given that up.
+
+A CTE is the right shape when the query has 2 or more named stages, when the
+same result is needed twice, or when the alternative is a subquery nested deep
+enough that nobody can see where it ends.
+
+It is also the easier of the 2 to debug. A CTE definition can be run on its own
+by selecting from it, which tells you whether the first stage is right before
+you look at the second. Extracting a derived table from the middle of a `FROM`
+clause to run it by hand is the same work done manually every time.
+
+## Recursive CTEs on real hierarchies
+
+Sakila has no hierarchy, so this section uses a table of its own:
+
+```sql
+CREATE TABLE employees (
+    id         INT PRIMARY KEY,
+    name       VARCHAR(50) NOT NULL,
+    manager_id INT NULL
+);
+
+INSERT INTO employees VALUES
+    (1,'Ada',NULL), (2,'Brem',1), (3,'Chi',1), (4,'Dov',2), (5,'Eze',4);
+```
+
+The seed selects the roots, and the recursive member joins the table to the
+rows already produced. The `depth` column is both the answer and the guard.
 
 ```sql
 WITH RECURSIVE org_chart AS (
-    -- Anchor member: start at the top
     SELECT id, name, manager_id, 0 AS depth
     FROM employees
     WHERE manager_id IS NULL
-
-    UNION ALL
-
-    -- Recursive member: find direct reports of rows already in the CTE
+  UNION ALL
     SELECT e.id, e.name, e.manager_id, oc.depth + 1
-    FROM employees e
-    JOIN org_chart oc ON e.manager_id = oc.id
+    FROM employees AS e
+    INNER JOIN org_chart AS oc ON e.manager_id = oc.id
+    WHERE oc.depth < 100
 )
 SELECT depth, name FROM org_chart ORDER BY depth, name;
 ```
 
-The `RECURSIVE` keyword is required — without it, MySQL doesn't recognize the self-reference and returns `ERROR 1146: Table '<database>.org_chart' doesn't exist`. A recursive CTE has two parts joined by `UNION ALL`:
+```text
++-------+------+
+| depth | name |
++-------+------+
+|     0 | Ada  |
+|     1 | Brem |
+|     1 | Chi  |
+|     2 | Dov  |
+|     3 | Eze  |
++-------+------+
+5 rows in set (0.00 sec)
+```
 
-1. **Anchor member** — the base case (employees with no manager)
-2. **Recursive member** — the step case (reports of employees already in the result)
+**Cycles are the failure mode.** If A reports to B and B reports to A, nothing
+in the query stops, and it runs until it hits the depth limit:
 
-MySQL stops when the recursive member returns zero rows. If your data has cycles (employee A reports to B, B reports to A), the query runs until it hits `cte_max_recursion_depth` (default: 1000) and errors. Guard against this with a depth column and a `WHERE depth < N` condition.
+```text
+ERROR 3636 (HY000): Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.
+```
 
-## Frequently Asked Questions
+`WHERE oc.depth < 100` in the query above is what prevents that. It turns an
+unbounded walk into a bounded one, and it works whether or not the data is
+clean.
 
-#### Are CTEs faster than subqueries?
+The error message suggests raising `cte_max_recursion_depth`, which is right
+only when the recursion genuinely terminates and needs more rounds than
+the default 1,000. A legitimate 1,500-step series hits the same error, and
+`SET SESSION cte_max_recursion_depth = 5000` is the correct answer there. On
+cyclic data it is the wrong one: the query still never ends, and fails later instead.
 
-Usually the same. The MySQL optimizer often inlines a CTE the same way it would a subquery. CTEs referenced multiple times may be materialized into a temporary table, which can be faster (avoids re-executing the subquery) or slower (extra I/O). If you suspect unwanted materialization, use `EXPLAIN FORMAT=TREE` and look for "Materialize CTE ... if needed" — the default `EXPLAIN`'s Extra column never shows the word "MATERIALIZED".
+## Availability and terminology
 
-#### Can I use CTEs in INSERT, UPDATE, or DELETE?
+CTEs arrived in MySQL 8.0 and are present in every release since, including
+8.4 and 9.x. A server that answers `ERROR 1064` to a `WITH` clause predates
+them; check with `SELECT VERSION()`.
 
-Yes. CTEs work with DML statements:
+The standard calls the first part of a recursive CTE the **anchor member** and
+the second the **recursive member**. The tutorial calls the first one the seed,
+which is the same thing, and MySQL's own messages use the standard terms.
+
+## CTEs work in INSERT, UPDATE and DELETE
 
 ```sql
 WITH stale_orders AS (
@@ -109,23 +219,23 @@ WITH stale_orders AS (
 DELETE FROM orders WHERE id IN (SELECT id FROM stale_orders);
 ```
 
-#### What's the recursion depth limit?
-
-The default is 1000 iterations (`cte_max_recursion_depth`). For deeper hierarchies, increase the session variable: `SET SESSION cte_max_recursion_depth = 5000`. If you hit the limit on normal data, check that your recursive member has a proper termination condition and that the data doesn't contain cycles.
+The CTE is evaluated first, so the rows it names are decided before the
+statement changes anything.
 
 ## Troubleshooting
 
-| Problem | Solution |
+| Problem | Cause and fix |
 |:--------|:---------|
-| `ERROR 1064` on WITH syntax | Running an old MySQL version that predates CTE support — check `SELECT VERSION()` |
-| `ERROR 1146: Table '<database>.cte_name' doesn't exist` | Missing `RECURSIVE` keyword — add `WITH RECURSIVE` when the CTE references itself |
-| `ERROR 3636: Recursive query aborted after N iterations. Try increasing @@cte_max_recursion_depth to a larger value.` | Add a depth counter and `WHERE depth < N` guard condition, or raise `@@cte_max_recursion_depth` |
-| CTE referenced in WHERE clause loses rows | Window functions and CTEs are evaluated after WHERE — filter in a subquery around the CTE |
-| CTE performing worse than subquery | Check `EXPLAIN FORMAT=TREE` for "Materialize CTE ... if needed" — try inlining the CTE as a subquery to compare |
+| A CTE is slower than the subquery it replaced | It materialized. Check `EXPLAIN FORMAT=TREE` for `Materialize CTE`. |
+| The CTE reads far more rows than the result needs | The outer filter was not pushed down. Move it inside the CTE. |
+| `ERROR 1146: Table '<database>.cte_name' doesn't exist` | The CTE references itself without `RECURSIVE`. Write `WITH RECURSIVE`. |
+| `ERROR 3636` on data you expect to terminate | Cycles in the data. Add a depth column and a `WHERE depth < N` guard. |
+| `ERROR 3636` on a genuinely deep series | Raise `cte_max_recursion_depth` for the session. |
+| `ERROR 1064` on `WITH` | The server predates CTE support. Check `SELECT VERSION()`. |
 
 ## See also
 
-- [Subqueries vs JOINs in MySQL](/guides/subqueries-vs-joins) — how CTEs compare to correlated subqueries
-- [Window Functions in MySQL 8.4](/guides/window-functions) — often used together with CTEs for analytic queries
+- [Subqueries vs JOINs in MySQL](/guides/subqueries-vs-joins) — the other shape this competes with
 - [MySQL GROUP BY performance](/guides/group-by-having) — the temporary table a CTE can help you avoid
-- [MySQL Views](/guides/views) — persisting a CTE-style abstraction as a schema object
+- [MySQL views](/guides/views) — persisting a named query as a schema object instead
+- [Common table expressions](/tutorial/cte) — the tutorial, if you want the syntax first
