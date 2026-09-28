@@ -2,10 +2,16 @@
 """Re-run every SQL example in tutorial/ and compare it with what is published.
 
 Each lesson pairs a ```sql block with the ```text block holding its output. This
-runs each of those statements against a live server and compares the two lines
-that carry the meaning: the column header, and the footer reporting how many
-rows came back. Those are what go stale when a query or the data changes, and
-they are what a reader compares their own screen against.
+runs each of those statements against a live server and compares three things:
+the column header, the footer reporting how many rows came back, and every data
+row the page prints. The first two go stale when a query or the data changes.
+The third catches a row transcribed wrong, which reads exactly like a row
+transcribed right.
+
+Data rows are compared as a multiset, so a page whose query has no ORDER BY does
+not fail when the server returns the same rows in a different order. A page may
+elide rows with a line containing only "...", and the rows it does keep must all
+be real.
 
 The client is driven through a pseudo-terminal on purpose. The mysql client
 drops the +---+ borders and the "(0.00 sec)" timing when its output is not a
@@ -100,12 +106,36 @@ def pairs(text):
 
 def significant(block):
     """The column header and the row-count or error line."""
-    lines = [l for l in block.strip().split("\n") if l != "..."]
+    lines = [l for l in block.strip().split("\n") if l.strip() != "..."]
     header = next((l for l in lines if l.startswith("|")), None)
     footer = next((l for l in reversed(lines) if "row" in l or "ERROR" in l), None)
     if footer:
         footer = re.sub(r"\(\d+\.\d+ sec\)", "", footer).strip()
     return header, footer
+
+
+def data_rows(block):
+    """Every printed row except the header, as a sorted list.
+
+    Sorted rather than positional because a query with no ORDER BY may come back
+    in a different order on a different server, which is not a documentation
+    defect. A wrong value still changes the list.
+    """
+    lines = [l.rstrip() for l in block.strip().split("\n")]
+    body = [l for l in lines if l.startswith("|")]
+    return sorted(body[1:])
+
+
+def missing_rows(page_block, live_block):
+    """Page rows that the server did not print. Elided rows are not required."""
+    live = list(data_rows(live_block))
+    gone = []
+    for row in data_rows(page_block):
+        if row in live:
+            live.remove(row)
+        else:
+            gone.append(row)
+    return gone
 
 
 def main():
@@ -118,15 +148,19 @@ def main():
             if found or sql.upper().startswith("USE "):
                 skipped += 1
                 continue
-            want = significant(shown)
-            got = significant(printed(run(sql), sql))
-            if want == got:
+            live = printed(run(sql), sql)
+            want, got = significant(shown), significant(live)
+            gone = missing_rows(shown, live)
+            if want == got and not gone:
                 ok += 1
             else:
                 bad += 1
                 print(f"MISMATCH {name}: {sql.splitlines()[0][:60]}")
-                print(f"   page: {want}")
-                print(f"   live: {got}")
+                if want != got:
+                    print(f"   page: {want}")
+                    print(f"   live: {got}")
+                for row in gone:
+                    print(f"   page row not returned by the server: {row}")
     print(f"\nmatched {ok}, mismatched {bad}, skipped {skipped}")
     return 1 if bad else 0
 
