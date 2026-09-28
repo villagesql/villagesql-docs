@@ -42,7 +42,7 @@ def run(statement, cols=200):
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["TERM"] = "dumb"
-        os.execv(CLIENT, [CLIENT, "-S", SOCKET, "-u", USER, DB])
+        os.execvp(CLIENT, [CLIENT, "-S", SOCKET, "-u", USER, DB])
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, cols, 0, 0))
     time.sleep(1.5)
     for line in statement.splitlines():
