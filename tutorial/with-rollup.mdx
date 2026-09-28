@@ -1,0 +1,211 @@
+---
+title: "MySQL WITH ROLLUP"
+sidebarTitle: "WITH ROLLUP"
+description: "How WITH ROLLUP adds subtotal and total rows to a MySQL GROUP BY result, what the NULLs in those rows mean, and how GROUPING tells them from real NULLs."
+keywords: "mysql with rollup, group by with rollup, mysql subtotal row, mysql grouping function, mysql total row sql, mysql rollup null"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`GROUP BY` gives you 1 row per group and no row for the whole. `WITH ROLLUP`
+adds that row, and the subtotals in between when you group on several columns.
+It saves running a second query and adding the numbers up yourself.
+
+Open the client with `mysql -u root -p sakila` before you start.
+
+## How WITH ROLLUP works
+
+```sql
+SELECT GROUPING_COLUMN, AGGREGATE_FUNCTION(COLUMN_NAME)
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN WITH ROLLUP;
+```
+
+Replace `GROUPING_COLUMN` with the column that defines the groups, `TABLE_NAME`
+with the table, and `AGGREGATE_FUNCTION(COLUMN_NAME)` with what to work out per
+group. `WITH ROLLUP` goes at the end of the `GROUP BY` clause.
+
+The server returns the normal groups, then extra rows where a grouping column
+is set aside and its aggregate covers everything. It puts NULL in the columns
+it set aside, which is how you spot those rows.
+
+## Examples
+
+### 1) Add a total row
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
+| NC-17  |   210 |
+| NULL   |  1000 |
++--------+-------+
+6 rows in set (0.00 sec)
+```
+
+6 rows rather than 5. The last one has NULL where a rating would be, and its
+count is the whole table.
+
+### 2) Subtotals as well
+
+Group on 2 columns and you get a subtotal per value of the first, then the
+grand total.
+
+```sql
+SELECT rating, rental_rate, COUNT(*) AS films
+FROM film
+WHERE length = 185
+GROUP BY rating, rental_rate WITH ROLLUP;
+```
+
+```text
++--------+-------------+-------+
+| rating | rental_rate | films |
++--------+-------------+-------+
+| G      |        2.99 |     1 |
+| G      |        4.99 |     2 |
+| G      |        NULL |     3 |
+| PG     |        2.99 |     1 |
+| PG     |        NULL |     1 |
+| PG-13  |        2.99 |     2 |
+| PG-13  |        4.99 |     1 |
+| PG-13  |        NULL |     3 |
+| R      |        2.99 |     1 |
+| R      |        4.99 |     2 |
+| R      |        NULL |     3 |
+| NULL   |        NULL |    10 |
++--------+-------------+-------+
+12 rows in set (0.00 sec)
+```
+
+Read a row by which columns are NULL. `G / NULL / 3` is the subtotal for `G`
+across every rate. `NULL / NULL / 10` is the grand total, which matches the 10
+films that run 185 minutes.
+
+The rollup rows follow the groups they summarise rather than collecting at the
+bottom, so the result reads top to bottom as a report.
+
+## Telling a rollup NULL from a real one
+
+The NULL in a rollup row means "every value of this column". A NULL in the data
+means "no value recorded". They print identically, so on a column that can be
+NULL you cannot tell the 2 apart by looking.
+
+`GROUPING()` answers the question directly. It returns 1 when the column was
+set aside for that row and 0 otherwise.
+
+```sql
+SELECT rating, GROUPING(rating) AS is_total, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++--------+----------+-------+
+| rating | is_total | films |
++--------+----------+-------+
+| G      |        0 |   178 |
+| PG     |        0 |   194 |
+| PG-13  |        0 |   223 |
+| R      |        0 |   195 |
+| NC-17  |        0 |   210 |
+| NULL   |        1 |  1000 |
++--------+----------+-------+
+6 rows in set (0.00 sec)
+```
+
+`rating` is never NULL in Sakila, so here the 2 questions have the same answer.
+On a column that does hold NULLs, testing `rating IS NULL` would catch both
+kinds of row and `GROUPING(rating) = 1` catches only the rollup.
+
+## ORDER BY moves the total, and changes the sort
+
+The examples above have no `ORDER BY`, which is deliberate: `WITH ROLLUP` puts
+each rollup row directly under the groups it summarises, and sorting throws that
+arrangement away.
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| NULL   |  1000 |
+| G      |   178 |
+| NC-17  |   210 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
++--------+-------+
+6 rows in set (0.00 sec)
+```
+
+2 things moved. The grand total sorted to the top, because NULL sorts before
+every real value. And the ratings came out alphabetically rather than in the
+`ENUM` declared order that [GROUP BY](/tutorial/group-by) showed, because
+sorting a rollup result sorts it as text.
+
+So decide which you want. Leave `ORDER BY` off for a report that reads as
+subtotals under their groups, or add it and accept that the rollup rows land
+wherever the sort puts them.
+
+## Labelling the rollup rows
+
+A column of NULLs is not what you want in a report. `COALESCE` puts a word
+there instead.
+
+```sql
+SELECT COALESCE(rating, 'All ratings') AS label, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++-------------+-------+
+| label       | films |
++-------------+-------+
+| G           |   178 |
+| PG          |   194 |
+| PG-13       |   223 |
+| R           |   195 |
+| NC-17       |   210 |
+| All ratings |  1000 |
++-------------+-------+
+6 rows in set (0.00 sec)
+```
+
+That reads well and it is only safe here because `rating` is never NULL in the
+data. On a column that can be NULL, `COALESCE` would label real gaps as totals,
+so use `GROUPING()` in the test instead.
+
+## Summary
+
+- Add `WITH ROLLUP` to the end of `GROUP BY` to get subtotal and total rows.
+- Read NULL in a grouping column as "every value of this column".
+- Expect a subtotal per value of each earlier column when you group on several.
+- Use `GROUPING(column)` to tell a rollup row from a row where the data is NULL.
+- Expect `ORDER BY` to move the rollup rows and to sort an `ENUM` as text.
+
+## See also
+
+- [GROUP BY](/tutorial/group-by): the groups this adds totals to
+- [Aggregate functions](/tutorial/aggregate-functions): what gets totalled
+- [IS NULL](/tutorial/is-null): the other thing a NULL in that column can mean
+- [MySQL GROUP BY performance](/guides/group-by-having): what grouping costs at scale

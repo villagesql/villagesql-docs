@@ -1,146 +1,216 @@
 ---
-title: "GROUP BY and HAVING in MySQL"
-sidebarTitle: "Using GROUP BY & HAVING"
-description: "How MySQL GROUP BY and HAVING work: aggregate functions, HAVING vs WHERE, ONLY_FULL_GROUP_BY mode, GROUP BY WITH ROLLUP, and common mistakes."
-keywords: "mysql group by, mysql having, mysql aggregate functions, mysql having vs where, mysql group by having, mysql only_full_group_by, mysql rollup, mysql count sum avg"
+title: "MySQL GROUP BY performance and grouping at scale"
+sidebarTitle: "GROUP BY performance"
+description: "Why a MySQL GROUP BY builds a temporary table, how an index removes it, what the same filter costs in WHERE against HAVING, and when ANY_VALUE is safe."
+keywords: "mysql group by performance, mysql group by slow, mysql group by using temporary, mysql group by index, mysql any_value, mysql group by temporary table, mysql tmp_table_size group by"
 ---
 
 import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 
 <VillagesqlBanner />
 
-`GROUP BY` collapses multiple rows into one row per group. `HAVING` filters those groups after aggregation. Together they're how MySQL handles aggregation queries — counting orders per customer, summing revenue by month, finding categories with more than 10 items.
+A `GROUP BY` that returns in milliseconds on a test table can take minutes on a
+real one, and the query text is identical. The difference is whether the server
+can walk an index in group order or has to build a temporary table first. This
+guide is about that difference, and about the choices that decide which you
+get.
 
-## GROUP BY Basics
+If you are learning the clauses themselves, the tutorial teaches them against a
+sample database: [aggregate functions](/tutorial/aggregate-functions),
+[GROUP BY](/tutorial/group-by), [HAVING](/tutorial/having),
+[COUNT DISTINCT](/tutorial/count-distinct),
+[GROUP_CONCAT](/tutorial/group-concat) and [WITH ROLLUP](/tutorial/with-rollup).
 
-```sql
--- Count orders per customer
-SELECT customer_id, COUNT(*) AS order_count
-FROM orders
-GROUP BY customer_id;
+## Grouping without an index builds a temporary table
 
--- Total revenue by month
-SELECT
-    DATE_FORMAT(created_at, '%Y-%m') AS month,
-    SUM(amount) AS revenue,
-    COUNT(*) AS order_count
-FROM orders
-GROUP BY month
-ORDER BY month;
-```
-
-Common aggregate functions:
-
-| Function | Returns |
-|:---------|:--------|
-| `COUNT(*)` | Number of rows in the group |
-| `COUNT(col)` | Number of non-NULL values in the column |
-| `SUM(col)` | Sum of all non-NULL values |
-| `AVG(col)` | Average of all non-NULL values |
-| `MIN(col)` / `MAX(col)` | Smallest / largest non-NULL value |
-| `GROUP_CONCAT(col)` | Comma-separated list of values in the group |
-
-## HAVING vs WHERE
-
-`WHERE` filters rows before grouping. `HAVING` filters groups after aggregation.
+To group rows, the server has to bring the rows of each group together. With no
+index on the grouping column it does that by building a temporary table:
 
 ```sql
--- WHERE: filter before grouping (uses indexes)
-SELECT customer_id, COUNT(*) AS order_count
-FROM orders
-WHERE created_at >= '2024-01-01'   -- only include orders from 2024
-GROUP BY customer_id;
-
--- HAVING: filter after grouping (on aggregate results)
-SELECT customer_id, COUNT(*) AS order_count
-FROM orders
-WHERE created_at >= '2024-01-01'
-GROUP BY customer_id
-HAVING order_count >= 5;           -- only customers with 5+ orders
+EXPLAIN SELECT rating, COUNT(*) FROM film GROUP BY rating\G
 ```
 
-`HAVING COUNT(*) >= 5` works because `COUNT(*)` is available after aggregation. `WHERE COUNT(*) >= 5` raises `ERROR 1111 (HY000): Invalid use of group function` — `COUNT()` doesn't exist at the WHERE stage. That is a semantic error, not a parser one.
+```text
+         type: ALL
+possible_keys: NULL
+          key: NULL
+         rows: 1000
+        Extra: Using temporary
+```
 
-Use both together: `WHERE` to reduce rows before the grouping (faster — can use indexes), `HAVING` to filter the resulting groups.
+`Using temporary` is the line to look for. On 1,000 rows it costs nothing. The
+table is held in memory while it fits, and spills to disk when it does not,
+which is where a grouped report stops being fast.
 
-## ONLY_FULL_GROUP_BY
-
-MySQL enforces `ONLY_FULL_GROUP_BY` by default. Every column in the `SELECT` list must either appear in the `GROUP BY` clause or be wrapped in an aggregate function:
+Which setting caps that memory depends on the engine the server uses for
+internal temporary tables. Check yours before you change anything:
 
 ```sql
--- Fails in ONLY_FULL_GROUP_BY mode: 'name' is not in GROUP BY
-SELECT customer_id, name, COUNT(*) FROM orders GROUP BY customer_id;
-
--- Fix: add name to GROUP BY
-SELECT customer_id, name, COUNT(*) FROM orders GROUP BY customer_id, name;
-
--- Or: use ANY_VALUE() if you don't care which name is returned (all rows in the group have the same name)
-SELECT customer_id, ANY_VALUE(name), COUNT(*) FROM orders GROUP BY customer_id;
+SELECT @@internal_tmp_mem_storage_engine AS engine,
+       @@temptable_max_ram, @@temptable_max_mmap, @@tmp_table_size;
 ```
 
-`ANY_VALUE()` explicitly tells MySQL "I know this column isn't in GROUP BY, pick any value from the group." Use it only when the column is functionally dependent on the GROUP BY column (all rows in the group have the same value).
+With `TempTable`, the budget is `temptable_max_ram` and `temptable_max_mmap`.
+`tmp_table_size` applies only when the engine is `MEMORY`, so raising it on a
+`TempTable` server changes nothing at all.
 
-## GROUP BY WITH ROLLUP
-
-`WITH ROLLUP` adds subtotal rows after each group level and a grand total at the end:
+An index on the grouping column removes the step entirely, because the index is
+already in that order:
 
 ```sql
-SELECT
-    COALESCE(category, 'ALL CATEGORIES') AS category,
-    COALESCE(month, 'ALL MONTHS') AS month,
-    SUM(amount) AS revenue
-FROM (
-    SELECT category, DATE_FORMAT(created_at, '%Y-%m') AS month, amount
-    FROM orders
-) t
-GROUP BY category, month WITH ROLLUP;
+EXPLAIN SELECT customer_id, COUNT(*) FROM payment GROUP BY customer_id\G
 ```
 
-MySQL adds NULL for the grouped columns in subtotal and grand total rows. `COALESCE` replaces those NULLs with readable labels. The month is computed in a
-derived table so the `GROUP BY` can name a plain column: MySQL's
-functional-dependency check does not see through a `COALESCE()` wrapped around
-the grouped expression, and grouping by the raw `DATE_FORMAT(...)` while
-selecting the `COALESCE()` of it fails under the default `ONLY_FULL_GROUP_BY`
-with `ERROR 1055`. `WITH ROLLUP` is useful for summary reports where you want group subtotals without running multiple queries.
+```text
+         type: index
+possible_keys: idx_fk_customer_id
+          key: idx_fk_customer_id
+         rows: 16500
+        Extra: Using index
+```
 
-For more complex analytics — running totals, rankings, moving averages — window functions handle cases that `GROUP BY` can't. See [Window Functions in MySQL 8.4](/guides/window-functions).
+No `Using temporary` and no `Using filesort`. The server reads the index in
+order, counts each run of equal values, and emits a row. `Using index` means it
+never touched the table itself.
 
-## Frequently Asked Questions
+So the first thing to check on a slow `GROUP BY` is whether an index leads with
+the grouping columns, in the same order you grouped them. A composite index on
+`(a, b)` serves `GROUP BY a` and `GROUP BY a, b`, and does nothing for
+`GROUP BY b`.
 
-#### Can I use a column alias in HAVING?
+## WHERE and HAVING are not a style choice
 
-Yes, in MySQL — unlike most other databases. MySQL resolves column aliases from `SELECT` before evaluating `HAVING`:
+Both can express a filter. They cost differently, because `WHERE` runs before
+the grouping and `HAVING` runs after it.
+
+A condition on the grouping column itself can be written either way and means
+the same thing, which makes it the honest comparison. In `WHERE`, the server
+narrows the index range first and groups only what it read:
 
 ```sql
-SELECT customer_id, COUNT(*) AS cnt
-FROM orders
-GROUP BY customer_id
-HAVING cnt > 5;   -- works in MySQL; would fail in PostgreSQL or SQL Server
+EXPLAIN FORMAT=TREE SELECT customer_id, COUNT(*) FROM payment WHERE customer_id <= 100 GROUP BY customer_id\G
 ```
 
-This is a MySQL-specific extension to the SQL standard. It's convenient but not portable.
+```text
+-> Group aggregate: count(0)  (cost=814 rows=599)
+    -> Filter: (payment.customer_id <= 100)  (cost=543 rows=2710)
+        -> Covering index range scan on payment using idx_fk_customer_id over (customer_id <= 100)  (cost=543 rows=2710)
+```
 
-#### Why does GROUP BY without ORDER BY return rows in random order?
+In `HAVING`, the same restriction arrives too late to narrow anything:
 
-Because MySQL doesn't guarantee order without an explicit `ORDER BY`. Even if the output looks ordered today, it can change with a different query plan or data distribution. Always add `ORDER BY` when order matters.
+```sql
+EXPLAIN FORMAT=TREE SELECT customer_id, COUNT(*) FROM payment GROUP BY customer_id HAVING customer_id <= 100\G
+```
 
-#### What's the difference between COUNT(*) and COUNT(col)?
+```text
+-> Filter: (payment.customer_id <= 100)  (cost=3324 rows=599)
+    -> Group aggregate: count(0)  (cost=3324 rows=599)
+        -> Covering index scan on payment using idx_fk_customer_id  (cost=1674 rows=16500)
+```
 
-`COUNT(*)` counts all rows including NULLs. `COUNT(col)` counts only rows where `col` is not NULL. `COUNT(DISTINCT col)` counts unique non-NULL values. Use `COUNT(*)` for row counts and `COUNT(col)` when you specifically want to count non-NULL occurrences.
+Same rows out, 4 times the estimated cost. The `WHERE` version reads an
+estimated 2,710 index entries; the `HAVING` version reads the whole index and
+throws most of the groups away afterwards.
+
+Those estimates come from InnoDB's sampled statistics and from the cost
+constants in `mysql.server_cost`, so your numbers will differ from these. The
+shape of the 2 plans is the part that transfers.
+
+The rule: put a condition in `WHERE` whenever it tests a row. Use `HAVING` only
+for what tests a group, which in practice means anything containing an
+aggregate. A `HAVING` clause with no aggregate in it is nearly always a `WHERE`
+clause in the wrong place, and `WHERE` with an aggregate in it is
+`ERROR 1111 (HY000): Invalid use of group function`.
+
+## ONLY_FULL_GROUP_BY, and the escape hatch
+
+`only_full_group_by` is on by default and rejects a query that selects a column
+which is neither grouped nor aggregated, with `ERROR 1055`. The reason is that
+such a query has no defined answer: the group holds many rows and nothing says
+which one to show.
+
+`ANY_VALUE()` tells the server you accept an arbitrary one, and the query then
+runs:
+
+```sql
+SELECT rating, ANY_VALUE(title) AS a_title, COUNT(*) AS films
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+No output is shown here on purpose. Which title comes back is not defined, so
+any result printed on this page would be a value you cannot reproduce.
+
+Use `ANY_VALUE()` when the column is functionally dependent on the grouping
+column and the server cannot prove it, which is the legitimate case. Do not use
+it to silence the error on a column that genuinely varies within the group: the
+value you get is not the first, the smallest, or anything else you can rely on,
+and it can change when the plan changes. `MIN()` or `MAX()` says what you meant
+and costs the same.
+
+Turning `only_full_group_by` off globally converts every one of these errors
+into a wrong answer nobody sees. It is the wrong fix.
+
+The check does see through an expression built on the grouping column, so
+`SELECT COALESCE(rating, 'unrated') ... GROUP BY rating` is accepted. What it
+rejects is an expression over a column you did not group, which is the ordinary
+case above wearing a function.
+
+## Aggregating a one-to-many join
+
+Joining before grouping multiplies rows, so a `SUM` over the result double
+counts. The symptom is a total that is too high by a factor nobody can explain.
+
+Aggregate each side in its own subquery and join the results, rather than
+joining first and grouping afterwards:
+
+```sql
+SELECT c.last_name, p.payments, r.rentals
+FROM customer AS c
+JOIN (SELECT customer_id, COUNT(*) AS payments FROM payment GROUP BY customer_id) AS p
+  ON p.customer_id = c.customer_id
+JOIN (SELECT customer_id, COUNT(*) AS rentals FROM rental GROUP BY customer_id) AS r
+  ON r.customer_id = c.customer_id
+ORDER BY c.last_name
+LIMIT 5;
+```
+
+Each subquery's aggregate is over the rows it belongs to. Joining both tables
+first and grouping afterwards multiplies payments by rentals and inflates both
+counts. [MySQL JOIN performance and common mistakes](/guides/joins) covers the
+multiplication itself.
+
+## When you do not want the rows collapsed
+
+`GROUP BY` replaces the rows with 1 row per group. When you want the aggregate
+*beside* each row, a window function does that without collapsing anything, and
+usually without the temporary table:
+
+```sql
+SELECT customer_id, amount, SUM(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM payment;
+```
+
+[Window functions in MySQL 8.4](/guides/window-functions) covers them properly.
 
 ## Troubleshooting
 
-| Problem | Solution |
+| Problem | Cause and fix |
 |:--------|:---------|
-| `ERROR 1055: not in GROUP BY clause` | Add the column to GROUP BY or wrap it in `ANY_VALUE()` |
-| `HAVING` on non-aggregate column | Use `WHERE` instead — `HAVING` works on aggregate results, not raw columns |
-| `GROUP_CONCAT` result truncated | Default max length is 1024 bytes; increase with `SET SESSION group_concat_max_len = 10000` |
-| Slow `GROUP BY` query | Add an index on the GROUP BY columns; check `EXPLAIN` for "Using filesort" or "Using temporary" |
+| `GROUP BY` is slow | No index leads with the grouping columns. Check `EXPLAIN` for `Using temporary`. |
+| Slow, and the disk is busy | The temporary table outgrew its memory budget and spilled. Narrow the rows first, then check the setting that matches your `internal_tmp_mem_storage_engine`. |
+| `ERROR 1055` | A selected column is neither grouped nor aggregated. Group it, aggregate it, or drop it. |
+| A `HAVING` filter is slow | It has no aggregate in it, so it belongs in `WHERE`. |
+| A total is too high | A one-to-many join multiplied the rows before the grouping. |
+| `GROUP_CONCAT` result cut short | It hit `group_concat_max_len`, which warns rather than errors. |
+| Groups come back in a surprising order | `GROUP BY` promises no order. Add `ORDER BY`. |
 
 ## See also
 
-- [Window Functions in MySQL 8.4](/guides/window-functions) — per-row aggregation without collapsing groups
-- [MySQL JOIN performance and common mistakes](/guides/joins) — why a one-to-many join needs grouping to fix its totals
-- [CTEs in MySQL](/guides/ctes-in-mysql) — pre-aggregating data before the main GROUP BY
-- [Common MySQL Errors and How to Fix Them](/guides/common-mysql-errors) — the ONLY_FULL_GROUP_BY error explained
-- [MySQL SELECT DISTINCT](/tutorial/select-distinct) — the tutorial lesson on removing duplicate rows
+- [Window functions in MySQL 8.4](/guides/window-functions) — aggregating without collapsing the rows
+- [MySQL JOIN performance and common mistakes](/guides/joins) — why a one-to-many join inflates a total
+- [CTEs in MySQL](/guides/ctes-in-mysql) — pre-aggregating before the main query
+- [Common MySQL errors](/guides/common-mysql-errors) — ERROR 1055 and ERROR 1111 in context
+- [GROUP BY](/tutorial/group-by) — the tutorial, if you want the clause itself first

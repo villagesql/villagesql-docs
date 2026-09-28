@@ -103,8 +103,10 @@ be a little warmer. Nothing needs hype.
 - **Admonitions.** Use Mintlify's `<Note>`, `<Info>`, `<Warning>`, `<Tip>`,
   and `<CardGroup>`/`<Card>` components to set off asides and navigation. Don't
   overuse them; a page that is all callouts has none.
-- **Em dashes:** avoid them. A comma, colon, period, or parentheses is almost
-  always clearer.
+- **Em dashes sparingly.** A comma, colon, period, or parentheses is usually
+  clearer, so reach for one of those first. Where an em dash genuinely reads
+  best, use it. The established form in a guide's `See also` list is
+  `- [Title](/path) — why it is relevant`, and that stays.
 - **Bold sparingly.** One or two genuinely key phrases per section, not
   decoration.
 - **No horizontal rules (`---`) inside body content.** Use headings and
