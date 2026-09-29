@@ -20,6 +20,10 @@ running server.**
 2. **Upstream consistency.** If a feature behaves exactly like upstream MySQL,
    don't re-document it; link to the [MySQL documentation](https://dev.mysql.com/doc/).
    We write custom docs only for the VillageSQL Extension Framework (VEF), extensions, and server deviations and additions from upstream.
+   Two directories are exempt, and only these two. `guides/` and `tutorial/`
+   teach MySQL itself, so they cover behavior that upstream also documents.
+   They exist to answer a reader's question on our site rather than to describe
+   a VillageSQL deviation. Everywhere else, rule 2 stands.
 3. **Single source of truth.** State each fact in one canonical place and link
    to it. Before removing something as "duplicate," cite the exact file and
    heading where the real copy lives. If you can't cite it, it stays.
@@ -37,7 +41,7 @@ wrong. VillageSQL organizes content along the lines of the
 | Page type | Answers | Example page | Shape |
 |---|---|---|---|
 | **Guide / how-to** | "How do I accomplish X?" | `guides/encrypting-columns.mdx` | Task-focused steps for a competent user solving a real problem |
-| **Tutorial** | "Teach me by doing" | `mysql-8.4/<version>/quickstart.mdx` | Guided lesson that ends in a working result |
+| **Tutorial** | "Teach me by doing" | `tutorial/index.mdx`, `mysql-8.4/<version>/quickstart.mdx` | Guided lesson that ends in a working result |
 | **Reference** | "What are the exact facts?" | `mysql-8.4/<version>/extension-api-reference.mdx` | Accurate, complete, dry: functions, signatures, types, options |
 | **Explanation** | "Why does it work this way?" | `mysql-8.4/<version>/extensions-or-plugins.mdx` | Background, rationale, mental models |
 
@@ -99,8 +103,10 @@ be a little warmer. Nothing needs hype.
 - **Admonitions.** Use Mintlify's `<Note>`, `<Info>`, `<Warning>`, `<Tip>`,
   and `<CardGroup>`/`<Card>` components to set off asides and navigation. Don't
   overuse them; a page that is all callouts has none.
-- **Em dashes:** avoid them. A comma, colon, period, or parentheses is almost
-  always clearer.
+- **Em dashes sparingly.** A comma, colon, period, or parentheses is usually
+  clearer, so reach for one of those first. Where an em dash genuinely reads
+  best, use it. The established form in a guide's `See also` list is
+  `- [Title](/path) — why it is relevant`, and that stays.
 - **Bold sparingly.** One or two genuinely key phrases per section, not
   decoration.
 - **No horizontal rules (`---`) inside body content.** Use headings and
@@ -227,7 +233,8 @@ the audience field and the raw-ABI rule.
 villagesql-docs/
 ├── docs.json              # navigation, theme, version dropdown; register new pages here
 ├── index.mdx              # docs landing page
-├── guides/                # how-to guides and tutorials (see also: keywords, cross-links)
+├── guides/                # how-to guides, one topic each (see also: keywords, cross-links)
+├── tutorial/              # the ordered MySQL lessons; order lives in scripts/tutorial-toc.json
 ├── mysql-8.4/
 │   ├── stable/            # current stable (fixed URL slot)
 │   ├── dev/               # active development, most edits go here
@@ -241,7 +248,26 @@ villagesql-docs/
   directory (`mysql-8.4/dev/`). Released versions are frozen except for
   corrections. The full release process is in [VERSIONING.md](./VERSIONING.md).
 - **Register new pages in `docs.json`.** A file that isn't in `docs.json` won't
-  appear in the sidebar.
+  appear in the sidebar. Two page sets are the exception, because a generator
+  writes their navigation: `extensions/` from `scripts/gen-extension-pages.py`,
+  and `tutorial/` from `scripts/gen-tutorial-nav.py`. Add a tutorial lesson to
+  `scripts/tutorial-toc.json`, run that script, and commit what it changes. CI
+  fails the pull request when the committed navigation and the generator
+  disagree.
+- **Lessons under `tutorial/` are written, never adapted.** The MySQL Reference
+  Manual is not open licensed, and its terms prohibit reuse of any part of it in
+  another publication. The other MySQL tutorial sites reserve all rights too.
+  So get the facts by running statements against a live server and write from
+  the output you captured. Do not draft next to any of those sources.
+- **Re-run the examples before you ship a change to them.** Two scripts do it,
+  both against a live server with Sakila loaded, and both are run by hand
+  because CI has no server:
+  `python3 scripts/verify-tutorial-examples.py` covers every lesson, and
+  `python3 scripts/verify-guide-examples.py` covers the guides listed at the top
+  of that file. They compare the column header, the row count and every printed
+  row; where the statement has an `ORDER BY` they compare the row order too.
+  `EXPLAIN` costs and row estimates are ignored, because they differ per
+  machine. Add a guide to that list once you have checked its examples by hand.
 - **Don't back-port syntax to a version that predates the feature.** Before
   changing an older version's page to reference a newer API, confirm that API
   existed when that version was released.

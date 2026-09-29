@@ -1,17 +1,26 @@
 ---
-title: "MySQL JOINs Explained"
-sidebarTitle: "Writing JOINs"
-description: "How MySQL JOIN types work: INNER JOIN, LEFT JOIN, RIGHT JOIN, and CROSS JOIN — with examples, performance considerations, and common mistakes."
-keywords: "mysql join, mysql inner join, mysql left join, mysql right join, mysql join example, mysql join performance, mysql outer join, mysql join types"
+title: "MySQL JOIN Performance and Common Mistakes"
+sidebarTitle: "JOIN performance"
+description: "Why a MySQL JOIN runs slow or returns the wrong rows: missing indexes, a WHERE that undoes a LEFT JOIN, duplicate rows, NULL join keys, and no FULL OUTER JOIN."
+keywords: "mysql join performance, mysql slow join, mysql left join returns fewer rows, mysql join duplicate rows, mysql full outer join, mysql join index, mysql join explain"
 ---
 
 import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 
 <VillagesqlBanner />
 
-JOINs combine rows from two or more tables based on a related column. They're one of the most-used features in SQL and one of the most commonly misunderstood — especially when NULLs or missing rows are involved.
+JOINs work the first time and go wrong later. The query is correct SQL, the
+server raises nothing, and the answer is a row count you were not expecting or
+a report that takes 40 seconds. This guide covers those cases: what makes a
+join slow, and the 4 ways one quietly returns the wrong rows.
 
-## The Tables Used in This Guide
+If you are still deciding which kind of join to write, the tutorial teaches
+each one against a sample database:
+[how joins work](/tutorial/joins), [INNER JOIN](/tutorial/inner-join),
+[LEFT JOIN](/tutorial/left-join), [RIGHT JOIN](/tutorial/right-join),
+[CROSS JOIN](/tutorial/cross-join) and [self join](/tutorial/self-join).
+
+## The tables used in this guide
 
 ```sql
 CREATE TABLE customers (
@@ -33,149 +42,158 @@ INSERT INTO orders VALUES
     (4, NULL, 15.00); -- order with no customer
 ```
 
-## JOIN Types at a Glance
+## Index the join column
 
-| Type | Returns | Use when |
-|:-----|:--------|:---------|
-| `INNER JOIN` | Only rows with a match in both tables | You want results that exist on both sides |
-| `LEFT JOIN` | All rows from the left table; NULL for unmatched right rows | You want all left-side rows regardless of whether a match exists |
-| `RIGHT JOIN` | All rows from the right table; NULL for unmatched left rows | Same result as `LEFT JOIN` with tables swapped — most developers rewrite it that way |
-| `CROSS JOIN` | Every combination of left and right rows (Cartesian product) | Generating all possible pairs; no `ON` condition |
-
-## INNER JOIN — Only Matching Rows
-
-`INNER JOIN` (or just `JOIN`) returns rows where the join condition matches in both tables. Rows with no match in either table are excluded.
+Without an index on the joining column, the server builds a hash table over one
+side and scans the other. `EXPLAIN FORMAT=TREE` names it:
 
 ```sql
-SELECT c.name, o.amount
-FROM customers c
-INNER JOIN orders o ON o.customer_id = c.id;
+EXPLAIN FORMAT=TREE SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id\G
 ```
 
+```text
+*************************** 1. row ***************************
+EXPLAIN: -> Inner hash join (o.customer_id = c.id)  (cost=2 rows=3)
+    -> Table scan on o  (cost=0.117 rows=4)
+    -> Hash
+        -> Table scan on c  (cost=0.55 rows=3)
 ```
-name  | amount
-------+--------
-Alice | 99.00
-Alice | 45.00
-Bob   | 120.00
-```
 
-Carol has no orders — she's excluded. The order with `customer_id = NULL` is also excluded because `NULL` doesn't match any value. Only rows with a match on both sides appear. For a full explanation of how MySQL handles NULL comparisons, see [NULL in MySQL](/guides/null-in-mysql).
-
-## LEFT JOIN — All Rows from the Left Table
-
-`LEFT JOIN` returns all rows from the left table, plus any matching rows from the right table. When there's no match, the right-side columns are NULL.
+A hash join reads each table once. On 7 rows that is nothing. On real tables it
+is 2 full table scans plus the memory to hold the hash, and when the build side
+does not fit in `join_buffer_size` the server spills it to disk in batches.
+Adding the index replaces all of that with a lookup:
 
 ```sql
-SELECT c.name, o.amount
-FROM customers c
-LEFT JOIN orders o ON o.customer_id = c.id;
-```
-
-```
-name  | amount
-------+--------
-Alice | 99.00
-Alice | 45.00
-Bob   | 120.00
-Carol | NULL
-```
-
-Carol appears now with `NULL` for `amount`. This is the right JOIN to use when you want all rows from the primary table, whether or not related rows exist.
-
-**Finding rows with no match** — filter on a NULL right-side column:
-
-```sql
--- Customers who have never placed an order
-SELECT c.name
-FROM customers c
-LEFT JOIN orders o ON o.customer_id = c.id
-WHERE o.id IS NULL;
-```
-
-```
-name
-------
-Carol
-```
-
-## RIGHT JOIN — All Rows from the Right Table
-
-`RIGHT JOIN` is the mirror of `LEFT JOIN`: all rows from the right table, NULLs for unmatched left-side columns. In practice, most developers rewrite `RIGHT JOIN` as a `LEFT JOIN` with the tables swapped — it's easier to read.
-
-```sql
--- These are equivalent
-SELECT c.name, o.amount
-FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id;
-
-SELECT c.name, o.amount
-FROM orders o LEFT JOIN customers c ON o.customer_id = c.id;
-```
-
-Both return all orders, including the one with no customer:
-
-```
-name  | amount
-------+--------
-Alice | 99.00
-Alice | 45.00
-Bob   | 120.00
-NULL  | 15.00
-```
-
-## CROSS JOIN — Every Combination
-
-`CROSS JOIN` produces the Cartesian product: every row from the left table paired with every row from the right table. With 3 customers and 4 orders, you get 12 rows. There's no `ON` condition.
-
-```sql
-SELECT c.name, o.amount
-FROM customers c
-CROSS JOIN orders o;
--- Returns 3 × 4 = 12 rows
-```
-
-Useful for generating combinations (e.g., all product-size pairings), not for querying related data.
-
-## JOIN Performance
-
-JOINs on large tables can be slow if the join columns aren't indexed.
-
-```sql
--- Without an index on orders.customer_id, MySQL scans all orders for each customer
-SELECT c.name, COUNT(o.id) AS order_count
-FROM customers c
-LEFT JOIN orders o ON o.customer_id = c.id
-GROUP BY c.id;
-
--- Add the index
 CREATE INDEX idx_orders_customer ON orders (customer_id);
 ```
 
-Always index the foreign key column on the "many" side of a one-to-many relationship. `EXPLAIN` shows the join order and which indexes are used — look for `type: ALL` on any joined table as a sign that an index is missing.
-
-## Frequently Asked Questions
-
-#### What's the difference between `JOIN` and `INNER JOIN`?
-Nothing. They're the same. `INNER JOIN` is the explicit form; `JOIN` is shorthand. Both return only matching rows.
-
-#### Why does adding a `WHERE` clause to a `LEFT JOIN` turn it into an `INNER JOIN`?
-When you filter on a column from the right table in the `WHERE` clause, rows where that column is NULL (the unmatched rows) are excluded. Put the condition in the `ON` clause instead if you want to keep unmatched rows:
+Ask for the same plan again and the hash is gone:
 
 ```sql
--- This excludes customers with no orders — behaves like INNER JOIN
+EXPLAIN FORMAT=TREE SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id\G
+```
+
+```text
+*************************** 1. row ***************************
+EXPLAIN: -> Nested loop inner join  (cost=1.95 rows=4)
+    -> Table scan on c  (cost=0.55 rows=3)
+    -> Index lookup on o using idx_orders_customer (customer_id=c.id)  (cost=0.378 rows=1.33)
+```
+
+Index the foreign key column on the "many" side of a one-to-many relationship.
+The primary key on the "one" side is already indexed, so that half needs
+nothing.
+
+In the default `EXPLAIN` output the same 2 plans read as `Extra: Using join
+buffer (hash join)` and `type: ref`. That table also shows the order the server
+chose to join in, which matters as soon as a query has 3 or more tables: the
+server reads them top to bottom, and the row estimate on the first one
+multiplies through everything below it.
+[Reading EXPLAIN output](/guides/reading-explain) covers the rest of the plan.
+
+An equality condition is what a hash join can look up. Join on a range or an
+inequality instead and the server still builds the hash, but it has nothing to
+look up with: the plan reads `Inner hash join (no condition)` with the test in a
+`Filter` above it, so every pair of rows is formed and then thrown away. That is
+the cost an indexed equality join avoids.
+
+## A WHERE clause turns a LEFT JOIN back into an INNER JOIN
+
+The most common wrong-row-count bug, and nothing warns you.
+
+```sql
+-- Excludes customers with no orders, so this is an inner join now
 SELECT c.name, o.amount
 FROM customers c
 LEFT JOIN orders o ON o.customer_id = c.id
 WHERE o.amount > 50;
 
--- This keeps customers with no orders
+-- Keeps customers with no orders
 SELECT c.name, o.amount
 FROM customers c
 LEFT JOIN orders o ON o.customer_id = c.id AND o.amount > 50;
 ```
 
-#### Does MySQL support FULL OUTER JOIN?
-No — MySQL doesn't have `FULL OUTER JOIN`. Emulate it with a `LEFT JOIN` and `RIGHT JOIN` combined with `UNION`:
+The join runs first and gives unmatched customers a NULL `o.amount`. `WHERE`
+then tests each row, `NULL > 50` is NULL rather than true, and those rows are
+dropped. Moving the condition into `ON` makes it part of what counts as a
+match instead.
+
+The rule: on an outer join, a condition on the inner table belongs in `ON`, and
+a condition on the preserved table belongs in `WHERE`. The exception is
+`WHERE <inner table key> IS NULL`, where dropping the matched rows is the
+point.
+
+## A NULL in the join column matches nothing
+
+`orders.customer_id` is nullable, and order 4 has no customer. An inner join
+drops it, because NULL is not equal to anything, including another NULL.
+
+```sql
+SELECT c.name, o.amount
+FROM customers c
+INNER JOIN orders o ON o.customer_id = c.id
+ORDER BY c.name, o.amount;
+```
+
+```text
++-------+--------+
+| name  | amount |
++-------+--------+
+| Alice |  45.00 |
+| Alice |  99.00 |
+| Bob   | 120.00 |
++-------+--------+
+3 rows in set (0.00 sec)
+```
+
+3 rows from 4 orders. Carol is missing because she has no orders, which is the
+expected half. Order 4 is missing because its `customer_id` is NULL, which is
+the half that surprises people: the row exists, its amount is real, and no join
+condition can reach it. A revenue total built on that join is short by 15.00 and
+nothing says so.
+
+When a join column is nullable, decide what an orphan row should do before you
+write the join. `LEFT JOIN` from `orders` keeps it with a NULL customer name.
+[NULL in MySQL](/guides/null-in-mysql) covers the comparison rule behind it.
+
+## A one-to-many join multiplies your rows
+
+A join returns 1 row per match, so joining to a table that holds several
+matching rows repeats the left row once per match. Totals computed over that
+result are then wrong, usually too high, and the query still looks right.
+
+```sql
+-- Alice appears twice, because she has 2 orders
+SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON o.customer_id = c.id;
+```
+
+Before treating duplicate rows as a bug, confirm the relationship really is
+one-to-one. When it is one-to-many and you want 1 row per customer,
+aggregate: `GROUP BY c.id` with `SUM` or `COUNT` over the joined column. See
+[MySQL GROUP BY performance](/guides/group-by-having).
+
+The same arithmetic goes wrong faster with 2 one-to-many joins in one query,
+where the 2 sets of matches multiply against each other. Aggregate each in its
+own subquery rather than joining both at once.
+
+## A missing ON gives you every combination
+
+MySQL accepts `INNER JOIN` with no `ON` clause and reads it as a cross join, so
+a typo produces the product of both tables rather than an error. 2 tables of
+10,000 rows give 100 million rows.
+
+When a join returns a suspiciously round and suspiciously large number, check
+for a missing `ON` before anything else. A comma between tables in `FROM` is
+the same thing in older syntax, with the matching condition usually further
+down in `WHERE`.
+
+## MySQL has no FULL OUTER JOIN
+
+There is no `FULL OUTER JOIN` in MySQL. Combine the 2 halves with `UNION`:
 
 ```sql
 SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
@@ -183,19 +201,35 @@ UNION
 SELECT c.name, o.amount FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id;
 ```
 
-`UNION` deduplicates the result. If your data can have legitimately duplicate rows and you want to preserve them, use `UNION ALL` — but be aware it will also include rows that appear in both halves.
+`UNION` removes duplicate rows, which is what makes the 2 halves join up
+cleanly. `UNION ALL` does not emulate a full outer join at all: it returns every
+matched row twice, once from each half. When your data has duplicate rows you
+need to keep, deduplicate on a key column instead of reaching for `UNION ALL`.
+
+## JOIN or subquery
+
+A join and an `IN` subquery often express the same filter, and which one the
+optimizer prefers depends on the data. When you only need to know whether a
+related row exists and want none of its columns, `EXISTS` usually reads better
+and lets the server stop at the first match.
+[Subqueries vs JOINs in MySQL](/guides/subqueries-vs-joins) compares them with
+plans.
 
 ## Troubleshooting
 
-| Problem | Solution |
+| Problem | Cause and fix |
 |:--------|:---------|
-| `LEFT JOIN` returns fewer rows than expected | A `WHERE` condition on the right table is filtering out NULL rows — move the condition to `ON` |
-| JOIN on large tables is slow | Add an index on the join column of the larger table |
-| Unexpected duplicate rows | The join is producing multiple matches — use `GROUP BY` or check whether the relationship is truly one-to-one |
-| `RIGHT JOIN` is confusing | Rewrite as `LEFT JOIN` with tables swapped — same result, easier to read |
+| `LEFT JOIN` returns fewer rows than expected | A `WHERE` condition on the right table is dropping the NULL rows. Move it to `ON`. |
+| A join on large tables is slow | The join column on the "many" side has no index. Check `EXPLAIN` for `type: ALL`. |
+| Unexpected duplicate rows | The relationship is one-to-many. Aggregate with `GROUP BY`, or confirm it should be one-to-one. |
+| A total is too high | Same cause: the join repeated the left row, so the sum counts it several times. |
+| A join returns a huge round number of rows | The `ON` clause is missing, so the join is a cross join. |
+| Rows are missing that exist in both tables | The join column is NULL on one side, so nothing matches it. |
+| `RIGHT JOIN` is hard to follow | Rewrite as `LEFT JOIN` with the tables swapped. Same result. |
 
 ## See also
 
-- [Subqueries vs JOINs in MySQL](/guides/subqueries-vs-joins) — when to use a subquery instead of a JOIN
-- [NULL in MySQL](/guides/null-in-mysql) — how NULL values affect JOIN results
-- [Foreign Keys in MySQL](/guides/foreign-keys) — the relationships that JOINs traverse
+- [Reading EXPLAIN output](/guides/reading-explain) — the plan that tells you which index a join used
+- [Foreign keys in MySQL](/guides/foreign-keys) — the constraint that decides which column to index
+- [MySQL GROUP BY performance](/guides/group-by-having) — aggregating a one-to-many join back to 1 row
+- [How joins work](/tutorial/joins) — the tutorial, if you want the basics first

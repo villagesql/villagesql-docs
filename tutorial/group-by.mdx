@@ -1,0 +1,232 @@
+---
+title: "MySQL GROUP BY"
+sidebarTitle: "GROUP BY"
+description: "How GROUP BY splits MySQL rows into groups and returns 1 row per group, how to group on several columns, and what ERROR 1055 is telling you."
+keywords: "mysql group by, group by mysql, mysql group by count, mysql group by multiple columns, mysql only_full_group_by, mysql group by clause"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+An aggregate with no `GROUP BY` treats the whole table as 1 group and returns 1
+row. `GROUP BY` splits the rows into groups first, so you get 1 row for each
+one. It is how "how many films" becomes "how many films of each rating".
+
+Open the client with `mysql -u root -p sakila` before you start.
+
+## How GROUP BY works
+
+```sql
+SELECT GROUPING_COLUMN, AGGREGATE_FUNCTION(COLUMN_NAME)
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN;
+```
+
+Replace `GROUPING_COLUMN` with the column whose values define the groups,
+`TABLE_NAME` with the table, and `AGGREGATE_FUNCTION(COLUMN_NAME)` with what you
+want worked out for each group.
+
+The server sorts the rows into buckets, 1 per distinct value of the grouping
+column, and runs the aggregate over each bucket separately. The result has as
+many rows as there were distinct values.
+
+`GROUP BY` goes after `WHERE` and before `ORDER BY`, which is also the order
+the result is defined in: filter the rows, group what survived, then sort the
+groups.
+
+## Examples
+
+### 1) One row per value
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
+| NC-17  |   210 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+5 groups, because `rating` has 5 distinct values, and the 5 counts add up to
+1,000. The rows come out in the declared order of the `ENUM` rather than
+alphabetically, which the [SELECT DISTINCT](/tutorial/select-distinct) lesson
+explains.
+
+### 2) Group on 2 columns
+
+Name 2 columns and a group is a distinct pairing, not a value of each.
+
+```sql
+SELECT rating, rental_rate, COUNT(*) AS films
+FROM film
+GROUP BY rating, rental_rate
+ORDER BY rating, rental_rate;
+```
+
+```text
++--------+-------------+-------+
+| rating | rental_rate | films |
++--------+-------------+-------+
+| G      |        0.99 |    64 |
+| G      |        2.99 |    59 |
+| G      |        4.99 |    55 |
+| PG     |        0.99 |    62 |
+| PG     |        2.99 |    64 |
+| PG     |        4.99 |    68 |
+...
++--------+-------------+-------+
+15 rows in set (0.01 sec)
+```
+
+5 ratings times 3 rates is 15 groups. This is the same shape
+`SELECT DISTINCT rating, rental_rate` returns, with a count attached to each
+row.
+
+### 3) Filter the rows before grouping
+
+`WHERE` runs first, so the counts are over the rows that survived it.
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+WHERE length > 120
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |    72 |
+| PG     |    82 |
+| PG-13  |   118 |
+| R      |    90 |
+| NC-17  |    95 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+Still 5 groups, all smaller. A group disappears entirely only when `WHERE`
+removes every one of its rows.
+
+### 4) Group on something you computed
+
+The grouping column does not have to be a column. Any expression works, and you
+can name it with an alias and group on that.
+
+```sql
+SELECT LEFT(title, 1) AS initial, COUNT(*) AS films
+FROM film
+GROUP BY initial
+ORDER BY initial
+LIMIT 5;
+```
+
+```text
++---------+-------+
+| initial | films |
++---------+-------+
+| A       |    46 |
+| B       |    63 |
+| C       |    92 |
+| D       |    65 |
+| E       |    32 |
++---------+-------+
+5 rows in set (0.00 sec)
+```
+
+`GROUP BY` accepts an alias from the select list, which `WHERE` does not. This
+is how a report gets grouped by month: compute the month, group on it.
+
+### 5) Group over a join
+
+Grouping is most useful once the rows come from more than 1 table. This counts
+each customer's payments.
+
+```sql
+SELECT c.last_name, COUNT(*) AS payments
+FROM customer AS c
+INNER JOIN payment AS p ON p.customer_id = c.customer_id
+GROUP BY c.customer_id, c.last_name
+ORDER BY payments DESC, c.last_name
+LIMIT 5;
+```
+
+```text
++-----------+----------+
+| last_name | payments |
++-----------+----------+
+| HUNT      |       46 |
+| SEAL      |       45 |
+| DEAN      |       42 |
+| SHAW      |       42 |
+| SANDERS   |       41 |
++-----------+----------+
+5 rows in set (0.01 sec)
+```
+
+The join runs first and produces 1 row per payment, then the grouping collapses
+those rows per customer. `customer_id` is in the `GROUP BY` as well as
+`last_name`, because 2 customers can share a surname and you want them counted
+apart.
+
+## Every selected column must be grouped or aggregated
+
+A group is many rows. Asking for a column that is neither the grouping column
+nor inside an aggregate asks the server which of those many rows to show, and
+it has no answer. The `only_full_group_by` setting, which is on by default, is
+what makes the server say so rather than guess.
+
+```sql
+SELECT rating, title FROM film GROUP BY rating;
+```
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'sakila.film.title' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+`ERROR 1055` names the column it could not resolve, here `title`. There are 3
+ways out, and which is right depends on what you meant:
+
+- Add the column to `GROUP BY`, when you wanted finer groups.
+- Wrap it in an aggregate such as `MIN(title)`, when any 1 value will do.
+- Move it out of the select list, when you did not need it.
+
+With `only_full_group_by` turned off the same query runs and returns an
+arbitrary title, chosen by whatever plan the server picked. The
+[MySQL GROUP BY performance](/guides/group-by-having) guide covers that setting and
+`ANY_VALUE()`, which is how you ask for an arbitrary row on purpose.
+
+## GROUP BY does not promise an order
+
+The groups come back in whatever order the server found convenient. Every
+example here says `ORDER BY` because that is the only way to fix the order, the
+same as with [LIMIT](/tutorial/limit).
+
+## Summary
+
+- Use `GROUP BY` to get 1 result row per distinct value instead of 1 in total.
+- Expect a group per distinct combination when you name several columns.
+- Expect `WHERE` to filter rows before the grouping happens.
+- Read `ERROR 1055` as a column that is neither grouped nor aggregated.
+- Add `ORDER BY` when the order of the groups matters.
+
+## See also
+
+- [Aggregate functions](/tutorial/aggregate-functions) — what to work out per group
+- [HAVING](/tutorial/having) — filtering the groups after they are built
+- [WITH ROLLUP](/tutorial/with-rollup) — adding a total row under the groups
+- [MySQL GROUP BY performance](/guides/group-by-having) — the temporary table this can build

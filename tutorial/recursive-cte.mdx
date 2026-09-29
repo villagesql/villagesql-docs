@@ -1,0 +1,135 @@
+---
+title: "MySQL recursive CTEs"
+sidebarTitle: "Recursive CTEs"
+description: "How a MySQL recursive CTE builds rows from its own output, the 2 parts every one needs, and the depth limit that stops a runaway query with ERROR 3636."
+keywords: "mysql recursive cte, mysql with recursive, mysql hierarchical query, mysql generate series, mysql error 3636, mysql anchor member"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+An ordinary CTE reads tables. A recursive one reads itself, so each round of
+rows produces the next. It is how SQL walks a hierarchy or generates a series,
+neither of which a plain `SELECT` can do.
+
+Open the client with `mysql -u root -p sakila` before you start.
+
+## How a recursive CTE works
+
+```sql
+WITH RECURSIVE CTE_NAME AS (
+  SELECT SEED_VALUE AS COLUMN_NAME
+  UNION ALL
+  SELECT NEXT_EXPRESSION FROM CTE_NAME WHERE STOP_CONDITION
+)
+SELECT COLUMN_NAME FROM CTE_NAME;
+```
+
+Replace `CTE_NAME` with a name for the result, `COLUMN_NAME` with the column it
+produces, `SEED_VALUE` with the starting value, `NEXT_EXPRESSION` with what
+makes the next row from the previous one, and `STOP_CONDITION` with the test
+that eventually fails.
+
+A recursive CTE has 2 kinds of part, joined by `UNION ALL`:
+
+- A **seed**, also called the anchor member, which mentions the CTE nowhere and
+  produces the starting rows.
+- A **recursive member**, which selects from the CTE itself.
+
+Most have exactly 1 of each, which is the shape below. MySQL accepts more than
+1 of either, and accepts `UNION` in place of `UNION ALL`, which deduplicates
+each round. Neither is common and both are worth recognizing when you meet
+them.
+
+The server runs the seed, then runs the recursive part against whatever the
+previous round produced, over and over, until a round produces no rows. The
+`WHERE` in the recursive part is what eventually makes that happen.
+
+The keyword is `WITH RECURSIVE`, and it goes on the `WITH`, not on the CTE.
+
+## Counting to 5
+
+```sql
+WITH RECURSIVE numbers AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM numbers WHERE n < 5
+)
+SELECT n FROM numbers;
+```
+
+```text
++------+
+| n    |
++------+
+|    1 |
+|    2 |
+|    3 |
+...
++------+
+5 rows in set (0.00 sec)
+```
+
+The seed makes row 1. The recursive part takes that row and makes 2, then takes
+2 and makes 3, and stops when it reaches 5 because `WHERE n < 5` produces no
+next row.
+
+A series like this is more useful than it looks. Joined against real data it
+gives you a row for every day in a range, including the days nothing happened,
+which no query over the data alone can produce.
+
+## Leaving out the stop condition
+
+Drop the `WHERE` and the recursive part always produces another row.
+
+```sql
+WITH RECURSIVE numbers AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM numbers
+)
+SELECT n FROM numbers;
+```
+
+```text
+ERROR 3636 (HY000): Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.
+```
+
+The server stops it rather than running forever. The limit is a setting:
+
+```sql
+SELECT @@cte_max_recursion_depth AS max_depth;
+```
+
+```text
++-----------+
+| max_depth |
++-----------+
+|      1000 |
++-----------+
+1 row in set (0.01 sec)
+```
+
+The count in the message is 1 higher than the setting, because the round that
+breaches the limit is counted before the server stops.
+
+Read `ERROR 3636` as a missing or wrong stop condition first. Raising the limit with
+`SET SESSION cte_max_recursion_depth = 5000;` is right only when you genuinely
+need more rounds than the default allows. It is wrong when the query would
+never have stopped, because it then takes longer to fail and fails anyway.
+The setting is a variable, so the 1,000 above is this server's value rather
+than a fixed property of MySQL.
+
+## Summary
+
+- Write `WITH RECURSIVE` when a CTE reads itself.
+- Give it a seed part and a recursive member, joined by `UNION ALL`.
+- Put the stop condition in the recursive part's `WHERE`.
+- Read `ERROR 3636` as a runaway recursion before reaching for the setting.
+
+## See also
+
+- [Common table expressions](/tutorial/cte) — the non-recursive kind
+- [UNION](/tutorial/union) — the operator joining the 2 parts
+- [When a MySQL CTE beats a derived table](/guides/ctes-in-mysql) — how the optimizer handles them
