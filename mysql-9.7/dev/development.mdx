@@ -379,10 +379,18 @@ void ba_concat_all(VarArgs args, StringResult out) {
 ## Extension Load and Unload Hooks
 
 An extension sometimes has work to do once per load rather than once per call —
-picking a CPU-specific implementation, or building a lookup table the VDFs then
-read. Register that work with `.on_init<&Fn>()` on the extension builder, and
-the matching teardown with `.on_deinit<&Fn>()`. Both take a function with the
-signature `void()`.
+picking a CPU-specific implementation, reading its own configuration once, or
+building a lookup table the VDFs then read. Register that work with
+`.on_init<&Fn>()` on the extension builder, and the matching teardown with
+`.on_deinit<&Fn>()`. Both take a function with the signature `void()`, and must
+be registered together — declaring one without the other fails to compile. An
+extension that reaches the server with a mismatched pair some other way is
+rejected at load instead:
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers
+an on_init hook without an on_deinit
+```
 
 <Warning>
 `.on_init<&Fn>()` and `.on_deinit<&Fn>()` are declared only in the opt-in dev ABI
@@ -390,15 +398,15 @@ headers (`-DVSQL_USE_DEV_ABI=ON`). A default stable-ABI build has neither method
 so registering a hook fails to compile.
 </Warning>
 
-`on_init` runs at every extension load: at `INSTALL EXTENSION` and again on each
-server startup, after the server has validated and accepted the extension. It
-never runs for an extension the server rejected. `on_deinit` runs at unload —
-`UNINSTALL EXTENSION` or server shutdown.
-
-Both hooks run inside the extension process with **no access to the server**:
-they cannot run SQL, read system variables, or reach server state. That is why
-they are the wrong place for setup that has to talk to the server — use a
-preview capability's populate step for that.
+`on_init` runs once per load — at `INSTALL EXTENSION`, and again on every server
+startup — after the server has validated the extension and populated its
+required capabilities, so a registered system variable already holds its
+configured value. At startup specifically, `on_init` is deferred until
+persisted system-variable values have been applied, so it never sees a
+compiled-in default in place of a value set with `SET PERSIST`. It never runs
+for an extension the server rejected. `on_deinit` runs at unload —
+`UNINSTALL EXTENSION` or server shutdown — before the server depopulates those
+same capabilities, so it sees the same live state `on_init` did.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -437,13 +445,6 @@ VEF_GENERATE_ENTRY_POINTS(
 
 After `INSTALL EXTENSION my_extension`, `SELECT fast_sqrt(16)` returns `4` —
 a result that is only reachable if `build_table` already ran.
-
-<Note>
-`on_deinit` is called from the `vef_unregister` entry point that
-`VEF_GENERATE_ENTRY_POINTS` generates. `VEF_GENERATE_REGISTRATION` does not
-define that entry point, so an extension using it must call its teardown from
-the `vef_unregister` it writes itself.
-</Note>
 
 ## VEF_GENERATE_REGISTRATION
 
