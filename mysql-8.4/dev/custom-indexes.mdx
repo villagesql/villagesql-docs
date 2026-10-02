@@ -1,0 +1,561 @@
+---
+audience: extension-author
+title: "Custom Indexes"
+description: "The index_type and index_profile preview capabilities let an extension supply its own index structure, and bind it to a custom type through a profile."
+---
+
+An extension can register its own index structure and have the server call into
+it. The server owns the SQL syntax, the metadata and the transaction. The
+extension owns the on-disk format of the index and the search through it.
+
+Two preview capabilities carry this. `vsql::preview::index_type` registers the
+index structure itself. `vsql::preview::index_profile` binds that structure to a
+custom type and names the functions the index computes with. Both live in
+`<villagesql/preview/index_builder.h>` in the dev ABI headers, so an extension
+that uses them builds with `-DVSQL_USE_DEV_ABI=ON`.
+
+<Warning>
+Reachable today: the DDL that creates, alters and drops a custom index; index
+maintenance on `INSERT`; and one query shape, a nearest-neighbour ordering
+served by the index.
+
+Not reachable: an `UPDATE` that changes an indexed column, and every access
+pattern other than nearest-neighbour search. `DELETE` is reachable only on an
+index whose `storage_props` omit `REF_LOOKUP` — see below. Four of the twelve
+required hooks — `mark_delete`, `purge`, `save` and `restore` — must exist for
+the builder to compile and the server never calls them.
+
+Statements naming a custom index are refused unless
+`vsql_allow_preview_extensions` is `ON`, the same setting that installing a
+preview extension already requires.
+</Warning>
+
+## The Three Pieces
+
+An index type is the structure: how entries are stored, inserted, deleted and
+scanned. It is registered once per extension per structure, under a name like
+`hnsw`.
+
+An index function is a deterministic function bound to a profile — a distance
+function, for instance. A profile binds two kinds. A function bound with
+`with_function()` is one the optimizer may plan an index scan for. A function
+bound with `with_helper()` is called only by the index implementation.
+
+Binding a function to a profile does not create a SQL function. The optimizer
+matches an `ORDER BY` call by name against the profile's bindings, so a function
+bound with `with_function()` must also be registered with `.func()` under the
+same name, or no statement can ever name it and the index is never chosen. A
+helper needs no `.func()`, and calling one from SQL gives `ERROR 1305 (42000):
+FUNCTION <database>.<name> does not exist`.
+
+An index profile ties a custom type to an index type and gives each bound
+function a numeric id the index calls it by. One index type serves many
+profiles: `vsql_vector` registers a single `hnsw` index type and four profiles
+over it — `hnsw_l1`, `hnsw_l2`, `hnsw_cosine` and `hnsw_inner_product` — one per
+distance metric.
+
+## Registering an Index Type
+
+`make_index_type<Name, Context>()` takes the index name and a per-index context
+struct that holds whatever run-time state the extension needs. All twelve hooks
+are required, in three groups, in this order. The builder does not compile if one
+is missing — the failing assertion names the hook.
+
+The lifecycle hooks create the index storage, load it when the table opens, and
+drop it:
+
+```cpp
+bool create(Ctx *, const Index &, Space::Ref, Segment::TrxRef, char *, uint32_t);
+bool load(Ctx *, const Index &, Index::StorageRef, char *, uint32_t);
+bool drop(Ctx *, const Index &, Segment::TrxRef, char *, uint32_t);
+```
+
+The DML hooks maintain the index as rows change. The server calls `insert`.
+`mark_delete` and `purge` must exist with these signatures so the builder
+compiles; stub them:
+
+```cpp
+bool insert(Ctx *, const Index &, Segment::TrxRef,
+            IndexScanKey::KeyPartData *keys, IndexScanKey::KeyPartData *pkeys,
+            IndexScanKey::KeyPartRef *key_ref, char *, uint32_t);
+bool mark_delete(Ctx *, const Index &, Segment::TrxRef,
+                 IndexScanKey::KeyPartRef *key_ref,
+                 IndexScanKey::KeyPartData *keys,
+                 IndexScanKey::KeyPartData *pkeys, bool delete_mark,
+                 char *, uint32_t);
+bool purge(Ctx *, const Index &, Segment::TrxRef,
+           IndexScanKey::KeyPartRef *key_ref, IndexScanKey::KeyPartData *keys,
+           IndexScanKey::KeyPartData *pkeys, char *, uint32_t);
+```
+
+The scan hooks answer queries. The server calls `begin`, `position`, `fetch` and
+`end`, and passes `position` only `Index::CursorOp::Next`. `save` and `restore`
+must exist and are stubs, like the two DML hooks above:
+
+```cpp
+bool begin(Ctx *, const Index &, MtrCtx::Ref, const IndexScanDesc &,
+           Index::Cursor *, bool *, char *, uint32_t);
+bool position(Index::Cursor, Index::CursorOp, bool *, char *, uint32_t);
+bool fetch(Index::Cursor, IndexScanKey::KeyPartRef *,
+           IndexScanKey::KeyPartData *keys, IndexScanKey::KeyPartData *pkeys,
+           char *, uint32_t);
+bool save(Index::Cursor, char *, uint32_t);
+bool restore(Index::Cursor, MtrCtx::Ref, bool *, char *, uint32_t);
+void end(Index::Cursor *);
+```
+
+Every hook that can fail takes a message buffer and its length as the last two
+arguments, and returns `true` on failure after writing the message there.
+
+The cursor belongs to the extension. Allocate it in `begin` and assign it to
+`*cursor`, already positioned on the first record — the server calls `fetch`
+before it calls `position`. Free the cursor in `end` and set `*cursor` to
+`nullptr`. The SDK does not wrap cursor state.
+
+The `bool *` argument of `begin`, `position` and `restore` is an end-of-scan
+flag the hook writes. On success the server calls `end` even when `begin` set
+that flag; on failure `begin` must leave `*cursor` null, and `end` is not
+called. The `MtrCtx::Ref` `begin` receives is null on the path the server drives
+today.
+
+The context does not belong to the extension. The SDK allocates
+`Index::StorageCtx<T>` and your `T` from the InnoDB arena before it calls
+`create` or `load`, and destroys the arena — which runs `~T` — after `drop`
+returns. Reach your own state through `ctx->user()` and the arena through
+`ctx->arena()`. Never delete the context, the user object or the arena.
+
+### Declaring What the Index Can Do
+
+`.capabilities()` declares which access patterns the index supports, and
+`.storage_props()` declares how each index entry refers back to the data it
+indexes. Both are required.
+
+The builder accepts five capability values, and the server acts on one:
+`Index::Support::KNN`, a k nearest neighbour scan for
+`ORDER BY <distance>(<column>, <reference>) LIMIT K`. `POINT_LOOKUP`,
+`RANGE_SCAN`, `REVERSE_SCAN` and `ORDER_BY` compile and register, and InnoDB
+reports no access flags for a custom index, so the optimizer builds none of
+those paths.
+
+The supported storage declaration is the pair
+`Index::Storage::HAS_COLUMN_REF | Index::Storage::REF_LOOKUP` on a single-column
+index over a column the extension stores itself. `HAS_COLUMN_REF` means each
+entry stores a stable column reference the server supplies rather than the full
+primary key, and it is what makes `get_key_data()` and `get_key_ref()` available.
+`REF_LOOKUP` means the index can re-locate an entry from that reference, and it
+carries an obligation: every entry purge has not yet removed must have a unique
+reference token, and an entry that is only marked deleted still counts.
+
+`Index::Storage::HAS_ROW_REF` is the third value. It fills the `pkeys` array
+`insert()` receives, nothing reads it back, and the statements that refuse to
+run on a custom index check for `REF_LOOKUP`, so an index that declares
+`HAS_ROW_REF` alone is left inconsistent by a `DELETE` instead of refusing it.
+Declare the pair above.
+
+### Reading and Writing Column References
+
+`get_key_data()` resolves a `KeyPartRef` — the kind the DML and scan hooks hand
+the index — into the key column's actual value, sized with
+`get_max_col_len(key_pos)`. `get_key_ref()` goes the other way: it derives the
+reference for a key column value already in the column store, such as one of
+the `keys` `insert()` receives. `get_key_data()` reads under its own
+mini-transaction and must not be called while the extension holds page latches.
+Both take `key_pos`, the zero-based key column the value belongs to, and
+return `true` on failure with the message in `index.get_error()`:
+
+```cpp
+std::vector<unsigned char> buf(index.get_max_col_len(key_pos));
+IndexScanKey::KeyPartData key_data{buf.data(), static_cast<uint32_t>(buf.size())};
+// The hooks receive key_ref as a pointer; get_key_data() takes it by value.
+if (index.get_key_data(key_pos, *key_ref, &key_data)) return true;  // index.get_error()
+// key_data holds the value.
+
+IndexScanKey::KeyPartRef derived_ref;
+if (index.get_key_ref(key_pos, keys[key_pos], &derived_ref)) return true;
+// derived_ref holds the reference.
+```
+
+The server leaves both as null function pointers unless the index declared
+`HAS_COLUMN_REF`, and the SDK calls them unguarded, so calling either without it
+crashes rather than returning an error.
+
+### Index Options
+
+`WITH (M = 8, ef_construction = 64)` in the DDL reaches the extension as index
+options. The server lowercases every key and value first, so `params[i].key`
+reads `m` even though the DDL wrote `M`. Declare a struct with defaults and a
+`parse` function, and register it with `.options<T, &T::parse>()`:
+
+```cpp
+struct HNSWOptions {
+  int M = 16;
+  int ef_construction = 200;
+  static bool parse(const Index::Parameter *params, uint32_t count,
+                    HNSWOptions *out, char *error_msg,
+                    uint32_t error_msg_len);
+};
+```
+
+Compare against the lowercased key:
+
+```cpp
+if (strcmp(params[i].key, "m") == 0) out->M = atoi(params[i].value);
+```
+
+`params` is null when the DDL carried no `WITH` clause, so `count` is the value
+to test first. A `parse` that returns failure aborts the DDL, and the message it
+wrote goes to the server error log — the client sees only
+`ERROR 1030 (HY000): Got error 168 - 'Unknown (generic) error from engine'`, so
+name the index and the offending key in the message.
+
+`index.options<HNSWOptions>()` returns a pointer to the parsed struct. It is
+reachable from every hook that receives the `Index` — the lifecycle hooks, the
+DML hooks and `begin`. The remaining scan hooks receive only a cursor, so an
+index type that needs its options mid-scan has to copy them into the cursor in
+`begin`.
+
+## Index Functions
+
+An index function must be deterministic and must return `REAL`. Build one and
+hold it in a `static const` — the profile stores a reference to it, so its
+address has to outlive registration:
+
+```cpp
+static const auto MY_INDEX_FN =
+    make_index_function<&my_index_fn>("my_index_fn")
+        .returns(vsql::REAL)
+        .param(MY_TYPE)
+        .param(MY_TYPE)
+        .deterministic()
+        .build();
+```
+
+A function may declare at most eight parameters, the value of
+`VEF_INDEX_PROFILE_FN_MAX_ARGS`. The server checks the return type and the arity
+at `INSTALL EXTENSION` rather than at first use.
+
+## Index Profiles
+
+A profile names the custom type, the index type, and the functions with their
+ids. `for_type()` takes the type *name string* — the same constant passed to
+`make_type` — not the type descriptor. `with_function()` and `with_helper()` take
+a built index function, not a name:
+
+```cpp
+static const auto MY_PROFILE =
+    make_index_profile("my_profile")
+        .for_type(kMyType)
+        .using_index(kMyIndex)
+        .with_function(1, MY_DISTANCE_FN)
+        .with_helper(1, MY_HELPER_FN)
+        .ordering(Index::Ordering::ASC)
+        .default_for_type(true)
+        .build();
+```
+
+Ids must be unique within each list, and the two lists are numbered
+independently — `with_function(1, ...)` and `with_helper(1, ...)` do not collide.
+A repeated id inside one list is rejected at `INSTALL EXTENSION`.
+
+`.default_for_type(true)` marks this profile as the one to use when a statement
+names no profile. It applies per type and index type pair, and defaults to false.
+`vsql_vector` marks `hnsw_l2`, which is why an index created without a profile
+records `hnsw_l2`.
+
+`.ordering()` records the scan directions the profile supports, as `NONE`, `ASC`,
+`DESC`, or `ASC | DESC`. The server stores the value and nothing reads it. Only
+an ascending ordering is ever planned, so a profile that declares `DESC` alone
+cannot serve a query.
+
+A hook calls a bound function through `index.profile()` or a bound helper
+through `index.helper()`. Both take the key column position, the id the profile
+gave the function, a pointer to the result, and the column values as
+`vef_storage_col_data_t` arguments.
+
+`index.helper_fn_name()` reports the registered name of a bound helper instead of
+calling it, which lets an inner loop resolve its own native implementation once
+rather than dispatching per call:
+
+```cpp
+std::array<char, 64> name{};
+if (index.helper_fn_name(key_pos, fn_id, name.data(), name.size())) {
+  // on failure, index.get_error()
+}
+```
+
+## Putting It Together
+
+A skeleton, with the hook bodies, the options struct and the context left out:
+
+```cpp
+#include <villagesql/preview/index_builder.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql::preview_index_builder;
+
+static constexpr const char kMyType[] = "my_type";
+static constexpr const char kMyIndex[] = "my_index";
+
+constexpr auto MY_TYPE = vsql::make_type<kMyType>()/* ... */.build();
+
+static constexpr auto MY_INDEX =
+    make_index_type<kMyIndex, MyContext>()
+        .lifecycle()
+            .create<&my_create>()
+            .load<&my_load>()
+            .drop<&my_drop>()
+        .dml()
+            .insert<&my_insert>()
+            .mark_delete<&my_mark_delete>()
+            .purge<&my_purge>()
+        .scan()
+            .begin<&my_begin_scan>()
+            .position<&my_position>()
+            .fetch<&my_fetch>()
+            .save<&my_save>()
+            .restore<&my_restore>()
+            .end<&my_end_scan>()
+        .global()
+            .capabilities(Index::Support::KNN)
+            .storage_props(Index::Storage::HAS_COLUMN_REF |
+                           Index::Storage::REF_LOOKUP)
+            .options<MyOptions, &MyOptions::parse>()
+            .build();
+
+static const auto MY_PROFILE =
+    make_index_profile("my_profile")
+        .for_type(kMyType)
+        .using_index(kMyIndex)
+        .with_function(1, MY_INDEX_FN)
+        .ordering(Index::Ordering::ASC)
+        .default_for_type(true)
+        .build();
+
+static auto INDEX_TYPE = IndexTypeCapability().index_type(MY_INDEX);
+static auto INDEX_PROFILE = IndexProfileCapability().index_profile(MY_PROFILE);
+
+VEF_GENERATE_ENTRY_POINTS(
+    vsql::make_extension()
+        .with(INDEX_TYPE)
+        .with(INDEX_PROFILE)
+        .type(MY_TYPE)
+        // The bound function needs a SQL function of the same name, or no
+        // statement can name it and the index is never chosen.
+        .func(vsql::make_func<&my_index_fn>("my_index_fn")
+                  .returns(vsql::REAL)
+                  .param(MY_TYPE)
+                  .param(MY_TYPE)
+                  .deterministic()
+                  .build()))
+```
+
+Both capability objects must be `static` — the SDK holds pointers into them —
+and each must be passed to `.with()` exactly once. One capability object can
+carry several structures: chain `.index_type()` or `.index_profile()` per
+structure.
+
+## The SQL Syntax
+
+A custom index is selected with `USING EXTENDED`, and the column may name the
+profile to use:
+
+```
+INDEX <name> (<column> [[<extension>.]<profile>] [ASC | DESC])
+  USING EXTENDED([<extension>.]<index_type>)
+  [WITH (<option> = <value>[, ...])]
+```
+
+The indexed column must be a custom type some installed extension registers,
+and when the DDL names a profile that profile must be declared for that column's
+type. A plain column is refused with
+`ERROR 3219 (HY000): No default index profile found: column '<name>' is not a
+custom type`. A partitioned table is refused with
+`ERROR 3219 (HY000): InnoDB: Custom index is not supported on partitioned tables`.
+
+The clause works inline in `CREATE TABLE`, and in `CREATE INDEX` and `ALTER
+TABLE ADD INDEX`. Both the profile and the index type may be qualified with the
+extension name, which is how you disambiguate two extensions offering the same
+name. When no profile is named, the server uses the profile that declared
+`default_for_type(true)` for that type and index type.
+
+Every statement in this section needs `vsql_allow_preview_extensions` set to
+`ON`, at startup or with `SET PERSIST`. Without it the statement is refused:
+
+```
+ERROR 3219 (HY000): Extended Index feature not yet implemented
+```
+
+Using `vsql_vector` as the example. The setting and the install come first, and
+the setting needs a restart when it is not already on:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+CREATE TABLE t2 (
+  id INT PRIMARY KEY,
+  a SVECTOR(4) NOT NULL,
+  b SVECTOR(8) NOT NULL,
+  INDEX idx_a (a) USING EXTENDED(hnsw),
+  INDEX idx_b (b hnsw_cosine) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_c ON t2 (a hnsw_l1) USING EXTENDED(hnsw);
+
+ALTER TABLE t2 ADD INDEX idx_d (b vsql_vector.hnsw_inner_product)
+  USING EXTENDED(vsql_vector.hnsw);
+```
+
+Dropping one is ordinary: `DROP INDEX`, `ALTER TABLE ... DROP INDEX`, or
+`DROP TABLE`, which removes the index metadata with the table. A custom index
+and the rows it holds survive a server restart.
+
+## Reading and Writing Through a Custom Index
+
+Rows go in with `INSERT`, and the index is maintained as they do. Creating the
+index on a table that already holds rows works too, and builds the index over
+them. The build runs with the table exclusively locked rather than as an
+online DDL — a custom index always takes the offline build path, regardless
+of any `ALGORITHM` clause, because nothing yet replays concurrent writes into
+one.
+
+One query shape is served by a custom index:
+`ORDER BY <distance>(<column>, <reference>) LIMIT K` as the only ordering term,
+ascending, with a constant `<reference>`. The index must be single-column, its
+type must declare `Index::Support::KNN`, and its bound profile must supply the
+distance function. The column and the reference can be given in either order. A
+query that misses any of these conditions runs as a table scan and a sort, with
+no warning. `EXPLAIN` names the access:
+
+```sql
+CREATE TABLE docs (
+  id INT PRIMARY KEY,
+  vec SVECTOR(4) NOT NULL,
+  payload VARCHAR(32),
+  INDEX idx_vec (vec hnsw_l2) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+
+INSERT INTO docs VALUES (1,'[1.0,2.0,3.0,4.0]','one'),
+                        (2,'[5.0,6.0,7.0,8.0]','two'),
+                        (3,'[9.0,1.0,2.0,3.0]','three');
+
+EXPLAIN FORMAT=TREE
+  SELECT id FROM docs ORDER BY L2_DISTANCE(vec,'[1.0,2.0,3.0,4.0]') LIMIT 2;
+```
+
+```
+-> Limit: 2 row(s)  (cost=0.55 rows=2)
+    -> Custom index distance scan on idx_vec  (cost=0.55 rows=3)
+```
+
+The server does not filter the index's own hits by the reading transaction's
+view. It resolves each hit to its row, skips the rows that view cannot see, and
+takes the next candidate — so `begin` should hand back its whole search pool
+rather than exactly `limit` entries, or a concurrent write leaves the query
+short of `K` rows.
+
+`DELETE` is refused on a table carrying a custom index whose `storage_props`
+declare `REF_LOOKUP` — the pair this page recommends above, and the one
+`vsql_vector`'s `hnsw` index type declares:
+
+```sql
+DELETE FROM docs WHERE id = 2;
+```
+```
+ERROR 3219 (HY000): DELETE on a table with a custom index (USING EXTENDED) is not supported yet.
+```
+
+On an index whose `storage_props` omit `REF_LOOKUP`, the same `DELETE`
+succeeds, and the deleted row's entry stays in the index: `mark_delete()` and
+`purge()`, the two hooks that would remove it, are never called.
+
+An `UPDATE` that changes an indexed column is refused regardless of
+`storage_props`:
+
+```sql
+UPDATE docs SET vec = '[0.0,0.0,0.0,0.0]' WHERE id = 1;
+```
+```
+ERROR 3219 (HY000): UPDATE that changes an indexed column on a table with a custom index (USING EXTENDED) is not supported yet.
+```
+
+An `UPDATE` that changes the primary key draws the same error, as does a
+`REPLACE` or an `INSERT ... ON DUPLICATE KEY UPDATE` that hits an existing row.
+An `UPDATE` that touches only unindexed columns succeeds.
+
+An `ALTER TABLE` that changes the primary key of a table with a custom index is
+refused regardless of `ALGORITHM`:
+
+```sql
+ALTER TABLE docs MODIFY id BIGINT NOT NULL;
+```
+```
+ERROR 3219 (HY000): VillageSQL: Changing the primary key of a table with a USING EXTENDED index is not supported
+```
+
+Adding a column, or modifying a column other than the primary key, leaves the
+table's existing custom index in place. Forcing a table rebuild with
+`ALGORITHM=COPY` or `ALGORITHM=INPLACE` also leaves the index in place, and a
+rebuilt index survives a restart.
+
+## What the Server Reports
+
+`SHOW CREATE TABLE` renders a custom index's bound profile, index type and any
+`WITH` parameters:
+
+```
+  KEY `idx_b` (`b` `vsql_vector`.`hnsw_cosine`) USING EXTENDED(`vsql_vector`.`hnsw`) WITH (`ef_construction` = 64, `m` = 8)
+```
+
+The profile and the index type are always backtick-quoted `extension.name`
+identifiers, never a string. Both the key and the value of a `WITH` parameter are
+lowercased and sorted alphabetically by key — the same normalization described
+under Index Options above — so a key written `M` renders as `m`. The profile is
+always shown, even when the DDL never named one and the server resolved it to the
+type's default: the persisted metadata records only the resolved name. The
+rendering round-trips, so replaying a captured `SHOW CREATE TABLE` string
+reproduces an index that renders identically.
+
+`INFORMATION_SCHEMA.STATISTICS.INDEX_TYPE` and `SHOW INDEX` report the index-type
+name passed to `USING EXTENDED(...)`, uppercased, in place of the storage
+engine's own algorithm name. The value carries no extension qualifier, so two
+extensions offering the same index-type name are indistinguishable in this
+column. A plain B-tree index on the same table still reports `BTREE`:
+
+```sql
+SELECT INDEX_NAME, INDEX_TYPE
+FROM INFORMATION_SCHEMA.STATISTICS
+WHERE TABLE_SCHEMA='d' AND TABLE_NAME='t2'
+ORDER BY INDEX_NAME;
+```
+
+```
+INDEX_NAME	INDEX_TYPE
+idx_a	HNSW
+idx_b	HNSW
+idx_c	HNSW
+idx_d	HNSW
+PRIMARY	BTREE
+```
+
+After `DROP INDEX idx_a ON t2`, its row is gone from this query too.
+
+## Where the Metadata Lives
+
+The server records each custom index in `villagesql.custom_indexes`, and its
+key columns — with the profile bound to each — in
+`villagesql.custom_index_columns`. Both survive a restart.
+
+Neither is readable from SQL, including as `root`:
+
+```sql
+SELECT * FROM villagesql.custom_indexes;
+```
+
+```
+ERROR 3554 (HY000): Access to table 'villagesql.custom_indexes' is rejected.
+```
+
+Treat them as server-internal. `SHOW CREATE TABLE` and
+`INFORMATION_SCHEMA.STATISTICS` are the supported way to inspect a custom index
+from a client.
