@@ -379,13 +379,12 @@ void ba_concat_all(VarArgs args, StringResult out) {
 ## Deciding a Function's Type Parameters at Resolution Time
 
 The server's built-in rules usually work out a return type's parameters from
-its arguments' declared types. Sometimes they can't — for example, deriving a
-parameterized custom type's parameters from a constant string-literal
-argument (`TYPEID('user') -> typeid(prefix=user)`), or combining two
-arguments' parameters into the return type's parameters
-(`vector_concat(vector(M), vector(N)) -> vector(M+N)`). For these, register a
-**bind-and-check-types hook** with `.bind_and_check_types<&Hook>()` on the
-func builder, with the signature:
+its arguments' declared types. Sometimes they can't. For example,
+`tvector_concat(TVECTOR(M), TVECTOR(N))` returns a `TVECTOR(M+N)`. The
+built-in rules reject two `TVECTOR` arguments whose dimensions differ, and
+they can copy an argument's parameters to the return type but never add them.
+For cases like this, register a **bind-and-check-types hook** with
+`.bind_and_check_types<&Hook>()` on the func builder, with the signature:
 
 ```cpp
 void my_hook(vsql::BindArgs args, vsql::BindResult out);
@@ -420,96 +419,136 @@ already resolved, such as a bare string literal, gets its parameters from
 the hook alone. A parameterized return type's parameters also come from the
 hook, in place of the built-in rule that copies them from an argument.
 
+The [`vsql_tvector`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/examples/vsql-tvector/src/tvector.cc)
+example extension in the server source tree registers such a hook on
+`tvector_concat`:
+
 ```cpp
 #include <villagesql/vsql.h>
-#include <cstring>
-using namespace vsql;
 
-// TYPEID(prefix=...) persists its prefix string verbatim.
-struct TypeIdParams {
-  std::string prefix;
-  static TypeIdParams parse(const std::map<std::string, std::string> &p) {
-    return {.prefix = p.at("prefix")};
+// Excerpt from villagesql/examples/vsql-tvector/src/tvector.cc. That file
+// also has the standard library includes, the constants kDefaultBytesPerElem
+// (4) and kTVectorMaxDimension (4096), the TVECTOR type, the tvector_concat
+// function body, and the helpers common_element_width() and
+// bind_params_for_vector(), which read an argument's resolved params or count
+// the elements of a constant literal.
+
+struct TVectorParams {
+  int64_t dimension;
+  size_t bytes_per_elem;  // 4 for float, 8 for double
+
+  static TVectorParams parse(const std::map<std::string, std::string> &params) {
+    auto dim_it = params.find("dimension");
+    int64_t dim = strtoll(dim_it->second.c_str(), nullptr, 10);
+    size_t bytes = kDefaultBytesPerElem;
+    auto type_it = params.find("type");
+    if (type_it != params.end() && type_it->second == "double") bytes = 8;
+    return TVectorParams{.dimension = dim, .bytes_per_elem = bytes};
   }
-  static void to_strings(const TypeIdParams &p,
+
+  // Inverse of parse: render a typed TVectorParams back into the canonical
+  // key/value string form. Used by the SDK when the server needs to publish
+  // inferred params (e.g., from a constant-string from_string) back in the
+  // same shape that parse() consumes.
+  static void to_strings(const TVectorParams &p,
                          std::map<std::string, std::string> &out) {
-    out["prefix"] = p.prefix;
+    out["dimension"] = std::to_string(p.dimension);
+    out["type"] = (p.bytes_per_elem == 8) ? "double" : "float";
   }
 };
 
-void typeid_from_string(MaybeParams<TypeIdParams> &params,
-                        std::string_view from, CustomResult out) {
-  const TypeIdParams &p = params.value();
-  auto buf = out.buffer();
-  if (buf.size() < p.prefix.size()) { out.error("TYPEID: buffer too small"); return; }
-  std::memcpy(buf.data(), p.prefix.data(), p.prefix.size());
-  out.set_length(p.prefix.size());
-}
-
-void typeid_to_string(CustomArgWith<TypeIdParams> in, StringResult out) {
-  auto bytes = in.value();
-  auto buf = out.buffer();
-  size_t n = std::min(buf.size(), bytes.size());
-  std::memcpy(buf.data(), bytes.data(), n);
-  out.set_length(n);
-}
-
-int typeid_compare(CustomArgWith<TypeIdParams> a, CustomArgWith<TypeIdParams> b) {
-  auto av = a.value(), bv = b.value();
-  size_t n = std::min(av.size(), bv.size());
-  int c = std::memcmp(av.data(), bv.data(), n);
-  if (c != 0) return c < 0 ? -1 : 1;
-  return av.size() == bv.size() ? 0 : (av.size() < bv.size() ? -1 : 1);
-}
-
-bool typeid_resolve_params(const std::map<std::string, std::string> &params,
-                          ResolvedTypeParams *result, char *error_msg) {
-  result->persisted_length = static_cast<int64_t>(params.at("prefix").size());
-  result->max_decode_buffer_length = 256;
-  return false;  // success
-}
-
-constexpr int64_t kTypeIdMaxPersistedLength = 256;
-static constexpr const char kTypeIdName[] = "TYPEID";
-
-constexpr auto TYPEID =
-    make_type<kTypeIdName>()
-        .variable_length_type()
-        .max_decode_buffer_length(256)
-        .max_persisted_length(kTypeIdMaxPersistedLength)
-        .params<TypeIdParams, &TypeIdParams::parse, &TypeIdParams::to_strings>()
-        .resolve_params<&typeid_resolve_params>()
-        .from_string<&typeid_from_string>()
-        .to_string<&typeid_to_string>()
-        .compare<&typeid_compare>()
-        .build();
-
-// TYPEID('user') should return typeid(prefix=user). The built-in rules can't
-// work this out on their own -- the return parameters come from the *value*
-// of a constant argument, not its declared type -- so the function supplies
-// them itself.
-void typeid_ctor_bind(BindArgs args, BindResult out) {
-  BindArgType name_arg = args.at(0);
-  if (!name_arg.has_const_value()) {
-    out.error("TYPEID(name) requires a constant string argument");
+// bind_and_check_types for tvector_concat.
+//
+// Two jobs the built-in rules cannot do:
+//   1. permit arguments whose dimensions differ (parameter sharing rejects it);
+//   2. compute the return dimension as M+N (the server return rule only
+//      copies).
+//
+// A third job appears when an argument is a constant: a bare '[1,2,3]' has no
+// type context, and with a hook installed nothing donates params to it, so the
+// hook counts the elements itself and answers with set_arg(). The element type
+// comes from whichever side the server already resolved, which is what the
+// built-in rules would have donated.
+void tvector_concat_bind(vsql::BindArgs args, vsql::BindResult out) {
+  if (args.size() != 2) {
+    out.error("expects 2 arguments");
     return;
   }
-  TypeIdParams p{.prefix = std::string(name_arg.const_value())};
-  out.set_return<TypeIdParams>(p);
+
+  std::string error_msg;
+  size_t bpe = 0;
+  if (common_element_width(args, bpe, error_msg)) {
+    out.error(error_msg);
+    return;
+  }
+
+  TVectorParams first{}, second{};
+  bool publish_first = false, publish_second = false;
+
+  if (bind_params_for_vector(args, 0, bpe, first, publish_first, error_msg) ||
+      bind_params_for_vector(args, 1, bpe, second, publish_second, error_msg)) {
+    out.error(error_msg);
+    return;
+  }
+
+  // Hand back the params of whichever argument the server could not resolve.
+  if (publish_first) out.set_arg(0, first);
+  if (publish_second) out.set_arg(1, second);
+
+  const int64_t total = first.dimension + second.dimension;
+  if (total > kTVectorMaxDimension) {
+    out.error("combined dimension " + std::to_string(total) +
+              " exceeds the maximum of " +
+              std::to_string(kTVectorMaxDimension));
+    return;
+  }
+  out.set_return(TVectorParams{.dimension = total, .bytes_per_elem = bpe});
 }
 
-void typeid_ctor(StringArg name, CustomResultWith<TypeIdParams> out) {
-  const TypeIdParams &p = out.params();
-  auto buf = out.buffer();
-  std::memcpy(buf.data(), p.prefix.data(), p.prefix.size());
-  out.set_length(p.prefix.size());
-}
+// Registration, inside make_extension():
+// .func(make_func<&tvector_concat>("tvector_concat")
+//     .returns(TVECTOR)
+//     .param(TVECTOR)
+//     .param(TVECTOR)
+//     .bind_and_check_types<&tvector_concat_bind>()
+//     .deterministic()
+//     .build())
+```
 
-// Registration:
-// make_func<&typeid_ctor>("TYPEID")
-//     .returns(TYPEID).param(STRING)
-//     .bind_and_check_types<&typeid_ctor_bind>()
-//     .build()
+The hook lets two vectors of different dimensions combine, and it counts the
+elements of a constant literal. A source build of the server includes
+`vsql_tvector`; the release tarballs do not.
+
+```sql
+INSTALL EXTENSION vsql_tvector;
+CREATE TABLE v2 (v vsql_tvector.TVECTOR(2));
+CREATE TABLE v3 (v vsql_tvector.TVECTOR(3));
+INSERT INTO v2 VALUES ('[1,2]');
+INSERT INTO v3 VALUES ('[3,4,5]');
+
+SELECT vsql_tvector.tvector_concat(v2.v, v3.v) AS c,
+       vsql_tvector.tvector_dim(vsql_tvector.tvector_concat(v2.v, v3.v)) AS dim
+FROM v2, v3;
+```
+
+```text
++-------------+------+
+| c           | dim  |
++-------------+------+
+| [1,2,3,4,5] |    5 |
++-------------+------+
+```
+
+```sql
+SELECT vsql_tvector.tvector_concat(v, '[6,7]') AS c FROM v3;
+```
+
+```text
++-------------+
+| c           |
++-------------+
+| [3,4,5,6,7] |
++-------------+
 ```
 
 ## Extension Load and Unload Hooks
