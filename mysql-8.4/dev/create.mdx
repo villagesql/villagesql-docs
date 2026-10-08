@@ -58,7 +58,7 @@ When you call a function without qualification, VillageSQL resolves it in this o
 **When to Use Qualified Names:**
 - Use `extension.function_name` when multiple extensions provide functions with the same name
 - Use unqualified names for cleaner code when there's no ambiguity
-- Qualification is never required if only one extension provides that function name
+- Qualification is not required if only one extension provides that function name and no system function or UDF has the same name
 
 Extensions can add:
 - **Custom functions (VDFs)** - SQL functions with automatic type checking and validation
@@ -73,11 +73,11 @@ You also need:
 
 - **Git** - For cloning and version control
 - **CMake** 3.18 or higher - Build system
-- **C++ Compiler** - With C++17 support: the template sets `CMAKE_CXX_STANDARD 17`, and the SDK's CMake package rejects a lower standard
+- **C++ Compiler** - With C++17 support: the template sets `CMAKE_CXX_STANDARD 17`, and its `FindVillageSQL.cmake` rejects a lower standard
 - **Basic C++ knowledge** - Understanding of C++ and function pointers
 
 <Tip>
-  **Building with an AI agent?** The [`vsql-extension-builder`](https://github.com/villagesql/villagesql-skills) skill automates this entire workflow — from scaffolding to testing — using Claude Code, Gemini, or other supported agents. Install it with:
+  **Building with an AI agent?** The [`vsql-extension-builder`](https://github.com/villagesql/villagesql-skills) skill automates this entire workflow — from scaffolding to testing — using Claude Code, Antigravity, or other supported agents. Install it with:
 
   ```bash
   curl -sSL https://villagesql.com/skills | bash
@@ -90,7 +90,7 @@ You can start with the extension template in two ways:
 
 ### Option A: Use Template from VillageSQL Source
 
-If you have VillageSQL source code, the template is included:
+If you have built VillageSQL from source, copy the template from the source tree and configure it in Step 7 with `-DCMAKE_PREFIX_PATH=/path/to/villagesql/build/villagesql-extension-sdk-<version>`:
 
 ```bash
 cd /path/to/villagesql-source
@@ -150,12 +150,13 @@ for all manifest fields.
 **Validation rules:**
 - `name`: Must start with a letter and end with a letter or digit. May contain lowercase letters, digits, underscores, and hyphens. Max 64 characters. **Use underscores** — hyphens require backtick quoting in SQL.
 - `version`: Must follow semantic versioning (e.g., 1.0.0, 0.2.1)
-- Invalid manifest will cause `INSTALL EXTENSION` to fail
+- `INSTALL EXTENSION` fails when `name` or `version` is missing, or when `name` breaks the start, end, character, or length rule
 
 **Example:**
 ```sql
 -- manifest.json has "name": "my_awesome_extension"
 INSTALL EXTENSION my_awesome_extension;  -- ✅ Correct: no quoting needed
+-- manifest.json has "name": "my-awesome-extension"
 INSTALL EXTENSION `my-awesome-extension`;  -- ⚠️ Works, but requires backtick quoting
 ```
 
@@ -211,7 +212,7 @@ VEF_GENERATE_ENTRY_POINTS(
 - `.build()` - Finalize function registration
 
 <Note>
-**Parameter Limit:** Functions support a maximum of 8 parameters (defined by `kMaxParams`). If you need more, consider using structured types or multiple functions.
+**Parameter Limit:** Functions declared with `.param()` support a maximum of 8 parameters (defined by `kMaxParams`). If you need more, consider a varargs VDF, structured types, or multiple functions.
 </Note>
 
 ### VDFs with Custom Type Arguments and Return Values
@@ -246,7 +247,7 @@ and `CustomResultWith<P>` for parameterized types.
 
 ### Deterministic Functions
 
-By default, VDFs are registered as non-deterministic. A non-deterministic function is blocked from three SQL contexts: generated columns, CHECK constraints, and expression default values (`DEFAULT (expr)` on a column) — using any of these features with a non-deterministic VDF returns an error. If your function always produces the same output for the same inputs and has no side effects, you can declare it deterministic by adding `.deterministic()` to the builder chain.
+By default, VDFs are registered as non-deterministic. A non-deterministic function is blocked from four SQL contexts: generated columns, functional indexes, CHECK constraints, and expression default values (`DEFAULT (expr)` on a column) — using any of these features with a non-deterministic VDF returns an error. If your function always produces the same output for the same inputs and has no side effects, you can declare it deterministic by adding `.deterministic()` to the builder chain.
 
 The optimizer may use this information to evaluate the function once per statement and reuse the value across rows, rather than calling it per row. Incorrectly marking a non-deterministic function as deterministic can therefore cause the server to return the same result for inputs that should produce different outputs. Only add `.deterministic()` when your function truly has no dependency on external state, randomness, or time.
 
@@ -282,7 +283,7 @@ For functions returning variable-length data, request a specific buffer size:
 ```cpp
 make_func<&large_result_impl>("large_result")
   .returns(STRING)
-  .param(INT)
+  .param(STRING)
   .buffer_size(65536)  // Request 64KB buffer
   .build()
 ```
@@ -311,12 +312,13 @@ void large_result_impl(StringArg input, StringResult out) {
 }
 ```
 
-For STRING results, `out.set(sv)` follows an snprintf-style overflow contract: it
+With the dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`), `out.set(sv)` follows an snprintf-style overflow contract: it
 copies as many bytes as fit in `out.buffer()`, but reports the value's *full*
 size. The server detects that the reported length exceeds the buffer, grows the
 buffer, and calls the function a second time — so a value larger than
 `.buffer_size()` is returned whole rather than truncated. One retry always
 suffices, because the reported length says exactly how large the buffer must be.
+With the stable ABI headers, `out.set(sv)` truncates the value to `out.buffer().size()`; use `out.buffer()` and `out.set_length()` as above.
 
 Growth is bounded by `max_allowed_packet`. A value larger than that is returned
 as `NULL`, not truncated.
@@ -326,15 +328,17 @@ in the same contract: report the full size you would have written, not the numbe
 of bytes that fit. Reporting the truncated length defeats the retry and silently
 drops the remainder.
 
-That contract applies at row time. A *materialized* STRING result — in a
-GROUP BY/DISTINCT temp table, `CREATE TABLE ... SELECT`, or UNION — still
-truncates at the argument width unless the function declares
-`.max_result_length(n)`, which sizes the result column (in characters, capped at
-`VEF_MAX_RESULT_LENGTH`, 16 MiB):
+That contract applies at row time. A *materialized* STRING result in a
+GROUP BY/DISTINCT temp table or UNION still truncates at the argument width,
+and `CREATE TABLE ... SELECT` fails in strict SQL mode with
+`ERROR 1406 (22001): Data too long for column '<col>' at row 1`, unless the
+function declares `.max_result_length(n)`, which sizes the result column (in
+characters, capped at `VEF_MAX_RESULT_LENGTH`, 16 MiB):
 
 ```cpp
 make_func<&large_result_impl>("large_result")
   .returns(STRING)
+  .param(STRING)
   .max_result_length(65536)
   .build()
 ```
@@ -364,37 +368,38 @@ Edit `CMakeLists.txt` to build your extension as a VEB file:
 ```cmake
 cmake_minimum_required(VERSION 3.18)
 project(my_extension)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find VillageSQL Extension Framework
-find_package(VillageSQLExtensionFramework QUIET)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+find_package(VillageSQL REQUIRED)
+include_directories(${VillageSQLExtensionFramework_INCLUDE_DIR})
 
-# The framework detects build flags via 4 methods (in order):
-# 1. Explicit MYSQL_INCLUDE_FLAGS/MYSQL_CXXFLAGS
-# 2. VillageSQL_BUILD_DIR (reads CMakeCache.txt from VillageSQL build)
-# 3. VSQL_BASE_DIR (uses mysql_config)
-# 4. Default - mysql_config from PATH
+# The template's cmake/FindVillageSQL.cmake finds the SDK in this order:
+# 1. VillageSQL_BUILD_DIR
+# 2. VillageSQL_SDK_DIR
+# 3. villagesql_config on PATH
+# 4. ~/.villagesql
 
 # Build shared library with your source files
 add_library(extension SHARED
     src/extension.cc
-    src/my_functions.cc
 )
 
 # Create VEB archive
 VEF_CREATE_VEB(
-    NAME my_extension
+    NAME my_awesome_extension
     LIBRARY_TARGET extension
     MANIFEST ${CMAKE_CURRENT_SOURCE_DIR}/manifest.json
 )
 
-# Install VEB to VillageSQL extensions directory
-install(FILES ${VEB_OUTPUT} DESTINATION ${INSTALL_DIR})
 ```
 
 **Configuration notes:**
 - `VillageSQLExtensionFramework` provides CMake helpers for building extensions
 - `VEF_CREATE_VEB()` packages your library, manifest, and metadata into a `.veb` archive
-- The framework automatically detects MySQL/VillageSQL build flags
+- `FindVillageSQL.cmake` finds the SDK and, with `VillageSQL_BUILD_DIR`, sets the VEB install directory
 - Library target name is typically `extension` (can be anything)
 - VEB name must match your manifest.json name
 - By default, extensions build against the stable ABI headers. Set `-DVSQL_USE_DEV_ABI=ON` to build against the unstable dev headers instead
@@ -416,7 +421,7 @@ Configure and build your extension:
 
 ```bash
 # Configure the build
-cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVillageSQL_SDK_DIR=/path/to/sdk
 
 # Or, if building against VillageSQL source:
 cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
@@ -444,7 +449,7 @@ You should see:
 ```
 manifest.json
 lib/
-lib/myext.so
+lib/my_awesome_extension.so
 ```
 
 ## Step 8: Install and Test
@@ -464,11 +469,11 @@ This copies the `.veb` file to the directory configured via `VillageSQL_VEB_INST
 Copy the VEB file manually:
 
 ```bash
-# Find the VEF directory
+# Find the VEB directory
 mysql -u root -p -e "SHOW VARIABLES LIKE 'veb_dir';"
 
 # Copy the VEB file
-sudo cp my-awesome-extension.veb /path/to/veb_dir/
+sudo cp my_awesome_extension.veb /path/to/veb_dir/
 ```
 
 ### Test Your Extension
@@ -503,7 +508,8 @@ Add test files to validate your extension works correctly:
 
 1. **Create a test file** in `mysql-test/t/`:
    ```sql
-   -- mysql-test/t/my_basic.test
+# mysql-test/t/my_basic.test
+INSTALL EXTENSION my_awesome_extension;
    SELECT my_reverse('abc');
    SELECT my_reverse('');
    SELECT my_reverse(NULL);
@@ -527,7 +533,7 @@ Add test files to validate your extension works correctly:
 Check the error log and verify the VEB contents:
 ```bash
 make show_veb
-tail -f /var/log/mysql/error.log
+tail -f /path/to/error.log
 ```
 
 ### Function Not Found
@@ -540,9 +546,6 @@ SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
 ### Build Errors
 
 ```bash
-# Verify mysql_config is available
-which mysql_config
-mysql_config --version
 
 # Check compiler version
 gcc --version  # or clang --version
@@ -587,7 +590,7 @@ Learn from existing VillageSQL extensions:
     icon="code"
     href="/mysql-8.4/dev/development"
   >
-    Argument and result types, aggregates, system variables, and testing
+    Argument and result types, aggregates, per-statement state, and varargs
   </Card>
   <Card
     title="Extension Architecture"
