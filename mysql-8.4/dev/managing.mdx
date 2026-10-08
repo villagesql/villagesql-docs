@@ -18,7 +18,7 @@ SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
 | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_REQUESTED_AT | PENDING_LAST_ERROR | PENDING_LAST_ERROR_AT |
 +----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
 | vsql_complex   | 0.0.1             | NULL            | NULL                 | NULL               | NULL                  |
-| vsql_uuid      | 0.0.3             | NULL            | NULL                 | NULL               | NULL                  |
+| vsql_uuid      | 0.0.8             | NULL            | NULL                 | NULL               | NULL                  |
 +----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
 ```
 
@@ -85,7 +85,7 @@ SHOW VARIABLES LIKE 'veb_dir';
 | Extension not found | Verify `.veb` file exists in veb_dir with correct name |
 | Permission denied | Check permissions: `chmod 644 extension.veb` |
 | Cannot uninstall: types in use | Attempt `UNINSTALL EXTENSION`; the error identifies blocking columns by name |
-| Version mismatch | Restart server to clear cache |
+| Version mismatch | The `.veb` file in `veb_dir` has a different version from the installed extension, and the server does not start: restore the `.veb` file of the installed version, then use `ALTER EXTENSION` |
 | Extension shows old behavior after update | `UNINSTALL` then `INSTALL`; clear `.veb_expansion_cache/` if needed |
 | Cannot compare types X and Y | Both sides must use the same custom type |
 | Unable to implicitly cast non-custom type | The literal or column being compared is not compatible with the custom type |
@@ -113,7 +113,7 @@ sudo chmod 644 /path/to/veb_dir/my_extension.veb
 
 ### Function Not Available After Install
 
-**Error:** `FUNCTION my_func does not exist`
+**Error:** `ERROR 1305 (42000): FUNCTION mydb.my_func does not exist`
 
 **Debug steps:**
 ```sql
@@ -128,7 +128,8 @@ runs old code.
 
 **Cause:** VillageSQL expands `.veb` files into `{datadir}/.veb_expansion_cache/` on first load. If you
 copy a new `.veb` without first running `UNINSTALL EXTENSION`, the server continues
-using the previously-expanded `.so` that is already loaded in memory.
+using the `.so` it already expanded, and at the next restart it refuses to start if
+that expansion is missing from the cache.
 
 **Solution:** Always follow the full UNINSTALL → replace → INSTALL cycle:
 
@@ -142,21 +143,12 @@ Then replace the `.veb` file in `veb_dir` and reinstall:
 INSTALL EXTENSION my_extension;
 ```
 
-If the extension still shows old behavior, clear the expansion cache before reinstalling:
-
-```bash
-rm -rf {datadir}/.veb_expansion_cache/my_extension/
-```
-
-```sql
-INSTALL EXTENSION my_extension;
-```
 
 ---
 
 ### Cannot Uninstall Extension
 
-**Error:** `Cannot uninstall extension: types in use`
+**Error:** ``ERROR 3219 (HY000): Cannot drop extension `my_extension` as 1 column(s) depend on it``
 
 **Solution:**
 
@@ -196,8 +188,8 @@ otool -L {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.s
 
 **Error:** `Failed to load VEF extension 'extension_name'`
 
-**Cause:** The `.veb` file failed to load at the entry-point stage — for
-example a missing or invalid `vef_register` symbol, or a corrupt `.veb` file.
+**Cause:** The extension library loaded but its entry point failed — for
+example a missing or invalid `vef_register` symbol.
 
 ### Extension Name Validation Errors
 
@@ -462,9 +454,10 @@ are the post-restart state.
 
 ### Recovering from a Pending Version Change at Startup
 
-A scheduled version change is applied during the next server startup. If a
-pending action can't be applied, the server can fail to start while persisting
-its pending-update decisions. Use `--villagesql-skip-extension-updates` when a
+A scheduled version change is applied during the next server startup. A change that
+cannot be applied is skipped, and the server records the reason in
+`PENDING_LAST_ERROR`. If the server cannot save its pending-update decisions, it
+fails to start. Use `--villagesql-skip-extension-updates` when a
 queued `ALTER EXTENSION ... AT RESTART` is blocking startup and you need the
 server up before you can clear it.
 
@@ -507,11 +500,11 @@ logs a single warning at startup naming how many were bypassed:
     ```
 
     ```text
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_LAST_ERROR |
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     | my_extension   | 1.0.0             | 2.0.0           | NULL               |
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     ```
 
     **Success signal:** each row's `PENDING_VERSION` is the target you need to
@@ -528,7 +521,7 @@ logs a single warning at startup naming how many were bypassed:
 
     **Success signal:** a `Cleared pending update for extension '<name>'
     (target matches current version '<current>')` note is returned, and
-    re-running the previous query shows `PENDING_VERSION` is `NULL`.
+    re-running the previous query returns no rows.
   </Step>
   <Step title="Restart without the flag">
     Restart the server normally, omitting `--villagesql-skip-extension-updates`.
@@ -552,7 +545,7 @@ logs a single warning at startup naming how many were bypassed:
    sudo rm /path/to/veb_dir/extension_name.veb
 
    # Copy new .veb file
-   sudo cp new_extension_name.veb /path/to/veb_dir/
+   sudo cp new_extension_name.veb /path/to/veb_dir/extension_name.veb
    ```
 
 3. **Install the new version:**
@@ -608,7 +601,7 @@ rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
 ```
 
 <Note>
-  Server restart automatically cleans up orphaned expansion directories.
+  Server restart removes the expansion directories of extensions that are not installed. It does not remove old `{sha256}` directories of an installed extension.
 </Note>
 
 ---
@@ -621,8 +614,7 @@ correctly in ROW format.
 
 `INSTALL EXTENSION` is not replicated — each server manages its own extensions.
 Install the extension on every replica before replication starts, using the same
-version as the source. The server enforces exact version matching; a version
-mismatch stops replication.
+version as the source. The server does not compare versions: a replica that runs a different version applies the changes with its own version of the extension.
 
 If a replica encounters a custom type it doesn't recognize, replication stops at
 the DDL statement — on `CREATE TABLE` or `ALTER TABLE`, before any dependent DML
@@ -646,7 +638,7 @@ from a donor with `vsql_complex` installed, against a recipient missing that
 extension's `.veb`, fails with:
 
 ```text
-ERROR HY000: VillageSQL: VEB file for extension 'vsql_complex' not found
+ERROR 3219 (HY000): VillageSQL: VEB file for extension 'vsql_complex' not found
 ```
 
 Place the same `.veb` build of every extension the donor has in the
@@ -671,7 +663,7 @@ services:
   villagesql:
     image: villagesql/server:latest
     environment:
-      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_ROOT_PASSWORD: "<your-password>"
     ports:
       - "3306:3306"
     volumes:
@@ -679,7 +671,7 @@ services:
     command: --veb_dir=/usr/lib/veb
 ```
 
-Copy a `.veb` file into `./extensions/` on the host, then install from SQL:
+Copy the `.veb` files that you need into `./extensions/` on the host (the mount hides the `.veb` files that ship in the image), then install from SQL:
 
 ```sql
 INSTALL EXTENSION my_extension;
@@ -697,7 +689,7 @@ SHOW VARIABLES LIKE 'veb_dir';
 
 If you encounter issues not covered here:
 
-1. **Check Error Log:** Most extension errors are logged with details
+1. **Check Error Log:** Library load failures and startup errors, such as a version mismatch or a pending update that was not applied, are logged with details
 2. **Review Extension Docs:** Extension-specific troubleshooting may exist
 3. **Ask on Discord:** Join the [VillageSQL Discord](https://discord.gg/KSr6whd3Fr)
 4. **File an Issue:** Report bugs on [GitHub Issues](https://github.com/villagesql/villagesql-server/issues)
