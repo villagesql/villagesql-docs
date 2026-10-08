@@ -28,10 +28,10 @@ VDFs support both qualified and unqualified function calls:
 
 ```sql
 -- Unqualified lookup
-SELECT complex_abs(value) FROM table;
+SELECT complex_abs(impedance) FROM signals;
 
 -- Qualified lookup
-SELECT vsql_complex.complex_abs(value) FROM table;
+SELECT vsql_complex.complex_abs(impedance) FROM signals;
 ```
 
 **Resolution order:**
@@ -42,7 +42,6 @@ SELECT vsql_complex.complex_abs(value) FROM table;
 
 If more than one extension registers a function with the same name, the unqualified call is ambiguous and the fully qualified name (`extension_name.function_name()`) must be used.
 
-**Performance:** For hot code paths, use qualified calls (`extension_name.function_name()`) to skip the resolution chain and directly invoke the extension function.
 
 ---
 
@@ -54,15 +53,15 @@ VillageSQL extensions are distributed as `.veb` (VillageSQL Extension Bundle) fi
 extension_name.veb (tar archive)
 ├── manifest.json       # Extension metadata (required)
 └── lib/
-    └── extension.so    # Compiled shared library (required)
+    └── extension_name.so    # Compiled shared library (required, named after the extension)
 ```
 
 ### manifest.json Schema
 
 ```json
 {
-  "name": "extension_name",          // Required: lowercase_with_underscores
-  "version": "1.0.0",                // Required: semantic version
+  "name": "extension_name",
+  "version": "1.0.0",
   "description": "Brief description",
   "author": "Your Name",
   "license": "GPL-2.0"
@@ -82,11 +81,11 @@ INSTALL EXTENSION name
     ↓
 1. Validate .veb exists in veb_dir
     ↓
-2. Calculate SHA256 hash of .veb
+2. Parse and validate manifest.json
     ↓
-3. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
+3. Calculate SHA256 hash of .veb
     ↓
-4. Parse and validate manifest.json
+4. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
     ↓
 5. Load .so library (dlopen with RTLD_LOCAL)
     ↓
@@ -99,7 +98,7 @@ INSTALL EXTENSION name
 Success
 ```
 
-**Rollback:** If any step fails, all changes are undone and the `.so` is unloaded.
+**Rollback:** If any step fails, the extension is not registered and the `.so` is unloaded. The expanded files stay in `.veb_expansion_cache` until the next server restart.
 
 **Symbol Isolation:** Extensions are loaded with `RTLD_LOCAL` flag, ensuring symbols from one extension don't conflict with symbols from other extensions. This prevents naming collisions when multiple extensions use common library names or function names.
 
@@ -114,13 +113,13 @@ UNINSTALL EXTENSION name
     ↓
 1. Check for column dependencies
     ↓
-2. Call vef_unregister() cleanup hook
+2. Drop registered VDFs
     ↓
-3. Drop registered VDFs
+3. Drop custom types
     ↓
-4. Drop custom types
+4. Remove extension registration and update cache
     ↓
-5. Remove extension registration and update cache
+5. Call vef_unregister() cleanup hook
     ↓
 6. Unload .so library (dlclose)
     ↓
@@ -143,10 +142,10 @@ datadir/
     └── extension_name/
         ├── abc123.../              # SHA256 of v1.0.0 .veb
         │   ├── manifest.json
-        │   └── lib/extension.so
+        │   └── lib/extension_name.so
         └── def456.../              # SHA256 of v2.0.0 .veb
             ├── manifest.json
-            └── lib/extension.so
+            └── lib/extension_name.so
 ```
 
 **Why SHA256 directories?**
@@ -154,7 +153,7 @@ datadir/
 - Enable rollback
 - Prevent "same version, different code"
 
-**Cleanup:** Orphaned SHA256 directories are removed on server restart.
+**Cleanup:** At server start, the `.veb_expansion_cache` directory of an extension that is not installed is removed. Older SHA256 directories of an installed extension stay.
 
 ---
 
@@ -217,7 +216,7 @@ Custom types map to MySQL storage types:
 Extension functions are called in a per-row execution model:
 
 - **Isolated per-row execution:** Each function call gets its own result buffer (thread-safe by design)
-- **Prerun/Postrun hooks:** Per-statement setup/cleanup, called once per SQL statement
+- **Prerun/Postrun hooks:** Per-statement setup/cleanup, called once for each place the function appears in a SQL statement
 - **No guaranteed isolation:** Multiple connections may call your functions concurrently
 - **Best practice:** Avoid global state; use function parameters and return values
 
@@ -275,9 +274,15 @@ mysqld --log-error-verbosity=3
 
 **GDB debugging:**
 ```bash
+# Linux
 gdb -p $(pidof mysqld)
-(gdb) break my_func_init
+(gdb) break vef_register
 (gdb) continue
+
+# macOS
+lldb -p $(pgrep -x mysqld)
+(lldb) breakpoint set -n vef_register
+(lldb) continue
 ```
 
 **Check dependencies:**
