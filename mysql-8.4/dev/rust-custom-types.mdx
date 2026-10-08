@@ -14,13 +14,13 @@ Use a custom type when:
 
 - You need a binary on-disk layout that a standard SQL type can't express (packed floats, fixed-width integers, binary identifiers)
 - Your type has its own ordering semantics that differ from lexicographic string ordering
-- You want the server to index and hash values correctly for `ORDER BY`, `COUNT(DISTINCT)`, and set operations
+- You want the server to index and hash values correctly for `ORDER BY`, `GROUP BY`, `DISTINCT`, and set operations
 
 If you only need SQL-callable functions and your data fits comfortably in `STRING`, `INT`, or `REAL` columns, you don't need a custom type.
 
 ## The custom_type! macro
 
-Every custom type needs 4 callbacks (encode, decode, compare, hash) and a default value. Here's the full macro signature:
+Every custom type needs 3 callbacks (encode, decode, compare), a default value, and optionally a hash callback. Here's the full macro signature:
 
 ```rust
 villagesql::custom_type!(
@@ -38,16 +38,16 @@ villagesql::custom_type!(
 | Field | Type | Description |
 |---|---|---|
 | `type_name` | string literal | The SQL type name. Case-insensitive in SQL. |
-| `persisted_length` | `usize` | Fixed byte length for on-disk storage. |
-| `max_decode_buffer_length` | `usize` | Maximum byte length of the decoded string representation. |
+| `persisted_length` | `i64` | Fixed byte length for on-disk storage. |
+| `max_decode_buffer_length` | `i64` | Maximum byte length of the decoded string representation. |
 | `encode` | fn | Converts a `&str` to binary bytes at INSERT time. |
 | `decode` | fn | Converts binary bytes back to a `String` for display. |
 | `compare` | fn | Returns `Ordering` for `ORDER BY`, `MIN`, `MAX`. |
-| `hash` | fn | Returns a `usize` hash for `COUNT(DISTINCT)` and set operations. Optional but recommended for indexed columns. |
-| `default` | string literal | A valid string the server can encode at type initialization. Must encode to exactly `persisted_length` bytes. Optional but recommended. |
+| `hash` | fn | Returns a `usize` hash for `GROUP BY`, `DISTINCT`, and set operations such as `UNION`. Optional but recommended. |
+| `default` | string literal | A valid string the server can encode at type initialization. Must encode to exactly `persisted_length` bytes. Required unless `intrinsic_default_fn` is given. |
 | `intrinsic_default_fn` | fn | Computes the default instead of stating it: `fn() -> Result<String, String>`. Use it when the default cannot be written as a literal. |
 
-`type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, and `compare` are required. `hash` is optional but recommended, because correct `COUNT(DISTINCT)` and set operations depend on it. Give the type a default one way or the other: `default` for a value you can write as a literal, `intrinsic_default_fn` for one the extension has to compute. Setting both makes `INSTALL EXTENSION` fail. Setting neither lets the extension install, and then fails the first statement that names the type.
+`type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, and `compare` are required. `hash` is optional but recommended, because correct `GROUP BY`, `DISTINCT`, and set operations depend on it. Give the type a default one way or the other: `default` for a value you can write as a literal, `intrinsic_default_fn` for one the extension has to compute. Setting both makes `INSTALL EXTENSION` fail. Setting neither lets the extension install, and then fails the first statement that names the type.
 
 ## Receiving and returning binary values
 
@@ -59,7 +59,7 @@ Functions that take or return a custom type work with raw bytes.
 fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
     match args.first() {
         Some(InValue::Custom(b)) => {
-            let numer = read_i64(b, 0);
+            let numer = i64::from_le_bytes(b[..8].try_into().unwrap());
             VdfReturn::int(numer)
         }
         Some(InValue::Null) | None => VdfReturn::null(),
@@ -85,12 +85,16 @@ fn rational_add_impl(args: &[InValue]) -> VdfReturn {
 To reference a custom type in a `func!` declaration, use `villagesql::custom!("type_name")`:
 
 ```rust
-villagesql::func!(
-    rational_add_impl,
-    "rational_add",
-    [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
-    deterministic: true
-)
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(
+            rational_add_impl,
+            "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
+            deterministic: true
+        ),
+    ]
+}
 ```
 
 ## Example: rational number type
@@ -152,7 +156,7 @@ pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     lhs.cmp(&rhs)
 }
 
-// hash: for COUNT(DISTINCT) and set operations
+// hash: for GROUP BY, DISTINCT, and set operations
 pub fn rational_hash(b: &[u8]) -> usize {
     // FNV-1a over the 16 bytes
     let mut h: usize = 0xcbf29ce484222325u64 as usize;
@@ -164,7 +168,7 @@ pub fn rational_hash(b: &[u8]) -> usize {
 }
 ```
 
-The `custom_type!` registration and the arithmetic VDFs (`rational_add`, `rational_sub`, etc.) are in the full source at `examples/vsql_rational/src/lib.rs`.
+The `custom_type!` registration, the `gcd` and `normalize` helpers that `rational_encode` calls, and the arithmetic VDFs (`rational_add`, `rational_sub`, etc.) are in the full source at `examples/vsql_rational/src/lib.rs`.
 
 With the extension installed:
 
@@ -227,7 +231,7 @@ villagesql::parameterized_type!(
 |---|---|---|
 | `type_name` | string literal | The SQL type name. Case-insensitive in SQL. |
 | `max_persisted_length` | `i64` | Upper bound on the on-disk byte length, across every valid parameterization. |
-| `max_decode_buffer_length` | `usize` | Maximum byte length of the decoded string representation. |
+| `max_decode_buffer_length` | `i64` | Maximum byte length of the decoded string representation. |
 | `encode` | fn | Converts a `&str` plus `&mut MaybeParams<P>` to binary bytes at INSERT time. |
 | `decode` | fn | Converts binary bytes plus `&P` back to a `String` for display. |
 | `compare` | fn | Returns `Ordering` for `ORDER BY`, `MIN`, `MAX`, given `&P`. |
@@ -236,15 +240,17 @@ villagesql::parameterized_type!(
 | `params_type` | type | Your parsed-parameter struct, e.g. `PadintParams`. |
 | `params_parse` | fn | Parses `Params` into `params_type`. Runs at most once per unique parameter combination — the SDK caches the result. |
 | `params_to_strings` | fn | The inverse of `params_parse`: writes `params_type` back into canonical `(key, value)` pairs. |
-| `hash` | fn | Returns a `usize` hash given `&P`. Optional but recommended for indexed columns. |
-| `default` | string literal | A valid string the server can encode at type initialization. Optional but recommended. |
+| `hash` | fn | Returns a `usize` hash given `&P`, used for `GROUP BY`, `DISTINCT`, and set operations. Optional but recommended. |
+| `default` | string literal | A valid string the server can encode at type initialization. Required unless `intrinsic_default_fn` is given. |
 | `intrinsic_default_fn` | fn | Computes the default instead of stating it: `fn(&P) -> Result<String, String>`. Use it when the default depends on the parameters. |
 
-`type_name`, `max_persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`, `int_to_params`, `resolve_params`, `params_type`, `params_parse`, and `params_to_strings` are required. `hash` and `default` are optional; `intrinsic_default_fn` (a function computing the default from `&P`, for when the default depends on parameters) is also optional and mutually exclusive with `default`.
+`type_name`, `max_persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`, `int_to_params`, `resolve_params`, `params_type`, `params_parse`, and `params_to_strings` are required. `hash` is optional. Give the type a default one way or the other: `default` for a value you can write as a literal, `intrinsic_default_fn` (a function computing the default from `&P`, for when the default depends on parameters) for one the extension has to compute. Setting both makes `INSTALL EXTENSION` fail. Setting neither lets the extension install, and then fails the first statement that names the type.
 
 Here's `padint` — an `i64` stored in a fixed 8 bytes, with a `width` parameter controlling zero-padded display width:
 
 ```rust
+use villagesql::{MaybeParams, Params, Resolved};
+
 pub struct PadintParams {
     pub width: u32,
 }
@@ -295,25 +301,30 @@ pub fn padint_compare(a: &[u8], b: &[u8], _p: &PadintParams) -> std::cmp::Orderi
     i64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(b[..8].try_into().unwrap()))
 }
 
-villagesql::parameterized_type!(
-    type_name: "padint",
-    max_persisted_length: 8,
-    max_decode_buffer_length: 32,
-    encode: padint_encode,
-    decode: padint_decode,
-    compare: padint_compare,
-    int_to_params: padint_int_to_params,
-    resolve_params: padint_resolve_params,
-    params_type: PadintParams,
-    params_parse: padint_parse,
-    params_to_strings: padint_to_strings,
-    default: "0",
-)
+villagesql::extension! {
+    funcs: [],
+    types: [
+        villagesql::parameterized_type!(
+            type_name: "padint",
+            max_persisted_length: 8,
+            max_decode_buffer_length: 32,
+            encode: padint_encode,
+            decode: padint_decode,
+            compare: padint_compare,
+            int_to_params: padint_int_to_params,
+            resolve_params: padint_resolve_params,
+            params_type: PadintParams,
+            params_parse: padint_parse,
+            params_to_strings: padint_to_strings,
+            default: "0",
+        ),
+    ]
+}
 ```
 
 A function receiving a parameterized custom-type argument sees
 `InValue::CustomWithParams { bytes, params }` rather than plain
-`InValue::Custom(bytes)` — `params` is a [`TypeParams`], a read-only,
+`InValue::Custom(bytes)` — `params` is a `TypeParams`, a read-only,
 zero-copy view over the column's declared `key=value` pairs.
 
 ## The extension! block with types
@@ -341,7 +352,7 @@ A function-only extension omits `types:`. A type-only extension keeps `funcs: []
     icon="book"
     href="/mysql-8.4/dev/rust-api-reference"
   >
-    Complete reference for InValue, VdfReturn, and all macros.
+    Reference for InValue, VdfReturn, and the extension!, func!, agg_func!, varargs_func!, custom_type!, and custom! macros.
   </Card>
   <Card
     title="Creating Extensions in Rust"
