@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "Preview Capabilities"
-description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the auth, keyring, mysql_services, status_var, sys_var, thread_worker, sql_query, and statement_event capabilities, and registration patterns."
+description: "Preview capabilities give extensions access to server features that are still stabilizing. This page covers enabling the preview tier, the auth, keyring, mysql_services, status_var, sys_var, session_var, thread_worker, sql_query, column_store, storage, and statement_event capabilities, and registration patterns."
 ---
 
 Preview capabilities are server-provided features exposed to extensions before
@@ -56,7 +56,7 @@ Uninstall those extensions first, then turn the setting off.
 | `vsql::preview::index_type` | `<villagesql/preview/index_builder.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`); see [Custom Indexes](/mysql-8.4/dev/custom-indexes) |
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
 | `vsql::preview::mysql_services` | `<villagesql/preview/mysql_services.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
-| `vsql::session_var` | `<villagesql/preview/session_var.h>` | Preview |
+| `vsql::session_var` | `<villagesql/preview/session_var.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
 | `vsql::preview::sql_query` | `<villagesql/preview/sql_query.h>` | Preview |
 | `vsql::preview::statement_event` | `<villagesql/preview/statement_event.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
 | `vsql::status_var` | `<villagesql/preview/status_var.h>` | Preview |
@@ -101,8 +101,6 @@ rule is violated:
   `capability '<Type>' was declared but never passed to .with(); every CapabilityBase-derived static must be registered via .with(cap) in the extension builder`
 - **Same instance passed to `.with()` more than once:**
   `capability '<Type>' passed to .with() more than once`
-- **Object passed to `.with()` is not a capability:**
-  `.with() received an object that does not inherit vsql::detail::CapabilityBase; not a registered capability`
 
 The full error surfaces as: `Failed to load VEF extension '<name>': vef_register returned an error: <message above>`.
 </Warning>
@@ -116,8 +114,10 @@ in SQL tables.
 
 The capability name `VEF_PREVIEW_KEYRING_NAME` is `"vsql::preview::keyring"`.
 
-A keyring component must be installed on the MySQL server for reads and
-writes to succeed. Without one, operations return
+A keyring component (for example `component_keyring_file`) must be loaded
+at server startup through a component manifest and its configuration file, as described in
+[Keyring Component Installation](https://dev.mysql.com/doc/refman/8.4/en/keyring-component-installation.html);
+`INSTALL COMPONENT` does not make it available. Without one, operations return
 `KeyringCapability::Status::UNAVAILABLE`.
 
 ### Status Values
@@ -189,7 +189,7 @@ if (status == KeyringCapability::Status::OK) {
 On any status other than `Status::OK`, `value` is empty.
 
 `write` returns `Status` directly and stores `data` under `data_id` /
-`auth_id`.
+`auth_id`. With `component_keyring_file`, writing an existing key returns `Status::ERROR`.
 
 ### Complete Example
 
@@ -218,9 +218,9 @@ void keyring_read(StringArg data_id, StringArg auth_id, StringResult out) {
   if (status != KeyringCapability::Status::OK) { out.set_null(); return; }
 
   auto buf = out.buffer();
-  size_t len = std::min(value.size(), buf.size());
-  memcpy(buf.data(), value.data(), len);
-  out.set_length(len);
+  if (value.size() <= buf.size())
+    memcpy(buf.data(), value.data(), value.size());
+  out.set_length(value.size());
 }
 
 void keyring_store(StringArg data_id, StringArg auth_id, StringArg value,
@@ -460,8 +460,8 @@ VEF_GENERATE_ENTRY_POINTS(make_extension().with(services).func(
 Install it and call the function:
 
 ```sql
-INSTALL EXTENSION vsql_mysql_services_session_test;
-SELECT vsql_mysql_services_session_test.session_sql_command() AS sql_command;
+INSTALL EXTENSION my_ext;
+SELECT my_ext.session_sql_command() AS sql_command;
 ```
 
 ```text
@@ -528,22 +528,22 @@ via `SHOW STATUS`.
 ## System Variables
 
 The sys_var capability (`vsql::sys_var`) lets an extension register
-MySQL system variables backed by extension-owned storage. Five types are
-supported: `BOOL` (`bool *`), `INT` (`long long *`), `DOUBLE` (`double *`),
-`STR` (`char **`), and `ENUM` (`unsigned long *`, storing a zero-based index
-into a fixed, ordered list of names). `INT` and `DOUBLE` descriptors also
+MySQL system variables backed by extension-owned storage. Four types are
+supported: `BOOL` (`bool *`), `INT` (`long long *`), `STR` (`char **`), and,
+on the dev ABI only, `ENUM` (`unsigned long *`, storing a zero-based index
+into a fixed, ordered list of names). `INT` descriptors also
 carry `min_val` and `max_val` bounds; all descriptors carry a default value
 and a comment.
 
 Build the capability with `vsql::preview_sys_var::make_capability()` and the
-matching factory functions `make_bool`, `make_int`, `make_double`, `make_str`,
-and `make_enum`. The
+matching factory functions `make_bool`, `make_int`, `make_str`, and
+`make_enum` (dev ABI only). The
 capability object also exposes `get()` and `set()` for
 programmatic access from extension code. Both return `false` on success.
 
 To react to value changes, chain `.on_change<&fn>()` on a descriptor. The
 callback receives a `sv::SysVarChange` with `var_name()` and typed accessors
-(`as_int()`, `as_real()`, `as_str()`, `as_enum()`).
+(`as_int()`, `as_str()`, and, on the dev ABI only, `as_enum()`).
 
 The server calls that callback while it holds its global system-variable lock.
 Reading or writing another of this extension's variables through its storage
@@ -565,7 +565,6 @@ to the storage pointers when the user sets a variable.
 |---------|--------------|------------------|
 | `sv::make_bool` | `bool *` | `def_val` |
 | `sv::make_int` | `long long *` | `def_val`, `min_val`, `max_val` |
-| `sv::make_double` | `double *` | `def_val`, `min_val`, `max_val` |
 | `sv::make_str` | `char **` | `def_val` |
 | `sv::make_enum` | `unsigned long *` | `names`, `name_count`, `def_val` |
 
@@ -579,9 +578,7 @@ ERROR 1231 (42000): Variable 'my_ext.mode' can't be set to the value of 'bogus'
 ```
 
 That validation is what distinguishes it from a free-form `make_str`: the
-value space is closed and enforced at `SET` time. `names` and its strings
-must have static storage duration — the server keeps a `TYPELIB` pointing at
-them for as long as the variable is registered. A convenience overload
+value space is closed and enforced at `SET` time. A convenience overload
 deduces `name_count` from a `static const char *const NAMES[] = {...}` array,
 so the count argument can be omitted.
 
@@ -601,7 +598,7 @@ static unsigned long g_mode  = 0;  // index into MODE_NAMES; default "off"
 static const char *const MODE_NAMES[] = {"off", "on", "sync"};
 
 static void on_threshold_change(sv::SysVarChange c) {
-  // c.var_name() identifies the variable; c.as_int() returns the new value
+  // c.var_name() identifies the variable; c.as_int().value() returns the new value
 }
 
 static auto SYS_VARS = sv::make_capability({
@@ -656,8 +653,7 @@ per-session (THD-local) system variables — the functional equivalent of a
 plugin's `MYSQL_THDVAR_*`. It is the session-scoped sibling of
 [`vsql::sys_var`](#system-variables): a sys_var has one value shared by every
 connection, while a session_var gives each connection its own value, set with
-`SET SESSION`, with the descriptor's default as the starting point for every
-new session and as the value read by `SET GLOBAL`. A variable's scope is fixed
+`SET SESSION`. The starting point for a new session is the descriptor's default, or the value last stored by `SET GLOBAL`. A variable's scope is fixed
 at registration — use this capability for per-session variables, `vsql::sys_var`
 for global ones.
 
@@ -760,15 +756,10 @@ ERROR 1232 (42000): Incorrect argument type to variable 'my_ext.session_int_var'
 
 ### Restart Behavior
 
-Session variables are **not** persisted the way `SET PERSIST` makes an ordinary
-sys_var durable — there is no `SET PERSIST` support for a session_var's own
-value. Across a server restart with the extension still installed, each
-variable reappears at its compiled default, not at whatever value a session
-had set before the restart: a `SET SESSION` value is per-connection state, and
-connections do not survive a restart in the first place, so there is nothing to
-lose — the variable's *global default* was never changed by that session's
-`SET SESSION` either, so restart simply reinstalls the variable at the same
-default it always had.
+`SET PERSIST` and `SET PERSIST_ONLY` work on a session variable's global value as on any MySQL system
+variable: the value survives a server restart, and each new session starts at it. A `SET SESSION`
+value is per-connection state and does not survive a restart. Without `SET PERSIST`, each variable
+reappears at its compiled default after a restart with the extension still installed.
 
 ## Thread Worker
 
@@ -1131,8 +1122,9 @@ feature: it enables new storage layouts, not a tuning knob for existing ones.
 
 <Warning>
   Column storage is a preview ABI — under active development and may change
-  between releases. It currently covers row-level persistence only; indexing
-  over custom-stored columns is not yet available.
+  between releases. It currently covers row-level persistence only; a custom-stored column accepts only a
+  [custom index](/mysql-8.4/dev/custom-indexes), and an ordinary index is refused with
+  `ERROR 3219 (HY000): InnoDB: Indexing for types with column storage is supported only with custom index.`
 </Warning>
 
 ### Declaring the Capabilities
@@ -1198,7 +1190,8 @@ Every function takes `storage::Column::StorageCtx<MyCtx>*`, whose `user()`
 accessor returns the extension's per-column state and whose `arena()` provides
 server-managed allocation for auxiliary objects. Every function returns `false`
 on success and `true` on error, writing a message into `error_msg` (capacity
-`error_msg_len`) so failures surface to the SQL client.
+`error_msg_len`). The server writes that message to its error log; a failed `create` or `insert`
+fails the statement with `ERROR 3219 (HY000): InnoDB: Custom type operation failed. See server error log for details.`
 
 ```cpp
 // CREATE TABLE / ALTER TABLE ADD COLUMN.
@@ -1335,13 +1328,16 @@ data_page.load_new(seg, mtr_ref);  // allocates a fresh page
 Pass `mtr_ref` to write calls so InnoDB logs the change:
 
 ```cpp
+// Read: a shared latch
 storage::Page page;
-
-// Read
 page.load(ctx->user()->space, page_num, storage::Page::Latch::SHARED, mtr_ref);
 uint32_t v = page.read_integer_4(storage::Page::HEADER_SIZE + offset);
+```
 
-// Write
+```cpp
+// Write: an exclusive latch. Do not load a page for writing
+// when the same mini-transaction already holds it with a shared latch.
+storage::Page page;
 page.load(ctx->user()->space, page_num, storage::Page::Latch::EXCLUSIVE, mtr_ref);
 page.write_integer_4(storage::Page::HEADER_SIZE + offset, v, mtr_ref);
 ```
@@ -1354,8 +1350,8 @@ Page layout constants:
 | `storage::Page::TRAILER_SIZE` | `8` | Do not write past `page_size - TRAILER_SIZE`. |
 | `storage::Page::get_size(space)` | runtime | Use instead of hard-coding 16384. |
 
-Reading or writing inside the header or trailer regions corrupts the page —
-InnoDB uses those byte ranges for its own bookkeeping and checksum.
+The page accessors reject an offset inside the header or trailer region: a release build
+skips the read or write, and a build without `NDEBUG` fails an `assert`. InnoDB uses those byte ranges for its own bookkeeping and checksum.
 
 ## Statement Events
 
@@ -1516,8 +1512,9 @@ VEF_GENERATE_ENTRY_POINTS(
 #### Enabling from SQL
 
 With the preview tier enabled (see
-[Enabling the Preview Tier](#enabling-the-preview-tier)), install the extension
-and configure it through its system variables:
+[Enabling the Preview Tier](#enabling-the-preview-tier)), build the extension with
+`-DVSQL_USE_DEV_ABI=ON`, copy its `.veb` file into `veb_dir`, install it, and configure it
+through its system variables:
 
 ```sql
 INSTALL EXTENSION vsql_slow_query_log;
@@ -1660,7 +1657,7 @@ The handler returns one of three results:
 |---|---|
 | `AuthResult::kOk` | Authentication succeeded. The handler must have called `authenticate_as()`; the session runs as that account. |
 | `AuthResult::kReject` | Authentication failed — bad credential or policy rejection. |
-| `AuthResult::kError` | An internal error prevented a decision (for example, a key source was unavailable). Treated identically to a rejection by the server; it exists only to distinguish "denied" from "couldn't decide" in logging. |
+| `AuthResult::kError` | An internal error prevented a decision (for example, a key source was unavailable). Treated identically to a rejection by the server. |
 
 Both `AuthResult::kReject` and `AuthResult::kError` deny the connection. Only
 `AuthResult::kOk` succeeds.
@@ -1678,8 +1675,8 @@ the session, replacing the account's default-role activation for this login.
 so the caller need not keep them. The server applies them *after* account
 resolution, using the same grant-checked activation as `SET ROLE`: only roles
 actually granted to the authenticated account activate, and names that are not
-granted are silently skipped — so a token can never grant or escalate privileges
-beyond what the DBA provisioned. Passing `n_roles == 0` activates no roles
+granted are silently skipped — so, unless the method sets `.roles_mode()`, a token
+cannot grant or escalate privileges beyond what the DBA provisioned. Passing `n_roles == 0` activates no roles
 (equivalent to `SET ROLE NONE`).
 
 ### Complete Example
@@ -1740,8 +1737,9 @@ VEF_GENERATE_ENTRY_POINTS(make_extension().with(g_auth))
 ### Binding an Account and Connecting
 
 With the preview tier enabled (see
-[Enabling the Preview Tier](#enabling-the-preview-tier)), install the extension
-and bind an account to the method. Because the handler maps to a second account,
+[Enabling the Preview Tier](#enabling-the-preview-tier)), build the extension with
+`-DVSQL_USE_DEV_ABI=ON`, copy its `.veb` file into `veb_dir`, install it, and bind an
+account to the method. Because the handler maps to a second account,
 create that account too and grant it the `PROXY` privilege that lets the
 connecting account assume its identity:
 
@@ -1797,9 +1795,12 @@ mysql --enable-cleartext-plugin --user=auth_user \
       -e "SELECT CURRENT_USER(), @@external_user"
 ```
 
-```
-CURRENT_USER()         @@external_user
-vsql_auth_test_user@%  auth_user
+```text
++-----------------------+-----------------+
+| CURRENT_USER()        | @@external_user |
++-----------------------+-----------------+
+| vsql_auth_test_user@% | auth_user       |
++-----------------------+-----------------+
 ```
 
 Uninstalling the extension removes the method; accounts bound to it can no
@@ -1927,15 +1928,16 @@ mysql --enable-cleartext-plugin --user=never_created --password=wrong-token \
 ```
 
 ```text
-ERROR 1045 (28000): Access denied for user 'never_created'@'localhost' (using password: YES)
+ERROR 1045 (28000): Access denied for user 'never_created'@'localhost' (using password: NO)
 ```
 
 <Warning>
 Opting in makes the difference between an unknown and an existing account
-observable to anyone holding a valid credential, which the standard
-unknown-account rejection deliberately hides. That is the trade this feature
-makes; weigh it before enabling the opt-in on a method whose credentials are
-widely held.
+observable, which the standard unknown-account rejection deliberately hides: a
+rejected login for an unknown account reports `(using password: NO)`, where a
+rejected login for an account with an ordinary password reports `(using password: YES)`,
+and a valid credential creates the account. That is the trade this feature
+makes; weigh it before enabling the opt-in on a method whose credentials are widely held.
 </Warning>
 
 ### Auto-Granting Roles
@@ -1988,15 +1990,15 @@ account below holds neither. With the setting off, the login leaves the
 account's roles alone:
 
 ```sql
-CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
-CREATE USER vsql_auth_test_user;
+CREATE USER IF NOT EXISTS auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER IF NOT EXISTS vsql_auth_test_user;
 GRANT SELECT ON *.* TO vsql_auth_test_user;
 GRANT PROXY ON vsql_auth_test_user TO auth_user;
-CREATE ROLE vsql_role_granted, vsql_role_denied;
+CREATE ROLE IF NOT EXISTS vsql_role_granted, vsql_role_denied;
 ```
 
-Connecting as `auth_user` with that token, in the same way as above, and asking
-what is active:
+Connect as `auth_user` with the password `vsql-auth-test-token-roles`, in the same way as above, and
+ask what is active with `SELECT CURRENT_ROLE()`:
 
 ```text
 +----------------+
