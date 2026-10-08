@@ -12,21 +12,21 @@ Custom types require three operations the engine calls internally: encode (strin
 
 ```cpp
 // Encode: string -> binary. Write the encoded bytes via out.buffer() and
-// out.set_length(n); call out.set_null() for SQL NULL, out.warning(msg) for
-// recoverable bad input, or out.error(msg) to abort the statement. Returning
-// without calling any of these surfaces a default warning.
+// out.set_length(n). out.set_null(), out.warning(msg), out.error(msg), or no
+// call at all reports the value as invalid: ERROR 1366 in strict mode, a
+// warning under IGNORE. msg is discarded.
 using TypeEncodeFunc = void (*)(std::string_view from, vsql::CustomResult out);
 
-// Decode: binary -> string. Report the outcome by calling
-// out.set_length(n), out.set(sv), out.set_null(), out.warning(msg), or
-// out.error(msg). If none is called the SDK falls back to a default
-// "failed to decode value" ERROR.
+// Decode: binary -> string. Report the result by calling out.set_length(n)
+// or out.set(sv). out.set_null(), out.warning(msg), out.error(msg), or no call
+// at all fails the read with ERROR 3219; msg goes to the server log, and the
+// default message is "failed to decode value".
 using TypeDecodeFunc = void (*)(vsql::CustomArg in, vsql::StringResult out);
 
 // Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
 using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
 
-// Hash: returns hash code (used for hash joins).
+// Hash: returns hash code (used for GROUP BY, DISTINCT and UNION).
 using TypeHashFunc = size_t (*)(vsql::CustomArg in);
 ```
 
@@ -34,7 +34,7 @@ Omitting a custom hash function falls back to hashing the type's raw stored
 bytes. This is unsafe for a type whose encode function can produce more than
 one binary representation of an equal logical value — the common case is a
 floating-point field, where `-0.0` and `+0.0` compare equal but differ
-bit-for-bit, so `GROUP BY` and `COUNT(DISTINCT)` would treat them as different.
+bit-for-bit, so `GROUP BY` and `SELECT DISTINCT` would treat them as different.
 
 Register these operations using `vsql::make_type<kTypeName>()`. The type name
 is passed as a non-type template parameter (NTTP) — a `static constexpr const char[]`
@@ -67,7 +67,7 @@ constexpr auto MYTYPE =
         .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
         .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
         .compare<&my_compare>()      // auto: "MYTYPE::compare"
-        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash" — required for types storing floating-point values
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"; set it for types that store floating-point values
         .intrinsic_default_str("0")  // string-literal intrinsic default
         .build();
 
@@ -90,7 +90,7 @@ check runs at `INSTALL EXTENSION` rather than at `CREATE TABLE`, so a type that
 is too wide is rejected with the whole extension:
 
 ```text
-ERROR HY000: Failed to install extension 'vsql_huge_fixed_test': type 'HUGE_FIELD' declares 70000 bytes of storage per value, which exceeds the maximum of 65532 bytes supported for custom-type columns today
+ERROR 3219 (HY000): Failed to install extension 'vsql_huge_fixed_test': type 'HUGE_FIELD' declares 70000 bytes of storage per value, which exceeds the maximum of 65532 bytes supported for custom-type columns today
 ```
 
 Staying under the cap does not guarantee a column fits. Every other column in
@@ -110,12 +110,17 @@ to binary using the type's `from_string` function.
 If you omit both `.intrinsic_default_str()` and `.intrinsic_default_vdf()`,
 the server calls `from_string("")` as a fallback. This happens when the type
 is **first used** (at table creation), not at `INSTALL EXTENSION`. If your
-encode function rejects empty string — or encodes it to the wrong number of
-bytes — type initialization fails with an error visible in the SQL client:
+encode function rejects empty string, type initialization fails with an error
+visible in the SQL client:
 
 ```
-Type 'MYTYPE' failed to initialize: from_string VDF encoded intrinsic
-default input '' to N bytes, expected persisted_length=M
+ERROR 3219 (HY000): Type 'my_ext.MYTYPE' failed to initialize: from_string VDF failed to encode intrinsic default input '' (expected persisted_length=M)
+```
+
+If it encodes empty string to the wrong number of bytes, the error is:
+
+```
+ERROR 3219 (HY000): Type 'my_ext.MYTYPE' failed to initialize: from_string VDF encoded intrinsic default input '' to N bytes, expected persisted_length=M
 ```
 
 For fixed-length types, the default string must encode to exactly
@@ -125,7 +130,8 @@ empty string is not a valid input.
 
 Provide the intrinsic default one of two ways. The two are mutually exclusive:
 declaring both `.intrinsic_default_str()` and `.intrinsic_default_vdf()` is a
-compile-time error.
+compile-time error with the dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`); with the
+stable headers the server rejects the type at `INSTALL EXTENSION`.
 
 **String literal: `.intrinsic_default_str()`**
 
@@ -138,9 +144,6 @@ When the default value depends on type parameters, implement a function
 against one of these signatures (available via `<villagesql/vsql.h>`):
 
 <Warning>
-  **Breaking change**: `IntrinsicDefaultFunc` and
-  `IntrinsicDefaultWithParamsFunc` return `std::string` instead of `const char*`.
-  Update any existing intrinsic default implementations to return `std::string` directly.
 </Warning>
 
 ```cpp
@@ -172,8 +175,8 @@ Parameterized types need the column's declared parameters at encode,
 decode, compare, and hash time to determine allocation sizes and layout.
 Define a params struct with a parse function and an inverse `to_strings`
 function, register both on the type builder with
-`.params<P, &ParseFunc, &ToStringsFunc>()`, and use `const P&` as the first
-argument of your type operation functions. The SDK caches the parse result
+`.params<P, &ParseFunc, &ToStringsFunc>()`, and take `vsql::MaybeParams<P> &` (encode) or
+`vsql::CustomArgWith<P>` (decode, compare, hash) as the first argument of your type operation functions. The SDK caches the parse result
 per unique parameter combination, so the parse function runs at most once
 per type instantiation. The `to_strings` function is the inverse of `parse`:
 it writes a typed `P` back into the canonical key/value string form so the
@@ -199,7 +202,7 @@ struct MyTypeParams {
 
 void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
                    std::string_view from, vsql::CustomResult out) {
-  const MyTypeParams &p = params.value();  // is_known() is always true at runtime
+  const MyTypeParams &p = params.value();  // is_known() is false when the server infers the params from a constant string
   size_t bytes = (size_t)p.dimension * 4;
   auto buf = out.buffer();
   if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
@@ -274,22 +277,23 @@ Register `.params<>()` on the type builder. Use `.int_to_params<&mytype_int_to_p
 to handle `MYTYPE(N)` integer syntax and `.resolve_params<&mytype_resolve_params_fn>()` to
 validate parameters and compute storage sizes. Call `.max_persisted_length(N)` with an
 upper bound on the persisted byte size across all valid parameterizations; the server
-uses this only on the type parameter inference path, where it has not yet inferred
-the params and so cannot consult `resolve_params` to size the encode buffer.
+uses it to size the encode buffer on the type parameter inference path, where it has not yet inferred
+the params and so cannot consult `resolve_params`, and rejects a resolved fixed `persisted_length` above it.
 For a VDF-based intrinsic default, use `.intrinsic_default_vdf()` with the VDF name and
-register the VDF separately via `make_intrinsic_default<&mytype_default>()`.
+register the VDF separately via `make_intrinsic_default<&mytype_default>("vdf_name")`.
 
-`build()` requires `.resolve_params<>()` whenever `.params<>()` or
-`.int_to_params<>()` is registered: `int_to_params` only rewrites the
+`build()` requires `.resolve_params<>()` whenever `.params<>()` or `.int_to_params<>()` is
+registered when you build against the dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`): `int_to_params` only rewrites the
 `MYTYPE(N)` shorthand into a parameter string, while `resolve_params` is the
 gate that validates the parameters and resolves storage size. Omitting it is a
-compile-time error.
+compile-time error there; with the stable headers the server rejects the type at `INSTALL EXTENSION`.
 
 <Warning>
 `.max_persisted_length()` requires VEF Protocol 3 or higher. A type using it
 cannot be loaded by pre-Protocol-3 servers. It is valid only for variable-length
 or parameterized types; a fixed non-parameterized type that sets it fails to
-compile.
+compile with the dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`), and the server rejects
+it at `INSTALL EXTENSION` when built with the stable headers.
 </Warning>
 
 The sizes `resolve_params` reports are also validated at `CREATE TABLE` time,
@@ -311,7 +315,7 @@ constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
 
 constexpr auto MYTYPE =
     vsql::make_type<kMyTypeName>()
-        .variable_length_type()  // Protocol 4; use instead of persisted_length(-1)
+        .persisted_length(-1)    // fixed length, sized per column by resolve_params
         .max_decode_buffer_length(16)
         .max_persisted_length(kMyTypeMaxPersistedLength)
         .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
@@ -339,8 +343,8 @@ The parameterized variants — `TypeEncodeWithParamsFunc<P>`,
 `<villagesql/vsql.h>`.
 The `vsql::make_type` template methods detect the params argument and route
 through the params cache automatically. Encode functions take
-`vsql::MaybeParams<P> &` as the first argument; `is_known()` is always true
-at runtime, and `value()` returns `const P&`. Decode, compare, and hash
+`vsql::MaybeParams<P> &` as the first argument; `is_known()` is false when the server infers
+the params from a constant string, and `value()` returns `const P&` once they are known. Decode, compare, and hash
 variants take `vsql::CustomArgWith<P>`, whose `params()` accessor returns
 `const P&`.
 
@@ -380,6 +384,7 @@ once, and have a non-empty value. A violation is a syntax error naming the
 type. Except for an empty parameter name, it also names the offending key:
 
 ```sql
+-- vsql_tvector ships in the villagesql/server Docker image; with a tarball install, build it from villagesql/examples/vsql-tvector in the server source
 INSTALL EXTENSION vsql_tvector;
 CREATE TABLE t3 (v vsql_tvector.TVECTOR('dimension=3,dimension=4'));
 -- ERROR 1064 (42000) at line 1: Type 'vsql_tvector.TVECTOR': duplicate parameter 'dimension' near 'vsql_tvector.TVECTOR('dimension=3,dimension=4'))' at line 1
@@ -387,10 +392,10 @@ CREATE TABLE t3 (v vsql_tvector.TVECTOR('dimension=3,dimension=4'));
 
 ### Rewriting parameters and supplying defaults
 
-`resolve_params` has a second, mutating overload: it takes the parameter map by
-non-const reference so the type can rewrite it — typically to fill defaults the
-author omitted. Register it the same way (`.resolve_params<&fn>()` accepts
-either form; register only one):
+`resolve_params` has a second, mutating overload, declared only in the opt-in dev ABI
+headers (`-DVSQL_USE_DEV_ABI=ON`): it takes the parameter map by non-const reference so
+the type can rewrite it — typically to fill defaults the author omitted. Register it the same
+way (`.resolve_params<&fn>()` accepts either form; register only one):
 
 ```cpp
 bool mytype_resolve_params_fn(std::map<std::string, std::string> &params,
@@ -429,11 +434,12 @@ but not removed`.
 The rewritten map becomes the canonical parameter string the server persists and
 `SHOW CREATE TABLE` prints, so the rewrite must be idempotent. A **bare**
 declaration (`MYTYPE`, no length or params) calls `resolve_params` with an empty
-map, so a type that supplies defaults gives every column explicit params —
+map when the type registers no `.int_to_params<>()`, so a type that supplies defaults gives every column explicit params —
 `vsql_bitfield_test`'s `BITFIELD` resolves a bare column to
 `max_number_of_bits=4096`:
 
 ```sql
+-- vsql_bitfield_test is built from villagesql/test-extensions/vsql-bitfield-test in the server source; the release does not ship it
 INSTALL EXTENSION vsql_bitfield_test;
 CREATE TABLE bits (id INT PRIMARY KEY, b vsql_bitfield_test.BITFIELD);
 SHOW CREATE TABLE bits;   -- b persists as BITFIELD('max_number_of_bits=4096')
@@ -497,7 +503,7 @@ default, so declare an explicit one that encodes to a non-empty value:
         .intrinsic_default_str("[0]")  // empty "[]" would encode to zero bytes
 ```
 
-Otherwise the type fails to initialize the first time a `NOT NULL` column
+Otherwise the type fails to initialize the first time a column
 references it, at `CREATE TABLE` — the same as a fixed-length type that cannot
 encode `from_string("")`.
 </Note>
