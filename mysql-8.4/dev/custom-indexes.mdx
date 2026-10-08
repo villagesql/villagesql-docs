@@ -131,20 +131,17 @@ indexes. Both are required.
 The builder accepts five capability values, and the server acts on one:
 `Index::Support::KNN`, a k nearest neighbour scan for
 `ORDER BY <distance>(<column>, <reference>) LIMIT K`. `POINT_LOOKUP`,
-`RANGE_SCAN`, `REVERSE_SCAN` and `ORDER_BY` compile and register, and InnoDB
-reports no access flags for a custom index, so the optimizer builds none of
-those paths.
+`RANGE_SCAN`, `REVERSE_SCAN` and `ORDER_BY` compile and register, and the optimizer builds none of those paths. An `=` condition on the indexed column can still plan an `Index lookup` on the custom index, for example under `FORCE INDEX`, whatever the index declares, and that query fails with `ERROR 1031 (HY000): Table storage engine for '<table>' doesn't have this option`.
 
-The supported storage declaration is the pair
-`Index::Storage::HAS_COLUMN_REF | Index::Storage::REF_LOOKUP` on a single-column
+The storage declaration that serves a nearest-neighbour scan is
+`Index::Storage::HAS_COLUMN_REF | Index::Storage::HAS_ROW_REF` on a single-column
 index over a column the extension stores itself. `HAS_COLUMN_REF` means each
 entry stores a stable column reference the server supplies rather than the full
 primary key, and it is what makes `get_key_data()` and `get_key_ref()` available.
 `REF_LOOKUP` means the index can re-locate an entry from that reference, and it
 carries an obligation: every entry must have a unique reference token.
 
-`Index::Storage::HAS_ROW_REF` is the third value. It fills the `pkeys` array
-`insert()` receives, and nothing reads it back. Declare the pair above.
+`Index::Storage::HAS_ROW_REF` means each entry stores the primary key of the row it indexes: the server passes it to `insert()` in the `pkeys` array, `fetch()` must return it in `pkeys`, and the server resolves each hit with a primary-key lookup. An index that does not declare it is never chosen for a nearest-neighbour scan. Declare it together with `HAS_COLUMN_REF`.
 
 ### Reading and Writing Column References
 
@@ -199,7 +196,7 @@ if (strcmp(params[i].key, "m") == 0) out->M = atoi(params[i].value);
 `params` is null when the DDL carried no `WITH` clause, so `count` is the value
 to test first. A `parse` that returns failure aborts the DDL, and the message it
 wrote goes to the server error log — the client sees only
-`ERROR 1030 (HY000): Got error 168 - 'Unknown (generic) error from engine'`, so
+`ERROR 1030 (HY000): Got error 168 - 'Unknown (generic) error from engine' from storage engine`, so
 name the index and the offending key in the message.
 
 `index.options<HNSWOptions>()` returns a pointer to the parsed struct. It is
@@ -258,8 +255,8 @@ records `hnsw_l2`.
 
 `.ordering()` records the scan directions the profile supports, as `NONE`, `ASC`,
 `DESC`, or `ASC | DESC`. The server stores the value and nothing reads it. Only
-an ascending ordering is ever planned, so a profile that declares `DESC` alone
-cannot serve a query.
+an ascending ordering is ever planned, whatever the profile declares: a profile that declares
+`DESC` alone still serves an ascending query, and a descending `ORDER BY` runs as a table scan.
 
 A hook calls a bound function through `index.profile()` or a bound helper
 through `index.helper()`. Both take the key column position, the id the profile
@@ -286,6 +283,9 @@ A skeleton, with the hook bodies, the options struct and the context left out:
 #include <villagesql/vsql.h>
 
 using namespace vsql::preview_index_builder;
+using vsql::preview_storage::MtrCtx;
+using vsql::preview_storage::Segment;
+using vsql::preview_storage::Space;
 
 static constexpr const char kMyType[] = "my_type";
 static constexpr const char kMyIndex[] = "my_index";
@@ -312,7 +312,7 @@ static constexpr auto MY_INDEX =
         .global()
             .capabilities(Index::Support::KNN)
             .storage_props(Index::Storage::HAS_COLUMN_REF |
-                           Index::Storage::REF_LOOKUP)
+                           Index::Storage::HAS_ROW_REF)
             .options<MyOptions, &MyOptions::parse>()
             .build();
 
@@ -379,8 +379,8 @@ Every statement in this section needs `vsql_allow_preview_extensions` set to
 ERROR 3219 (HY000): Extended Index feature not yet implemented
 ```
 
-Using `vsql_vector` as the example, turn the setting on and install the
-extension first:
+Using `vsql_vector` as the example, build it from the `vsql-vector` repository, copy
+`vsql_vector.veb` into the `veb_dir`, turn the setting on, and install the extension first:
 
 ```sql
 SET PERSIST vsql_allow_preview_extensions = ON;
@@ -408,15 +408,15 @@ and the rows it holds survive a server restart.
 
 Rows go in with `INSERT`, and the index is maintained as they do. Creating the
 index on a table that already holds rows works too, and builds the index over
-them. The build runs with the table exclusively locked rather than as an
-online DDL — a custom index always takes the offline build path, regardless
-of any `ALGORITHM` clause, because nothing yet replays concurrent writes into
-one.
+them. The build blocks writes to the table rather than running as an online DDL; reads
+continue. A custom index takes the offline build path with `ALGORITHM=INPLACE`, `ALGORITHM=COPY` or
+no clause, because nothing yet replays concurrent writes into one. `ALGORITHM=INSTANT` and
+`LOCK=NONE` are refused.
 
 One query shape is served by a custom index:
 `ORDER BY <distance>(<column>, <reference>) LIMIT K` as the only ordering term,
 ascending, with a constant `<reference>`. The index must be single-column, its
-type must declare `Index::Support::KNN`, and its bound profile must supply the
+type must declare `Index::Support::KNN` and `Index::Storage::HAS_ROW_REF`, and its bound profile must supply the
 distance function. The column and the reference can be given in either order. A
 query that misses any of these conditions runs as a table scan and a sort, with
 no warning. `EXPLAIN` names the access:
@@ -458,8 +458,9 @@ ERROR 3219 (HY000): UPDATE that changes an indexed column on a table with a cust
 ```
 
 An `UPDATE` that changes the primary key draws the same error, as does a
-`REPLACE` or an `INSERT ... ON DUPLICATE KEY UPDATE` that hits an existing row.
-An `UPDATE` that touches only unindexed columns succeeds.
+`REPLACE` that hits an existing row or an `INSERT ... ON DUPLICATE KEY UPDATE` that assigns an indexed
+column or the primary key. An `UPDATE` or an `INSERT ... ON DUPLICATE KEY UPDATE` that assigns only
+unindexed columns succeeds.
 
 An `ALTER TABLE` that changes the primary key of a table with a custom index is
 refused regardless of `ALGORITHM`:
