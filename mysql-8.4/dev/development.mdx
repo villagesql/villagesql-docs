@@ -13,7 +13,7 @@ VEF Protocol 3 is stable as of v0.0.4. Protocol 4 is under development and is av
 ## Writing Extension Functions
 
 Extension functions are written in C++ and registered with VEF. Include a
-single header to access the full SDK:
+single header to access the VDF, type, and extension builder APIs:
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -28,8 +28,8 @@ handler anywhere above it and the server process terminates. Ordinary SQL input
 reaches this: `std::stoi()` throws on a non-numeric string, and
 `nlohmann::json::dump()` throws on text that is not valid UTF-8.
 
-Wrap the body of every entry point you register: VDFs, aggregate result
-functions, and the `from_string`/`to_string` operations of a custom type.
+Wrap the body of every entry point you register: VDFs, aggregate functions,
+prerun and postrun hooks, and the operations of a custom type.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -94,10 +94,10 @@ void add_impl(IntArg a, IntArg b, IntResult out) {
 }
 
 // Registration is unchanged:
-make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build();
+// make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build()
 ```
 
-**Binary example** — transform a custom type buffer in place:
+**Binary example** — transform a custom type value into the result buffer:
 
 ```cpp
 using namespace vsql;
@@ -115,7 +115,7 @@ For `StringResult` and `CustomResult`, write into `buffer()`, then call
 `set_length()` with the number of bytes written. `buffer().size()` is the
 maximum capacity.
 
-For VDFs that return a custom type (`returns(CUSTOM(MYTYPE))`), the server
+For VDFs that return a custom type (`.returns(MYTYPE)`), the server
 sizes the result buffer to the resolved return type's `persisted_length`
 automatically — extension authors do not need to declare `.buffer_size(...)`
 on the function builder for this case. If `prerun` grows the buffer further,
@@ -339,7 +339,7 @@ SELECT point_path('1,2');
 #include <cstring>
 using namespace vsql;
 
-constexpr size_t kBytearrayLen = 4;
+constexpr size_t kBytearrayLen = 8;
 
 void ba_concat_all_prerun(PrerunArgs args, PrerunResult out) {
   if (args.size() == 0) {
@@ -363,6 +363,7 @@ void ba_concat_all(VarArgs args, StringResult out) {
   for (auto a : args) {
     if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
     auto bytes = a.as_custom();
+    if (off + bytes.size() > dst.size()) { out.error("ba_concat_all: result too long"); return; }
     std::memcpy(dst.data() + off, bytes.data(), bytes.size());
     off += bytes.size();
   }
@@ -399,7 +400,7 @@ it: registration walks every function's final built state and rejects the
 first one that is both varargs and has a bind hook, with:
 
 ```text
-VDF '%s' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
+ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned an error: VDF '<function>' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
 ```
 
 <Warning>
@@ -563,8 +564,7 @@ extension that reaches the server with a mismatched pair some other way is
 rejected at load instead:
 
 ```text
-ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers
-an on_init hook without an on_deinit
+ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers an on_init hook without an on_deinit
 ```
 
 <Warning>
@@ -632,7 +632,7 @@ extensions, use `VEF_GENERATE_ENTRY_POINTS` instead.
 ```cpp
 VEF_GENERATE_REGISTRATION(
     make_extension()
-        .func(make_func<&my_impl>("my_func").returns(INT).build()))
+        .func(make_func<&my_impl>("my_func").returns(INT).no_params().build()))
 
 // Then define your own extern "C" vef_register/vef_unregister that call
 // _vef_do_register() and optionally modify the result.
@@ -655,8 +655,10 @@ The following VEF capabilities are available as opt-in preview headers. ABI and 
 
 `INFORMATION_SCHEMA.EXTENSION_REGISTRATION` exposes the in-memory VEF
 registration struct for each loaded extension as a JSON document. Use it to
-verify that the server parsed your extension's functions, types, and system
-variables correctly after `INSTALL EXTENSION`.
+`INFORMATION_SCHEMA.EXTENSION_REGISTRATION` exposes the in-memory VEF
+registration struct for each loaded extension as a JSON document. Use it to
+verify that the server parsed your extension's functions and types
+correctly after `INSTALL EXTENSION`.
 
 ```sql
 SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL, REGISTRATION_JSON
