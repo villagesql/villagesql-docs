@@ -18,7 +18,7 @@ tutorial. Complete Steps 1–3 before continuing here.
 
 ## Define Type Operations
 
-Every custom type needs encode, decode, and compare operations, and optionally a hash operation. Implement them against these signatures and pass builder objects to `vsql::make_type<>()`:
+Every custom type needs encode, decode, and compare operations, and optionally a hash operation. Implement them against these signatures and pass them to the `vsql::make_type<>()` builder:
 
 ```cpp
 // Encode: string -> binary. Write to out.buffer() and call out.set_length(n).
@@ -45,8 +45,7 @@ separate buffer-size request is needed.
 
 Raw binary access goes through `vsql::Span<T>`, a non-owning view over a
 contiguous sequence of `T` — `in.value()` returns
-`vsql::Span<const unsigned char>` and `out.buffer()` returns
-`vsql::Span<unsigned char>`. Using C++20 or later, `vsql::Span<T>` is an alias
+`vsql::Span<const unsigned char>` and `out.buffer()` returns `vsql::Span<unsigned char>` on a `CustomResult` and `vsql::Span<char>` on a `StringResult`. Using C++20 or later, `vsql::Span<T>` is an alias
 for `std::span<T>`; under C++17 the C++ SDK provides a minimal source-compatible
 fallback with the same `data()`, `size()`, `empty()`, indexing, and iterator
 surface. It is available via `#include <villagesql/vsql.h>`.
@@ -74,7 +73,7 @@ constexpr auto MYTYPE =
         .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
         .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
         .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
-        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Development guide
+        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Type Operations
         .build();
 
 VEF_GENERATE_ENTRY_POINTS(
@@ -113,7 +112,7 @@ See [Type Operations](/mysql-8.4/dev/type-operations) for the full C++ signature
 | Non-custom | Custom | Error: `Cannot convert column 'col' to custom type 'MYTYPE'` |
 | Custom | String type | Allowed |
 | Custom | Non-string type | Error: `Cannot convert custom type column 'col' to non-string type` |
-| Custom | Different custom type | Error if incompatible: `Cannot convert between incompatible custom types 'A' and 'B'` |
+| Custom | Different custom type | Error if incompatible: `Cannot convert between incompatible custom types 'ext_a.A' and 'ext_b.B'` |
 
 An `ALTER TABLE` that adds, drops, or modifies a custom-type column is also
 refused outright under `LOCK TABLES`: custom-type operations write to
@@ -196,7 +195,7 @@ void encode_complex(std::string_view from, CustomResult out) {
     if (endptr == p || *endptr != ',') return fail();
     p = endptr + 1;
     imag = strtod(p, &endptr);
-    if (endptr == p || *endptr != ')') return fail();
+    if (endptr == p || *endptr != ')' || endptr[1] != '\0') return fail();
     memcpy(buf.data(), &real, 8);
     memcpy(buf.data() + 8, &imag, 8);
     out.set_length(16);
@@ -241,6 +240,23 @@ int compare_complex(CustomArg a, CustomArg b) {
     if (a_imag > b_imag) return 1;
     return 0;
 }
+
+static constexpr const char kComplexTypeName[] = "COMPLEX";
+
+constexpr auto COMPLEX =
+    vsql::make_type<kComplexTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&encode_complex>()
+        .to_string<&decode_complex>()
+        .compare<&compare_complex>()
+        .intrinsic_default_str("(0,0)")
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(COMPLEX)
+);
 ```
 
 Decoding uses `std::to_chars` rather than `snprintf`: a fixed-precision format
@@ -280,7 +296,7 @@ SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
 VDFs can be used in generated column expressions. The VDF must be declared `.deterministic()` in the extension builder — the server blocks non-deterministic functions in this context.
 
 ```sql
-CREATE TABLE signals (
+CREATE TABLE signals_generated (
     id INT PRIMARY KEY,
     impedance COMPLEX,
     -- Generated column computed by a VDF
@@ -301,7 +317,7 @@ requirement from generated columns applies here because MySQL implements
 functional indexes as hidden generated columns.
 
 ```sql
-CREATE TABLE signals (
+CREATE TABLE signals_indexed (
     id INT PRIMARY KEY,
     sig COMPLEX,
     INDEX idx_magnitude ((COMPLEX_ABS(sig)))
@@ -313,7 +329,7 @@ The optimizer uses the index when the same VDF expression appears in `WHERE`,
 so the optimizer matches the expression:
 
 ```sql
-SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+SELECT id FROM signals_indexed WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
 ```
 
 ## Next Steps
