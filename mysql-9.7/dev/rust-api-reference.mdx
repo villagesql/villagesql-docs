@@ -23,7 +23,7 @@ pub enum InValue<'a> {
 
 | Variant | Rust type | Corresponding SQL type |
 |---|---|---|
-| `String(&str)` | UTF-8 string slice | `STRING` / `VARCHAR` / `TEXT` |
+| `String(&str)` | String slice holding the argument's raw bytes, not checked for UTF-8 (a latin1 or binary argument keeps its bytes) | `STRING` / `VARCHAR` / `TEXT` |
 | `Real(f64)` | 64-bit float | `REAL` / `DOUBLE` / `FLOAT` |
 | `Int(i64)` | 64-bit signed integer | `INT` / `BIGINT` / `TINYINT` |
 | `Null` | — | SQL `NULL` for any type |
@@ -48,7 +48,7 @@ Always match on `Null` explicitly. Calling `.unwrap()` or pattern-matching only 
 
 **Warning vs error:**
 
-Use `warning` for user-input validation failures where continuing with the rest of the result set makes sense. In strict mode, MySQL promotes warnings to errors on `INSERT` and `UPDATE`. Use `error` for conditions where proceeding is unsafe — corrupt stored data, internal invariant violations. A fatal error aborts the entire statement.
+Use `warning` for user-input validation failures where continuing with the rest of the result set makes sense. A warning does not fail the statement, including `INSERT` and `UPDATE` in strict mode. Use `error` for conditions where proceeding is unsafe — corrupt stored data, internal invariant violations. A fatal error aborts the entire statement.
 
 ```rust
 fn validate_impl(args: &[InValue]) -> VdfReturn {
@@ -104,8 +104,8 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: Stat
 | `"sql_name"` | The SQL function name as a string literal. This is what users call from SQL. |
 | `[param_types]` | Comma-separated list of `villagesql::Type::*` or `villagesql::custom!("name")` values. Use `[]` for zero-arity functions. |
 | `return_type` | `villagesql::Type::*` or `villagesql::custom!("name")`. |
-| `buffer_size: N` | Optional. Size in bytes of the result buffer for string/binary returns. Use `0` for the server default (1024 bytes). When a function returns a string or binary value larger than `buffer_size`, the function errors rather than truncating — declare a larger `buffer_size` to handle larger results. |
-| `deterministic: true` | Optional. Declares the function deterministic — same inputs always produce the same output, no side effects. The optimizer can cache results for identical inputs. Only set this when it's true. |
+| `buffer_size: N` | Optional. Size in bytes of the result buffer for string/binary returns, with a minimum of 1024. Use `0` or any value below 1024 for the server default (1024 bytes). When a function returns a string or binary value larger than the buffer, the function errors rather than truncating — declare a larger `buffer_size` to handle larger results. |
+| `deterministic: true` | Optional. Declares the function deterministic — same inputs always produce the same output, no side effects. Only a deterministic function can appear in a generated column or a `CHECK` constraint. Only set this when it's true. |
 | `postrun: postrun_fn` | Optional, only on the `state:`/`prerun:` forms. `fn(&mut StateType)`, called once after the last row, before the SDK drops the state. |
 
 **Type constants** for use in `func!`:
@@ -331,7 +331,7 @@ Because the server validates nothing, a varargs prerun needs to see the argument
 | `ArgType` method | Returns |
 |---|---|
 | `is_str()` | `true` for a `STRING` argument. |
-| `is_real()` | `true` for a `REAL` argument. |
+| `is_real()` | `true` for a `REAL` argument. A `DECIMAL` value, such as the literal `1.5`, is a `STRING` argument. |
 | `is_int()` | `true` for an `INT` argument. |
 | `is_custom()` | `true` for an argument of a custom type registered by any installed extension. |
 | `custom_name()` | `Option<&str>` — the custom type's name. `Some` only when `is_custom()` is true; `None` for the scalar types. |
@@ -447,13 +447,13 @@ villagesql::custom_type!(
 
 | Field | Type | Description |
 |---|---|---|
-| `type_name` | `&str` literal | SQL name for the type. Case-insensitive in SQL. Must be unique among all installed extensions. |
+| `type_name` | `&str` literal | SQL name for the type. Case-insensitive in SQL. Refer to it as `<extension>.<type>` when more than one installed extension registers the same name. |
 | `persisted_length` | `usize` | Fixed byte length for on-disk storage. All encoded values must produce exactly this many bytes. |
 | `max_decode_buffer_length` | `usize` | Maximum byte length of the decoded string. Used to size the output buffer before calling `decode`. |
 | `encode` | `fn(&str) -> Result<Vec<u8>, String>` | Called at `INSERT` time. Converts a SQL string literal to binary. Return `Err(msg)` to reject the input. |
 | `decode` | `fn(&[u8]) -> Result<String, String>` | Called to display the value. Converts binary back to a string. |
 | `compare` | `fn(&[u8], &[u8]) -> std::cmp::Ordering` | Called for `ORDER BY`, `MIN`, `MAX`. Return `Less`, `Equal`, or `Greater`. |
-| `hash` | `fn(&[u8]) -> usize` | Optional. Called for `COUNT(DISTINCT)` and set operations. Values that compare `Equal` must hash to the same value. Recommended for indexed columns. |
+| `hash` | `fn(&[u8]) -> usize` | Optional. Called for `GROUP BY`, `DISTINCT` and `UNION`. Values that compare `Equal` must hash to the same value. Recommended for indexed columns. |
 | `default` | `&str` literal | Optional. A valid string the server encodes at type initialization to verify the callback works. Must encode to exactly `persisted_length` bytes. |
 | `intrinsic_default_fn` | `fn() -> Result<String, String>` | Optional. Computes that string instead of stating it, for a default that cannot be written as a literal. |
 
@@ -496,9 +496,9 @@ Every extension needs a `manifest.json` alongside its `Cargo.toml`:
 
 | Field | Required | Format | Description |
 |---|---|---|---|
-| `name` | Yes | lowercase letters, digits, `_`, `-` | Extension identifier. Must match the `INSTALL EXTENSION` name. Use underscores — hyphens require backtick quoting in SQL. |
+| `name` | Yes | letters, digits, `_`, `-` | Extension identifier. Must match the `INSTALL EXTENSION` name. Use underscores — hyphens require backtick quoting in SQL. |
 | `version` | Yes | MAJOR.MINOR.PATCH | Semantic version. |
-| `description` | No | String | Shown in `INFORMATION_SCHEMA.EXTENSIONS`. |
+| `description` | No | String | Brief description of the extension. |
 | `author` | No | String | Author name or organization. |
 | `license` | No | String | License identifier. `GPL-2.0` recommended for open-source extensions. |
 
