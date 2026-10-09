@@ -106,7 +106,49 @@ Track schema changes in version-controlled migration files. Common tools:
 | golang-migrate | Go | SQL-based; numbered files |
 | Alembic | Python | Python or SQL; auto-generates from models |
 
-Each tool maintains a migrations table in the database to track which migrations have run, so reruns are safe.
+Each tool keeps a migrations table recording which files have run, so re-running the command skips anything already applied.
+
+### Partial failures aren't rolled back
+
+The skip-what's-applied guarantee only holds for migrations that finish. MySQL commits DDL one statement at a time and can't roll it back (see [Transactions in MySQL](/guides/transactions)), so a file that fails halfway leaves its earlier statements applied: nothing undoes them, and a plain re-run won't repair the database.
+
+What you're left with depends on the tool: some don't record the failed migration and retry it on the next run, while others mark it failed and refuse to continue until you clear that state by hand. Either way, recovery is manual, so check your tool's docs for how it flags a failed migration and how to reset it.
+
+### Making a statement safe to rerun
+
+Since MySQL has no `ADD COLUMN IF NOT EXISTS`, a bare column add isn't repeatable on its own:
+
+```sql
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS notes TEXT;
+-- ERROR 1064 (42000): You have an error in your SQL syntax
+```
+
+A plain `ADD COLUMN` commits on the first run. If a later statement in the same file fails, then depending on how your migration tool handles the failure, a retry may re-run this statement against a column that already exists:
+
+```sql
+ALTER TABLE orders ADD COLUMN notes TEXT;
+-- ERROR 1060 (42S21): Duplicate column name 'notes'
+```
+
+To make the add itself repeatable, apply it only when `INFORMATION_SCHEMA` shows the column is missing, via a prepared statement:
+
+```sql
+SET @needed = (
+  SELECT COUNT(*) = 0
+  FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'orders'
+    AND COLUMN_NAME = 'notes'
+);
+SET @ddl = IF(@needed,
+  'ALTER TABLE orders ADD COLUMN notes TEXT',
+  'SELECT 1');  -- no-op branch (returns a throwaway row)
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+```
+
+Run it twice: the first run adds the column, the second no-ops. Two limits worth knowing. It doesn't clear whatever failure state your tool already recorded; you still resolve that through your tool's own recovery process, and the guard is what keeps the retry from hitting this same error again once you do. And it only covers schema shape, whether a column, index, or table exists; a data migration, an `UPDATE` or `INSERT` that transforms existing rows, needs its own idempotency strategy, such as `INSERT ... ON DUPLICATE KEY UPDATE` or a `WHERE` clause that excludes rows already transformed.
 
 ## Frequently Asked Questions
 
