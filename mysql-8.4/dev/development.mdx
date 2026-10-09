@@ -21,12 +21,39 @@ single header to access the VDF, type, and extension builder APIs:
 
 ## Exception Safety
 
-Containing exceptions is the extension's responsibility. The SDK does not wrap
-your implementation in a `try`/`catch`, and neither does the server, so an
-exception that escapes an entry point unwinds across the C ABI boundary with no
-handler anywhere above it and the server process terminates. Ordinary SQL input
-reaches this: `std::stoi()` throws on a non-numeric string, and
-`nlohmann::json::dump()` throws on text that is not valid UTF-8.
+Containing exceptions is the extension's responsibility. On Protocol 3 (the
+stable ABI, used by default), nothing wraps an entry point: the SDK doesn't,
+and neither does the server, so an exception that escapes it unwinds across
+the C ABI boundary with no handler anywhere above it and the server process
+terminates. Ordinary SQL input reaches this: `std::stoi()` throws on a
+non-numeric string, and `nlohmann::json::dump()` throws on text that is not
+valid UTF-8.
+
+On Protocol 4 (the dev ABI, `-DVSQL_USE_DEV_ABI=ON`), the SDK wraps the VDF
+body and an aggregate's accumulate and result functions in a `try`/`catch`.
+An exception that reaches one becomes a VDF error instead of a crash:
+
+```
+ERROR 3200 (HY000): VDF error in function '<name>': VDF threw an exception (<what>)
+```
+
+The `(<what>)` part appears only when the exception derives from
+`std::exception`. On Protocol 4, an exception from the constructor of an
+aggregate's state object fails the statement:
+
+```
+ERROR 1123 (HY000): Can't initialize function '<name>'; VDF threw an exception (<what>)
+```
+
+On Protocol 4, an exception from an aggregate's clear function is caught and
+discarded. No error or warning reaches the client, and the state is not
+reset, so each later group adds to the totals of the groups before it and
+the query returns wrong results.
+
+An exception crashes the server on either ABI when it comes from a custom
+`.prerun<&Hook>()` or `.postrun<&Hook>()` hook, or from the destructor of an
+aggregate's state object. C++ destructors are `noexcept` by default, so a
+throw from one calls `std::terminate()` before any `catch` runs.
 
 Wrap the body of every entry point you register: VDFs, aggregate functions,
 prerun and postrun hooks, and the operations of a custom type.
@@ -50,10 +77,10 @@ void to_int_impl(StringArg in, IntResult out) {
 ```
 
 Catch `...` in addition to `const std::exception &`: a dependency may throw a
-type that does not derive from `std::exception`, and that one still terminates
-the server. Choose between `warning()` and `error()` on the same basis as any
-other failure — `warning()` for bad input the statement should survive,
-`error()` where continuing is unsafe.
+type that does not derive from `std::exception`, and on Protocol 3 any
+exception terminates the server. Choose between `warning()` and `error()` on the
+same basis as any other failure — `warning()` for bad input the statement
+should survive, `error()` where continuing is unsafe.
 
 ## Argument and Result Types
 
