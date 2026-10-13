@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "C++ API 参考"
-description: "VDF API 契约、空值处理、缓冲区大小调整、编码/解码约定、预执行/后执行钩子以及 VillageSQL 扩展的 SQL 功能兼容性。"
+description: "VDF API 契约、空值处理、缓冲区大小调整、预执行/后执行钩子以及 VillageSQL 扩展的 SQL 功能兼容性。"
 ---
 
 此页面是 C++ 扩展作者的参考。有关分步教程，请参阅[使用 C++ 创建扩展](/zh/mysql-9.7/stable/create)。对于自定义列类型，请参阅[C++ 中的自定义类型](/zh/mysql-9.7/stable/custom-types)。
@@ -68,7 +68,7 @@ void upper_impl(StringArg input, StringResult out) {
 }
 ```
 
-**4. 将错误消息传递给 `out.error(msg)`。如果需要，消息将被截断为 `VEF_MAX_ERROR_LEN`（512 字节）。**
+**4. 将错误消息传递给 `out.error(msg)`。消息会被截断以适合 `VEF_MAX_ERROR_LEN`（512 字节，包括结尾的 NUL），服务器还可能进一步缩短它。**
 
 `out.error(msg)` 接受一个 `std::string_view`。它将消息复制到服务器管理的缓冲区中，并在一个调用中将结果状态设置为错误。
 
@@ -94,6 +94,10 @@ void my_reverse_impl(StringArg input, StringResult out) {
 
     auto sv = input.value();
     auto buf = out.buffer();
+    if (sv.size() > buf.size()) {
+        out.error("Input length exceeds buffer size");
+        return;
+    }
     for (size_t i = 0; i < sv.size(); i++) {
         buf.data()[i] = sv[sv.size() - 1 - i];
     }
@@ -123,8 +127,8 @@ void count_vowels_impl(StringArg input, IntResult out) {
 **NULL 处理选项：**
 - **输入 NULL 检查：** `input.is_null()`
 - **返回 NULL：** `out.set_null()`
-- **返回值：** `out.set(v)`（数值/自定义）或在写入 `out.buffer()` 后调用 `out.set_length(n)`（字符串）
-- **返回警告：** `out.warning(msg)`——为该行返回 NULL，添加 SQL 警告，继续执行。在严格模式下，将由此产生的 NULL 插入 NOT NULL 列仍会因普通的严格模式 NULL 拒绝而失败（`ERROR 1048 (23000): Column '<col>' cannot be null`）——警告本身不会变成错误，可为空的列则会静默接受该 NULL。调用它而不是 `out.set()`，而不是同时调用两者。
+- **返回值：** `out.set(v)`（数值）或在写入 `out.buffer()` 后调用 `out.set_length(n)`（字符串/自定义）
+- **返回警告：** `out.warning(msg)`——为该行返回 NULL，添加 SQL 警告，继续执行。在严格模式下，将由此产生的 NULL 插入 NOT NULL 列仍会因普通的严格模式 NULL 拒绝而失败（`ERROR 1048 (23000): Column '<col>' cannot be null`）——警告本身不会变成错误，可为空的列则会接受该 NULL。调用它而不是 `out.set()`，而不是同时调用两者。
 - **返回错误：** `out.error(msg)`——中止语句执行
 
 ## 错误处理
@@ -161,7 +165,7 @@ void my_postrun(vsql::PostrunArgs args);
 有关 `PrerunArgs` 和 `PostrunArgs` 方法的详细信息，请参阅开发指南中的[每语句状态（预执行和后执行）](/zh/mysql-9.7/stable/development#per-statement-state-prerun-and-postrun)。
 
 <Note>
-**大多数扩展不需要预执行/后执行钩子。** C++ SDK 会自动处理常见情况，例如类型检查和结果缓冲区大小调整——对于返回 STRING 和返回 CUSTOM 的 VDF，结果缓冲区将在 VDF 主体运行之前调整为适合解析后的返回类型。仅当您需要昂贵的每语句设置（例如打开连接），而这些设置不应为每行进行时，才使用预执行/后执行。
+**大多数扩展不需要预执行/后执行钩子。** 类型检查和结果缓冲区大小调整是自动的。返回 STRING 的 VDF 一开始拥有 1024 字节的结果缓冲区；当它写入能容纳的部分并通过 `out.set_length(n)` 报告完整长度时，服务器会扩大缓冲区并再次调用该 VDF。对于返回 CUSTOM 的 VDF，结果缓冲区将在 VDF 主体运行之前调整为适合解析后的返回类型。仅当您需要昂贵的每语句设置（例如打开连接），而这些设置不应为每行进行时，才使用预执行/后执行。
 
 如果您发现您的用例需要预执行/后执行，请在 [VillageSQL Discord](https://discord.gg/KSr6whd3Fr) 上分享您的场景——团队可能会添加 C++ SDK 支持以自动处理它。
 </Note>
@@ -253,7 +257,7 @@ SELECT id, impedance FROM tmp_signals;
 
 ## 触发器
 
-触发器会在具有自定义类型列的表上触发。触发器主体可以引用 `NEW` 和 `OLD` 中的非自定义类型列。在触发器主体中访问自定义类型列的值尚未支持。
+触发器会在具有自定义类型列的表上触发。触发器主体可以引用 `NEW` 和 `OLD` 中的非自定义类型列。在触发器主体中访问自定义类型列的值是受支持的：`NEW.<column>` 和 `OLD.<column>` 可以直接读取并传递给扩展函数。
 
 ```sql
 CREATE TABLE signals (
@@ -264,14 +268,17 @@ CREATE TABLE signals (
 CREATE TABLE signal_log (
     id        INT,
     label     VARCHAR(50),
+    magnitude REAL,
     logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TRIGGER signals_after_insert
 AFTER INSERT ON signals
 FOR EACH ROW
-    INSERT INTO signal_log (id, label) VALUES (NEW.id, NEW.label);
+    INSERT INTO signal_log (id, label, magnitude)
+    VALUES (NEW.id, NEW.label, complex_abs(NEW.impedance));
 
 INSERT INTO signals VALUES (1, '(10,5)', 'sensor_a');
-SELECT id, label FROM signal_log;
+SELECT id, label, magnitude FROM signal_log;
+-- 1  sensor_a  11.180339887498949
 ```

@@ -12,7 +12,7 @@ description: "C++でVillageSQL拡張の新しいカラムタイプを定義し�
 
 ## タイプ操作の定義
 
-すべてのカスタムタイプには、エンコード、デコード、および比較操作が必要であり、オプションでハッシュ操作も必要です。これらのシグネチャに対して実装し、`vsql::make_type<>()`にビルダーオブジェクトを渡します。
+すべてのカスタムタイプには、エンコード、デコード、および比較操作が必要であり、オプションでハッシュ操作も定義できます。これらのシグネチャに対して実装し、`vsql::make_type<>()`ビルダーに渡します。
 
 ```cpp
 // Encode: string -> binary. Write to out.buffer() and call out.set_length(n).
@@ -32,7 +32,7 @@ size_t mytype_hash(vsql::CustomArg in) { /* ... */ }
 カスタムタイプを返すVDF（`from_string`）の場合、サーバーはVDFを呼び出す前に、出力バッファーのサイズをタイプの`persisted_length`値以上に設定するため、呼び出し時に`buf.size() >= persisted_length`が保証されます。これは、固定幅タイプとパラメータ化されたタイプの両方に適用されます（`persisted_length`は、呼び出し時にタイプコンテキストから解決されます）。個別のバッファーサイズ要求は必要ありません。
 </Note>
 
-生のバイナリアクセスは、連続した`T`のシーケンスに対する非所有ビューである`vsql::Span<T>`を介して行われます。`in.value()`は`vsql::Span<const unsigned char>`を返し、`out.buffer()`は`vsql::Span<unsigned char>`を返します。C++20以降を使用する場合、`vsql::Span<T>`は`std::span<T>`のエイリアスです。C++17の場合、C++ SDKは、同じ`data()`、`size()`、`empty()`、インデックス、およびイテレータインターフェースを持つ、最小限のソース互換のフォールバックを提供します。これは、`#include <villagesql/vsql.h>`を介して利用できます。
+生のバイナリアクセスは、連続した`T`のシーケンスに対する非所有ビューである`vsql::Span<T>`を介して行われます。`in.value()`は`vsql::Span<const unsigned char>`を返し、`out.buffer()`は`CustomResult`では`vsql::Span<unsigned char>`を、`StringResult`では`vsql::Span<char>`を返します。C++20以降を使用する場合、`vsql::Span<T>`は`std::span<T>`のエイリアスです。C++17の場合、C++ SDKは、同じ`data()`、`size()`、`empty()`、インデックス、およびイテレータインターフェースを持つ、最小限のソース互換のフォールバックを提供します。これは、`#include <villagesql/vsql.h>`を介して利用できます。
 
 ## タイプの登録
 
@@ -54,7 +54,7 @@ constexpr auto MYTYPE =
         .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
         .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
         .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
-        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Development guide
+        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Type Operations
         .build();
 
 VEF_GENERATE_ENTRY_POINTS(
@@ -73,10 +73,10 @@ VEF_GENERATE_ENTRY_POINTS(
 
 | ビルダーメソッド | 自動生成されたVDF名 | VDF SQLシグネチャ |
 |----------------|------------------------|-------------------|
-| `.from_string<&f>()` | `TYPE::from_string` | `(STRING) -> CUSTOM(このタイプ)` |
-| `.to_string<&f>()` | `TYPE::to_string` | `(CUSTOM(このタイプ)) -> STRING` |
-| `.compare<&f>()` | `TYPE::compare` | `(CUSTOM(このタイプ), CUSTOM(このタイプ)) -> INT` |
-| `.hash<&f>()` | `TYPE::hash` | `(CUSTOM(このタイプ)) -> INT` |
+| `.from_string<&f>()` | `TYPE::from_string` | `(STRING) -> CUSTOM(this type)` |
+| `.to_string<&f>()` | `TYPE::to_string` | `(CUSTOM(this type)) -> STRING` |
+| `.compare<&f>()` | `TYPE::compare` | `(CUSTOM(this type), CUSTOM(this type)) -> INT` |
+| `.hash<&f>()` | `TYPE::hash` | `(CUSTOM(this type)) -> INT` |
 
 完全なC++シグネチャについては、[タイプ操作](/ja/mysql-9.7/stable/type-operations)を参照してください。
 
@@ -89,7 +89,18 @@ VEF_GENERATE_ENTRY_POINTS(
 | 非カスタム | カスタム | エラー: `Cannot convert column 'col' to custom type 'MYTYPE'` |
 | カスタム | 文字列タイプ | 許可 |
 | カスタム | 文字列以外のタイプ | エラー: `Cannot convert custom type column 'col' to non-string type` |
-| カスタム | 異なるカスタムタイプ | 互換性がない場合はエラー: `Cannot convert between incompatible custom types 'A' and 'B'` |
+| カスタム | 異なるカスタムタイプ | 互換性がない場合はエラー: `Cannot convert between incompatible custom types 'ext_a.A' and 'ext_b.B'` |
+
+カスタムタイプの列を追加、削除、または変更する`ALTER TABLE`は、`LOCK TABLES`の下では即座に拒否されます。カスタムタイプの操作はvillagesql自身のシステムテーブルに書き込みますが、これらのテーブルはロック対象のテーブル一覧に含まれていないため、サーバーはテーブルを開く処理の深部で失敗するのではなく、ステートメントを事前に拒否します。
+
+```sql
+LOCK TABLES my_table WRITE;
+ALTER TABLE my_table ADD COLUMN v MYTYPE;
+-- ERROR 3219 (HY000): Custom type table operations are not supported under LOCK TABLES.
+UNLOCK TABLES;
+```
+
+カスタムタイプの列に触れない`ALTER TABLE`は、この制限の対象になりません。
 
 ## タイプ変換関数
 
@@ -150,7 +161,7 @@ void encode_complex(std::string_view from, CustomResult out) {
     if (endptr == p || *endptr != ',') return fail();
     p = endptr + 1;
     imag = strtod(p, &endptr);
-    if (endptr == p || *endptr != ')') return fail();
+    if (endptr == p || *endptr != ')' || endptr[1] != '\0') return fail();
     memcpy(buf.data(), &real, 8);
     memcpy(buf.data() + 8, &imag, 8);
     out.set_length(16);
@@ -195,6 +206,23 @@ int compare_complex(CustomArg a, CustomArg b) {
     if (a_imag > b_imag) return 1;
     return 0;
 }
+
+static constexpr const char kComplexTypeName[] = "COMPLEX";
+
+constexpr auto COMPLEX =
+    vsql::make_type<kComplexTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&encode_complex>()
+        .to_string<&decode_complex>()
+        .compare<&compare_complex>()
+        .intrinsic_default_str("(0,0)")
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(COMPLEX)
+);
 ```
 
 デコードには`snprintf`ではなく`std::to_chars`を使用します。`"%.6f"`のような固定精度の書式では`double`に必要な桁が失われ、`0.1234567891`が`0.123457`として読み戻されるためです。エンコードでは`strtod`を呼び出す前に入力をコピーします。`std::string_view`は終端のヌル文字を持たないためです。`std::from_chars`の浮動小数点オーバーロードを使えばこのコピーを回避できますが、libc++ではmacOS 26以降でのみ利用可能とマークされているため、これらを使用する拡張機能はそれより前のターゲット向けにビルドできません。
@@ -228,7 +256,7 @@ SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
 VDFは、生成されたカラム式で使用できます。VDFは、拡張ビルダーで`.deterministic()`として宣言されている必要があります。サーバーは、このコンテキストで非決定的な関数をブロックします。
 
 ```sql
-CREATE TABLE signals (
+CREATE TABLE signals_generated (
     id INT PRIMARY KEY,
     impedance COMPLEX,
     -- Generated column computed by a VDF
@@ -247,7 +275,7 @@ CREATE TABLE signals (
 VDFは、関数インデックス式で使用できます。生成されたカラムからの同じ`.deterministic()`要件がここにも適用されます。これは、MySQLが関数インデックスを隠し生成カラムとして実装するためです。
 
 ```sql
-CREATE TABLE signals (
+CREATE TABLE signals_indexed (
     id INT PRIMARY KEY,
     sig COMPLEX,
     INDEX idx_magnitude ((COMPLEX_ABS(sig)))
@@ -257,7 +285,7 @@ CREATE TABLE signals (
 オプティマイザは、同じVDF式が`WHERE`、`ORDER BY`、または`GROUP BY`に含まれる場合に、インデックスを使用します。オプティマイザが式を一致させられるように、比較値をVDFの戻り値のタイプにキャストします。
 
 ```sql
-SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+SELECT id FROM signals_indexed WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
 ```
 
 ## 次のステップ

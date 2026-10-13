@@ -18,7 +18,7 @@ SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
 | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_REQUESTED_AT | PENDING_LAST_ERROR | PENDING_LAST_ERROR_AT |
 +----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
 | vsql_complex   | 0.0.1             | NULL            | NULL                 | NULL               | NULL                  |
-| vsql_uuid      | 0.0.3             | NULL            | NULL                 | NULL               | NULL                  |
+| vsql_uuid      | 0.0.8             | NULL            | NULL                 | NULL               | NULL                  |
 +----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
 ```
 
@@ -85,7 +85,7 @@ SHOW VARIABLES LIKE 'veb_dir';
 | 找不到扩展 | 验证 `.veb` 文件是否存在于 `veb_dir` 中，并且名称正确 |
 | 权限被拒绝 | 检查权限：`chmod 644 extension.veb` |
 | 无法卸载：类型正在使用 | 尝试 `UNINSTALL EXTENSION`；错误会通过名称标识阻止的列 |
-| 版本不匹配 | 重新启动服务器以清除缓存 |
+| 版本不匹配 | `veb_dir` 中的 `.veb` 文件版本与已安装扩展的版本不同，服务器无法启动：恢复已安装版本的 `.veb` 文件，然后使用 `ALTER EXTENSION` |
 | 更新后扩展显示旧行为 | `UNINSTALL` 然后 `INSTALL`；如果需要，清除 `.veb_expansion_cache/` |
 | 无法比较类型 X 和 Y | 两侧都必须使用相同的自定义类型 |
 | 无法隐式转换非自定义类型 | 要比较的字面量或列与自定义类型不兼容 |
@@ -113,7 +113,7 @@ sudo chmod 644 /path/to/veb_dir/my_extension.veb
 
 ### 安装后函数不可用
 
-**错误：** `FUNCTION my_func does not exist`
+**错误：** `ERROR 1305 (42000): FUNCTION mydb.my_func does not exist`
 
 **调试步骤：**
 ```sql
@@ -128,7 +128,7 @@ SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension
 
 **原因：** VillageSQL 会在第一次加载时将 `.veb` 文件解包到 `{datadir}/.veb_expansion_cache/`。如果您
 在不先运行 `UNINSTALL EXTENSION` 的情况下复制新的 `.veb`，服务器将继续
-使用先前解包的 `.so`，该 `.so` 已经加载到内存中。
+使用它已经解包的 `.so`，并且在下次重启时，如果缓存中缺少该解包内容，服务器会拒绝启动。
 
 **解决方案：** 始终遵循完整的 UNINSTALL → 替换 → INSTALL 流程：
 
@@ -142,28 +142,19 @@ UNINSTALL EXTENSION my_extension;
 INSTALL EXTENSION my_extension;
 ```
 
-如果扩展仍然显示旧行为，请在重新安装之前清除扩展缓存：
-
-```bash
-rm -rf {datadir}/.veb_expansion_cache/my_extension/
-```
-
-```sql
-INSTALL EXTENSION my_extension;
-```
 
 ---
 
 ### 无法卸载扩展
 
-**错误：** `Cannot uninstall extension: types in use`
+**错误：** ``ERROR 3219 (HY000): Cannot drop extension `my_extension` as 1 column(s) depend on it``
 
 **解决方案：**
 
 ```sql
 -- Attempt uninstall; the error identifies blocking columns by name
 UNINSTALL EXTENSION my_extension;
--- If blocked: ERROR HY000: Cannot drop extension `my_extension` as 1 column(s) depend on it,
+-- If blocked: ERROR 3219 (HY000): Cannot drop extension `my_extension` as 1 column(s) depend on it,
 --             e.g. mydb.mytable.my_column has type MYTYPE
 
 -- Drop or alter the identified column(s), then retry
@@ -176,7 +167,7 @@ UNINSTALL EXTENSION my_extension;
 
 ### 库加载错误
 
-**错误：** `Cannot load library: undefined symbol`
+**错误：** `Failed to load VEF extension 'my_extension': failed to load so: <dlerror text>`
 
 **原因：**
 - 缺少库依赖项
@@ -196,8 +187,8 @@ otool -L {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.s
 
 **错误：** `Failed to load VEF extension 'extension_name'`
 
-**原因：** `.veb` 文件在入口点阶段加载失败——例如缺少或无效的
-`vef_register` 符号，或者 `.veb` 文件已损坏。
+**原因：** 扩展库已加载，但其入口点失败——例如缺少或无效的
+`vef_register` 符号。
 
 ### 扩展名称验证错误
 
@@ -284,7 +275,7 @@ SELECT * FROM t WHERE complex_col = 42;
 -- ERROR: Unable to implicitly cast a non-custom type during compare...
 ```
 
-**解决方案：** 使用类型的编码函数，字面字符串会自动转换为自定义类型。对于其他类型（整数、浮点数），请使用显式转换函数：
+**解决方案：** 字符串字面量会通过类型的编码函数自动转换为自定义类型。对于其他类型（整数、浮点数），请使用显式转换函数：
 
 ```sql
 -- Use a string literal instead (auto-cast works)
@@ -459,8 +450,9 @@ WHERE EXTENSION_NAME = 'update_test';
 
 ### 从启动时的待处理版本更改中恢复
 
-已计划的版本更改会在下次服务器启动期间应用。如果
-某个待处理的操作无法应用，服务器可能会启动失败，而其待处理更新决策仍保留在磁盘上。当排队的
+已计划的版本更改会在下次服务器启动期间应用。无法应用的更改会被跳过，
+服务器会将原因记录在 `PENDING_LAST_ERROR` 中。如果服务器无法保存其待处理更新决策，
+则会启动失败。当排队的
 `ALTER EXTENSION ... AT RESTART` 阻止了启动，而你需要在清除它之前
 先让服务器启动时，请使用 `--villagesql-skip-extension-updates`。
 
@@ -503,11 +495,11 @@ WHERE EXTENSION_NAME = 'update_test';
     ```
 
     ```text
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_LAST_ERROR |
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     | my_extension   | 1.0.0             | 2.0.0           | NULL               |
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     ```
 
     **成功信号：** 每一行的 `PENDING_VERSION` 就是你需要清除的目标；
@@ -524,7 +516,7 @@ WHERE EXTENSION_NAME = 'update_test';
 
     **成功信号：** 返回一条 `Cleared pending update for extension '<name>'
     (target matches current version '<current>')` 提示，且
-    重新运行上一个查询显示 `PENDING_VERSION` 为 `NULL`。
+    重新运行上一个查询不再返回任何行。
   </Step>
   <Step title="不带该标志重启">
     正常重启服务器，省略 `--villagesql-skip-extension-updates`。
@@ -547,7 +539,7 @@ WHERE EXTENSION_NAME = 'update_test';
    sudo rm /path/to/veb_dir/extension_name.veb
 
    # Copy new .veb file
-   sudo cp new_extension_name.veb /path/to/veb_dir/
+   sudo cp new_extension_name.veb /path/to/veb_dir/extension_name.veb
    ```
 
 3. **安装新版本：**
@@ -603,7 +595,7 @@ rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
 ```
 
 <Note>
-  服务器重启会自动清理孤立的解包缓存目录。
+  服务器重启会删除未安装扩展的解包目录。它不会删除已安装扩展的旧 `{sha256}` 目录。
 </Note>
 
 ---
@@ -612,7 +604,7 @@ rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
 
 对于自定义类型，推荐使用 ROW 格式的 binlog。对自定义类型列执行的 INSERT、UPDATE、DELETE 和 ALTER TABLE 操作在 ROW 格式中都能正确复制。
 
-`INSTALL EXTENSION` 不会复制——每个服务器管理自己的扩展。在复制开始之前，在每个副本上安装扩展，并使用与源相同的版本。服务器强制执行精确的版本匹配；版本不匹配会停止复制。
+`INSTALL EXTENSION` 不会复制——每个服务器管理自己的扩展。在复制开始之前，在每个副本上安装扩展，并使用与源相同的版本。服务器不会比较版本：运行不同版本的副本会使用它自己的扩展版本来应用这些更改。
 
 如果副本遇到它不识别的自定义类型，则复制将在 DDL 语句处停止——在 `CREATE TABLE` 或 `ALTER TABLE` 处，在任何依赖的 DML 应用之前。安装正确的扩展版本，然后恢复：
 
@@ -622,9 +614,18 @@ START REPLICA SQL_THREAD;
 ```
 
 `mysqldump` 在输出中保留完全限定的自定义类型名称。只要在导入转储之前在目标服务器上安装了扩展，逻辑恢复就可以工作。
+<Note>
+`CLONE INSTANCE` 会在连接握手期间、任何数据传输之前，验证捐赠方上安装的每个 VillageSQL 扩展在接收方上都可用——名称、版本和 `.veb` SHA256 都相同。缺失或不匹配的扩展会在握手期间中止克隆，而不是让克隆完成后在接收方重启时才失败。从安装了 `vsql_complex` 的捐赠方向缺少该扩展 `.veb` 的接收方执行 `CLONE INSTANCE` 会失败，并报：
+
+```text
+ERROR 3219 (HY000): VillageSQL: VEB file for extension 'vsql_complex' not found
+```
+
+在克隆之前，请将捐赠方拥有的每个扩展的同一 `.veb` 构建放入接收方的 `veb_dir`。
+</Note>
 
 <Warning>
-尚未测试与 Clone 插件、XtraBackup 和 InnoDB Cluster / Group Replication 的行为。在生产环境中依赖它之前，请测试您的恢复路径。
+尚未测试与 XtraBackup 和 InnoDB Cluster / Group Replication 的行为。在生产环境中依赖它之前，请测试您的恢复路径。
 </Warning>
 
 ---
@@ -640,7 +641,7 @@ services:
   villagesql:
     image: villagesql/server:mysql-9.7_latest
     environment:
-      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_ROOT_PASSWORD: "<your-password>"
     ports:
       - "3306:3306"
     volumes:
@@ -648,7 +649,7 @@ services:
     command: --veb_dir=/usr/lib/veb
 ```
 
-将 `.veb` 文件复制到主机上的 `./extensions/` 中，然后从 SQL 安装：
+将您需要的 `.veb` 文件复制到主机上的 `./extensions/` 中（该挂载会遮盖镜像中自带的 `.veb` 文件），然后从 SQL 安装：
 
 ```sql
 INSTALL EXTENSION my_extension;
@@ -666,7 +667,7 @@ SHOW VARIABLES LIKE 'veb_dir';
 
 如果您遇到此处未涵盖的问题：
 
-1. **检查错误日志：** 大多数扩展错误都带有详细信息记录在日志中。
+1. **检查错误日志：** 库加载失败和启动错误（例如版本不匹配或未能应用的待处理更新）都会带有详细信息记录在日志中。
 2. **查看扩展文档：** 扩展特定的故障排除方法可能存在。
 3. **在 Discord 上提问：** 加入 [VillageSQL Discord](https://discord.gg/KSr6whd3Fr)。
 4. **提交问题：** 在 [GitHub Issues](https://github.com/villagesql/villagesql-server/issues) 上报告错误。

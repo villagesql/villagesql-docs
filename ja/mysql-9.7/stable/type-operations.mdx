@@ -12,25 +12,25 @@ description: "C++タイプ操作ビルダーの詳細なリファレンス — �
 
 ```cpp
 // Encode: string -> binary. Write the encoded bytes via out.buffer() and
-// out.set_length(n); call out.set_null() for SQL NULL, out.warning(msg) for
-// recoverable bad input, or out.error(msg) to abort the statement. Returning
-// without calling any of these surfaces a default warning.
+// out.set_length(n). out.set_null(), out.warning(msg), out.error(msg), or no
+// call at all reports the value as invalid: ERROR 1366 in strict mode, a
+// warning under IGNORE. msg is discarded.
 using TypeEncodeFunc = void (*)(std::string_view from, vsql::CustomResult out);
 
-// Decode: binary -> string. Report the outcome by calling
-// out.set_length(n), out.set(sv), out.set_null(), out.warning(msg), or
-// out.error(msg). If none is called the SDK falls back to a default
-// "failed to decode value" ERROR.
+// Decode: binary -> string. Report the result by calling out.set_length(n)
+// or out.set(sv). out.set_null(), out.warning(msg), out.error(msg), or no call
+// at all fails the read with ERROR 3219; msg goes to the server log, and the
+// default message is "failed to decode value".
 using TypeDecodeFunc = void (*)(vsql::CustomArg in, vsql::StringResult out);
 
 // Compare: returns -1, 0, or 1 (used for ORDER BY and indexes).
 using TypeCompareFunc = int (*)(vsql::CustomArg a, vsql::CustomArg b);
 
-// Hash: returns hash code (used for hash joins).
+// Hash: returns hash code (used for GROUP BY, DISTINCT and UNION).
 using TypeHashFunc = size_t (*)(vsql::CustomArg in);
 ```
 
-カスタムハッシュ関数を省略すると、タイプの生の格納バイトをハッシュする方式にフォールバックします。これは、エンコード関数が、論理的に等しい値に対して複数のバイナリ表現を生成しうるタイプでは安全ではありません。よくあるケースは浮動小数点フィールドで、`-0.0`と`+0.0`は等しいと比較されるにもかかわらずビット単位では異なるため、`GROUP BY`と`COUNT(DISTINCT)`がそれらを異なる値として扱ってしまいます。
+カスタムハッシュ関数を省略すると、タイプの生の格納バイトをハッシュする方式にフォールバックします。これは、エンコード関数が、論理的に等しい値に対して複数のバイナリ表現を生成しうるタイプでは安全ではありません。よくあるケースは浮動小数点フィールドで、`-0.0`と`+0.0`は等しいと比較されるにもかかわらずビット単位では異なるため、`GROUP BY`と`SELECT DISTINCT`がそれらを異なる値として扱ってしまいます。
 
 これらの操作は、`vsql::make_type<kTypeName>()`を使用して登録します。タイプ名は、非型テンプレートパラメータ（NTTP）として渡されます。`static constexpr const char[]`配列です。ビルダーは、このNTTPから`TYPE::method`形式（例：`"MYTYPE::from_string"`）のVDF名を自動生成するため、手動での文字列マッチングは不要です。ビルドされたタイプオブジェクトを、拡張ビルダーの`.type()`に渡します。タイプ操作用の個別の`.func()`呼び出しは必要ありません。
 
@@ -58,7 +58,7 @@ constexpr auto MYTYPE =
         .from_string<&my_encode>()   // auto: "MYTYPE::from_string"
         .to_string<&my_decode>()     // auto: "MYTYPE::to_string"
         .compare<&my_compare>()      // auto: "MYTYPE::compare"
-        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash" — required for types storing floating-point values
+        .hash<&my_hash>()            // optional, auto: "MYTYPE::hash"; set it for types that store floating-point values
         .intrinsic_default_str("0")  // string-literal intrinsic default
         .build();
 
@@ -72,7 +72,7 @@ VEF_GENERATE_ENTRY_POINTS(
 カスタムタイプが宣言できるストレージは、値ごとに最大**65532バイト**です。カスタムカラムは`VARBINARY`フィールドによって支えられており、MySQLの1行あたり65535バイトの予算からは、そのフィールドの長さを表す2バイトと行のNULLバイトも支払われます。カラムがNULL可能かどうかは`CREATE TABLE`時にカラムごとに決まり、NULL可能がデフォルトであるため、この上限はNULLバイトの分を残しておく必要があります。`persisted_length`と`max_persisted_length`の両方がこの上限に対してチェックされ、そのチェックは`CREATE TABLE`時ではなく`INSTALL EXTENSION`時に実行されます。そのため、幅が大きすぎるタイプは拡張機能全体とともに拒否されます。
 
 ```text
-ERROR HY000: Failed to install extension 'vsql_huge_fixed_test': type 'HUGE_FIELD' declares 70000 bytes of storage per value, which exceeds the maximum of 65532 bytes supported for custom-type columns today
+ERROR 3219 (HY000): Failed to install extension 'vsql_huge_fixed_test': type 'HUGE_FIELD' declares 70000 bytes of storage per value, which exceeds the maximum of 65532 bytes supported for custom-type columns today
 ```
 
 上限を下回っていても、カラムが収まることが保証されるわけではありません。テーブル内の他のすべてのカラムも同じ65535バイトの行予算から引き出され、それを判断できるのは`CREATE TABLE`だけです。そのため、上限またはその付近のタイプは、そこで`ER_TOO_BIG_ROWSIZE`により失敗する可能性があります。同じ幅の通常の`VARBINARY`も同じ動作をします。
@@ -82,17 +82,22 @@ ERROR HY000: Failed to install extension 'vsql_huge_fixed_test': type 'HUGE_FIEL
 `NOT NULL`のカスタムタイプカラムが`IGNORE`モード（例：`INSERT IGNORE`または`UPDATE IGNORE`）で`NULL`を受け取った場合、サーバーはエラーを発生させる代わりに、組み込みデフォルトを呼び出してフォールバック値を生成します。組み込みデフォルトは文字列表現を提供し、サーバーはタイプの`from_string`関数を使用してそれをバイナリに変換します。
 
 <Note>
-`.intrinsic_default_str()`と`.intrinsic_default_vdf()`の両方を省略すると、サーバーはフォールバックとして`from_string("")`を呼び出します。これは、タイプが**最初に使用される**とき（テーブル作成時）に発生し、`INSTALL EXTENSION`時ではありません。エンコード関数が空の文字列を拒否する場合、または間違ったバイト数にエンコードする場合、タイプの初期化はSQLクライアントに表示されるエラーで失敗します。
+`.intrinsic_default_str()`と`.intrinsic_default_vdf()`の両方を省略すると、サーバーはフォールバックとして`from_string("")`を呼び出します。これは、タイプが**最初に使用される**とき（テーブル作成時）に発生し、`INSTALL EXTENSION`時ではありません。エンコード関数が空の文字列を拒否する場合、タイプの初期化はSQLクライアントに表示されるエラーで失敗します。
 
 ```
-Type 'MYTYPE' failed to initialize: from_string VDF encoded intrinsic
-default input '' to N bytes, expected persisted_length=M
+ERROR 3219 (HY000): Type 'my_ext.MYTYPE' failed to initialize: from_string VDF failed to encode intrinsic default input '' (expected persisted_length=M)
+```
+
+空の文字列を間違ったバイト数にエンコードする場合、エラーは次のとおりです。
+
+```
+ERROR 3219 (HY000): Type 'my_ext.MYTYPE' failed to initialize: from_string VDF encoded intrinsic default input '' to N bytes, expected persisted_length=M
 ```
 
 固定長タイプの場合、デフォルト文字列は正確に`persisted_length`バイトにエンコードされる必要があります。空の文字列が有効な入力ではないタイプには、明示的なデフォルトを設定してください。
 </Note>
 
-組み込みデフォルトは、次の2つの方法のいずれかで指定します。この2つは相互に排他的です。`.intrinsic_default_str()`と`.intrinsic_default_vdf()`の両方を宣言すると、コンパイルエラーになります。
+組み込みデフォルトは、次の2つの方法のいずれかで指定します。この2つは相互に排他的です。`.intrinsic_default_str()`と`.intrinsic_default_vdf()`の両方を宣言すると、開発ABIヘッダー（`-DVSQL_USE_DEV_ABI=ON`）ではコンパイルエラーになります。安定版ヘッダーでは、サーバーは`INSTALL EXTENSION`時にそのタイプを拒否します。
 
 **文字列リテラル：`.intrinsic_default_str()`**
 
@@ -101,12 +106,6 @@ default input '' to N bytes, expected persisted_length=M
 **VDFベース：`.intrinsic_default_vdf()` + `make_intrinsic_default`**
 
 デフォルト値がタイプパラメータに依存する場合は、次のいずれかのシグネチャに対して関数を実装します（`<villagesql/vsql.h>`から利用可能）。
-
-<Warning>
-  **破壊的変更**：`IntrinsicDefaultFunc`と
-  `IntrinsicDefaultWithParamsFunc`は、`const char*`ではなく`std::string`を返します。
-  既存の組み込みデフォルトの実装を更新して、直接`std::string`を返すようにしてください。
-</Warning>
 
 ```cpp
 // Fixed (no type parameters):
@@ -128,7 +127,9 @@ std::string mytype_default(const MyTypeParams &p, char * /*error_msg*/) {
 
 ## パラメータ化されたタイプ {#parameterized-types}
 
-パラメータ化されたタイプは、割り当てサイズとレイアウトを決定するために、エンコード、デコード、比較、およびハッシュの時点でカラムの宣言されたパラメータを必要とします。パース関数と逆の`to_strings`関数を持つパラメータ構造体を定義し、`.params<P, &ParseFunc, &ToStringsFunc>()`でタイプビルダーに両方を登録し、タイプ操作関数の最初の引数として`const P&`を使用します。SDKは一意のパラメータの組み合わせごとにパース結果をキャッシュするため、パース関数はタイプのインスタンス化ごとに最大1回だけ実行されます。`to_strings`関数は`parse`の逆です。型`P`のインスタンスを正規のキー/値の文字列形式に書き戻すため、サーバーは`parse`が消費するのと同じ形状で推論されたパラメータを公開できます。
+パラメータ化されたタイプは、割り当てサイズとレイアウトを決定するために、エンコード、デコード、比較、およびハッシュの時点でカラムの宣言されたパラメータを必要とします。パース関数と逆の`to_strings`関数を持つパラメータ構造体を定義し、`.params<P, &ParseFunc, &ToStringsFunc>()`でタイプビルダーに両方を登録し、タイプ操作関数の最初の引数として`vsql::MaybeParams<P> &`（エンコード）または`vsql::CustomArgWith<P>`（デコード、比較、ハッシュ）を取ります。SDKは一意のパラメータの組み合わせごとにパース結果をキャッシュするため、パース関数はタイプのインスタンス化ごとに最大1回だけ実行されます。`to_strings`関数は`parse`の逆です。型`P`のインスタンスを正規のキー/値の文字列形式に書き戻すため、サーバーは`parse`が消費するのと同じ形状で推論されたパラメータを公開できます。
+
+パースキャッシュは、パラメータ構造体そのものをキーとします。`TypeParamsCache<P>`は`P`ごとに1つのインスタンスであり、その`P`で宣言されたすべてのカスタムタイプで共有されます。複数のタイプが同じパラメータ構造体を使用する場合、それぞれが同じパース関数を登録しなければなりません。異なる方法でパースする必要があるタイプには、独自のパラメータ構造体が必要です。
 
 ```cpp
 struct MyTypeParams {
@@ -144,7 +145,7 @@ struct MyTypeParams {
 
 void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
                    std::string_view from, vsql::CustomResult out) {
-  const MyTypeParams &p = params.value();  // is_known() is always true at runtime
+  const MyTypeParams &p = params.value();  // is_known() is false when the server infers the params from a constant string
   size_t bytes = (size_t)p.dimension * 4;
   auto buf = out.buffer();
   if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
@@ -187,22 +188,44 @@ bool mytype_int_to_params_fn(int64_t value,
 bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
                               vsql::ResolvedTypeParams *result,
                               char *error_msg) {
-  int64_t dim = std::stoll(params.at("dimension"));
+  auto it = params.find("dimension");
+  if (it == params.end()) {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN, "MYTYPE: dimension parameter is required");
+    return true;
+  }
+  char *endptr = nullptr;
+  int64_t dim = std::strtoll(it->second.c_str(), &endptr, 10);
+  if (endptr == it->second.c_str() || *endptr != '\0') {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: invalid dimension value '%s'", it->second.c_str());
+    return true;
+  }
+  if (dim <= 0) {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: dimension must be a positive integer");
+    return true;
+  }
+  if (dim > INT64_MAX / 4) {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: dimension %" PRId64 " is too large", dim);
+    return true;
+  }
   result->persisted_length = dim * 4;
   result->max_decode_buffer_length = 64;
   return false;  // success
 }
 ```
 
-タイプビルダーに`.params<>()`を登録します。`MYTYPE(N)`整数構文を処理するには`.int_to_params<&mytype_int_to_params_fn>()`を、パラメータを検証してストレージサイズを計算するには`.resolve_params<&mytype_resolve_params_fn>()`を使用します。すべての有効なパラメータ化にわたる永続化されるバイトサイズの上限を指定して`.max_persisted_length(N)`を呼び出します。サーバーはこれをタイプパラメータ推論のパスでのみ使用します。そこではまだパラメータを推論しておらず、エンコードバッファーのサイズを決定するために`resolve_params`を参照できないためです。VDFベースの組み込みデフォルトの場合は、VDF名を指定して`.intrinsic_default_vdf()`を使用し、`make_intrinsic_default<&mytype_default>()`を介してVDFを個別に登録します。
+タイプビルダーに`.params<>()`を登録します。`MYTYPE(N)`整数構文を処理するには`.int_to_params<&mytype_int_to_params_fn>()`を、パラメータを検証してストレージサイズを計算するには`.resolve_params<&mytype_resolve_params_fn>()`を使用します。すべての有効なパラメータ化にわたる永続化されるバイトサイズの上限を指定して`.max_persisted_length(N)`を呼び出します。サーバーは、まだパラメータを推論しておらず、そのため`resolve_params`を参照できないタイプパラメータ推論のパスで、エンコードバッファーのサイズを決定するためにこれを使用し、解決された固定の`persisted_length`がこれを超える場合は拒否します。VDFベースの組み込みデフォルトの場合は、VDF名を指定して`.intrinsic_default_vdf()`を使用し、`make_intrinsic_default<&mytype_default>("vdf_name")`を介してVDFを個別に登録します。
 
-`.params<>()`または`.int_to_params<>()`が登録されている場合、`build()`は常に
-`.resolve_params<>()`を必要とします。`int_to_params`は`MYTYPE(N)`という短縮形を
-パラメータ文字列に書き換えるだけであり、パラメータを検証してストレージサイズを
-解決するゲートは`resolve_params`です。これを省略すると、コンパイルエラーになります。
+開発ABIヘッダー（`-DVSQL_USE_DEV_ABI=ON`）に対してビルドする場合、`.params<>()`または
+`.int_to_params<>()`が登録されていれば、`build()`は常に`.resolve_params<>()`を
+必要とします。`int_to_params`は`MYTYPE(N)`という短縮形をパラメータ文字列に
+書き換えるだけであり、パラメータを検証してストレージサイズを解決するゲートは
+`resolve_params`です。これを省略すると、そこではコンパイルエラーになります。安定版ヘッダーでは、サーバーは`INSTALL EXTENSION`時にそのタイプを拒否します。
 
 <Warning>
-`.max_persisted_length()`にはVEFプロトコル3以上が必要です。これを使用するタイプは、プロトコル3より前のサーバーではロードできません。これは、可変長タイプまたはパラメータ化されたタイプでのみ有効です。パラメータ化されていない固定長タイプがこれを設定すると、コンパイルに失敗します。
+`.max_persisted_length()`にはVEFプロトコル3以上が必要です。これを使用するタイプは、プロトコル3より前のサーバーではロードできません。これは、可変長タイプまたはパラメータ化されたタイプでのみ有効です。パラメータ化されていない固定長タイプがこれを設定すると、開発ABIヘッダー（`-DVSQL_USE_DEV_ABI=ON`）ではコンパイルに失敗し、安定版ヘッダーでビルドした場合はサーバーが`INSTALL EXTENSION`時にそれを拒否します。
 </Warning>
 
 `resolve_params`が報告するサイズは、カラムのパラメータが判明した`CREATE TABLE`時にも
@@ -224,7 +247,7 @@ constexpr int64_t kMyTypeMaxPersistedLength = kMyTypeMaxDimension * 4;
 
 constexpr auto MYTYPE =
     vsql::make_type<kMyTypeName>()
-        .variable_length_type()  // Protocol 4; use instead of persisted_length(-1)
+        .persisted_length(-1)    // fixed length, sized per column by resolve_params
         .max_decode_buffer_length(16)
         .max_persisted_length(kMyTypeMaxPersistedLength)
         .params<MyTypeParams, &MyTypeParams::parse, &MyTypeParams::to_strings>()
@@ -252,8 +275,8 @@ VEF_GENERATE_ENTRY_POINTS(
 `<villagesql/vsql.h>`から利用可能です。
 `vsql::make_type`のテンプレートメソッドは、パラメータ引数を検出し、
 パラメータキャッシュを自動的に経由します。エンコード関数は、
-最初の引数として`vsql::MaybeParams<P> &`を取ります。`is_known()`は実行時に常に真であり、
-`value()`は`const P&`を返します。デコード、比較、およびハッシュの
+最初の引数として`vsql::MaybeParams<P> &`を取ります。`is_known()`は、サーバーが定数文字列からパラメータを推論する場合に偽であり、
+`value()`は、パラメータが判明した後に`const P&`を返します。デコード、比較、およびハッシュの
 バリアントは、`params()`アクセサが`const P&`を返す`vsql::CustomArgWith<P>`を取ります。
 
 **SQLでのパラメータの指定。** 2つの構文が`resolve_params`に到達します。
@@ -287,9 +310,22 @@ CREATE TABLE t2 (v ext.MYTYPE('dimension=8')); -- string form (.resolve_params o
 単一のタイプのパラメータ名と値を合わせて1024バイト以内に収めてください。
 </Note>
 
+どちらの構文でパラメータを指定した場合でも、サーバーは`resolve_params`を呼び出す前に、
+結果のマップを検証します。すべてのキーは空でなく、1回だけ出現し、空でない値を
+持たなければなりません。違反は、タイプ名を示す構文エラーになります。パラメータ名が空の
+場合を除き、問題のあるキーも示されます。
+
+```sql
+-- vsql_tvector ships in the villagesql/server Docker image; with a tarball install, build it from villagesql/examples/vsql-tvector in the server source
+INSTALL EXTENSION vsql_tvector;
+CREATE TABLE t3 (v vsql_tvector.TVECTOR('dimension=3,dimension=4'));
+-- ERROR 1064 (42000) at line 1: Type 'vsql_tvector.TVECTOR': duplicate parameter 'dimension' near 'vsql_tvector.TVECTOR('dimension=3,dimension=4'))' at line 1
+```
+
 ### パラメータの書き換えとデフォルトの指定
 
-`resolve_params`には、2つ目の変更用オーバーロードがあります。パラメータマップを
+`resolve_params`には、2つ目の変更用オーバーロードがあり、これはオプトインの
+開発ABIヘッダー（`-DVSQL_USE_DEV_ABI=ON`）でのみ宣言されています。パラメータマップを
 非const参照で受け取るため、タイプがそれを書き換えることができます — 通常は、
 作者が省略したデフォルトを埋めるためです。同じ方法で登録します
 （`.resolve_params<&fn>()`はどちらの形式も受け入れます。1つだけ登録してください）。
@@ -299,21 +335,44 @@ bool mytype_resolve_params_fn(std::map<std::string, std::string> &params,
                               vsql::ResolvedTypeParams *result, char *error_msg) {
   if (params.find("dimension") == params.end())
     params["dimension"] = "128";                 // supply a default
-  int64_t dim = std::stoll(params.at("dimension"));
+  const std::string &dim_str = params.at("dimension");
+  char *endptr = nullptr;
+  int64_t dim = std::strtoll(dim_str.c_str(), &endptr, 10);
+  if (endptr == dim_str.c_str() || *endptr != '\0') {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: invalid dimension value '%s'", dim_str.c_str());
+    return true;
+  }
+  if (dim <= 0) {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: dimension must be a positive integer");
+    return true;
+  }
+  if (dim > INT64_MAX / 4) {
+    snprintf(error_msg, VEF_MAX_ERROR_LEN,
+             "MYTYPE: dimension %" PRId64 " is too large", dim);
+    return true;
+  }
   result->persisted_length = dim * 4;
   result->max_decode_buffer_length = 64;
   return false;                                  // success
 }
 ```
 
+変更用の`resolve_params`コールバックは、パラメータを追加または変更できますが、
+呼び出し側が書いたパラメータを削除することはエラーです：`Type '<extension>.<type>':
+resolve_params removed parameter '<key>'; parameters may be added or changed
+but not removed`。
+
 書き換えられたマップは、サーバーが永続化し、`SHOW CREATE TABLE`が出力する
 正規のパラメータ文字列になるため、書き換えは冪等でなければなりません。**素の**
-宣言（`MYTYPE`、長さやパラメータなし）は、それをスキップするのではなく、
-空のマップで`resolve_params`を呼び出すようになったため、デフォルトを提供するタイプは、
+宣言（`MYTYPE`、長さやパラメータなし）は、タイプが`.int_to_params<>()`を登録していない
+場合、空のマップで`resolve_params`を呼び出すため、デフォルトを提供するタイプは、
 すべてのカラムに明示的なパラメータを与えます — `vsql_bitfield_test`の`BITFIELD`は、
 素のカラムを`max_number_of_bits=4096`に解決します。
 
 ```sql
+-- vsql_bitfield_test is built from villagesql/test-extensions/vsql-bitfield-test in the server source; the release does not ship it
 INSTALL EXTENSION vsql_bitfield_test;
 CREATE TABLE bits (id INT PRIMARY KEY, b vsql_bitfield_test.BITFIELD);
 SHOW CREATE TABLE bits;   -- b persists as BITFIELD('max_number_of_bits=4096')
@@ -377,7 +436,7 @@ VEF_GENERATE_ENTRY_POINTS(
         .intrinsic_default_str("[0]")  // empty "[]" would encode to zero bytes
 ```
 
-そうしないと、`NOT NULL`カラムが最初にそれを参照するとき、`CREATE TABLE`時に
+そうしないと、カラムが最初にそれを参照するとき、`CREATE TABLE`時に
 タイプの初期化に失敗します — `from_string("")`をエンコードできない固定長タイプと
 同じです。
 </Note>

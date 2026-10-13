@@ -14,13 +14,13 @@ description: "VillageSQL Rust SDKで新しいカラム型を定義します。�
 
 - 標準のSQL型では表現できないバイナリのオンディスクレイアウトが必要な場合（パックされた浮動小数点数、固定幅の整数、バイナリ識別子）
 - 型に、辞書順の文字列の順序とは異なる独自の順序セマンティクスがある場合
-- `ORDER BY`、`COUNT(DISTINCT)`、およびセット操作のために、サーバーに値を正しくインデックス化・ハッシュさせたい場合
+- `ORDER BY`、`GROUP BY`、`DISTINCT`、およびセット操作のために、サーバーに値を正しくインデックス化・ハッシュさせたい場合
 
 SQLで呼び出すことができる関数のみが必要で、データが`STRING`、`INT`、または`REAL`カラムに問題なく収まる場合は、カスタム型は必要ありません。
 
 ## `custom_type!`マクロ
 
-すべてのカスタム型には、4つのコールバック（エンコード、デコード、比較、ハッシュ）とデフォルト値が必要です。完全なマクロのシグネチャは次のとおりです。
+すべてのカスタム型には、3つのコールバック（エンコード、デコード、比較）とデフォルト値が必要で、オプションでハッシュのコールバックを指定できます。完全なマクロのシグネチャは次のとおりです。
 
 ```rust
 villagesql::custom_type!(
@@ -38,15 +38,16 @@ villagesql::custom_type!(
 | フィールド | 型 | 説明 |
 |---|---|---|
 | `type_name` | 文字列リテラル | SQLの型名。SQLでは大文字と小文字が区別されません。 |
-| `persisted_length` | `usize` | オンディスクストレージの固定バイト長。 |
-| `max_decode_buffer_length` | `usize` | デコードされた文字列表現の最大バイト長。 |
+| `persisted_length` | `i64` | オンディスクストレージの固定バイト長。 |
+| `max_decode_buffer_length` | `i64` | デコードされた文字列表現の最大バイト長。 |
 | `encode` | 関数 | `INSERT`時に`&str`をバイナリバイトに変換します。 |
 | `decode` | 関数 | 表示用にバイナリバイトを`String`に変換します。 |
 | `compare` | 関数 | `ORDER BY`、`MIN`、`MAX`の`Ordering`を返します。 |
-| `hash` | 関数 | `COUNT(DISTINCT)`およびセット操作の`usize`ハッシュを返します。オプションですが、インデックス化されたカラムには推奨されます。 |
-| `default` | 文字列リテラル | サーバーが型初期化時にエンコードできる有効な文字列。正確に`persisted_length`バイトにエンコードする必要があります。オプションですが、推奨されます。 |
+| `hash` | 関数 | `GROUP BY`、`DISTINCT`、および`UNION`などのセット操作の`usize`ハッシュを返します。オプションですが、推奨されます。 |
+| `default` | 文字列リテラル | サーバーが型初期化時にエンコードできる有効な文字列。正確に`persisted_length`バイトにエンコードする必要があります。`intrinsic_default_fn`を指定しない限り必須です。 |
+| `intrinsic_default_fn` | 関数 | デフォルト値を記述する代わりに計算します: `fn() -> Result<String, String>`。デフォルト値をリテラルとして書けない場合に使用します。 |
 
-`type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、および`compare`は必須です。`hash`と`default`はオプションですが、推奨されます。`hash`は、正しい`COUNT(DISTINCT)`およびセット操作に必要であり、`default`は、型初期化の検証に必要です。
+`type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、および`compare`は必須です。`hash`はオプションですが、正しい`GROUP BY`、`DISTINCT`、およびセット操作はこれに依存するため、推奨されます。型にはどちらかの方法でデフォルト値を与えてください。リテラルとして書ける値には`default`を、拡張機能が計算する必要がある値には`intrinsic_default_fn`を使用します。両方を設定すると`INSTALL EXTENSION`は失敗します。どちらも設定しない場合、拡張機能はインストールできますが、その型を指定する最初のステートメントが失敗します。
 
 ## バイナリ値の受信と返却
 
@@ -58,7 +59,7 @@ villagesql::custom_type!(
 fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
     match args.first() {
         Some(InValue::Custom(b)) => {
-            let numer = read_i64(b, 0);
+            let numer = i64::from_le_bytes(b[..8].try_into().unwrap());
             VdfReturn::int(numer)
         }
         Some(InValue::Null) | None => VdfReturn::null(),
@@ -84,12 +85,16 @@ fn rational_add_impl(args: &[InValue]) -> VdfReturn {
 `func!`宣言でカスタム型を参照するには、`villagesql::custom!("type_name")`を使用します。
 
 ```rust
-villagesql::func!(
-    rational_add_impl,
-    "rational_add",
-    [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
-    deterministic: true
-)
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(
+            rational_add_impl,
+            "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
+            deterministic: true
+        ),
+    ]
+}
 ```
 
 ## 例：有理数型
@@ -151,7 +156,7 @@ pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     lhs.cmp(&rhs)
 }
 
-// hash: for COUNT(DISTINCT) and set operations
+// hash: for GROUP BY, DISTINCT, and set operations
 pub fn rational_hash(b: &[u8]) -> usize {
     // FNV-1a over the 16 bytes
     let mut h: usize = 0xcbf29ce484222325u64 as usize;
@@ -163,7 +168,7 @@ pub fn rational_hash(b: &[u8]) -> usize {
 }
 ```
 
-`custom_type!`登録と算術VDF（`rational_add`、`rational_sub`など）は、`examples/vsql_rational/src/lib.rs`の完全なソースにあります。
+`custom_type!`登録、`rational_encode`が呼び出す`gcd`および`normalize`ヘルパー、および算術VDF（`rational_add`、`rational_sub`など）は、`examples/vsql_rational/src/lib.rs`の完全なソースにあります。
 
 拡張機能がインストールされている場合：
 
@@ -226,7 +231,7 @@ villagesql::parameterized_type!(
 |---|---|---|
 | `type_name` | 文字列リテラル | SQLの型名。SQLでは大文字と小文字が区別されません。 |
 | `max_persisted_length` | `i64` | すべての有効なパラメータ化にわたる、オンディスクのバイト長の上限。 |
-| `max_decode_buffer_length` | `usize` | デコードされた文字列表現の最大バイト長。 |
+| `max_decode_buffer_length` | `i64` | デコードされた文字列表現の最大バイト長。 |
 | `encode` | 関数 | `INSERT`時に`&str`と`&mut MaybeParams<P>`をバイナリバイトに変換します。 |
 | `decode` | 関数 | 表示用にバイナリバイトと`&P`を`String`に戻します。 |
 | `compare` | 関数 | `&P`を受け取り、`ORDER BY`、`MIN`、`MAX`の`Ordering`を返します。 |
@@ -235,14 +240,17 @@ villagesql::parameterized_type!(
 | `params_type` | 型 | 解析済みパラメータの構造体（`PadintParams`など）。 |
 | `params_parse` | 関数 | `Params`を`params_type`に解析します。一意のパラメータの組み合わせごとに最大1回だけ実行されます。SDKが結果をキャッシュします。 |
 | `params_to_strings` | 関数 | `params_parse`の逆です。`params_type`を正規の`(key, value)`のペアに書き戻します。 |
-| `hash` | 関数 | `&P`を受け取り、`usize`ハッシュを返します。オプションですが、インデックス化されたカラムには推奨されます。 |
-| `default` | 文字列リテラル | サーバーが型初期化時にエンコードできる有効な文字列。オプションですが、推奨されます。 |
+| `hash` | 関数 | `&P`を受け取り、`usize`ハッシュを返します。`GROUP BY`、`DISTINCT`、およびセット操作に使用されます。オプションですが、推奨されます。 |
+| `default` | 文字列リテラル | サーバーが型初期化時にエンコードできる有効な文字列。`intrinsic_default_fn`を指定しない限り必須です。 |
+| `intrinsic_default_fn` | 関数 | デフォルト値を記述する代わりに計算します: `fn(&P) -> Result<String, String>`。デフォルト値がパラメータに依存する場合に使用します。 |
 
-`type_name`、`max_persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、`compare`、`int_to_params`、`resolve_params`、`params_type`、`params_parse`、および`params_to_strings`は必須です。`hash`と`default`はオプションです。`intrinsic_default_fn`（デフォルトがパラメータに依存する場合に、`&P`からデフォルトを計算する関数）もオプションであり、`default`とは相互に排他的です。
+`type_name`、`max_persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、`compare`、`int_to_params`、`resolve_params`、`params_type`、`params_parse`、および`params_to_strings`は必須です。`hash`はオプションです。型にはどちらかの方法でデフォルト値を与えてください。リテラルとして書ける値には`default`を、拡張機能が計算する必要がある値には`intrinsic_default_fn`（デフォルトがパラメータに依存する場合に、`&P`からデフォルトを計算する関数）を使用します。両方を設定すると`INSTALL EXTENSION`は失敗します。どちらも設定しない場合、拡張機能はインストールできますが、その型を指定する最初のステートメントが失敗します。
 
 次は`padint`です。固定の8バイトで格納される`i64`で、ゼロ埋めされた表示幅を制御する`width`パラメータを持ちます。
 
 ```rust
+use villagesql::{MaybeParams, Params, Resolved};
+
 pub struct PadintParams {
     pub width: u32,
 }
@@ -293,25 +301,30 @@ pub fn padint_compare(a: &[u8], b: &[u8], _p: &PadintParams) -> std::cmp::Orderi
     i64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(b[..8].try_into().unwrap()))
 }
 
-villagesql::parameterized_type!(
-    type_name: "padint",
-    max_persisted_length: 8,
-    max_decode_buffer_length: 32,
-    encode: padint_encode,
-    decode: padint_decode,
-    compare: padint_compare,
-    int_to_params: padint_int_to_params,
-    resolve_params: padint_resolve_params,
-    params_type: PadintParams,
-    params_parse: padint_parse,
-    params_to_strings: padint_to_strings,
-    default: "0",
-)
+villagesql::extension! {
+    funcs: [],
+    types: [
+        villagesql::parameterized_type!(
+            type_name: "padint",
+            max_persisted_length: 8,
+            max_decode_buffer_length: 32,
+            encode: padint_encode,
+            decode: padint_decode,
+            compare: padint_compare,
+            int_to_params: padint_int_to_params,
+            resolve_params: padint_resolve_params,
+            params_type: PadintParams,
+            params_parse: padint_parse,
+            params_to_strings: padint_to_strings,
+            default: "0",
+        ),
+    ]
+}
 ```
 
 パラメータ化されたカスタム型の引数を受け取る関数は、単なる
 `InValue::Custom(bytes)`ではなく`InValue::CustomWithParams { bytes, params }`を
-受け取ります。`params`は[`TypeParams`]であり、カラムに宣言された`key=value`の
+受け取ります。`params`は`TypeParams`であり、カラムに宣言された`key=value`の
 ペアに対する読み取り専用でゼロコピーのビューです。
 
 ## 型を含む`extension!`ブロック
@@ -339,7 +352,7 @@ villagesql::extension! {
     icon="book"
     href="/ja/mysql-9.7/stable/rust-api-reference"
   >
-    `InValue`、`VdfReturn`、およびすべてのマクロの完全なリファレンス。
+    `InValue`、`VdfReturn`、および`extension!`、`func!`、`agg_func!`、`varargs_func!`、`custom_type!`、`custom!`マクロのリファレンス。
   </Card>
   <Card
     title="Rust で拡張機能を作成する"

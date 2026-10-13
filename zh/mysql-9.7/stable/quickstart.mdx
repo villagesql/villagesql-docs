@@ -13,7 +13,7 @@ description: "开始使用 VillageSQL Server。"
 在容器中运行 VillageSQL，无需进行主机端安装：
 
 ```bash
-docker run -d --name vsql -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -p 3306:3306 villagesql/server:mysql-9.7_latest
+docker run -d --name vsql -e MYSQL_ROOT_PASSWORD=<your-password> -p 3306:3306 villagesql/server:mysql-9.7_latest
 ```
 
 ### 选项 B：Shell 脚本
@@ -24,7 +24,7 @@ docker run -d --name vsql -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -p 3306:3306 village
 curl -fsSL https://install.villagesql.com | bash
 ```
 
-脚本会询问三个问题：安装哪个代码库、用哪种方式安装、安装哪个版本。在第一个问题中选择 **MySQL 9.7**，即可获得本文档描述的服务器。
+脚本会询问安装哪个代码库以及用哪种方式安装。源码构建还会询问安装哪个版本。在第一个问题中选择 **MySQL 9.7**，即可获得本文档描述的服务器。
 
 如果没有终端来回答这些问题（CI 任务、Dockerfile、AI 智能体），请用环境变量传入答案，并设置在管道的 `bash` 一侧：
 
@@ -33,7 +33,7 @@ curl -fsSL https://install.villagesql.com | \
   VSQL_CODEBASE=mysql-9.7 INSTALL_METHOD=prebuilt bash
 ```
 
-`VSQL_CODEBASE` 接受 `mysql-8.4`、`percona-8.4` 或 `mysql-9.7`。Percona 构建仅面向 MySQL 8.4。`INSTALL_METHOD` 接受 `docker`、`prebuilt` 或 `source`。源码构建还接受 `VSQL_VERSION=stable|nightly|latest`；Docker 和预编译安装始终使用稳定版本。
+`VSQL_CODEBASE` 接受 `mysql-8.4`、`percona-8.4` 或 `mysql-9.7`。Percona 构建仅跟踪 MySQL 8.4。`INSTALL_METHOD` 接受 `docker`、`prebuilt` 或 `source`。源码构建还接受 `VSQL_VERSION=stable|nightly|latest`；Docker 和预编译安装始终使用稳定版本。
 
 在运行脚本之前检查脚本：`curl -fsSL https://install.villagesql.com | less`
 
@@ -43,7 +43,7 @@ curl -fsSL https://install.villagesql.com | \
 
 ### Shell 脚本设置了哪些内容
 
-Shell 脚本（选项 B）会将所有内容安装到 `~/.villagesql/` 下，并在端口 3306 上启动服务器。重要的位置如下：
+Shell 脚本（选项 B）会将服务器安装到 `~/.villagesql/` 下，并在端口 3306 上启动它；如果您在脚本的安装方式问题中选择 Docker，它会改为启动一个名为 `vsql` 的容器。重要的位置如下：
 
 | 路径 | 内容说明 |
 | --- | --- |
@@ -52,9 +52,9 @@ Shell 脚本（选项 B）会将所有内容安装到 `~/.villagesql/` 下，并
 | `~/.villagesql/mysql.sock` | 服务器套接字 |
 | `~/.villagesql/mysql.log` | 服务器错误日志 |
 
-如果 `~/.local/bin` 位于您的 `PATH` 中，该脚本还会添加快捷命令：`villagesql`（客户端）、`villagesql-server`（服务器）和 `villagesql-admin`（管理工具）。
+如果 `~/.local/bin` 存在且可写，该脚本还会添加快捷命令：`villagesql`（客户端）、`villagesql-server`（服务器）和 `villagesql-admin`（管理工具）。
 
-Docker（选项 A）和手动源代码构建不会创建 `~/.villagesql/` — Docker 将其数据保存在容器内部。
+Docker（选项 A）和手动源代码构建不会创建 `~/.villagesql/` — Docker 将其数据保存在挂载于容器内 `/var/lib/mysql` 的 Docker 卷中。
 
 ## 步骤 2：连接到服务器
 
@@ -64,8 +64,8 @@ Docker（选项 A）和手动源代码构建不会创建 `~/.villagesql/` — Do
 mysql -h 127.0.0.1 -P 3306 -u root -p
 ```
 
-- **Docker（选项 A）：** 容器启动时 root 密码为空 — 在密码提示处按 Enter 键即可。
-- **Shell 脚本（选项 B）：** 生成的 root 密码保存在 `~/.villagesql/credentials.txt` 中。
+- **Docker（选项 A）：** 输入您通过 `MYSQL_ROOT_PASSWORD` 设置的 root 密码。
+- **Shell 脚本（选项 B）：** 生成的 root 密码保存在 `~/.villagesql/credentials.txt` 中。如果您在脚本的安装方式问题中选择了 Docker，密码会打印在屏幕上而不会保存。
 
 ## 步骤 3：安装您的第一个扩展
 
@@ -109,11 +109,15 @@ CREATE TABLE events (
     label VARCHAR(50)
 );
 
--- Insert rows with generated v7 UUIDs
-INSERT INTO events VALUES
-    (UUID_V7(), 'signup'),
-    (UUID_V7(), 'login'),
-    (UUID_V7(), 'purchase');
+-- Insert rows with generated v7 UUIDs. Each UUID_V7() embeds a millisecond
+-- timestamp, so rows inserted in the same statement can land in the same
+-- millisecond and tie-break on their random bits instead of insertion
+-- order — insert separately, with a gap, to see the ordering clearly.
+INSERT INTO events VALUES (UUID_V7(), 'signup');
+SELECT SLEEP(0.01);
+INSERT INTO events VALUES (UUID_V7(), 'login');
+SELECT SLEEP(0.01);
+INSERT INTO events VALUES (UUID_V7(), 'purchase');
 
 -- v7 keys sort in creation order
 SELECT id, label FROM events ORDER BY id;
@@ -127,9 +131,10 @@ FROM events
 ORDER BY id;
 ```
 
-要卸载扩展：
+要卸载扩展，请先删除所有使用其类型的对象：
 
 ```sql
+DROP DATABASE demo;
 UNINSTALL EXTENSION vsql_uuid;
 ```
 
@@ -161,5 +166,5 @@ UNINSTALL EXTENSION vsql_uuid;
 ### 服务器无法启动
 
 常见问题：
-- 端口 3306 已经被占用：配置您的服务器以使用不同的端口
+- 端口 3306 已经被占用：停止另一个服务器，或在设置 `PORT=<port>` 的情况下运行安装程序。使用 Docker 时，请更改 `-p` 的主机侧端口。
 - 权限：确保文件可读/可执行

@@ -13,7 +13,7 @@ O Protocol 3 do VEF é estável desde a v0.0.4. O Protocol 4 está em desenvolvi
 ## Escrevendo Funções de Extensão
 
 As funções de extensão são escritas em C++ e registradas com o VEF. Inclua um
-único cabeçalho para acessar o SDK completo:
+único cabeçalho para acessar as APIs de VDF, de tipo e do construtor de extensão:
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -29,7 +29,7 @@ SQL comum chega a isso: `std::stoi()` lança uma exceção em uma string não nu
 `nlohmann::json::dump()` lança uma exceção em um texto que não é UTF-8 válido.
 
 Envolva o corpo de cada ponto de entrada que você registrar: VDFs, funções de
-resultado de agregação e as operações `from_string`/`to_string` de um tipo personalizado.
+agregação, ganchos prerun e postrun, e as operações de um tipo personalizado.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -81,7 +81,7 @@ contígua de `T` com `data()`, `size()`, `empty()`, `begin()`/`end()` e
 SDK fornece uma implementação mínima compatível, de modo que o mesmo código compila em
 qualquer um dos padrões. Ele está disponível através de `<villagesql/vsql.h>`.
 
-`warning(msg)` retorna SQL NULL para a linha e anexa um aviso SQL. No modo estrito (`STRICT_TRANS_TABLES`), o MySQL o promove a um erro de instrução em INSERT/UPDATE, então ele se comporta como `error(msg)` em contextos estritos. Use-o para entrada inválida recuperável, como uma string que não pode ser analisada em uma função de codificação. Use `error(msg)` para dados armazenados corrompidos ou qualquer condição em que continuar seja inseguro. A mensagem de ambos é truncada para caber no buffer de erro interno do servidor, se necessário.
+`warning(msg)` retorna SQL NULL para a linha e anexa um aviso SQL. Esse NULL é um valor comum do ponto de vista do servidor, portanto só se torna um erro de instrução da mesma forma que qualquer NULL: gravá-lo em uma coluna `NOT NULL` falha sob `STRICT_TRANS_TABLES`, assim como `INSERT INTO t VALUES (NULL)` falharia. Gravá-lo em uma coluna que aceita NULL tem sucesso, com o aviso incluído. Use `warning(msg)` para entrada inválida recuperável, como uma string que não pode ser analisada em uma função de codificação. Use `error(msg)` para dados armazenados corrompidos ou qualquer condição em que continuar seja inseguro. A mensagem de ambos é truncada para caber no buffer de erro interno do servidor, se necessário.
 
 **Exemplo escalar** — soma dois inteiros:
 
@@ -94,10 +94,10 @@ void add_impl(IntArg a, IntArg b, IntResult out) {
 }
 
 // Registration is unchanged:
-make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build();
+// make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build()
 ```
 
-**Exemplo binário** — transforma um buffer de tipo personalizado no local:
+**Exemplo binário** — transforma um valor de tipo personalizado no buffer de resultado:
 
 ```cpp
 using namespace vsql;
@@ -115,7 +115,7 @@ Para `StringResult` e `CustomResult`, escreva em `buffer()` e, em seguida, chame
 `set_length()` com o número de bytes escritos. `buffer().size()` é a
 capacidade máxima.
 
-Para VDFs que retornam um tipo personalizado (`returns(CUSTOM(MYTYPE))`), o servidor
+Para VDFs que retornam um tipo personalizado (`.returns(MYTYPE)`), o servidor
 dimensiona o buffer de resultado para o `persisted_length` do tipo de retorno resolvido
 automaticamente — os autores de extensões não precisam declarar `.buffer_size(...)`
 no construtor da função nesse caso. Se `prerun` aumentar ainda mais o buffer,
@@ -174,7 +174,7 @@ void my_result(const SumState &s, IntResult out) {
 Como funcionam os métodos do construtor:
 - `make_aggregate_func<State, &result_fn>()` gera automaticamente `prerun` e `postrun` (inicializa por valor e remove o `State`).
 - `.clear<&fn>()` registra sua função de redefinição `void(State&)`.
-- `.accumulate<&fn>()` registra sua função de acumulação `void(State&, TypedArgs...)`. Os `TypedArgs` são deduzidos da assinatura da função (`IntArg`, `StringArg`, etc.).
+- `.accumulate<&fn>()` registra sua função de acumulação `void(State&, TypedArgs...)`. Os `TypedArgs` são deduzidos da assinatura da função (`IntArg`, `StringArg`, etc.). Chame `.accumulate<>()` depois de todas as chamadas `.param(TYPE)`: o construtor verifica a contagem de argumentos tipados contra a contagem de parâmetros SQL declarados em tempo de compilação, então chamá-lo antes falha na compilação.
 - O tipo de resultado (`IntResult`, `RealResult`, etc.) é deduzido da assinatura da função de resultado.
 
 Para um contador que nunca retorna NULL, use um tipo de estado simples:
@@ -340,7 +340,7 @@ SELECT point_path('1,2');
 #include <cstring>
 using namespace vsql;
 
-constexpr size_t kBytearrayLen = 4;
+constexpr size_t kBytearrayLen = 8;
 
 void ba_concat_all_prerun(PrerunArgs args, PrerunResult out) {
   if (args.size() == 0) {
@@ -364,6 +364,7 @@ void ba_concat_all(VarArgs args, StringResult out) {
   for (auto a : args) {
     if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
     auto bytes = a.as_custom();
+    if (off + bytes.size() > dst.size()) { out.error("ba_concat_all: result too long"); return; }
     std::memcpy(dst.data() + off, bytes.data(), bytes.size());
     off += bytes.size();
   }
@@ -377,13 +378,199 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .build()
 ```
 
+## Decidindo os Parâmetros de Tipo de uma Função no Momento da Resolução {#deciding-a-functions-type-parameters-at-resolution-time}
+
+As regras internas do servidor normalmente determinam os parâmetros de um tipo de
+retorno a partir dos tipos declarados dos seus argumentos. Às vezes elas não
+conseguem. Por exemplo, `tvector_concat(TVECTOR(M), TVECTOR(N))` retorna um
+`TVECTOR(M+N)`. As regras internas rejeitam dois argumentos `TVECTOR` cujas
+dimensões diferem, e elas podem copiar os parâmetros de um argumento para o tipo
+de retorno, mas nunca somá-los. Para casos como este, registre um **gancho
+bind-and-check-types** com `.bind_and_check_types<&Hook>()` no construtor da
+função, com a assinatura:
+
+```cpp
+void my_hook(vsql::BindArgs args, vsql::BindResult out);
+```
+
+`.bind_and_check_types()` e `.varargs()` são mutuamente exclusivos na mesma
+função — uma VDF com varargs não tem uma lista fixa de argumentos sobre a qual o
+gancho possa raciocinar. Declarar `.varargs()` antes de
+`.bind_and_check_types<&Hook>()` na cadeia do construtor é uma falha de
+`static_assert` em tempo de compilação. Declará-los na outra ordem compila, mas
+a extensão é rejeitada quando o servidor a carrega: o registro percorre o estado
+final construído de cada função e rejeita a primeira que é varargs e tem um
+gancho de bind ao mesmo tempo, com:
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned an error: VDF '<function>' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
+```
+
+<Warning>
+`.bind_and_check_types<&Hook>()` e `<villagesql/vsql/bind_check_types.h>`
+são declarados apenas nos cabeçalhos de ABI de desenvolvimento opcionais
+(`-DVSQL_USE_DEV_ABI=ON`) e exigem o Protocol 4 do VEF. Uma compilação padrão
+com a ABI estável não tem nenhum dos dois, então registrar um gancho falha na
+compilação.
+</Warning>
+
+O servidor chama o gancho entre duas passagens que ele faz sobre os argumentos de
+uma função: a primeira passagem verifica o tipo base de cada argumento, o gancho
+é executado em seguida, e a segunda passagem aplica a resposta do gancho para
+cada argumento em que ele deu uma. Com um gancho instalado, a primeira passagem
+não coleta parâmetros compartilhados entre argumentos do mesmo tipo
+personalizado, então nenhum deles precisa concordar com os outros. Um argumento
+cujo próprio tipo ainda não está resolvido, como um literal de string simples,
+recebe seus parâmetros apenas do gancho. Os parâmetros de um tipo de retorno
+parametrizado também vêm do gancho, no lugar da regra interna que os copia de um
+argumento.
+
+A extensão de exemplo [`vsql_tvector`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/examples/vsql-tvector/src/tvector.cc)
+na árvore de código-fonte do servidor registra um gancho desses em
+`tvector_concat`:
+
+```cpp
+#include <villagesql/vsql.h>
+
+// Excerpt from villagesql/examples/vsql-tvector/src/tvector.cc. That file
+// also has the standard library includes, the constants kDefaultBytesPerElem
+// (4) and kTVectorMaxDimension (4096), the TVECTOR type, the tvector_concat
+// function body, and the helpers common_element_width() and
+// bind_params_for_vector(), which read an argument's resolved params or count
+// the elements of a constant literal.
+
+struct TVectorParams {
+  int64_t dimension;
+  size_t bytes_per_elem;  // 4 for float, 8 for double
+
+  static TVectorParams parse(const std::map<std::string, std::string> &params) {
+    auto dim_it = params.find("dimension");
+    int64_t dim = strtoll(dim_it->second.c_str(), nullptr, 10);
+    size_t bytes = kDefaultBytesPerElem;
+    auto type_it = params.find("type");
+    if (type_it != params.end() && type_it->second == "double") bytes = 8;
+    return TVectorParams{.dimension = dim, .bytes_per_elem = bytes};
+  }
+
+  // Inverse of parse: render a typed TVectorParams back into the canonical
+  // key/value string form. Used by the SDK when the server needs to publish
+  // inferred params (e.g., from a constant-string from_string) back in the
+  // same shape that parse() consumes.
+  static void to_strings(const TVectorParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
+    out["type"] = (p.bytes_per_elem == 8) ? "double" : "float";
+  }
+};
+
+// bind_and_check_types for tvector_concat.
+//
+// Two jobs the built-in rules cannot do:
+//   1. permit arguments whose dimensions differ (parameter sharing rejects it);
+//   2. compute the return dimension as M+N (the server return rule only
+//      copies).
+//
+// A third job appears when an argument is a constant: a bare '[1,2,3]' has no
+// type context, and with a hook installed nothing donates params to it, so the
+// hook counts the elements itself and answers with set_arg(). The element type
+// comes from whichever side the server already resolved, which is what the
+// built-in rules would have donated.
+void tvector_concat_bind(vsql::BindArgs args, vsql::BindResult out) {
+  if (args.size() != 2) {
+    out.error("expects 2 arguments");
+    return;
+  }
+
+  std::string error_msg;
+  size_t bpe = 0;
+  if (common_element_width(args, bpe, error_msg)) {
+    out.error(error_msg);
+    return;
+  }
+
+  TVectorParams first{}, second{};
+  bool publish_first = false, publish_second = false;
+
+  if (bind_params_for_vector(args, 0, bpe, first, publish_first, error_msg) ||
+      bind_params_for_vector(args, 1, bpe, second, publish_second, error_msg)) {
+    out.error(error_msg);
+    return;
+  }
+
+  // Hand back the params of whichever argument the server could not resolve.
+  if (publish_first) out.set_arg(0, first);
+  if (publish_second) out.set_arg(1, second);
+
+  const int64_t total = first.dimension + second.dimension;
+  if (total > kTVectorMaxDimension) {
+    out.error("combined dimension " + std::to_string(total) +
+              " exceeds the maximum of " +
+              std::to_string(kTVectorMaxDimension));
+    return;
+  }
+  out.set_return(TVectorParams{.dimension = total, .bytes_per_elem = bpe});
+}
+
+// Registration, inside make_extension():
+// .func(make_func<&tvector_concat>("tvector_concat")
+//     .returns(TVECTOR)
+//     .param(TVECTOR)
+//     .param(TVECTOR)
+//     .bind_and_check_types<&tvector_concat_bind>()
+//     .deterministic()
+//     .build())
+```
+
+O gancho permite que dois vetores de dimensões diferentes sejam combinados, e ele
+conta os elementos de um literal constante. Uma compilação do servidor a partir
+do código-fonte inclui o `vsql_tvector`; os tarballs de release não.
+
+```sql
+INSTALL EXTENSION vsql_tvector;
+CREATE TABLE v2 (v vsql_tvector.TVECTOR(2));
+CREATE TABLE v3 (v vsql_tvector.TVECTOR(3));
+INSERT INTO v2 VALUES ('[1,2]');
+INSERT INTO v3 VALUES ('[3,4,5]');
+
+SELECT vsql_tvector.tvector_concat(v2.v, v3.v) AS c,
+       vsql_tvector.tvector_dim(vsql_tvector.tvector_concat(v2.v, v3.v)) AS dim
+FROM v2, v3;
+```
+
+```text
++-------------+------+
+| c           | dim  |
++-------------+------+
+| [1,2,3,4,5] |    5 |
++-------------+------+
+```
+
+```sql
+SELECT vsql_tvector.tvector_concat(v, '[6,7]') AS c FROM v3;
+```
+
+```text
++-------------+
+| c           |
++-------------+
+| [3,4,5,6,7] |
++-------------+
+```
+
 ## Ganchos de Carregamento e Descarregamento da Extensão {#extension-load-and-unload-hooks}
 
 Às vezes uma extensão tem trabalho a fazer uma vez por carregamento, em vez de uma
-vez por chamada — escolher uma implementação específica de CPU ou construir uma
-tabela de consulta que as VDFs depois leem. Registre esse trabalho com
-`.on_init<&Fn>()` no construtor da extensão, e a desmontagem correspondente com
-`.on_deinit<&Fn>()`. Ambos recebem uma função com a assinatura `void()`.
+vez por chamada — escolher uma implementação específica de CPU, ler a sua própria
+configuração uma única vez ou construir uma tabela de consulta que as VDFs depois
+leem. Registre esse trabalho com `.on_init<&Fn>()` no construtor da extensão, e a
+desmontagem correspondente com `.on_deinit<&Fn>()`. Ambos recebem uma função com
+a assinatura `void()`, e precisam ser registrados juntos — declarar um sem o
+outro falha na compilação. Uma extensão que chega ao servidor com um par
+incompleto por algum outro caminho é rejeitada no carregamento:
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers an on_init hook without an on_deinit
+```
 
 <Warning>
 `.on_init<&Fn>()` e `.on_deinit<&Fn>()` são declarados apenas nos cabeçalhos de ABI
@@ -391,17 +578,17 @@ de desenvolvimento opcionais (`-DVSQL_USE_DEV_ABI=ON`). Uma compilação padrão
 ABI estável não tem nenhum dos dois métodos, então registrar um gancho falha na compilação.
 </Warning>
 
-`on_init` é executado a cada carregamento da extensão: no `INSTALL EXTENSION` e
-novamente a cada inicialização do servidor, depois que o servidor validou e aceitou
-a extensão. Ele nunca é executado para uma extensão que o servidor rejeitou.
-`on_deinit` é executado no descarregamento — `UNINSTALL EXTENSION` ou desligamento
-do servidor.
-
-Ambos os ganchos são executados dentro do processo da extensão **sem acesso ao
-servidor**: eles não podem executar SQL, ler variáveis de sistema nem alcançar o
-estado do servidor. É por isso que eles são o lugar errado para uma configuração que
-precisa falar com o servidor — use a etapa de populate de uma capability Preview
-para isso.
+`on_init` é executado uma vez por carregamento — no `INSTALL EXTENSION`, e
+novamente a cada inicialização do servidor — depois que o servidor validou a
+extensão e populou as capabilities exigidas por ela, de modo que uma variável de
+sistema registrada já contém o seu valor configurado. Na inicialização,
+especificamente, `on_init` é adiado até que os valores persistidos das variáveis
+de sistema tenham sido aplicados, então ele nunca vê um padrão compilado no lugar
+de um valor definido com `SET PERSIST`. Ele nunca é executado para uma extensão
+que o servidor rejeitou. `on_deinit` é executado no descarregamento —
+`UNINSTALL EXTENSION` ou desligamento do servidor — antes que o servidor
+despopule essas mesmas capabilities, então ele vê o mesmo estado ativo que
+`on_init` viu.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -441,13 +628,6 @@ VEF_GENERATE_ENTRY_POINTS(
 Depois de `INSTALL EXTENSION my_extension`, `SELECT fast_sqrt(16)` retorna `4` —
 um resultado que só é alcançável se `build_table` já tiver sido executado.
 
-<Note>
-`on_deinit` é chamado a partir do ponto de entrada `vef_unregister` que
-`VEF_GENERATE_ENTRY_POINTS` gera. `VEF_GENERATE_REGISTRATION` não define esse
-ponto de entrada, então uma extensão que o utiliza precisa chamar a sua desmontagem
-a partir do `vef_unregister` que ela mesma escreve.
-</Note>
-
 ## VEF_GENERATE_REGISTRATION
 
 `VEF_GENERATE_REGISTRATION` cria um auxiliar interno `_vef_do_register()`
@@ -459,7 +639,7 @@ normais, use `VEF_GENERATE_ENTRY_POINTS` em vez disso.
 ```cpp
 VEF_GENERATE_REGISTRATION(
     make_extension()
-        .func(make_func<&my_impl>("my_func").returns(INT).build()))
+        .func(make_func<&my_impl>("my_func").returns(INT).no_params().build()))
 
 // Then define your own extern "C" vef_register/vef_unregister that call
 // _vef_do_register() and optionally modify the result.
@@ -482,8 +662,8 @@ As seguintes capabilities do VEF estão disponíveis como cabeçalhos Preview op
 
 `INFORMATION_SCHEMA.EXTENSION_REGISTRATION` expõe a struct de registro do VEF
 em memória para cada extensão carregada como um documento JSON. Use-o para
-verificar se o servidor analisou corretamente as funções, os tipos e as variáveis de sistema
-da sua extensão após o `INSTALL EXTENSION`.
+verificar se o servidor analisou corretamente as funções e os tipos da sua
+extensão após o `INSTALL EXTENSION`.
 
 ```sql
 SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL, REGISTRATION_JSON
@@ -495,7 +675,7 @@ WHERE EXTENSION_NAME = 'my_ext';
 |--------|------|-------------|
 | `EXTENSION_NAME` | `VARCHAR(64)` | Nome da extensão instalada. |
 | `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | Versão do protocol VEF negociada entre a extensão e o servidor. |
-| `REGISTRATION_JSON` | `VARCHAR(65535)` | Serialização JSON da struct `vef_registration_t`, incluindo os arrays `funcs` e `types`. |
+| `REGISTRATION_JSON` | `VARCHAR(65535)` | Serialização JSON da struct `vef_registration_t`, incluindo os arrays `funcs` e `types` e uma chave `sdk_version` que informa a versão do SDK com a qual a extensão foi compilada. |
 
 ## Veja Também
 

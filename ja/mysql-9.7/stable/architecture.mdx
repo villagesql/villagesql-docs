@@ -22,10 +22,10 @@ VDF は修飾付きおよび修飾なしの関数呼び出しの両方をサポ�
 
 ```sql
 -- Unqualified lookup
-SELECT complex_abs(value) FROM table;
+SELECT complex_abs(impedance) FROM signals;
 
 -- Qualified lookup
-SELECT vsql_complex.complex_abs(value) FROM table;
+SELECT vsql_complex.complex_abs(impedance) FROM signals;
 ```
 
 **解決順序：**
@@ -36,7 +36,6 @@ SELECT vsql_complex.complex_abs(value) FROM table;
 
 複数の拡張機能が同じ名前の関数を登録している場合、修飾なしの呼び出しは曖昧になるため、完全修飾名（`extension_name.function_name()`）を使用する必要があります。
 
-**パフォーマンス：** ホットパスでは、解決チェーンをスキップして拡張機能関数を直接呼び出すため、修飾付き呼び出し（`extension_name.function_name()`）を使用してください。
 
 ---
 
@@ -48,15 +47,15 @@ VillageSQL の拡張機能は `.veb`（VillageSQL Extension Bundle）ファイ�
 extension_name.veb (tar archive)
 ├── manifest.json       # Extension metadata (required)
 └── lib/
-    └── extension.so    # Compiled shared library (required)
+    └── extension_name.so    # Compiled shared library (required, named after the extension)
 ```
 
 ### manifest.json スキーマ
 
 ```json
 {
-  "name": "extension_name",          // Required: lowercase_with_underscores
-  "version": "1.0.0",                // Required: semantic version
+  "name": "extension_name",
+  "version": "1.0.0",
   "description": "Brief description",
   "author": "Your Name",
   "license": "GPL-2.0"
@@ -76,11 +75,11 @@ INSTALL EXTENSION name
     ↓
 1. Validate .veb exists in veb_dir
     ↓
-2. Calculate SHA256 hash of .veb
+2. Parse and validate manifest.json
     ↓
-3. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
+3. Calculate SHA256 hash of .veb
     ↓
-4. Parse and validate manifest.json
+4. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
     ↓
 5. Load .so library (dlopen with RTLD_LOCAL)
     ↓
@@ -93,7 +92,7 @@ INSTALL EXTENSION name
 Success
 ```
 
-**ロールバック：** どのステップでも失敗した場合、すべての変更が取り消され、`.so` がアンロードされます。
+**ロールバック：** どのステップでも失敗した場合、拡張機能は登録されず、`.so` がアンロードされます。展開されたファイルは、次回のサーバー再起動まで `.veb_expansion_cache` に残ります。
 
 **シンボルの分離：** 拡張機能は `RTLD_LOCAL` フラグで読み込まれ、ある拡張機能のシンボルが他の拡張機能のシンボルと競合しないようにします。これにより、複数の拡張機能が共通のライブラリ名や関数名を使用した場合でも、名前衝突を防ぎます。
 
@@ -108,13 +107,13 @@ UNINSTALL EXTENSION name
     ↓
 1. Check for column dependencies
     ↓
-2. Call vef_unregister() cleanup hook
+2. Drop registered VDFs
     ↓
-3. Drop registered VDFs
+3. Drop custom types
     ↓
-4. Drop custom types
+4. Remove extension registration and update cache
     ↓
-5. Remove extension registration and update cache
+5. Call vef_unregister() cleanup hook
     ↓
 6. Unload .so library (dlclose)
     ↓
@@ -137,10 +136,10 @@ datadir/
     └── extension_name/
         ├── abc123.../              # SHA256 of v1.0.0 .veb
         │   ├── manifest.json
-        │   └── lib/extension.so
+        │   └── lib/extension_name.so
         └── def456.../              # SHA256 of v2.0.0 .veb
             ├── manifest.json
-            └── lib/extension.so
+            └── lib/extension_name.so
 ```
 
 **なぜ SHA256 ディレクトリなのか？**
@@ -148,7 +147,7 @@ datadir/
 - ロールバックを可能にする
 - 「同じバージョン、異なるコード」を防ぐ
 
-**クリーンアップ：** 孤立した SHA256 ディレクトリはサーバー再起動時に削除されます。
+**クリーンアップ：** サーバー起動時に、インストールされていない拡張機能の `.veb_expansion_cache` ディレクトリは削除されます。インストールされている拡張機能の古い SHA256 ディレクトリは残ります。
 
 ---
 
@@ -201,7 +200,6 @@ CREATE TABLE t (col COMPLEX)
 | COMPLEX     | MYSQL_TYPE_VARCHAR  | 16 |
 | UUID        | MYSQL_TYPE_VARCHAR  | 16 |
 | INET        | MYSQL_TYPE_VARCHAR  | 19 |
-| JSON_SCHEMA | MYSQL_TYPE_BLOB     | 可変 |
 
 ---
 
@@ -212,7 +210,7 @@ CREATE TABLE t (col COMPLEX)
 拡張機能関数は行ごとの実行モデルで呼び出されます：
 
 - **行ごとの分離実行：** 各関数呼び出しには独自の結果バッファが割り当てられます（設計上スレッドセーフ）
-- **Prerun/Postrun フック：** ステートメントごとのセットアップ/クリーンアップ、SQL ステートメントごとに 1 回呼び出されます
+- **Prerun/Postrun フック：** ステートメントごとのセットアップ/クリーンアップ、SQL ステートメント内で関数が現れる箇所ごとに 1 回呼び出されます
 - **分離の保証なし：** 複数の接続が同時にあなたの関数を呼び出す可能性があります
 - **ベストプラクティス：** グローバル状態を避け、関数のパラメータと戻り値を使用してください
 
@@ -259,7 +257,7 @@ SELECT * FROM signals WHERE impedance_magnitude > 100;
 - 拡張機能は任意のファイルの読み取り、ネットワークへのアクセス、コードの実行が可能です
 - **信頼に関する影響：** 信頼できるソースからの拡張機能のみをインストールしてください
 
-**インストールのセキュリティ：** `villagesql_extension_installer` ユーザーとして実行されます（コンテキストスイッチ）。
+**インストールのセキュリティ：** `INSTALL EXTENSION` と `UNINSTALL EXTENSION` には `EXTENSION_ADMIN` 権限（または `SUPER`）が必要で、通常の MySQL の権限付与システムによって強制されます。
 
 <Accordion title="拡張機能のデバッグ">
 
@@ -270,9 +268,15 @@ mysqld --log-error-verbosity=3
 
 **GDB デバッグ：**
 ```bash
+# Linux
 gdb -p $(pidof mysqld)
-(gdb) break my_func_init
+(gdb) break vef_register
 (gdb) continue
+
+# macOS
+lldb -p $(pgrep -x mysqld)
+(lldb) breakpoint set -n vef_register
+(lldb) continue
 ```
 
 **依存関係の確認：**

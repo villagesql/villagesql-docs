@@ -22,10 +22,10 @@ VDF는 접두사 포함(qualified) 및 미포함(unqualified) 함수 호출을 �
 
 ```sql
 -- Unqualified lookup
-SELECT complex_abs(value) FROM table;
+SELECT complex_abs(impedance) FROM signals;
 
 -- Qualified lookup
-SELECT vsql_complex.complex_abs(value) FROM table;
+SELECT vsql_complex.complex_abs(impedance) FROM signals;
 ```
 
 **해석 순서:**
@@ -35,8 +35,6 @@ SELECT vsql_complex.complex_abs(value) FROM table;
 4. 저장 함수 (`CREATE FUNCTION`으로 생성)
 
 둘 이상의 확장이 동일한 이름의 함수를 등록하면 접두사 미포함 호출은 모호해지며, 접두사를 완전히 포함한 이름(`extension_name.function_name()`)을 사용해야 합니다.
-
-**성능:** 핫 코드 경로에서는 해석 체인을 건너뛰고 직접 확장 함수를 호출하기 위해 접두사 포함 호출(`extension_name.function_name()`)을 사용하세요.
 
 ---
 
@@ -48,15 +46,15 @@ VillageSQL 확장은 `.veb` (VillageSQL Extension Bundle) 파일로 배포되며
 extension_name.veb (tar archive)
 ├── manifest.json       # Extension metadata (required)
 └── lib/
-    └── extension.so    # Compiled shared library (required)
+    └── extension_name.so    # Compiled shared library (required, named after the extension)
 ```
 
 ### manifest.json 스키마
 
 ```json
 {
-  "name": "extension_name",          // Required: lowercase_with_underscores
-  "version": "1.0.0",                // Required: semantic version
+  "name": "extension_name",
+  "version": "1.0.0",
   "description": "Brief description",
   "author": "Your Name",
   "license": "GPL-2.0"
@@ -76,11 +74,11 @@ INSTALL EXTENSION name
     ↓
 1. Validate .veb exists in veb_dir
     ↓
-2. Calculate SHA256 hash of .veb
+2. Parse and validate manifest.json
     ↓
-3. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
+3. Calculate SHA256 hash of .veb
     ↓
-4. Parse and validate manifest.json
+4. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
     ↓
 5. Load .so library (dlopen with RTLD_LOCAL)
     ↓
@@ -93,7 +91,7 @@ INSTALL EXTENSION name
 Success
 ```
 
-**롤백:** 단계 중 하나가 실패하면 모든 변경 사항이 취소되고 `.so`가 언로드됩니다.
+**롤백:** 단계 중 하나가 실패하면 확장은 등록되지 않고 `.so`가 언로드됩니다. 압축 해제된 파일은 다음 서버 재시작 때까지 `.veb_expansion_cache`에 남아 있습니다.
 
 **심볼 격리:** 확장은 `RTLD_LOCAL` 플래그로 로드되어, 한 확장의 심볼이 다른 확장의 심볼과 충돌하지 않습니다. 이는 여러 확장이 공통 라이브러리 이름이나 함수 이름을 사용할 때 이름 충돌을 방지합니다.
 
@@ -108,13 +106,13 @@ UNINSTALL EXTENSION name
     ↓
 1. Check for column dependencies
     ↓
-2. Call vef_unregister() cleanup hook
+2. Drop registered VDFs
     ↓
-3. Drop registered VDFs
+3. Drop custom types
     ↓
-4. Drop custom types
+4. Remove extension registration and update cache
     ↓
-5. Remove extension registration and update cache
+5. Call vef_unregister() cleanup hook
     ↓
 6. Unload .so library (dlclose)
     ↓
@@ -137,10 +135,10 @@ datadir/
     └── extension_name/
         ├── abc123.../              # SHA256 of v1.0.0 .veb
         │   ├── manifest.json
-        │   └── lib/extension.so
+        │   └── lib/extension_name.so
         └── def456.../              # SHA256 of v2.0.0 .veb
             ├── manifest.json
-            └── lib/extension.so
+            └── lib/extension_name.so
 ```
 
 **SHA256 디렉터리를 왜 사용하는가?**
@@ -148,7 +146,7 @@ datadir/
 - 롤백 가능
 - "동일한 버전, 다른 코드" 방지
 
-**정리:** 서버 재시작 시 고아 SHA256 디렉터리가 제거됩니다.
+**정리:** 서버 시작 시 설치되지 않은 확장의 `.veb_expansion_cache` 디렉터리가 제거됩니다. 설치된 확장의 오래된 SHA256 디렉터리는 남아 있습니다.
 
 ---
 
@@ -201,7 +199,6 @@ CREATE TABLE t (col COMPLEX)
 | COMPLEX     | MYSQL_TYPE_VARCHAR  | 16 |
 | UUID        | MYSQL_TYPE_VARCHAR  | 16 |
 | INET        | MYSQL_TYPE_VARCHAR  | 19 |
-| JSON_SCHEMA | MYSQL_TYPE_BLOB     | 가변 |
 
 ---
 
@@ -212,7 +209,7 @@ CREATE TABLE t (col COMPLEX)
 확장 함수는 행별 실행 모델로 호출됩니다:
 
 - **행별 격리 실행:** 각 함수 호출은 자체 결과 버퍼를 얻음 (디자인상 스레드 안전)
-- **프리런/포스트런 훅:** 문장별 설정/정리, SQL 문장당 한 번 호출
+- **프리런/포스트런 훅:** 문장별 설정/정리, SQL 문장에서 함수가 나타나는 각 위치마다 한 번 호출
 - **격리 보장 없음:** 여러 연결이 동시에 함수를 호출할 수 있음
 - **모범 사례:** 글로벌 상태를 피하고, 함수 매개변수와 반환 값 사용
 
@@ -259,7 +256,7 @@ SELECT * FROM signals WHERE impedance_magnitude > 100;
 - 확장은 모든 파일 읽기, 네트워크 접근, 코드 실행 가능
 - **신뢰 영향:** 신뢰할 수 있는 소스에서만 확장 설치
 
-**설치 보안:** `villagesql_extension_installer` 사용자로 실행 (컨텍스트 전환).
+**설치 보안:** `INSTALL EXTENSION`과 `UNINSTALL EXTENSION`에는 `EXTENSION_ADMIN` 권한(또는 `SUPER`)이 필요하며, 일반 MySQL 권한 시스템이 이를 적용합니다.
 
 <Accordion title="확장 디버깅">
 
@@ -270,9 +267,15 @@ mysqld --log-error-verbosity=3
 
 **GDB 디버깅:**
 ```bash
+# Linux
 gdb -p $(pidof mysqld)
-(gdb) break my_func_init
+(gdb) break vef_register
 (gdb) continue
+
+# macOS
+lldb -p $(pgrep -x mysqld)
+(lldb) breakpoint set -n vef_register
+(lldb) continue
 ```
 
 **의존성 확인:**

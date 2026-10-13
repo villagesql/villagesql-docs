@@ -1,7 +1,7 @@
 ---
 audience: extension-author
 title: "Referência da API C++"
-description: "Contratos da API de VDF, tratamento de NULL, dimensionamento de buffer, convenções de encode/decode, hooks prerun/postrun e compatibilidade de recursos SQL para extensões do VillageSQL."
+description: "Contratos da API de VDF, tratamento de NULL, dimensionamento de buffer, hooks prerun/postrun e compatibilidade de recursos SQL para extensões do VillageSQL."
 ---
 
 Esta página é uma referência para autores de extensões em C++. Para o tutorial passo a passo,
@@ -75,7 +75,7 @@ void upper_impl(StringArg input, StringResult out) {
 }
 ```
 
-**4. Passe as mensagens de erro para `out.error(msg)`. A mensagem é truncada em `VEF_MAX_ERROR_LEN` (512 bytes) se necessário.**
+**4. Passe as mensagens de erro para `out.error(msg)`. A mensagem é truncada para caber em `VEF_MAX_ERROR_LEN` (512 bytes, incluindo o NUL de terminação), e o servidor pode encurtá-la ainda mais.**
 
 `out.error(msg)` aceita um `std::string_view`. Ele copia a mensagem para um
 buffer gerenciado pelo servidor e define o estado do resultado como erro em uma única chamada.
@@ -102,6 +102,10 @@ void my_reverse_impl(StringArg input, StringResult out) {
 
     auto sv = input.value();
     auto buf = out.buffer();
+    if (sv.size() > buf.size()) {
+        out.error("Input length exceeds buffer size");
+        return;
+    }
     for (size_t i = 0; i < sv.size(); i++) {
         buf.data()[i] = sv[sv.size() - 1 - i];
     }
@@ -131,8 +135,8 @@ Verifique se há NULL via `is_null()` e retorne NULL chamando `set_null()`.
 **Opções de tratamento de NULL:**
 - **Verificação de NULL na entrada:** `input.is_null()`
 - **Retornar NULL:** `out.set_null()`
-- **Retornar valor:** `out.set(v)` (numérico/personalizado) ou `out.set_length(n)` após escrever em `out.buffer()` (string)
-- **Retornar aviso:** `out.warning(msg)` — retorna NULL para esta linha, adiciona um aviso SQL, continua a execução. No modo estrito, inserir o NULL resultante em uma coluna NOT NULL ainda falha com a rejeição de NULL comum do modo estrito (`ERROR 1048 (23000): Column '<col>' cannot be null`) — o aviso em si não se torna um erro, e uma coluna que aceita NULL recebe o NULL silenciosamente. Chame em vez de `out.set()`, não além dele.
+- **Retornar valor:** `out.set(v)` (numérico) ou `out.set_length(n)` após escrever em `out.buffer()` (string/personalizado)
+- **Retornar aviso:** `out.warning(msg)` — retorna NULL para esta linha, adiciona um aviso SQL, continua a execução. No modo estrito, inserir o NULL resultante em uma coluna NOT NULL ainda falha com a rejeição de NULL comum do modo estrito (`ERROR 1048 (23000): Column '<col>' cannot be null`) — o aviso em si não se torna um erro, e uma coluna que aceita NULL recebe o NULL. Chame em vez de `out.set()`, não além dele.
 - **Retornar erro:** `out.error(msg)` — aborta a execução da instrução
 
 ## Tratamento de Erros
@@ -171,10 +175,12 @@ Para detalhes dos métodos de `PrerunArgs` e `PostrunArgs`, consulte
 no guia de Desenvolvimento.
 
 <Note>
-**A maioria das extensões não precisa de hooks prerun/postrun.** O SDK C++ trata
-automaticamente casos comuns, como verificação de tipos e dimensionamento do buffer de resultado; tanto para
-VDFs que retornam STRING quanto para as que retornam CUSTOM, o buffer de resultado é aumentado para acomodar
-o tipo de retorno resolvido antes de o corpo da VDF ser executado. Use prerun/postrun somente quando
+**A maioria das extensões não precisa de hooks prerun/postrun.** A verificação de tipos e o dimensionamento do buffer
+de resultado são automáticos. Uma VDF que retorna STRING começa com um buffer de resultado de 1024 bytes;
+quando ela escreve o que cabe e informa o comprimento total com `out.set_length(n)`, o
+servidor aumenta o buffer e chama a VDF novamente. Para uma VDF que retorna CUSTOM, o
+buffer de resultado é aumentado para acomodar o tipo de retorno resolvido antes de o corpo da VDF ser executado.
+Use prerun/postrun somente quando
 você precisar de uma configuração cara por instrução (como abrir conexões) que
 não deveria acontecer por linha.
 
@@ -186,14 +192,14 @@ adicionar suporte no SDK C++ para tratá-lo automaticamente.
 ## Funções de Agregação
 
 As agregações integradas COUNT(DISTINCT), MIN, MAX e GROUP_CONCAT funcionam com
-tipos personalizados prontas para uso. MIN e MAX exigem uma função de comparação registrada
+tipos personalizados sem configuração adicional. MIN e MAX exigem uma função de comparação registrada
 no tipo.
 
 VDFs de agregação personalizadas também têm suporte. Registre uma com
 `make_aggregate_func<State, &result_fn>("name")`, depois encadeie `.returns()`,
 `.param()`, `.clear<>()` e `.accumulate<>()` antes de chamar `.build()`.
 Tanto `.clear<>()` quanto `.accumulate<>()` são obrigatórios. Consulte
-[Aggregate VDFs](/pt-BR/mysql-9.7/stable/development#aggregate-vdfs) para a
+[VDFs Agregadas](/pt-BR/mysql-9.7/stable/development#aggregate-vdfs) para a
 API do builder e as assinaturas de callback.
 
 **Operações de agregação integradas com tipos personalizados:**
@@ -290,7 +296,8 @@ caminho versionado do SDK C++ estável.
 
 Gatilhos disparam em tabelas com colunas de tipo personalizado. O corpo do gatilho pode
 referenciar colunas de tipo não personalizado de `NEW` e `OLD`. Acessar valores de
-coluna de tipo personalizado dentro do corpo de um gatilho ainda não tem suporte.
+coluna de tipo personalizado dentro do corpo de um gatilho tem suporte: `NEW.<column>` e
+`OLD.<column>` podem ser lidos diretamente e passados para funções de extensão.
 
 ```sql
 CREATE TABLE signals (
@@ -301,14 +308,17 @@ CREATE TABLE signals (
 CREATE TABLE signal_log (
     id        INT,
     label     VARCHAR(50),
+    magnitude REAL,
     logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TRIGGER signals_after_insert
 AFTER INSERT ON signals
 FOR EACH ROW
-    INSERT INTO signal_log (id, label) VALUES (NEW.id, NEW.label);
+    INSERT INTO signal_log (id, label, magnitude)
+    VALUES (NEW.id, NEW.label, complex_abs(NEW.impedance));
 
 INSERT INTO signals VALUES (1, '(10,5)', 'sensor_a');
-SELECT id, label FROM signal_log;
+SELECT id, label, magnitude FROM signal_log;
+-- 1  sensor_a  11.180339887498949
 ```

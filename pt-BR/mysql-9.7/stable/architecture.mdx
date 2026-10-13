@@ -28,10 +28,10 @@ As VDFs oferecem suporte a chamadas de função qualificadas e não qualificadas
 
 ```sql
 -- Unqualified lookup
-SELECT complex_abs(value) FROM table;
+SELECT complex_abs(impedance) FROM signals;
 
 -- Qualified lookup
-SELECT vsql_complex.complex_abs(value) FROM table;
+SELECT vsql_complex.complex_abs(impedance) FROM signals;
 ```
 
 **Ordem de resolução:**
@@ -41,8 +41,6 @@ SELECT vsql_complex.complex_abs(value) FROM table;
 4. Funções armazenadas (criadas com `CREATE FUNCTION`)
 
 Se mais de uma extensão registrar uma função com o mesmo nome, a chamada não qualificada é ambígua e o nome totalmente qualificado (`extension_name.function_name()`) deve ser usado.
-
-**Desempenho:** Para caminhos de código intensivos, use chamadas qualificadas (`extension_name.function_name()`) para pular a cadeia de resolução e invocar diretamente a função de extensão.
 
 ---
 
@@ -54,15 +52,15 @@ As extensões do VillageSQL são distribuídas como arquivos `.veb` (VillageSQL 
 extension_name.veb (tar archive)
 ├── manifest.json       # Extension metadata (required)
 └── lib/
-    └── extension.so    # Compiled shared library (required)
+    └── extension_name.so    # Compiled shared library (required, named after the extension)
 ```
 
 ### Esquema do manifest.json
 
 ```json
 {
-  "name": "extension_name",          // Required: lowercase_with_underscores
-  "version": "1.0.0",                // Required: semantic version
+  "name": "extension_name",
+  "version": "1.0.0",
   "description": "Brief description",
   "author": "Your Name",
   "license": "GPL-2.0"
@@ -82,11 +80,11 @@ INSTALL EXTENSION name
     ↓
 1. Validate .veb exists in veb_dir
     ↓
-2. Calculate SHA256 hash of .veb
+2. Parse and validate manifest.json
     ↓
-3. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
+3. Calculate SHA256 hash of .veb
     ↓
-4. Parse and validate manifest.json
+4. Expand to {datadir}/.veb_expansion_cache/{name}/{sha256}/
     ↓
 5. Load .so library (dlopen with RTLD_LOCAL)
     ↓
@@ -99,7 +97,7 @@ INSTALL EXTENSION name
 Success
 ```
 
-**Reversão:** Se qualquer etapa falhar, todas as alterações são desfeitas e a `.so` é descarregada.
+**Reversão:** Se qualquer etapa falhar, a extensão não é registrada e a `.so` é descarregada. Os arquivos expandidos permanecem em `.veb_expansion_cache` até a próxima reinicialização do servidor.
 
 **Isolamento de Símbolos:** As extensões são carregadas com a flag `RTLD_LOCAL`, garantindo que os símbolos de uma extensão não entrem em conflito com os símbolos de outras extensões. Isso evita colisões de nomes quando várias extensões usam nomes de biblioteca ou nomes de função comuns.
 
@@ -114,13 +112,13 @@ UNINSTALL EXTENSION name
     ↓
 1. Check for column dependencies
     ↓
-2. Call vef_unregister() cleanup hook
+2. Drop registered VDFs
     ↓
-3. Drop registered VDFs
+3. Drop custom types
     ↓
-4. Drop custom types
+4. Remove extension registration and update cache
     ↓
-5. Remove extension registration and update cache
+5. Call vef_unregister() cleanup hook
     ↓
 6. Unload .so library (dlclose)
     ↓
@@ -143,10 +141,10 @@ datadir/
     └── extension_name/
         ├── abc123.../              # SHA256 of v1.0.0 .veb
         │   ├── manifest.json
-        │   └── lib/extension.so
+        │   └── lib/extension_name.so
         └── def456.../              # SHA256 of v2.0.0 .veb
             ├── manifest.json
-            └── lib/extension.so
+            └── lib/extension_name.so
 ```
 
 **Por que diretórios SHA256?**
@@ -154,7 +152,7 @@ datadir/
 - Habilitar reversão
 - Evitar "mesma versão, código diferente"
 
-**Limpeza:** Diretórios SHA256 órfãos são removidos na reinicialização do servidor.
+**Limpeza:** Na inicialização do servidor, o diretório `.veb_expansion_cache` de uma extensão que não está instalada é removido. Os diretórios SHA256 mais antigos de uma extensão instalada permanecem.
 
 ---
 
@@ -207,7 +205,6 @@ Os tipos personalizados são mapeados para tipos de armazenamento do MySQL:
 | COMPLEX     | MYSQL_TYPE_VARCHAR  | 16 |
 | UUID        | MYSQL_TYPE_VARCHAR  | 16 |
 | INET        | MYSQL_TYPE_VARCHAR  | 19 |
-| JSON_SCHEMA | MYSQL_TYPE_BLOB     | Variável |
 
 ---
 
@@ -218,7 +215,7 @@ Os tipos personalizados são mapeados para tipos de armazenamento do MySQL:
 As funções de extensão são chamadas em um modelo de execução por linha:
 
 - **Execução isolada por linha:** Cada chamada de função recebe seu próprio buffer de resultado (thread-safe por design)
-- **Ganchos Prerun/Postrun:** Configuração/limpeza por instrução, chamados uma vez por instrução SQL
+- **Ganchos Prerun/Postrun:** Configuração/limpeza por instrução, chamados uma vez para cada lugar em que a função aparece em uma instrução SQL
 - **Sem isolamento garantido:** Várias conexões podem chamar suas funções simultaneamente
 - **Prática recomendada:** Evite estado global; use parâmetros de função e valores de retorno
 
@@ -265,7 +262,7 @@ SELECT * FROM signals WHERE impedance_magnitude > 100;
 - As extensões podem ler qualquer arquivo, acessar a rede, executar código
 - **Implicações de confiança:** Instale apenas extensões de fontes confiáveis
 
-**Segurança de instalação:** Executa como usuário `villagesql_extension_installer` (troca de contexto).
+**Segurança de instalação:** `INSTALL EXTENSION` e `UNINSTALL EXTENSION` exigem o privilégio `EXTENSION_ADMIN` (ou `SUPER`), imposto pelo sistema comum de concessões do MySQL.
 
 <Accordion title="Depurando Extensões">
 
@@ -276,9 +273,15 @@ mysqld --log-error-verbosity=3
 
 **Depuração com GDB:**
 ```bash
+# Linux
 gdb -p $(pidof mysqld)
-(gdb) break my_func_init
+(gdb) break vef_register
 (gdb) continue
+
+# macOS
+lldb -p $(pgrep -x mysqld)
+(lldb) breakpoint set -n vef_register
+(lldb) continue
 ```
 
 **Verificar dependências:**
@@ -303,7 +306,7 @@ otool -L /path/to/extension.so
 
 <CardGroup cols={2}>
   <Card
-    title="Criando Extensões em C++"
+    title="Criar Extensão"
     icon="code"
     href="/pt-BR/mysql-9.7/stable/create"
   >
@@ -317,7 +320,7 @@ otool -L /path/to/extension.so
     Tabelas e visões do sistema
   </Card>
   <Card
-    title="Exemplos de Extensões em C++"
+    title="Exemplos"
     icon="lightbulb"
     href="/pt-BR/mysql-9.7/stable/examples"
   >

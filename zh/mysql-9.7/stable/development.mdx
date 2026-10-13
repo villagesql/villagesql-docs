@@ -12,7 +12,7 @@ VEF 协议 3 自 v0.0.4 版本起已稳定。协议 4 正在开发中，并且�
 
 ## 编写扩展函数
 
-扩展函数是用 C++ 编写的，并向 VEF 注册。包含一个标头以访问完整的 SDK：
+扩展函数是用 C++ 编写的，并向 VEF 注册。包含一个标头以访问 VDF、类型和扩展生成器 API：
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -22,7 +22,7 @@ VEF 协议 3 自 v0.0.4 版本起已稳定。协议 4 正在开发中，并且�
 
 控制异常是扩展的责任。SDK 不会将您的实现包装在 `try`/`catch` 中，服务器也不会，因此从入口点逃逸的异常会跨越 C ABI 边界展开，在其之上没有任何处理程序，服务器进程会终止。普通的 SQL 输入就会触发这一点：`std::stoi()` 在遇到非数字字符串时会抛出异常，而 `nlohmann::json::dump()` 在遇到非有效 UTF-8 的文本时会抛出异常。
 
-请包装您注册的每一个入口点的主体：VDF、聚合结果函数，以及自定义类型的 `from_string`/`to_string` 操作。
+请包装您注册的每一个入口点的主体：VDF、聚合函数、prerun 和 postrun 钩子，以及自定义类型的各项操作。
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -54,7 +54,7 @@ VDF 参数和结果作为类型安全的参数和结果类型传递。框架会�
 
 **Span 类型：** 面向字节的参数和结果类型上的 `value()` 和 `buffer()` 返回一个 `vsql::Span<T>`——一个非所有权视图，用于连续的 `T` 序列，具有 `data()`、`size()`、`empty()`、`begin()`/`end()` 和 `operator[]`。在 C++20 中，它是 `std::span<T>` 的别名；在 C++17 中，此 SDK 提供了一个最小的兼容实现，因此相同的代码可以在任何标准中编译。它通过 `<villagesql/vsql.h>` 提供。
 
-`warning(msg)` 会为该行返回 SQL NULL，并附加一个 SQL 警告。在严格模式 (`STRICT_TRANS_TABLES`) 下，MySQL 会将其升级为 INSERT/UPDATE 上的语句错误，因此它在严格上下文中表现得像 `error(msg)`。将其用于可恢复的错误输入，例如编码函数中的无法解析的字符串。对于已损坏的存储数据或任何继续操作不安全的情况，请使用 `error(msg)`。两种情况下的消息都会被截断以适应服务器的内部错误缓冲区（如果需要）。
+`warning(msg)` 会为该行返回 SQL NULL，并附加一个 SQL 警告。从服务器的角度来看，该 NULL 只是一个普通值，因此它仅会像任何普通 NULL 一样变成语句错误：在 `STRICT_TRANS_TABLES` 下将其写入 `NOT NULL` 列会失败，这与 `INSERT INTO t VALUES (NULL)` 相同。将其写入可空列则会成功，并附带警告。请将 `warning(msg)` 用于可恢复的错误输入，例如编码函数中无法解析的字符串。对于已损坏的存储数据或任何继续操作不安全的情况，请使用 `error(msg)`。两种情况下的消息都会被截断以适应服务器的内部错误缓冲区（如果需要）。
 
 **标量示例**——将两个整数相加：
 
@@ -67,10 +67,10 @@ void add_impl(IntArg a, IntArg b, IntResult out) {
 }
 
 // Registration is unchanged:
-make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build();
+// make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build()
 ```
 
-**二进制示例**——就地转换自定义类型缓冲区：
+**二进制示例**——将自定义类型值转换到结果缓冲区中：
 
 ```cpp
 using namespace vsql;
@@ -86,7 +86,7 @@ void rot13_impl(CustomArg in, CustomResult out) {
 
 对于 `StringResult` 和 `CustomResult`，写入 `buffer()`，然后调用 `set_length()`，其中包含写入的字节数。`buffer().size()` 是最大容量。
 
-对于返回自定义类型的 VDF (`returns(CUSTOM(MYTYPE))`)，服务器会自动调整结果缓冲区的大小以匹配解析的返回类型的 `persisted_length`——扩展作者在此情况下不需要在函数生成器上声明 `.buffer_size(...)`。如果 `prerun` 进一步增大缓冲区，则会保留更大的大小。这使得，例如，`SVECTOR::from_string('[…1024 floats…]')` 可以在不使结果缓冲区耗尽空间的情况下编码一个大型向量。
+对于返回自定义类型的 VDF (`.returns(MYTYPE)`)，服务器会自动调整结果缓冲区的大小以匹配解析的返回类型的 `persisted_length`——扩展作者在此情况下不需要在函数生成器上声明 `.buffer_size(...)`。如果 `prerun` 进一步增大缓冲区，则会保留更大的大小。这使得，例如，`SVECTOR::from_string('[…1024 floats…]')` 可以在不使结果缓冲区耗尽空间的情况下编码一个大型向量。
 
 您可以在同一扩展中的不同函数中使用不同的样式——每个函数的样式由其自身的签名决定。
 
@@ -128,7 +128,7 @@ void my_result(const SumState &s, IntResult out) {
 生成器方法的工作方式：
 - `make_aggregate_func<State, &result_fn>()` 自动生成 `prerun` 和 `postrun`（值初始化并删除 `State`）。
 - `.clear<&fn>()` 注册您的 `void(State&)` 重置函数。
-- `.accumulate<&fn>()` 注册您的 `void(State&, TypedArgs...)` 折叠函数。`TypedArgs` 从函数签名中推断出来（`IntArg`、`StringArg` 等）。
+- `.accumulate<&fn>()` 注册您的 `void(State&, TypedArgs...)` 折叠函数。`TypedArgs` 从函数签名中推断出来（`IntArg`、`StringArg` 等）。请在所有 `.param(TYPE)` 调用之后再调用 `.accumulate<>()`：生成器会在编译时将类型化参数的数量与声明的 SQL 参数数量进行核对，因此提前调用会导致构建失败。
 - 结果类型 (`IntResult`、`RealResult` 等)从结果函数签名中推断出来。
 
 对于永不返回 NULL 的计数器，请使用纯状态类型：
@@ -270,7 +270,7 @@ SELECT point_path('1,2');
 #include <cstring>
 using namespace vsql;
 
-constexpr size_t kBytearrayLen = 4;
+constexpr size_t kBytearrayLen = 8;
 
 void ba_concat_all_prerun(PrerunArgs args, PrerunResult out) {
   if (args.size() == 0) {
@@ -294,6 +294,7 @@ void ba_concat_all(VarArgs args, StringResult out) {
   for (auto a : args) {
     if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
     auto bytes = a.as_custom();
+    if (off + bytes.size() > dst.size()) { out.error("ba_concat_all: result too long"); return; }
     std::memcpy(dst.data() + off, bytes.data(), bytes.size());
     off += bytes.size();
   }
@@ -307,17 +308,167 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .build()
 ```
 
+## 在解析时决定函数的类型参数 {#deciding-a-functions-type-parameters-at-resolution-time}
+
+服务器的内置规则通常能够根据参数声明的类型推算出返回类型的参数。但有时它们做不到。例如，`tvector_concat(TVECTOR(M), TVECTOR(N))` 返回一个 `TVECTOR(M+N)`。内置规则会拒绝两个维度不同的 `TVECTOR` 参数，并且它们可以将某个参数的参数复制到返回类型，但永远不会把它们相加。对于这类情况，请在函数生成器上使用 `.bind_and_check_types<&Hook>()` 注册一个**绑定并检查类型钩子**，其签名为：
+
+```cpp
+void my_hook(vsql::BindArgs args, vsql::BindResult out);
+```
+
+`.bind_and_check_types()` 和 `.varargs()` 在同一个函数上互斥——可变参数 VDF 没有固定的参数列表供该钩子推理。在生成器链中先声明 `.varargs()` 再声明 `.bind_and_check_types<&Hook>()` 是编译时 `static_assert` 失败。以相反的顺序声明它们可以编译，但服务器加载该扩展时会拒绝它：注册过程会遍历每个函数最终构建出的状态，并拒绝第一个既是可变参数又带有绑定钩子的函数，错误为：
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned an error: VDF '<function>' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
+```
+
+<Warning>
+`.bind_and_check_types<&Hook>()` 和 `<villagesql/vsql/bind_check_types.h>` 仅在选择加入的开发 ABI 标头中声明 (`-DVSQL_USE_DEV_ABI=ON`)，并且需要 VEF 协议 4。默认的稳定 ABI 构建两者都没有，因此注册钩子会导致编译失败。
+</Warning>
+
+服务器在它对函数参数进行的两次遍历之间调用该钩子：第一次遍历检查每个参数的基础类型，接着运行该钩子，第二次遍历则对钩子给出了答案的每个参数应用其答案。安装了钩子后，第一次遍历不会在同一自定义类型的参数之间收集共享参数，因此它们之间无需彼此一致。自身类型尚未解析的参数（例如裸字符串字面量）只能从钩子获得其参数。参数化返回类型的参数同样来自钩子，取代了从某个参数复制它们的内置规则。
+
+服务器源代码树中的 [`vsql_tvector`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/examples/vsql-tvector/src/tvector.cc) 示例扩展在 `tvector_concat` 上注册了这样一个钩子：
+
+```cpp
+#include <villagesql/vsql.h>
+
+// Excerpt from villagesql/examples/vsql-tvector/src/tvector.cc. That file
+// also has the standard library includes, the constants kDefaultBytesPerElem
+// (4) and kTVectorMaxDimension (4096), the TVECTOR type, the tvector_concat
+// function body, and the helpers common_element_width() and
+// bind_params_for_vector(), which read an argument's resolved params or count
+// the elements of a constant literal.
+
+struct TVectorParams {
+  int64_t dimension;
+  size_t bytes_per_elem;  // 4 for float, 8 for double
+
+  static TVectorParams parse(const std::map<std::string, std::string> &params) {
+    auto dim_it = params.find("dimension");
+    int64_t dim = strtoll(dim_it->second.c_str(), nullptr, 10);
+    size_t bytes = kDefaultBytesPerElem;
+    auto type_it = params.find("type");
+    if (type_it != params.end() && type_it->second == "double") bytes = 8;
+    return TVectorParams{.dimension = dim, .bytes_per_elem = bytes};
+  }
+
+  // Inverse of parse: render a typed TVectorParams back into the canonical
+  // key/value string form. Used by the SDK when the server needs to publish
+  // inferred params (e.g., from a constant-string from_string) back in the
+  // same shape that parse() consumes.
+  static void to_strings(const TVectorParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
+    out["type"] = (p.bytes_per_elem == 8) ? "double" : "float";
+  }
+};
+
+// bind_and_check_types for tvector_concat.
+//
+// Two jobs the built-in rules cannot do:
+//   1. permit arguments whose dimensions differ (parameter sharing rejects it);
+//   2. compute the return dimension as M+N (the server return rule only
+//      copies).
+//
+// A third job appears when an argument is a constant: a bare '[1,2,3]' has no
+// type context, and with a hook installed nothing donates params to it, so the
+// hook counts the elements itself and answers with set_arg(). The element type
+// comes from whichever side the server already resolved, which is what the
+// built-in rules would have donated.
+void tvector_concat_bind(vsql::BindArgs args, vsql::BindResult out) {
+  if (args.size() != 2) {
+    out.error("expects 2 arguments");
+    return;
+  }
+
+  std::string error_msg;
+  size_t bpe = 0;
+  if (common_element_width(args, bpe, error_msg)) {
+    out.error(error_msg);
+    return;
+  }
+
+  TVectorParams first{}, second{};
+  bool publish_first = false, publish_second = false;
+
+  if (bind_params_for_vector(args, 0, bpe, first, publish_first, error_msg) ||
+      bind_params_for_vector(args, 1, bpe, second, publish_second, error_msg)) {
+    out.error(error_msg);
+    return;
+  }
+
+  // Hand back the params of whichever argument the server could not resolve.
+  if (publish_first) out.set_arg(0, first);
+  if (publish_second) out.set_arg(1, second);
+
+  const int64_t total = first.dimension + second.dimension;
+  if (total > kTVectorMaxDimension) {
+    out.error("combined dimension " + std::to_string(total) +
+              " exceeds the maximum of " +
+              std::to_string(kTVectorMaxDimension));
+    return;
+  }
+  out.set_return(TVectorParams{.dimension = total, .bytes_per_elem = bpe});
+}
+
+// Registration, inside make_extension():
+// .func(make_func<&tvector_concat>("tvector_concat")
+//     .returns(TVECTOR)
+//     .param(TVECTOR)
+//     .param(TVECTOR)
+//     .bind_and_check_types<&tvector_concat_bind>()
+//     .deterministic()
+//     .build())
+```
+
+该钩子让两个维度不同的向量可以合并，并且它会统计常量字面量的元素个数。服务器的源代码构建包含 `vsql_tvector`；发行版压缩包则不包含。
+
+```sql
+INSTALL EXTENSION vsql_tvector;
+CREATE TABLE v2 (v vsql_tvector.TVECTOR(2));
+CREATE TABLE v3 (v vsql_tvector.TVECTOR(3));
+INSERT INTO v2 VALUES ('[1,2]');
+INSERT INTO v3 VALUES ('[3,4,5]');
+
+SELECT vsql_tvector.tvector_concat(v2.v, v3.v) AS c,
+       vsql_tvector.tvector_dim(vsql_tvector.tvector_concat(v2.v, v3.v)) AS dim
+FROM v2, v3;
+```
+
+```text
++-------------+------+
+| c           | dim  |
++-------------+------+
+| [1,2,3,4,5] |    5 |
++-------------+------+
+```
+
+```sql
+SELECT vsql_tvector.tvector_concat(v, '[6,7]') AS c FROM v3;
+```
+
+```text
++-------------+
+| c           |
++-------------+
+| [3,4,5,6,7] |
++-------------+
+```
+
 ## 扩展加载和卸载钩子 {#extension-load-and-unload-hooks}
 
-扩展有时需要在每次加载时执行一些工作，而不是在每次调用时执行——例如选择针对特定 CPU 的实现，或者构建一个供 VDF 随后读取的查找表。使用扩展生成器上的 `.on_init<&Fn>()` 注册该工作，并使用 `.on_deinit<&Fn>()` 注册与之匹配的清理工作。两者都接受一个签名为 `void()` 的函数。
+扩展有时需要在每次加载时执行一些工作，而不是在每次调用时执行——例如选择针对特定 CPU 的实现、一次性读取自己的配置，或者构建一个供 VDF 随后读取的查找表。使用扩展生成器上的 `.on_init<&Fn>()` 注册该工作，并使用 `.on_deinit<&Fn>()` 注册与之匹配的清理工作。两者都接受一个签名为 `void()` 的函数，并且必须一起注册——只声明其中一个而不声明另一个会导致编译失败。以其他方式带着不匹配的一对到达服务器的扩展则会在加载时被拒绝：
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers an on_init hook without an on_deinit
+```
 
 <Warning>
 `.on_init<&Fn>()` 和 `.on_deinit<&Fn>()` 仅在选择加入的开发 ABI 标头中声明 (`-DVSQL_USE_DEV_ABI=ON`)。默认的稳定 ABI 构建没有这两个方法，因此注册钩子会导致编译失败。
 </Warning>
 
-`on_init` 在每次扩展加载时运行：在 `INSTALL EXTENSION` 时，以及在每次服务器启动时——都是在服务器验证并接受该扩展之后。对于被服务器拒绝的扩展，它绝不会运行。`on_deinit` 在卸载时运行——`UNINSTALL EXTENSION` 或服务器关闭。
-
-这两个钩子都在扩展进程内运行，且**无法访问服务器**：它们不能运行 SQL、读取系统变量或访问服务器状态。因此，对于必须与服务器通信的初始化工作，它们不是合适的位置——请改用预览功能的 populate 步骤。
+`on_init` 在每次加载时运行一次——在 `INSTALL EXTENSION` 时，以及在每次服务器启动时——时机是在服务器验证该扩展并填充其所需功能之后，因此已注册的系统变量此时已经持有其配置值。特别是在启动时，`on_init` 会推迟到持久化的系统变量值应用完毕之后，因此它绝不会看到编译时默认值取代了通过 `SET PERSIST` 设置的值。对于被服务器拒绝的扩展，它绝不会运行。`on_deinit` 在卸载时运行——`UNINSTALL EXTENSION` 或服务器关闭——时机是在服务器清空这些功能之前，因此它看到的实时状态与 `on_init` 看到的相同。
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -356,10 +507,6 @@ VEF_GENERATE_ENTRY_POINTS(
 
 在 `INSTALL EXTENSION my_extension` 之后，`SELECT fast_sqrt(16)` 返回 `4`——只有在 `build_table` 已经运行的情况下才能得到这个结果。
 
-<Note>
-`on_deinit` 是从 `VEF_GENERATE_ENTRY_POINTS` 生成的 `vef_unregister` 入口点调用的。`VEF_GENERATE_REGISTRATION` 不定义该入口点，因此使用它的扩展必须从其自行编写的 `vef_unregister` 中调用自己的清理函数。
-</Note>
-
 ## VEF_GENERATE_REGISTRATION
 
 `VEF_GENERATE_REGISTRATION` 创建一个内部 `_vef_do_register()` 辅助函数，该函数执行扩展注册，但不定义 `extern "C"` 入口点。当您需要自定义 `vef_register` 行为时使用它——例如，在测试构建中注册后修补描述符。对于常规扩展，请改用 `VEF_GENERATE_ENTRY_POINTS`。
@@ -367,7 +514,7 @@ VEF_GENERATE_ENTRY_POINTS(
 ```cpp
 VEF_GENERATE_REGISTRATION(
     make_extension()
-        .func(make_func<&my_impl>("my_func").returns(INT).build()))
+        .func(make_func<&my_impl>("my_func").returns(INT).no_params().build()))
 
 // Then define your own extern "C" vef_register/vef_unregister that call
 // _vef_do_register() and optionally modify the result.
@@ -388,7 +535,7 @@ VEF_GENERATE_REGISTRATION(
 
 ## 检查扩展注册元数据
 
-`INFORMATION_SCHEMA.EXTENSION_REGISTRATION` 将每个已加载扩展的内存 VEF 注册结构作为 JSON 文档公开。使用它来验证服务器在 `INSTALL EXTENSION` 之后是否已正确解析扩展的函数、类型和系统变量。
+`INFORMATION_SCHEMA.EXTENSION_REGISTRATION` 将每个已加载扩展的内存 VEF 注册结构作为 JSON 文档公开。使用它来验证服务器在 `INSTALL EXTENSION` 之后是否已正确解析扩展的函数和类型。
 
 ```sql
 SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL, REGISTRATION_JSON
@@ -400,7 +547,7 @@ WHERE EXTENSION_NAME = 'my_ext';
 |--------|------|-------------|
 | `EXTENSION_NAME` | `VARCHAR(64)` | 已安装扩展的名称。 |
 | `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | 扩展和服务器之间协商的 VEF 协议版本。 |
-| `REGISTRATION_JSON` | `VARCHAR(65535)` | `vef_registration_t` 结构的 JSON 序列化，包括 `funcs` 和 `types` 数组。 |
+| `REGISTRATION_JSON` | `VARCHAR(65535)` | `vef_registration_t` 结构的 JSON 序列化，包括 `funcs` 和 `types` 数组，以及一个报告该扩展构建时所用 SDK 版本的 `sdk_version` 键。 |
 
 ## 另请参阅
 

@@ -114,7 +114,7 @@ vsql_status_var.requests	1
 
 ## システム変数 {#system-variables}
 
-`sys_var` 機能は、拡張機能が所有する MySQL システム変数を登録します。3 つの型がサポートされます：`Bool`、`Int`（`min`/`max` の境界付き）、および `Str` です。すべての spec は、名前、`SHOW VARIABLES` のメタデータに表示されるコメント、デフォルト値、およびオプションの `on_change` コールバックを持ちます。
+`sys_var` 機能は、拡張機能が所有する MySQL システム変数を登録します。3 つの型がサポートされます：`Bool`、`Int`（`min`/`max` の境界付き）、および `Str` です。すべての spec は、名前、コメント、デフォルト値、およびオプションの `on_change` コールバックを持ちます。
 
 名前と文字列のデフォルト値は `&'static CStr` の値です — C 文字列リテラル（`c"enabled"`）として記述してください：
 
@@ -263,11 +263,73 @@ SET GLOBAL vsql_thread_worker.ticker_enabled = OFF;
 
 作業関数がパニックした場合、SDK は FFI 境界でそのパニックを捕捉し、その呼び出しが `NextWakeup::unchanged()` を返したものとして扱います — ワーカーは実行を継続します。
 
-`ThreadHandle` パラメータは参照で渡されます。`villagesql::preview::sql_query` の `SqlQueryCapability::open` に渡すと、ワーカー内から SQL を実行できます。
+`handle` パラメータを [`SqlQueryCapability::open`](#sql-query) に渡すと、ワーカー内から SQL を実行できます。
+
+## SQL クエリ {#sql-query}
+
+`sql_query` 機能は、`thread_worker` のコールバックから SQL セッションを開きます。これにより、バックグラウンドワーカーは、自身がロードされているサーバーに対してステートメントを実行できます。`ThreadWorkerCapability` と一緒に宣言し、ワーカーが受け取る `ThreadHandle` でセッションを開きます：
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+use villagesql::preview::sql_query::SqlQueryCapability;
+use villagesql::preview::thread_worker::{
+    NextWakeup, ThreadHandle, ThreadWorkerCapability, WakeupReason,
+};
+use villagesql::{InValue, VdfReturn};
+
+static USER_COUNT: AtomicI64 = AtomicI64::new(-1);
+
+static SQL_QUERY: SqlQueryCapability = SqlQueryCapability::new();
+
+fn worker(reason: WakeupReason, handle: &ThreadHandle) -> NextWakeup {
+    if reason == WakeupReason::Periodic {
+        if let Some(session) = SQL_QUERY.open(handle) {
+            if let Some(mut result) = session.execute("SELECT COUNT(*) FROM mysql.user") {
+                if !result.has_error() {
+                    if let Some(n) = result.next_row().and_then(|row| row.get_int(0)) {
+                        USER_COUNT.store(n, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+    NextWakeup::unchanged()
+}
+
+static WORKER: ThreadWorkerCapability =
+    ThreadWorkerCapability::new(worker, "user_count", Duration::from_secs(5), None);
+
+fn user_count_impl(_args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(USER_COUNT.load(Ordering::Relaxed))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(user_count_impl, "user_count", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &WORKER,
+        &SQL_QUERY,
+    ]
+}
+```
+
+`SqlQueryCapability::open(handle)` は、機能に値が設定されていない場合（プレビューがオフ、または要求されていない）、ABI が古すぎる場合、あるいはサーバーがセッションを開けなかった場合に `None` を返します。結果を使用する前に確認してください。
+
+`Session` には、ステートメントを実行する 2 つの方法があります：
+
+- `execute(sql)` は結果セット全体をバッファリングし、`QueryResult` を返します。`next_row()` が `None` を返すまで繰り返し呼び出します。各 `Row` は `get_int(i)`、`get_str(i)`、`get_real(i)`、または `get_bytes(i)` で列を読み取ります。`get_bytes`/`get_str` は、SQL `NULL` または範囲外のインデックスに対して `None` を返します（`get_str` は UTF-8 でないバイトに対しても `None` を返します）。`get_int`/`get_real` はまず列をテキストとして解析するため、解析できないテキストに対しても `None` を返します。`execute` 自体は、セットアップの失敗（セッションがない、またはメモリ不足）の場合にのみ `None` を返します。
+- `for_each(sql, |row: Row<'_>| { ... })` は、結果セット全体をバッファリングする代わりに、行をクロージャにストリーミングします。返される `QueryResult` は診断情報のみを持ち、反復処理するバッファリングされた行はありません。また、セットアップの失敗時には `None` を返します。
+
+ステートメントが成功したと判断する前に、どちらの結果でも `has_error()` と `error()`（`errno`、`severity`、`sqlstate`、`message` を持つ `Option<Diag>`）を確認してください。`warnings()` は、結果に付随するすべての警告とノートを返します。
+
+`Session` と `QueryResult` は、それぞれドロップ時に基盤となるハンドルを閉じます。自分で呼び出す close メソッドはありません。
 
 ## キーリングアクセス {#keyring-access}
 
-`keyring` 機能は、MySQL keyring コンポーネントに格納されたシークレット — API キー、暗号化キー、テーブルに置くべきでないあらゆるもの — を読み書きします。サーバーに keyring コンポーネント（例：`component_keyring_file`）がインストールされている必要があります。インストールされていない場合、すべての読み書きは `KeyringError::NoComponent` で失敗します。
+`keyring` 機能は、MySQL keyring コンポーネントに格納されたシークレット — API キー、暗号化キー、テーブルに置くべきでないあらゆるもの — を読み書きします。keyring コンポーネント（例：`component_keyring_file`）は、[Keyring Component Installation](https://dev.mysql.com/doc/refman/9.7/en/keyring-component-installation.html) で説明されているように、コンポーネントマニフェストとその構成ファイルを通じてサーバー起動時にロードされている必要があります。`INSTALL COMPONENT` では利用可能になりません。コンポーネントがない場合、すべての読み書きは `KeyringError::NoComponent` で失敗します。
 
 ```rust
 use std::ffi::CString;
@@ -293,7 +355,8 @@ fn keyring_read_impl(args: &[InValue]) -> VdfReturn {
             Ok(s) => VdfReturn::string(s),
             Err(_) => VdfReturn::null(),
         },
-        Ok(None) | Err(_) => VdfReturn::null(),
+        Ok(None) => VdfReturn::null(),
+        Err(e) => VdfReturn::error(format!("keyring: {e}")),
     }
 }
 

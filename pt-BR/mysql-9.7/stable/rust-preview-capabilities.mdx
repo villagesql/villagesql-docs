@@ -141,9 +141,8 @@ vsql_status_var.requests	1
 
 A capability `sys_var` registra variáveis de sistema do MySQL de propriedade da
 sua extensão. Há suporte para três tipos: `Bool`, `Int` (com limites
-`min`/`max`) e `Str`. Todo spec carrega um nome, um comentário mostrado nos
-metadados de `SHOW VARIABLES`, um valor padrão e um callback `on_change`
-opcional.
+`min`/`max`) e `Str`. Todo spec carrega um nome, um comentário, um valor padrão e um callback
+`on_change` opcional.
 
 Nomes e valores padrão de string são valores `&'static CStr` — escreva-os como
 literais de string C (`c"enabled"`):
@@ -330,17 +329,99 @@ Se a função de trabalho gerar panic, o SDK captura o panic na fronteira da FFI
 trata a chamada como se ela retornasse `NextWakeup::unchanged()` — o worker
 continua em execução.
 
-O parâmetro `ThreadHandle` chega por referência; passe-o para
-`SqlQueryCapability::open`, em `villagesql::preview::sql_query`, para executar
-SQL de dentro do worker.
+Passe o parâmetro `handle` para [`SqlQueryCapability::open`](#sql-query) para
+executar SQL de dentro do worker.
+
+## Consulta SQL {#sql-query}
+
+A capability `sql_query` abre uma sessão SQL a partir de um callback de
+`thread_worker`, de modo que um worker em segundo plano pode executar instruções no servidor em que ele está
+carregado. Declare-a junto com `ThreadWorkerCapability` e abra uma sessão
+com o `ThreadHandle` que o worker recebe:
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+use villagesql::preview::sql_query::SqlQueryCapability;
+use villagesql::preview::thread_worker::{
+    NextWakeup, ThreadHandle, ThreadWorkerCapability, WakeupReason,
+};
+use villagesql::{InValue, VdfReturn};
+
+static USER_COUNT: AtomicI64 = AtomicI64::new(-1);
+
+static SQL_QUERY: SqlQueryCapability = SqlQueryCapability::new();
+
+fn worker(reason: WakeupReason, handle: &ThreadHandle) -> NextWakeup {
+    if reason == WakeupReason::Periodic {
+        if let Some(session) = SQL_QUERY.open(handle) {
+            if let Some(mut result) = session.execute("SELECT COUNT(*) FROM mysql.user") {
+                if !result.has_error() {
+                    if let Some(n) = result.next_row().and_then(|row| row.get_int(0)) {
+                        USER_COUNT.store(n, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+    NextWakeup::unchanged()
+}
+
+static WORKER: ThreadWorkerCapability =
+    ThreadWorkerCapability::new(worker, "user_count", Duration::from_secs(5), None);
+
+fn user_count_impl(_args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(USER_COUNT.load(Ordering::Relaxed))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(user_count_impl, "user_count", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &WORKER,
+        &SQL_QUERY,
+    ]
+}
+```
+
+`SqlQueryCapability::open(handle)` retorna `None` se a capability não foi
+populada (preview desligado ou não solicitada), se a ABI é antiga demais ou se o servidor
+não conseguiu abrir uma sessão — verifique isso antes de usar o resultado.
+
+Uma `Session` oferece duas maneiras de executar uma instrução:
+
+- `execute(sql)` armazena em buffer o conjunto de resultados completo e retorna um `QueryResult`.
+  Chame `next_row()` repetidamente até que ela retorne `None`; cada `Row` lê
+  colunas com `get_int(i)`, `get_str(i)`, `get_real(i)` ou `get_bytes(i)`.
+  `get_bytes`/`get_str` retornam `None` para `NULL` do SQL ou um índice fora do
+  intervalo (e também para bytes que não são UTF-8, no caso de `get_str`); `get_int`/`get_real` analisam a
+  coluna primeiro como texto, então também retornam `None` para texto que não pode ser analisado.
+  O próprio `execute` retorna `None` apenas em falha de configuração (sem sessão, ou sem
+  memória).
+- `for_each(sql, |row: Row<'_>| { ... })` transmite as linhas para uma closure em vez
+  de armazenar em buffer o conjunto de resultados completo. O `QueryResult` que ele retorna carrega
+  apenas diagnósticos — sem linhas em buffer para iterar — e também retorna `None`
+  em falha de configuração.
+
+Verifique `has_error()` e `error()` (um `Option<Diag>` com `errno`,
+`severity`, `sqlstate` e `message`) em qualquer um dos resultados antes de confiar que uma
+instrução teve sucesso. `warnings()` retorna todos os avisos e notas anexados ao
+resultado.
+
+Uma `Session` e um `QueryResult` fecham, cada um, seu handle subjacente quando são
+descartados — não há um método de fechamento para você chamar.
 
 ## Acesso ao Keyring {#keyring-access}
 
 A capability `keyring` lê e escreve segredos armazenados no componente keyring
 do MySQL — chaves de API, chaves de criptografia, qualquer coisa que não deveria
-ficar em uma tabela. Um componente keyring (por exemplo,
-`component_keyring_file`) deve estar instalado no servidor; sem um, toda leitura
-e escrita falha com `KeyringError::NoComponent`.
+ficar em uma tabela. Um componente keyring (por exemplo, `component_keyring_file`) deve ser carregado
+na inicialização do servidor por meio de um manifesto de componente e seu arquivo de configuração, conforme descrito em
+[Keyring Component Installation](https://dev.mysql.com/doc/refman/9.7/en/keyring-component-installation.html);
+`INSTALL COMPONENT` não o torna disponível. Sem um, toda leitura e escrita falha com
+`KeyringError::NoComponent`.
 
 ```rust
 use std::ffi::CString;
@@ -366,7 +447,8 @@ fn keyring_read_impl(args: &[InValue]) -> VdfReturn {
             Ok(s) => VdfReturn::string(s),
             Err(_) => VdfReturn::null(),
         },
-        Ok(None) | Err(_) => VdfReturn::null(),
+        Ok(None) => VdfReturn::null(),
+        Err(e) => VdfReturn::error(format!("keyring: {e}")),
     }
 }
 

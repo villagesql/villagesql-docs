@@ -14,13 +14,13 @@ description: "VillageSQL Rust SDK에서 새로운 컬럼 타입을 정의합니�
 
 - 표준 SQL 타입으로 표현할 수 없는 디스크 상의 이진 레이아웃이 필요할 때(압축된 부동소수점, 고정 폭 정수, 이진 식별자)
 - 타입 자체가 사전식 문자열 정렬과 다른 순서 의미론을 가질 때
-- 서버가 `ORDER BY`, `COUNT(DISTINCT)`, 및 집합 연산을 위해 값들을 올바르게 인덱싱하고 해시하도록 하려 할 때
+- 서버가 `ORDER BY`, `GROUP BY`, `DISTINCT`, 및 집합 연산을 위해 값들을 올바르게 인덱싱하고 해시하도록 하려 할 때
 
 SQL 호출 가능한 함수만 필요하고 데이터를 `STRING`, `INT`, 또는 `REAL` 컬럼에 무리 없이 담을 수 있을 경우, 사용자 정의 타입이 필요하지 않습니다.
 
 ## custom_type! 매크로
 
-모든 사용자 정의 타입은 4개의 콜백(인코딩, 디코딩, 비교, 해시)과 기본값이 필요합니다. 전체 매크로 서명은 다음과 같습니다:
+모든 사용자 정의 타입은 3개의 콜백(인코딩, 디코딩, 비교)과 기본값이 필요하며, 선택적으로 해시 콜백을 가질 수 있습니다. 전체 매크로 서명은 다음과 같습니다:
 
 ```rust
 villagesql::custom_type!(
@@ -38,15 +38,16 @@ villagesql::custom_type!(
 | 필드 | 유형 | 설명 |
 |---|---|---|
 | `type_name` | 문자열 리터럴 | SQL 타입 이름. SQL에서는 대소문자 구분 없음. |
-| `persisted_length` | `usize` | 디스크 저장을 위한 고정 바이트 길이. |
-| `max_decode_buffer_length` | `usize` | 디코딩된 문자열 표현의 최대 바이트 길이. |
+| `persisted_length` | `i64` | 디스크 저장을 위한 고정 바이트 길이. |
+| `max_decode_buffer_length` | `i64` | 디코딩된 문자열 표현의 최대 바이트 길이. |
 | `encode` | fn | INSERT 시에 `&str`를 이진 바이트로 변환합니다. |
 | `decode` | fn | 이진 바이트를 표시용 `String`으로 변환합니다. |
 | `compare` | fn | `ORDER BY`, `MIN`, `MAX`에 대한 `Ordering`을 반환합니다. |
-| `hash` | fn | `COUNT(DISTINCT)` 및 집합 연산을 위한 `usize` 해시를 반환합니다. 선택적이지만 인덱스가 있는 컬럼에는 권장됩니다. |
-| `default` | 문자열 리터럴 | 서버가 타입 초기화 시 인코딩할 수 있는 유효한 문자열. 정확히 `persisted_length` 바이트로 인코딩되어야 합니다. 선택적이지만 권장됩니다. |
+| `hash` | fn | `GROUP BY`, `DISTINCT`, 및 `UNION`과 같은 집합 연산을 위한 `usize` 해시를 반환합니다. 선택적이지만 권장됩니다. |
+| `default` | 문자열 리터럴 | 서버가 타입 초기화 시 인코딩할 수 있는 유효한 문자열. 정확히 `persisted_length` 바이트로 인코딩되어야 합니다. `intrinsic_default_fn`을 지정하지 않는 한 필수입니다. |
+| `intrinsic_default_fn` | fn | 기본값을 직접 명시하는 대신 계산합니다: `fn() -> Result<String, String>`. 기본값을 리터럴로 작성할 수 없을 때 사용합니다. |
 
-`type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`는 필수입니다. `hash`와 `default`는 선택적이지만 권장됩니다 — `hash`는 올바른 `COUNT(DISTINCT)` 및 집합 연산을 위해 필요하며, `default`는 타입 초기화 검증을 위해 필요합니다.
+`type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`는 필수입니다. `hash`는 선택적이지만 권장됩니다. 올바른 `GROUP BY`, `DISTINCT`, 및 집합 연산이 이에 의존하기 때문입니다. 타입에 기본값을 둘 중 한 가지 방법으로 지정하세요: 리터럴로 쓸 수 있는 값에는 `default`를, 확장이 계산해야 하는 값에는 `intrinsic_default_fn`을 사용합니다. 둘 다 설정하면 `INSTALL EXTENSION`이 실패합니다. 둘 다 설정하지 않으면 확장은 설치되지만, 그 타입을 지정하는 첫 번째 문이 실패합니다.
 
 ## 이진 값 수신 및 반환
 
@@ -58,7 +59,7 @@ villagesql::custom_type!(
 fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
     match args.first() {
         Some(InValue::Custom(b)) => {
-            let numer = read_i64(b, 0);
+            let numer = i64::from_le_bytes(b[..8].try_into().unwrap());
             VdfReturn::int(numer)
         }
         Some(InValue::Null) | None => VdfReturn::null(),
@@ -84,12 +85,16 @@ fn rational_add_impl(args: &[InValue]) -> VdfReturn {
 `func!` 선언에서 사용자 정의 타입을 참조하려면 `villagesql::custom!("type_name")`을 사용합니다:
 
 ```rust
-villagesql::func!(
-    rational_add_impl,
-    "rational_add",
-    [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
-    deterministic: true
-)
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(
+            rational_add_impl,
+            "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
+            deterministic: true
+        ),
+    ]
+}
 ```
 
 ## 예시: 유리수 타입
@@ -151,7 +156,7 @@ pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     lhs.cmp(&rhs)
 }
 
-// hash: for COUNT(DISTINCT) and set operations
+// hash: for GROUP BY, DISTINCT, and set operations
 pub fn rational_hash(b: &[u8]) -> usize {
     // FNV-1a over the 16 bytes
     let mut h: usize = 0xcbf29ce484222325u64 as usize;
@@ -163,7 +168,7 @@ pub fn rational_hash(b: &[u8]) -> usize {
 }
 ```
 
-`custom_type!` 등록 및 산술 VDF(`rational_add`, `rational_sub` 등)는 `examples/vsql_rational/src/lib.rs`의 전체 소스에 있습니다.
+`custom_type!` 등록, `rational_encode`가 호출하는 `gcd` 및 `normalize` 헬퍼, 그리고 산술 VDF(`rational_add`, `rational_sub` 등)는 `examples/vsql_rational/src/lib.rs`의 전체 소스에 있습니다.
 
 확장이 설치된 후:
 
@@ -226,7 +231,7 @@ villagesql::parameterized_type!(
 |---|---|---|
 | `type_name` | 문자열 리터럴 | SQL 타입 이름. SQL에서는 대소문자 구분 없음. |
 | `max_persisted_length` | `i64` | 모든 유효한 매개변수화에 걸친 디스크 상 바이트 길이의 상한. |
-| `max_decode_buffer_length` | `usize` | 디코딩된 문자열 표현의 최대 바이트 길이. |
+| `max_decode_buffer_length` | `i64` | 디코딩된 문자열 표현의 최대 바이트 길이. |
 | `encode` | fn | INSERT 시에 `&str`와 `&mut MaybeParams<P>`를 이진 바이트로 변환합니다. |
 | `decode` | fn | 이진 바이트와 `&P`를 표시용 `String`으로 다시 변환합니다. |
 | `compare` | fn | `&P`가 주어졌을 때 `ORDER BY`, `MIN`, `MAX`에 대한 `Ordering`을 반환합니다. |
@@ -235,14 +240,17 @@ villagesql::parameterized_type!(
 | `params_type` | 타입 | 파싱된 매개변수 구조체입니다. 예: `PadintParams`. |
 | `params_parse` | fn | `Params`를 `params_type`으로 파싱합니다. 고유한 매개변수 조합마다 최대 한 번 실행됩니다 — SDK가 결과를 캐시합니다. |
 | `params_to_strings` | fn | `params_parse`의 역방향입니다: `params_type`을 정규 `(key, value)` 쌍으로 다시 씁니다. |
-| `hash` | fn | `&P`가 주어졌을 때 `usize` 해시를 반환합니다. 선택적이지만 인덱스가 있는 컬럼에는 권장됩니다. |
-| `default` | 문자열 리터럴 | 서버가 타입 초기화 시 인코딩할 수 있는 유효한 문자열. 선택적이지만 권장됩니다. |
+| `hash` | fn | `&P`가 주어졌을 때 `usize` 해시를 반환하며, `GROUP BY`, `DISTINCT`, 및 집합 연산에 사용됩니다. 선택적이지만 권장됩니다. |
+| `default` | 문자열 리터럴 | 서버가 타입 초기화 시 인코딩할 수 있는 유효한 문자열. `intrinsic_default_fn`을 지정하지 않는 한 필수입니다. |
+| `intrinsic_default_fn` | fn | 기본값을 직접 명시하는 대신 계산합니다: `fn(&P) -> Result<String, String>`. 기본값이 매개변수에 따라 달라질 때 사용합니다. |
 
-`type_name`, `max_persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`, `int_to_params`, `resolve_params`, `params_type`, `params_parse`, `params_to_strings`는 필수입니다. `hash`와 `default`는 선택적입니다. `intrinsic_default_fn`(기본값이 매개변수에 따라 달라질 때 `&P`로부터 기본값을 계산하는 함수) 또한 선택적이며 `default`와 상호 배타적입니다.
+`type_name`, `max_persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`, `int_to_params`, `resolve_params`, `params_type`, `params_parse`, `params_to_strings`는 필수입니다. `hash`는 선택적입니다. 타입에 기본값을 둘 중 한 가지 방법으로 지정하세요: 리터럴로 쓸 수 있는 값에는 `default`를, 확장이 계산해야 하는 값에는 `intrinsic_default_fn`(기본값이 매개변수에 따라 달라질 때 `&P`로부터 기본값을 계산하는 함수)을 사용합니다. 둘 다 설정하면 `INSTALL EXTENSION`이 실패합니다. 둘 다 설정하지 않으면 확장은 설치되지만, 그 타입을 지정하는 첫 번째 문이 실패합니다.
 
 다음은 `padint`입니다 — 고정된 8바이트에 저장되는 `i64`이며, `width` 매개변수가 0으로 채워지는 표시 폭을 제어합니다:
 
 ```rust
+use villagesql::{MaybeParams, Params, Resolved};
+
 pub struct PadintParams {
     pub width: u32,
 }
@@ -293,27 +301,32 @@ pub fn padint_compare(a: &[u8], b: &[u8], _p: &PadintParams) -> std::cmp::Orderi
     i64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(b[..8].try_into().unwrap()))
 }
 
-villagesql::parameterized_type!(
-    type_name: "padint",
-    max_persisted_length: 8,
-    max_decode_buffer_length: 32,
-    encode: padint_encode,
-    decode: padint_decode,
-    compare: padint_compare,
-    int_to_params: padint_int_to_params,
-    resolve_params: padint_resolve_params,
-    params_type: PadintParams,
-    params_parse: padint_parse,
-    params_to_strings: padint_to_strings,
-    default: "0",
-)
+villagesql::extension! {
+    funcs: [],
+    types: [
+        villagesql::parameterized_type!(
+            type_name: "padint",
+            max_persisted_length: 8,
+            max_decode_buffer_length: 32,
+            encode: padint_encode,
+            decode: padint_decode,
+            compare: padint_compare,
+            int_to_params: padint_int_to_params,
+            resolve_params: padint_resolve_params,
+            params_type: PadintParams,
+            params_parse: padint_parse,
+            params_to_strings: padint_to_strings,
+            default: "0",
+        ),
+    ]
+}
 ```
 
 매개변수화된 사용자 정의 타입 인수를 받는 함수는 일반
 `InValue::Custom(bytes)`가 아니라
 `InValue::CustomWithParams { bytes, params }`를 봅니다 — `params`는
 컬럼에 선언된 `key=value` 쌍에 대한 읽기 전용, 무복사 뷰인
-[`TypeParams`]입니다.
+`TypeParams`입니다.
 
 ## extension! 블록과 타입
 
@@ -340,7 +353,7 @@ villagesql::extension! {
     icon="book"
     href="/ko/mysql-9.7/stable/rust-api-reference"
   >
-    InValue, VdfReturn, 및 모든 매크로에 대한 완전한 참조.
+    InValue, VdfReturn, 그리고 extension!, func!, agg_func!, varargs_func!, custom_type!, custom! 매크로에 대한 참조.
   </Card>
   <Card
     title="Rust에서 확장 빌드"

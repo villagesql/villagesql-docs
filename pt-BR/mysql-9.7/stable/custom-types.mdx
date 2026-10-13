@@ -19,7 +19,7 @@ Conclua os Passos 1 a 3 antes de continuar aqui.
 
 ## Definir as Operações de Tipo
 
-Todo tipo personalizado precisa de operações de codificação, decodificação e comparação e, opcionalmente, de uma operação de hash. Implemente-as de acordo com estas assinaturas e passe os objetos builder para `vsql::make_type<>()`:
+Todo tipo personalizado precisa de operações de codificação, decodificação e comparação e, opcionalmente, de uma operação de hash. Implemente-as de acordo com estas assinaturas e passe-as ao builder `vsql::make_type<>()`:
 
 ```cpp
 // Encode: string -> binary. Write to out.buffer() and call out.set_length(n).
@@ -47,8 +47,7 @@ necessária.
 
 O acesso binário bruto passa por `vsql::Span<T>`, uma visão não proprietária
 sobre uma sequência contígua de `T` — `in.value()` retorna
-`vsql::Span<const unsigned char>` e `out.buffer()` retorna
-`vsql::Span<unsigned char>`. Usando C++20 ou posterior, `vsql::Span<T>` é um
+`vsql::Span<const unsigned char>` e `out.buffer()` retorna `vsql::Span<unsigned char>` em um `CustomResult` e `vsql::Span<char>` em um `StringResult`. Usando C++20 ou posterior, `vsql::Span<T>` é um
 alias para `std::span<T>`; sob C++17, o SDK C++ fornece uma implementação de
 fallback mínima e compatível em nível de código-fonte, com a mesma superfície de
 `data()`, `size()`, `empty()`, indexação e iteradores. Ela está disponível por
@@ -78,7 +77,7 @@ constexpr auto MYTYPE =
         .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
         .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
         .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
-        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Development guide
+        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Type Operations
         .build();
 
 VEF_GENERATE_ENTRY_POINTS(
@@ -119,7 +118,23 @@ Consulte [Operações de Tipo](/pt-BR/mysql-9.7/stable/type-operations) para as 
 | Não personalizado | Personalizado | Erro: `Cannot convert column 'col' to custom type 'MYTYPE'` |
 | Personalizado | Tipo string | Permitido |
 | Personalizado | Tipo não string | Erro: `Cannot convert custom type column 'col' to non-string type` |
-| Personalizado | Tipo personalizado diferente | Erro se incompatível: `Cannot convert between incompatible custom types 'A' and 'B'` |
+| Personalizado | Tipo personalizado diferente | Erro se incompatível: `Cannot convert between incompatible custom types 'ext_a.A' and 'ext_b.B'` |
+
+Um `ALTER TABLE` que adiciona, remove ou modifica uma coluna de tipo personalizado também é
+recusado de imediato sob `LOCK TABLES`: as operações de tipo personalizado escrevem nas
+tabelas de sistema do próprio villagesql, que não estão na lista de tabelas bloqueadas, então
+o servidor rejeita a instrução logo no início em vez de falhar no meio da
+abertura da tabela:
+
+```sql
+LOCK TABLES my_table WRITE;
+ALTER TABLE my_table ADD COLUMN v MYTYPE;
+-- ERROR 3219 (HY000): Custom type table operations are not supported under LOCK TABLES.
+UNLOCK TABLES;
+```
+
+Um `ALTER TABLE` que não toca em uma coluna de tipo personalizado não está sujeito a
+essa restrição.
 
 ## Funções de Conversão de Tipo
 
@@ -188,7 +203,7 @@ void encode_complex(std::string_view from, CustomResult out) {
     if (endptr == p || *endptr != ',') return fail();
     p = endptr + 1;
     imag = strtod(p, &endptr);
-    if (endptr == p || *endptr != ')') return fail();
+    if (endptr == p || *endptr != ')' || endptr[1] != '\0') return fail();
     memcpy(buf.data(), &real, 8);
     memcpy(buf.data() + 8, &imag, 8);
     out.set_length(16);
@@ -233,6 +248,23 @@ int compare_complex(CustomArg a, CustomArg b) {
     if (a_imag > b_imag) return 1;
     return 0;
 }
+
+static constexpr const char kComplexTypeName[] = "COMPLEX";
+
+constexpr auto COMPLEX =
+    vsql::make_type<kComplexTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&encode_complex>()
+        .to_string<&decode_complex>()
+        .compare<&compare_complex>()
+        .intrinsic_default_str("(0,0)")
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(COMPLEX)
+);
 ```
 
 A decodificação usa `std::to_chars` em vez de `snprintf`: um formato de precisão fixa
@@ -272,7 +304,7 @@ SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
 As VDFs podem ser usadas em expressões de colunas geradas. A VDF precisa ser declarada como `.deterministic()` no builder da extensão — o servidor bloqueia funções não determinísticas neste contexto.
 
 ```sql
-CREATE TABLE signals (
+CREATE TABLE signals_generated (
     id INT PRIMARY KEY,
     impedance COMPLEX,
     -- Generated column computed by a VDF
@@ -293,7 +325,7 @@ de `.deterministic()` das colunas geradas se aplica aqui, porque o MySQL
 implementa índices funcionais como colunas geradas ocultas.
 
 ```sql
-CREATE TABLE signals (
+CREATE TABLE signals_indexed (
     id INT PRIMARY KEY,
     sig COMPLEX,
     INDEX idx_magnitude ((COMPLEX_ABS(sig)))
@@ -305,7 +337,7 @@ O otimizador usa o índice quando a mesma expressão de VDF aparece em `WHERE`,
 retorno da VDF, de modo que o otimizador corresponda à expressão:
 
 ```sql
-SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+SELECT id FROM signals_indexed WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
 ```
 
 ## Próximos Passos
@@ -328,7 +360,7 @@ Quando o seu tipo estiver definido, continue com o Passo 5 do tutorial para comp
     Tipos que recebem parâmetros como VECTOR(1536) — codificação, decodificação e dimensionamento de armazenamento cientes da dimensão.
   </Card>
   <Card
-    title="Referência da API C++"
+    title="Referência da API de Extensões"
     icon="book"
     href="/pt-BR/mysql-9.7/stable/extension-api-reference"
   >

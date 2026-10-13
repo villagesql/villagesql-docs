@@ -18,7 +18,7 @@ description: "从 Rust SDK 使用 VillageSQL 预览功能——通过 extension!
 SET PERSIST vsql_allow_preview_extensions = ON;
 ```
 
-有关详细信息，包括为什么此变量会拒绝 `SET GLOBAL`，请参阅[启用预览层](/zh/mysql-9.7/stable/preview-capabilities#启用预览层)。
+有关详细信息，包括为什么此变量会拒绝 `SET GLOBAL`，请参阅[启用预览层](/zh/mysql-9.7/stable/preview-capabilities#enabling-the-preview-tier)。
 
 您还需要一套可用的 Rust 扩展设置——[使用 Rust 构建扩展](/zh/mysql-9.7/stable/rust-sdk)演练涵盖了工具链、`cargo-vsql` 以及您的第一个 `extension!` 块。
 
@@ -114,7 +114,7 @@ vsql_status_var.requests	1
 
 ## 系统变量 {#system-variables}
 
-`sys_var` 功能注册由您的扩展拥有的 MySQL 系统变量。支持三种类型：`Bool`、`Int`（带 `min`/`max` 边界）和 `Str`。每个描述符都携带一个名称、一条在 `SHOW VARIABLES` 元数据中显示的注释、一个默认值以及一个可选的 `on_change` 回调。
+`sys_var` 功能注册由您的扩展拥有的 MySQL 系统变量。支持三种类型：`Bool`、`Int`（带 `min`/`max` 边界）和 `Str`。每个描述符都携带一个名称、一条注释、一个默认值以及一个可选的 `on_change` 回调。
 
 名称和字符串默认值是 `&'static CStr` 值——请将它们写为 C 字符串字面量（`c"enabled"`）：
 
@@ -263,11 +263,73 @@ SET GLOBAL vsql_thread_worker.ticker_enabled = OFF;
 
 如果工作函数发生 panic，SDK 会在 FFI 边界捕获该 panic，并将该次调用视为返回了 `NextWakeup::unchanged()`——工作器会继续运行。
 
-`ThreadHandle` 参数以引用方式传入；将它传给 `villagesql::preview::sql_query` 中的 `SqlQueryCapability::open`，即可在工作器内部执行 SQL。
+将 `handle` 参数传给 [`SqlQueryCapability::open`](#sql-query)，即可在工作器内部执行 SQL。
+
+## SQL 查询 {#sql-query}
+
+`sql_query` 功能从 `thread_worker` 回调中打开一个 SQL 会话，因此后台工作器可以对加载它的服务器运行语句。将它与 `ThreadWorkerCapability` 一起声明，并使用工作器收到的 `ThreadHandle` 打开会话：
+
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+use villagesql::preview::sql_query::SqlQueryCapability;
+use villagesql::preview::thread_worker::{
+    NextWakeup, ThreadHandle, ThreadWorkerCapability, WakeupReason,
+};
+use villagesql::{InValue, VdfReturn};
+
+static USER_COUNT: AtomicI64 = AtomicI64::new(-1);
+
+static SQL_QUERY: SqlQueryCapability = SqlQueryCapability::new();
+
+fn worker(reason: WakeupReason, handle: &ThreadHandle) -> NextWakeup {
+    if reason == WakeupReason::Periodic {
+        if let Some(session) = SQL_QUERY.open(handle) {
+            if let Some(mut result) = session.execute("SELECT COUNT(*) FROM mysql.user") {
+                if !result.has_error() {
+                    if let Some(n) = result.next_row().and_then(|row| row.get_int(0)) {
+                        USER_COUNT.store(n, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+    NextWakeup::unchanged()
+}
+
+static WORKER: ThreadWorkerCapability =
+    ThreadWorkerCapability::new(worker, "user_count", Duration::from_secs(5), None);
+
+fn user_count_impl(_args: &[InValue]) -> VdfReturn {
+    VdfReturn::int(USER_COUNT.load(Ordering::Relaxed))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(user_count_impl, "user_count", [] -> villagesql::Type::Int),
+    ],
+    requires: [
+        &WORKER,
+        &SQL_QUERY,
+    ]
+}
+```
+
+如果该功能未被填充（预览功能关闭或未请求）、ABI 过旧，或服务器未能打开会话，`SqlQueryCapability::open(handle)` 会返回 `None`——请在使用结果之前检查它。
+
+`Session` 提供两种运行语句的方式：
+
+- `execute(sql)` 缓冲完整的结果集并返回一个 `QueryResult`。反复调用 `next_row()` 直到它返回 `None`；每个 `Row` 通过 `get_int(i)`、`get_str(i)`、`get_real(i)` 或 `get_bytes(i)` 读取列。`get_bytes`/`get_str` 在 SQL `NULL` 或索引超出范围时返回 `None`（`get_str` 遇到非 UTF-8 字节时也是如此）；`get_int`/`get_real` 会先将列解析为文本，因此在文本无法解析时也会返回 `None`。`execute` 本身只在设置失败（没有会话或内存不足）时返回 `None`。
+- `for_each(sql, |row: Row<'_>| { ... })` 将各行流式传给一个闭包，而不是缓冲完整的结果集。它返回的 `QueryResult` 只携带诊断信息——没有可迭代的缓冲行——并且同样在设置失败时返回 `None`。
+
+在信任语句已成功之前，请检查任一结果上的 `has_error()` 和 `error()`（一个带有 `errno`、`severity`、`sqlstate` 和 `message` 的 `Option<Diag>`）。`warnings()` 返回附加在结果上的所有警告和提示。
+
+`Session` 和 `QueryResult` 各自在被丢弃时关闭其底层句柄——没有需要您自行调用的关闭方法。
 
 ## 密钥环访问 {#keyring-access}
 
-`keyring` 功能读取和写入存储在 MySQL 密钥环组件中的密钥——API 密钥、加密密钥，以及任何不应存储在表中的内容。服务器上必须安装一个密钥环组件（例如 `component_keyring_file`）；如果没有，每次读取和写入都会以 `KeyringError::NoComponent` 失败。
+`keyring` 功能读取和写入存储在 MySQL 密钥环组件中的密钥——API 密钥、加密密钥，以及任何不应存储在表中的内容。密钥环组件（例如 `component_keyring_file`）必须按照 [Keyring Component Installation](https://dev.mysql.com/doc/refman/9.7/en/keyring-component-installation.html) 所述，在服务器启动时通过组件清单及其配置文件加载；`INSTALL COMPONENT` 不会使它可用。如果没有密钥环组件，每次读取和写入都会以 `KeyringError::NoComponent` 失败。
 
 ```rust
 use std::ffi::CString;
@@ -293,7 +355,8 @@ fn keyring_read_impl(args: &[InValue]) -> VdfReturn {
             Ok(s) => VdfReturn::string(s),
             Err(_) => VdfReturn::null(),
         },
-        Ok(None) | Err(_) => VdfReturn::null(),
+        Ok(None) => VdfReturn::null(),
+        Err(e) => VdfReturn::error(format!("keyring: {e}")),
     }
 }
 

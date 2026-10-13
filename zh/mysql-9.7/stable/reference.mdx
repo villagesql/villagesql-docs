@@ -24,7 +24,7 @@ description: 用于查询扩展元数据和服务器状态的 VillageSQL 系统�
 | 列名 | 类型 | 描述 |
 |--------|------|-------------|
 | `EXTENSION_NAME` | varchar | 已安装扩展的名称 |
-| `EXTENSION_VERSION` | varchar | 扩展报告的版本字符串 |
+| `EXTENSION_VERSION` | varchar | 来自扩展 `manifest.json` 的版本字符串 |
 | `PENDING_VERSION` | longtext | 扩展将在下次重启时更改到的版本，若无则为 `NULL` |
 | `PENDING_REQUESTED_AT` | longtext | 请求待处理版本更改的时间，若无则为 `NULL` |
 | `PENDING_LAST_ERROR` | longtext | 版本更改失败时的错误消息，若无则为 `NULL` |
@@ -50,11 +50,11 @@ WHERE EXTENSION_NAME = 'vsql_complex';
 | EXTENSION_NAME   | EXTENSION_VERSION |
 +------------------+-------------------+
 | vsql_complex     | 0.0.1             |
-| vsql_uuid        | 0.2.1             |
+| vsql_uuid        | 0.0.8             |
 +------------------+-------------------+
 ```
 
-`EXTENSION_NAME` 值均为小写，与传递给 `make_extension()` 的名称匹配。
+`EXTENSION_NAME` 值与扩展 `manifest.json` 中的 `name` 字段匹配。
 
 该视图反映当前的安装状态。
 
@@ -95,7 +95,7 @@ WHERE DATA_TYPE LIKE 'vsql_complex.%';
 
 ### INFORMATION_SCHEMA.EXTENSION_REGISTRATION
 
-将每个已加载扩展的内存中 VEF 注册结构作为 JSON 文档公开。使用它来验证服务器是否在 `INSTALL EXTENSION` 之后正确解析了扩展的函数、类型和系统变量。
+将每个已加载扩展的内存中 VEF 注册结构作为 JSON 文档公开。使用它来验证服务器是否在 `INSTALL EXTENSION` 之后正确解析了扩展的函数和类型。
 
 ```sql
 SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL, REGISTRATION_JSON
@@ -107,7 +107,7 @@ WHERE EXTENSION_NAME = 'vsql_complex';
 |--------|------|-------------|
 | `EXTENSION_NAME` | `VARCHAR(64)` | 已安装扩展的名称。 |
 | `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | 扩展和服务器之间协商的 VEF 协议版本。 |
-| `REGISTRATION_JSON` | `VARCHAR(65535)` | `vef_registration_t` 结构的 JSON 序列化，包括 `funcs` 和 `types` 数组。 |
+| `REGISTRATION_JSON` | `VARCHAR(65535)` | `vef_registration_t` 结构的 JSON 序列化，包括 `funcs` 和 `types` 数组，以及一个报告扩展构建所用 SDK 版本的 `sdk_version` 键。 |
 
 ---
 
@@ -179,7 +179,7 @@ veb_dir=/path/to/extensions/
 
 ```sql
 SELECT @@villagesql_server_version;
--- Example output: mysql-9.7_0.0.6
+-- Example output: mysql-9.7_0.0.7
 
 -- All VillageSQL system variables at once. Not every one of them starts with
 -- villagesql_, so a LIKE 'villagesql_%' pattern on its own misses some.
@@ -197,7 +197,7 @@ SHOW VARIABLES WHERE Variable_name LIKE 'villagesql\_%'
 
 ```sql
 SELECT @@villagesql_schema_version;
--- Example output: mysql-9.7_0.0.6
+-- Example output: mysql-9.7_0.0.7
 ```
 
 **作用域：**全局，只读。无法在运行时设置。
@@ -220,6 +220,9 @@ SELECT @@villagesql_vef_server_protocol;
 | **当前值** | `4` (`VEF_PROTOCOL_4`) |
 
 协议 V4 增加了对变长自定义类型的支持，并允许函数声明其字符串结果的最大长度。
+它还增加了 `on_init` / `on_deinit` 加载和卸载钩子，服务器会在扩展所需的功能填充完成后、
+以及在它们被清除之前调用这些钩子。第三项新增内容是 `bind_and_check_types`，这个钩子
+让函数可以在解析时自行决定其返回类型参数，而不是依赖内置的消歧规则。
 V4 正在选择加入的开发版 ABI 下积极开发中，在稳定之前可能会发生变化。如果您在
 开发扩展，请参阅 [类型操作](/zh/mysql-9.7/stable/type-operations) 和
 [使用 C++ 创建扩展](/zh/mysql-9.7/stable/create)，了解各协议版本提供的功能。
@@ -246,7 +249,7 @@ SELECT @@villagesql_build_info;
 | `files_modified` | integer | 构建时修改的文件 |
 | `build_timestamp` | string | ISO-8601 UTC 时间戳，例如 `"2026-06-17T12:34:56Z"`；发布构建中为空 |
 | `build_host` | string | 构建机器的主机名；发布构建中为空 |
-| `build_os` | string | 主机操作系统：`"Linux-6.18.15"` 或 `"Darwin-24.3.0"` |
+| `build_os` | string | 主机操作系统和内核版本，即构建机器上 `uname -s` 和 `uname -r` 报告的内容，例如 `"Linux-6.18.15"` |
 | `build_arch` | string | 主机 CPU 架构：`"x86_64"`、`"aarch64"` 或 `"arm64"` |
 
 **作用域：**全局，只读。无法在运行时设置。
@@ -273,14 +276,14 @@ ERROR 3219 (HY000): Failed to load VEF extension 'vsql_keyring_reader': extensio
 SET PERSIST vsql_allow_preview_extensions = ON;
 ```
 
-| Property | Value |
+| 属性 | 值 |
 |----------|-------|
 | **作用域** | 全局 |
 | **访问权限** | 可读；使用 `SET PERSIST` 设置 |
 | **类型** | 布尔值 |
 | **默认值** | `OFF` |
 
-请使用 `SET PERSIST`，而不是 `SET GLOBAL`。预览扩展在服务器启动时加载，因此该值必须在重启后仍然有效，而只有 `SET PERSIST` 会将其写入 `mysqld-auto.cnf`；因此 `SET GLOBAL` 会被拒绝。在 `mysqld-auto.cnf` 尚不存在之前（例如服务器首次启动时），请改为在 `mysqld` 命令行中传入 `--vsql_allow_preview_extensions=ON`。
+请使用 `SET PERSIST`，而不是 `SET GLOBAL`。预览扩展在服务器启动时加载，因此该值必须在重启后仍然有效，而只有 `SET PERSIST` 会将其写入 `mysqld-auto.cnf`；因此 `SET GLOBAL` 会被拒绝。要在首次启动之前开启它，请在 `mysqld` 命令行中传入 `--vsql_allow_preview_extensions=ON`。
 
 只要仍有使用预览功能的扩展处于已安装状态，就无法将该值重新关闭，因为这些扩展要求服务器启动时该设置为 ON。请先卸载这些扩展。
 
