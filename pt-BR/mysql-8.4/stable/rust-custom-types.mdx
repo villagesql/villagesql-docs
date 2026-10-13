@@ -14,13 +14,13 @@ Use um tipo personalizado quando:
 
 - Você precisar de um layout binário em disco que um tipo SQL padrão não consegue expressar (floats compactados, inteiros de largura fixa, identificadores binários)
 - Seu tipo tiver semântica de ordenação própria que difere da ordenação lexicográfica de strings
-- Você quiser que o servidor indexe e faça hash dos valores corretamente para `ORDER BY`, `COUNT(DISTINCT)` e operações de conjunto
+- Você quiser que o servidor indexe e faça hash dos valores corretamente para `ORDER BY`, `GROUP BY`, `DISTINCT` e operações de conjunto
 
 Se você precisar apenas de funções chamáveis via SQL e seus dados couberem confortavelmente em colunas `STRING`, `INT` ou `REAL`, você não precisa de um tipo personalizado.
 
 ## A macro custom_type!
 
-Todo tipo personalizado precisa de 4 callbacks (encode, decode, compare, hash) e um valor padrão. Aqui está a assinatura completa da macro:
+Todo tipo personalizado precisa de 3 callbacks (encode, decode, compare), um valor padrão e, opcionalmente, um callback de hash. Aqui está a assinatura completa da macro:
 
 ```rust
 villagesql::custom_type!(
@@ -38,15 +38,16 @@ villagesql::custom_type!(
 | Campo | Tipo | Descrição |
 |---|---|---|
 | `type_name` | literal de string | O nome do tipo SQL. Não diferencia maiúsculas de minúsculas em SQL. |
-| `persisted_length` | `usize` | Comprimento fixo em bytes para o armazenamento em disco. |
-| `max_decode_buffer_length` | `usize` | Comprimento máximo em bytes da representação de string decodificada. |
+| `persisted_length` | `i64` | Comprimento fixo em bytes para o armazenamento em disco. |
+| `max_decode_buffer_length` | `i64` | Comprimento máximo em bytes da representação de string decodificada. |
 | `encode` | fn | Converte um `&str` em bytes binários no momento do INSERT. |
 | `decode` | fn | Converte bytes binários de volta em uma `String` para exibição. |
 | `compare` | fn | Retorna `Ordering` para `ORDER BY`, `MIN`, `MAX`. |
-| `hash` | fn | Retorna um hash `usize` para `COUNT(DISTINCT)` e operações de conjunto. Opcional, mas recomendado para colunas indexadas. |
-| `default` | literal de string | Uma string válida que o servidor consegue codificar na inicialização do tipo. Deve codificar para exatamente `persisted_length` bytes. Opcional, mas recomendado. |
+| `hash` | fn | Retorna um hash `usize` para `GROUP BY`, `DISTINCT` e operações de conjunto como `UNION`. Opcional, mas recomendado. |
+| `default` | literal de string | Uma string válida que o servidor consegue codificar na inicialização do tipo. Deve codificar para exatamente `persisted_length` bytes. Obrigatório, a menos que `intrinsic_default_fn` seja fornecido. |
+| `intrinsic_default_fn` | fn | Calcula o padrão em vez de declará-lo: `fn() -> Result<String, String>`. Use-o quando o padrão não puder ser escrito como literal. |
 
-`type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode` e `compare` são obrigatórios. `hash` e `default` são opcionais, mas recomendados — `hash` é necessário para que o `COUNT(DISTINCT)` e as operações de conjunto funcionem corretamente, e `default` é necessário para a verificação de inicialização do tipo.
+`type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode` e `compare` são obrigatórios. `hash` é opcional, mas recomendado, porque `GROUP BY`, `DISTINCT` e as operações de conjunto corretos dependem dele. Dê ao tipo um padrão de uma forma ou de outra: `default` para um valor que você consegue escrever como literal, `intrinsic_default_fn` para um que a extensão precisa calcular. Definir ambos faz o `INSTALL EXTENSION` falhar. Não definir nenhum deixa a extensão ser instalada e, então, faz falhar a primeira instrução que nomeia o tipo.
 
 ## Recebendo e retornando valores binários
 
@@ -58,7 +59,7 @@ Funções que recebem ou retornam um tipo personalizado trabalham com bytes brut
 fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
     match args.first() {
         Some(InValue::Custom(b)) => {
-            let numer = read_i64(b, 0);
+            let numer = i64::from_le_bytes(b[..8].try_into().unwrap());
             VdfReturn::int(numer)
         }
         Some(InValue::Null) | None => VdfReturn::null(),
@@ -84,12 +85,16 @@ fn rational_add_impl(args: &[InValue]) -> VdfReturn {
 Para referenciar um tipo personalizado em uma declaração `func!`, use `villagesql::custom!("type_name")`:
 
 ```rust
-villagesql::func!(
-    rational_add_impl,
-    "rational_add",
-    [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
-    deterministic: true
-)
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(
+            rational_add_impl,
+            "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
+            deterministic: true
+        ),
+    ]
+}
 ```
 
 ## Exemplo: tipo de número racional
@@ -151,7 +156,7 @@ pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     lhs.cmp(&rhs)
 }
 
-// hash: for COUNT(DISTINCT) and set operations
+// hash: for GROUP BY, DISTINCT, and set operations
 pub fn rational_hash(b: &[u8]) -> usize {
     // FNV-1a over the 16 bytes
     let mut h: usize = 0xcbf29ce484222325u64 as usize;
@@ -163,7 +168,7 @@ pub fn rational_hash(b: &[u8]) -> usize {
 }
 ```
 
-O registro `custom_type!` e as VDFs aritméticas (`rational_add`, `rational_sub`, etc.) estão no código-fonte completo em `examples/vsql_rational/src/lib.rs`.
+O registro `custom_type!`, os auxiliares `gcd` e `normalize` que `rational_encode` chama, e as VDFs aritméticas (`rational_add`, `rational_sub`, etc.) estão no código-fonte completo em `examples/vsql_rational/src/lib.rs`.
 
 Com a extensão instalada:
 
@@ -226,7 +231,7 @@ villagesql::parameterized_type!(
 |---|---|---|
 | `type_name` | literal de string | O nome do tipo SQL. Não diferencia maiúsculas de minúsculas em SQL. |
 | `max_persisted_length` | `i64` | Limite superior do comprimento em bytes em disco, considerando todas as parametrizações válidas. |
-| `max_decode_buffer_length` | `usize` | Comprimento máximo em bytes da representação de string decodificada. |
+| `max_decode_buffer_length` | `i64` | Comprimento máximo em bytes da representação de string decodificada. |
 | `encode` | fn | Converte um `&str` mais um `&mut MaybeParams<P>` em bytes binários no momento do INSERT. |
 | `decode` | fn | Converte bytes binários mais um `&P` de volta em uma `String` para exibição. |
 | `compare` | fn | Retorna `Ordering` para `ORDER BY`, `MIN`, `MAX`, dado um `&P`. |
@@ -235,14 +240,17 @@ villagesql::parameterized_type!(
 | `params_type` | tipo | Sua struct de parâmetros analisados, por exemplo `PadintParams`. |
 | `params_parse` | fn | Analisa `Params` em `params_type`. É executada no máximo uma vez por combinação única de parâmetros — o SDK armazena o resultado em cache. |
 | `params_to_strings` | fn | O inverso de `params_parse`: escreve `params_type` de volta em pares `(key, value)` canônicos. |
-| `hash` | fn | Retorna um hash `usize` dado um `&P`. Opcional, mas recomendado para colunas indexadas. |
-| `default` | literal de string | Uma string válida que o servidor consegue codificar na inicialização do tipo. Opcional, mas recomendado. |
+| `hash` | fn | Retorna um hash `usize` dado um `&P`, usado para `GROUP BY`, `DISTINCT` e operações de conjunto. Opcional, mas recomendado. |
+| `default` | literal de string | Uma string válida que o servidor consegue codificar na inicialização do tipo. Obrigatório, a menos que `intrinsic_default_fn` seja fornecido. |
+| `intrinsic_default_fn` | fn | Calcula o padrão em vez de declará-lo: `fn(&P) -> Result<String, String>`. Use-o quando o padrão depender dos parâmetros. |
 
-`type_name`, `max_persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`, `int_to_params`, `resolve_params`, `params_type`, `params_parse` e `params_to_strings` são obrigatórios. `hash` e `default` são opcionais; `intrinsic_default_fn` (uma função que calcula o padrão a partir de `&P`, para quando o padrão depende dos parâmetros) também é opcional e mutuamente exclusiva com `default`.
+`type_name`, `max_persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, `compare`, `int_to_params`, `resolve_params`, `params_type`, `params_parse` e `params_to_strings` são obrigatórios. `hash` é opcional. Dê ao tipo um padrão de uma forma ou de outra: `default` para um valor que você consegue escrever como literal, `intrinsic_default_fn` (uma função que calcula o padrão a partir de `&P`, para quando o padrão depende dos parâmetros) para um que a extensão precisa calcular. Definir ambos faz o `INSTALL EXTENSION` falhar. Não definir nenhum deixa a extensão ser instalada e, então, faz falhar a primeira instrução que nomeia o tipo.
 
 Aqui está `padint` — um `i64` armazenado em 8 bytes fixos, com um parâmetro `width` que controla a largura de exibição preenchida com zeros:
 
 ```rust
+use villagesql::{MaybeParams, Params, Resolved};
+
 pub struct PadintParams {
     pub width: u32,
 }
@@ -293,25 +301,30 @@ pub fn padint_compare(a: &[u8], b: &[u8], _p: &PadintParams) -> std::cmp::Orderi
     i64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(b[..8].try_into().unwrap()))
 }
 
-villagesql::parameterized_type!(
-    type_name: "padint",
-    max_persisted_length: 8,
-    max_decode_buffer_length: 32,
-    encode: padint_encode,
-    decode: padint_decode,
-    compare: padint_compare,
-    int_to_params: padint_int_to_params,
-    resolve_params: padint_resolve_params,
-    params_type: PadintParams,
-    params_parse: padint_parse,
-    params_to_strings: padint_to_strings,
-    default: "0",
-)
+villagesql::extension! {
+    funcs: [],
+    types: [
+        villagesql::parameterized_type!(
+            type_name: "padint",
+            max_persisted_length: 8,
+            max_decode_buffer_length: 32,
+            encode: padint_encode,
+            decode: padint_decode,
+            compare: padint_compare,
+            int_to_params: padint_int_to_params,
+            resolve_params: padint_resolve_params,
+            params_type: PadintParams,
+            params_parse: padint_parse,
+            params_to_strings: padint_to_strings,
+            default: "0",
+        ),
+    ]
+}
 ```
 
 Uma função que recebe um argumento de tipo personalizado parametrizado vê
 `InValue::CustomWithParams { bytes, params }` em vez do simples
-`InValue::Custom(bytes)` — `params` é um [`TypeParams`], uma visão somente de
+`InValue::Custom(bytes)` — `params` é um `TypeParams`, uma visão somente de
 leitura e sem cópia sobre os pares `key=value` declarados da coluna.
 
 ## O bloco extension! com tipos
@@ -339,7 +352,7 @@ Uma extensão que contém apenas funções omite `types:`. Uma extensão que con
     icon="book"
     href="/pt-BR/mysql-8.4/stable/rust-api-reference"
   >
-    Referência completa para InValue, VdfReturn e todas as macros.
+    Referência para InValue, VdfReturn e as macros extension!, func!, agg_func!, varargs_func!, custom_type! e custom!.
   </Card>
   <Card
     title="Criando Extensões em Rust"

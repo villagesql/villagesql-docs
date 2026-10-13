@@ -23,7 +23,7 @@ pub enum InValue<'a> {
 
 | バリアント | Rust 型 | 対応する SQL 型 |
 |---|---|---|
-| `String(&str)` | UTF-8 文字列スライス | `STRING` / `VARCHAR` / `TEXT` |
+| `String(&str)` | 引数の生のバイトを保持する文字列スライス。UTF-8 かどうかはチェックされません (latin1 またはバイナリの引数はそのバイトを保持します) | `STRING` / `VARCHAR` / `TEXT` |
 | `Real(f64)` | 64 ビット浮動小数点数 | `REAL` / `DOUBLE` / `FLOAT` |
 | `Int(i64)` | 64 ビット符号付き整数 | `INT` / `BIGINT` / `TINYINT` |
 | `Null` | — | 任意の型の SQL `NULL` |
@@ -48,7 +48,7 @@ pub enum InValue<'a> {
 
 **警告とエラー:**
 
-`warning` は、残りの結果セットで処理を続けることが理にかなう、ユーザー入力の検証エラーに使用します。 厳密モードでは、MySQL は `INSERT` および `UPDATE` で警告をエラーに昇格させます。 `error` は、処理を続行することが安全でない場合に使用します。たとえば、保存されたデータが破損している場合や、内部の不変条件に違反している場合です。 致命的なエラーは、ステートメント全体を中止します。
+`warning` は、残りの結果セットで処理を続けることが理にかなう、ユーザー入力の検証エラーに使用します。 警告はステートメントを失敗させません。厳密モードの `INSERT` および `UPDATE` でも同様です。 `error` は、処理を続行することが安全でない場合に使用します。たとえば、保存されたデータが破損している場合や、内部の不変条件に違反している場合です。 致命的なエラーは、ステートメント全体を中止します。
 
 ```rust
 fn validate_impl(args: &[InValue]) -> VdfReturn {
@@ -85,7 +85,7 @@ villagesql::extension! {
 
 ## func! マクロ
 
-`func!` は、SQL で呼び出すことができる関数を宣言します。 6 つの形式があります。ステートメントごとの状態を持たない 4 つの形式 (パラメータなし、`buffer_size` のみ、`deterministic` のみ、両方) と、`prerun` 関数を通じてステートメントごとの状態を付加する 2 つの形式です。
+`func!` は、SQL で呼び出すことができる関数を宣言します。 8 つの形式があります。ステートメントごとの状態を持たない 4 つの形式 (パラメータなし、`buffer_size` のみ、`deterministic` のみ、両方)、`prerun` 関数を通じてステートメントごとの状態を付加する 2 つの形式、そしてそれらにオプションの `postrun:` を加えた 2 つの形式です。以下の[ステートメントごとの状態](#per-statement-state)を参照してください。
 
 ```rust
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type)
@@ -94,11 +94,9 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, determinist
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N, deterministic: true)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, postrun: postrun_fn)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, postrun: postrun_fn, buffer_size: N, deterministic: true)
 ```
-
-<Note>
-  `buffer_size` パラメータには、`villagesql` クレートの **0.0.2 以降**が必要です。 現在の [crates.io](https://crates.io/crates/villagesql) リリース (`0.0.1`) ではこれを公開していません。 `0.0.2` がリリースされるまでは、`buffer_size` を使用しない形式を使用してください。
-</Note>
 
 | 引数 | 説明 |
 |---|---|
@@ -106,8 +104,9 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: Stat
 | `"sql_name"` | 文字列リテラルとしての SQL 関数名。 これは、ユーザーが SQL から呼び出す名前です。 |
 | `[param_types]` | カンマで区切られた `villagesql::Type::*` または `villagesql::custom!("name")` 値のリスト。 引数がない関数には `[]` を使用します。 |
 | `return_type` | `villagesql::Type::*` または `villagesql::custom!("name")`。 |
-| `buffer_size: N` | オプション。 文字列/バイナリの戻り値に対する結果バッファーのバイト単位のサイズ。 サーバーのデフォルト (256 バイト) を使用するには `0` を指定します。 関数が `buffer_size` より大きい文字列またはバイナリ値を返す場合、関数は切り捨てずにエラーになります。より大きな結果を処理するには、より大きな `buffer_size` を宣言してください。 |
-| `deterministic: true` | オプション。 関数が決定性を持つことを宣言します。つまり、同じ入力は常に同じ出力を生成し、副作用はありません。 オプティマイザーは、同じ入力に対して結果をキャッシュできます。 これは、それが真の場合にのみ設定してください。 |
+| `buffer_size: N` | オプション。 文字列/バイナリの戻り値に対する結果バッファーのバイト単位のサイズで、最小値は 1024 です。 サーバーのデフォルト (1024 バイト) を使用するには、`0` または 1024 未満の任意の値を指定します。 関数がバッファーより大きい文字列またはバイナリ値を返す場合、関数は切り捨てずにエラーになります。より大きな結果を処理するには、より大きな `buffer_size` を宣言してください。 |
+| `deterministic: true` | オプション。 関数が決定性を持つことを宣言します。つまり、同じ入力は常に同じ出力を生成し、副作用はありません。 生成列や `CHECK` 制約で使用できるのは、決定性を持つ関数だけです。 これは、それが真の場合にのみ設定してください。 |
+| `postrun: postrun_fn` | オプションで、`state:`/`prerun:` の形式でのみ使用できます。 `fn(&mut StateType)`。最後の行の後、SDK が状態を破棄する前に 1 回呼び出されます。 |
 
 `func!` で使用する **型定数**:
 
@@ -131,11 +130,9 @@ prerun 関数のシグネチャは `fn(PrerunArgs, PrerunResult<T>)` であり�
 
 `PrerunArgs::len()` は各行が受け取る引数の数であり、`PrerunArgs::is_empty()` は関数が引数なしで呼び出された場合に true になります。
 
-状態を自分で解放してはいけません。 `func!` は、ステートメントが終了したときに状態を破棄する postrun を生成します。 これは、postrun が `delete_state<T>()` を呼び出す必要がある C++ SDK とは逆です。[ステートメントごとの状態](/ja/mysql-8.4/stable/development#per-statement-state-prerun-and-postrun) を参照してください。
+状態を自分で解放してはいけません。 `func!` は、ステートメントが終了したときに状態を破棄する postrun を常に生成するため、独自の後処理を指定した場合でも、状態の解放はあなたの責任ではありません。 この破棄のステップは、postrun が `delete_state<T>()` を呼び出す必要がある C++ SDK とは逆です。[ステートメントごとの状態](/ja/mysql-8.4/stable/development#per-statement-state-prerun-and-postrun) を参照してください。
 
-<Note>
-  `state` および `prerun` パラメータは、まだ公開されたリリースには含まれていません。 現在の [crates.io](https://crates.io/crates/villagesql) リリース (`0.0.1`) ではこれらを公開していません。
-</Note>
+独自の後処理を先に実行するには、`postrun: postrun_fn` (`fn(&mut StateType)`) を指定します。これは最後の行の後、状態がまだ借用可能なうちに、SDK 自身の破棄の前に 1 回実行されます。[Rust SDK リポジトリ](https://github.com/villagesql/vsql-rust-sdk)の `examples/vsql_postrun_order/src/lib.rs` を参照してください。記録されたテスト出力には `prerun,postrun,drop|rows_seen=3` という行が含まれており、この順序を裏付けています。
 
 ステートメント内での自身の呼び出しインデックスを返す関数を持つ、完全な拡張機能:
 
@@ -205,12 +202,6 @@ villagesql::agg_func!(result_fn, "sql_name", [param_types] -> return_type,
 | `accumulate: accumulate_fn` | `fn(&mut State, &[InValue])`。1 行をアキュムレーターに畳み込みます。行ごとに 1 回実行されます。何も返しません。値は `result_fn` を通じてのみ外部に出ます。 |
 | `buffer_size: N` / `deterministic: true` | オプションですが、両方同時に指定するか、まったく指定しないかのどちらかです。`agg_func!` には `func!` のような単一オプションの形式はありません。指定した場合の意味は `func!` と同じです。 |
 
-<Note>
-  `agg_func!` は、まだ公開されたリリースには含まれていません。現在の
-  [crates.io](https://crates.io/crates/villagesql) リリース (`0.0.1`) では
-  これを公開していません。
-</Note>
-
 アキュムレーターはステートメントごとに 1 回割り当てられ、ステートメントの終了時に破棄されます。`agg_func!` は、それを作成する prerun と破棄する postrun の両方を生成するため、どちらも自分で書く必要はありません。グループごとの動作を実現するのが `clear_fn` です。`GROUP BY` では同じアキュムレーターがグループ間で再利用されるため、グループ間で漏れてはならないフィールドはここでリセットする必要があります。
 
 完全な SUM 相当の集約関数 — SDK リポジトリの `vsql_agg_sum` の例:
@@ -278,7 +269,7 @@ SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin
   サーバーは、可変長引数 VDF に対して引数の数と型の検証を一切行いません。呼び出しをチェックするための宣言されたパラメータリストが存在しないため、引数ゼロの呼び出しや想定していない型を含め、SQL テキストが渡したものすべてがそのまま関数に到達します。検証は完全に `prerun` フックの仕事です。また、可変長引数の登録には VEF Protocol 3 が必要です。古いサーバーはインストール時に拡張機能を拒否します。これは C++ SDK と同じ動作です。[C++ SDK でもフレームワークは可変長引数 VDF の引数の数や型を検証できません](/ja/mysql-8.4/stable/development#varargs-vdfs)。
 </Warning>
 
-6 つの形式があります。3 つの形があり、それぞれに省略形と、`buffer_size` と `deterministic` を（単独ではなく必ず一緒に）追加する完全形があります。
+8 つの形式があります。3 つの形があり、それぞれに省略形と、`buffer_size` と `deterministic` を（単独ではなく必ず一緒に）追加する完全形があります。`state:`/`prerun:` の形には、さらにオプションの `postrun:` を追加する 2 つの形式があります。意味は `func!` と同じです。
 
 ```rust
 // Per-statement state plus a validating prerun.
@@ -286,6 +277,13 @@ villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
     state: StateType, prerun: prerun_fn)
 villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
     state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+
+// Per-statement state, validating prerun, and author postrun.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn, postrun: postrun_fn)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn, postrun: postrun_fn,
+    buffer_size: N, deterministic: true)
 
 // Validating prerun, no state.
 villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
@@ -307,6 +305,7 @@ villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
 | `return_type` | `villagesql::Type::*` または `villagesql::custom!("name")`。引数は可変でも、戻り値の型は固定です。 |
 | `state: StateType` | オプション。ステートメントごとの状態で、`prerun` によって割り当てられ、各行呼び出しで `&mut` として借用されます。`prerun:` が必要です。`agg_func!` とは異なり `Default` の制約はありません。prerun が値を構築します。 |
 | `prerun: prerun_fn` | オプションで、引数の検証を行える唯一の場所です。`fn(PrerunArgs, PrerunResult<T>)`。`T` は `state:` で指定された型、prerun のみの形式では `()` です。 |
+| `postrun: postrun_fn` | オプションで、`state:`/`prerun:` の形式でのみ使用できます。意味は `func!` と同じです: `fn(&mut StateType)`。最後の行の後、SDK が状態を破棄する前に 1 回実行されます。 |
 | `buffer_size: N` / `deterministic: true` | オプション。両方同時に指定するか、まったく指定しないかのどちらかです。指定した場合の意味は `func!` と同じですが、可変長引数では固定値はしばしば不適切です。結果は通常、引数の数に応じて大きくなるためです。代わりに prerun 内で `request_buffer_size` を使ってサイズを設定してください。 |
 
 ベア形式には検証がなく、引数ゼロの呼び出しも受け入れます。あらゆる入力に対して定義される関数であれば正当な選択ですが、行関数だけで、渡され得るすべての入力に対処しなければならないことを意味します。ステートメントごとの状態を割り当てて破棄するのは `state:` 形式のみです。prerun のみの形式は `PrerunResult<()>` を使用して何も保存しないため、postrun は存在しません。そのような prerun は `PrerunResult` を `error` と `request_buffer_size` のためだけに使用し、`set_state` は決して呼び出しません。
@@ -322,18 +321,12 @@ villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
 | `ArgType` のメソッド | 戻り値 |
 |---|---|
 | `is_str()` | `STRING` 引数の場合に `true`。 |
-| `is_real()` | `REAL` 引数の場合に `true`。 |
+| `is_real()` | `REAL` 引数の場合に `true`。リテラル `1.5` のような `DECIMAL` 値は `STRING` 引数です。 |
 | `is_int()` | `INT` 引数の場合に `true`。 |
 | `is_custom()` | インストールされている任意の拡張機能が登録したカスタム型の引数の場合に `true`。 |
 | `custom_name()` | `Option<&str>` — カスタム型の名前。`is_custom()` が true の場合にのみ `Some`。スカラー型では `None`。 |
 
 `is_custom()` と `custom_name()` を組み合わせることで、特定の 1 つのカスタム型だけを受け入れられます。`is_custom()` だけでは、サーバー内のすべてのカスタム型を受け入れてしまいます。
-
-<Note>
-  `varargs_func!` と `PrerunArgs::type_at` は、まだ公開されたリリースには
-  含まれていません。現在の [crates.io](https://crates.io/crates/villagesql)
-  リリース (`0.0.1`) ではこれらを公開していません。
-</Note>
 
 SDK リポジトリの `vsql_varargs` の例は、形式ごとに 1 つの関数を宣言しています。prerun で検証し、ステートメントごとの呼び出しカウンターを持つ、状態付きの可変長引数関数:
 
@@ -427,7 +420,7 @@ SELECT vsql_varargs.arg_count(1, 2.5, 'mix');
 
 ## custom_type! マクロ
 
-`custom_type!` は、新しい列型を登録します。 `type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、および `compare` が必要です。 `hash` と `default` はオプションですが、推奨されます。
+`custom_type!` は、新しい列型を登録します。 `type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、および `compare` が必要です。 `hash` はオプションですが、推奨されます。 `default` と `intrinsic_default_fn` はどちらか一方を指定し、両方は指定しないでください。
 
 ```rust
 villagesql::custom_type!(
@@ -444,16 +437,23 @@ villagesql::custom_type!(
 
 | フィールド | 型 | 説明 |
 |---|---|---|
-| `type_name` | `&str` リテラル | SQL での型の名前。 SQL では大文字と小文字が区別されません。 すべてのインストールされた拡張機能で一意である必要があります。 |
+| `type_name` | `&str` リテラル | SQL での型の名前。 SQL では大文字と小文字が区別されません。 インストールされた複数の拡張機能が同じ名前を登録している場合は、`<extension>.<type>` として参照します。 |
 | `persisted_length` | `usize` | ディスク上のストレージの固定バイト長。 エンコードされたすべての値は、正確にこの数のバイトを生成する必要があります。 |
 | `max_decode_buffer_length` | `usize` | デコードされた文字列の最大バイト長。 `decode` を呼び出す前に、出力バッファーのサイズを設定するために使用されます。 |
 | `encode` | `fn(&str) -> Result<Vec<u8>, String>` | `INSERT` 実行時に呼び出されます。 SQL 文字列リテラルをバイナリに変換します。 入力を拒否するには、`Err(msg)` を返します。 |
 | `decode` | `fn(&[u8]) -> Result<String, String>` | 値を表示するために呼び出されます。 バイナリを文字列に変換します。 |
 | `compare` | `fn(&[u8], &[u8]) -> std::cmp::Ordering` | `ORDER BY`、`MIN`、`MAX` で呼び出されます。 `Less`、`Equal`、または `Greater` を返します。 |
-| `hash` | `fn(&[u8]) -> usize` | オプション。 `COUNT(DISTINCT)` およびセット操作で呼び出されます。 比較結果が `Equal` となる値は、同じハッシュ値を返す必要があります。 インデックス付きの列には推奨されます。 |
+| `hash` | `fn(&[u8]) -> usize` | オプション。 `GROUP BY`、`DISTINCT`、および `UNION` で呼び出されます。 比較結果が `Equal` となる値は、同じハッシュ値を返す必要があります。 インデックス付きの列には推奨されます。 |
 | `default` | `&str` リテラル | オプション。 サーバーが型を初期化するときに、コールバックが機能していることを確認するためにエンコードする有効な文字列。 正確に `persisted_length` バイトにエンコードする必要があります。 |
+| `intrinsic_default_fn` | `fn() -> Result<String, String>` | オプション。 リテラルとして書けないデフォルト値のために、その文字列を記述する代わりに計算します。 |
 
-`default` フィールドは、列のデフォルト値ではありません。 これは、起動時のプローブです。 サーバーは、拡張機能をロードするときに `encode(default)` を呼び出して、コールバックが機能していることを確認します。 `encode` がデフォルトに対して `Err` を返す場合、拡張機能のロードは失敗します。
+`default` フィールドは、列のデフォルト値ではありません。省略された列は `NULL` になります。 これは、サーバーが型を初期化するときにエンコードする文字列を提供します。その初期化は、拡張機能のインストール時ではなく、ステートメントが初めてその型を名指ししたときに行われます。 `default` と `intrinsic_default_fn` のどちらも指定しない場合、サーバーは代わりに空文字列をエンコードします。 いずれの場合も、エンコードが `Err` を返すと、そのステートメントは失敗し、型は使用できないままになります。
+
+```
+ERROR 3219 (HY000): Type '<extension>.<type>' failed to initialize: from_string VDF failed to encode intrinsic default input '<default>' (expected persisted_length=<N>)
+```
+
+`default` と `intrinsic_default_fn` の両方を指定した場合は、拡張機能のインストール時に拒否されます。初回使用時まで先送りされることはありません。
 
 ## custom! マクロ
 
@@ -486,9 +486,9 @@ villagesql::func!(
 
 | フィールド | 必須 | 形式 | 説明 |
 |---|---|---|---|
-| `name` | はい | 英小文字、数字、`_`、`-` | 拡張機能の識別子。 `INSTALL EXTENSION` 名と一致する必要があります。 アンダースコアを使用してください。ハイフンは SQL でバッククォートで囲む必要があります。 |
+| `name` | はい | 英字、数字、`_`、`-` | 拡張機能の識別子。 `INSTALL EXTENSION` 名と一致する必要があります。 アンダースコアを使用してください。ハイフンは SQL でバッククォートで囲む必要があります。 |
 | `version` | はい | MAJOR.MINOR.PATCH | セマンティックバージョン。 |
-| `description` | いいえ | 文字列 | `INFORMATION_SCHEMA.EXTENSIONS` に表示されます。 |
+| `description` | いいえ | 文字列 | 拡張機能の簡単な説明。 |
 | `author` | いいえ | 文字列 | 作成者名または組織。 |
 | `license` | いいえ | 文字列 | ライセンス識別子。 オープンソースの拡張機能には `GPL-2.0` を推奨します。 |
 

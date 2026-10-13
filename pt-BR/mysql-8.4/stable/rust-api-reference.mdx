@@ -23,7 +23,7 @@ pub enum InValue<'a> {
 
 | Variante | Tipo Rust | Tipo SQL correspondente |
 |---|---|---|
-| `String(&str)` | Fatia de string UTF-8 | `STRING` / `VARCHAR` / `TEXT` |
+| `String(&str)` | Fatia de string contendo os bytes brutos do argumento, sem verificação de UTF-8 (um argumento latin1 ou binário mantém seus bytes) | `STRING` / `VARCHAR` / `TEXT` |
 | `Real(f64)` | Ponto flutuante de 64 bits | `REAL` / `DOUBLE` / `FLOAT` |
 | `Int(i64)` | Inteiro com sinal de 64 bits | `INT` / `BIGINT` / `TINYINT` |
 | `Null` | — | `NULL` do SQL para qualquer tipo |
@@ -48,7 +48,7 @@ Sempre faça a correspondência de `Null` explicitamente. Chamar `.unwrap()` ou 
 
 **Aviso vs. erro:**
 
-Use `warning` para falhas de validação de entrada do usuário em que faz sentido continuar com o restante do conjunto de resultados. No modo estrito, o MySQL promove avisos a erros em `INSERT` e `UPDATE`. Use `error` para condições em que prosseguir é inseguro: dados armazenados corrompidos, violações de invariantes internas. Um erro fatal aborta a instrução inteira.
+Use `warning` para falhas de validação de entrada do usuário em que faz sentido continuar com o restante do conjunto de resultados. Um aviso não faz a instrução falhar, inclusive `INSERT` e `UPDATE` no modo estrito. Use `error` para condições em que prosseguir é inseguro: dados armazenados corrompidos, violações de invariantes internas. Um erro fatal aborta a instrução inteira.
 
 ```rust
 fn validate_impl(args: &[InValue]) -> VdfReturn {
@@ -85,7 +85,7 @@ villagesql::extension! {
 
 ## macro func!
 
-`func!` declara uma função chamável via SQL. Seis formas — quatro sem estado por instrução (sem parâmetros, apenas `buffer_size`, apenas `deterministic`, ambos) e duas que anexam estado por instrução por meio de uma função `prerun`:
+`func!` declara uma função chamável via SQL. Oito formas — quatro sem estado por instrução (sem parâmetros, apenas `buffer_size`, apenas `deterministic`, ambos), duas que anexam estado por instrução por meio de uma função `prerun` e mais duas que adicionam uma `postrun:` opcional sobre essas. Consulte [Estado por instrução](#per-statement-state) abaixo.
 
 ```rust
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type)
@@ -94,14 +94,9 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, determinist
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, buffer_size: N, deterministic: true)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn)
 villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, postrun: postrun_fn)
+villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: StateType, prerun: prerun_fn, postrun: postrun_fn, buffer_size: N, deterministic: true)
 ```
-
-<Note>
-  O parâmetro `buffer_size` requer o crate `villagesql` **0.0.2 ou
-  posterior**. A versão atual do [crates.io](https://crates.io/crates/villagesql)
-  (`0.0.1`) não o expõe — até que o `0.0.2` seja lançado, use as formas sem
-  `buffer_size`.
-</Note>
 
 | Argumento | Descrição |
 |---|---|
@@ -109,8 +104,9 @@ villagesql::func!(rust_fn, "sql_name", [param_types] -> return_type, state: Stat
 | `"sql_name"` | O nome da função SQL como um literal de string. É isso que os usuários chamam a partir do SQL. |
 | `[param_types]` | Lista separada por vírgulas de valores `villagesql::Type::*` ou `villagesql::custom!("name")`. Use `[]` para funções de aridade zero. |
 | `return_type` | `villagesql::Type::*` ou `villagesql::custom!("name")`. |
-| `buffer_size: N` | Opcional. Tamanho em bytes do buffer de resultado para retornos de string/binário. Use `0` para o padrão do servidor (256 bytes). Quando uma função retorna um valor de string ou binário maior que `buffer_size`, a função gera um erro em vez de truncar — declare um `buffer_size` maior para lidar com resultados maiores. |
-| `deterministic: true` | Opcional. Declara a função como determinística — as mesmas entradas sempre produzem a mesma saída, sem efeitos colaterais. O otimizador pode armazenar em cache os resultados para entradas idênticas. Defina isso apenas quando for verdadeiro. |
+| `buffer_size: N` | Opcional. Tamanho em bytes do buffer de resultado para retornos de string/binário, com um mínimo de 1024. Use `0` ou qualquer valor abaixo de 1024 para o padrão do servidor (1024 bytes). Quando uma função retorna um valor de string ou binário maior que o buffer, a função gera um erro em vez de truncar — declare um `buffer_size` maior para lidar com resultados maiores. |
+| `deterministic: true` | Opcional. Declara a função como determinística — as mesmas entradas sempre produzem a mesma saída, sem efeitos colaterais. Somente uma função determinística pode aparecer em uma coluna gerada ou em uma restrição `CHECK`. Defina isso apenas quando for verdadeiro. |
+| `postrun: postrun_fn` | Opcional, somente nas formas `state:`/`prerun:`. `fn(&mut StateType)`, chamada uma vez após a última linha, antes de o SDK descartar o estado. |
 
 **Constantes de tipo** para uso em `func!`:
 
@@ -134,13 +130,9 @@ Uma função prerun tem a assinatura `fn(PrerunArgs, PrerunResult<T>)`, e a fun�
 
 `PrerunArgs::len()` é o número de argumentos que cada linha vai receber, e `PrerunArgs::is_empty()` é verdadeiro quando a função foi chamada sem argumentos.
 
-Você não deve liberar o estado por conta própria: `func!` gera a postrun que o descarta quando a instrução termina. Isso é o oposto do SDK C++, onde sua postrun tem que chamar `delete_state<T>()` — consulte [Estado por Instrução](/pt-BR/mysql-8.4/stable/development#per-statement-state-prerun-and-postrun).
+Você não deve liberar o estado por conta própria: `func!` sempre gera a postrun que o descarta quando a instrução termina, então liberá-lo não é responsabilidade sua, mesmo quando você fornece a sua própria finalização. Essa etapa de descarte é o oposto do SDK C++, onde sua postrun tem que chamar `delete_state<T>()` — consulte [Estado por Instrução](/pt-BR/mysql-8.4/stable/development#per-statement-state-prerun-and-postrun).
 
-<Note>
-  Os parâmetros `state` e `prerun` ainda não estão em uma versão publicada. A
-  versão atual do [crates.io](https://crates.io/crates/villagesql) (`0.0.1`)
-  não os expõe.
-</Note>
+Nomeie uma `postrun: postrun_fn`, `fn(&mut StateType)`, para executar primeiro a sua própria finalização: ela é executada uma vez após a última linha, enquanto o estado ainda pode ser tomado emprestado, e antes do descarte feito pelo próprio SDK. Consulte `examples/vsql_postrun_order/src/lib.rs` no [repositório do SDK Rust](https://github.com/villagesql/vsql-rust-sdk), cuja saída de teste registrada inclui a linha `prerun,postrun,drop|rows_seen=3`, confirmando a ordem.
 
 Uma extensão completa cuja função retorna o próprio índice de chamada dentro da instrução:
 
@@ -209,11 +201,6 @@ villagesql::agg_func!(result_fn, "sql_name", [param_types] -> return_type,
 | `clear: clear_fn` | `fn(&mut State)`. Redefine o acumulador no início de cada grupo. |
 | `accumulate: accumulate_fn` | `fn(&mut State, &[InValue])`. Incorpora uma linha ao acumulador. É executada uma vez por linha. Não retorna nada — o valor só sai por meio de `result_fn`. |
 | `buffer_size: N` / `deterministic: true` | Opcionais, mas fornecidos juntos ou não fornecidos — `agg_func!` não tem formas de opção única como `func!` tem. Mesmo significado que em `func!` quando fornecidos. |
-
-<Note>
-  `agg_func!` ainda não está em uma versão publicada. A versão atual do
-  [crates.io](https://crates.io/crates/villagesql) (`0.0.1`) não o expõe.
-</Note>
 
 O acumulador é alocado uma vez por instrução e descartado quando a instrução termina — `agg_func!` gera tanto a prerun que o cria quanto a postrun que o descarta, então você nunca escreve nenhuma das duas. `clear_fn` é o que dá a você o comportamento por grupo: com `GROUP BY`, o mesmo acumulador é reutilizado entre os grupos, então qualquer campo que não deva vazar entre grupos tem que ser redefinido ali.
 
@@ -291,7 +278,10 @@ SELECT grp, vsql_agg_sum.agg_sum(val) AS mine, SUM(val) AS builtin
   varargs](/pt-BR/mysql-8.4/stable/development#varargs-vdfs).
 </Warning>
 
-Seis formas — três formatos, cada um com uma forma abreviada e uma forma completa que adiciona `buffer_size` e `deterministic` juntos (nunca isoladamente):
+Oito formas — três formatos, cada um com uma forma abreviada e uma forma completa que adiciona
+`buffer_size` e `deterministic` juntos (nunca isoladamente). O formato `state:`/
+`prerun:` tem mais duas sobre essas, adicionando uma `postrun:` opcional —
+mesmo significado que em `func!`:
 
 ```rust
 // Per-statement state plus a validating prerun.
@@ -299,6 +289,13 @@ villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
     state: StateType, prerun: prerun_fn)
 villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
     state: StateType, prerun: prerun_fn, buffer_size: N, deterministic: true)
+
+// Per-statement state, validating prerun, and author postrun.
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn, postrun: postrun_fn)
+villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
+    state: StateType, prerun: prerun_fn, postrun: postrun_fn,
+    buffer_size: N, deterministic: true)
 
 // Validating prerun, no state.
 villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
@@ -320,6 +317,7 @@ villagesql::varargs_func!(impl_fn, "sql_name", [..] -> return_type,
 | `return_type` | `villagesql::Type::*` ou `villagesql::custom!("name")`. O tipo de retorno é fixo mesmo que os argumentos não sejam. |
 | `state: StateType` | Opcional. Estado por instrução, alocado pela `prerun` e tomado emprestado como `&mut` por cada chamada de linha. Requer `prerun:`. Diferente de `agg_func!`, não há a exigência de `Default` — a sua prerun constrói o valor. |
 | `prerun: prerun_fn` | Opcional, e o único lugar onde a validação de argumentos pode acontecer. `fn(PrerunArgs, PrerunResult<T>)`, onde `T` é o tipo nomeado por `state:`, ou `()` na forma apenas com prerun. |
+| `postrun: postrun_fn` | Opcional, somente nas formas `state:`/`prerun:` — significa o mesmo que em `func!`: `fn(&mut StateType)`, executada uma vez após a última linha e antes de o SDK descartar o estado. |
 | `buffer_size: N` / `deterministic: true` | Opcionais, fornecidos juntos ou não fornecidos. Mesmo significado que em `func!` quando fornecidos — para varargs, um valor fixo costuma ser a escolha errada, já que o resultado normalmente cresce com a contagem de argumentos; dimensione-o na prerun com `request_buffer_size` em vez disso. |
 
 A forma básica não tem validação e aceita uma chamada com zero argumentos — uma escolha legítima para uma função que é total sobre toda entrada, mas isso significa que a função de linha sozinha é responsável por toda entrada que pode receber. Apenas a forma com `state:` aloca e descarta o estado por instrução; a forma apenas com prerun usa `PrerunResult<()>` e não armazena nada, então não há postrun para ela — uma prerun dessas usa `PrerunResult` apenas para `error` e `request_buffer_size`, nunca para `set_state`.
@@ -335,18 +333,12 @@ Como o servidor não valida nada, uma prerun de varargs precisa ver os tipos dos
 | Método de `ArgType` | Retorna |
 |---|---|
 | `is_str()` | `true` para um argumento `STRING`. |
-| `is_real()` | `true` para um argumento `REAL`. |
+| `is_real()` | `true` para um argumento `REAL`. Um valor `DECIMAL`, como o literal `1.5`, é um argumento `STRING`. |
 | `is_int()` | `true` para um argumento `INT`. |
 | `is_custom()` | `true` para um argumento de um tipo personalizado registrado por qualquer extensão instalada. |
 | `custom_name()` | `Option<&str>` — o nome do tipo personalizado. `Some` apenas quando `is_custom()` é verdadeiro; `None` para os tipos escalares. |
 
 Combine `is_custom()` com `custom_name()` para aceitar exatamente um tipo personalizado: `is_custom()` sozinho aceita todo tipo personalizado no servidor.
-
-<Note>
-  `varargs_func!` e `PrerunArgs::type_at` ainda não estão em uma versão
-  publicada. A versão atual do
-  [crates.io](https://crates.io/crates/villagesql) (`0.0.1`) não os expõe.
-</Note>
 
 O exemplo `vsql_varargs` no repositório do SDK declara uma função por forma. Uma função varargs com estado, validada na prerun e carregando um contador de chamadas por instrução:
 
@@ -440,7 +432,7 @@ O exemplo também declara `describe` (uma função apenas com prerun que rejeita
 
 ## macro custom_type!
 
-`custom_type!` registra um novo tipo de coluna. `type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode` e `compare` são obrigatórios. `hash` e `default` são opcionais, mas recomendados.
+`custom_type!` registra um novo tipo de coluna. `type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode` e `compare` são obrigatórios. `hash` é opcional, mas recomendado. Forneça `default` ou `intrinsic_default_fn`, não ambos.
 
 ```rust
 villagesql::custom_type!(
@@ -457,16 +449,23 @@ villagesql::custom_type!(
 
 | Campo | Tipo | Descrição |
 |---|---|---|
-| `type_name` | Literal `&str` | Nome SQL para o tipo. Não diferencia maiúsculas de minúsculas no SQL. Deve ser único entre todas as extensões instaladas. |
+| `type_name` | Literal `&str` | Nome SQL para o tipo. Não diferencia maiúsculas de minúsculas no SQL. Refira-se a ele como `<extension>.<type>` quando mais de uma extensão instalada registrar o mesmo nome. |
 | `persisted_length` | `usize` | Comprimento fixo em bytes para armazenamento em disco. Todos os valores codificados devem produzir exatamente essa quantidade de bytes. |
 | `max_decode_buffer_length` | `usize` | Comprimento máximo em bytes da string decodificada. Usado para dimensionar o buffer de saída antes de chamar `decode`. |
 | `encode` | `fn(&str) -> Result<Vec<u8>, String>` | Chamado no momento do `INSERT`. Converte um literal de string SQL em binário. Retorne `Err(msg)` para rejeitar a entrada. |
 | `decode` | `fn(&[u8]) -> Result<String, String>` | Chamado para exibir o valor. Converte binário de volta em uma string. |
 | `compare` | `fn(&[u8], &[u8]) -> std::cmp::Ordering` | Chamado para `ORDER BY`, `MIN`, `MAX`. Retorne `Less`, `Equal` ou `Greater`. |
-| `hash` | `fn(&[u8]) -> usize` | Opcional. Chamado para `COUNT(DISTINCT)` e operações de conjunto. Valores que comparam como `Equal` devem ter o mesmo hash. Recomendado para colunas indexadas. |
+| `hash` | `fn(&[u8]) -> usize` | Opcional. Chamado para `GROUP BY`, `DISTINCT` e `UNION`. Valores que comparam como `Equal` devem ter o mesmo hash. Recomendado para colunas indexadas. |
 | `default` | Literal `&str` | Opcional. Uma string válida que o servidor codifica na inicialização do tipo para verificar se o callback funciona. Deve codificar em exatamente `persisted_length` bytes. |
+| `intrinsic_default_fn` | `fn() -> Result<String, String>` | Opcional. Calcula essa string em vez de declará-la, para um padrão que não pode ser escrito como literal. |
 
-O campo `default` não é um valor padrão de coluna — é uma sondagem de inicialização. O servidor chama `encode(default)` ao carregar a extensão para verificar se o callback funciona. Se `encode` retornar `Err` para o padrão, a extensão falha ao carregar.
+O campo `default` não é um valor padrão de coluna; uma coluna omitida é `NULL`. Ele fornece a string que o servidor codifica ao inicializar o tipo, e isso acontece na primeira vez em que uma instrução nomeia o tipo, e não quando a extensão é instalada. Se você não fornecer nem `default` nem `intrinsic_default_fn`, o servidor codifica a string vazia. Em qualquer caso, um encode que retorna `Err` faz essa instrução falhar e deixa o tipo inutilizável:
+
+```
+ERROR 3219 (HY000): Type '<extension>.<type>' failed to initialize: from_string VDF failed to encode intrinsic default input '<default>' (expected persisted_length=<N>)
+```
+
+Fornecer tanto `default` quanto `intrinsic_default_fn` é recusado quando a extensão é instalada, e não adiado para o primeiro uso.
 
 ## macro custom!
 
@@ -499,9 +498,9 @@ Toda extensão precisa de um `manifest.json` ao lado de seu `Cargo.toml`:
 
 | Campo | Obrigatório | Formato | Descrição |
 |---|---|---|---|
-| `name` | Sim | letras minúsculas, dígitos, `_`, `-` | Identificador da extensão. Deve corresponder ao nome do `INSTALL EXTENSION`. Use underscores — hifens exigem o uso de crases no SQL. |
+| `name` | Sim | letras, dígitos, `_`, `-` | Identificador da extensão. Deve corresponder ao nome do `INSTALL EXTENSION`. Use underscores — hifens exigem o uso de crases no SQL. |
 | `version` | Sim | MAJOR.MINOR.PATCH | Versão semântica. |
-| `description` | Não | String | Exibido em `INFORMATION_SCHEMA.EXTENSIONS`. |
+| `description` | Não | String | Breve descrição da extensão. |
 | `author` | Não | String | Nome do autor ou organização. |
 | `license` | Não | String | Identificador de licença. `GPL-2.0` recomendado para extensões de código aberto. |
 

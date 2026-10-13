@@ -1,0 +1,557 @@
+---
+audience: extension-author
+title: "Índices Personalizados"
+description: "As capabilities Preview index_type e index_profile permitem que uma extensão forneça sua própria estrutura de índice e a vincule a um tipo personalizado por meio de um perfil."
+---
+
+Uma extensão pode registrar sua própria estrutura de índice e fazer com que o
+servidor a chame. O servidor é dono da sintaxe SQL, dos metadados e da transação.
+A extensão é dona do formato em disco do índice e da busca dentro dele.
+
+Duas capabilities Preview sustentam isso. `vsql::preview::index_type` registra a
+estrutura de índice em si. `vsql::preview::index_profile` vincula essa estrutura
+a um tipo personalizado e nomeia as funções com as quais o índice calcula. Ambas
+ficam em `<villagesql/preview/index_builder.h>` nos cabeçalhos da dev ABI, então
+uma extensão que as usa é compilada com `-DVSQL_USE_DEV_ABI=ON`.
+
+<Warning>
+Suportado hoje: a DDL que cria, altera e remove um índice personalizado; a
+manutenção do índice em `INSERT`; e um formato de consulta, uma ordenação por
+vizinho mais próximo servida pelo índice.
+
+Não suportado: `DELETE`, um `UPDATE` que altera uma coluna indexada, e todo
+padrão de acesso que não seja a busca por vizinho mais próximo. Quatro dos doze
+hooks obrigatórios — `mark_delete`, `purge`, `save` e `restore` — precisam
+existir para que o builder compile, e o servidor nunca os chama.
+
+As instruções que nomeiam um índice personalizado são recusadas a menos que
+`vsql_allow_preview_extensions` esteja em `ON`, a mesma configuração que
+instalar uma extensão Preview já exige.
+</Warning>
+
+## As Três Peças {#the-three-pieces}
+
+Um tipo de índice é a estrutura: como as entradas são armazenadas, inseridas e
+percorridas. Ele é registrado uma vez por extensão e por estrutura, sob um nome
+como `hnsw`.
+
+Uma função de índice é uma função determinística vinculada a um perfil — uma
+função de distância, por exemplo. Um perfil vincula duas categorias de funções.
+Uma função vinculada com `with_function()` é uma para a qual o otimizador pode
+planejar um scan de índice. Uma função vinculada com `with_helper()` é chamada
+apenas pela implementação do índice.
+
+Vincular uma função a um perfil não cria uma função SQL. O otimizador casa uma
+chamada em `ORDER BY` pelo nome com as vinculações do perfil, então uma função
+vinculada com `with_function()` também deve ser registrada com `.func()` sob o
+mesmo nome, ou nenhuma instrução jamais poderá nomeá-la e o índice nunca será
+escolhido. Um helper não precisa de `.func()`, e chamar um a partir do SQL
+resulta em `ERROR 1305 (42000): FUNCTION <database>.<name> does not exist`.
+
+Um perfil de índice liga um tipo personalizado a um tipo de índice e dá a cada
+função vinculada um id numérico pelo qual o índice a chama. Um tipo de índice
+serve a muitos perfis: `vsql_vector` registra um único tipo de índice `hnsw` e
+quatro perfis sobre ele — `hnsw_l1`, `hnsw_l2`, `hnsw_cosine` e
+`hnsw_inner_product` — um por métrica de distância.
+
+## Registrando um Tipo de Índice {#registering-an-index-type}
+
+`make_index_type<Name, Context>()` recebe o nome do índice e uma struct de
+contexto por índice que guarda todo o estado de execução de que a extensão
+precisa. Todos os doze hooks são obrigatórios, em três grupos, nesta ordem. O
+builder não compila se um deles estiver faltando — a asserção que falha nomeia o
+hook.
+
+Os hooks de ciclo de vida criam o armazenamento do índice, o carregam quando a
+tabela é aberta e o removem:
+
+```cpp
+bool create(Ctx *, const Index &, Space::Ref, Segment::TrxRef, char *, uint32_t);
+bool load(Ctx *, const Index &, Index::StorageRef, char *, uint32_t);
+bool drop(Ctx *, const Index &, Segment::TrxRef, char *, uint32_t);
+```
+
+Os hooks de DML mantêm o índice conforme as linhas mudam. O servidor chama
+`insert`. `mark_delete` e `purge` precisam existir com estas assinaturas para que
+o builder compile; implemente-os como stubs:
+
+```cpp
+bool insert(Ctx *, const Index &, Segment::TrxRef,
+            IndexScanKey::KeyPartData *keys, IndexScanKey::KeyPartData *pkeys,
+            IndexScanKey::KeyPartRef *key_ref, char *, uint32_t);
+bool mark_delete(Ctx *, const Index &, Segment::TrxRef,
+                 IndexScanKey::KeyPartRef *key_ref,
+                 IndexScanKey::KeyPartData *keys,
+                 IndexScanKey::KeyPartData *pkeys, bool delete_mark,
+                 char *, uint32_t);
+bool purge(Ctx *, const Index &, Segment::TrxRef,
+           IndexScanKey::KeyPartRef *key_ref, IndexScanKey::KeyPartData *keys,
+           IndexScanKey::KeyPartData *pkeys, char *, uint32_t);
+```
+
+Os hooks de scan respondem às consultas. O servidor chama `begin`, `position`,
+`fetch` e `end`, e passa a `position` apenas `Index::CursorOp::Next`. `save` e
+`restore` precisam existir e são stubs, como os dois hooks de DML acima:
+
+```cpp
+bool begin(Ctx *, const Index &, MtrCtx::Ref, const IndexScanDesc &,
+           Index::Cursor *, bool *, char *, uint32_t);
+bool position(Index::Cursor, Index::CursorOp, bool *, char *, uint32_t);
+bool fetch(Index::Cursor, IndexScanKey::KeyPartRef *,
+           IndexScanKey::KeyPartData *keys, IndexScanKey::KeyPartData *pkeys,
+           char *, uint32_t);
+bool save(Index::Cursor, char *, uint32_t);
+bool restore(Index::Cursor, MtrCtx::Ref, bool *, char *, uint32_t);
+void end(Index::Cursor *);
+```
+
+Todo hook que pode falhar recebe um buffer de mensagem e seu comprimento como os
+dois últimos argumentos, e retorna `true` em caso de falha depois de escrever a
+mensagem ali.
+
+O cursor pertence à extensão. Aloque-o em `begin` e atribua-o a `*cursor`, já
+posicionado no primeiro registro — o servidor chama `fetch` antes de chamar
+`position`. Libere o cursor em `end` e defina `*cursor` como `nullptr`. O SDK não
+encapsula o estado do cursor.
+
+O argumento `bool *` de `begin`, `position` e `restore` é uma flag de fim de scan
+que o hook escreve. Em caso de sucesso, o servidor chama `end` mesmo quando
+`begin` definiu essa flag; em caso de falha, `begin` deve deixar `*cursor` nulo,
+e `end` não é chamado. O `MtrCtx::Ref` que `begin` recebe é nulo no caminho que
+o servidor conduz hoje.
+
+O contexto não pertence à extensão. O SDK aloca `Index::StorageCtx<T>` e o seu
+`T` a partir da arena do InnoDB antes de chamar `create` ou `load`, e destrói a
+arena — o que executa `~T` — depois que `drop` retorna. Alcance seu próprio
+estado por meio de `ctx->user()` e a arena por meio de `ctx->arena()`. Nunca
+exclua o contexto, o objeto de usuário ou a arena.
+
+### Declarando o Que o Índice Pode Fazer {#declaring-what-the-index-can-do}
+
+`.capabilities()` declara quais padrões de acesso o índice suporta, e
+`.storage_props()` declara como cada entrada do índice se refere de volta aos
+dados que ela indexa. Ambos são obrigatórios.
+
+O builder aceita cinco valores de capability, e o servidor age sobre um:
+`Index::Support::KNN`, um scan dos k vizinhos mais próximos para
+`ORDER BY <distance>(<column>, <reference>) LIMIT K`. `POINT_LOOKUP`,
+`RANGE_SCAN`, `REVERSE_SCAN` e `ORDER_BY` compilam e são registrados, e o otimizador não constrói nenhum desses caminhos. Uma condição `=` na coluna indexada ainda pode planejar um `Index lookup` no índice personalizado, por exemplo sob `FORCE INDEX`, independentemente do que o índice declara, e essa consulta falha com `ERROR 1031 (HY000): Table storage engine for '<table>' doesn't have this option`.
+
+A declaração de armazenamento que serve a um scan de vizinho mais próximo é
+`Index::Storage::HAS_COLUMN_REF | Index::Storage::HAS_ROW_REF` em um índice de
+coluna única sobre uma coluna que a própria extensão armazena. `HAS_COLUMN_REF`
+significa que cada entrada armazena uma referência de coluna estável fornecida
+pelo servidor, em vez da chave primária completa, e é o que torna
+`get_key_data()` e `get_key_ref()` disponíveis. `REF_LOOKUP` significa que o
+índice consegue relocalizar uma entrada a partir dessa referência, e traz uma
+obrigação: toda entrada deve ter um token de referência único.
+
+`Index::Storage::HAS_ROW_REF` significa que cada entrada armazena a chave primária da linha que ela indexa: o servidor a passa para `insert()` no array `pkeys`, `fetch()` deve devolvê-la em `pkeys`, e o servidor resolve cada acerto com uma busca pela chave primária. Um índice que não o declara nunca é escolhido para um scan de vizinho mais próximo. Declare-o junto com `HAS_COLUMN_REF`.
+
+### Lendo e Escrevendo Referências de Coluna {#reading-and-writing-column-references}
+
+`get_key_data()` resolve um `KeyPartRef` — do tipo que os hooks de DML e de scan
+entregam ao índice — no valor real da coluna de chave, dimensionado com
+`get_max_col_len(key_pos)`. `get_key_ref()` faz o caminho inverso: deriva a
+referência para um valor de coluna de chave que já está no armazenamento de
+coluna, como um dos `keys` que `insert()` recebe. `get_key_data()` lê sob a sua
+própria mini-transação e não deve ser chamado enquanto a extensão mantém latches
+de página. Ambos recebem `key_pos`, a coluna de chave, com base zero, à qual o
+valor pertence, e retornam `true` em caso de falha, com a mensagem em
+`index.get_error()`:
+
+```cpp
+std::vector<unsigned char> buf(index.get_max_col_len(key_pos));
+IndexScanKey::KeyPartData key_data{buf.data(), static_cast<uint32_t>(buf.size())};
+// The hooks receive key_ref as a pointer; get_key_data() takes it by value.
+if (index.get_key_data(key_pos, *key_ref, &key_data)) return true;  // index.get_error()
+// key_data holds the value.
+
+IndexScanKey::KeyPartRef derived_ref;
+if (index.get_key_ref(key_pos, keys[key_pos], &derived_ref)) return true;
+// derived_ref holds the reference.
+```
+
+O servidor deixa ambos como pointers de função nulos a menos que o índice tenha
+declarado `HAS_COLUMN_REF`, e o SDK os chama sem proteção, então chamar qualquer
+um deles sem essa declaração causa um crash em vez de retornar um erro.
+
+### Opções de Índice {#index-options}
+
+`WITH (M = 8, ef_construction = 64)` na DDL chega à extensão como opções de
+índice. O servidor converte cada chave e valor para minúsculas primeiro, então
+`params[i].key` vale `m` mesmo que a DDL tenha escrito `M`. Declare uma struct
+com valores padrão e uma função `parse`, e registre-a com
+`.options<T, &T::parse>()`:
+
+```cpp
+struct HNSWOptions {
+  int M = 16;
+  int ef_construction = 200;
+  static bool parse(const Index::Parameter *params, uint32_t count,
+                    HNSWOptions *out, char *error_msg,
+                    uint32_t error_msg_len);
+};
+```
+
+Compare com a chave em minúsculas:
+
+```cpp
+if (strcmp(params[i].key, "m") == 0) out->M = atoi(params[i].value);
+```
+
+`params` é nulo quando a DDL não trouxe uma cláusula `WITH`, então `count` é o
+valor a testar primeiro. Um `parse` que retorna falha aborta a DDL, e a mensagem
+que ele escreveu vai para o log de erros do servidor — o cliente vê apenas
+`ERROR 1030 (HY000): Got error 168 - 'Unknown (generic) error from engine' from storage engine`, então
+nomeie o índice e a chave problemática na mensagem.
+
+`index.options<HNSWOptions>()` retorna um pointer para a struct já parseada. Ele
+é alcançável a partir de todo hook que recebe o `Index` — os hooks de ciclo de
+vida, os hooks de DML e `begin`. Os demais hooks de scan recebem apenas um
+cursor, então um tipo de índice que precisa de suas opções durante o scan tem de
+copiá-las para o cursor em `begin`.
+
+## Funções de Índice {#index-functions}
+
+Uma função de índice deve ser determinística e deve retornar `REAL`. Construa
+uma e a mantenha em um `static const` — o perfil armazena uma referência a ela,
+portanto seu endereço tem de sobreviver ao registro:
+
+```cpp
+static const auto MY_INDEX_FN =
+    make_index_function<&my_index_fn>("my_index_fn")
+        .returns(vsql::REAL)
+        .param(MY_TYPE)
+        .param(MY_TYPE)
+        .deterministic()
+        .build();
+```
+
+Uma função pode declarar no máximo oito parâmetros, o valor de
+`VEF_INDEX_PROFILE_FN_MAX_ARGS`. O servidor verifica o tipo de retorno e a
+aridade no `INSTALL EXTENSION`, e não no primeiro uso.
+
+## Perfis de Índice {#index-profiles}
+
+Um perfil nomeia o tipo personalizado, o tipo de índice e as funções com seus
+ids. `for_type()` recebe a *string com o nome do tipo* — a mesma constante
+passada para `make_type` — e não o descritor do tipo. `with_function()` e
+`with_helper()` recebem uma função de índice já construída, não um nome:
+
+```cpp
+static const auto MY_PROFILE =
+    make_index_profile("my_profile")
+        .for_type(kMyType)
+        .using_index(kMyIndex)
+        .with_function(1, MY_DISTANCE_FN)
+        .with_helper(1, MY_HELPER_FN)
+        .ordering(Index::Ordering::ASC)
+        .default_for_type(true)
+        .build();
+```
+
+Os ids devem ser únicos dentro de cada lista, e as duas listas são numeradas de
+forma independente — `with_function(1, ...)` e `with_helper(1, ...)` não
+colidem. Um id repetido dentro de uma mesma lista é rejeitado no
+`INSTALL EXTENSION`.
+
+`.default_for_type(true)` marca este perfil como aquele a ser usado quando uma
+instrução não nomeia nenhum perfil. Aplica-se por par de tipo e tipo de índice, e
+tem o valor padrão false. O `vsql_vector` marca `hnsw_l2`, e é por isso que um
+índice criado sem um perfil registra `hnsw_l2`.
+
+`.ordering()` registra as direções de scan que o perfil suporta, como `NONE`,
+`ASC`, `DESC`, ou `ASC | DESC`. O servidor armazena o valor e nada o lê. Apenas
+uma ordenação ascendente é planejada, independentemente do que o perfil declara:
+um perfil que declara apenas `DESC` ainda serve a uma consulta ascendente, e um
+`ORDER BY` descendente é executado como um scan de tabela.
+
+Um hook chama uma função vinculada por meio de `index.profile()` ou um helper
+vinculado por meio de `index.helper()`. Ambos recebem a posição da coluna de
+chave, o id que o perfil deu à função, um pointer para o resultado e os valores
+das colunas como argumentos `vef_storage_col_data_t`.
+
+`index.helper_fn_name()` informa o nome registrado de um helper vinculado em vez
+de chamá-lo, o que permite que um laço interno resolva a sua própria
+implementação nativa uma única vez, em vez de despachar a cada chamada:
+
+```cpp
+std::array<char, 64> name{};
+if (index.helper_fn_name(key_pos, fn_id, name.data(), name.size())) {
+  // on failure, index.get_error()
+}
+```
+
+## Juntando Tudo {#putting-it-together}
+
+Um esqueleto, sem os corpos dos hooks, a struct de opções e o contexto:
+
+```cpp
+#include <villagesql/preview/index_builder.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql::preview_index_builder;
+using vsql::preview_storage::MtrCtx;
+using vsql::preview_storage::Segment;
+using vsql::preview_storage::Space;
+
+static constexpr const char kMyType[] = "my_type";
+static constexpr const char kMyIndex[] = "my_index";
+
+constexpr auto MY_TYPE = vsql::make_type<kMyType>()/* ... */.build();
+
+static constexpr auto MY_INDEX =
+    make_index_type<kMyIndex, MyContext>()
+        .lifecycle()
+            .create<&my_create>()
+            .load<&my_load>()
+            .drop<&my_drop>()
+        .dml()
+            .insert<&my_insert>()
+            .mark_delete<&my_mark_delete>()
+            .purge<&my_purge>()
+        .scan()
+            .begin<&my_begin_scan>()
+            .position<&my_position>()
+            .fetch<&my_fetch>()
+            .save<&my_save>()
+            .restore<&my_restore>()
+            .end<&my_end_scan>()
+        .global()
+            .capabilities(Index::Support::KNN)
+            .storage_props(Index::Storage::HAS_COLUMN_REF |
+                           Index::Storage::HAS_ROW_REF)
+            .options<MyOptions, &MyOptions::parse>()
+            .build();
+
+static const auto MY_PROFILE =
+    make_index_profile("my_profile")
+        .for_type(kMyType)
+        .using_index(kMyIndex)
+        .with_function(1, MY_INDEX_FN)
+        .ordering(Index::Ordering::ASC)
+        .default_for_type(true)
+        .build();
+
+static auto INDEX_TYPE = IndexTypeCapability().index_type(MY_INDEX);
+static auto INDEX_PROFILE = IndexProfileCapability().index_profile(MY_PROFILE);
+
+VEF_GENERATE_ENTRY_POINTS(
+    vsql::make_extension()
+        .with(INDEX_TYPE)
+        .with(INDEX_PROFILE)
+        .type(MY_TYPE)
+        // The bound function needs a SQL function of the same name, or no
+        // statement can name it and the index is never chosen.
+        .func(vsql::make_func<&my_index_fn>("my_index_fn")
+                  .returns(vsql::REAL)
+                  .param(MY_TYPE)
+                  .param(MY_TYPE)
+                  .deterministic()
+                  .build()))
+```
+
+Ambos os objetos de capability devem ser `static` — o SDK mantém pointers para
+dentro deles — e cada um deve ser passado para `.with()` exatamente uma vez. Um
+único objeto de capability pode carregar várias estruturas: encadeie
+`.index_type()` ou `.index_profile()` por estrutura.
+
+## A Sintaxe SQL {#the-sql-syntax}
+
+Um índice personalizado é selecionado com `USING EXTENDED`, e a coluna pode
+nomear o perfil a ser usado:
+
+```
+INDEX <name> (<column> [[<extension>.]<profile>] [ASC | DESC])
+  USING EXTENDED([<extension>.]<index_type>)
+  [WITH (<option> = <value>[, ...])]
+```
+
+A coluna indexada deve ser um tipo personalizado que alguma extensão instalada
+registra, e quando a DDL nomeia um perfil, esse perfil deve estar declarado para
+o tipo daquela coluna. Uma coluna comum é recusada com
+`ERROR 3219 (HY000): No default index profile found: column '<name>' is not a custom type`.
+Uma tabela particionada é recusada com
+`ERROR 3219 (HY000): InnoDB: Custom index is not supported on partitioned tables`.
+
+A cláusula funciona inline em `CREATE TABLE`, e em `CREATE INDEX` e `ALTER TABLE
+ADD INDEX`. Tanto o perfil quanto o tipo de índice podem ser qualificados com o
+nome da extensão, que é como você desambigua duas extensões que oferecem o mesmo
+nome. Quando nenhum perfil é nomeado, o servidor usa o perfil que declarou
+`default_for_type(true)` para aquele par de tipo e tipo de índice.
+
+Toda instrução desta seção precisa de `vsql_allow_preview_extensions` definido
+como `ON`, na inicialização ou com `SET PERSIST`. Sem isso, a instrução é
+recusada:
+
+```
+ERROR 3219 (HY000): Extended Index feature not yet implemented
+```
+
+Usando o `vsql_vector` como exemplo, compile-o a partir do repositório
+`vsql-vector`, copie `vsql_vector.veb` para o `veb_dir`, ligue a configuração e
+instale a extensão primeiro:
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+CREATE TABLE t2 (
+  id INT PRIMARY KEY,
+  a SVECTOR(4) NOT NULL,
+  b SVECTOR(8) NOT NULL,
+  INDEX idx_a (a) USING EXTENDED(hnsw),
+  INDEX idx_b (b hnsw_cosine) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_c ON t2 (a hnsw_l1) USING EXTENDED(hnsw);
+
+ALTER TABLE t2 ADD INDEX idx_d (b vsql_vector.hnsw_inner_product)
+  USING EXTENDED(vsql_vector.hnsw);
+```
+
+Removê-lo é algo comum: `DROP INDEX`, `ALTER TABLE ... DROP INDEX`, ou
+`DROP TABLE`, que remove os metadados do índice junto com a tabela. Um índice
+personalizado e as linhas que ele contém sobrevivem a uma reinicialização do
+servidor.
+
+## Lendo e Escrevendo Através de um Índice Personalizado {#reading-and-writing-through-a-custom-index}
+
+As linhas entram com `INSERT`, e o índice é mantido conforme elas entram. Criar
+o índice em uma tabela que já contém linhas também funciona, e constrói o índice
+sobre elas. A construção bloqueia as escritas na tabela em vez de executar como
+uma DDL online; as leituras continuam. Um índice personalizado segue o caminho de
+construção offline com `ALGORITHM=INPLACE`, `ALGORITHM=COPY` ou sem cláusula,
+porque nada ainda reproduz escritas concorrentes dentro de um.
+`ALGORITHM=INSTANT` e `LOCK=NONE` são recusados.
+
+Um formato de consulta é servido por um índice personalizado:
+`ORDER BY <distance>(<column>, <reference>) LIMIT K` como o único termo de
+ordenação, ascendente, com um `<reference>` constante. O índice deve ser de
+coluna única, seu tipo deve declarar `Index::Support::KNN` e
+`Index::Storage::HAS_ROW_REF`, e seu perfil vinculado deve fornecer a função de
+distância. A coluna e a referência podem ser dadas em qualquer ordem. Uma
+consulta que não atende a qualquer uma dessas condições é executada como um scan
+de tabela e uma ordenação, sem nenhum aviso. O `EXPLAIN` nomeia o acesso:
+
+```sql
+CREATE TABLE docs (
+  id INT PRIMARY KEY,
+  vec SVECTOR(4) NOT NULL,
+  payload VARCHAR(32),
+  INDEX idx_vec (vec hnsw_l2) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+
+INSERT INTO docs VALUES (1,'[1.0,2.0,3.0,4.0]','one'),
+                        (2,'[5.0,6.0,7.0,8.0]','two'),
+                        (3,'[9.0,1.0,2.0,3.0]','three');
+
+EXPLAIN FORMAT=TREE
+  SELECT id FROM docs ORDER BY L2_DISTANCE(vec,'[1.0,2.0,3.0,4.0]') LIMIT 2;
+```
+
+```
+-> Limit: 2 row(s)  (cost=0.55 rows=2)
+    -> Custom index distance scan on idx_vec  (cost=0.55 rows=3)
+```
+
+O servidor não filtra os acertos do próprio índice pela visão da transação que
+lê. Ele resolve cada acerto para a sua linha, pula as linhas que essa visão não
+consegue ver e pega o próximo candidato — então `begin` deve devolver todo o seu
+conjunto de busca em vez de exatamente `limit` entradas, ou uma escrita
+concorrente deixa a consulta com menos de `K` linhas.
+
+Um `UPDATE` que altera uma coluna indexada é recusado:
+
+```sql
+UPDATE docs SET vec = '[0.0,0.0,0.0,0.0]' WHERE id = 1;
+```
+```
+ERROR 3219 (HY000): UPDATE that changes an indexed column on a table with a custom index (USING EXTENDED) is not supported yet.
+```
+
+Um `UPDATE` que altera a chave primária recebe o mesmo erro, assim como um
+`REPLACE` que atinge uma linha existente ou um `INSERT ... ON DUPLICATE KEY UPDATE` que atribui uma
+coluna indexada ou a chave primária. Um `UPDATE` ou um `INSERT ... ON DUPLICATE KEY UPDATE` que atribui
+apenas colunas não indexadas tem sucesso.
+
+Um `ALTER TABLE` que altera a chave primária de uma tabela com um índice
+personalizado é recusado independentemente do `ALGORITHM`:
+
+```sql
+ALTER TABLE docs MODIFY id BIGINT NOT NULL;
+```
+```
+ERROR 3219 (HY000): VillageSQL: Changing the primary key of a table with a USING EXTENDED index is not supported
+```
+
+Adicionar uma coluna, ou modificar uma coluna que não seja a chave primária,
+deixa o índice personalizado existente da tabela no lugar. Forçar uma
+reconstrução da tabela com `ALGORITHM=COPY` ou `ALGORITHM=INPLACE` também deixa
+o índice no lugar, e um índice reconstruído sobrevive a uma reinicialização.
+
+## O Que o Servidor Informa {#what-the-server-reports}
+
+`SHOW CREATE TABLE` mostra o perfil vinculado, o tipo de índice e quaisquer
+parâmetros `WITH` de um índice personalizado:
+
+```
+  KEY `idx_b` (`b` `vsql_vector`.`hnsw_cosine`) USING EXTENDED(`vsql_vector`.`hnsw`) WITH (`ef_construction` = 64, `m` = 8)
+```
+
+O perfil e o tipo de índice são sempre identificadores `extension.name` entre
+crases, nunca uma string. Tanto a chave quanto o valor de um parâmetro `WITH`
+são convertidos para minúsculas e ordenados alfabeticamente pela chave — a mesma
+normalização descrita em Opções de Índice acima — então uma chave escrita como
+`M` aparece como `m`. O perfil é sempre mostrado, mesmo quando a DDL nunca
+nomeou um e o servidor o resolveu para o padrão do tipo: os metadados persistidos
+registram apenas o nome resolvido. A renderização faz a ida e volta, então
+reproduzir uma string capturada de `SHOW CREATE TABLE` recria um índice que é
+mostrado de forma idêntica.
+
+`INFORMATION_SCHEMA.STATISTICS.INDEX_TYPE` e `SHOW INDEX` informam o nome do
+tipo de índice passado para `USING EXTENDED(...)`, em maiúsculas, no lugar do
+nome do algoritmo do próprio mecanismo de armazenamento. O valor não carrega o
+qualificador da extensão, então duas extensões que oferecem o mesmo nome de tipo
+de índice são indistinguíveis nesta coluna. Um índice B-tree comum na mesma
+tabela continua informando `BTREE`:
+
+```sql
+SELECT INDEX_NAME, INDEX_TYPE
+FROM INFORMATION_SCHEMA.STATISTICS
+WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='t2'
+ORDER BY INDEX_NAME;
+```
+
+```
+INDEX_NAME	INDEX_TYPE
+idx_a	HNSW
+idx_b	HNSW
+idx_c	HNSW
+idx_d	HNSW
+PRIMARY	BTREE
+```
+
+Depois de `DROP INDEX idx_a ON t2`, a sua linha também desaparece desta
+consulta.
+
+## Onde Ficam os Metadados {#where-the-metadata-lives}
+
+O servidor registra cada índice personalizado em `villagesql.custom_indexes`, e
+suas colunas de chave — com o perfil vinculado a cada uma — em
+`villagesql.custom_index_columns`. Ambos sobrevivem a uma reinicialização.
+
+Nenhum dos dois é legível a partir do SQL, nem mesmo como `root`:
+
+```sql
+SELECT * FROM villagesql.custom_indexes;
+```
+
+```
+ERROR 3554 (HY000): Access to table 'villagesql.custom_indexes' is rejected.
+```
+
+Trate-os como internos ao servidor. `SHOW CREATE TABLE` e
+`INFORMATION_SCHEMA.STATISTICS` são a forma suportada de inspecionar um índice
+personalizado a partir de um cliente.

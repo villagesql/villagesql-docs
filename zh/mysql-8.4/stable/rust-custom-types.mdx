@@ -14,13 +14,13 @@ description: "在 VillageSQL Rust SDK 中定义新的列类型——二进制布
 
 - 您需要一种二进制的磁盘布局，而标准的 SQL 类型无法表达这种布局（打包的浮点数、固定宽度的整数、二进制标识符）
 - 您的类型具有其自身的排序语义，该语义与字符串字典序不同
-- 您希望服务器正确地索引和哈希值，以便进行 `ORDER BY`、`COUNT(DISTINCT)` 和集合操作
+- 您希望服务器正确地索引和哈希值，以便进行 `ORDER BY`、`GROUP BY`、`DISTINCT` 和集合操作
 
 如果您只需要可从 SQL 调用的函数，并且您的数据可以轻松地放入 `STRING`、`INT` 或 `REAL` 列中，则不需要自定义类型。
 
 ## `custom_type!` 宏
 
-每个自定义类型都需要 4 个回调函数（编码、解码、比较、哈希）和一个默认值。以下是完整的宏签名：
+每个自定义类型都需要 3 个回调函数（编码、解码、比较）、一个默认值，以及可选的哈希回调函数。以下是完整的宏签名：
 
 ```rust
 villagesql::custom_type!(
@@ -38,15 +38,16 @@ villagesql::custom_type!(
 | 字段 | 类型 | 描述 |
 |---|---|---|
 | `type_name` | 字符串字面量 | SQL 类型名称。在 SQL 中不区分大小写。 |
-| `persisted_length` | `usize` | 用于磁盘存储的固定字节长度。 |
-| `max_decode_buffer_length` | `usize` | 解码后的字符串表示形式的最大字节长度。 |
+| `persisted_length` | `i64` | 用于磁盘存储的固定字节长度。 |
+| `max_decode_buffer_length` | `i64` | 解码后的字符串表示形式的最大字节长度。 |
 | `encode` | 函数 | 将 `&str` 转换为 INSERT 时的二进制字节。 |
 | `decode` | 函数 | 将二进制字节转换回 `String` 以进行显示。 |
 | `compare` | 函数 | 返回 `Ordering`，用于 `ORDER BY`、`MIN`、`MAX`。 |
-| `hash` | 函数 | 返回 `usize` 哈希值，用于 `COUNT(DISTINCT)` 和集合操作。可选，但建议为索引列使用。 |
-| `default` | 字符串字面量 | 一个有效的字符串，服务器可以在类型初始化时对其进行编码。必须编码为恰好 `persisted_length` 个字节。可选，但建议使用。 |
+| `hash` | 函数 | 返回 `usize` 哈希值，用于 `GROUP BY`、`DISTINCT` 以及 `UNION` 等集合操作。可选，但建议使用。 |
+| `default` | 字符串字面量 | 一个有效的字符串，服务器可以在类型初始化时对其进行编码。必须编码为恰好 `persisted_length` 个字节。除非给出了 `intrinsic_default_fn`，否则为必需。 |
+| `intrinsic_default_fn` | 函数 | 计算默认值而不是直接写出它：`fn() -> Result<String, String>`。当默认值无法写成字面量时使用。 |
 
-`type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode` 和 `compare` 是必需的。`hash` 和 `default` 是可选的，但建议使用——`hash` 对于正确的 `COUNT(DISTINCT)` 和集合操作是必需的，`default` 用于类型初始化验证。
+`type_name`、`persisted_length`、`max_decode_buffer_length`、`encode`、`decode` 和 `compare` 是必需的。`hash` 是可选的，但建议使用，因为正确的 `GROUP BY`、`DISTINCT` 和集合操作依赖于它。请以两种方式之一为类型提供默认值：对于可以写成字面量的值使用 `default`，对于扩展必须计算的值使用 `intrinsic_default_fn`。两者都设置会使 `INSTALL EXTENSION` 失败。两者都不设置时扩展可以安装，但随后第一条使用该类型的语句会失败。
 
 ## 接收和返回二进制值
 
@@ -58,7 +59,7 @@ villagesql::custom_type!(
 fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
     match args.first() {
         Some(InValue::Custom(b)) => {
-            let numer = read_i64(b, 0);
+            let numer = i64::from_le_bytes(b[..8].try_into().unwrap());
             VdfReturn::int(numer)
         }
         Some(InValue::Null) | None => VdfReturn::null(),
@@ -84,12 +85,16 @@ fn rational_add_impl(args: &[InValue]) -> VdfReturn {
 要在 `func!` 声明中引用自定义类型，请使用 `villagesql::custom!("type_name")`：
 
 ```rust
-villagesql::func!(
-    rational_add_impl,
-    "rational_add",
-    [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
-    deterministic: true
-)
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(
+            rational_add_impl,
+            "rational_add",
+            [villagesql::custom!("rational"), villagesql::custom!("rational")] -> villagesql::custom!("rational"),
+            deterministic: true
+        ),
+    ]
+}
 ```
 
 ## 示例：有理数类型
@@ -151,7 +156,7 @@ pub fn rational_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     lhs.cmp(&rhs)
 }
 
-// hash: for COUNT(DISTINCT) and set operations
+// hash: for GROUP BY, DISTINCT, and set operations
 pub fn rational_hash(b: &[u8]) -> usize {
     // FNV-1a over the 16 bytes
     let mut h: usize = 0xcbf29ce484222325u64 as usize;
@@ -163,7 +168,7 @@ pub fn rational_hash(b: &[u8]) -> usize {
 }
 ```
 
-`custom_type!` 注册和算术 VDF（`rational_add`、`rational_sub` 等）都在完整的源代码 `examples/vsql_rational/src/lib.rs` 中。
+`custom_type!` 注册、`rational_encode` 所调用的 `gcd` 和 `normalize` 辅助函数，以及算术 VDF（`rational_add`、`rational_sub` 等）都在完整的源代码 `examples/vsql_rational/src/lib.rs` 中。
 
 安装扩展后：
 
@@ -225,7 +230,7 @@ villagesql::parameterized_type!(
 |---|---|---|
 | `type_name` | 字符串字面量 | SQL 类型名称。在 SQL 中不区分大小写。 |
 | `max_persisted_length` | `i64` | 在所有有效的参数化组合中，磁盘上字节长度的上限。 |
-| `max_decode_buffer_length` | `usize` | 解码后的字符串表示形式的最大字节长度。 |
+| `max_decode_buffer_length` | `i64` | 解码后的字符串表示形式的最大字节长度。 |
 | `encode` | 函数 | 在 INSERT 时将 `&str` 加上 `&mut MaybeParams<P>` 转换为二进制字节。 |
 | `decode` | 函数 | 将二进制字节加上 `&P` 转换回 `String` 以进行显示。 |
 | `compare` | 函数 | 在给定 `&P` 的情况下，为 `ORDER BY`、`MIN`、`MAX` 返回 `Ordering`。 |
@@ -234,14 +239,17 @@ villagesql::parameterized_type!(
 | `params_type` | 类型 | 您解析后的参数结构体，例如 `PadintParams`。 |
 | `params_parse` | 函数 | 将 `Params` 解析为 `params_type`。对于每个唯一的参数组合最多运行一次——SDK 会缓存结果。 |
 | `params_to_strings` | 函数 | `params_parse` 的逆操作：将 `params_type` 写回规范的 `(key, value)` 对。 |
-| `hash` | 函数 | 在给定 `&P` 的情况下返回一个 `usize` 哈希值。可选，但建议为索引列使用。 |
-| `default` | 字符串字面量 | 一个有效的字符串，服务器可以在类型初始化时对其进行编码。可选，但建议使用。 |
+| `hash` | 函数 | 在给定 `&P` 的情况下返回一个 `usize` 哈希值，用于 `GROUP BY`、`DISTINCT` 和集合操作。可选，但建议使用。 |
+| `default` | 字符串字面量 | 一个有效的字符串，服务器可以在类型初始化时对其进行编码。除非给出了 `intrinsic_default_fn`，否则为必需。 |
+| `intrinsic_default_fn` | 函数 | 计算默认值而不是直接写出它：`fn(&P) -> Result<String, String>`。当默认值取决于参数时使用。 |
 
-`type_name`、`max_persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、`compare`、`int_to_params`、`resolve_params`、`params_type`、`params_parse` 和 `params_to_strings` 是必需的。`hash` 和 `default` 是可选的；`intrinsic_default_fn`（一个根据 `&P` 计算默认值的函数，用于默认值取决于参数的情况）也是可选的，并且与 `default` 互斥。
+`type_name`、`max_persisted_length`、`max_decode_buffer_length`、`encode`、`decode`、`compare`、`int_to_params`、`resolve_params`、`params_type`、`params_parse` 和 `params_to_strings` 是必需的。`hash` 是可选的。请以两种方式之一为类型提供默认值：对于可以写成字面量的值使用 `default`，对于扩展必须计算的值使用 `intrinsic_default_fn`（一个根据 `&P` 计算默认值的函数，用于默认值取决于参数的情况）。两者都设置会使 `INSTALL EXTENSION` 失败。两者都不设置时扩展可以安装，但随后第一条使用该类型的语句会失败。
 
 下面是 `padint`——一个以固定 8 个字节存储的 `i64`，带有一个控制补零显示宽度的 `width` 参数：
 
 ```rust
+use villagesql::{MaybeParams, Params, Resolved};
+
 pub struct PadintParams {
     pub width: u32,
 }
@@ -292,25 +300,30 @@ pub fn padint_compare(a: &[u8], b: &[u8], _p: &PadintParams) -> std::cmp::Orderi
     i64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(b[..8].try_into().unwrap()))
 }
 
-villagesql::parameterized_type!(
-    type_name: "padint",
-    max_persisted_length: 8,
-    max_decode_buffer_length: 32,
-    encode: padint_encode,
-    decode: padint_decode,
-    compare: padint_compare,
-    int_to_params: padint_int_to_params,
-    resolve_params: padint_resolve_params,
-    params_type: PadintParams,
-    params_parse: padint_parse,
-    params_to_strings: padint_to_strings,
-    default: "0",
-)
+villagesql::extension! {
+    funcs: [],
+    types: [
+        villagesql::parameterized_type!(
+            type_name: "padint",
+            max_persisted_length: 8,
+            max_decode_buffer_length: 32,
+            encode: padint_encode,
+            decode: padint_decode,
+            compare: padint_compare,
+            int_to_params: padint_int_to_params,
+            resolve_params: padint_resolve_params,
+            params_type: PadintParams,
+            params_parse: padint_parse,
+            params_to_strings: padint_to_strings,
+            default: "0",
+        ),
+    ]
+}
 ```
 
 接收参数化自定义类型参数的函数看到的是
 `InValue::CustomWithParams { bytes, params }`，而不是普通的
-`InValue::Custom(bytes)`——`params` 是一个 [`TypeParams`]，它是对该列所声明的
+`InValue::Custom(bytes)`——`params` 是一个 `TypeParams`，它是对该列所声明的
 `key=value` 对的只读、零拷贝视图。
 
 ## 包含类型的 `extension!` 块
@@ -338,7 +351,7 @@ villagesql::extension! {
     icon="book"
     href="/zh/mysql-8.4/stable/rust-api-reference"
   >
-    关于 `InValue`、`VdfReturn` 和所有宏的完整参考。
+    InValue、VdfReturn 以及 extension!、func!、agg_func!、varargs_func!、custom_type! 和 custom! 宏的参考。
   </Card>
   <Card
     title="使用 Rust 构建扩展"

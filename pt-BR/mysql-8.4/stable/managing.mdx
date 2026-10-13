@@ -18,7 +18,7 @@ SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
 | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_REQUESTED_AT | PENDING_LAST_ERROR | PENDING_LAST_ERROR_AT |
 +----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
 | vsql_complex   | 0.0.1             | NULL            | NULL                 | NULL               | NULL                  |
-| vsql_uuid      | 0.0.3             | NULL            | NULL                 | NULL               | NULL                  |
+| vsql_uuid      | 0.0.8             | NULL            | NULL                 | NULL               | NULL                  |
 +----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
 ```
 
@@ -85,7 +85,7 @@ SHOW VARIABLES LIKE 'veb_dir';
 | Extensão não encontrada | Verifique se o arquivo `.veb` existe no veb_dir com o nome correto |
 | Permissão negada | Verifique as permissões: `chmod 644 extension.veb` |
 | Não é possível desinstalar: tipos em uso | Tente `UNINSTALL EXTENSION`; o erro identifica pelo nome as colunas que estão bloqueando |
-| Incompatibilidade de versão | Reinicie o servidor para limpar o cache |
+| Incompatibilidade de versão | O arquivo `.veb` em `veb_dir` tem uma versão diferente da extensão instalada, e o servidor não inicia: restaure o arquivo `.veb` da versão instalada e depois use `ALTER EXTENSION` |
 | A extensão apresenta comportamento antigo após a atualização | `UNINSTALL` e depois `INSTALL`; limpe `.veb_expansion_cache/` se necessário |
 | Não é possível comparar os tipos X e Y | Ambos os lados devem usar o mesmo tipo personalizado |
 | Não é possível fazer cast implícito de tipo não personalizado | O literal ou a coluna sendo comparados não são compatíveis com o tipo personalizado |
@@ -113,7 +113,7 @@ sudo chmod 644 /path/to/veb_dir/my_extension.veb
 
 ### Função Indisponível Após a Instalação
 
-**Erro:** `FUNCTION my_func does not exist`
+**Erro:** `ERROR 1305 (42000): FUNCTION mydb.my_func does not exist`
 
 **Passos de depuração:**
 ```sql
@@ -128,7 +128,8 @@ executa o código antigo.
 
 **Causa:** O VillageSQL expande os arquivos `.veb` em `{datadir}/.veb_expansion_cache/` no primeiro carregamento. Se você
 copiar um novo `.veb` sem antes executar `UNINSTALL EXTENSION`, o servidor continua
-usando o `.so` previamente expandido que já está carregado na memória.
+usando o `.so` que ele já expandiu, e na próxima reinicialização ele se recusa a iniciar se
+essa expansão estiver ausente do cache.
 
 **Solução:** Sempre siga o ciclo completo UNINSTALL → substituir → INSTALL:
 
@@ -142,28 +143,19 @@ Em seguida, substitua o arquivo `.veb` em `veb_dir` e reinstale:
 INSTALL EXTENSION my_extension;
 ```
 
-Se a extensão ainda apresentar comportamento antigo, limpe o cache de expansão antes de reinstalar:
-
-```bash
-rm -rf {datadir}/.veb_expansion_cache/my_extension/
-```
-
-```sql
-INSTALL EXTENSION my_extension;
-```
 
 ---
 
 ### Não é Possível Desinstalar a Extensão
 
-**Erro:** `Cannot uninstall extension: types in use`
+**Erro:** ``ERROR 3219 (HY000): Cannot drop extension `my_extension` as 1 column(s) depend on it``
 
 **Solução:**
 
 ```sql
 -- Attempt uninstall; the error identifies blocking columns by name
 UNINSTALL EXTENSION my_extension;
--- If blocked: ERROR HY000: Cannot drop extension `my_extension` as 1 column(s) depend on it,
+-- If blocked: ERROR 3219 (HY000): Cannot drop extension `my_extension` as 1 column(s) depend on it,
 --             e.g. mydb.mytable.my_column has type MYTYPE
 
 -- Drop or alter the identified column(s), then retry
@@ -176,7 +168,7 @@ UNINSTALL EXTENSION my_extension;
 
 ### Erros de Carregamento de Biblioteca
 
-**Erro:** `Cannot load library: undefined symbol`
+**Erro:** `Failed to load VEF extension 'my_extension': failed to load so: <dlerror text>`
 
 **Causas:**
 - Dependências de biblioteca ausentes
@@ -196,8 +188,8 @@ otool -L {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.s
 
 **Erro:** `Failed to load VEF extension 'extension_name'`
 
-**Causa:** O arquivo `.veb` falhou ao carregar na etapa do ponto de entrada — por
-exemplo, um símbolo `vef_register` ausente ou inválido, ou um arquivo `.veb` corrompido.
+**Causa:** A biblioteca da extensão carregou, mas seu ponto de entrada falhou — por
+exemplo, um símbolo `vef_register` ausente ou inválido.
 
 ### Erros de Validação de Nome de Extensão
 
@@ -462,9 +454,10 @@ são o estado pós-reinicialização.
 
 ### Recuperando de uma Alteração de Versão Pendente na Inicialização
 
-Uma alteração de versão agendada é aplicada durante a próxima inicialização do servidor. Se uma
-ação pendente não puder ser aplicada, o servidor pode falhar ao iniciar enquanto persiste
-suas decisões de atualização pendentes. Use `--villagesql-skip-extension-updates` quando um
+Uma alteração de versão agendada é aplicada durante a próxima inicialização do servidor. Uma alteração que
+não pode ser aplicada é ignorada, e o servidor registra o motivo em
+`PENDING_LAST_ERROR`. Se o servidor não conseguir salvar suas decisões de atualização pendentes, ele
+falha ao iniciar. Use `--villagesql-skip-extension-updates` quando um
 `ALTER EXTENSION ... AT RESTART` enfileirado estiver bloqueando a inicialização e você precisar do
 servidor no ar antes de poder limpá-lo.
 
@@ -507,11 +500,11 @@ registra um único aviso na inicialização informando quantas foram ignoradas:
     ```
 
     ```text
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_LAST_ERROR |
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     | my_extension   | 1.0.0             | 2.0.0           | NULL               |
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     ```
 
     **Sinal de sucesso:** o `PENDING_VERSION` de cada linha é o destino que você precisa
@@ -528,7 +521,7 @@ registra um único aviso na inicialização informando quantas foram ignoradas:
 
     **Sinal de sucesso:** uma nota `Cleared pending update for extension '<name>'
     (target matches current version '<current>')` é retornada, e
-    executar novamente a consulta anterior mostra que `PENDING_VERSION` é `NULL`.
+    executar novamente a consulta anterior não retorna nenhuma linha.
   </Step>
   <Step title="Reinicie sem a flag">
     Reinicie o servidor normalmente, omitindo `--villagesql-skip-extension-updates`.
@@ -552,7 +545,7 @@ registra um único aviso na inicialização informando quantas foram ignoradas:
    sudo rm /path/to/veb_dir/extension_name.veb
 
    # Copy new .veb file
-   sudo cp new_extension_name.veb /path/to/veb_dir/
+   sudo cp new_extension_name.veb /path/to/veb_dir/extension_name.veb
    ```
 
 3. **Instale a nova versão:**
@@ -608,7 +601,7 @@ rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
 ```
 
 <Note>
-  A reinicialização do servidor limpa automaticamente os diretórios de expansão órfãos.
+  A reinicialização do servidor remove os diretórios de expansão das extensões que não estão instaladas. Ela não remove os diretórios `{sha256}` antigos de uma extensão instalada.
 </Note>
 
 ---
@@ -621,8 +614,7 @@ ALTER TABLE em colunas de tipo personalizado replicam corretamente no formato RO
 
 `INSTALL EXTENSION` não é replicado; cada servidor gerencia suas próprias extensões.
 Instale a extensão em cada réplica antes de a replicação começar, usando a mesma
-versão da origem. O servidor impõe a correspondência exata de versão; uma incompatibilidade
-de versão interrompe a replicação.
+versão da origem. O servidor não compara versões: uma réplica que executa uma versão diferente aplica as alterações com a sua própria versão da extensão.
 
 Se uma réplica encontrar um tipo personalizado que não reconhece, a replicação para na
 instrução DDL, seja em `CREATE TABLE` ou `ALTER TABLE`, antes que qualquer DML dependente
@@ -636,9 +628,25 @@ START REPLICA SQL_THREAD;
 O `mysqldump` preserva os nomes de tipo personalizado totalmente qualificados na saída. As
 restaurações lógicas funcionam desde que a extensão esteja instalada no servidor de destino antes
 de importar o dump.
+<Note>
+`CLONE INSTANCE` valida que toda extensão do VillageSQL instalada no
+doador está disponível no receptor — mesmo nome, versão e SHA256 do `.veb` —
+durante o handshake da conexão, antes de qualquer transferência de dados. Uma extensão
+ausente ou incompatível aborta o clone durante o handshake em vez de deixá-lo
+terminar e falhar somente quando o receptor reinicia. Um `CLONE INSTANCE`
+a partir de um doador com `vsql_complex` instalado, contra um receptor sem o
+`.veb` dessa extensão, falha com:
+
+```text
+ERROR 3219 (HY000): VillageSQL: VEB file for extension 'vsql_complex' not found
+```
+
+Coloque o mesmo build do `.veb` de toda extensão que o doador tem no
+`veb_dir` do receptor antes de clonar.
+</Note>
 
 <Warning>
-O comportamento com o plugin Clone, o XtraBackup e o InnoDB Cluster / Group
+O comportamento com o XtraBackup e o InnoDB Cluster / Group
 Replication ainda não foi testado. Teste seu caminho de restauração antes de confiar nele
 em produção.
 </Warning>
@@ -656,7 +664,7 @@ services:
   villagesql:
     image: villagesql/server:latest
     environment:
-      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_ROOT_PASSWORD: "<your-password>"
     ports:
       - "3306:3306"
     volumes:
@@ -664,7 +672,7 @@ services:
     command: --veb_dir=/usr/lib/veb
 ```
 
-Copie um arquivo `.veb` para `./extensions/` no host e depois instale via SQL:
+Copie os arquivos `.veb` de que você precisa para `./extensions/` no host (a montagem oculta os arquivos `.veb` que vêm na imagem) e depois instale via SQL:
 
 ```sql
 INSTALL EXTENSION my_extension;
@@ -682,7 +690,7 @@ SHOW VARIABLES LIKE 'veb_dir';
 
 Se você encontrar problemas não abordados aqui:
 
-1. **Verifique o Log de Erros:** A maioria dos erros de extensão é registrada com detalhes
+1. **Verifique o Log de Erros:** Falhas de carregamento de biblioteca e erros de inicialização, como uma incompatibilidade de versão ou uma atualização pendente que não foi aplicada, são registrados com detalhes
 2. **Revise a Documentação da Extensão:** Pode existir uma solução de problemas específica da extensão
 3. **Pergunte no Discord:** Entre no [Discord do VillageSQL](https://discord.gg/KSr6whd3Fr)
 4. **Registre um Issue:** Reporte bugs no [GitHub Issues](https://github.com/villagesql/villagesql-server/issues)

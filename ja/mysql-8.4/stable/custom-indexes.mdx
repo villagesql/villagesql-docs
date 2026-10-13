@@ -1,0 +1,388 @@
+---
+audience: extension-author
+title: "カスタムインデックス"
+description: "index_type および index_profile プレビュー機能により、拡張機能は独自のインデックス構造を提供し、プロファイルを通じてそれをカスタムタイプに結び付けることができます。"
+---
+
+拡張機能は独自のインデックス構造を登録し、サーバーからそれを呼び出させることができます。サーバーは SQL 構文、メタデータ、およびトランザクションを所有します。拡張機能はインデックスのディスク上のフォーマットと、その中の検索を所有します。
+
+これを担うプレビュー機能は2つあります。`vsql::preview::index_type` はインデックス構造そのものを登録します。`vsql::preview::index_profile` はその構造をカスタムタイプに結び付け、インデックスが計算に使用する関数を指定します。どちらも dev ABI ヘッダーの `<villagesql/preview/index_builder.h>` にあるため、これらを使用する拡張機能は `-DVSQL_USE_DEV_ABI=ON` でビルドします。
+
+<Warning>
+現在サポートされているもの：カスタムインデックスを作成、変更、削除する DDL、`INSERT` におけるインデックスの保守、およびインデックスが処理する最近傍順序付けという1つのクエリ形状です。
+
+サポートされていないもの：`DELETE`、インデックス対象のカラムを変更する `UPDATE`、および最近傍検索以外のすべてのアクセスパターンです。12個の必須フックのうち4つ — `mark_delete`、`purge`、`save`、`restore` — は、ビルダーがコンパイルされるために存在しなければなりませんが、サーバーはそれらを呼び出しません。
+
+カスタムインデックスを指定するステートメントは、`vsql_allow_preview_extensions` が `ON` でない限り拒否されます。これは、プレビュー拡張機能のインストールにすでに必要な設定と同じものです。
+</Warning>
+
+## 3つの構成要素 {#the-three-pieces}
+
+インデックスタイプは構造です。エントリをどのように格納し、挿入し、スキャンするかを定めます。これは `hnsw` のような名前で、拡張機能ごと・構造ごとに1回登録されます。
+
+インデックス関数は、プロファイルに結び付けられた決定論的な関数です — たとえば距離関数です。プロファイルは2種類を結び付けます。`with_function()` で結び付けられた関数は、オプティマイザがインデックススキャンを計画する対象となりうる関数です。`with_helper()` で結び付けられた関数は、インデックスの実装からのみ呼び出されます。
+
+関数をプロファイルに結び付けても、SQL 関数は作成されません。オプティマイザは `ORDER BY` 内の呼び出しを名前でプロファイルの結び付けと照合するため、`with_function()` で結び付けた関数は、同じ名前で `.func()` でも登録する必要があります。そうしなければ、どのステートメントもその関数を指定できず、インデックスは決して選択されません。ヘルパーには `.func()` は不要で、SQL からヘルパーを呼び出すと `ERROR 1305 (42000): FUNCTION <database>.<name> does not exist` になります。
+
+インデックスプロファイルは、カスタムタイプをインデックスタイプに結び付け、結び付けられた各関数にインデックスが呼び出しに使用する数値 ID を与えます。1つのインデックスタイプは多数のプロファイルに対応します。`vsql_vector` は単一の `hnsw` インデックスタイプと、その上に4つのプロファイル — `hnsw_l1`、`hnsw_l2`、`hnsw_cosine`、`hnsw_inner_product` — を距離メトリックごとに1つずつ登録します。
+
+## インデックスタイプの登録 {#registering-an-index-type}
+
+`make_index_type<Name, Context>()` は、インデックス名と、拡張機能が必要とする実行時の状態を保持するインデックスごとのコンテキスト構造体を取ります。12個のフックはすべて必須で、3つのグループに分かれ、この順序で指定します。1つでも欠けているとビルダーはコンパイルされません — 失敗したアサーションがそのフックの名前を示します。
+
+ライフサイクルフックは、インデックスストレージを作成し、テーブルが開かれるときにロードし、削除します：
+
+```cpp
+bool create(Ctx *, const Index &, Space::Ref, Segment::TrxRef, char *, uint32_t);
+bool load(Ctx *, const Index &, Index::StorageRef, char *, uint32_t);
+bool drop(Ctx *, const Index &, Segment::TrxRef, char *, uint32_t);
+```
+
+DML フックは、行の変更に応じてインデックスを保守します。サーバーは `insert` を呼び出します。`mark_delete` と `purge` は、ビルダーがコンパイルされるようにこれらのシグネチャで存在しなければなりません。スタブにしてください：
+
+```cpp
+bool insert(Ctx *, const Index &, Segment::TrxRef,
+            IndexScanKey::KeyPartData *keys, IndexScanKey::KeyPartData *pkeys,
+            IndexScanKey::KeyPartRef *key_ref, char *, uint32_t);
+bool mark_delete(Ctx *, const Index &, Segment::TrxRef,
+                 IndexScanKey::KeyPartRef *key_ref,
+                 IndexScanKey::KeyPartData *keys,
+                 IndexScanKey::KeyPartData *pkeys, bool delete_mark,
+                 char *, uint32_t);
+bool purge(Ctx *, const Index &, Segment::TrxRef,
+           IndexScanKey::KeyPartRef *key_ref, IndexScanKey::KeyPartData *keys,
+           IndexScanKey::KeyPartData *pkeys, char *, uint32_t);
+```
+
+スキャンフックはクエリに応答します。サーバーは `begin`、`position`、`fetch`、`end` を呼び出し、`position` には `Index::CursorOp::Next` のみを渡します。`save` と `restore` は存在しなければならず、上記の2つの DML フックと同様にスタブです：
+
+```cpp
+bool begin(Ctx *, const Index &, MtrCtx::Ref, const IndexScanDesc &,
+           Index::Cursor *, bool *, char *, uint32_t);
+bool position(Index::Cursor, Index::CursorOp, bool *, char *, uint32_t);
+bool fetch(Index::Cursor, IndexScanKey::KeyPartRef *,
+           IndexScanKey::KeyPartData *keys, IndexScanKey::KeyPartData *pkeys,
+           char *, uint32_t);
+bool save(Index::Cursor, char *, uint32_t);
+bool restore(Index::Cursor, MtrCtx::Ref, bool *, char *, uint32_t);
+void end(Index::Cursor *);
+```
+
+失敗しうるすべてのフックは、最後の2つの引数としてメッセージバッファとその長さを取り、そこにメッセージを書き込んだ上で失敗時に `true` を返します。
+
+カーソルは拡張機能に属します。`begin` でカーソルを割り当て、最初のレコードに位置付けた状態で `*cursor` に代入してください — サーバーは `position` を呼び出す前に `fetch` を呼び出します。`end` でカーソルを解放し、`*cursor` を `nullptr` に設定してください。C++ SDK はカーソルの状態をラップしません。
+
+`begin`、`position`、`restore` の `bool *` 引数は、フックが書き込むスキャン終了フラグです。成功時には、`begin` がそのフラグを設定した場合でもサーバーは `end` を呼び出します。失敗時には、`begin` は `*cursor` を null のままにしなければならず、`end` は呼び出されません。`begin` が受け取る `MtrCtx::Ref` は、現在サーバーが駆動するパスでは null です。
+
+コンテキストは拡張機能に属しません。C++ SDK は `create` または `load` を呼び出す前に、InnoDB のアリーナから `Index::StorageCtx<T>` とあなたの `T` を割り当て、`drop` が返った後にアリーナを破棄します — これにより `~T` が実行されます。自身の状態には `ctx->user()` を通じて、アリーナには `ctx->arena()` を通じてアクセスしてください。コンテキスト、ユーザーオブジェクト、アリーナを削除してはいけません。
+
+### インデックスができることの宣言 {#declaring-what-the-index-can-do}
+
+`.capabilities()` は、インデックスがサポートするアクセスパターンを宣言し、`.storage_props()` は、各インデックスエントリがインデックス対象のデータをどのように参照するかを宣言します。どちらも必須です。
+
+ビルダーは5つの機能値を受け付けますが、サーバーが動作するのは1つだけです。それは `Index::Support::KNN` で、`ORDER BY <distance>(<column>, <reference>) LIMIT K` のための K 近傍スキャンです。`POINT_LOOKUP`、`RANGE_SCAN`、`REVERSE_SCAN`、`ORDER_BY` はコンパイルされ登録されますが、オプティマイザはそれらのパスをどれも構築しません。インデックス対象のカラムに対する `=` 条件は、インデックスが何を宣言していても、たとえば `FORCE INDEX` の下では依然としてカスタムインデックスに対する `Index lookup` を計画する場合があり、そのクエリは `ERROR 1031 (HY000): Table storage engine for '<table>' doesn't have this option` で失敗します。
+
+最近傍スキャンを処理するストレージ宣言は、拡張機能自身が格納するカラムに対する単一カラムのインデックスにおける `Index::Storage::HAS_COLUMN_REF | Index::Storage::HAS_ROW_REF` です。`HAS_COLUMN_REF` は、各エントリがプライマリキー全体ではなく、サーバーが提供する安定したカラム参照を格納することを意味し、これにより `get_key_data()` と `get_key_ref()` が利用可能になります。`REF_LOOKUP` は、インデックスがその参照からエントリを再特定できることを意味し、義務が伴います。すべてのエントリは一意の参照トークンを持たなければなりません。
+
+`Index::Storage::HAS_ROW_REF` は、各エントリがインデックス対象の行のプライマリキーを格納することを意味します。サーバーはそれを `pkeys` 配列で `insert()` に渡し、`fetch()` はそれを `pkeys` で返さなければならず、サーバーは各ヒットをプライマリキーのルックアップで解決します。これを宣言しないインデックスは、最近傍スキャンに決して選択されません。`HAS_COLUMN_REF` と一緒に宣言してください。
+
+### カラム参照の読み取りと書き込み {#reading-and-writing-column-references}
+
+`get_key_data()` は、`KeyPartRef` — DML およびスキャンのフックがインデックスに渡す種類のもの — を、`get_max_col_len(key_pos)` でサイズ指定されたキーカラムの実際の値に解決します。`get_key_ref()` はその逆を行います。`insert()` が受け取る `keys` の1つのように、すでにカラムストアにあるキーカラムの値に対する参照を導出します。`get_key_data()` は独自のミニトランザクションの下で読み取るため、拡張機能がページラッチを保持している間に呼び出してはいけません。どちらも、その値が属するゼロ始まりのキーカラムである `key_pos` を取り、失敗時には `index.get_error()` にメッセージを入れて `true` を返します：
+
+```cpp
+std::vector<unsigned char> buf(index.get_max_col_len(key_pos));
+IndexScanKey::KeyPartData key_data{buf.data(), static_cast<uint32_t>(buf.size())};
+// The hooks receive key_ref as a pointer; get_key_data() takes it by value.
+if (index.get_key_data(key_pos, *key_ref, &key_data)) return true;  // index.get_error()
+// key_data holds the value.
+
+IndexScanKey::KeyPartRef derived_ref;
+if (index.get_key_ref(key_pos, keys[key_pos], &derived_ref)) return true;
+// derived_ref holds the reference.
+```
+
+インデックスが `HAS_COLUMN_REF` を宣言していない限り、サーバーはどちらも null の関数ポインタのままにし、C++ SDK はガードなしでそれらを呼び出すため、`HAS_COLUMN_REF` なしでどちらかを呼び出すと、エラーを返すのではなくクラッシュします。
+
+### インデックスオプション {#index-options}
+
+DDL 内の `WITH (M = 8, ef_construction = 64)` は、インデックスオプションとして拡張機能に届きます。サーバーはすべてのキーと値を先に小文字化するため、DDL では `M` と書かれていても `params[i].key` は `m` と読み取れます。デフォルト値と `parse` 関数を持つ構造体を宣言し、`.options<T, &T::parse>()` で登録してください：
+
+```cpp
+struct HNSWOptions {
+  int M = 16;
+  int ef_construction = 200;
+  static bool parse(const Index::Parameter *params, uint32_t count,
+                    HNSWOptions *out, char *error_msg,
+                    uint32_t error_msg_len);
+};
+```
+
+小文字化されたキーと比較します：
+
+```cpp
+if (strcmp(params[i].key, "m") == 0) out->M = atoi(params[i].value);
+```
+
+DDL に `WITH` 句がない場合、`params` は null であるため、最初に検査する値は `count` です。失敗を返す `parse` は DDL を中止し、書き込んだメッセージはサーバーのエラーログに送られます — クライアントには `ERROR 1030 (HY000): Got error 168 - 'Unknown (generic) error from engine' from storage engine` しか見えないため、メッセージにはインデックスと問題のあるキーの名前を入れてください。
+
+`index.options<HNSWOptions>()` は、パースされた構造体へのポインタを返します。これは `Index` を受け取るすべてのフック — ライフサイクルフック、DML フック、および `begin` — から到達可能です。残りのスキャンフックはカーソルのみを受け取るため、スキャンの途中でオプションを必要とするインデックスタイプは、`begin` でそれらをカーソルにコピーする必要があります。
+
+## インデックス関数 {#index-functions}
+
+インデックス関数は決定論的でなければならず、`REAL` を返さなければなりません。関数を構築し、`static const` で保持してください — プロファイルはその参照を格納するため、そのアドレスは登録より長く存続する必要があります：
+
+```cpp
+static const auto MY_INDEX_FN =
+    make_index_function<&my_index_fn>("my_index_fn")
+        .returns(vsql::REAL)
+        .param(MY_TYPE)
+        .param(MY_TYPE)
+        .deterministic()
+        .build();
+```
+
+関数が宣言できるパラメータは最大8個で、これは `VEF_INDEX_PROFILE_FN_MAX_ARGS` の値です。サーバーは戻り値のタイプと引数の数を、最初の使用時ではなく `INSTALL EXTENSION` で検査します。
+
+## インデックスプロファイル {#index-profiles}
+
+プロファイルは、カスタムタイプ、インデックスタイプ、および ID 付きの関数を指定します。`for_type()` はタイプの*名前文字列* — `make_type` に渡すのと同じ定数 — を取り、タイプディスクリプタは取りません。`with_function()` と `with_helper()` は、名前ではなく構築済みのインデックス関数を取ります：
+
+```cpp
+static const auto MY_PROFILE =
+    make_index_profile("my_profile")
+        .for_type(kMyType)
+        .using_index(kMyIndex)
+        .with_function(1, MY_DISTANCE_FN)
+        .with_helper(1, MY_HELPER_FN)
+        .ordering(Index::Ordering::ASC)
+        .default_for_type(true)
+        .build();
+```
+
+ID は各リスト内で一意でなければならず、2つのリストは独立して番号付けされます — `with_function(1, ...)` と `with_helper(1, ...)` は衝突しません。1つのリスト内で ID が重複した場合、`INSTALL EXTENSION` で拒否されます。
+
+`.default_for_type(true)` は、ステートメントがプロファイルを指定しない場合に使用するプロファイルとして、このプロファイルをマークします。これはタイプとインデックスタイプの組み合わせごとに適用され、デフォルトは false です。`vsql_vector` は `hnsw_l2` をマークしており、そのためプロファイルを指定せずに作成されたインデックスは `hnsw_l2` を記録します。
+
+`.ordering()` は、プロファイルがサポートするスキャン方向を `NONE`、`ASC`、`DESC`、または `ASC | DESC` として記録します。サーバーはこの値を格納しますが、何もそれを読み取りません。プロファイルが何を宣言していても、計画されるのは昇順の順序付けだけです。`DESC` のみを宣言したプロファイルも昇順のクエリを処理し、降順の `ORDER BY` はテーブルスキャンとして実行されます。
+
+フックは、結び付けられた関数を `index.profile()` を通じて、結び付けられたヘルパーを `index.helper()` を通じて呼び出します。どちらも、キーカラムの位置、プロファイルがその関数に与えた ID、結果へのポインタ、および `vef_storage_col_data_t` 引数としてのカラムの値を取ります。
+
+`index.helper_fn_name()` は、結び付けられたヘルパーを呼び出す代わりに、その登録名を報告します。これにより、内側のループは呼び出しごとにディスパッチするのではなく、独自のネイティブ実装を1回だけ解決できます：
+
+```cpp
+std::array<char, 64> name{};
+if (index.helper_fn_name(key_pos, fn_id, name.data(), name.size())) {
+  // on failure, index.get_error()
+}
+```
+
+## 組み合わせる {#putting-it-together}
+
+フックの本体、オプション構造体、およびコンテキストを省略したスケルトンです：
+
+```cpp
+#include <villagesql/preview/index_builder.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql::preview_index_builder;
+using vsql::preview_storage::MtrCtx;
+using vsql::preview_storage::Segment;
+using vsql::preview_storage::Space;
+
+static constexpr const char kMyType[] = "my_type";
+static constexpr const char kMyIndex[] = "my_index";
+
+constexpr auto MY_TYPE = vsql::make_type<kMyType>()/* ... */.build();
+
+static constexpr auto MY_INDEX =
+    make_index_type<kMyIndex, MyContext>()
+        .lifecycle()
+            .create<&my_create>()
+            .load<&my_load>()
+            .drop<&my_drop>()
+        .dml()
+            .insert<&my_insert>()
+            .mark_delete<&my_mark_delete>()
+            .purge<&my_purge>()
+        .scan()
+            .begin<&my_begin_scan>()
+            .position<&my_position>()
+            .fetch<&my_fetch>()
+            .save<&my_save>()
+            .restore<&my_restore>()
+            .end<&my_end_scan>()
+        .global()
+            .capabilities(Index::Support::KNN)
+            .storage_props(Index::Storage::HAS_COLUMN_REF |
+                           Index::Storage::HAS_ROW_REF)
+            .options<MyOptions, &MyOptions::parse>()
+            .build();
+
+static const auto MY_PROFILE =
+    make_index_profile("my_profile")
+        .for_type(kMyType)
+        .using_index(kMyIndex)
+        .with_function(1, MY_INDEX_FN)
+        .ordering(Index::Ordering::ASC)
+        .default_for_type(true)
+        .build();
+
+static auto INDEX_TYPE = IndexTypeCapability().index_type(MY_INDEX);
+static auto INDEX_PROFILE = IndexProfileCapability().index_profile(MY_PROFILE);
+
+VEF_GENERATE_ENTRY_POINTS(
+    vsql::make_extension()
+        .with(INDEX_TYPE)
+        .with(INDEX_PROFILE)
+        .type(MY_TYPE)
+        // The bound function needs a SQL function of the same name, or no
+        // statement can name it and the index is never chosen.
+        .func(vsql::make_func<&my_index_fn>("my_index_fn")
+                  .returns(vsql::REAL)
+                  .param(MY_TYPE)
+                  .param(MY_TYPE)
+                  .deterministic()
+                  .build()))
+```
+
+どちらの機能オブジェクトも `static` でなければならず — C++ SDK はその中へのポインタを保持します — それぞれを `.with()` に正確に1回渡す必要があります。1つの機能オブジェクトは複数の構造を運べます。構造ごとに `.index_type()` または `.index_profile()` をチェーンしてください。
+
+## SQL 構文 {#the-sql-syntax}
+
+カスタムインデックスは `USING EXTENDED` で選択し、カラムは使用するプロファイルを指定できます：
+
+```
+INDEX <name> (<column> [[<extension>.]<profile>] [ASC | DESC])
+  USING EXTENDED([<extension>.]<index_type>)
+  [WITH (<option> = <value>[, ...])]
+```
+
+インデックス対象のカラムは、インストール済みのいずれかの拡張機能が登録するカスタムタイプでなければならず、DDL がプロファイルを指定する場合、そのプロファイルはそのカラムのタイプに対して宣言されていなければなりません。通常のカラムは `ERROR 3219 (HY000): No default index profile found: column '<name>' is not a custom type` で拒否されます。パーティション化されたテーブルは `ERROR 3219 (HY000): InnoDB: Custom index is not supported on partitioned tables` で拒否されます。
+
+この句は `CREATE TABLE` 内のインラインで機能し、`CREATE INDEX` および `ALTER TABLE ADD INDEX` でも機能します。プロファイルとインデックスタイプはどちらも拡張機能名で修飾でき、これにより同じ名前を提供する2つの拡張機能を区別できます。プロファイルが指定されていない場合、サーバーはそのタイプとインデックスタイプに対して `default_for_type(true)` を宣言したプロファイルを使用します。
+
+このセクションのすべてのステートメントは、起動時または `SET PERSIST` で `vsql_allow_preview_extensions` を `ON` に設定する必要があります。それがなければ、ステートメントは拒否されます：
+
+```
+ERROR 3219 (HY000): Extended Index feature not yet implemented
+```
+
+例として `vsql_vector` を使用します。まず `vsql-vector` リポジトリからビルドし、`vsql_vector.veb` を `veb_dir` にコピーし、設定をオンにして、拡張機能をインストールします：
+
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+CREATE TABLE t2 (
+  id INT PRIMARY KEY,
+  a SVECTOR(4) NOT NULL,
+  b SVECTOR(8) NOT NULL,
+  INDEX idx_a (a) USING EXTENDED(hnsw),
+  INDEX idx_b (b hnsw_cosine) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_c ON t2 (a hnsw_l1) USING EXTENDED(hnsw);
+
+ALTER TABLE t2 ADD INDEX idx_d (b vsql_vector.hnsw_inner_product)
+  USING EXTENDED(vsql_vector.hnsw);
+```
+
+削除は通常どおりです。`DROP INDEX`、`ALTER TABLE ... DROP INDEX`、または `DROP TABLE` を使用します。`DROP TABLE` はテーブルとともにインデックスのメタデータを削除します。カスタムインデックスとそれが保持する行は、サーバーの再起動後も維持されます。
+
+## カスタムインデックスを介した読み取りと書き込み {#reading-and-writing-through-a-custom-index}
+
+行は `INSERT` で入り、それに応じてインデックスが保守されます。すでに行を保持しているテーブルにインデックスを作成することもでき、その行に対してインデックスが構築されます。この構築はオンライン DDL として実行されるのではなく、テーブルへの書き込みをブロックします。読み取りは継続します。カスタムインデックスは、`ALGORITHM=INPLACE`、`ALGORITHM=COPY`、または句なしの場合にオフラインの構築パスを取ります。これは、同時の書き込みをカスタムインデックスに再生するものがまだ存在しないためです。`ALGORITHM=INSTANT` と `LOCK=NONE` は拒否されます。
+
+カスタムインデックスが処理するクエリ形状は1つです。唯一の順序付け項として、定数の `<reference>` を持つ昇順の `ORDER BY <distance>(<column>, <reference>) LIMIT K` です。インデックスは単一カラムでなければならず、そのタイプは `Index::Support::KNN` と `Index::Storage::HAS_ROW_REF` を宣言しなければならず、結び付けられたプロファイルは距離関数を提供しなければなりません。カラムと参照はどちらの順序でも指定できます。これらの条件のいずれかを満たさないクエリは、警告なしにテーブルスキャンとソートとして実行されます。`EXPLAIN` はアクセスを示します：
+
+```sql
+CREATE TABLE docs (
+  id INT PRIMARY KEY,
+  vec SVECTOR(4) NOT NULL,
+  payload VARCHAR(32),
+  INDEX idx_vec (vec hnsw_l2) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+
+INSERT INTO docs VALUES (1,'[1.0,2.0,3.0,4.0]','one'),
+                        (2,'[5.0,6.0,7.0,8.0]','two'),
+                        (3,'[9.0,1.0,2.0,3.0]','three');
+
+EXPLAIN FORMAT=TREE
+  SELECT id FROM docs ORDER BY L2_DISTANCE(vec,'[1.0,2.0,3.0,4.0]') LIMIT 2;
+```
+
+```
+-> Limit: 2 row(s)  (cost=0.55 rows=2)
+    -> Custom index distance scan on idx_vec  (cost=0.55 rows=3)
+```
+
+サーバーは、インデックス自身のヒットを読み取りトランザクションのビューでフィルタしません。各ヒットをその行に解決し、そのビューから見えない行をスキップして、次の候補を取ります — そのため、`begin` は正確に `limit` 個のエントリではなく、検索プール全体を返すべきです。そうしなければ、同時の書き込みによってクエリの結果が `K` 行に満たなくなります。
+
+インデックス対象のカラムを変更する `UPDATE` は拒否されます：
+
+```sql
+UPDATE docs SET vec = '[0.0,0.0,0.0,0.0]' WHERE id = 1;
+```
+```
+ERROR 3219 (HY000): UPDATE that changes an indexed column on a table with a custom index (USING EXTENDED) is not supported yet.
+```
+
+プライマリキーを変更する `UPDATE` も同じエラーになります。既存の行に当たる `REPLACE` や、インデックス対象のカラムまたはプライマリキーに代入する `INSERT ... ON DUPLICATE KEY UPDATE` も同様です。インデックス対象でないカラムのみに代入する `UPDATE` または `INSERT ... ON DUPLICATE KEY UPDATE` は成功します。
+
+カスタムインデックスを持つテーブルのプライマリキーを変更する `ALTER TABLE` は、`ALGORITHM` にかかわらず拒否されます：
+
+```sql
+ALTER TABLE docs MODIFY id BIGINT NOT NULL;
+```
+```
+ERROR 3219 (HY000): VillageSQL: Changing the primary key of a table with a USING EXTENDED index is not supported
+```
+
+カラムの追加や、プライマリキー以外のカラムの変更は、テーブルの既存のカスタムインデックスをそのまま残します。`ALGORITHM=COPY` または `ALGORITHM=INPLACE` でテーブルの再構築を強制した場合もインデックスはそのまま残り、再構築されたインデックスは再起動後も維持されます。
+
+## サーバーが報告する内容 {#what-the-server-reports}
+
+`SHOW CREATE TABLE` は、カスタムインデックスに結び付けられたプロファイル、インデックスタイプ、および `WITH` パラメータがあればそれを表示します：
+
+```
+  KEY `idx_b` (`b` `vsql_vector`.`hnsw_cosine`) USING EXTENDED(`vsql_vector`.`hnsw`) WITH (`ef_construction` = 64, `m` = 8)
+```
+
+プロファイルとインデックスタイプは、常にバッククォートで囲まれた `extension.name` 識別子であり、文字列ではありません。`WITH` パラメータのキーと値はどちらも小文字化され、キーのアルファベット順にソートされます — 上記のインデックスオプションで説明したものと同じ正規化です — そのため、`M` と書かれたキーは `m` として表示されます。DDL がプロファイルを指定せず、サーバーがそれをタイプのデフォルトに解決した場合でも、プロファイルは常に表示されます。永続化されたメタデータは解決された名前のみを記録するためです。この表示はラウンドトリップするため、取得した `SHOW CREATE TABLE` の文字列を再実行すると、同一の表示になるインデックスが再現されます。
+
+`INFORMATION_SCHEMA.STATISTICS.INDEX_TYPE` と `SHOW INDEX` は、ストレージエンジン自身のアルゴリズム名の代わりに、`USING EXTENDED(...)` に渡されたインデックスタイプ名を大文字化して報告します。この値には拡張機能の修飾子が含まれないため、同じインデックスタイプ名を提供する2つの拡張機能は、このカラムでは区別できません。同じテーブル上の通常の B-tree インデックスは、引き続き `BTREE` を報告します：
+
+```sql
+SELECT INDEX_NAME, INDEX_TYPE
+FROM INFORMATION_SCHEMA.STATISTICS
+WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='t2'
+ORDER BY INDEX_NAME;
+```
+
+```
+INDEX_NAME	INDEX_TYPE
+idx_a	HNSW
+idx_b	HNSW
+idx_c	HNSW
+idx_d	HNSW
+PRIMARY	BTREE
+```
+
+`DROP INDEX idx_a ON t2` の後は、その行もこのクエリから消えます。
+
+## メタデータの保存場所 {#where-the-metadata-lives}
+
+サーバーは各カスタムインデックスを `villagesql.custom_indexes` に記録し、そのキーカラム — 各カラムに結び付けられたプロファイルとともに — を `villagesql.custom_index_columns` に記録します。どちらも再起動後も維持されます。
+
+どちらも `root` を含めて SQL からは読み取れません：
+
+```sql
+SELECT * FROM villagesql.custom_indexes;
+```
+
+```
+ERROR 3554 (HY000): Access to table 'villagesql.custom_indexes' is rejected.
+```
+
+これらはサーバー内部のものとして扱ってください。クライアントからカスタムインデックスを調べる、サポートされた方法は `SHOW CREATE TABLE` と `INFORMATION_SCHEMA.STATISTICS` です。

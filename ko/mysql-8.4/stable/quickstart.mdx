@@ -13,7 +13,7 @@ VillageSQL Server 인스턴스를 실행하고, 연결한 후 확장 시스템�
 호스트 설치 없이 컨테이너에서 VillageSQL을 실행합니다:
 
 ```bash
-docker run -d --name vsql -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -p 3306:3306 villagesql/server:latest
+docker run -d --name vsql -e MYSQL_ROOT_PASSWORD=<your-password> -p 3306:3306 villagesql/server:latest
 ```
 
 ### 옵션 B: 쉘 스크립트
@@ -24,7 +24,7 @@ docker run -d --name vsql -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -p 3306:3306 village
 curl -fsSL https://install.villagesql.com | bash
 ```
 
-스크립트는 세 가지를 묻습니다. 어떤 코드베이스를 설치할지, 어떤 방법으로 설치할지, 어떤 버전을 설치할지입니다. 첫 번째 질문에서 **MySQL 8.4** 을 선택하면 이 문서가 설명하는 서버가 설치됩니다.
+스크립트는 어떤 코드베이스를 설치할지와 어떤 방법으로 설치할지를 묻습니다. 소스 빌드는 어떤 버전을 설치할지도 묻습니다. 첫 번째 질문에서 **MySQL 8.4** 을 선택하면 이 문서가 설명하는 서버가 설치됩니다.
 
 질문에 답할 터미널이 없는 환경(CI 작업, Dockerfile, AI 에이전트)에서는 답을 환경 변수로 전달하세요. 파이프의 `bash` 쪽에 지정합니다.
 
@@ -45,7 +45,7 @@ VillageSQL은 업스트림 MySQL 대신 Percona Server 기반으로도 빌드됩
 
 ### 쉘 스크립트가 설정하는 것
 
-쉘 스크립트(옵션 B)는 모든 것을 `~/.villagesql/` 아래에 설치하고 포트 3306에서 서버를 시작합니다. 중요한 위치는 다음과 같습니다:
+쉘 스크립트(옵션 B)는 서버를 `~/.villagesql/` 아래에 설치하고 포트 3306에서 서버를 시작합니다. 스크립트의 설치 방법 질문에서 Docker를 선택하면 대신 `vsql`이라는 이름의 컨테이너를 시작합니다. 중요한 위치는 다음과 같습니다:
 
 | 경로 | 설명 |
 | --- | --- |
@@ -54,9 +54,9 @@ VillageSQL은 업스트림 MySQL 대신 Percona Server 기반으로도 빌드됩
 | `~/.villagesql/mysql.sock` | 서버 소켓 |
 | `~/.villagesql/mysql.log` | 서버 오류 로그 |
 
-`~/.local/bin`이 `PATH`에 있으면, 스크립트는 단축 명령도 추가합니다: `villagesql`(클라이언트), `villagesql-server`(서버), `villagesql-admin`(관리 도구).
+`~/.local/bin`이 존재하고 쓰기 가능하면, 스크립트는 단축 명령도 추가합니다: `villagesql`(클라이언트), `villagesql-server`(서버), `villagesql-admin`(관리 도구).
 
-Docker(옵션 A)와 수동 소스 빌드는 `~/.villagesql/`를 만들지 않습니다 — Docker는 데이터를 컨테이너 안에 보관합니다.
+Docker(옵션 A)와 수동 소스 빌드는 `~/.villagesql/`를 만들지 않습니다 — Docker는 데이터를 컨테이너 안의 `/var/lib/mysql`에 마운트된 Docker 볼륨에 보관합니다.
 
 ## 단계 2: 서버에 연결
 
@@ -66,8 +66,8 @@ Docker(옵션 A)와 수동 소스 빌드는 `~/.villagesql/`를 만들지 않습
 mysql -h 127.0.0.1 -P 3306 -u root -p
 ```
 
-- **Docker(옵션 A):** 컨테이너는 빈 root 비밀번호로 시작합니다 — 비밀번호 프롬프트에서 Enter를 누르세요.
-- **쉘 스크립트(옵션 B):** 생성된 root 비밀번호는 `~/.villagesql/credentials.txt`에 저장되어 있습니다.
+- **Docker(옵션 A):** `MYSQL_ROOT_PASSWORD`로 설정한 root 비밀번호를 입력하세요.
+- **쉘 스크립트(옵션 B):** 생성된 root 비밀번호는 `~/.villagesql/credentials.txt`에 저장되어 있습니다. 스크립트의 설치 방법 질문에서 Docker를 선택했다면, 비밀번호는 화면에 출력되고 저장되지 않습니다.
 
 ## 단계 3: 첫 번째 확장 설치
 
@@ -111,11 +111,15 @@ CREATE TABLE events (
     label VARCHAR(50)
 );
 
--- Insert rows with generated v7 UUIDs
-INSERT INTO events VALUES
-    (UUID_V7(), 'signup'),
-    (UUID_V7(), 'login'),
-    (UUID_V7(), 'purchase');
+-- Insert rows with generated v7 UUIDs. Each UUID_V7() embeds a millisecond
+-- timestamp, so rows inserted in the same statement can land in the same
+-- millisecond and tie-break on their random bits instead of insertion
+-- order — insert separately, with a gap, to see the ordering clearly.
+INSERT INTO events VALUES (UUID_V7(), 'signup');
+SELECT SLEEP(0.01);
+INSERT INTO events VALUES (UUID_V7(), 'login');
+SELECT SLEEP(0.01);
+INSERT INTO events VALUES (UUID_V7(), 'purchase');
 
 -- v7 keys sort in creation order
 SELECT id, label FROM events ORDER BY id;
@@ -129,9 +133,10 @@ FROM events
 ORDER BY id;
 ```
 
-확장 제거 방법:
+확장을 제거하려면, 먼저 그 유형을 사용하는 모든 것을 삭제하세요:
 
 ```sql
+DROP DATABASE demo;
 UNINSTALL EXTENSION vsql_uuid;
 ```
 
@@ -163,5 +168,5 @@ VillageSQL을 실행하고 확장 시스템을 확인한 후, 다음을 탐색�
 ### 서버 시작 안됨
 
 흔한 문제:
-- 포트 3306이 이미 사용 중: 서버를 다른 포트로 구성하세요
+- 포트 3306이 이미 사용 중: 다른 서버를 중지하거나, `PORT=<port>`를 설정하여 설치 스크립트를 실행하세요. Docker에서는 `-p`의 호스트 쪽을 변경하세요.
 - 권한: 파일이 읽기/실행 가능하도록 확인하세요

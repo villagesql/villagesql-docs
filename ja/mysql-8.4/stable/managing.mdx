@@ -18,7 +18,7 @@ SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS;
 | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_REQUESTED_AT | PENDING_LAST_ERROR | PENDING_LAST_ERROR_AT |
 +----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
 | vsql_complex   | 0.0.1             | NULL            | NULL                 | NULL               | NULL                  |
-| vsql_uuid      | 0.0.3             | NULL            | NULL                 | NULL               | NULL                  |
+| vsql_uuid      | 0.0.8             | NULL            | NULL                 | NULL               | NULL                  |
 +----------------+-------------------+-----------------+----------------------+--------------------+-----------------------+
 ```
 
@@ -85,7 +85,7 @@ SHOW VARIABLES LIKE 'veb_dir';
 | 拡張機能が見つからない | `veb_dir` に正しい名前の `.veb` ファイルが存在するか確認 |
 | アクセス拒否 | 権限を確認: `chmod 644 extension.veb` |
 | アンインストールできない：型が使用中 | `UNINSTALL EXTENSION` を実行; エラーメッセージでブロックしている列名が特定されます |
-| バージョンの不一致 | キャッシュをクリアするためにサーバーを再起動 |
+| バージョンの不一致 | `veb_dir` 内の `.veb` ファイルのバージョンがインストール済みの拡張機能と異なり、サーバーが起動しません: インストール済みバージョンの `.veb` ファイルを復元してから、`ALTER EXTENSION` を使用してください |
 | アップデート後に拡張機能が古い動作をする | `UNINSTALL` 後に `INSTALL`; 必要に応じて `.veb_expansion_cache/` をクリア |
 | 型 X と Y を比較できない | 両方の側で同じカスタム型を使用する必要があります |
 | 非カスタム型を暗黙的にキャストできない | 比較対象のリテラルまたは列が、カスタム型と互換性がありません |
@@ -113,7 +113,7 @@ sudo chmod 644 /path/to/veb_dir/my_extension.veb
 
 ### インストール後に関数が利用できない
 
-**Error:** `FUNCTION my_func does not exist`
+**Error:** `ERROR 1305 (42000): FUNCTION mydb.my_func does not exist`
 
 **デバッグ手順:**
 ```sql
@@ -126,7 +126,7 @@ SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension
 **症状:** `.veb` ファイルを置き換えて再インストールした後、拡張機能がまだ
 古いコードを実行しています。
 
-**原因:** VillageSQL は初回読み込み時に `.veb` ファイルを `{datadir}/.veb_expansion_cache/` に展開します。`UNINSTALL EXTENSION` を実行せずに新しい `.veb` をコピーした場合、サーバーはメモリに既に読み込まれている以前に展開された `.so` の使用を続けます。
+**原因:** VillageSQL は初回読み込み時に `.veb` ファイルを `{datadir}/.veb_expansion_cache/` に展開します。`UNINSTALL EXTENSION` を実行せずに新しい `.veb` をコピーした場合、サーバーは既に展開済みの `.so` の使用を続け、次回の再起動時にその展開ディレクトリがキャッシュに存在しなければ起動を拒否します。
 
 **解決策:** 常に完全な UNINSTALL → 置き換え → INSTALL のサイクルに従ってください：
 
@@ -140,28 +140,19 @@ UNINSTALL EXTENSION my_extension;
 INSTALL EXTENSION my_extension;
 ```
 
-拡張機能がまだ古い動作をする場合は、再インストールする前に展開キャッシュをクリアします：
-
-```bash
-rm -rf {datadir}/.veb_expansion_cache/my_extension/
-```
-
-```sql
-INSTALL EXTENSION my_extension;
-```
 
 ---
 
 ### 拡張機能をアンインストールできない
 
-**Error:** `Cannot uninstall extension: types in use`
+**Error:** ``ERROR 3219 (HY000): Cannot drop extension `my_extension` as 1 column(s) depend on it``
 
 **解決策:**
 
 ```sql
 -- Attempt uninstall; the error identifies blocking columns by name
 UNINSTALL EXTENSION my_extension;
--- If blocked: ERROR HY000: Cannot drop extension `my_extension` as 1 column(s) depend on it,
+-- If blocked: ERROR 3219 (HY000): Cannot drop extension `my_extension` as 1 column(s) depend on it,
 --             e.g. mydb.mytable.my_column has type MYTYPE
 
 -- Drop or alter the identified column(s), then retry
@@ -174,7 +165,7 @@ UNINSTALL EXTENSION my_extension;
 
 ### ライブラリの読み込みエラー
 
-**Error:** `Cannot load library: undefined symbol`
+**Error:** `Failed to load VEF extension 'my_extension': failed to load so: <dlerror text>`
 
 **原因:**
 - 必要なライブラリ依存関係の欠如
@@ -194,8 +185,8 @@ otool -L {datadir}/.veb_expansion_cache/my_extension/<sha256>/lib/my_extension.s
 
 **Error:** `Failed to load VEF extension 'extension_name'`
 
-**原因:** `.veb` ファイルがエントリーポイントの段階で読み込みに失敗しました。たとえば、
-`vef_register` シンボルが存在しないか無効である、または `.veb` ファイルが破損している場合です。
+**原因:** 拡張機能ライブラリは読み込まれましたが、そのエントリーポイントが失敗しました。たとえば、
+`vef_register` シンボルが存在しないか無効である場合です。
 
 ### 拡張機能名の検証エラー
 
@@ -461,8 +452,9 @@ WHERE EXTENSION_NAME = 'update_test';
 
 ### 起動時の保留中バージョン変更からの回復
 
-予定されたバージョン変更は、次回のサーバー起動時に適用されます。保留中の
-アクションを適用できない場合、サーバーは保留中の更新に関する判断内容をディスクに記録したまま、起動に失敗することがあります。キューに入れられた `ALTER EXTENSION ... AT RESTART`
+予定されたバージョン変更は、次回のサーバー起動時に適用されます。適用できない
+変更はスキップされ、サーバーはその理由を `PENDING_LAST_ERROR` に記録します。
+サーバーが保留中の更新に関する判断内容を保存できない場合、起動に失敗します。キューに入れられた `ALTER EXTENSION ... AT RESTART`
 が起動をブロックしていて、それをクリアする前にサーバーを起動する必要がある場合は、
 `--villagesql-skip-extension-updates` を使用してください。
 
@@ -505,11 +497,11 @@ WHERE EXTENSION_NAME = 'update_test';
     ```
 
     ```text
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     | EXTENSION_NAME | EXTENSION_VERSION | PENDING_VERSION | PENDING_LAST_ERROR |
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     | my_extension   | 1.0.0             | 2.0.0           | NULL               |
-    +--------------+-------------------+-----------------+--------------------+
+    +----------------+-------------------+-----------------+--------------------+
     ```
 
     **成功のサイン:** 各行の `PENDING_VERSION` はクリアが必要な対象です。
@@ -526,7 +518,7 @@ WHERE EXTENSION_NAME = 'update_test';
 
     **成功のサイン:** `Cleared pending update for extension '<name>'
     (target matches current version '<current>')` というノートが返され、
-    前のクエリを再実行すると `PENDING_VERSION` が `NULL` になっています。
+    前のクエリを再実行すると行が返されなくなります。
   </Step>
   <Step title="フラグなしで再起動する">
     `--villagesql-skip-extension-updates` を省略して、サーバーを通常どおり再起動します。
@@ -549,7 +541,7 @@ WHERE EXTENSION_NAME = 'update_test';
    sudo rm /path/to/veb_dir/extension_name.veb
 
    # Copy new .veb file
-   sudo cp new_extension_name.veb /path/to/veb_dir/
+   sudo cp new_extension_name.veb /path/to/veb_dir/extension_name.veb
    ```
 
 3. **新しいバージョンをインストールします：**
@@ -605,7 +597,7 @@ rm -rf {datadir}/.veb_expansion_cache/my_extension/<sha256-from-ls>/
 ```
 
 <Note>
-  サーバーの再起動により、孤立した展開ディレクトリは自動的にクリーンアップされます。
+  サーバーの再起動により、インストールされていない拡張機能の展開ディレクトリは削除されます。インストールされている拡張機能の古い `{sha256}` ディレクトリは削除されません。
 </Note>
 
 ---
@@ -618,8 +610,8 @@ INSERT、UPDATE、DELETE、および ALTER TABLE 操作は、すべて ROW 形�
 
 `INSTALL EXTENSION` はレプリケートされません — 各サーバーは独自の拡張機能を管理します。
 レプリケーションを開始する前に、ソースと同じバージョンを使用して、すべてのレプリカに
-拡張機能をインストールしてください。サーバーは正確なバージョンの一致を強制します。
-バージョンが不一致だとレプリケーションが停止します。
+拡張機能をインストールしてください。サーバーはバージョンを比較しません。異なるバージョンを
+実行しているレプリカは、自身のバージョンの拡張機能で変更を適用します。
 
 レプリカが認識しないカスタム型に遭遇した場合、レプリケーションは DDL ステートメントで
 停止します — `CREATE TABLE` または `ALTER TABLE` の実行時、関連する DML が
@@ -633,11 +625,26 @@ START REPLICA SQL_THREAD;
 `mysqldump` は、出力に完全に修飾されたカスタム型名を保持します。論理リストアは、
 ダンプをインポートする前にターゲットサーバーに拡張機能がインストールされていれば
 機能します。
+<Note>
+`CLONE INSTANCE` は、ドナーにインストールされているすべての VillageSQL 拡張機能が
+レシピエントで利用可能であること（同じ名前、バージョン、および `.veb` の SHA256）を、
+データ転送が始まる前の接続ハンドシェイク中に検証します。拡張機能が欠落しているか
+一致しない場合、クローンはハンドシェイク中に中止されます。完了させてから、
+レシピエントの再起動時に初めて失敗することはありません。`vsql_complex` が
+インストールされたドナーから、その拡張機能の `.veb` がないレシピエントへの
+`CLONE INSTANCE` は、次のエラーで失敗します。
+
+```text
+ERROR 3219 (HY000): VillageSQL: VEB file for extension 'vsql_complex' not found
+```
+
+クローンする前に、ドナーが持つすべての拡張機能の同じ `.veb` ビルドを、
+レシピエントの `veb_dir` に配置してください。
+</Note>
 
 <Warning>
-Clone プラグイン、XtraBackup、InnoDB Cluster / Group
-Replication での動作はまだテストされていません。本番環境で依存する前に、
-リストアパスをテストしてください。
+XtraBackup、InnoDB Cluster / Group Replication での動作はまだテストされていません。
+本番環境で依存する前に、リストアパスをテストしてください。
 </Warning>
 
 ---
@@ -653,7 +660,7 @@ services:
   villagesql:
     image: villagesql/server:latest
     environment:
-      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_ROOT_PASSWORD: "<your-password>"
     ports:
       - "3306:3306"
     volumes:
@@ -661,7 +668,7 @@ services:
     command: --veb_dir=/usr/lib/veb
 ```
 
-ホストの `./extensions/` に `.veb` ファイルをコピーし、SQL からインストールします：
+必要な `.veb` ファイルをホストの `./extensions/` にコピーし（このマウントは、イメージに同梱されている `.veb` ファイルを隠します）、SQL からインストールします：
 
 ```sql
 INSTALL EXTENSION my_extension;
@@ -679,7 +686,7 @@ SHOW VARIABLES LIKE 'veb_dir';
 
 ここでカバーされていない問題が発生した場合は：
 
-1. **エラーログを確認：** ほとんどの拡張機能エラーは詳細とともにログに記録されます
+1. **エラーログを確認：** ライブラリの読み込み失敗や、バージョンの不一致や適用されなかった保留中の更新などの起動時エラーは、詳細とともにログに記録されます
 2. **拡張機能ドキュメントを確認：** 拡張機能固有のトラブルシューティングが存在する場合があります
 3. **Discord で質問：** [VillageSQL Discord](https://discord.gg/KSr6whd3Fr) に参加してください
 4. **問題を報告：** [GitHub Issues](https://github.com/villagesql/villagesql-server/issues) でバグを報告してください

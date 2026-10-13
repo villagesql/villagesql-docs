@@ -12,7 +12,7 @@ description: "C++에서 VillageSQL 확장용 새 열 유형 정의 — 유형 �
 
 ## 유형 연산 정의
 
-사용자 정의 유형은 인코딩, 디코딩, 비교 연산을 필요로 하며, 선택적으로 해시 연산을 포함할 수 있습니다. 이 서명에 맞춰 구현하고 `vsql::make_type<>()`에 빌더 객체를 전달하세요:
+사용자 정의 유형은 인코딩, 디코딩, 비교 연산을 필요로 하며, 선택적으로 해시 연산을 포함할 수 있습니다. 이 서명에 맞춰 구현하고 `vsql::make_type<>()` 빌더에 전달하세요:
 
 ```cpp
 // Encode: string -> binary. Write to out.buffer() and call out.set_length(n).
@@ -32,7 +32,7 @@ size_t mytype_hash(vsql::CustomArg in) { /* ... */ }
 `from_string` VDF(사용자 정의 유형을 반환하는 함수)의 경우, 서버는 VDF를 호출하기 전에 출력 버퍼를 유형의 `persisted_length` 값 이상으로 크기 조정합니다. 따라서 `buf.size() >= persisted_length`가 호출 시 보장됩니다. 이는 고정 폭 유형과 매개변수화 유형(해당 유형 컨텍스트에서 `persisted_length`가 호출 시 해석됨) 모두에 적용됩니다. 별도의 버퍼 크기 요청이 필요하지 않습니다.
 </Note>
 
-원시 바이너리 접근은 `vsql::Span<T>`를 통해 이루어집니다. 이는 `T`의 연속된 시퀀스를 가리키는 소유하지 않는 뷰로, `in.value()`는 `vsql::Span<const unsigned char>`를 반환하고 `out.buffer()`는 `vsql::Span<unsigned char>`를 반환합니다. C++20 이상에서는 `vsql::Span<T>`가 `std::span<T>`의 별칭이며, C++17에서는 동일한 `data()`, `size()`, `empty()`, 인덱싱, 반복자 인터페이스를 제공하는 최소한의 소스 호환 대체 구현이 C++ SDK에 포함됩니다. `#include <villagesql/vsql.h>`를 통해 사용할 수 있습니다.
+원시 바이너리 접근은 `vsql::Span<T>`를 통해 이루어집니다. 이는 `T`의 연속된 시퀀스를 가리키는 소유하지 않는 뷰로, `in.value()`는 `vsql::Span<const unsigned char>`를 반환하고 `out.buffer()`는 `CustomResult`에서는 `vsql::Span<unsigned char>`를, `StringResult`에서는 `vsql::Span<char>`를 반환합니다. C++20 이상에서는 `vsql::Span<T>`가 `std::span<T>`의 별칭이며, C++17에서는 동일한 `data()`, `size()`, `empty()`, 인덱싱, 반복자 인터페이스를 제공하는 최소한의 소스 호환 대체 구현이 C++ SDK에 포함됩니다. `#include <villagesql/vsql.h>`를 통해 사용할 수 있습니다.
 
 ## 유형 등록
 
@@ -54,7 +54,7 @@ constexpr auto MYTYPE =
         .to_string<&mytype_to_string>()       // auto: "MYTYPE::to_string"
         .compare<&mytype_compare>()           // auto: "MYTYPE::compare"
         .hash<&mytype_hash>()                 // optional; auto: "MYTYPE::hash"
-        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Development guide
+        .intrinsic_default_str("...")         // must encode to exactly 16 bytes; see Type Operations
         .build();
 
 VEF_GENERATE_ENTRY_POINTS(
@@ -89,7 +89,18 @@ VEF_GENERATE_ENTRY_POINTS(
 | 비사용자 정의 유형 | 사용자 정의 유형 | 오류: `Cannot convert column 'col' to custom type 'MYTYPE'` |
 | 사용자 정의 유형 | 문자열 유형 | 허용 |
 | 사용자 정의 유형 | 비문자열 유형 | 오류: `Cannot convert custom type column 'col' to non-string type` |
-| 사용자 정의 유형 | 다른 사용자 정의 유형 | 호환되지 않을 경우 오류: `Cannot convert between incompatible custom types 'A' and 'B'` |
+| 사용자 정의 유형 | 다른 사용자 정의 유형 | 호환되지 않을 경우 오류: `Cannot convert between incompatible custom types 'ext_a.A' and 'ext_b.B'` |
+
+사용자 정의 유형 열을 추가, 삭제 또는 수정하는 `ALTER TABLE`은 `LOCK TABLES` 아래에서도 즉시 거부됩니다. 사용자 정의 유형 작업은 villagesql 자체 시스템 테이블에 쓰는데, 이 테이블들은 잠긴 테이블 목록에 없으므로 서버는 테이블을 여는 깊은 단계에서 실패하는 대신 문을 처음부터 거부합니다:
+
+```sql
+LOCK TABLES my_table WRITE;
+ALTER TABLE my_table ADD COLUMN v MYTYPE;
+-- ERROR 3219 (HY000): Custom type table operations are not supported under LOCK TABLES.
+UNLOCK TABLES;
+```
+
+사용자 정의 유형 열을 건드리지 않는 `ALTER TABLE`은 이 제한을 받지 않습니다.
 
 ## 유형 변환 함수
 
@@ -150,7 +161,7 @@ void encode_complex(std::string_view from, CustomResult out) {
     if (endptr == p || *endptr != ',') return fail();
     p = endptr + 1;
     imag = strtod(p, &endptr);
-    if (endptr == p || *endptr != ')') return fail();
+    if (endptr == p || *endptr != ')' || endptr[1] != '\0') return fail();
     memcpy(buf.data(), &real, 8);
     memcpy(buf.data() + 8, &imag, 8);
     out.set_length(16);
@@ -195,6 +206,23 @@ int compare_complex(CustomArg a, CustomArg b) {
     if (a_imag > b_imag) return 1;
     return 0;
 }
+
+static constexpr const char kComplexTypeName[] = "COMPLEX";
+
+constexpr auto COMPLEX =
+    vsql::make_type<kComplexTypeName>()
+        .persisted_length(16)
+        .max_decode_buffer_length(64)
+        .from_string<&encode_complex>()
+        .to_string<&decode_complex>()
+        .compare<&compare_complex>()
+        .intrinsic_default_str("(0,0)")
+        .build();
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .type(COMPLEX)
+);
 ```
 
 디코딩에는 `snprintf` 대신 `std::to_chars`를 사용합니다. `"%.6f"`와 같은 고정 정밀도 형식은 `double`에 필요한 자릿수를 버리므로, `0.1234567891`이 `0.123457`로 읽힙니다. 인코딩은 `strtod`를 호출하기 전에 입력을 복사하는데, `std::string_view`에는 종료 널 문자가 없기 때문입니다. `std::from_chars`의 부동소수점 오버로드를 사용하면 이 복사를 피할 수 있지만, libc++는 이 오버로드를 macOS 26부터만 사용할 수 있는 것으로 표시하므로 이를 사용하는 확장은 이전 대상에 대해 빌드에 실패합니다.
@@ -228,7 +256,7 @@ SELECT COUNT(DISTINCT impedance), MIN(impedance), MAX(impedance),
 VDF는 생성된 컬럼 표현식에서 사용할 수 있습니다. VDF는 확장 빌더에서 `.deterministic()`으로 선언되어야 합니다. 서버는 이 컨텍스트에서 비결정적 함수를 차단합니다.
 
 ```sql
-CREATE TABLE signals (
+CREATE TABLE signals_generated (
     id INT PRIMARY KEY,
     impedance COMPLEX,
     -- Generated column computed by a VDF
@@ -247,7 +275,7 @@ CREATE TABLE signals (
 VDF는 함수형 인덱스 표현식에서 사용할 수 있습니다. 생성된 컬럼과 동일한 `.deterministic()` 요구 사항이 적용됩니다. MySQL은 함수형 인덱스를 숨겨진 생성된 컬럼으로 구현하기 때문입니다.
 
 ```sql
-CREATE TABLE signals (
+CREATE TABLE signals_indexed (
     id INT PRIMARY KEY,
     sig COMPLEX,
     INDEX idx_magnitude ((COMPLEX_ABS(sig)))
@@ -257,7 +285,7 @@ CREATE TABLE signals (
 최적화 도구는 동일한 VDF 표현식이 `WHERE`, `ORDER BY`, `GROUP BY`에 나타날 때 인덱스를 사용합니다. 비교 값을 VDF의 반환 유형으로 캐스팅하여 최적화 도구가 표현식을 일치시킬 수 있도록 해야 합니다:
 
 ```sql
-SELECT id FROM signals WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
+SELECT id FROM signals_indexed WHERE COMPLEX_ABS(sig) > CAST(20.0 AS DOUBLE);
 ```
 
 ## 다음 단계
