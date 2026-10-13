@@ -80,6 +80,14 @@ version *numbers*, and it keeps them all resolving: the current stable's number
 bounces to `/stable/`, and a superseded number becomes its own frozen archive.
 (`gen-redirects.py` is only for one-off structural URL moves.)
 
+- **Sync the stable menus** (`sync-stable-nav.py`): the English stable menu
+  becomes the dev menu, so a page that is new in dev appears in it. Each
+  locale menu is the English one without Guides and Tutorial; a page with no
+  translation yet points at the English page. Run it again after the
+  translation lands, to switch those pages to their translations.
+
+Cut every product the release covers (`--product mysql-9.7` for 9.7).
+
 ### 2. Re-translate the new stable into ja/ko/zh/pt-BR
 
 Only `mysql-8.4/` and `extensions/` are translated per locale — **not**
@@ -100,6 +108,24 @@ Only `mysql-8.4/` and `extensions/` are translated per locale — **not**
   bare** — guides aren't translated. Add `{#english-slug}` custom ids to
   link-target headings so English-slug anchors keep resolving.
 - Branch convention: `adam/translations-0.0.6`, one squashed commit.
+
+Then make the 9.7 translations from the new 8.4 ones — no second translation
+run:
+
+```bash
+python3 scripts/mirror-locales.py --from mysql-8.4 --to mysql-9.7 --slot stable
+# translate the listed lines by hand, then:
+python3 scripts/mirror-locales.py --from mysql-8.4 --to mysql-9.7 --slot stable --check
+python3 scripts/sync-stable-nav.py --product mysql-8.4
+python3 scripts/sync-stable-nav.py --product mysql-9.7
+```
+
+`mirror-locales.py` swaps the version tokens, takes every code block from the
+English 9.7 page, and lists the English lines whose 9.7 wording is not a token
+swap. In each locale page, remove the translation of each `-` line and
+translate each `+` line. `--check` exits 0 only when the code spans, links and
+code-block positions on those pages match English. Do not run it again without
+`--check` after the hand edits: a full run writes the pages again.
 
 ### 3. Update version-number prose (not URLs)
 

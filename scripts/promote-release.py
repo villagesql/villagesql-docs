@@ -25,6 +25,9 @@ Steps (example: stable 0.0.5 -> 0.0.6, dev opens 0.0.7-dev):
      and update redirects — drop the outgoing number's redirect (freeing its
      archive), repoint the outgoing -dev redirects to the shipped number, and
      add the new stable number's redirect -> /stable/.
+  5. rebuild the product's stable menus from the dev menu
+     (sync-stable-nav.py), so a page that is new in dev appears in every
+     stable menu.
 
 Usage:
     python3 scripts/promote-release.py --old-stable 0.0.5 --new-stable 0.0.6 \
@@ -310,7 +313,7 @@ def main():
         if not dry:
             shutil.copytree(d, dest)
             rewrite_prefix(dest, f"{product}/stable/", f"{product}/{old}/")
-    print(f"{tag}noindex archive {old} (via noindex-version.py)")
+    print(f"{tag}noindex archive {old} (via noindex-version.py)", flush=True)
     if not dry:
         subprocess.run([sys.executable, str(scripts / "noindex-version.py"), old,
                         "--product", product, "--repo", str(repo)], check=True)
@@ -357,6 +360,12 @@ def main():
     else:
         docs_path.write_text(text)
         print("docs.json updated and re-validated.")
+
+    # 5. stable menus follow the promoted pages (new dev pages join them)
+    nav = [sys.executable, str(scripts / "sync-stable-nav.py"),
+           "--product", product, "--repo", str(repo)]
+    sys.stdout.flush()  # keep this script's lines ahead of the child's in a pipe
+    subprocess.run(nav + (["--dry-run"] if dry else []), check=True)
 
     print("\nManual follow-ups (VERSIONING.md): re-translate locale stable, "
           "update content version-number prose, website + freshness.py.")
