@@ -13,7 +13,7 @@ VEF Protocol 3 is stable as of v0.0.4. Protocol 4 is under development and is av
 ## Writing Extension Functions
 
 Extension functions are written in C++ and registered with VEF. Include a
-single header to access the full SDK:
+single header to access the VDF, type, and extension builder APIs:
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -28,8 +28,8 @@ handler anywhere above it and the server process terminates. Ordinary SQL input
 reaches this: `std::stoi()` throws on a non-numeric string, and
 `nlohmann::json::dump()` throws on text that is not valid UTF-8.
 
-Wrap the body of every entry point you register: VDFs, aggregate result
-functions, and the `from_string`/`to_string` operations of a custom type.
+Wrap the body of every entry point you register: VDFs, aggregate functions,
+prerun and postrun hooks, and the operations of a custom type.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -94,10 +94,10 @@ void add_impl(IntArg a, IntArg b, IntResult out) {
 }
 
 // Registration is unchanged:
-make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build();
+// make_func<&add_impl>("add").returns(INT).param(INT).param(INT).build()
 ```
 
-**Binary example** — transform a custom type buffer in place:
+**Binary example** — transform a custom type value into the result buffer:
 
 ```cpp
 using namespace vsql;
@@ -115,7 +115,7 @@ For `StringResult` and `CustomResult`, write into `buffer()`, then call
 `set_length()` with the number of bytes written. `buffer().size()` is the
 maximum capacity.
 
-For VDFs that return a custom type (`returns(CUSTOM(MYTYPE))`), the server
+For VDFs that return a custom type (`.returns(MYTYPE)`), the server
 sizes the result buffer to the resolved return type's `persisted_length`
 automatically — extension authors do not need to declare `.buffer_size(...)`
 on the function builder for this case. If `prerun` grows the buffer further,
@@ -174,7 +174,7 @@ void my_result(const SumState &s, IntResult out) {
 How the builder methods work:
 - `make_aggregate_func<State, &result_fn>()` auto-generates `prerun` and `postrun` (value-initializes and deletes `State`).
 - `.clear<&fn>()` registers your `void(State&)` reset function.
-- `.accumulate<&fn>()` registers your `void(State&, TypedArgs...)` fold function. `TypedArgs` are deduced from the function signature (`IntArg`, `StringArg`, etc.).
+- `.accumulate<&fn>()` registers your `void(State&, TypedArgs...)` fold function. `TypedArgs` are deduced from the function signature (`IntArg`, `StringArg`, etc.). Call `.accumulate<>()` after all `.param(TYPE)` calls: the builder checks the typed-argument count against the declared SQL parameter count at compile time, so calling it earlier fails to build.
 - The result type (`IntResult`, `RealResult`, etc.) is deduced from the result function signature.
 
 For a counter that never returns NULL, use a plain state type:
@@ -339,7 +339,7 @@ SELECT point_path('1,2');
 #include <cstring>
 using namespace vsql;
 
-constexpr size_t kBytearrayLen = 4;
+constexpr size_t kBytearrayLen = 8;
 
 void ba_concat_all_prerun(PrerunArgs args, PrerunResult out) {
   if (args.size() == 0) {
@@ -363,6 +363,7 @@ void ba_concat_all(VarArgs args, StringResult out) {
   for (auto a : args) {
     if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
     auto bytes = a.as_custom();
+    if (off + bytes.size() > dst.size()) { out.error("ba_concat_all: result too long"); return; }
     std::memcpy(dst.data() + off, bytes.data(), bytes.size());
     off += bytes.size();
   }
@@ -376,13 +377,195 @@ void ba_concat_all(VarArgs args, StringResult out) {
 //     .build()
 ```
 
+## Deciding a Function's Type Parameters at Resolution Time
+
+The server's built-in rules usually work out a return type's parameters from
+its arguments' declared types. Sometimes they can't. For example,
+`tvector_concat(TVECTOR(M), TVECTOR(N))` returns a `TVECTOR(M+N)`. The
+built-in rules reject two `TVECTOR` arguments whose dimensions differ, and
+they can copy an argument's parameters to the return type but never add them.
+For cases like this, register a **bind-and-check-types hook** with
+`.bind_and_check_types<&Hook>()` on the func builder, with the signature:
+
+```cpp
+void my_hook(vsql::BindArgs args, vsql::BindResult out);
+```
+
+`.bind_and_check_types()` and `.varargs()` are mutually exclusive on the same
+function — a varargs VDF has no fixed argument list for the hook to reason
+about. Declaring `.varargs()` before `.bind_and_check_types<&Hook>()` in the
+builder chain is a compile-time `static_assert` failure. Declaring them in
+the other order compiles, but the extension is rejected when the server loads
+it: registration walks every function's final built state and rejects the
+first one that is both varargs and has a bind hook, with:
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned an error: VDF '<function>' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
+```
+
+<Warning>
+`.bind_and_check_types<&Hook>()` and `<villagesql/vsql/bind_check_types.h>`
+are declared only in the opt-in dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`) and
+require VEF Protocol 4. A default stable-ABI build has neither, so
+registering a hook fails to compile.
+</Warning>
+
+The server calls the hook between two passes it makes over a function's
+arguments: the first pass checks each argument's base type, the hook runs
+next, and the second pass applies the hook's answer for each argument where
+it gave one. With a hook installed, the first pass does not collect shared
+parameters between arguments of the same custom type, so none of them are
+required to agree with each other. An argument whose own type is not
+already resolved, such as a bare string literal, gets its parameters from
+the hook alone. A parameterized return type's parameters also come from the
+hook, in place of the built-in rule that copies them from an argument.
+
+The [`vsql_tvector`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/examples/vsql-tvector/src/tvector.cc)
+example extension in the server source tree registers such a hook on
+`tvector_concat`:
+
+```cpp
+#include <villagesql/vsql.h>
+
+// Excerpt from villagesql/examples/vsql-tvector/src/tvector.cc. That file
+// also has the standard library includes, the constants kDefaultBytesPerElem
+// (4) and kTVectorMaxDimension (4096), the TVECTOR type, the tvector_concat
+// function body, and the helpers common_element_width() and
+// bind_params_for_vector(), which read an argument's resolved params or count
+// the elements of a constant literal.
+
+struct TVectorParams {
+  int64_t dimension;
+  size_t bytes_per_elem;  // 4 for float, 8 for double
+
+  static TVectorParams parse(const std::map<std::string, std::string> &params) {
+    auto dim_it = params.find("dimension");
+    int64_t dim = strtoll(dim_it->second.c_str(), nullptr, 10);
+    size_t bytes = kDefaultBytesPerElem;
+    auto type_it = params.find("type");
+    if (type_it != params.end() && type_it->second == "double") bytes = 8;
+    return TVectorParams{.dimension = dim, .bytes_per_elem = bytes};
+  }
+
+  // Inverse of parse: render a typed TVectorParams back into the canonical
+  // key/value string form. Used by the SDK when the server needs to publish
+  // inferred params (e.g., from a constant-string from_string) back in the
+  // same shape that parse() consumes.
+  static void to_strings(const TVectorParams &p,
+                         std::map<std::string, std::string> &out) {
+    out["dimension"] = std::to_string(p.dimension);
+    out["type"] = (p.bytes_per_elem == 8) ? "double" : "float";
+  }
+};
+
+// bind_and_check_types for tvector_concat.
+//
+// Two jobs the built-in rules cannot do:
+//   1. permit arguments whose dimensions differ (parameter sharing rejects it);
+//   2. compute the return dimension as M+N (the server return rule only
+//      copies).
+//
+// A third job appears when an argument is a constant: a bare '[1,2,3]' has no
+// type context, and with a hook installed nothing donates params to it, so the
+// hook counts the elements itself and answers with set_arg(). The element type
+// comes from whichever side the server already resolved, which is what the
+// built-in rules would have donated.
+void tvector_concat_bind(vsql::BindArgs args, vsql::BindResult out) {
+  if (args.size() != 2) {
+    out.error("expects 2 arguments");
+    return;
+  }
+
+  std::string error_msg;
+  size_t bpe = 0;
+  if (common_element_width(args, bpe, error_msg)) {
+    out.error(error_msg);
+    return;
+  }
+
+  TVectorParams first{}, second{};
+  bool publish_first = false, publish_second = false;
+
+  if (bind_params_for_vector(args, 0, bpe, first, publish_first, error_msg) ||
+      bind_params_for_vector(args, 1, bpe, second, publish_second, error_msg)) {
+    out.error(error_msg);
+    return;
+  }
+
+  // Hand back the params of whichever argument the server could not resolve.
+  if (publish_first) out.set_arg(0, first);
+  if (publish_second) out.set_arg(1, second);
+
+  const int64_t total = first.dimension + second.dimension;
+  if (total > kTVectorMaxDimension) {
+    out.error("combined dimension " + std::to_string(total) +
+              " exceeds the maximum of " +
+              std::to_string(kTVectorMaxDimension));
+    return;
+  }
+  out.set_return(TVectorParams{.dimension = total, .bytes_per_elem = bpe});
+}
+
+// Registration, inside make_extension():
+// .func(make_func<&tvector_concat>("tvector_concat")
+//     .returns(TVECTOR)
+//     .param(TVECTOR)
+//     .param(TVECTOR)
+//     .bind_and_check_types<&tvector_concat_bind>()
+//     .deterministic()
+//     .build())
+```
+
+The hook lets two vectors of different dimensions combine, and it counts the
+elements of a constant literal. A source build of the server includes
+`vsql_tvector`; the release tarballs do not.
+
+```sql
+INSTALL EXTENSION vsql_tvector;
+CREATE TABLE v2 (v vsql_tvector.TVECTOR(2));
+CREATE TABLE v3 (v vsql_tvector.TVECTOR(3));
+INSERT INTO v2 VALUES ('[1,2]');
+INSERT INTO v3 VALUES ('[3,4,5]');
+
+SELECT vsql_tvector.tvector_concat(v2.v, v3.v) AS c,
+       vsql_tvector.tvector_dim(vsql_tvector.tvector_concat(v2.v, v3.v)) AS dim
+FROM v2, v3;
+```
+
+```text
++-------------+------+
+| c           | dim  |
++-------------+------+
+| [1,2,3,4,5] |    5 |
++-------------+------+
+```
+
+```sql
+SELECT vsql_tvector.tvector_concat(v, '[6,7]') AS c FROM v3;
+```
+
+```text
++-------------+
+| c           |
++-------------+
+| [3,4,5,6,7] |
++-------------+
+```
+
 ## Extension Load and Unload Hooks
 
 An extension sometimes has work to do once per load rather than once per call —
-picking a CPU-specific implementation, or building a lookup table the VDFs then
-read. Register that work with `.on_init<&Fn>()` on the extension builder, and
-the matching teardown with `.on_deinit<&Fn>()`. Both take a function with the
-signature `void()`.
+picking a CPU-specific implementation, reading its own configuration once, or
+building a lookup table the VDFs then read. Register that work with
+`.on_init<&Fn>()` on the extension builder, and the matching teardown with
+`.on_deinit<&Fn>()`. Both take a function with the signature `void()`, and must
+be registered together — declaring one without the other fails to compile. An
+extension that reaches the server with a mismatched pair some other way is
+rejected at load instead:
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers an on_init hook without an on_deinit
+```
 
 <Warning>
 `.on_init<&Fn>()` and `.on_deinit<&Fn>()` are declared only in the opt-in dev ABI
@@ -390,15 +573,15 @@ headers (`-DVSQL_USE_DEV_ABI=ON`). A default stable-ABI build has neither method
 so registering a hook fails to compile.
 </Warning>
 
-`on_init` runs at every extension load: at `INSTALL EXTENSION` and again on each
-server startup, after the server has validated and accepted the extension. It
-never runs for an extension the server rejected. `on_deinit` runs at unload —
-`UNINSTALL EXTENSION` or server shutdown.
-
-Both hooks run inside the extension process with **no access to the server**:
-they cannot run SQL, read system variables, or reach server state. That is why
-they are the wrong place for setup that has to talk to the server — use a
-preview capability's populate step for that.
+`on_init` runs once per load — at `INSTALL EXTENSION`, and again on every server
+startup — after the server has validated the extension and populated its
+required capabilities, so a registered system variable already holds its
+configured value. At startup specifically, `on_init` is deferred until
+persisted system-variable values have been applied, so it never sees a
+compiled-in default in place of a value set with `SET PERSIST`. It never runs
+for an extension the server rejected. `on_deinit` runs at unload —
+`UNINSTALL EXTENSION` or server shutdown — before the server depopulates those
+same capabilities, so it sees the same live state `on_init` did.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -438,13 +621,6 @@ VEF_GENERATE_ENTRY_POINTS(
 After `INSTALL EXTENSION my_extension`, `SELECT fast_sqrt(16)` returns `4` —
 a result that is only reachable if `build_table` already ran.
 
-<Note>
-`on_deinit` is called from the `vef_unregister` entry point that
-`VEF_GENERATE_ENTRY_POINTS` generates. `VEF_GENERATE_REGISTRATION` does not
-define that entry point, so an extension using it must call its teardown from
-the `vef_unregister` it writes itself.
-</Note>
-
 ## VEF_GENERATE_REGISTRATION
 
 `VEF_GENERATE_REGISTRATION` creates an internal `_vef_do_register()` helper
@@ -456,7 +632,7 @@ extensions, use `VEF_GENERATE_ENTRY_POINTS` instead.
 ```cpp
 VEF_GENERATE_REGISTRATION(
     make_extension()
-        .func(make_func<&my_impl>("my_func").returns(INT).build()))
+        .func(make_func<&my_impl>("my_func").returns(INT).no_params().build()))
 
 // Then define your own extern "C" vef_register/vef_unregister that call
 // _vef_do_register() and optionally modify the result.
@@ -479,8 +655,10 @@ The following VEF capabilities are available as opt-in preview headers. ABI and 
 
 `INFORMATION_SCHEMA.EXTENSION_REGISTRATION` exposes the in-memory VEF
 registration struct for each loaded extension as a JSON document. Use it to
-verify that the server parsed your extension's functions, types, and system
-variables correctly after `INSTALL EXTENSION`.
+`INFORMATION_SCHEMA.EXTENSION_REGISTRATION` exposes the in-memory VEF
+registration struct for each loaded extension as a JSON document. Use it to
+verify that the server parsed your extension's functions and types
+correctly after `INSTALL EXTENSION`.
 
 ```sql
 SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL, REGISTRATION_JSON
@@ -492,7 +670,7 @@ WHERE EXTENSION_NAME = 'my_ext';
 |--------|------|-------------|
 | `EXTENSION_NAME` | `VARCHAR(64)` | Name of the installed extension. |
 | `NEGOTIATED_PROTOCOL` | `BIGINT UNSIGNED` | VEF protocol version negotiated between the extension and the server. |
-| `REGISTRATION_JSON` | `VARCHAR(65535)` | JSON serialization of the `vef_registration_t` struct, including `funcs` and `types` arrays. |
+| `REGISTRATION_JSON` | `VARCHAR(65535)` | JSON serialization of the `vef_registration_t` struct, including `funcs` and `types` arrays and an `sdk_version` key reporting the SDK version the extension was built against. |
 
 ## See Also
 
