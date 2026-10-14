@@ -94,20 +94,28 @@ Only `mysql-8.4/` and `extensions/` are translated per locale — **not**
 `guides/`. Output overwrites `ja/mysql-8.4/stable/`, `ko/...`, `zh/...`,
 `pt-BR/...`.
 
-- **Translator: Opus via Claude Code.** Anthropic API keys are disabled for this
-  workspace, so `translate.py --model opus` can't authenticate here — drive the
-  Opus translation through a Claude Code session (a Workflow fanning over the
-  files). `translate.py` reads the stable slot from `docs.json` automatically.
-- **Quality judge: Gemini (`agy`)** — native-language FIX/LEAVE pass. Do not use
-  a weaker model to judge a stronger one.
-- **Code blocks + placeholders:** never send fenced code to the model — extract
-  before, restore after; a dropped placeholder is a hard failure (re-run).
+- **Translate only what changed.** Diff each English page against the archive
+  of the previous stable (`mysql-8.4/<old>/`, after mapping its `<old>/` links to
+  `stable/`). Update the existing translation: keep every translated sentence
+  whose English did not change, translate new and changed text, delete removed
+  text. A page that is new in this release is translated in full.
+- **Translator: Fable, from a Claude Code session** — one subagent per language
+  and page group (0.0.7 used two per language). Anthropic API keys are disabled
+  for this workspace, so `translate.py --model ...` cannot run here.
+- **Mechanical check before review:** every code block byte-identical to
+  English and in the same order, the same headings, front-matter keys and link
+  targets. Copy code blocks from English; never send them to the model.
+- **Review: Gemini (`agy`)**, source-aligned, one call per page:
+  `agy --print='<instructions, English page, translated page>'` (the prompt is
+  attached to the flag). It runs from a tool call when you are signed in. A
+  Fable agent per language then judges each finding against English and
+  applies the correct ones; the English page is the authority, not the reviewer.
 - **Link prefixing:** in a `<lang>` page, prefix in-content links to *translated*
   sections: `](/mysql-8.4/...)` → `](/<lang>/mysql-8.4/...)` and
   `](/extensions/...)` → `](/<lang>/extensions/...)`. **Leave `](/guides/...)`
   bare** — guides aren't translated. Add `{#english-slug}` custom ids to
   link-target headings so English-slug anchors keep resolving.
-- Branch convention: `adam/translations-0.0.6`, one squashed commit.
+- Branch convention: `adam/translations-<version>`.
 
 Then make the 9.7 translations from the new 8.4 ones — no second translation
 run:
