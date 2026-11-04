@@ -235,7 +235,7 @@ content:
 | `reference.mdx` | `VERSION()` output examples (`mysql-8.4_0.0.6-dev`); "not part of standard MySQL 8.4 syntax" |
 | `source.mdx` | build version string example; the source build's version option |
 | `install.mdx` | the install script's version option |
-| `quickstart.mdx` | the Docker tag and the one-line install command |
+| `install-server.mdx` | the Docker tag and the one-line install command |
 | `create.mdx` | one link to `dev.mysql.com/doc/extending-mysql/8.4/en/...` |
 
 The remaining ~24 pages — the whole C++ and Rust SDK surface, extension
@@ -292,7 +292,7 @@ integrates Percona's MySQL improvements, on the `percona-8.4` branch.
 to build and install it, and what VillageSQL supports about it. Send every
 question about the Percona improvements themselves to Percona's documentation.
 This lives in one page, `mysql-8.4/dev/percona.mdx`, linked from
-`quickstart.mdx` and `source.mdx`.
+`install-server.mdx` and `source.mdx`.
 
 **An index of the Percona changes is worth having only if a script generates
 it.** A hand-written summary of another project's feature set goes stale in

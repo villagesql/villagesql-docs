@@ -41,7 +41,7 @@ wrong. VillageSQL organizes content along the lines of the
 | Page type | Answers | Example page | Shape |
 |---|---|---|---|
 | **Guide / how-to** | "How do I accomplish X?" | `guides/encrypting-columns.mdx` | Task-focused steps for a competent user solving a real problem |
-| **Tutorial** | "Teach me by doing" | `tutorial/index.mdx`, `mysql-8.4/<version>/quickstart.mdx` | Guided lesson that ends in a working result |
+| **Tutorial** | "Teach me by doing" | `tutorial/index.mdx`, `quickstart.mdx`, `mysql-8.4/<version>/install-server.mdx` | Guided lesson that ends in a working result |
 | **Reference** | "What are the exact facts?" | `mysql-8.4/<version>/extension-api-reference.mdx` | Accurate, complete, dry: functions, signatures, types, options |
 | **Explanation** | "Why does it work this way?" | `mysql-8.4/<version>/extensions-or-plugins.mdx` | Background, rationale, mental models |
 
