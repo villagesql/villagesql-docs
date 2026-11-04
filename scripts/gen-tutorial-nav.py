@@ -21,7 +21,7 @@ why it is there:
    entry, which would fail the build, so an absent lesson is skipped and named
    in the run output instead.
 
-2. The group sits in the Guides tab, which has no release versions. The hub
+2. The group sits in the Learn tab, which has no release versions. The hub
    page is its first entry, so the heading looks like every other group
    heading in the tab.
 
@@ -60,7 +60,7 @@ def present(slug):
 
 
 def guides_groups(docs):
-    """The groups array of the English Guides tab."""
+    """The groups array of the English Learn tab."""
     for language in docs["navigation"]["languages"]:
         if language.get("language") != "en":
             continue
