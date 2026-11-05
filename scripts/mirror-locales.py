@@ -7,7 +7,7 @@ second translation run:
 
   1. Apply the token map to <lang>/<from>/<slot>/<page>: page paths, version
      ids (mysql-8.4_ -> mysql-9.7_), upstream manual URLs, and the MySQL
-     version from each product's English index.mdx.
+     version from each product's English introduction.mdx.
   2. Replace every fenced code block with the block at the same position in
      the English <to> page. Translations never change code blocks, so the
      English target has the right commands and output.
@@ -49,10 +49,10 @@ LINK = re.compile(r"\]\(([^)\s]+)\)|href=\"([^\"]+)\"")
 
 
 def mysql_version(repo, product, slot):
-    text = (repo / product / slot / "index.mdx").read_text()
+    text = (repo / product / slot / "introduction.mdx").read_text()
     m = COMPAT.search(text)
     if not m:
-        raise SystemExit(f"error: no 'compatible with MySQL x.y.z' in {product}/{slot}/index.mdx")
+        raise SystemExit(f"error: no 'compatible with MySQL x.y.z' in {product}/{slot}/introduction.mdx")
     return m.group(1)
 
 
