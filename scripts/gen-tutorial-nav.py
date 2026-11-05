@@ -30,6 +30,7 @@ why it is there:
    is the operative statement of that rule.
 """
 
+import glob
 import json
 import os
 import re
@@ -38,6 +39,10 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOC = os.path.join(REPO, "scripts", "tutorial-toc.json")
 DOCS_JSON = os.path.join(REPO, "docs.json")
+# English pages live under en/ once the site moves them there; the menu paths
+# and the links on the hub page follow. The manifest stays layout-free.
+EN = "en/" if glob.glob(os.path.join(REPO, "en", "**", "*.mdx"), recursive=True) else ""
+TUTORIAL = os.path.join(REPO, EN, "tutorial")
 
 BEGIN = "{/* BEGIN GENERATED CONTENTS. Edit scripts/tutorial-toc.json, then run scripts/gen-tutorial-nav.py */}"
 END = "{/* END GENERATED CONTENTS */}"
@@ -56,7 +61,7 @@ def load_toc():
 
 
 def present(slug):
-    return os.path.exists(os.path.join(REPO, "tutorial", f"{slug}.mdx"))
+    return os.path.exists(os.path.join(TUTORIAL, f"{slug}.mdx"))
 
 
 def guides_groups(docs):
@@ -82,13 +87,13 @@ def build_group(toc, listed):
         if slugs:
             pages.append({
                 "group": section["title"],
-                "pages": [f"tutorial/{s}" for s in slugs],
+                "pages": [f"{EN}tutorial/{s}" for s in slugs],
             })
     # Before the first lesson lands, the group would otherwise carry an empty
     # pages array, which lists nothing and leaves the hub page unreachable from
     # the sidebar. Falling back to the hub keeps the navigation valid while the
     # sections are still being written.
-    return {"group": toc["group"], "pages": [toc["root"]] + pages}
+    return {"group": toc["group"], "pages": [EN + toc["root"]] + pages}
 
 
 def update_navigation(group):
@@ -105,7 +110,7 @@ def update_navigation(group):
 
 def update_hub(toc, listed):
     """Rewrite the contents list on the hub page, between the two markers."""
-    path = os.path.join(REPO, "tutorial", "index.mdx")
+    path = os.path.join(TUTORIAL, "index.mdx")
     if not os.path.exists(path):
         return False
     lines = []
@@ -118,7 +123,7 @@ def update_hub(toc, listed):
         lines.append(f"### {number}. {section['title']}")
         lines.append("")
         for lesson in rows:
-            lines.append(f"- [{lesson['label']}](/tutorial/{lesson['slug']})")
+            lines.append(f"- [{lesson['label']}](/{EN}tutorial/{lesson['slug']})")
         lines.append("")
     contents = "\n".join(lines).rstrip()
     body = BEGIN + "\n\n" + contents + "\n\n" + END if contents else BEGIN + "\n" + END
@@ -142,8 +147,8 @@ def main():
     hub = update_hub(toc, listed)
 
     print(f"listed {len(listed)} of {len(planned)} lessons in the {toc['tab']} tab")
-    print("rewrote the contents list on tutorial/index.mdx" if hub
-          else "tutorial/index.mdx does not exist yet, so no contents list was written")
+    print(f"rewrote the contents list on {EN}tutorial/index.mdx" if hub
+          else f"{EN}tutorial/index.mdx does not exist yet, so no contents list was written")
     if missing:
         print(f"not written yet, so left out: {', '.join(missing)}")
 

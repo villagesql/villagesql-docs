@@ -44,12 +44,31 @@ import sys
 from pathlib import Path
 
 DEFAULT_PRODUCT = "mysql-8.4"
-LOCALES = ["", "ja", "ko", "zh", "pt-BR"]  # "" = English tree at repo root
+LOCALES = ["", "ja", "ko", "zh", "pt-BR"]  # "" = English tree, at the root or under en/
+
+
+def english_root(repo: Path) -> Path:
+    """Where the English pages live: under en/ once the site moves them there."""
+    return repo / "en" if any((repo / "en").rglob("*.mdx")) else repo
+
+
+def english_prefix(repo: Path) -> str:
+    """The address prefix of the English pages: "en/" or nothing."""
+    return "en/" if any((repo / "en").rglob("*.mdx")) else ""
+
+
+def version_folder(repo: Path, product: str) -> str:
+    """mysql-8.4 or 8.4 -> the version folder name this layout uses.
+
+    The folder counts only when it holds pages: the old mysql-8.4/ folder stays
+    behind holding manifest.json.schema.json files."""
+    number = product.removeprefix("mysql-")
+    return number if any((english_root(repo) / number).rglob("*.mdx")) else f"mysql-{number}"
 
 
 def product_label(product: str) -> str:
-    """Directory name -> the name docs.json shows: mysql-9.7 -> MySQL 9.7."""
-    return product.replace("mysql-", "MySQL ", 1)
+    """Directory name -> the name docs.json shows: mysql-9.7 or 9.7 -> MySQL 9.7."""
+    return "MySQL " + product.removeprefix("mysql-")
 
 
 def product_span(text: str, product: str):
@@ -71,7 +90,7 @@ def product_span(text: str, product: str):
 def slot_dirs(repo: Path, product: str, slot: str):
     """Existing <locale>/<product>/<slot> dirs across locales."""
     for loc in LOCALES:
-        d = (repo / loc / product / slot) if loc else (repo / product / slot)
+        d = (repo / loc / product / slot) if loc else (english_root(repo) / product / slot)
         if d.is_dir():
             yield d
 
@@ -237,29 +256,33 @@ def manage_redirects(text: str, repo: Path, product: str, old_stable: str,
     Re-emits the array in the established format so unchanged entries diff clean.
     """
     redirects = json.loads(text).get("redirects", [])
-    old_pref = f"/{product}/{old_stable}"
-    dev_pref = f"/{product}/{new_stable}-dev"
-    dev_dest = f"/{product}/dev"
+    en = english_prefix(repo)
+    # Redirects made before English moved under en/, or before the version
+    # folders dropped their mysql- prefix, keep their old sources.
+    spellings = {product, "mysql-" + product.removeprefix("mysql-")}
+    old_prefs = {f"/{e}{s}/{old_stable}" for e in ("", en) for s in spellings}
+    dev_prefs = {f"/{e}{s}/{new_stable}-dev" for e in ("", en) for s in spellings}
+    dev_dest = f"/{en}{product}/dev"
     removed = repointed = 0
     out = []
     for r in redirects:
         s = r["source"]
-        if s == old_pref or s.startswith(old_pref + "/"):
+        if any(s == p or s.startswith(p + "/") for p in old_prefs):
             removed += 1
             continue
-        if s == dev_pref or s.startswith(dev_pref + "/"):
+        if any(s == p or s.startswith(p + "/") for p in dev_prefs):
             d = r["destination"]
             if d == dev_dest or d.startswith(dev_dest + "/"):
                 r = {"source": s,
-                     "destination": f"/{product}/{new_stable}" + d[len(dev_dest):]}
+                     "destination": f"/{en}{product}/{new_stable}" + d[len(dev_dest):]}
                 repointed += 1
         out.append(r)
 
-    stable_dir = repo / product / "stable"
-    adds = [(f"/{product}/{new_stable}", f"/{product}/stable")]
+    stable_dir = english_root(repo) / product / "stable"
+    adds = [(f"/{en}{product}/{new_stable}", f"/{en}{product}/stable")]
     for p in sorted(stable_dir.rglob("*.mdx")):
         slug = str(p.relative_to(stable_dir)).removesuffix(".mdx")
-        adds.append((f"/{product}/{new_stable}/{slug}", f"/{product}/stable/{slug}"))
+        adds.append((f"/{en}{product}/{new_stable}/{slug}", f"/{en}{product}/stable/{slug}"))
     out.extend({"source": s, "destination": d} for s, d in adds)
 
     arr_open = text.index("[", text.index('"redirects": ['))
@@ -283,7 +306,7 @@ def main():
     ap.add_argument("--new-stable", required=True, help="incoming stable number, e.g. 0.0.6")
     ap.add_argument("--new-dev", required=True, help="new dev label body, e.g. 0.0.7-dev")
     ap.add_argument("--product", default=DEFAULT_PRODUCT,
-                    help="product directory to cut, e.g. mysql-9.7 (default mysql-8.4)")
+                    help="product to cut, e.g. mysql-9.7 or 9.7 (default mysql-8.4)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--repo", default=None)
     args = ap.parse_args()
@@ -291,18 +314,18 @@ def main():
     repo = Path(args.repo).resolve() if args.repo else Path(__file__).resolve().parent.parent
     scripts = repo / "scripts"
     old, new, ndev = args.old_stable, args.new_stable, args.new_dev
-    product = args.product
+    product = version_folder(repo, args.product)
     dry = args.dry_run
     tag = "[plan] " if dry else ""
     print(f"{tag}product: {product} ({product_label(product)})")
 
-    en_stable = repo / product / "stable"
-    en_dev = repo / product / "dev"
+    en_stable = english_root(repo) / product / "stable"
+    en_dev = english_root(repo) / product / "dev"
     if not en_stable.is_dir() or not en_dev.is_dir():
         print(f"error: {product}/stable and {product}/dev must both exist",
               file=sys.stderr)
         return 1
-    if (repo / product / old).exists():
+    if (english_root(repo) / product / old).exists():
         print(f"error: archive {product}/{old} already exists", file=sys.stderr)
         return 1
 
@@ -312,7 +335,7 @@ def main():
         print(f"{tag}snapshot {d.relative_to(repo)} -> {dest.relative_to(repo)}")
         if not dry:
             shutil.copytree(d, dest)
-            rewrite_prefix(dest, f"{product}/stable/", f"{product}/{old}/")
+            rewrite_prefix(dest, f"/{product}/stable/", f"/{product}/{old}/")
     print(f"{tag}noindex archive {old} (via noindex-version.py)", flush=True)
     if not dry:
         subprocess.run([sys.executable, str(scripts / "noindex-version.py"), old,
@@ -323,14 +346,14 @@ def main():
     if not dry:
         shutil.rmtree(en_stable)
         shutil.copytree(en_dev, en_stable)
-        rewrite_prefix(en_stable, f"{product}/dev/", f"{product}/stable/")
+        rewrite_prefix(en_stable, f"/{product}/dev/", f"/{product}/stable/")
 
     # 3. scaffold new dev from new stable (dev is self-canonical, no re-stamp)
     print(f"{tag}scaffold {product}/dev from new stable (stable/ -> dev/ links)")
     if not dry:
         shutil.rmtree(en_dev)
         shutil.copytree(en_stable, en_dev)
-        rewrite_prefix(en_dev, f"{product}/stable/", f"{product}/dev/")
+        rewrite_prefix(en_dev, f"/{product}/stable/", f"/{product}/dev/")
 
     # 4. docs.json: archived version entry, labels, and redirect lifecycle
     docs_path = repo / "docs.json"

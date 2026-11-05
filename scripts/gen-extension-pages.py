@@ -31,13 +31,30 @@ in the shared body.
 Usage:  python3 scripts/gen-extension-pages.py          # from the repo root
 """
 
+import glob
 import json
 import os
 import re
 import sys
 
-SLOTS = ["mysql-8.4/stable", "mysql-8.4/dev", "mysql-9.7/stable", "mysql-9.7/dev"]
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# English pages live under en/ once the site moves them there, and the version
+# folders may drop their mysql- prefix (en/8.4/); the slot paths and the links
+# into them follow.
+EN = "en/" if glob.glob(os.path.join(REPO, "en", "**", "*.mdx"), recursive=True) else ""
+
+
+def version_folder(product):
+    """mysql-8.4 or 8.4 -> the version folder name this layout uses.
+
+    The folder counts only when it holds pages: the old mysql-8.4/ folder stays
+    behind holding manifest.json.schema.json files."""
+    number = product.removeprefix("mysql-")
+    renamed = glob.glob(os.path.join(REPO, EN, number, "**", "*.mdx"), recursive=True)
+    return number if renamed else "mysql-" + number
+
+
+SLOTS = [f"{EN}{version_folder(p)}/{s}" for p in ("mysql-8.4", "mysql-9.7") for s in ("stable", "dev")]
 DATA = os.path.join(REPO, "scripts", "extension-pages.json")
 DOCS_JSON = os.path.join(REPO, "docs.json")
 CATALOG = os.path.join(REPO, "snippets", "extensions-en.mdx")
@@ -59,7 +76,21 @@ def resolve(item, slot):
     """Turn the slot-relative forms in the data file into absolute links."""
     item = re.sub(r"\]\(\.\./([a-z0-9-]+)\)", rf"](/{slot}/\1)", item)
     item = re.sub(r"\]\((vsql-[a-z0-9-]+)\)", rf"](/{slot}/extensions/\1)", item)
-    return item
+    return english_links(item)
+
+
+def english_links(item):
+    """Give an absolute link to an English page its /en prefix, when there is one."""
+    if not EN:
+        return item
+
+    def prefix(m):
+        top = re.split(r"[/#?]", m.group(1))[0]
+        under_en = os.path.join(REPO, "en", top)
+        if os.path.exists(under_en) or os.path.exists(under_en + ".mdx"):
+            return f"](/en/{m.group(1)})"
+        return m.group(0)
+    return re.sub(r"\]\(/(?!en/)([^)\s]+)\)", prefix, item)
 
 
 def catalog_slugs():
@@ -103,7 +134,7 @@ def update_navigation(slugs):
         root = group.get("root") or group["pages"][0]
         slot = "/".join(root.split("/")[:-1]).lstrip("/")
         if slot.split("/")[0] in ("ja", "ko", "zh", "pt-BR"):
-            slot = "/".join(slot.split("/")[1:])  # locale navs list the English pages
+            slot = EN + "/".join(slot.split("/")[1:])  # locale navs list the English pages
         group["pages"] = [f"{slot}/extensions/{s}" for s in slugs]
 
     json.dump(docs, open(DOCS_JSON, "w"), indent=2, ensure_ascii=False)

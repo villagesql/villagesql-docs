@@ -18,7 +18,7 @@ the pages:
 Running it on an unchanged tree changes nothing.
 
 Usage:
-    python3 scripts/sync-stable-nav.py [--product mysql-9.7] [--dry-run] [--repo PATH]
+    python3 scripts/sync-stable-nav.py [--product mysql-9.7 | 9.7] [--dry-run] [--repo PATH]
 """
 
 import argparse
@@ -60,7 +60,8 @@ def page_list(node):
 
 def sync(docs, product, repo):
     """Return (docs, report lines). docs is modified in place."""
-    label = product.replace("mysql-", "MySQL ", 1)
+    number = product.removeprefix("mysql-")
+    label = f"MySQL {number}"
     prod = next((p for p in docs["navigation"]["products"]
                  if p.get("product") == label), None)
     if prod is None:
@@ -70,7 +71,12 @@ def sync(docs, product, repo):
     if dev is None or stable is None:
         raise SystemExit(f"error: {label} needs a Development and a Stable version")
 
-    dev_prefix, stable_prefix = f"{product}/dev/", f"{product}/stable/"
+    # English pages live under en/ once the site moves them there, and the
+    # version folder may drop its mysql- prefix (en/8.4/).
+    en = "en/" if any((repo / "en").rglob("*.mdx")) else ""
+    # The folder counts only when it holds pages (the old one keeps .json files).
+    product = number if any((repo / en / number).rglob("*.mdx")) else f"mysql-{number}"
+    dev_prefix, stable_prefix = f"{en}{product}/dev/", f"{en}{product}/stable/"
     report = []
 
     def to_stable(p):
@@ -88,7 +94,7 @@ def sync(docs, product, repo):
             new_groups = en_groups
         else:
             def localize(p, lang=lang):
-                lp = f"{lang}/{p}"
+                lp = f"{lang}/{p[len(en):] if p.startswith(en) else p}"
                 return lp if (repo / f"{lp}.mdx").exists() else p
 
             new_groups = map_paths(

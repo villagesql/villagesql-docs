@@ -28,13 +28,19 @@ def main():
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve() if args.repo else Path(__file__).resolve().parent.parent
+    # English pages live under en/ once the site moves them there, and so do
+    # their addresses.
+    en = "en/" if any((repo / "en").rglob("*.mdx")) else ""
+    # The version folder may also have dropped its mysql- prefix (en/8.4/). It
+    # counts only when it holds pages: the old folder keeps schema .json files.
+    v84 = "8.4" if any((repo / en / "8.4").rglob("*.mdx")) else "mysql-8.4"
 
     if args.source_dir:
         src = Path(args.source_dir)
     else:
-        src = repo / "mysql-8.4" / args.old
+        src = repo / en / v84 / args.old
         if not src.is_dir():
-            src = repo / "mysql-8.4" / args.new
+            src = repo / en / v84 / args.new
 
     if not src.is_dir():
         print(f"error: source dir not found: {src}", file=sys.stderr)
@@ -42,8 +48,8 @@ def main():
 
     pages = sorted(p.relative_to(src).with_suffix("").as_posix() for p in src.rglob("*.mdx"))
 
-    entries = [(f"/mysql-8.4/{args.old}", f"/mysql-8.4/{args.new}")]
-    entries += [(f"/mysql-8.4/{args.old}/{p}", f"/mysql-8.4/{args.new}/{p}") for p in pages]
+    entries = [(f"/{en}{v84}/{args.old}", f"/{en}{v84}/{args.new}")]
+    entries += [(f"/{en}{v84}/{args.old}/{p}", f"/{en}{v84}/{args.new}/{p}") for p in pages]
 
     blocks = []
     for source, dest in entries:

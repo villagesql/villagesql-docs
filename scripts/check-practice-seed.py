@@ -10,11 +10,13 @@ to stay byte for byte the same.
 Exits non-zero and prints a diff when they drift.
 """
 
-import difflib, os, re, sys
+import difflib, glob, os, re, sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(REPO, "scripts", "tutorial-practice.sql")
-PAGE = os.path.join(REPO, "tutorial", "insert.mdx")
+# English pages live under en/ once the site moves them there.
+EN = "en/" if glob.glob(os.path.join(REPO, "en", "**", "*.mdx"), recursive=True) else ""
+PAGE = os.path.join(REPO, EN, "tutorial", "insert.mdx")
 START = "DROP DATABASE IF EXISTS sakila_practice;"
 
 
@@ -34,10 +36,10 @@ def main():
 
     if seed == shown:
         return 0
-    print("The practice seed and the block in tutorial/insert.mdx disagree:")
+    print(f"The practice seed and the block in {EN}tutorial/insert.mdx disagree:")
     for line in difflib.unified_diff(seed.split("\n"), shown.split("\n"),
                                      "scripts/tutorial-practice.sql",
-                                     "tutorial/insert.mdx", lineterm=""):
+                                     f"{EN}tutorial/insert.mdx", lineterm=""):
         print(line)
     return 1
 

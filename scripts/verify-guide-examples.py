@@ -115,8 +115,13 @@ def drop_own(db, tables):
 
 def main():
     ok = bad = setup = 0
+    missing = [rel for rel in GUIDES if not os.path.exists(os.path.join(REPO, tv.EN, rel))]
+    if missing:
+        # A guide that moved would otherwise go unchecked, or stop the run halfway.
+        print("guides not found: " + ", ".join(os.path.join(tv.EN, rel) for rel in missing))
+        return 1
     for rel, cfg in GUIDES.items():
-        path = os.path.join(REPO, rel)
+        path = os.path.join(REPO, tv.EN, rel)
         db = cfg["db"]
         if cfg["scratch"]:
             tv.run(f"DROP DATABASE IF EXISTS {db};", db="mysql")
