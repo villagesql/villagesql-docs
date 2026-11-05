@@ -40,10 +40,10 @@ wrong. VillageSQL organizes content along the lines of the
 
 | Page type | Answers | Example page | Shape |
 |---|---|---|---|
-| **Guide / how-to** | "How do I accomplish X?" | `guides/encrypting-columns.mdx` | Task-focused steps for a competent user solving a real problem |
-| **Tutorial** | "Teach me by doing" | `tutorial/index.mdx`, `quickstart.mdx`, `mysql-8.4/<version>/install-server.mdx` | Guided lesson that ends in a working result |
-| **Reference** | "What are the exact facts?" | `mysql-8.4/<version>/extension-api-reference.mdx` | Accurate, complete, dry: functions, signatures, types, options |
-| **Explanation** | "Why does it work this way?" | `mysql-8.4/<version>/extensions-or-plugins.mdx` | Background, rationale, mental models |
+| **Guide / how-to** | "How do I accomplish X?" | `en/guides/encrypting-columns.mdx` | Task-focused steps for a competent user solving a real problem |
+| **Tutorial** | "Teach me by doing" | `en/tutorial/index.mdx`, `en/quickstart.mdx`, `en/8.4/stable/install-server.mdx` | Guided lesson that ends in a working result |
+| **Reference** | "What are the exact facts?" | `en/sdk/cpp/extension-api-reference.mdx` | Accurate, complete, dry: functions, signatures, types, options |
+| **Explanation** | "Why does it work this way?" | `en/extensions/build/extensions-or-plugins.mdx` | Background, rationale, mental models |
 
 Keep the modes separate. Reference and explanation often live side by side in
 the same version directory; the difference is the content, not the folder.
@@ -212,7 +212,7 @@ sidebarTitle: "Short title"   # shown in the nav when the full title is long
 keywords: "comma, separated, search terms"
 ```
 
-**Versioned pages** under `mysql-8.4/<version>/` **must** declare an audience:
+**Extension, SDK, and server pages** (under `en/extensions/`, `en/sdk/`, `en/8.4/`, and `en/9.7/`) **must** declare an audience:
 
 ```yaml
 audience: extension-author    # writing C++/Rust extensions with the SDK
@@ -231,30 +231,35 @@ the audience field and the raw-ABI rule.
 
 ```
 villagesql-docs/
-├── docs.json              # navigation, theme, version dropdown; register new pages here
-├── index.mdx              # docs landing page
-├── guides/                # how-to guides, one topic each (see also: keywords, cross-links)
-├── tutorial/              # the ordered MySQL lessons; order lives in scripts/tutorial-toc.json
-├── mysql-8.4/
-│   ├── stable/            # current stable (fixed URL slot)
-│   ├── dev/               # active development, most edits go here
-│   └── 0.0.1 … 0.0.4/     # frozen archived versions
-├── extensions/
+├── docs.json              # navigation (one menu per language), theme, redirects; register new pages here
+├── index.mdx              # docs landing page, the only English page at the root
+├── en/
+│   ├── guides/            # how-to guides, one topic each (see also: keywords, cross-links)
+│   ├── tutorial/          # the ordered MySQL lessons; order lives in scripts/tutorial-toc.json
+│   ├── extensions/        # shared extension pages, one copy for every release
+│   ├── sdk/               # shared C++ and Rust SDK references
+│   ├── 8.4/ and 9.7/
+│   │   ├── stable/        # server pages for the current release
+│   │   ├── dev/           # server pages for the next release
+│   │   └── 0.0.1 … 0.0.7/ # frozen past releases
+│   └── quickstart.mdx, version-policy.mdx, …
 ├── snippets/              # reusable MDX fragments
-└── ja/ ko/ zh/ pt-BR/     # translations
+└── ja/ ko/ zh/ pt-BR/     # translations, with the same paths as en/
 ```
 
-- **Edit the dev version.** New content and changes go to the current dev
-  directory (`mysql-8.4/dev/`). Released versions are frozen except for
-  corrections. The full release process is in [VERSIONING.md](./VERSIONING.md).
+- **Put each change where it belongs.** A change in the released software
+  edits the shared page or the stable server page. A change that exists only in
+  the next release edits the dev server page, or adds a `Changed in <next>-dev`
+  note to the shared page. Past releases are frozen except for corrections. The
+  full policy and release process are in [VERSIONING.md](./VERSIONING.md).
 - **Register new pages in `docs.json`.** A file that isn't in `docs.json` won't
   appear in the sidebar. Two page sets are the exception, because a generator
-  writes their navigation: `extensions/` from `scripts/gen-extension-pages.py`,
-  and `tutorial/` from `scripts/gen-tutorial-nav.py`. Add a tutorial lesson to
+  writes their navigation: `en/extensions/` from `scripts/gen-extension-pages.py`,
+  and `en/tutorial/` from `scripts/gen-tutorial-nav.py`. Add a tutorial lesson to
   `scripts/tutorial-toc.json`, run that script, and commit what it changes. CI
   fails the pull request when the committed navigation and the generator
   disagree.
-- **Lessons under `tutorial/` are written, never adapted.** The MySQL Reference
+- **Lessons under `en/tutorial/` are written, never adapted.** The MySQL Reference
   Manual is not open licensed, and its terms prohibit reuse of any part of it in
   another publication. The other MySQL tutorial sites reserve all rights too.
   So get the facts by running statements against a live server and write from
@@ -340,7 +345,7 @@ query" for runtime-verified ones. This is the industry "docs-as-tests" practice.
 server behavior.
 
 ## 11. Links, cross-linking, and accessibility
-- **Internal links are relative** (`/guides/ai-prompts-in-mysql`), never
+- **Internal links are relative** (`/en/guides/ai-prompts-in-mysql`), never
   absolute URLs. Absolute links to our own site break in preview and
   translation.
 - **Descriptive link text.** Link the words that describe the destination
