@@ -88,7 +88,8 @@ def pages_in(node):
         for item in node:
             out.extend(pages_in(item))
     elif isinstance(node, dict):
-        for key in ("pages", "groups", "menu", "tabs", "languages"):
+        # A group's own page (root) comes before the pages inside it.
+        for key in ("root", "pages", "groups", "menu", "tabs", "languages"):
             if key in node:
                 out.extend(pages_in(node[key]))
     return out
@@ -111,8 +112,9 @@ def shared_pages(docs):
     catalog = set()
     for group in tab(docs, "Extensions")["groups"]:
         for sub in group["pages"]:
-            if isinstance(sub, dict) and sub.get("group") == "All extensions":
-                catalog.update(bare(p) for p in pages_in(sub))
+            # The extension pages sit in the group whose own page is the catalog.
+            if isinstance(sub, dict) and str(sub.get("root", "")).endswith("extensions/catalog"):
+                catalog.update(bare(p) for p in pages_in(sub["pages"]))
     shared = {}
     for name in ("Overview", "Extensions", "Reference"):
         for page in map(bare, pages_in(tab(docs, name))):
