@@ -21,7 +21,7 @@ License, version 2 (GPLv2).
 ## Set up a server
 
 To install a server, fetch
-<https://raw.githubusercontent.com/villagesql/villagesql-skills/main/skills/vsql-install-server/SKILL.md>
+[https://raw.githubusercontent.com/villagesql/villagesql-skills/main/skills/vsql-install-server/SKILL.md](https://raw.githubusercontent.com/villagesql/villagesql-skills/main/skills/vsql-install-server/SKILL.md)
 and follow it. It installs a server, connects, and installs an extension to
 prove that the server works.
 
@@ -65,10 +65,10 @@ Two errors are common:
 ## Find more
 
 - The extension catalog has one page for each extension:
-  <https://villagesql.com/docs/en/extensions/catalog.md>
+  [https://villagesql.com/docs/en/extensions/catalog.md](https://villagesql.com/docs/en/extensions/catalog.md)
 - To build your own extension in C++ or Rust, read
-  <https://villagesql.com/docs/en/extensions/build/create.md>
-- The docs list every page for agents at <https://villagesql.com/docs/llms.txt>.
+  [https://villagesql.com/docs/en/extensions/build/create.md](https://villagesql.com/docs/en/extensions/build/create.md)
+- The docs list every page for agents at [https://villagesql.com/docs/llms.txt](https://villagesql.com/docs/llms.txt).
 - Read any docs page as Markdown by adding `.md` to its address.
 - The docs are also in Japanese, Korean, Chinese, and Brazilian Portuguese.
   Replace `/en/` in an address with `/ja/`, `/ko/`, `/zh/`, or `/pt-BR/`. The
