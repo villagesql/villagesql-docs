@@ -1,0 +1,117 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+`vsql_stat_ch` 为服务器完成的每条语句记录一个事件，并分批发送到
+ClickHouse。查询历史于是保存在一个您可以聚合的地方，两者之间不需要
+收集器进程。它使用 ClickHouse 的原生协议或 HTTP，并且可以在服务器
+运行时在两者之间切换。
+
+| | |
+|---|---|
+| **维护者** | VillageSQL |
+| **源代码和完整文档** | [villagesql/vsql-stat-ch](https://github.com/villagesql/vsql-stat-ch) |
+| **许可证** | GPL-2.0 |
+| **能力** | 预览 |
+
+<Warning>
+  此扩展使用了四个预览能力，因此服务器必须以
+  `--vsql_allow_preview_extensions=ON` 启动。否则 `INSTALL EXTENSION`
+  会被拒绝。
+</Warning>
+
+## 安装 {#install}
+
+`vsql_stat_ch` 未随服务器捆绑，因此请先构建再安装。克隆存储库时请
+带上子模块，因为它内置了一个 ClickHouse 客户端：
+
+```bash
+git clone --recurse-submodules https://github.com/villagesql/vsql-stat-ch.git
+cd vsql-stat-ch
+VillageSQL_BUILD_DIR=/path/to/villagesql/build ./build.sh
+```
+
+把生成的 `vsql_stat_ch.veb` 复制到 `veb_dir` 系统变量所指定的目录中，
+然后安装它：
+
+```sql
+INSTALL EXTENSION vsql_stat_ch;
+```
+
+确认它已存在：
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_stat_ch';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_stat_ch   |
++----------------+
+```
+
+## 新增内容 {#what-it-adds}
+
+它添加了一条捕获路径、一组设置和一组状态计数器，不添加 SQL 函数。
+
+| 设置 | 默认值 | 控制内容 |
+|---|---|---|
+| `vsql_stat_ch.enabled` | `OFF` | 是否捕获语句 |
+| `vsql_stat_ch.transport` | `native` | `native` 使用端口 9000，`http` 使用 HTTP 接口 |
+| `vsql_stat_ch.clickhouse_host` | `localhost` | ClickHouse 主机，用于原生传输 |
+| `vsql_stat_ch.clickhouse_port` | `9000` | 其端口 |
+| `vsql_stat_ch.clickhouse_url` | 空 | 基础 URL，用于 HTTP 传输 |
+| `vsql_stat_ch.clickhouse_database` | `default` | 目标数据库 |
+| `vsql_stat_ch.clickhouse_table` | `events_raw` | 目标表 |
+| `vsql_stat_ch.clickhouse_user`、`vsql_stat_ch.clickhouse_password` | `default`、空 | 凭据 |
+| `vsql_stat_ch.compression` | `1` | 0 不压缩，1 为 LZ4，2 为 zstd |
+| `vsql_stat_ch.batch_max` | `10000` | 一批包含多少事件 |
+| `vsql_stat_ch.flush_interval_ms` | `1000` | 未满的批次等待多长时间 |
+| `vsql_stat_ch.queue_capacity` | `100000` | 内存中最多可以有多少事件等待，至少 `1000`；请在捕获第一个事件之前设置，或用 `SET PERSIST` 设置后重启 |
+| `vsql_stat_ch.statement_max_bytes` | `4096` | 语句文本在何处截断 |
+| `vsql_stat_ch.http_timeout_secs` | `10` | HTTP 传输的超时时间 |
+
+## 示例 {#example}
+
+把它指向一个 ClickHouse 实例并开始捕获：
+
+```sql
+SET GLOBAL vsql_stat_ch.clickhouse_host = 'clickhouse';
+SET GLOBAL vsql_stat_ch.clickhouse_database = 'default';
+SET GLOBAL vsql_stat_ch.clickhouse_table = 'events_raw';
+SET GLOBAL vsql_stat_ch.enabled = ON;
+```
+
+通过状态计数器观察它在做什么：
+
+```sql
+SHOW STATUS LIKE 'vsql_stat_ch%';
+```
+
+```
++-------------------------------+-------+
+| Variable_name                 | Value |
++-------------------------------+-------+
+| vsql_stat_ch.events_archived  | 0     |
+| vsql_stat_ch.events_captured  | 0     |
+| vsql_stat_ch.events_dropped   | 0     |
+| vsql_stat_ch.flush_errors     | 0     |
+| vsql_stat_ch.last_flush_utime | 0     |
+| vsql_stat_ch.queue_depth      | 0     |
++-------------------------------+-------+
+```
+
+`events_dropped` 不断上升意味着队列填满的速度快于排空的速度，因此
+要么 ClickHouse 响应缓慢，要么 `queue_capacity` 对于当前的语句速率
+来说太小。
+
+<Note>
+  语句文本在 `statement_max_bytes` 处截断，而语句文本可能带有您数据中
+  的字面量。在开启捕获之前，请先决定您的 ClickHouse 表允许保存什么。
+</Note>

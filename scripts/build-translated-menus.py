@@ -5,7 +5,8 @@
 
 Each translated menu is a copy of the English menu (tabs, menus, groups and
 their order) in which every page is replaced by its translation when the
-translated file exists, and dropped when it does not. A group, menu item or tab
+translated file exists, and dropped when it does not. A link page (front
+matter with url:, such as the Community links) stays as the English page. A group, menu item or tab
 left with no pages is dropped too. Labels stay in English, as the live
 translated menus have them today. Run it after the page move and the en/ step,
 or on any layout: it reads the English page path, removes a leading en/, and
@@ -22,10 +23,22 @@ LANGS = ["ja", "ko", "zh", "pt-BR"]
 CONTAINERS = ("tabs", "menu", "groups", "pages", "dropdowns", "anchors")
 
 
+def is_link_page(path):
+    """A page whose front matter has url: only sends the reader to another
+    site, so it needs no translation."""
+    if not path.is_file():
+        return False
+    text = path.read_text()
+    head = text.split("---", 2)[1] if text.startswith("---") else ""
+    return any(line.startswith("url:") for line in head.splitlines())
+
+
 def translated(page, lang, repo):
     rest = page[3:] if page.startswith("en/") else page
     target = f"{lang}/{rest}"
-    return target if (repo / f"{target}.mdx").is_file() else None
+    if (repo / f"{target}.mdx").is_file():
+        return target
+    return page if is_link_page(repo / f"{page}.mdx") else None
 
 
 def rebuild(node, lang, repo):
