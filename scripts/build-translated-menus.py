@@ -92,7 +92,13 @@ def rebuild(node, lang, repo):
                 has_content = has_content or "://" in str(v)
             else:
                 out[k] = v
-        return out if has_content else None
+        if not has_content:
+            return None
+        # A group whose own page survived but whose pages did not would show
+        # an empty dropdown; list its own page as a plain page instead.
+        if "root" in out and not any(k in out for k in CONTAINERS if k != "root"):
+            return out["root"]
+        return out
     return node
 
 
