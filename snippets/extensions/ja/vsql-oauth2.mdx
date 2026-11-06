@@ -1,0 +1,112 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+`vsql_oauth2` を使うと、アカウントがパスワードの代わりに JWT でサインインできます。この拡張機能は、JWKS エンドポイントから取得した鍵または 1 つの静的な公開鍵に対してトークンの署名を検証し、トークンの有効期限が切れていないことを確認し、トークン内のクレームを VillageSQL アカウントにマッピングします。認証情報を発行する場所は、引き続きあなたの ID プロバイダーだけです。
+
+| | |
+|---|---|
+| **メンテナー** | VillageSQL |
+| **ソースと完全なドキュメント** | [villagesql/vsql-oauth2](https://github.com/villagesql/vsql-oauth2) |
+| **ライセンス** | GPL-2.0 |
+| **機能** | プレビュー |
+
+<Warning>
+  この拡張機能はプレビュー機能を使用するため、`vsql_allow_preview_extensions` が `ON` である必要があります。サーバーを `--vsql_allow_preview_extensions=ON` で起動するか、`SET PERSIST vsql_allow_preview_extensions = ON` を実行してください。そうでない場合、`INSTALL EXTENSION` は拒否されます。
+</Warning>
+
+## インストール {#install}
+
+インストールスクリプト、Docker イメージ、またはリリース tarball で VillageSQL をインストールした場合、`vsql_oauth2.veb` はすでにサーバーの `lib/veb/` ディレクトリにあります。1 つのステートメントでサーバーにインストールします。
+
+```sql
+INSTALL EXTENSION vsql_oauth2;
+```
+
+インストールされたことを確認します。
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_oauth2';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_oauth2    |
++----------------+
+```
+
+自分でビルドするには、[リポジトリ](https://github.com/villagesql/vsql-oauth2)のビルド手順に従ってください。
+
+## 追加される機能 {#what-it-adds}
+
+SQL 関数ではなく、認証プラグインを追加します。アカウントを作成するときにプラグインを指定すると、そのアカウントはトークンを提示して認証するようになります。
+
+```sql
+CREATE USER 'analyst'@'%' IDENTIFIED WITH vsql_oauth2;
+```
+
+```sql
+SELECT user, plugin FROM mysql.user WHERE user = 'analyst';
+```
+
+```
++---------+-------------+
+| user    | plugin      |
++---------+-------------+
+| analyst | vsql_oauth2 |
++---------+-------------+
+```
+
+セッションは、接続したアカウントではなく、トークンが指名するアカウントとして実行されます。その名前は `username_claim` のクレーム (デフォルトは `sub`) が供給します。その値が `analyst` であれば、上のステートメントだけで十分です。メールアドレスなど別のものを指名する場合は、そのアカウントも作成し、接続するアカウントからプロキシさせます。
+
+```sql
+CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
+CREATE USER 'alice@example.com' ACCOUNT LOCK;
+GRANT SELECT ON app.* TO 'alice@example.com';
+GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
+```
+
+`ACCOUNT LOCK` は誰も `alice@example.com` として直接サインインできないようにしますが、ロックされたアカウントに対してもプロキシの付与は機能します。`validate_password` が動作しているサーバーは、ロックの有無にかかわらず、パスワードのないアカウントの作成を拒否し、`ERROR 1819 (HY000): Your password does not satisfy the current policy
+requirements` と答えます。それに該当する場合は、誰も持っていないパスワードをアカウントに与えてください。
+
+プロキシの付与がない場合、ログインは `ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing
+proxy privilege.` で拒否されます。
+
+それ以外はすべて設定です。
+
+| 設定 | デフォルト | 制御内容 |
+|---|---|---|
+| `vsql_oauth2.jwks_url` | 空 | 署名鍵の取得元。静的な鍵より優先される |
+| `vsql_oauth2.public_key` | 空 | JWKS エンドポイントを持たないプロバイダー向けの静的な公開鍵 |
+| `vsql_oauth2.jwks_refresh_interval` | `3600` | 鍵を再取得する間隔 (秒) |
+| `vsql_oauth2.jwks_http_timeout` | `5` | 取得にかけられる時間 (秒) |
+| `vsql_oauth2.issuer` | 空 | 設定時に、トークンが持っていなければならない `iss` クレーム |
+| `vsql_oauth2.audience` | 空 | 設定時に、トークンが持っていなければならない `aud` クレーム |
+| `vsql_oauth2.username_claim` | `sub` | アカウントを指名するクレーム |
+| `vsql_oauth2.roles_claim` | 空 | ロールを運ぶクレーム |
+| `vsql_oauth2.roles_filter` | 空 | それらのロールのうち考慮するもの |
+| `vsql_oauth2.roles_transform_pattern`, `vsql_oauth2.roles_transform_replacement` | 空 | プロバイダーのロール名をデータベースのロール名に変換する方法 |
+| `vsql_oauth2.auto_create` | `OFF` | 未知のサブジェクトが初回ログイン時にアカウントを得るかどうか |
+| `vsql_oauth2.auto_grant` | `OFF` | `OFF`/`ON`/`SYNC` — `OFF` はすでに付与済みのロールだけを有効化する。`ON` はさらに、DB ロールとして存在するクレーム内のロールを付与する。`SYNC` はそれに加えて、トークンがもはやクレームしていない付与済みロールを、デフォルトロールを除いて取り消す |
+
+RSA 署名は RS256、RS384、および RS512 として、ECDSA は ES256、ES384、および ES512 として受け付けられます。
+
+<Warning>
+  `auto_create` と `auto_grant` はデフォルトで無効で、そのデフォルトが安全な設定です。これらを有効にすると、誰がここにアカウントを持ち、何に到達できるかを ID プロバイダーが決めることになるため、有効にする前に `roles_filter` を絞ってください。`auto_grant = SYNC` はさらに進んで、オペレーターがアカウントの `DEFAULT ROLE` として設定したロールを除き、トークンがクレームしていないアカウントのロールをすべて取り消します。
+</Warning>
+
+<Note>
+  `SET PERSIST` で書き込んだ設定は再起動後も残りますが、`UNINSTALL EXTENSION` はそれを削除します。アンインストールと再インストールの後は、すべての設定がデフォルトに戻り、再起動しても古い値は戻りません。
+</Note>
+
+## ステータス変数 {#status-variables}
+
+| 変数 | 説明 |
+|----------|-------------|
+| `vsql_oauth2.jwks_fetch_failures` | JWKS の取得に失敗し、使用できるキャッシュ済みの鍵も残っていなかったために失敗したログインの数。キャッシュ済みの鍵にフォールバックした再取得の失敗は数えない。 |

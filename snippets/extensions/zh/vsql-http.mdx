@@ -1,0 +1,118 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+`vsql_http` 从查询内部发出 HTTP 请求。触发器可以调用 webhook，`SELECT`
+可以用 API 的数据充实各行，计划事件可以把摘要推送到某个地方，中间
+不需要应用层。它基于 libcurl 构建，并以 JSON 返回每个响应。
+
+| | |
+|---|---|
+| **维护者** | VillageSQL |
+| **源代码和完整文档** | [villagesql/vsql-http](https://github.com/villagesql/vsql-http) |
+| **许可证** | GPL-2.0 |
+
+## 安装 {#install}
+
+如果您使用安装脚本、Docker 镜像或发行版压缩包安装了 VillageSQL，
+`vsql_http.veb` 已经位于服务器的 `lib/veb/` 目录中。
+用一条语句将它安装到服务器中：
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+确认它已存在：
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_http';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_http      |
++----------------+
+```
+
+要自行构建，请按照[存储库](https://github.com/villagesql/vsql-http)中的
+构建说明进行操作。
+
+## 新增内容 {#what-it-adds}
+
+每个请求函数都返回一个包含四个字段的 JSON 对象：`status`、
+`content_type`、`headers` 和 `content`。无法完成的请求（例如连接被拒绝
+或超时）返回 `NULL`，并抛出一条带有 curl 错误消息的警告：
+
+```
+Warning 3200 VDF error in function 'http_get': Couldn't connect to server
+```
+
+| 函数 | 返回 | 作用 |
+|---|---|---|
+| `http_get(url)` | 文本 | GET 请求，响应以 JSON 返回 |
+| `http_post(url, content_type, body)` | 文本 | 带请求体的 POST 请求 |
+| `http_put(url, content_type, body)` | 文本 | 带请求体的 PUT 请求 |
+| `http_patch(url, content_type, body)` | 文本 | 带请求体的 PATCH 请求 |
+| `http_delete(url)` | 文本 | DELETE 请求 |
+| `http_request(method, url, headers, body, content_type, options)` | 文本 | 任意方法，自定义请求头和选项以 JSON 传入 |
+| `url_encode(s)` | 文本 | 对字符串做百分号编码，以便用于 URL |
+| `url_decode(s)` | 文本 | 还原 `url_encode` 的结果 |
+
+`http_request` 的 `method` 参数不区分大小写地匹配 GET、HEAD、POST、PUT、
+DELETE、CONNECT、OPTIONS、TRACE 和 PATCH，并以大写发送；其他任何方法
+按原样发送。
+
+## 示例 {#example}
+
+获取一个 URL，并从响应中读出两个字段：
+
+```sql
+SET @r = CONVERT(http_get('https://villagesql.com/robots.txt') USING utf8mb4);
+
+SELECT JSON_EXTRACT(@r, '$.status') AS status,
+       JSON_UNQUOTE(JSON_EXTRACT(@r, '$.content_type')) AS content_type;
+```
+
+```
++--------+---------------------------+
+| status | content_type              |
++--------+---------------------------+
+| 200    | text/plain; charset=utf-8 |
++--------+---------------------------+
+```
+
+安全地构建查询字符串：
+
+```sql
+SELECT url_encode('hello world & more') AS encoded;
+```
+
+```
++----------------------------+
+| encoded                    |
++----------------------------+
+| hello%20world%20%26%20more |
++----------------------------+
+```
+
+<Note>
+  在 VillageSQL 0.0.6 及更早版本上，响应带有 binary 字符集。
+  JSON 函数或 `JSON` 列会拒绝它，因此上面的示例如果去掉 `CONVERT`，
+  在这些版本上会失败并报
+  `ERROR 3144 (22032): Cannot create a JSON value from a string with CHARACTER
+  SET 'binary'.`。在 `JSON_OBJECT()` 或 `JSON_ARRAY()` 内部它会被接受，
+  但会被 base64 编码。在这些版本上请保留 `CONVERT(... USING utf8mb4)`；
+  在 0.0.7 及更高版本上它不是必需的，但保留也无害。
+</Note>
+
+<Warning>
+  请求会阻塞发出它的语句，默认最长 30 秒。只有 `http_request` 可以通过
+  其选项参数缩短该时间，例如 `'{"timeout": 5}'`。逐行调用会把一次表扫描
+  变成一连串网络往返，因此请不要对大结果集使用这些调用。
+</Warning>

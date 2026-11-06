@@ -21,16 +21,16 @@ why it is there:
    entry, which would fail the build, so an absent lesson is skipped and named
    in the run output instead.
 
-2. The group goes into the live version slots only, never into the frozen
-   archives. An archive is a snapshot of what shipped with that release, and
-   the tutorial did not. This matches how the Guides group already sits in
-   archives with fewer subgroups than the live slots carry.
+2. The group sits in the Guides tab, which has no release versions. The hub
+   page is its first entry, so the heading looks like every other group
+   heading in the tab.
 
-3. The group goes into English navigation blocks only. Nothing under tutorial/
+3. The group goes into the English navigation only. Nothing under tutorial/
    is translated, for the same reason nothing under guides/ is. VERSIONING.md
    is the operative statement of that rule.
 """
 
+import glob
 import json
 import os
 import re
@@ -39,6 +39,10 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOC = os.path.join(REPO, "scripts", "tutorial-toc.json")
 DOCS_JSON = os.path.join(REPO, "docs.json")
+# English pages live under en/ once the site moves them there; the menu paths
+# and the links on the hub page follow. The manifest stays layout-free.
+EN = "en/" if glob.glob(os.path.join(REPO, "en", "**", "*.mdx"), recursive=True) else ""
+TUTORIAL = os.path.join(REPO, EN, "tutorial")
 
 BEGIN = "{/* BEGIN GENERATED CONTENTS. Edit scripts/tutorial-toc.json, then run scripts/gen-tutorial-nav.py */}"
 END = "{/* END GENERATED CONTENTS */}"
@@ -57,30 +61,22 @@ def load_toc():
 
 
 def present(slug):
-    return os.path.exists(os.path.join(REPO, "tutorial", f"{slug}.mdx"))
+    return os.path.exists(os.path.join(TUTORIAL, f"{slug}.mdx"))
 
 
-def live_group_arrays(docs):
-    """The groups array of every live English navigation block.
+def guides_groups(docs):
+    """The groups array of the English Guides tab."""
+    for language in docs["navigation"]["languages"]:
+        if language.get("language") != "en":
+            continue
+        for tab in language["tabs"]:
+            if tab.get("tab") == toc_tab():
+                return tab["groups"]
+    sys.exit(f"docs.json has no English tab named {toc_tab()!r}")
 
-    A version is live when its label names it as the development or the stable
-    slot. Everything else is a frozen archive, which keeps the navigation it
-    was frozen with.
-    """
-    arrays = []
-    for product in docs["navigation"]["products"]:
-        for version in product["versions"]:
-            label = version.get("version", "")
-            if not label.startswith(("Development", "Stable")):
-                continue
-            if "languages" in version:
-                targets = [x for x in version["languages"] if x.get("language") == "en"]
-            else:
-                targets = [version]
-            for target in targets:
-                if isinstance(target.get("groups"), list):
-                    arrays.append(target["groups"])
-    return arrays
+
+def toc_tab():
+    return load_toc()["tab"]
 
 
 def build_group(toc, listed):
@@ -91,40 +87,30 @@ def build_group(toc, listed):
         if slugs:
             pages.append({
                 "group": section["title"],
-                "pages": [f"tutorial/{s}" for s in slugs],
+                "pages": [f"{EN}tutorial/{s}" for s in slugs],
             })
     # Before the first lesson lands, the group would otherwise carry an empty
     # pages array, which lists nothing and leaves the hub page unreachable from
     # the sidebar. Falling back to the hub keeps the navigation valid while the
     # sections are still being written.
-    return {
-        "group": toc["group"],
-        "icon": toc["icon"],
-        "pages": pages or [toc["root"]],
-        "root": toc["root"],
-    }
+    return {"group": toc["group"], "pages": [EN + toc["root"]] + pages}
 
 
-def update_navigation(group, before):
+def update_navigation(group):
     docs = json.load(open(DOCS_JSON))
-    count = 0
-    for groups in live_group_arrays(docs):
-        names = [g.get("group") for g in groups]
-        if group["group"] in names:
-            groups[names.index(group["group"])] = group
-        elif before in names:
-            groups.insert(names.index(before), group)
-        else:
-            groups.append(group)
-        count += 1
+    groups = guides_groups(docs)
+    names = [g.get("group") for g in groups]
+    if group["group"] in names:
+        groups[names.index(group["group"])] = group
+    else:
+        groups.insert(0, group)
     json.dump(docs, open(DOCS_JSON, "w"), indent=2, ensure_ascii=False)
     open(DOCS_JSON, "a").write("\n")
-    return count
 
 
 def update_hub(toc, listed):
     """Rewrite the contents list on the hub page, between the two markers."""
-    path = os.path.join(REPO, "tutorial", "index.mdx")
+    path = os.path.join(TUTORIAL, "index.mdx")
     if not os.path.exists(path):
         return False
     lines = []
@@ -137,7 +123,7 @@ def update_hub(toc, listed):
         lines.append(f"### {number}. {section['title']}")
         lines.append("")
         for lesson in rows:
-            lines.append(f"- [{lesson['label']}](/tutorial/{lesson['slug']})")
+            lines.append(f"- [{lesson['label']}](/{EN}tutorial/{lesson['slug']})")
         lines.append("")
     contents = "\n".join(lines).rstrip()
     body = BEGIN + "\n\n" + contents + "\n\n" + END if contents else BEGIN + "\n" + END
@@ -157,12 +143,12 @@ def main():
     listed = {s for s in planned if present(s)}
     missing = [s for s in planned if s not in listed]
 
-    navs = update_navigation(build_group(toc, listed), toc["before_group"])
+    update_navigation(build_group(toc, listed))
     hub = update_hub(toc, listed)
 
-    print(f"listed {len(listed)} of {len(planned)} lessons in {navs} navigation blocks")
-    print("rewrote the contents list on tutorial/index.mdx" if hub
-          else "tutorial/index.mdx does not exist yet, so no contents list was written")
+    print(f"listed {len(listed)} of {len(planned)} lessons in the {toc['tab']} tab")
+    print(f"rewrote the contents list on {EN}tutorial/index.mdx" if hub
+          else f"{EN}tutorial/index.mdx does not exist yet, so no contents list was written")
     if missing:
         print(f"not written yet, so left out: {', '.join(missing)}")
 

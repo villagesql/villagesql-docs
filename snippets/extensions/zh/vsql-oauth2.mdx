@@ -1,0 +1,135 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+`vsql_oauth2` 让账户用 JWT 而不是密码登录。扩展根据从 JWKS 端点获取的
+密钥或一个静态公钥验证令牌的签名，检查令牌尚未过期，并把令牌中的某个
+声明映射到一个 VillageSQL 账户。您的身份提供商仍然是唯一签发凭据的
+地方。
+
+| | |
+|---|---|
+| **维护者** | VillageSQL |
+| **源代码和完整文档** | [villagesql/vsql-oauth2](https://github.com/villagesql/vsql-oauth2) |
+| **许可证** | GPL-2.0 |
+| **能力** | 预览 |
+
+<Warning>
+  此扩展使用了一个预览能力，因此 `vsql_allow_preview_extensions` 必须为
+  `ON`。请以 `--vsql_allow_preview_extensions=ON` 启动服务器，或运行
+  `SET PERSIST vsql_allow_preview_extensions = ON`。否则 `INSTALL EXTENSION`
+  会被拒绝。
+</Warning>
+
+## 安装 {#install}
+
+如果您使用安装脚本、Docker 镜像或发行版压缩包安装了 VillageSQL，
+`vsql_oauth2.veb` 已经位于服务器的 `lib/veb/` 目录中。
+用一条语句将它安装到服务器中：
+
+```sql
+INSTALL EXTENSION vsql_oauth2;
+```
+
+确认它已存在：
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_oauth2';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_oauth2    |
++----------------+
+```
+
+要自行构建，请按照[存储库](https://github.com/villagesql/vsql-oauth2)中的
+构建说明进行操作。
+
+## 新增内容 {#what-it-adds}
+
+它添加的是一个认证插件，而不是 SQL 函数。创建账户时指定该插件，
+该账户随后就通过出示令牌来认证：
+
+```sql
+CREATE USER 'analyst'@'%' IDENTIFIED WITH vsql_oauth2;
+```
+
+```sql
+SELECT user, plugin FROM mysql.user WHERE user = 'analyst';
+```
+
+```
++---------+-------------+
+| user    | plugin      |
++---------+-------------+
+| analyst | vsql_oauth2 |
++---------+-------------+
+```
+
+会话以令牌指定的账户运行，而不是以发起连接的账户运行。
+`username_claim` 中的声明（默认为 `sub`）提供该名称。当它的值是
+`analyst` 时，上面的语句就足够了。当它指定其他名称（例如电子邮件
+地址）时，请同时创建该账户，并让发起连接的账户代理到它：
+
+```sql
+CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
+CREATE USER 'alice@example.com' ACCOUNT LOCK;
+GRANT SELECT ON app.* TO 'alice@example.com';
+GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
+```
+
+`ACCOUNT LOCK` 阻止任何人直接以 `alice@example.com` 登录，而代理授权
+对锁定的账户仍然有效。运行 `validate_password` 的服务器拒绝创建没有
+密码的账户，无论是否锁定，并回答
+`ERROR 1819 (HY000): Your password does not satisfy the current policy
+requirements`。在这种情况下，请给该账户设置一个没有人持有的密码。
+
+没有代理授权时，登录会被拒绝并报
+`ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing
+proxy privilege.`
+
+其余全部是配置。
+
+| 设置 | 默认值 | 控制内容 |
+|---|---|---|
+| `vsql_oauth2.jwks_url` | 空 | 从哪里获取签名密钥。优先于静态密钥 |
+| `vsql_oauth2.public_key` | 空 | 静态公钥，用于没有 JWKS 端点的提供商 |
+| `vsql_oauth2.jwks_refresh_interval` | `3600` | 这些密钥多久重新获取一次，单位为秒 |
+| `vsql_oauth2.jwks_http_timeout` | `5` | 一次获取最多可以花多长时间，单位为秒 |
+| `vsql_oauth2.issuer` | 空 | 设置后，令牌必须携带的 `iss` 声明 |
+| `vsql_oauth2.audience` | 空 | 设置后，令牌必须携带的 `aud` 声明 |
+| `vsql_oauth2.username_claim` | `sub` | 哪个声明指定账户名 |
+| `vsql_oauth2.roles_claim` | 空 | 哪个声明携带角色 |
+| `vsql_oauth2.roles_filter` | 空 | 这些角色中哪些会被考虑 |
+| `vsql_oauth2.roles_transform_pattern`、`vsql_oauth2.roles_transform_replacement` | 空 | 提供商的角色名如何变成数据库角色名 |
+| `vsql_oauth2.auto_create` | `OFF` | 未知主体是否在首次登录时获得账户 |
+| `vsql_oauth2.auto_grant` | `OFF` | `OFF`/`ON`/`SYNC` —— `OFF` 只激活已授予的角色；`ON` 还会授予令牌声明中存在于数据库中的角色；`SYNC` 在此基础上还会撤销令牌不再声明的已授予角色，默认角色除外 |
+
+RSA 签名接受 RS256、RS384 和 RS512，ECDSA 接受 ES256、ES384 和 ES512。
+
+<Warning>
+  `auto_create` 和 `auto_grant` 默认关闭，这个默认值是安全的。开启它们
+  意味着由您的身份提供商决定谁在这里拥有账户以及能访问什么，因此在
+  开启之前请先限定 `roles_filter` 的范围。`auto_grant = SYNC` 更进一步：
+  它还会撤销账户持有而令牌未声明的任何角色，由操作员设为账户
+  `DEFAULT ROLE` 的角色除外。
+</Warning>
+
+<Note>
+  用 `SET PERSIST` 写入的设置在重启后仍然保留，但 `UNINSTALL EXTENSION`
+  会删除它。卸载并重新安装后，每个设置都会恢复默认值，重启也不会
+  恢复旧值。
+</Note>
+
+## 状态变量 {#status-variables}
+
+| 变量 | 说明 |
+|----------|-------------|
+| `vsql_oauth2.jwks_fetch_failures` | 因 JWKS 获取失败且没有缓存密钥可用而失败的登录次数。获取失败但回退到缓存密钥的刷新不计入。 |

@@ -7,7 +7,7 @@ second translation run:
 
   1. Apply the token map to <lang>/<from>/<slot>/<page>: page paths, version
      ids (mysql-8.4_ -> mysql-9.7_), upstream manual URLs, and the MySQL
-     version from each product's English index.mdx.
+     version from each product's English introduction.mdx.
   2. Replace every fenced code block with the block at the same position in
      the English <to> page. Translations never change code blocks, so the
      English target has the right commands and output.
@@ -49,18 +49,34 @@ LINK = re.compile(r"\]\(([^)\s]+)\)|href=\"([^\"]+)\"")
 
 
 def mysql_version(repo, product, slot):
-    text = (repo / product / slot / "index.mdx").read_text()
+    text = (repo / product / slot / "introduction.mdx").read_text()
     m = COMPAT.search(text)
     if not m:
-        raise SystemExit(f"error: no 'compatible with MySQL x.y.z' in {product}/{slot}/index.mdx")
+        raise SystemExit(f"error: no 'compatible with MySQL x.y.z' in {product}/{slot}/introduction.mdx")
     return m.group(1)
 
 
+def version_folder(english, product):
+    """mysql-8.4 or 8.4 -> the version folder name this layout uses.
+
+    The folder counts only when it holds pages: the old mysql-8.4/ folder stays
+    behind holding manifest.json.schema.json files."""
+    number = product.removeprefix("mysql-")
+    return number if any((english / number).rglob("*.mdx")) else f"mysql-{number}"
+
+
 def token_map(repo, src, dst, slot):
-    s_num, d_num = src.split("-", 1)[1], dst.split("-", 1)[1]
+    s_num, d_num = src.removeprefix("mysql-"), dst.removeprefix("mysql-")
+    if src.startswith("mysql-"):
+        folder = (f"/{src}/", f"/{dst}/")
+    else:
+        # A bare 8.4 folder is swapped only after a language root, so that an
+        # outside address such as docs.percona.com/percona-server/8.4/ stays.
+        folder = (re.compile(r"/(en|ja|ko|zh|pt-BR)/" + re.escape(src) + "/"), rf"/\1/{dst}/")
     return [
-        (f"/{src}/", f"/{dst}/"),
-        (f"{src}_", f"{dst}_"),
+        folder,
+        # Version ids such as mysql-8.4_0.0.6 keep the prefix in every layout.
+        (f"mysql-{s_num}_", f"mysql-{d_num}_"),
         (mysql_version(repo, src, slot), mysql_version(repo, dst, slot)),
         (f"dev.mysql.com/doc/refman/{s_num}/", f"dev.mysql.com/doc/refman/{d_num}/"),
         (f"dev.mysql.com/doc/extending-mysql/{s_num}/", f"dev.mysql.com/doc/extending-mysql/{d_num}/"),
@@ -70,7 +86,7 @@ def token_map(repo, src, dst, slot):
 
 def apply(text, tokens):
     for a, b in tokens:
-        text = text.replace(a, b)
+        text = a.sub(b, text) if isinstance(a, re.Pattern) else text.replace(a, b)
     return text
 
 
@@ -114,8 +130,8 @@ def layout(text):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--from", dest="src", default="mysql-8.4")
-    ap.add_argument("--to", dest="dst", default="mysql-9.7")
+    ap.add_argument("--from", dest="src", default="mysql-8.4", help="mysql-8.4 or 8.4")
+    ap.add_argument("--to", dest="dst", default="mysql-9.7", help="mysql-9.7 or 9.7")
     ap.add_argument("--slot", default="stable")
     ap.add_argument("--langs", default="ja,ko,zh,pt-BR")
     mode = ap.add_mutually_exclusive_group()
@@ -126,17 +142,20 @@ def main():
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve() if args.repo else Path(__file__).resolve().parent.parent
-    src, dst, slot = args.src, args.dst, args.slot
     langs = args.langs.split(",")
-    tokens = token_map(repo, src, dst, slot)
-    en_dst_root = repo / dst / slot
+    # English pages live under en/ once the site moves them there, and the
+    # version folders may drop their mysql- prefix (en/8.4/).
+    english = repo / "en" if any((repo / "en").rglob("*.mdx")) else repo
+    src, dst, slot = version_folder(english, args.src), version_folder(english, args.dst), args.slot
+    tokens = token_map(english, src, dst, slot)
+    en_dst_root = english / dst / slot
     pages = sorted(p.relative_to(en_dst_root) for p in en_dst_root.rglob("*.mdx"))
     tag = "[plan] " if args.dry_run else ""
 
     # English check, once per page: where does the token map not explain <to>?
     by_hand = {}
     for rel in pages:
-        en_src = repo / src / slot / rel
+        en_src = english / src / slot / rel
         if not en_src.exists():
             continue
         mapped = prose_lines(apply(en_src.read_text(), tokens))
@@ -192,17 +211,17 @@ def main():
     # lines must occur as often in each locale page as in the English page.
     failed = 0
     for rel, diff in by_hand.items():
-        watched = set(invariants("\n".join(l[1:] for l in diff)))
+        watched = set(invariants("\n".join(l[1:] for l in diff), "en"))
         en_text = (en_dst_root / rel).read_text()
-        english = invariants(en_text)
+        en_found = invariants(en_text, "en")
         block_moved = any(l[1:].strip().startswith("[code block") for l in diff)
         for lang in langs:
             page = repo / lang / dst / slot / rel
             if not page.exists():
                 continue
             ours = invariants(page.read_text(), lang)
-            wrong = [f"{t} {ours[t]}x, English {english[t]}x"
-                     for t in sorted(watched) if ours[t] != english[t]]
+            wrong = [f"{t} {ours[t]}x, English {en_found[t]}x"
+                     for t in sorted(watched) if ours[t] != en_found[t]]
             if block_moved and layout(page.read_text()) != layout(en_text):
                 wrong.append("code blocks are not between the same paragraphs as in English")
             if wrong:

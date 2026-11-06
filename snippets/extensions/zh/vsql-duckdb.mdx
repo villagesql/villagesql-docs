@@ -1,0 +1,170 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+`vsql_duckdb` 在服务器进程内运行 DuckDB，因此一条 SQL 语句可以直接从
+对象存储或磁盘读取 Parquet、CSV 和 JSON 文件。分析文件留在原处，
+您可以把它们和自己的表放在一起查询，无需导出步骤，也无需运维第二个
+引擎。
+
+| | |
+|---|---|
+| **维护者** | VillageSQL |
+| **源代码和完整文档** | [villagesql/vsql-duckdb](https://github.com/villagesql/vsql-duckdb) |
+| **许可证** | GPL-2.0 |
+| **能力** | 预览 |
+
+<Warning>
+  此扩展声明了三个预览能力，因此服务器必须以
+  `--vsql_allow_preview_extensions=ON` 启动。它还需要比 0.0.6 更新的
+  VillageSQL 服务器。
+</Warning>
+
+## 安装 {#install}
+
+`vsql_duckdb` 未随服务器捆绑，因此请先从存储库构建它，并把生成的
+`vsql_duckdb.veb` 复制到 `veb_dir` 系统变量所指定的目录中。
+然后安装它：
+
+```sql
+INSTALL EXTENSION vsql_duckdb;
+```
+
+确认它已存在：
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_duckdb';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_duckdb    |
++----------------+
+```
+
+构建说明在[存储库](https://github.com/villagesql/vsql-duckdb)中。
+
+## 新增内容 {#what-it-adds}
+
+| 函数 | 返回 | 作用 |
+|---|---|---|
+| `duckdb_query(sql)` | 文本 | 运行一条 DuckDB 查询，并以 JSON 数组返回各行 |
+| `duckdb_scalar(sql)` | 文本 | 运行一条 DuckDB 查询，并返回第一行的第一个值 |
+| `duckdb_status()` | 文本 | 报告 DuckDB 版本、链接进来的读取器和当前设置 |
+
+| 设置 | 默认值 | 控制内容 |
+|---|---|---|
+| `vsql_duckdb.allow_local_files` | `OFF` | 查询是否可以读取服务器自身磁盘上的文件 |
+| `vsql_duckdb.enable_external_access` | `ON` | 查询是否可以访问网络 |
+| `vsql_duckdb.s3_endpoint`、`vsql_duckdb.s3_region`、`vsql_duckdb.s3_url_style`、`vsql_duckdb.s3_use_ssl` | 见 `duckdb_status()` | 对象存储的位置以及如何寻址 |
+| `vsql_duckdb.s3_key_id`、`vsql_duckdb.s3_secret_keyring_id`、`vsql_duckdb.s3_secret_keyring_auth_id` | 空 | 对象存储凭据，密钥保存在密钥环中 |
+| `vsql_duckdb.memory_limit_mb` | `1024` | 嵌入式引擎的内存上限 |
+| `vsql_duckdb.threads` | `2` | 它可以使用多少线程 |
+| `vsql_duckdb.timeout_ms` | `30000` | 一条查询可以运行多长时间 |
+| `vsql_duckdb.max_result_bytes` | `1048576` | 返回结果的大小上限 |
+| `vsql_duckdb.temp_directory` | 空 | 查询超出内存时溢写到磁盘的位置，仅在 `allow_local_files` 开启时发生 |
+
+`SHOW STATUS LIKE 'vsql_duckdb%'` 报告两个计数器，它们在服务器进程的
+整个生命周期内保留：
+
+```
++----------------------------+-------+
+| Variable_name              | Value |
++----------------------------+-------+
+| vsql_duckdb.queries_failed | 0     |
+| vsql_duckdb.queries_total  | 0     |
++----------------------------+-------+
+```
+
+`queries_total` 统计已运行的 `duckdb_query()` 或 `duckdb_scalar()` 调用，
+无论成功还是报错——`duckdb_scalar()` 因结果为空或值为 NULL 而返回
+`NULL` 的调用算作成功。`sql` 参数本身为 `NULL` 的调用返回 `NULL`，
+两个计数器都不递增。`queries_failed` 只统计报错的调用，并且包含在
+`queries_total` 之内。
+
+## 示例 {#example}
+
+问问它是什么：
+
+```sql
+SELECT duckdb_status() AS status\G
+```
+
+```
+*************************** 1. row ***************************
+status: {
+  "duckdb_version": "v1.5.5",
+  "readers": ["core_functions", "httpfs", "json", "parquet"],
+  "engine_error": "",
+  "object_storage_credential": "not configured",
+  "s3_endpoint": "",
+  "s3_region": "",
+  "s3_url_style": "vhost",
+  "s3_use_ssl": true,
+  "enable_external_access": true,
+  "allow_local_files": false,
+  "memory_limit_mb": 1024,
+  "threads": 2,
+  "timeout_ms": 30000,
+  "max_result_bytes": 1048576
+}
+```
+
+运行一条不涉及任何文件的查询：
+
+```sql
+SELECT duckdb_scalar('SELECT 6 * 7') AS answer;
+```
+
+```
++--------+
+| answer |
++--------+
+| 42     |
++--------+
+```
+
+读取一个 CSV，并以 JSON 形式取回各行。从服务器自身磁盘读取默认是
+关闭的，因此请先打开它：
+
+```sql
+SET GLOBAL vsql_duckdb.allow_local_files = ON;
+
+SELECT duckdb_query(
+    'SELECT sku, units * unit_price AS total
+     FROM read_csv_auto(''/path/to/sales.csv'')
+     ORDER BY total DESC') AS rows_json\G
+```
+
+```
+*************************** 1. row ***************************
+rows_json: [{"sku":"A-100","total":59.97},{"sku":"A-101","total":24.5},{"sku":"A-102","total":21.7}]
+```
+
+用完后请再次关闭它，因为在您关闭之前它会一直保持开启：
+
+```sql
+SET GLOBAL vsql_duckdb.allow_local_files = OFF;
+```
+
+由于结果是 JSON，`JSON_TABLE` 可以把它变回行，供您与自己的表联接。
+
+<Warning>
+  `allow_local_files` 会打开服务器账户能读取的每一个文件，而
+  `enable_external_access` 默认开启，因此查询也可以访问网络。扩展函数
+  不像存储函数那样可以授权，因此在这里能运行 SQL 的任何人都能调用它们：
+  安装该扩展就把这两个开关的能力交给了每个账户。对象存储密钥保存在
+  密钥环中，`vsql_duckdb.s3_secret_keyring_id` 只是指定它的名称。
+</Warning>
+
+<Note>
+  用 `SET PERSIST` 写入的设置在重启后仍然保留，但 `UNINSTALL EXTENSION`
+  会删除它。卸载并重新安装后，每个设置都会恢复默认值，重启也不会
+  恢复旧值。
+</Note>

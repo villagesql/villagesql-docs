@@ -4,298 +4,169 @@ noindex: true
 
 # Documentation Versioning Policy
 
-## Model
+## Layout
 
-The VillageSQL version number is **not** in the documentation URL. Content
-lives in fixed slots:
+English pages live under `en/`, and each translation lives under its language
+code (`ja/`, `ko/`, `zh/`, `pt-BR/`) with the same paths. The home page,
+`index.mdx`, is the only English page at the root. Every address keeps
+working when a release is cut, so search engines see one fixed set of
+addresses.
 
-- **Current stable** → `mysql-8.4/stable/` (served at
-  `villagesql.com/docs/mysql-8.4/stable/...`). Indexed.
-- **Development** → `mysql-8.4/dev/`. Indexed and **self-canonical** — no
-  cross-canonical to stable, so dev's new features (whether on new pages or
-  added to existing ones) stay findable in search. Making the latest features
-  findable is a deliberate goal; stable wins the identical mirror pages anyway
-  because all internal links, the sitemap, and `llms.txt` point at `/stable/`.
-- **Frozen archives** → `mysql-8.4/0.0.4/`, `0.0.3/`, … Each is a snapshot of a
-  past release, `noindex`ed, kept reachable at its direct URL.
+There are two kinds of page:
 
-Because the stable and dev URLs never change, cutting a release **moves no live
-URL** — Google indexes one fixed set of stable URLs across all releases, and no
-per-release reindexing or mass redirect is needed. This is the whole point of
-the slot model. The version number stays visible to readers through the
-`docs.json` version-switcher label (e.g. `Stable (0.0.5)`), not the URL.
+- **Shared pages** exist once for every release: the extension pages
+  (`en/extensions/`, `en/extensions/build/`), the SDK references
+  (`en/sdk/cpp/`, `en/sdk/rust/`), `en/version-policy.mdx`, the Quickstart,
+  the Guides, and the Tutorial. Their text describes the current release.
+- **Server pages** have a copy for each server and release slot:
+  `en/8.4/stable/`, `en/8.4/dev/`, `en/9.7/stable/`, and `en/9.7/dev/`. They
+  cover installing, building, and running the server. Past releases are
+  frozen copies at `en/8.4/0.0.6/` and so on, marked `noindex`.
 
-The current stable version is translated (ja/ko/zh/pt-BR). A version that
-shipped translations keeps its translations **and** its language switcher after
-it is archived. The dev version and older never-translated versions are
-English-only.
+A change that exists only in the next release goes on the shared page as a
+note, so readers of the current release are not misled:
 
-## Workflow
-
-**All changes go to the dev slot** (`mysql-8.4/dev/`).
-
-## Cutting a Release
-
-Runbook for promoting dev to stable. The example cuts **stable 0.0.5 → 0.0.6**
-and opens **0.0.7-dev**. Substitute versions as needed. **Freeze dev content
-before starting** — the promote and translation steps assume it is final.
-
-### 1. Run the shuffle (automated)
-
-```bash
-python3 scripts/promote-release.py \
-    --old-stable 0.0.5 --new-stable 0.0.6 --new-dev 0.0.7-dev --dry-run
-# review the plan, then run for real (drop --dry-run)
-python3 scripts/promote-release.py \
-    --old-stable 0.0.5 --new-stable 0.0.6 --new-dev 0.0.7-dev
+```mdx
+<Info>
+**Changed in 0.0.8-dev.** What is different in the next release.
+</Info>
 ```
 
-The script cuts one product. It defaults to `mysql-8.4`; add
-`--product mysql-9.7` to cut that one. Each product is cut on its own release
-cadence, and every `docs.json` edit is scoped to the product named, so cutting
-one never relabels another.
+MySQL 8.4 and MySQL 9.7 work the same way by design. When a real difference
+exists, the shared page marks it with a `**MySQL 9.7:**` note, as the managing
+page does for the Docker image name. Links to Oracle's MySQL manual point at
+the 8.4 edition.
 
-This performs, in order:
-- **Snapshot** `mysql-8.4/stable/` (and each locale mirror) → `mysql-8.4/0.0.5/`,
-  rewriting the archive's self-links `stable/` → `0.0.5/` so the frozen copy
-  refers to its own version.
-- **Noindex** the new `0.0.5` archive (all locales, via `noindex-version.py`).
-- **Promote** `mysql-8.4/dev/` → `mysql-8.4/stable/` (English): rewrite `dev/` →
-  `stable/` links.
-- **Scaffold** a fresh `mysql-8.4/dev/` from the new stable. Dev is
-  self-canonical (no canonical stamping), so its new features stay findable.
-- **Insert** the archived version entry into `docs.json` `versions` (the old
-  stable entry relabeled to the bare number `0.0.5`, repointed to
-  `mysql-8.4/0.0.5/...`, keeping its `languages` block so the archived-but-
-  translated switcher survives), then **bump** the two labels: `Stable (0.0.5)`
-  → `Stable (0.0.6)` and `Development (0.0.6-dev)` → `Development (0.0.7-dev)`.
-- **Update redirects** so every version number keeps resolving: drop the
-  `0.0.5 → /stable/` redirects (so the freshly-frozen `0.0.5` archive is
-  reachable, not shadowed), repoint the `0.0.6-dev` redirects to `0.0.6` (old
-  dev links track what shipped), and add `0.0.6 → /stable/` (the new current
-  stable resolves at its number too). `docs.json` is re-validated before write.
+Translated pages cover the shared extension and SDK pages and the stable
+server pages. The Guides, the Tutorial, and the dev pages are English only.
 
-The stable and dev *slot* URLs never move — the only redirect churn is on the
-version *numbers*, and it keeps them all resolving: the current stable's number
-bounces to `/stable/`, and a superseded number becomes its own frozen archive.
-(`gen-redirects.py` is only for one-off structural URL moves.)
+The `manifest.json.schema.json` files stay at their old paths
+(`mysql-8.4/stable/`, `mysql-8.4/0.0.6/`, and so on), because extension
+manifests name them by their GitHub address.
 
-- **Sync the stable menus** (`sync-stable-nav.py`): the English stable menu
-  becomes the dev menu, so a page that is new in dev appears in it. Each
-  locale menu is the English one without Guides and Tutorial; a page with no
-  translation yet points at the English page. Run it again after the
-  translation lands, to switch those pages to their translations.
+## Where a change goes
 
-Cut every product the release covers (`--product mysql-9.7` for 9.7).
+- **A change in the released software, or a fix to wrong text:** edit the
+  text of the shared page, or the stable server page.
+- **A change that exists only on `main`:** edit the dev server page, or add a
+  `Changed in <next>-dev` note to the shared page.
 
-### 2. Re-translate the new stable into ja/ko/zh/pt-BR
+## Cutting a release
 
-Only `mysql-8.4/` and `extensions/` are translated per locale — **not**
-`guides/`. Output overwrites `ja/mysql-8.4/stable/`, `ko/...`, `zh/...`,
-`pt-BR/...`.
+The example cuts stable 0.0.7 to 0.0.8 and opens 0.0.9-dev. Freeze the
+English text before you start, because the translation step assumes it is
+final.
 
-- **Translate only what changed.** Diff each English page against the archive
-  of the previous stable (`mysql-8.4/<old>/`, after mapping its `<old>/` links to
-  `stable/`). Update the existing translation: keep every translated sentence
-  whose English did not change, translate new and changed text, delete removed
-  text. A page that is new in this release is translated in full.
-- **Translator: Fable, from a Claude Code session** — one subagent per language
-  and page group (0.0.7 used two per language). Anthropic API keys are disabled
-  for this workspace, so `translate.py --model ...` cannot run here.
-- **Mechanical check before review:** every code block byte-identical to
-  English and in the same order, the same headings, front-matter keys and link
-  targets. Copy code blocks from English; never send them to the model.
-- **Review: Gemini (`agy`)**, source-aligned, one call per page:
-  `agy --print='<instructions, English page, translated page>'` (the prompt is
-  attached to the flag). It runs from a tool call when you are signed in. A
-  Fable agent per language then judges each finding against English and
-  applies the correct ones; the English page is the authority, not the reviewer.
-- **Link prefixing:** in a `<lang>` page, prefix in-content links to *translated*
-  sections: `](/mysql-8.4/...)` → `](/<lang>/mysql-8.4/...)` and
-  `](/extensions/...)` → `](/<lang>/extensions/...)`. **Leave `](/guides/...)`
-  bare** — guides aren't translated. Add `{#english-slug}` custom ids to
-  link-target headings so English-slug anchors keep resolving.
-- Branch convention: `adam/translations-<version>`.
-
-Then make the 9.7 translations from the new 8.4 ones — no second translation
-run:
+### 1. Run the cut
 
 ```bash
-python3 scripts/mirror-locales.py --from mysql-8.4 --to mysql-9.7 --slot stable
-# translate the listed lines by hand, then:
-python3 scripts/mirror-locales.py --from mysql-8.4 --to mysql-9.7 --slot stable --check
-python3 scripts/sync-stable-nav.py --product mysql-8.4
-python3 scripts/sync-stable-nav.py --product mysql-9.7
+python3 scripts/cut-release.py --old 0.0.7 --new 0.0.8 --next 0.0.9-dev --repo . --dry-run
+# read the plan, then run it again without --dry-run
 ```
 
-`mirror-locales.py` swaps the version tokens, takes every code block from the
-English 9.7 page, and lists the English lines whose 9.7 wording is not a token
-swap. In each locale page, remove the translation of each `-` line and
-translate each `+` line. `--check` exits 0 only when the code spans, links and
-code-block positions on those pages match English. Do not run it again without
-`--check` after the hand edits: a full run writes the pages again.
+The script does these steps, in order:
 
-### 3. Update version-number prose (not URLs)
+- **Archive.** It copies each server's stable pages to `en/8.4/0.0.7/` and
+  `en/9.7/0.0.7/`, with the shared pages beside them, and does the same for
+  each translation. The copies leave out the `0.0.8-dev` notes, point their
+  links at the archive, get `noindex`, and get a group in the Past releases
+  menu.
+- **Promote.** Each server's dev pages replace its stable pages, and a new
+  dev copy starts from the new stable.
+- **Notes.** Every `Changed in 0.0.8-dev` note on a shared page becomes normal
+  page text. The script lists each one; read the sentences around it.
+- **Labels and redirects.** The menu labels, `dev-releases.mdx`, and
+  `past-releases.mdx` name the new numbers, and every version number keeps
+  resolving.
+- **Leftovers.** It lists the server pages that still name the old release,
+  for you to update.
 
-The slots are fixed, so hrefs no longer change at a cut. Only the version-number
-*text* can go stale — sweep for it and update or make it version-agnostic:
-- `index.mdx`, `snippets/villagesql-banner.mdx`, `extensions/index.mdx`.
-- **Do NOT** bump the "requires VillageSQL 0.0.4 or later" lines — that is a
-  minimum-version floor (Protocol 2 landed in 0.0.4), not the current version.
+### 2. Translate what changed
 
-### 4. Cross-repo + tooling (outside this repo)
+Translate into ja, ko, zh, and pt-BR only what changed in the English pages
+since the last cut. Keep every translated sentence whose English did not
+change, translate new and changed text, and delete text that English removed.
+A new page is translated in full.
 
-- **`villagesql-website`**: bump the display version in `src/_data/site.js`
-  (`docsVersion`). The docs links point at the fixed `/stable/` slot, so no
-  per-cut link edits are needed. Deploy only **after** the new docs are live.
-- **`vsql-docs-validator/freshness.py`** (on disk, not a git repo — edit the
-  standalone copy, not the `claude-config` backup): add the newly-archived
-  number (`0.0.5`) to `_ARCHIVED_VERSIONS`. The `dev/`/`stable/` slot prefixes
-  are fixed, so — unlike the old numbered model — they no longer need remapping
-  every cut.
-- **`vsql-extension-template` and `vsql-extension-template-rust`**: bump the
-  pinned `villagesql-version` in each repo's scaffold CI workflow
-  (`.github/workflows/ci.yml` and `_github/workflows/ci.yml` respectively) to
-  the new stable. The scaffold pins a fixed release rather than tracking the
-  newest one, so an extension author's build never changes underneath them —
-  which means nothing bumps it but this step.
+- **Translator: Fable, from a Claude Code session,** one helper per language.
+- **Code blocks are copied from English,** never translated. Every code block
+  must match English, in the same order, with the same headings, front-matter
+  keys, and link targets.
+- **Links:** in a translated page, a link to a translated page carries the
+  language prefix, such as `](/ja/extensions/install)`. A link to an
+  English-only page, such as a guide, keeps its `/en/` address.
+- **Headings that links point at** get the English slug as a custom id, such
+  as `## 見出し {#english-slug}`, so English anchors keep working.
+- **Mechanical check:**
+  `python3 ~/scripts/check_translations.py --docs . --version stable --langs ja,ko,zh,pt-BR`.
+  It exits 1 when it finds no pages.
+- **Review: Gemini (`agy`),** one call per changed page, comparing the
+  translation with English. A Fable helper per language then checks each
+  finding against English and applies the correct ones. English is the
+  authority, not the reviewer.
 
-### 5. All future changes go to the dev slot (`mysql-8.4/dev/`).
+Then make the 9.7 server-page translations from the 8.4 ones, with no second
+translation run:
 
-## Archive Policy
+```bash
+python3 scripts/mirror-locales.py --from 8.4 --to 9.7 --slot stable
+# translate the lines it lists by hand, then:
+python3 scripts/mirror-locales.py --from 8.4 --to 9.7 --slot stable --check
+```
 
-- Keep **10 versions** in the switcher dropdown.
-- When adding version 11, remove the oldest version entry from `docs.json` (but
-  keep its files). Archived versions remain reachable via direct URL, e.g.
-  `villagesql.com/docs/mysql-8.4/0.0.1/quickstart`.
+`mirror-locales.py` swaps the version tokens and takes each code block from
+the English 9.7 page. It lists the English lines whose 9.7 wording is not a
+token swap: in each translated page, remove the translation of each `-` line
+and translate each `+` line. `--check` exits 0 only when the code spans,
+links, and code-block positions match English. Do not run it again without
+`--check` after the hand edits, because a full run writes the pages again.
 
-## Placeholder products
+Last, rebuild the translated menus from the English menu:
 
-MySQL 9.7 was a placeholder of this shape and is no longer one — see the next
-section. MySQL 8.0 was the same shape; the product was dropped from
-`docs.json` and its files removed (2026-08-27), since VillageSQL does not
-build MySQL 8.0.
+```bash
+python3 scripts/build-translated-menus.py .
+```
 
-## Adding a MySQL version (built — 9.7)
+### 3. Update version numbers in prose
 
-Built 2026-08-22. This section records the agreed shape that build followed.
+Addresses do not change at a cut, but text that names the current version can
+go stale. Check `index.mdx`, `snippets/villagesql-banner.mdx`, and the catalog
+introduction in `snippets/extensions-en.mdx`. Leave a sentence such as
+"requires VillageSQL 0.0.4 or later" alone: it states a minimum version, not
+the current one.
 
-**Both server builds shipped in 0.0.6, on 2026-08-25.** The `release/0.0.6`
-release carries three tarballs for each codebase, and Docker Hub carries one
-image for each codebase and architecture.
+### 4. Other repositories
 
-**Refer to the branches of record, never a personal branch.** Engineering work
-on the two newer codebases happens on `mysql-9.7` and `percona-8.4` in
-`villagesql-server`, and those branches keep taking commits. What each release
-delivered is marked by a tag instead: `publish/mysql-8.4_0.0.6`,
-`publish/mysql-9.7_0.0.6`, `publish/percona-8.4_0.0.6`. A `dbentley/*` or
-`adam/*` branch may hold the same commits and is still not the source of truth.
+- **`villagesql-website`:** update the version shown on the site
+  (`docsVersion` in `src/_data/site.js`). Deploy it after the new docs are
+  live.
+- **`vsql-docs-validator/freshness.py`:** add the newly archived number to
+  `_ARCHIVED_VERSIONS`.
+- **`vsql-extension-template` and `vsql-extension-template-rust`:** update the
+  pinned `villagesql-version` in each repository's scaffold CI workflow
+  (`.github/workflows/ci.yml` and `_github/workflows/ci.yml`). The scaffold
+  pins a release so that an extension author's build does not change under
+  them, so only this step moves it.
 
-**Every artifact names the codebase and the VillageSQL version, joined by an
-underscore** — `mysql-8.4_0.0.6`, `mysql-9.7_0.0.6`, `percona-8.4_0.0.6`. A
-running server reports the same string in `@@villagesql_server_version`, and it
-is how a reader confirms which codebase they installed.
+## Server builds and their names
 
-| Artifact | Pattern |
+VillageSQL builds three codebases, and the install script offers all three:
+MySQL 8.4, Percona Server 8.4, and MySQL 9.7. The Percona build tracks MySQL
+8.4 only, so its pages (`percona.mdx`, `install-percona.mdx`, and
+`source-percona.mdx`) live in the 8.4 server pages. Document that the Percona
+build exists, how to install and build it, and what VillageSQL supports about
+it. Send questions about Percona's own changes to Percona's documentation.
+
+Every artifact names the codebase and the VillageSQL version, joined by an
+underscore, such as `mysql-8.4_0.0.7` or `percona-8.4_0.0.7`. A running server
+reports the same string in `@@villagesql_server_version`.
+
+| Artifact | Name |
 |---|---|
-| Git tag for a shipped release | `publish/<codebase>_<version>` |
+| Git tag for a release | `publish/<codebase>_<version>` |
 | Release tarball | `villagesql-dev-server-<codebase>_<version>-<os>-<arch>.tar.gz` |
-| Docker image | `villagesql/server:<codebase>_<version>-<arch>` |
+| Docker image | `villagesql/server:<codebase>_<version>`, and `villagesql/server:<codebase>_latest` |
 
-**Every Docker command in the docs names an architecture.** Docker Hub carries
-one image per codebase and architecture, and nothing else: no combined tag such
-as `mysql-8.4_0.0.6`, and no floating tag such as `stable` or `latest`, both of
-which were deleted on 2026-08-25. That is a decision, not a gap (Lee,
-2026-08-25) — a combined tag can be added after launch if it proves useful. So
-a Docker command must end in `-amd64` or `-arm64`, and the version number is
-part of every one of them. Expect to rewrite each Docker command in the docs at
-every release until a floating tag exists.
-
-**Model: parallel trees, like the upstream MySQL manual.** Each MySQL version
-gets a complete, independently editable doc set under its own product in the
-`docs.json` product switcher — `mysql-8.4/` and `mysql-9.7/`. Readers see a
-whole 9.7 manual at 9.7 URLs, not a shared tree with the version filed off. Two
-near-identical indexed trees are normal for versioned documentation and are not
-treated as a duplicate-content problem, the same reasoning that lets the
-`stable/` and `dev/` slots both stay indexed.
-
-**Seed 9.7 by copying the dev slot, not stable.** When 9.7 work begins, mirror
-`mysql-8.4/dev/` to `mysql-9.7/dev/` and substitute the version tokens. Dev is
-English-only, so seeding from dev costs **no translation work at all**;
-translation starts only when 9.7 cuts its first stable. Do not seed from
-`mysql-8.4/stable/`, which would immediately owe four locale mirrors.
-
-**What actually differs.** Measured against `mysql-8.4/dev/` on 2026-08-17,
-excluding in-page self-links, only these pages carry MySQL-version-specific
-content:
-
-| Page | What ties it to a MySQL version |
-|---|---|
-| `index.mdx` | "compatible with MySQL 8.4.10", and the same string in `description` |
-| `reference.mdx` | `VERSION()` output examples (`mysql-8.4_0.0.6-dev`); "not part of standard MySQL 8.4 syntax" |
-| `source.mdx` | build version string example; the source build's version option |
-| `install.mdx` | the install script's version option |
-| `quickstart.mdx` | the Docker tag and the one-line install command |
-| `create.mdx` | one link to `dev.mysql.com/doc/extending-mysql/8.4/en/...` |
-
-The remaining ~24 pages — the whole C++ and Rust SDK surface, extension
-authoring, protocol, testing — contain no MySQL-version reference. They copy
-across unchanged and should stay identical until a real difference appears.
-
-**Reconciliation is not built yet.** The plan was for `freshness.py` to report
-every page whose 9.7 copy differs from its 8.4 twin after version-token
-substitution, as a reminder to update both copies — not a rule forbidding
-difference, since a page in the table above is expected to differ every run.
-That check does not exist in `vsql-docs-validator/freshness.py` as of
-2026-08-23. Until it does, nothing catches a fix landing in one tree and not
-the other — three open PRs (#195, #196, #188) did exactly that and had to be
-found and patched into the 9.7 tree by hand. Start with the bare report when
-building it. Only if that list grows too noisy to read is it worth adding a
-per-page "differs on purpose" marker — do not build that machinery up front.
-
-**Version selection is a packaging decision first.** VillageSQL builds three
-flavors, each with its own build artifacts, and the install script offers all
-three:
-
-| Flavor | Documented in |
-|---|---|
-| MySQL 8.4 | `mysql-8.4/` |
-| MySQL 9.7 | `mysql-9.7/` |
-| MySQL 8.4 with Percona changes | `mysql-8.4/dev/percona.mdx` |
-
-**A Percona flavor belongs to a MySQL version, and there will eventually be a
-9.7 one.** Today only the 8.4 Percona build exists, so `percona.mdx` starts life
-in the 8.4 tree alone. When the 9.7 Percona build ships, it gets its own
-`mysql-9.7/dev/percona.mdx` — do not write a single shared Percona page that
-tries to cover both, and do not treat Percona's absence from the 9.7 tree as
-permanent.
-
-That shapes `install.mdx` and `source.mdx`. Both appear in both trees, and each
-lists the flavors that exist for its own MySQL version — three choices in 8.4
-today, two in 9.7 until the 9.7 Percona build lands. So both pages carry a real
-difference between the trees from the start, and stay on the differs-from-8.4
-list permanently.
-
-`percona.mdx` itself stays short: what the branch is, which artifact to install,
-what VillageSQL supports, and a link to Percona's own documentation. Do not
-document Percona's changes here.
-
-Get the option names from the server team before writing any of these pages.
-The page structure follows the flag names.
-
-## Percona branch
-
-Built 2026-08-22. VillageSQL ships a second buildable 8.4 codebase that
-integrates Percona's MySQL improvements, on the `percona-8.4` branch.
-
-**Do not document Percona's own changes.** Document that the branch exists, how
-to build and install it, and what VillageSQL supports about it. Send every
-question about the Percona improvements themselves to Percona's documentation.
-This lives in one page, `mysql-8.4/dev/percona.mdx`, linked from
-`quickstart.mdx` and `source.mdx`.
-
-**An index of the Percona changes is worth having only if a script generates
-it.** A hand-written summary of another project's feature set goes stale in
-silence. If the server repo can emit the list — a merge manifest, a tagged
-commit range, a build flag list — generate the page and let `freshness.py` fail
-when the source moves. If nothing can generate it, link to Percona and stop.
+`villagesql/server:latest` is the current MySQL 8.4 release. Refer to the
+release tags, not to a branch: work continues on the `mysql-9.7` and
+`percona-8.4` branches after each release.

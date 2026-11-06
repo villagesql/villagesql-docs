@@ -1,0 +1,178 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+O `vsql_duckdb` executa o DuckDB dentro do processo do servidor, então uma
+instrução SQL pode ler arquivos Parquet, CSV e JSON diretamente do
+armazenamento de objetos ou do disco. Os arquivos analíticos ficam onde estão,
+e você os consulta ao lado das suas tabelas sem uma etapa de exportação nem um
+segundo mecanismo para operar.
+
+| | |
+|---|---|
+| **Mantenedor** | VillageSQL |
+| **Código-fonte e documentação completa** | [villagesql/vsql-duckdb](https://github.com/villagesql/vsql-duckdb) |
+| **Licença** | GPL-2.0 |
+| **Capability** | Preview |
+
+<Warning>
+  Esta extensão declara três capabilities Preview, então o servidor precisa ser
+  iniciado com `--vsql_allow_preview_extensions=ON`. Ela também precisa de um
+  servidor VillageSQL mais recente que o 0.0.6.
+</Warning>
+
+## Instalar
+
+O `vsql_duckdb` não vem incluído com o servidor, então compile-o primeiro a
+partir do repositório e copie o `vsql_duckdb.veb` resultante para o diretório
+indicado pela variável de sistema `veb_dir`. Em seguida, instale-o:
+
+```sql
+INSTALL EXTENSION vsql_duckdb;
+```
+
+Confirme que ele está lá:
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_duckdb';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_duckdb    |
++----------------+
+```
+
+As instruções de compilação estão no
+[repositório](https://github.com/villagesql/vsql-duckdb).
+
+## O que ela adiciona
+
+| Função | Retorna | O que faz |
+|---|---|---|
+| `duckdb_query(sql)` | texto | Executa uma consulta DuckDB e retorna as linhas como um array JSON |
+| `duckdb_scalar(sql)` | texto | Executa uma consulta DuckDB e retorna o primeiro valor da primeira linha |
+| `duckdb_status()` | texto | Informa a versão do DuckDB, os leitores vinculados e as configurações atuais |
+
+| Configuração | Padrão | O que controla |
+|---|---|---|
+| `vsql_duckdb.allow_local_files` | `OFF` | Se uma consulta pode ler arquivos no disco do próprio servidor |
+| `vsql_duckdb.enable_external_access` | `ON` | Se uma consulta pode acessar a rede |
+| `vsql_duckdb.s3_endpoint`, `vsql_duckdb.s3_region`, `vsql_duckdb.s3_url_style`, `vsql_duckdb.s3_use_ssl` | veja `duckdb_status()` | Onde fica o armazenamento de objetos e como endereçá-lo |
+| `vsql_duckdb.s3_key_id`, `vsql_duckdb.s3_secret_keyring_id`, `vsql_duckdb.s3_secret_keyring_auth_id` | vazio | As credenciais do armazenamento de objetos, com o segredo guardado no keyring |
+| `vsql_duckdb.memory_limit_mb` | `1024` | O teto de memória do mecanismo embutido |
+| `vsql_duckdb.threads` | `2` | Quantas threads ele pode usar |
+| `vsql_duckdb.timeout_ms` | `30000` | Por quanto tempo uma consulta pode rodar |
+| `vsql_duckdb.max_result_bytes` | `1048576` | O teto de tamanho de um resultado retornado |
+| `vsql_duckdb.temp_directory` | vazio | Onde ele grava em disco quando uma consulta excede a memória, o que acontece somente enquanto `allow_local_files` está ativado |
+
+`SHOW STATUS LIKE 'vsql_duckdb%'` informa dois contadores, que persistem
+durante a vida do processo do servidor:
+
+```
++----------------------------+-------+
+| Variable_name              | Value |
++----------------------------+-------+
+| vsql_duckdb.queries_failed | 0     |
+| vsql_duckdb.queries_total  | 0     |
++----------------------------+-------+
+```
+
+`queries_total` conta uma chamada de `duckdb_query()` ou `duckdb_scalar()` que
+foi executada, tenha ela tido sucesso ou gerado um erro — uma chamada de
+`duckdb_scalar()` que retorna `NULL`, por um resultado vazio ou por um valor
+NULL, conta como sucesso. Uma chamada cujo argumento `sql` é ele mesmo `NULL`
+retorna `NULL` sem incrementar nenhum dos contadores. `queries_failed` conta
+somente as chamadas que geraram um erro, e está incluído em `queries_total`.
+
+## Exemplo
+
+Pergunte a ele o que ele é:
+
+```sql
+SELECT duckdb_status() AS status\G
+```
+
+```
+*************************** 1. row ***************************
+status: {
+  "duckdb_version": "v1.5.5",
+  "readers": ["core_functions", "httpfs", "json", "parquet"],
+  "engine_error": "",
+  "object_storage_credential": "not configured",
+  "s3_endpoint": "",
+  "s3_region": "",
+  "s3_url_style": "vhost",
+  "s3_use_ssl": true,
+  "enable_external_access": true,
+  "allow_local_files": false,
+  "memory_limit_mb": 1024,
+  "threads": 2,
+  "timeout_ms": 30000,
+  "max_result_bytes": 1048576
+}
+```
+
+Execute uma consulta que não toca em nenhum arquivo:
+
+```sql
+SELECT duckdb_scalar('SELECT 6 * 7') AS answer;
+```
+
+```
++--------+
+| answer |
++--------+
+| 42     |
++--------+
+```
+
+Leia um CSV e receba as linhas de volta como JSON. A leitura do disco do
+próprio servidor vem desativada por padrão, então ative-a primeiro:
+
+```sql
+SET GLOBAL vsql_duckdb.allow_local_files = ON;
+
+SELECT duckdb_query(
+    'SELECT sku, units * unit_price AS total
+     FROM read_csv_auto(''/path/to/sales.csv'')
+     ORDER BY total DESC') AS rows_json\G
+```
+
+```
+*************************** 1. row ***************************
+rows_json: [{"sku":"A-100","total":59.97},{"sku":"A-101","total":24.5},{"sku":"A-102","total":21.7}]
+```
+
+Desative-a novamente quando terminar, porque ela permanece ativada até que
+você o faça:
+
+```sql
+SET GLOBAL vsql_duckdb.allow_local_files = OFF;
+```
+
+Como o resultado é JSON, o `JSON_TABLE` o transforma de volta em linhas que
+você pode juntar com as suas próprias tabelas.
+
+<Warning>
+  O `allow_local_files` abre todo arquivo que a conta do servidor pode ler, e o
+  `enable_external_access` vem ativado por padrão, então uma consulta também
+  pode acessar a rede. As funções de extensão não podem receber permissões via
+  GRANT como as funções armazenadas, então qualquer pessoa que possa executar
+  SQL aqui pode chamá-las: instalar a extensão dá a todas as contas o alcance
+  dos dois interruptores. O segredo do armazenamento de objetos fica no
+  keyring, e o `vsql_duckdb.s3_secret_keyring_id` apenas o nomeia.
+</Warning>
+
+<Note>
+  Uma configuração gravada com `SET PERSIST` sobrevive a uma reinicialização,
+  mas `UNINSTALL EXTENSION` a apaga. Após desinstalar e reinstalar, toda
+  configuração volta ao seu padrão, e nenhuma reinicialização traz o valor
+  antigo de volta.
+</Note>

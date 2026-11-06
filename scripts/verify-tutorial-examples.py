@@ -53,6 +53,8 @@ SOCKET = os.environ.get("VSQL_SOCKET", "/tmp/mysql.sock")
 USER = os.environ.get("VSQL_USER", "root")
 DB = os.environ.get("VSQL_DB", "sakila")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# English pages live under en/ once the site moves them there.
+EN = "en/" if glob.glob(os.path.join(REPO, "en", "**", "*.mdx"), recursive=True) else ""
 
 # A syntax skeleton is recognised by its placeholders, which are upper case and
 # always contain an underscore (COLUMN_LIST, SORT_COLUMN). Matching bare upper
@@ -255,7 +257,12 @@ def orders_rows(sql):
 
 def main():
     ok = bad = skipped = notes = 0
-    for path in sorted(glob.glob(os.path.join(REPO, "tutorial", "*.mdx"))):
+    paths = sorted(glob.glob(os.path.join(REPO, EN, "tutorial", "*.mdx")))
+    if not paths:
+        # A run that checks nothing must not pass.
+        print(f"no lessons found in {os.path.join(REPO, EN, 'tutorial')}")
+        return 1
+    for path in paths:
         name = os.path.basename(path)
         text = open(path).read()
         found_db = VERIFY_DB.search(text)
