@@ -3,10 +3,11 @@
 
 Used at release-cut time (VERSIONING.md step 4) to de-index the version that
 just lost `default: true`. Idempotent — safe to re-run. Covers the English
-tree (`<product>/<version>/`) and its locale mirrors.
+tree (`<product>/<version>/`, or `en/<product>/<version>/` once English moves
+under en/) and its locale mirrors.
 
 Usage:
-    python3 scripts/noindex-version.py 0.0.4 [--product mysql-9.7]
+    python3 scripts/noindex-version.py 0.0.4 [--product mysql-9.7 | 9.7]
         [--dry-run] [--repo PATH]
 """
 
@@ -15,12 +16,17 @@ import sys
 from pathlib import Path
 
 DEFAULT_PRODUCT = "mysql-8.4"
-LOCALES = ["", "ja", "ko", "zh", "pt-BR"]  # "" = English tree at repo root
+LOCALES = ["", "ja", "ko", "zh", "pt-BR"]  # "" = English tree, at the root or under en/
 
 
 def version_dirs(repo: Path, product: str, version: str):
+    english = repo / "en" if any((repo / "en").rglob("*.mdx")) else repo
+    # mysql-8.4 or 8.4: the folder may have dropped its mysql- prefix. It counts
+    # only when it holds pages: the old folder keeps schema .json files.
+    number = product.removeprefix("mysql-")
+    product = number if any((english / number).rglob("*.mdx")) else f"mysql-{number}"
     for locale in LOCALES:
-        base = repo / locale / product / version if locale else repo / product / version
+        base = repo / locale / product / version if locale else english / product / version
         if base.is_dir():
             yield base
 

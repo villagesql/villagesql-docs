@@ -1,0 +1,151 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+O `vsql_rest` serve as suas tabelas por HTTP de dentro do processo do banco de
+dados. Um cliente lê linhas com uma URL em vez de uma conexão, filtra-as com
+parâmetros de consulta e chama funções armazenadas em `/rpc/`. Não há
+aplicação para escrever nem segundo processo para executar.
+
+| | |
+|---|---|
+| **Mantenedor** | VillageSQL |
+| **Código-fonte e documentação completa** | [villagesql/vsql-rest](https://github.com/villagesql/vsql-rest) |
+| **Licença** | GPL-2.0 |
+| **Capability** | Preview |
+
+<Warning>
+  Esta extensão usa uma capability Preview, então `vsql_allow_preview_extensions`
+  precisa estar `ON`. Inicie o servidor com `--vsql_allow_preview_extensions=ON`
+  ou execute `SET PERSIST vsql_allow_preview_extensions = ON`. Caso contrário,
+  o `INSTALL EXTENSION` é recusado.
+</Warning>
+
+## Instalar
+
+O `vsql_rest.veb` já está no diretório `lib/veb/` do servidor se você instalou
+o VillageSQL com o script de instalação, a imagem Docker ou um tarball de
+release. Instale-o no servidor com uma única instrução:
+
+```sql
+INSTALL EXTENSION vsql_rest;
+```
+
+Confirme que ele está lá:
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_rest';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_rest      |
++----------------+
+```
+
+Para compilá-lo você mesmo, siga as instruções de compilação no
+[repositório](https://github.com/villagesql/vsql-rest).
+
+## O que ela adiciona
+
+Ela não adiciona funções SQL. Você a configura com `SET GLOBAL`, e toda
+requisição que ela responde chega por HTTP.
+
+| Configuração | Padrão | O que controla |
+|---|---|---|
+| `vsql_rest.vsql_rest_enabled` | `OFF` | Se o listener está em execução |
+| `vsql_rest.schema` | vazio | O banco de dados que ele serve; toda requisição de tabela e de RPC recebe `503` (código `VSQL0007`) até que isso seja definido |
+| `vsql_rest.allowed_tables` | vazio | Quais tabelas são acessíveis; vazio significa todas |
+| `vsql_rest.table_methods` | vazio | Quais métodos HTTP cada tabela aceita, escrito como `table:GET,POST\|table2:GET`; vazio significa `GET`, `POST`, `PATCH` e `DELETE` em todas as tabelas |
+| `vsql_rest.allowed_routines` | vazio | Quais funções podem ser chamadas em `/rpc/`; vazio significa todas |
+| `vsql_rest.port` | `3000` | A porta HTTP |
+| `vsql_rest.ssl_port` | `3443` | A porta HTTPS |
+| `vsql_rest.ssl_cert`, `vsql_rest.ssl_key` | vazio | O certificado e a chave para HTTPS |
+| `vsql_rest.require_auth` | `OFF` | Se uma requisição precisa carregar um JWT |
+| `vsql_rest.jwt_secret`, `vsql_rest.jwt_public_key` | vazio | Como esse JWT é verificado |
+| `vsql_rest.max_rows` | `1000` | Quantas linhas voltam quando uma requisição não traz `?limit` |
+| `vsql_rest.schema_ttl` | `60` | Por quanto tempo o layout de tabelas em cache é reutilizado, em segundos; alterar `vsql_rest.schema`, ou desativar e reativar `vsql_rest_enabled`, o reconstrói na próxima requisição |
+
+## Exemplo
+
+Crie a tabela primeiro, porque o listener armazena em cache o layout do banco
+de dados quando inicia e o mantém por `schema_ttl` segundos:
+
+```sql
+CREATE DATABASE extdocs;
+USE extdocs;
+
+CREATE TABLE people (id INT PRIMARY KEY, name VARCHAR(32));
+
+INSERT INTO people VALUES
+    (1, 'Jonathan Smith'),
+    (2, 'John Smyth'),
+    (3, 'Joan Smithe'),
+    (4, 'Peter Brown');
+```
+
+Em seguida, nomeie o banco de dados e a tabela e ligue o listener:
+
+```sql
+SET GLOBAL vsql_rest.schema = 'extdocs';
+SET GLOBAL vsql_rest.allowed_tables = 'people';
+SET GLOBAL vsql_rest.vsql_rest_enabled = ON;
+```
+
+Leia a tabela por HTTP:
+
+```bash
+curl http://127.0.0.1:3000/people
+```
+
+```json
+[{"id":1,"name":"Jonathan Smith"},{"id":2,"name":"John Smyth"},{"id":3,"name":"Joan Smithe"},{"id":4,"name":"Peter Brown"}]
+```
+
+Filtre-a com um parâmetro de consulta:
+
+```bash
+curl "http://127.0.0.1:3000/people?id=eq.2"
+```
+
+```json
+[{"id":2,"name":"John Smyth"}]
+```
+
+Desligar a configuração fecha a porta:
+
+```sql
+SET GLOBAL vsql_rest.vsql_rest_enabled = OFF;
+```
+
+<Warning>
+  Os padrões deixam a autenticação desativada, todas as tabelas servidas e
+  todos os métodos HTTP suportados (`GET`, `POST`, `PATCH`, `DELETE`)
+  permitidos, e o listener se vincula a todas as interfaces desde o momento em
+  que inicia. Qualquer coisa que consiga alcançar o host pode então ler e
+  gravar todas as tabelas do schema. Defina `allowed_tables`, `table_methods` e
+  `require_auth`, configure um segredo ou uma chave pública de JWT e coloque a
+  porta atrás de um firewall antes de ligar o listener. Não há configuração de
+  endereço de vinculação.
+</Warning>
+
+<Note>
+  Uma configuração gravada com `SET PERSIST` sobrevive a uma reinicialização,
+  mas `UNINSTALL EXTENSION` a apaga. Após desinstalar e reinstalar, toda
+  configuração volta ao seu padrão, e nenhuma reinicialização traz o valor
+  antigo de volta.
+</Note>
+
+<Note>
+  Toda configuração de string é lida de volta por meio do servidor, que retorna
+  no máximo 1022 bytes. Um `schema`, `allowed_tables`, `allowed_routines`,
+  `table_methods`, `jwt_secret` ou `jwt_public_key` mais longo faz toda
+  requisição falhar com `500`; um `ssl_cert` ou `ssl_key` mais longo impede o
+  listener de iniciar.
+</Note>

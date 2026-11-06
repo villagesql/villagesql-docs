@@ -15,16 +15,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-This is a Mintlify documentation site with the following structure:
+This is a Mintlify documentation site:
 
-- **Configuration**: `docs.json` defines navigation (tabs, groups, pages), theme (almond), colors, logo, and contextual AI tool options
-- **Content organization**:
-  - `essentials/` - Core documentation content (markdown, code, images, settings, navigation)
-  - `ai-tools/` - AI tool integration guides (cursor, claude-code, windsurf)
-  - `api-reference/` - API documentation with OpenAPI spec
-  - `snippets/` - Reusable content snippets
-- **Navigation structure**: Two-tab layout (Guides, API reference) with nested groups
-- **Deployment**: Auto-deploys to production via GitHub app integration when pushing to main branch
+- **Configuration**: `docs.json` holds the navigation, one menu per language, the theme, colors, logo, and redirects.
+- **Content**: English pages live under `en/`, except the home page `index.mdx`. Translations live under `ja/`, `ko/`, `zh/`, and `pt-BR/` with the same paths. `snippets/` holds shared content, and `scripts/` holds the generators and release tools.
+- **Navigation**: six tabs: Overview, Extensions, Server, Reference, Guides, and Resources.
+- **Deployment**: auto-deploys to production when a change merges to `main`.
+
+[VERSIONING.md](./VERSIONING.md) explains which pages are shared by every release and which have a copy per server and release.
 
 ## Working relationship
 - You can push back on ideas-this can lead to better documentation. Cite sources and explain your reasoning when you do so
@@ -82,9 +80,9 @@ VillageSQL's key differentiator is its extension framework. When documenting ext
 ## Extension pages
 
 Each extension has one body in `snippets/extensions/<slug>.mdx` and one page
-per live version slot under `<slot>/extensions/<slug>.mdx`. The pages are
-generated: edit the body, or the title and See also list in
-`scripts/extension-pages.json`, then run `scripts/gen-extension-pages.py`.
+at `en/extensions/<slug>.mdx`. The pages are generated: edit the body, or the
+title and See also list in `scripts/extension-pages.json`, then run
+`scripts/gen-extension-pages.py`.
 
 Two Mintlify constraints put the See also list in the generated page instead of
 the shared body, and both were measured:
@@ -112,7 +110,8 @@ the shared body, and both were measured:
 
 ## Versioning workflow
 - See [VERSIONING.md](./VERSIONING.md) for the complete versioning policy
-- All changes go to the dev slot (e.g., `mysql-8.4/dev/`)
+- A change in the released software, or a fix to wrong text, edits the shared page or the stable server page
+- A change that exists only on `main` edits the dev server page (such as `en/8.4/dev/`), or adds a `Changed in <next>-dev` note to the shared page
 - When cutting a release, follow the process in VERSIONING.md
 
 ## Git workflow

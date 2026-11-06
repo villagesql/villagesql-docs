@@ -1,0 +1,143 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+当几个数值列属于一组，而您想把它们作为一个值来查询时，请使用
+`vsql_cube`。一串 AND 条件可以测试某一行是否落在某个范围内，但不能
+按距离对行排序。`cube` 类型两者都能做到。它是 PostgreSQL `cube` 扩展的
+移植版本。大多数 PostgreSQL 函数名得以保留；`cube()` 构造函数、运算符
+及其支持函数（`cube_contained`、`cube_overlap`、`distance_taxicab`、
+`distance_chebyshev`）变成了下面的具名函数。
+
+| | |
+|---|---|
+| **维护者** | VillageSQL |
+| **源代码和完整文档** | [villagesql/vsql-cube](https://github.com/villagesql/vsql-cube) |
+| **许可证** | GPL-2.0 |
+
+## 安装 {#install}
+
+如果您使用安装脚本、Docker 镜像或发行版压缩包安装了 VillageSQL，
+`vsql_cube.veb` 已经位于服务器的 `lib/veb/` 目录中。
+用一条语句将它安装到服务器中：
+
+```sql
+INSTALL EXTENSION vsql_cube;
+```
+
+确认它已存在：
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_cube';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_cube      |
++----------------+
+```
+
+要自行构建，请按照[存储库](https://github.com/villagesql/vsql-cube)中的
+构建说明进行操作。
+
+## 新增内容 {#what-it-adds}
+
+### cube 类型
+
+将列声明为 `` `cube`(N) ``，其中 `N` 是一个值可以拥有的最大维数，从 1 到 100。
+`cube` 是 MySQL 的保留字，因此需要反引号，并且维数是必需的。
+
+```sql
+CREATE TABLE sensors (
+    id      INT PRIMARY KEY,
+    name    VARCHAR(32),
+    reading `cube`(3)
+);
+```
+
+以坐标字符串写入值。列会解析它：
+
+```sql
+INSERT INTO sensors VALUES
+    (1, 'north', '12.5,40.1,3.0'),
+    (2, 'south', '48.0,12.7,9.5'),
+    (3, 'east',  '30.2,25.0,6.1');
+```
+
+### 函数
+
+| 函数 | 返回 | 作用 |
+|---|---|---|
+| `cube_point_nd(x, y, ...)` | `cube` | 由坐标构建一个点 |
+| `cube_box_nd(lower..., upper...)` | `cube` | 由下角点和随后的上角点构建一个盒子 |
+| `cube_point(x)`、`cube_box(x, y)` | `cube` | 构建一维的点或盒子 |
+| `cube_from_string(s)`、`cube_to_string(c)` | `cube`、字符串 | 在文本和 `cube` 之间转换 |
+| `cube_dim(c)` | 整数 | 维数 |
+| `cube_coord(c, n)` | 实数 | 第 `n` 个坐标，先数左下角再数右上角。超出范围返回 NULL |
+| `cube_ll_coord(c, n)`、`cube_ur_coord(c, n)` | 实数 | 左下角或右上角的第 `n` 个坐标 |
+| `cube_is_point(c)` | 整数 | 值是点时为 1，是盒子时为 0 |
+| `cube_contains(a, b)`、`cube_contained_by(a, b)` | 整数 | 一个值是否包含另一个值 |
+| `cube_overlaps(a, b)` | 整数 | 两个值是否有重叠空间 |
+| `cube_distance(a, b)` | 实数 | 欧几里得距离 |
+| `cube_taxicab_distance(a, b)` | 实数 | 曼哈顿距离 |
+| `cube_chebyshev_distance(a, b)` | 实数 | 切比雪夫距离 |
+| `cube_union(a, b)`、`cube_inter(a, b)` | `cube` | 包含两者的最小盒子；两者的交集 |
+| `cube_enlarge(c, r, n)` | `cube` | 在前 `n` 个维度上把值扩大 `r` |
+| `cube_subset(c, d1, d2, ...)` | `cube` | 由列出的维度组成的新值，从 1 开始计数 |
+| `cube_add_dim(c, lo, hi, ...)` | `cube` | 每对 lo/hi 追加一个维度 |
+| `cube_agg(c)` | `cube` | 聚合：组内所有值的包围盒 |
+| `cube_scalar_agg(x)` | `cube` | 聚合：数值列的包围范围 |
+
+## 示例 {#example}
+
+找出离目标读数最近的两个传感器，再找出某个区域内的传感器：
+
+```sql
+SELECT name, ROUND(cube_distance(reading, cube_point_nd(30, 25, 6)), 2) AS dist
+FROM sensors
+ORDER BY dist
+LIMIT 2;
+```
+
+```
++-------+-------+
+| name  | dist  |
++-------+-------+
+| east  |  0.22 |
+| south | 22.08 |
++-------+-------+
+```
+
+```sql
+SELECT name FROM sensors
+WHERE cube_contains(cube_box_nd(10, 10, 0, 35, 45, 7), reading) = 1;
+```
+
+```
++-------+
+| name  |
++-------+
+| north |
+| east  |
++-------+
+```
+
+<Note>
+  `cube` 参数从列获取维数，因此当某个 `cube` 参数是列值，或是保留列维数
+  的函数（例如 `cube_union` 或 `cube_enlarge`）的结果时，调用才能成功。
+  没有这类参数的调用，例如 `cube_dim(cube_point_nd(1, 2))`，会失败并报
+  `ERROR 3219 (HY000): Cannot initialize function 'cube_dim': cannot determine
+  type parameters for vsql_cube.cube in argument 1`。出于同样的原因，
+  插入时请使用普通坐标字符串，而不要用 `cube_point_nd()` 包装。
+
+  `cube_point_nd`、`cube_box_nd`、`cube_subset` 和 `cube_add_dim` 的每个
+  坐标参数也可以是逗号分隔的字符串，各列表首尾相接。因此
+  `cube_point_nd('1,2,3')` 和 `cube_point_nd(1, 2, 3)` 构建同一个点。
+  当坐标存放在列中时请传入字符串，这是单独参数无法表达的唯一情况。
+</Note>

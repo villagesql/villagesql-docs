@@ -1,0 +1,141 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+O `vsql_oauth2` permite que uma conta faça login com um JWT em vez de uma
+senha. A extensão verifica a assinatura do token, com chaves obtidas de um
+endpoint JWKS ou com uma única chave pública estática, verifica se o token não
+expirou e mapeia uma claim dentro dele para uma conta do VillageSQL. O seu
+provedor de identidade continua sendo o único lugar que emite credenciais.
+
+| | |
+|---|---|
+| **Mantenedor** | VillageSQL |
+| **Código-fonte e documentação completa** | [villagesql/vsql-oauth2](https://github.com/villagesql/vsql-oauth2) |
+| **Licença** | GPL-2.0 |
+| **Capability** | Preview |
+
+<Warning>
+  Esta extensão usa uma capability Preview, então `vsql_allow_preview_extensions`
+  precisa estar `ON`. Inicie o servidor com `--vsql_allow_preview_extensions=ON`
+  ou execute `SET PERSIST vsql_allow_preview_extensions = ON`. Caso contrário,
+  o `INSTALL EXTENSION` é recusado.
+</Warning>
+
+## Instalar
+
+O `vsql_oauth2.veb` já está no diretório `lib/veb/` do servidor se você
+instalou o VillageSQL com o script de instalação, a imagem Docker ou um tarball
+de release. Instale-o no servidor com uma única instrução:
+
+```sql
+INSTALL EXTENSION vsql_oauth2;
+```
+
+Confirme que ele está lá:
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_oauth2';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_oauth2    |
++----------------+
+```
+
+Para compilá-lo você mesmo, siga as instruções de compilação no
+[repositório](https://github.com/villagesql/vsql-oauth2).
+
+## O que ela adiciona
+
+Ela adiciona um plugin de autenticação, e não funções SQL. Nomeie o plugin ao
+criar a conta, e essa conta passa a se autenticar apresentando um token:
+
+```sql
+CREATE USER 'analyst'@'%' IDENTIFIED WITH vsql_oauth2;
+```
+
+```sql
+SELECT user, plugin FROM mysql.user WHERE user = 'analyst';
+```
+
+```
++---------+-------------+
+| user    | plugin      |
++---------+-------------+
+| analyst | vsql_oauth2 |
++---------+-------------+
+```
+
+A sessão roda como a conta que o token nomeia, e não como a conta que se
+conectou. A claim em `username_claim`, `sub` por padrão, fornece esse nome.
+Quando o seu valor é `analyst`, a instrução acima é tudo de que você precisa.
+Quando ela nomeia outra coisa, como um endereço de e-mail, crie essa conta
+também e deixe a conta que se conecta atuar como proxy dela:
+
+```sql
+CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
+CREATE USER 'alice@example.com' ACCOUNT LOCK;
+GRANT SELECT ON app.* TO 'alice@example.com';
+GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
+```
+
+`ACCOUNT LOCK` impede que alguém faça login como `alice@example.com`
+diretamente, e a concessão de proxy continua funcionando para uma conta
+bloqueada. Um servidor que executa o `validate_password` se recusa a criar uma
+conta sem senha, bloqueada ou não, respondendo
+`ERROR 1819 (HY000): Your password does not satisfy the current policy
+requirements`. Onde isso se aplica, dê à conta uma senha que ninguém possui.
+
+Sem a concessão de proxy, o login é recusado com
+`ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing
+proxy privilege.`
+
+Todo o resto é configuração.
+
+| Configuração | Padrão | O que controla |
+|---|---|---|
+| `vsql_oauth2.jwks_url` | vazio | De onde as chaves de assinatura são obtidas. Tem precedência sobre uma chave estática |
+| `vsql_oauth2.public_key` | vazio | Uma chave pública estática, para um provedor sem endpoint JWKS |
+| `vsql_oauth2.jwks_refresh_interval` | `3600` | Com que frequência essas chaves são obtidas novamente, em segundos |
+| `vsql_oauth2.jwks_http_timeout` | `5` | Quanto tempo uma busca pode levar, em segundos |
+| `vsql_oauth2.issuer` | vazio | A claim `iss` que um token precisa carregar, quando definida |
+| `vsql_oauth2.audience` | vazio | A claim `aud` que um token precisa carregar, quando definida |
+| `vsql_oauth2.username_claim` | `sub` | Qual claim nomeia a conta |
+| `vsql_oauth2.roles_claim` | vazio | Qual claim carrega as roles |
+| `vsql_oauth2.roles_filter` | vazio | Quais dessas roles são consideradas |
+| `vsql_oauth2.roles_transform_pattern`, `vsql_oauth2.roles_transform_replacement` | vazio | Como o nome de role de um provedor se torna um nome de role do banco de dados |
+| `vsql_oauth2.auto_create` | `OFF` | Se um sujeito desconhecido recebe uma conta no primeiro login |
+| `vsql_oauth2.auto_grant` | `OFF` | `OFF`/`ON`/`SYNC` — `OFF` ativa somente as roles já concedidas; `ON` também concede as roles reivindicadas que existem como roles do BD; `SYNC` faz isso e revoga as roles concedidas que o token não reivindica mais, exceto as roles padrão |
+
+Assinaturas RSA são aceitas como RS256, RS384 e RS512, e ECDSA como ES256,
+ES384 e ES512.
+
+<Warning>
+  `auto_create` e `auto_grant` vêm desativados por padrão, e esse padrão é o
+  seguro. Ativá-los significa que o seu provedor de identidade decide quem tem
+  uma conta aqui e o que ela pode acessar, então restrinja `roles_filter` antes
+  de fazê-lo. `auto_grant = SYNC` vai além: ele também revoga qualquer role que
+  a conta possui e que o token não reivindica, exceto as roles definidas como
+  `DEFAULT ROLE` da conta por um operador.
+</Warning>
+
+<Note>
+  Uma configuração gravada com `SET PERSIST` sobrevive a uma reinicialização,
+  mas `UNINSTALL EXTENSION` a apaga. Após desinstalar e reinstalar, toda
+  configuração volta ao seu padrão, e nenhuma reinicialização traz o valor
+  antigo de volta.
+</Note>
+
+## Variáveis de status
+
+| Variável | Descrição |
+|----------|-------------|
+| `vsql_oauth2.jwks_fetch_failures` | Logins que falharam porque a busca do JWKS falhou e não havia chaves em cache para usar. Uma atualização que falha e recorre às chaves em cache não conta. |

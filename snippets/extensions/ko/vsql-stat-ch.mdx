@@ -1,0 +1,118 @@
+{/* Body of the extension page, shared by every version slot. The See also
+    list is NOT here: it lives in each generated page under
+    <slot>/extensions/, because a snippet cannot take a property and a
+    relative link fails mint broken-links. Run
+    scripts/gen-extension-pages.py after editing. */}
+
+`vsql_stat_ch`는 서버가 완료하는 모든 문마다 이벤트 하나를 기록하고, 이를
+배치로 ClickHouse에 보냅니다. 그러면 쿼리 이력이 집계할 수 있는 곳에 쌓이며,
+둘 사이에 수집기 프로세스가 필요 없습니다. ClickHouse의 네이티브 프로토콜 또는
+HTTP를 사용하며, 서버가 실행 중인 상태에서 둘 사이를 전환할 수 있습니다.
+
+| | |
+|---|---|
+| **관리자** | VillageSQL |
+| **소스 및 전체 문서** | [villagesql/vsql-stat-ch](https://github.com/villagesql/vsql-stat-ch) |
+| **라이선스** | GPL-2.0 |
+| **기능 단계** | 미리 보기 |
+
+<Warning>
+  이 확장 기능은 미리 보기 기능 네 가지를 사용하므로, 서버를
+  `--vsql_allow_preview_extensions=ON`으로 시작해야 합니다. 그렇지 않으면
+  `INSTALL EXTENSION`이 거부됩니다.
+</Warning>
+
+## 설치 {#install}
+
+`vsql_stat_ch`는 서버와 함께 번들로 제공되지 않으므로, 설치하기 전에 빌드하세요.
+ClickHouse 클라이언트를 벤더링하므로 저장소를 서브모듈과 함께 복제합니다:
+
+```bash
+git clone --recurse-submodules https://github.com/villagesql/vsql-stat-ch.git
+cd vsql-stat-ch
+VillageSQL_BUILD_DIR=/path/to/villagesql/build ./build.sh
+```
+
+생성된 `vsql_stat_ch.veb`를 `veb_dir` 시스템 변수가 가리키는 디렉터리에 복사한
+다음 설치합니다:
+
+```sql
+INSTALL EXTENSION vsql_stat_ch;
+```
+
+설치되었는지 확인합니다:
+
+```sql
+SELECT EXTENSION_NAME
+FROM INFORMATION_SCHEMA.EXTENSIONS
+WHERE EXTENSION_NAME = 'vsql_stat_ch';
+```
+
+```
++----------------+
+| EXTENSION_NAME |
++----------------+
+| vsql_stat_ch   |
++----------------+
+```
+
+## 추가되는 기능 {#what-it-adds}
+
+캡처 경로, 설정 집합, 상태 카운터 집합을 추가하며, SQL 함수는 추가하지 않습니다.
+
+| 설정 | 기본값 | 제어 대상 |
+|---|---|---|
+| `vsql_stat_ch.enabled` | `OFF` | 문 캡처 여부 |
+| `vsql_stat_ch.transport` | `native` | 포트 9000용 `native` 또는 HTTP 인터페이스용 `http` |
+| `vsql_stat_ch.clickhouse_host` | `localhost` | 네이티브 전송용 ClickHouse 호스트 |
+| `vsql_stat_ch.clickhouse_port` | `9000` | 그 포트 |
+| `vsql_stat_ch.clickhouse_url` | 비어 있음 | HTTP 전송용 기본 URL |
+| `vsql_stat_ch.clickhouse_database` | `default` | 대상 데이터베이스 |
+| `vsql_stat_ch.clickhouse_table` | `events_raw` | 대상 테이블 |
+| `vsql_stat_ch.clickhouse_user`, `vsql_stat_ch.clickhouse_password` | `default`, 비어 있음 | 자격 증명 |
+| `vsql_stat_ch.compression` | `1` | 0은 없음, 1은 LZ4, 2는 zstd |
+| `vsql_stat_ch.batch_max` | `10000` | 배치 하나에 들어가는 이벤트 수 |
+| `vsql_stat_ch.flush_interval_ms` | `1000` | 부분 배치가 기다리는 시간 |
+| `vsql_stat_ch.queue_capacity` | `100000` | 메모리에서 대기할 수 있는 이벤트 수. 최소 `1000`. 첫 이벤트가 캡처되기 전에 설정하거나, `SET PERSIST` 후 재시작 |
+| `vsql_stat_ch.statement_max_bytes` | `4096` | 문 텍스트를 잘라내는 위치 |
+| `vsql_stat_ch.http_timeout_secs` | `10` | HTTP 전송의 시간 제한 |
+
+## 예제 {#example}
+
+ClickHouse 인스턴스를 지정하고 캡처를 시작합니다:
+
+```sql
+SET GLOBAL vsql_stat_ch.clickhouse_host = 'clickhouse';
+SET GLOBAL vsql_stat_ch.clickhouse_database = 'default';
+SET GLOBAL vsql_stat_ch.clickhouse_table = 'events_raw';
+SET GLOBAL vsql_stat_ch.enabled = ON;
+```
+
+상태 카운터로 동작을 지켜봅니다:
+
+```sql
+SHOW STATUS LIKE 'vsql_stat_ch%';
+```
+
+```
++-------------------------------+-------+
+| Variable_name                 | Value |
++-------------------------------+-------+
+| vsql_stat_ch.events_archived  | 0     |
+| vsql_stat_ch.events_captured  | 0     |
+| vsql_stat_ch.events_dropped   | 0     |
+| vsql_stat_ch.flush_errors     | 0     |
+| vsql_stat_ch.last_flush_utime | 0     |
+| vsql_stat_ch.queue_depth      | 0     |
++-------------------------------+-------+
+```
+
+`events_dropped`가 올라가면 큐가 비워지는 속도보다 빨리 찼다는 뜻이므로,
+ClickHouse의 응답이 느리거나 `queue_capacity`가 문 처리 속도에 비해 너무
+작은 것입니다.
+
+<Note>
+  문 텍스트는 `statement_max_bytes`에서 잘리며, 문 텍스트에는 데이터의
+  리터럴이 포함될 수 있습니다. 캡처를 켜기 전에 ClickHouse 테이블이 무엇을 담아도
+  되는지 결정하세요.
+</Note>
