@@ -1,0 +1,170 @@
+---
+title: "MySQL の全文検索"
+sidebarTitle: "全文検索の使用"
+description: "MySQL の全文検索の仕組み: FULLTEXT インデックス、MATCH...AGAINST 構文、自然言語モードとブールモードとクエリ拡張の比較、および全文検索と LIKE の使い分け。"
+keywords: "mysql full-text search, mysql fulltext index, mysql match against, mysql boolean mode search, mysql natural language search, mysql full text search example, mysql search text"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL の `LIKE '%keyword%'` は小さなテーブルでは機能しますが、インデックスを使えません。すべての行がスキャンされます。全文検索は、テキスト列を検索するための、インデックスを使った順位付きの代替手段を提供します。
+
+## FULLTEXT インデックスの作成 {#creating-a-fulltext-index}
+
+`FULLTEXT` インデックスは、`InnoDB`（デフォルトのストレージエンジン）と `MyISAM` のテーブルの `CHAR`、`VARCHAR`、および `TEXT` 列で機能します。
+
+```sql
+CREATE TABLE articles (
+    id    INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(200),
+    body  TEXT,
+    FULLTEXT idx_ft (title, body)
+);
+```
+
+既存のテーブルに `FULLTEXT` インデックスを追加します。
+
+```sql
+ALTER TABLE articles ADD FULLTEXT INDEX idx_ft (title, body);
+```
+
+1 つの `FULLTEXT` インデックスは複数の列にまたがることができます。そのインデックスに対するクエリは、インデックス化されたすべての列を同時に検索します。
+
+## MATCH...AGAINST によるクエリ {#querying-with-matchagainst}
+
+全文クエリは `MATCH(columns) AGAINST(expression)` 構文を使います。`MATCH` の列リストは、`FULLTEXT` インデックスの列と正確に一致しなければなりません。
+
+```sql
+SELECT id, title,
+       MATCH(title, body) AGAINST('database performance') AS relevance
+FROM articles
+WHERE MATCH(title, body) AGAINST('database performance');
+```
+
+`MATCH...AGAINST` が `WHERE` 句にあるとき、MySQL は関連度の降順で行を返します。`AGAINST` 式は関連度スコアを返し、0 は一致なしを意味します。
+
+## 検索モード {#search-modes}
+
+MySQL は 3 つの検索モードをサポートしています。
+
+| モード | 構文 | 動作 |
+|:-----|:-------|:---------|
+| 自然言語（デフォルト） | `AGAINST('phrase')` または `AGAINST('phrase' IN NATURAL LANGUAGE MODE)` | 関連度で結果を順位付けします。よくある単語は無視されます |
+| ブールモード | `AGAINST('phrase' IN BOOLEAN MODE)` | 演算子（`+`、`-`、`*`、`""`）をサポートします。関連度スコアは利用できますが自動ではありません。順位付けするには `ORDER BY MATCH...AGAINST` を追加します |
+| クエリ拡張 | `AGAINST('phrase' WITH QUERY EXPANSION)` | 2 パス: まず一致を見つけ、次にその結果から得た関連語で拡張します |
+
+### 自然言語モード {#natural-language-mode}
+
+デフォルトです。MySQL は、極端によくある単語を事実上無視する重み付け方式を使います。ほぼすべての行に現れる語は、関連度スコアにほとんど寄与しません。英語のよくあるストップワード（`the`、`is`、`at`）は完全に除外されます。明示的な `ORDER BY` がない場合、結果は関連度の降順で返されます。
+
+```sql
+-- Returns rows matching 'index' or 'query', ranked by relevance
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('index query');
+```
+
+### ブールモード {#boolean-mode}
+
+ブールモードは、精密な制御のための演算子をサポートします。
+
+```sql
+-- Must contain 'index', must not contain 'slow', 'performance' is optional
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('+index -slow performance' IN BOOLEAN MODE);
+```
+
+よく使うブール演算子:
+
+| 演算子 | 意味 | 例 |
+|:---------|:--------|:--------|
+| `+` | 単語が存在しなければならない | `+index` |
+| `-` | 単語が存在してはならない | `-slow` |
+| `*` | 前方一致のワイルドカード | `perform*` |
+| `""` | フレーズ一致 | `"query optimizer"` |
+| `>` `<` | 関連度を上げる/下げる | `>fast <slow` |
+| `()` | グループ化 | `+(index query) -slow` |
+
+InnoDB テーブルでは、`MATCH()` 式のすべての列に `FULLTEXT` インデックスが必要です。それがないと、InnoDB でのブールモードのクエリはエラーを返します。（MyISAM は FULLTEXT インデックスなしのブールモードを許可しますが、すべての行をスキャンします。）
+
+### クエリ拡張 {#query-expansion}
+
+2 パスの検索です。MySQL は最初のクエリを実行し、上位の一致を取り、そこから追加の語を抽出し、それらの語を加えて検索を再実行します。
+
+```sql
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('database' WITH QUERY EXPANSION);
+```
+
+ユーザーが単一の語やあいまいな語で検索するときに役立ちます。最初のパスの上位の一致が話題から外れている場合、意外な結果を返すことがあります。
+
+## 全文検索と LIKE の比較 {#full-text-search-vs-like}
+
+| | FULLTEXT + MATCH...AGAINST | LIKE '%keyword%' |
+|:--|:--------------------------|:-----------------|
+| インデックスの使用 | あり。大きなテーブルで高速 | なし。フルスキャン |
+| 関連度の順位付け | あり（自然言語モード） | なし |
+| 単語の部分一致 | `*` 演算子で可能 | 可能（LIKE '%word%'） |
+| 複数の列 | インデックスごとに 1 つの MATCH | OR 条件が必要 |
+| FULLTEXT インデックスの要否 | 必要（InnoDB は必須。MyISAM はなしでもスキャンする） | 不要 |
+| 最小の単語長 | あり（`innodb_ft_min_token_size` = 3） | なし |
+| 短い単語（2 文字） | デフォルトで除外される | 一致する |
+
+小さなテーブルでの単純なパターン一致、前方一致検索（インデックス付きの `LIKE 'prefix%'`）、または任意のパターン一致が必要な場合は `LIKE` を使います。テキスト列の中の単語やフレーズを検索していて、関連度の順位付けや大規模でのより良いパフォーマンスが必要な場合は、全文検索を使います。
+
+## 最小の単語長 {#minimum-word-length}
+
+InnoDB のデフォルトの最小トークンサイズは 3 文字です（`innodb_ft_min_token_size`）。3 文字より短い単語はインデックス化されません。2 文字の単語のためには、最小値を下げます。
+
+```sql
+-- In my.cnf / my.ini
+[mysqld]
+innodb_ft_min_token_size = 2
+```
+
+`innodb_ft_min_token_size` は動的変数ではありません。有効にするにはサーバーの再起動が必要です。再起動後、すべての `FULLTEXT` インデックスを再構築します。
+
+```sql
+OPTIMIZE TABLE articles;
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 単語がテーブルにあるのに、MATCH...AGAINST が行を返さないのはなぜですか? {#why-does-my-matchagainst-return-no-rows-even-though-the-word-is-in-the-table}
+
+よくある理由は 3 つです。(1) 単語が `innodb_ft_min_token_size`（デフォルト 3）より短い。(2) 単語がストップワードリストにある。(3) MyISAM テーブルで、単語が 50% 以上の行に現れる。MyISAM の自然言語モードは、そのような単語を役に立たないほどよくある単語として扱います。InnoDB にはこの制限がありません。MyISAM の 50% のしきい値を回避するにはブールモードを使います。
+
+#### 全文検索を WHERE 条件と一緒に使えますか? {#can-i-use-full-text-search-with-where-conditions}
+
+はい。`MATCH...AGAINST` を他の `WHERE` 条件と通常どおり組み合わせます。
+
+```sql
+SELECT title FROM articles
+WHERE status = 'published'
+  AND MATCH(title, body) AGAINST('performance' IN BOOLEAN MODE);
+```
+
+MySQL は全文検索の部分に `FULLTEXT` インデックスを使い、他のインデックス付きの列でのフィルタは別に行えます。
+
+#### MySQL の全文検索は複数の言語をサポートしていますか? {#does-mysql-full-text-search-support-multiple-languages}
+
+MySQL にはいくつかの言語の組み込みストップワードリストがあります。本番環境の多言語検索では、通常、`innodb_ft_enable_stopword = OFF` を設定して `innodb_ft_server_stopword_table` で独自のストップワードテーブルを提供するか、外部の検索エンジン（Elasticsearch、MeiliSearch）を使う必要があります。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 1214: The used table type doesn't support FULLTEXT indexes` | FULLTEXT をサポートするのは InnoDB と MyISAM だけです。`SHOW CREATE TABLE` でストレージエンジンを確認します |
+| `MATCH` の列リストの不一致エラー | `MATCH(...)` の列は、FULLTEXT インデックスに列挙された列と、同じ順序で正確に一致しなければなりません |
+| よくある単語が結果を返さない | 単語がストップワードリストにあるか、MyISAM テーブルで 50% 以上の行に現れている可能性があります。ブールモードを試します: `AGAINST('word' IN BOOLEAN MODE)` |
+| 短い単語が見つからない | 単語が `innodb_ft_min_token_size`（デフォルト 3）未満です。設定を下げ、MySQL を再起動し、`OPTIMIZE TABLE` を実行してインデックスを再構築します |
+| `INSERT` 後の結果が現れない | InnoDB は FULLTEXT の更新をバッファします。`SET GLOBAL innodb_optimize_fulltext_only=1; OPTIMIZE TABLE articles;` を実行してフラッシュします |
+
+## 関連項目 {#see-also}
+
+- [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes) — FULLTEXT は B ツリーと並ぶ特殊なインデックスの種類です
+- [MySQL の JSON](/ja/guides/json-in-mysql) — 構造化データと並べて JSON のテキストフィールドを検索する
+- [多次元の範囲クエリ](/ja/guides/cube-queries) — テキスト検索が適さない場合に、複数の数値の次元にわたって検索する
+- [MySQL の LIKE](/ja/tutorial/like) — 大規模環境では全文インデックスが置き換えるパターン演算子
+- [MySQL の REGEXP](/ja/tutorial/regexp) — すべての行を読むパターン一致

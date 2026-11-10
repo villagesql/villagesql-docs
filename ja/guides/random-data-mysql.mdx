@@ -1,0 +1,142 @@
+---
+title: "MySQL でのランダムデータの生成"
+sidebarTitle: "ランダムデータの生成"
+description: "MySQL でランダムデータを生成する方法 — RAND()、RANDOM_BYTES()、および VillageSQL の gen_random_bytes() を使った、暗号学的に安全なバイト列、ランダムな UUID、およびテストデータの生成。"
+keywords: "mysql random data, mysql generate random bytes, mysql random uuid, mysql random token, mysql random test data, mysql gen_random_bytes"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL の `RAND()` は、クエリ結果のシャッフルなどに使う疑似乱数を生成します。暗号学的に安全ではないため、トークン、ソルト、またはノンスを生成する場合には問題になります。`RANDOM_BYTES()` がそのギャップを埋め、VillageSQL の `vsql_crypto` 拡張機能は、統一された暗号 API の一部として `gen_random_bytes()` と `gen_random_uuid()` を追加します。
+
+## MySQL のランダム関数 {#mysqls-random-functions}
+
+MySQL には、目的が大きく異なる 2 つの組み込みランダム関数があります。
+
+**`RAND()`** — 0 から 1 の間の疑似乱数の浮動小数点数を返します。高速で、セキュリティに関係しない用途に適しています。クエリ結果のランダム化、重み付きサンプリング、ランダムな行の選択などです。暗号学的に安全ではありません。
+
+```sql
+-- Shuffle query results
+SELECT * FROM products ORDER BY RAND() LIMIT 10;
+
+-- Random integer in a range
+SELECT FLOOR(RAND() * 100) AS random_0_to_99;
+```
+
+**`RANDOM_BYTES(n)`** — 暗号学的に安全な `n` バイトのランダムなバイト列を `VARBINARY` として返します。トークン、ソルト、ノンス、および鍵にはこれを使います。
+
+```sql
+-- 16-byte cryptographic token
+SELECT HEX(RANDOM_BYTES(16)) AS token;
+
+-- Use as a session token
+INSERT INTO sessions (token, user_id, expires_at)
+VALUES (RANDOM_BYTES(32), 42, NOW() + INTERVAL 7 DAY);
+```
+
+## VillageSQL の場合: gen_random_bytes() と gen_random_uuid() {#with-villagesql-gen_random_bytes-and-gen_random_uuid}
+
+VillageSQL の `vsql_crypto` 拡張機能は `gen_random_bytes()` と `gen_random_uuid()` を追加します。これらは、`RANDOM_BYTES()` と同じエントロピー源である OpenSSL の `RAND_bytes()` を使用します。
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+組み込み関数ではなくこれらを使う主な理由は一貫性です。すでに `vsql_crypto` の `digest()`、`hmac()`、または `encrypt()` を使っている場合、すべての暗号操作を 1 つの拡張機能にまとめておくと、アップグレードと監査が簡単になります。
+
+```sql
+-- Cryptographically secure random bytes
+SELECT HEX(gen_random_bytes(16)) AS token_hex;
+SELECT HEX(gen_random_bytes(32)) AS session_key;
+
+-- Verify length
+SELECT LENGTH(gen_random_bytes(24));  -- Returns 24
+
+-- Random UUID v4
+SELECT gen_random_uuid();
+-- Returns: 'de2ae351-fc1b-4182-b6a5-72d11a341dc3' (different every call)
+```
+
+### テストデータの生成 {#generating-test-data}
+
+ランダム関数はテストテーブルへのデータ投入に役立ちます。
+
+```sql
+-- Insert 1000 rows of test data. WITH RECURSIVE must immediately precede
+-- the SELECT it attaches to, so it goes after the INSERT's column list.
+INSERT INTO test_users (username, email, score, token)
+WITH RECURSIVE n AS (
+    SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 1000
+)
+SELECT
+    CONCAT('user_', i),
+    CONCAT('user', i, '@example.com'),
+    FLOOR(RAND() * 100),
+    gen_random_bytes(16)
+FROM n;
+```
+
+### ワンタイムトークンと招待コード {#one-time-tokens-and-invite-codes}
+
+```sql
+CREATE TABLE invites (
+    token     VARBINARY(32) PRIMARY KEY,
+    email     VARCHAR(255),
+    used      TINYINT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO invites (token, email)
+VALUES (gen_random_bytes(32), 'newuser@example.com');
+
+-- Return token as hex for use in a URL
+SELECT HEX(token) AS invite_link, email FROM invites WHERE used = 0;
+```
+
+## 適切な関数の選択 {#choosing-the-right-function}
+
+| 関数 | 出力 | 暗号学的に安全 | 使用する場面 |
+|:---|:---|:---|:---|
+| `RAND()` | 0–1 の浮動小数点数 | いいえ | シャッフル、サンプリング、重み付き選択 |
+| `FLOOR(RAND() * n)` | 0–(n-1) の整数 | いいえ | テストデータ用のランダムな整数 |
+| `RANDOM_BYTES(n)` | VARBINARY | はい | トークン、ノンス、ソルト — MySQL 組み込み |
+| `gen_random_bytes(n)` | VARBINARY | はい | RANDOM_BYTES と同じで、vsql_crypto API と統一 |
+| `gen_random_uuid()` | VARCHAR（UUID 文字列） | はい | 文字列としての UUID v4 — vsql_uuid は不要 |
+
+`RANDOM_BYTES()` と `gen_random_bytes()` は機能的に同等で、どちらも同じ品質の乱数を返します。すでに `vsql_crypto` を使っている場合は、暗号関連の機能を 1 か所にまとめるために `gen_random_bytes()` を使います。ランダムなバイト列だけが必要で他に何も要らない場合は、MySQL の `RANDOM_BYTES()` で十分です。
+
+ソート可能なバリアント（v7）とバイナリ格納を備えた UUID 型が必要な場合は、`gen_random_uuid()` ではなく `vsql_uuid` 拡張機能を使います。完全な比較は [MySQL の UUID](/ja/guides/uuids) を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### RAND() はトークンの生成に安全ですか? {#is-rand-safe-for-generating-tokens}
+
+いいえ。`RAND()` は予測可能な状態からシードされる疑似乱数生成器です。`ORDER BY RAND()` などセキュリティに関係しない用途には問題ありませんが、`RAND()` で生成したトークンは理論上予測できます。セキュリティ上重要なものには `RANDOM_BYTES()` または `gen_random_bytes()` を使ってください。
+
+#### 安全なトークンには何バイト必要ですか? {#how-many-bytes-do-i-need-for-a-secure-token}
+
+セッショントークンと API キーには 32 バイト（256 ビット）が標準です。16 バイト（128 ビット）が実用的なセキュリティの最低ラインです。安全のために 32 バイトを使ってください。
+
+#### gen_random_bytes() を DEFAULT として使用できますか? {#can-i-use-gen_random_bytes-as-a-default}
+
+いいえ。MySQL 自体は DEFAULT 式で非決定的な関数を許可しており、`UUID()`、`RAND()`、および `NOW()` はそこで機能します。`gen_random_bytes()` が拒否されるのは、非決定的として登録された VillageSQL 拡張機能の関数だからで、VEF は MySQL 自体が何を許可するかに関係なく、DEFAULT 式でそれらをブロックします。代わりに各 INSERT ステートメントで値を生成してください。
+
+#### gen_random_uuid() と vsql_uuid の UUID_V4() の違いは何ですか? {#whats-the-difference-between-gen_random_uuid-and-uuid_v4-from-vsql_uuid}
+
+`gen_random_uuid()` は `VARCHAR` の UUID 文字列を返します。`vsql_uuid` 拡張機能の `UUID_V4()` は、16 バイトのバイナリ格納を持つネイティブの `UUID` 型を返します。UUID を主キーとして使う場合は、`vsql_uuid` の `UUID_V4()` または `UUID_V7()` を優先してください。UUID 文字列が必要で、別の拡張機能をインストールしたくない場合は `gen_random_uuid()` を使います。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.gen_random_bytes does not exist` | `INSTALL EXTENSION vsql_crypto` を実行する |
+| トークンが連番または予測可能に見える | `gen_random_bytes()` ではなく `RAND()` を使っている可能性がある |
+| `gen_random_bytes()` が NULL を返す | 引数が正の整数であることを確認する |
+| `DEFAULT (gen_random_bytes(32))` が拒否される | MySQL は非決定的なデフォルトを許可しない — 各 INSERT で生成する |
+
+## 関連項目 {#see-also}
+
+- [MySQL でのパスワードハッシュ](/ja/guides/password-hashing) — 資格情報の保存でランダムなバイト列をソルトとして使う
+- [MySQL の UUID](/ja/guides/uuids) — UUID v4 は暗号学的な乱数のよくある用途

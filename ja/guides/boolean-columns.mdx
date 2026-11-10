@@ -1,0 +1,249 @@
+---
+title: "MySQL で本物のブール値を格納する方法"
+sidebarTitle: "ブール列"
+description: "VillageSQL の vsql_boolean 拡張機能を使用して MySQL に true と false を格納する方法 — TINYINT(1) が 5 や -1 を受け入れる理由と、STRICTBOOL がそれらを拒否する仕組み。"
+keywords: "mysql boolean, mysql tinyint 1 boolean, mysql bool column, mysql true false column, strictbool, vsql_boolean"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL にはブール型がありません。`BOOL` と `BOOLEAN` は `TINYINT(1)` の別表記であり、1 バイトに収まる任意の数値を格納します。この列は `0` や `1` と同じように `5` や `-1` も保持し、入れた値をそのまま返します。VillageSQL の `vsql_boolean` 拡張機能は、2 つの値だけを保持し、それ以外をすべて拒否する `STRICTBOOL` 列型を追加します。
+
+## TINYINT(1) が問題になる理由 {#why-tinyint1-bites}
+
+MySQL が提供する列に、4 行を挿入した例を示します。
+
+```sql
+CREATE TABLE accounts_tinyint (id INT PRIMARY KEY, active BOOL);
+
+INSERT INTO accounts_tinyint VALUES (1, TRUE), (2, FALSE), (3, 5), (4, -1);
+
+SELECT id, active FROM accounts_tinyint;
+```
+
+```
++----+--------+
+| id | active |
++----+--------+
+|  1 |      1 |
+|  2 |      0 |
+|  3 |      5 |
+|  4 |     -1 |
++----+--------+
+```
+
+何も拒否されませんでした。次に、同じ質問を 2 通りの方法で尋ねます。
+
+```sql
+SELECT COUNT(*) AS rows_that_are_truthy FROM accounts_tinyint WHERE active;
+SELECT COUNT(*) AS matches_equals_true  FROM accounts_tinyint WHERE active = TRUE;
+```
+
+```
++----------------------+
+| rows_that_are_truthy |
++----------------------+
+|                    3 |
++----------------------+
++---------------------+
+| matches_equals_true |
++---------------------+
+|                   1 |
++---------------------+
+```
+
+3 行が真と評価され、1 行が `TRUE` と等しくなります。どちらのクエリも正しく見えますが、結果は一致しません。`TRUE` はリテラルの `1` であり、`WHERE active` はゼロ以外の任意の値を調べるためです。`5` を保持する行は、一方のクエリではアクティブで、もう一方では非アクティブです。スキーマには `5` の書き込みを止めるものが何もなかったため、この不一致は後になって、数字の合わないレポートによって発見されます。
+
+## STRICTBOOL 列 {#the-strictbool-column}
+
+```sql
+INSTALL EXTENSION vsql_boolean;
+```
+
+```sql
+CREATE TABLE accounts (
+    id     INT PRIMARY KEY,
+    email  VARCHAR(64),
+    active STRICTBOOL NOT NULL DEFAULT 'false'
+);
+```
+
+この列は、文字列 `'true'`/`'false'`、`'t'`/`'f'`、`'yes'`/`'no'`、`'on'`/`'off'`、および `'1'`/`'0'` を、大文字小文字を問わず受け入れます。文字列として渡してください。数値をそのまま渡すと拒否されます。どの表記で入力しても、返されるのは `true` または `false` です。
+
+```sql
+INSERT INTO accounts (id, email, active) VALUES
+    (1, 'ana@example.com',  'true'),
+    (2, 'ben@example.com',  'no'),
+    (3, 'cleo@example.com', 'on'),
+    (4, 'dev@example.com',  '0');
+
+INSERT INTO accounts (id, email) VALUES (5, 'eve@example.com');
+
+SELECT id, email, active FROM accounts;
+```
+
+```
++----+------------------+--------+
+| id | email            | active |
++----+------------------+--------+
+|  1 | ana@example.com  | true   |
+|  2 | ben@example.com  | false  |
+|  3 | cleo@example.com | true   |
+|  4 | dev@example.com  | false  |
+|  5 | eve@example.com  | false  |
++----+------------------+--------+
+```
+
+行 5 は値を指定しなかったため、列のデフォルト値を取りました。受け入れられる表記以外のものは、あるべき場所、つまり挿入時に拒否されます。
+
+```sql
+INSERT INTO accounts (id, email, active) VALUES (6, 'f@example.com', 'maybe');
+```
+
+```
+ERROR 1366 (HY000): Incorrect STRICTBOOL value: 'maybe' for column 'active' at row 1
+```
+
+値で絞り込むときは、書き込んだときと同じ方法で指定します。
+
+```sql
+SELECT email FROM accounts WHERE active = 'true';
+```
+
+```
++------------------+
+| email            |
++------------------+
+| ana@example.com  |
+| cleo@example.com |
++------------------+
+```
+
+## 集計 {#counting}
+
+この型には 2 つの集計関数が付属します。`boolean_sum` は true の行を数え、`boolean_avg` はその割合を返します。
+
+```sql
+SELECT boolean_sum(active) AS active_accounts,
+       ROUND(boolean_avg(active), 2) AS active_share,
+       COUNT(*) AS total
+FROM accounts;
+```
+
+```
++-----------------+--------------+-------+
+| active_accounts | active_share | total |
++-----------------+--------------+-------+
+|               2 |          0.4 |     5 |
++-----------------+--------------+-------+
+```
+
+どちらの集計関数も NULL を無視するため、割合は回答のあった行を分母として計算されます。
+
+```sql
+CREATE TABLE survey (id INT PRIMARY KEY, agreed STRICTBOOL);
+INSERT INTO survey VALUES (1, 'true'), (2, 'false'), (3, NULL);
+
+SELECT boolean_sum(agreed) AS yes,
+       ROUND(boolean_avg(agreed), 2) AS share,
+       COUNT(*) AS rows_total
+FROM survey;
+```
+
+```
++------+-------+------------+
+| yes  | share | rows_total |
++------+-------+------------+
+|    1 |   0.5 |          3 |
++------+-------+------------+
+```
+
+3 行のうち、2 件の回答に対して 1 件が yes なので、割合は 0.5 です。NULL を false として数えたい場合は、集計関数がそう解釈することを期待するのではなく、クエリで明示してください。
+
+## インデックス {#indexing}
+
+`STRICTBOOL` 列には、他の列と同じようにインデックスを作成できます。
+
+```sql
+CREATE INDEX idx_active ON accounts (active);
+```
+
+そのインデックスに価値があるかどうかは、いつもの問題です。2 つの値しか持たない列の選択性が高くなるのは、一方の値が稀な場合だけです。たとえば、ほとんど何もロックされないアカウントテーブルの `locked` フラグがそうです。
+
+## 既存の列の移行 {#migrating-an-existing-column}
+
+`TINYINT` 列をその場で変換することはできません。サーバーはこれを拒否します。
+
+```sql
+ALTER TABLE accounts_tinyint MODIFY active STRICTBOOL;
+```
+
+```
+ERROR 3219 (HY000): Cannot convert column 'active' to custom type 'STRICTBOOL'
+```
+
+代わりに、2 つ目の列を追加して値を入れます。
+
+```sql
+ALTER TABLE accounts_tinyint ADD COLUMN active_bool STRICTBOOL NOT NULL DEFAULT 'false';
+
+UPDATE accounts_tinyint SET active_bool = 'true'  WHERE active <> 0;
+UPDATE accounts_tinyint SET active_bool = 'false' WHERE active = 0;
+
+SELECT id, active, active_bool FROM accounts_tinyint;
+```
+
+```
++----+--------+-------------+
+| id | active | active_bool |
++----+--------+-------------+
+|  1 |      1 | true        |
+|  2 |      0 | false       |
+|  3 |      5 | true        |
+|  4 |     -1 | true        |
++----+--------+-------------+
+```
+
+この 2 つのステートメントは、それぞれリテラルを代入しています。値を計算するステートメントは拒否されます。`STRICTBOOL` 列は文字列式を受け取らないためです。
+
+```sql
+UPDATE accounts_tinyint SET active_bool = IF(active <> 0, 'true', 'false');
+```
+
+```
+ERROR 3219 (HY000): Incorrect STRICTBOOL value: cannot implicitly cast string expression. Use explicit conversion for column 'active_bool' at row 1
+```
+
+エラーが求める明示的な変換とは、この型自身の関数です。そのため、1 つのステートメントで実行できます。
+
+```sql
+UPDATE accounts_tinyint SET active_bool = STRICTBOOL::from_string(IF(active <> 0, 'true', 'false'));
+```
+
+移行は、`5` や `-1` の行が何を意味していたかを決める機会でもあります。上の例では、ゼロ以外はすべて `true` になりました。これは `WHERE active` が返していた結果と同じです。システム内のどこかのレポートが代わりに `active = 1` を使用していたなら、そのレポートは一致していなかったことになり、今がそれに気づくときです。
+
+新しい列が正しくなったら、古い列を削除して名前を変更します。
+
+```sql
+ALTER TABLE accounts_tinyint DROP COLUMN active;
+ALTER TABLE accounts_tinyint RENAME COLUMN active_bool TO active;
+```
+
+## トラブルシューティング {#troubleshooting}
+
+| エラー | 対処 |
+|---|---|
+| `Incorrect STRICTBOOL value: '<value>'` | 値が受け入れられる表記のいずれでもありません。`'true'`/`'false'`、`'t'`/`'f'`、`'yes'`/`'no'`、`'on'`/`'off'`、または `'1'`/`'0'` を引用符付きで使用します |
+| `Incorrect STRICTBOOL value: cannot implicitly cast string expression` | 右辺が計算式です。`STRICTBOOL::from_string(...)` で包むか、結果ごとにリテラルを代入します |
+| `Cannot convert column '<col>' to custom type 'STRICTBOOL'` | `ALTER ... MODIFY` ではこの型に変換できません。新しい列を追加して値を入れます |
+| `FUNCTION <db>.boolean_sum does not exist` | `INSTALL EXTENSION vsql_boolean` を実行します |
+| `NOT NULL` 列が、その列を省略した挿入を拒否する | 上の例のように、列に明示的な `DEFAULT` を指定します |
+
+## 関連項目 {#see-also}
+
+- [vsql_boolean](/ja/extensions/vsql-boolean) — この拡張機能が追加するすべての関数を記載したリファレンスページ
+- [データ型の選択](/ja/guides/choosing-data-types) — より狭い列に価値がある場合
+- [MySQL における NULL](/ja/guides/null-in-mysql) — ブール集計関数が読み飛ばすもの
+- [MySQL の CHECK 制約](/ja/guides/check-constraints) — 不正な値を拒否するもう 1 つの方法

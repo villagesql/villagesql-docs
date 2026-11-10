@@ -1,0 +1,172 @@
+---
+title: "MySQL の生成列"
+sidebarTitle: "生成列の使用"
+description: "MySQL の生成列の仕組み: VIRTUAL と STORED の比較、式とインデックス作成、関数インデックスのパターン、および生成列がアプリケーション層の計算を置き換える場合。"
+keywords: "mysql generated column, mysql virtual column, mysql stored generated column, mysql computed column, mysql generated column index, mysql functional index, mysql as generated"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+生成列とは、アプリケーションが格納するのではなく、式から値が導出される列です。MySQL がそれを自動的に計算します。スキーマで計算式を一度定義すれば、MySQL がその一貫性を保ちます。
+
+## 構文 {#syntax}
+
+```sql
+column_name data_type [GENERATED ALWAYS] AS (expression) [VIRTUAL | STORED]
+```
+
+```sql
+CREATE TABLE orders (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    subtotal    DECIMAL(10,2) NOT NULL,
+    tax_rate    DECIMAL(5,4) NOT NULL,
+    tax_amount  DECIMAL(10,2) AS (subtotal * tax_rate) VIRTUAL,
+    total       DECIMAL(10,2) AS (subtotal + subtotal * tax_rate) STORED
+);
+```
+
+## VIRTUAL と STORED の比較 {#virtual-vs-stored}
+
+| | VIRTUAL | STORED |
+|:--|:--------|:-------|
+| 格納 | ディスクに格納されず、読み取り時に計算される | INSERT/UPDATE 時にディスクに書き込まれる |
+| 計算のタイミング | すべての SELECT | すべての INSERT/UPDATE |
+| ディスク容量 | 容量を節約する | 通常の列と同じように容量を使う |
+| インデックス作成の可否 | 可能（インデックスが計算された値を格納する） | 可能 |
+| 外部キーの参照先にできるか | 不可 | 不可 |
+| デフォルト | はい。省略時は VIRTUAL がデフォルト | 明示的に指定する |
+
+計算が高コストで、列を書き込むよりはるかに多く読み取る場合は `STORED` を使います。格納容量が懸念される場合や、書き込みが頻繁に起こる場合は `VIRTUAL`（デフォルト）を使います。
+
+## 式 {#expressions}
+
+生成列の式は、同じ行の他の列を参照できます。他の生成列を参照したり、非決定的な関数を呼び出したりすることはできません。
+
+```sql
+CREATE TABLE users (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    first_name VARCHAR(50),
+    last_name  VARCHAR(50),
+    full_name  VARCHAR(101) AS (CONCAT(first_name, ' ', last_name)) VIRTUAL,
+    email      VARCHAR(100),
+    email_lower VARCHAR(100) AS (LOWER(email)) STORED
+);
+```
+
+生成列で許可される関数は決定的でなければなりません。同じ入力が常に同じ出力を生成するものです。許可されないもの: `NOW()`、`RAND()`、`UUID()`、サブクエリ、ストアド関数。
+
+JSON からフィールドを抽出するのはよくある使い方です。
+
+```sql
+CREATE TABLE events (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    payload JSON,
+    user_id INT AS (payload->>'$.user_id') STORED,
+    action  VARCHAR(50) AS (payload->>'$.action') VIRTUAL
+);
+```
+
+## 生成列へのインデックス作成 {#indexing-generated-columns}
+
+生成列にインデックスを追加できます。`VIRTUAL` 列の場合、MySQL は計算された値をインデックスに実体化します。
+
+```sql
+CREATE TABLE events (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    occurred_at DATETIME NOT NULL,
+    ym          VARCHAR(7) AS (DATE_FORMAT(occurred_at, '%Y-%m')) VIRTUAL
+);
+
+-- Index the computed ym. (Note: YEAR_MONTH is a reserved word — the
+-- INTERVAL unit in INTERVAL '1-2' YEAR_MONTH — so an unquoted column
+-- can't be named year_month.)
+ALTER TABLE events ADD INDEX idx_ym (ym);
+
+-- This query now uses the index
+SELECT * FROM events WHERE ym = '2024-06';
+```
+
+これは**関数インデックス**、つまり列の生の値ではなく列の関数に対するインデックスを構築する方法でもあります。MySQL 8.0.13 以降は関数インデックスを直接サポートしており（`INDEX (LOWER(email))`）、内部的に隠れた生成列を作成します。
+
+```sql
+-- Functional index syntax (MySQL 8.0.13+)
+CREATE TABLE users (
+    id    INT PRIMARY KEY,
+    email VARCHAR(100),
+    INDEX idx_email_lower ((LOWER(email)))  -- note the double parentheses
+);
+
+-- Equivalent to:
+CREATE TABLE users (
+    id          INT PRIMARY KEY,
+    email       VARCHAR(100),
+    email_lower VARCHAR(100) AS (LOWER(email)) VIRTUAL,
+    INDEX idx_email_lower (email_lower)
+);
+```
+
+## 挿入と更新 {#inserting-and-updating}
+
+`INSERT` や `UPDATE` で生成列に値を代入することはできません。列の値は常に式から導出されます。明示的に `DEFAULT` と書くことはできますが、それだけです。
+
+```sql
+-- Correct: omit the generated column entirely
+INSERT INTO orders (subtotal, tax_rate) VALUES (100.00, 0.08);
+
+-- Correct: DEFAULT is allowed
+INSERT INTO orders (subtotal, tax_rate, total) VALUES (100.00, 0.08, DEFAULT);
+
+-- Error: cannot assign a value to a generated column
+INSERT INTO orders (subtotal, tax_rate, total) VALUES (100.00, 0.08, 108.00);
+```
+
+## ALTER TABLE {#alter-table}
+
+既存のテーブルに生成列を追加します。
+
+```sql
+ALTER TABLE orders
+ADD COLUMN discount_pct DECIMAL(5,2)
+    AS (CASE WHEN subtotal > 1000 THEN 0.10 ELSE 0.00 END) VIRTUAL;
+```
+
+生成列の式を変更します。`VIRTUAL`/`STORED` の格納クラスは同じままでなければなりません。切り替えると `ERROR 3106: 'Changing the STORED status' is not supported for generated columns` が発生するため、格納クラスの変更には列の削除と再追加が必要です。
+
+```sql
+ALTER TABLE orders
+MODIFY COLUMN tax_amount DECIMAL(10,2)
+    AS (ROUND(subtotal * tax_rate, 2)) VIRTUAL;
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### WHERE 句で生成列を使えますか? {#can-i-use-a-generated-column-in-a-where-clause}
+
+はい。インデックスのない `VIRTUAL` 列の場合、MySQL はスキャン中に式を計算します。`STORED` 列またはインデックス付きの `VIRTUAL` 列の場合、値はすでに実体化されています。インデックスが使われているかどうかは `EXPLAIN` で確認してください。
+
+#### 元の列が変わると、生成列は自動的に更新されますか? {#does-a-generated-column-update-automatically-when-the-source-columns-change}
+
+はい。MySQL は `VIRTUAL` 生成列を読み取りのたびに再計算します。`STORED` 生成列は、式の中の列に影響するすべての `INSERT` または `UPDATE` で再計算されて書き込まれます。
+
+#### 生成列をパーティションキーとして使えますか? {#can-i-use-a-generated-column-as-a-partition-key}
+
+はい。`STORED` と `VIRTUAL` のどちらの生成列でも使えます。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 3105: The value specified for generated column is not allowed` | INSERT/UPDATE で生成列に明示的な値を代入しました。省略するか DEFAULT を使います |
+| `ERROR 3763: Expression of generated column '<col>' contains a disallowed function: <name>` | 式が `NOW()`、`RAND()`、`UUID()`、またはサブクエリを使っています。決定的な代替に置き換えます |
+| 生成列がインデックスを使わない | `EXPLAIN` を確認します。WHERE 句の式は生成列の式と正確に一致しなければなりません。`WHERE LOWER(email)` は `LOWER(email)` 生成列のインデックスを使いますが、`WHERE LOWER(TRIM(email))` は使いません |
+| `STORED` 列が書き込みを遅くする | すべての INSERT/UPDATE が式を再計算して格納します。読み取りのパフォーマンスが優先でなければ `VIRTUAL` に切り替えます |
+| 生成列を追加する `ALTER TABLE` が遅い | MySQL は `STORED` 生成列のためにテーブルを再構築します。`VIRTUAL` 列の追加ははるかに速いです（多くの場合メタデータのみ） |
+
+## 関連項目 {#see-also}
+
+- [MySQL の JSON](/ja/guides/json-in-mysql) — 主な用途: 生成列による JSON フィールドのインデックス作成
+- [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes) — 生成列のインデックスは通常のインデックスと同じように機能します
+- [MySQL のデータ型の選択](/ja/guides/choosing-data-types) — 導出した値を格納するより生成列が優れている場合
+- [MySQL の論理削除](/ja/guides/soft-deletes) — 論理削除された行に対する一意制約の修正

@@ -1,0 +1,186 @@
+---
+title: "MySQL でのベクトル埋め込みの生成"
+sidebarTitle: "埋め込みの生成"
+description: "VillageSQL の ai_embedding() 関数を使って MySQL でベクトル埋め込みを生成し保存する方法 — セマンティック検索、類似度マッチング、レコメンデーションシステム向け。"
+keywords: "mysql vector embeddings, mysql ai_embedding, mysql semantic search, mysql text embeddings, mysql openai embeddings, mysql similarity search"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ベクトル埋め込みは、テキストを意味を捉えた数値の配列として表現します。同じトピックについての 2 つのテキストは、共通の単語がなくても似たベクトルを持ちます。MySQL には埋め込みを生成する組み込みの方法がありません。VillageSQL の `vsql_ai` 拡張機能は `ai_embedding()` を追加します。これは埋め込みモデルを呼び出し、保存とクエリができる JSON 配列としてベクトルを返します。
+
+## 埋め込みの用途 {#what-embeddings-are-for}
+
+埋め込みモデルは、テキストを固定長の浮動小数点数のベクトルに変換します。2 つのベクトル間の距離は意味的な類似度を反映します。
+
+- `"dog"` と `"puppy"` → 似たベクトル
+- `"dog"` と `"database index"` → 離れたベクトル
+
+これにより、セマンティック検索(クエリと同じことを*意味する*行を見つける)、クラスタリング、レコメンデーションが可能になります。どれもキーワード検索がうまく扱えないものです。
+
+## VillageSQL の場合: ai_embedding() {#with-villagesql-ai_embedding}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+`ai_embedding(provider, model, api_key, text)` は埋め込みモデルを呼び出し、JSON 配列の文字列を返します。
+
+```sql
+SET @key = 'your-openai-api-key';
+
+SELECT ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning is fascinating');
+-- Returns: [0.02646778, 0.019067757, -0.05332306, ...]
+```
+
+### 文字セットの変換 {#the-charset-conversion}
+
+VillageSQL 0.0.6 以前では、`ai_embedding()` は binary 文字セットを返し、MySQL の JSON パーサーは binary 文字列を拒否します。結果が `JSON` 列や JSON 関数に届く前に、`CONVERT(... USING utf8mb4)` を通す必要があります。
+
+```sql
+-- On 0.0.6 and earlier, this throws an error — JSON_LENGTH rejects binary charset
+-- ERROR 3144 (22032): Cannot create a JSON value from a string with CHARACTER SET 'binary'
+SELECT JSON_LENGTH(ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning'));
+
+-- This works on every version
+SELECT JSON_LENGTH(
+  CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning')
+          USING utf8mb4)
+);
+```
+
+VillageSQL 0.0.7 以降は正しい文字セットを直接返すので、そこでは `CONVERT` はもう必要ありません。ただし残しても害はないので、0.0.6 以前との互換性のために、以下のすべての例は引き続きそれを使います。
+
+### 埋め込みの保存 {#storing-embeddings}
+
+JSON 配列を `JSON` 列に保存します。
+
+```sql
+CREATE TABLE documents (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    title    VARCHAR(255),
+    content  TEXT,
+    embedding JSON
+);
+
+SET @key = 'your-openai-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this INSERT.
+
+INSERT INTO documents (title, content, embedding) VALUES
+    ('Intro to ML',
+     'Machine learning is a subset of artificial intelligence',
+     CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                          'Machine learning is a subset of artificial intelligence')
+             USING utf8mb4)),
+    ('Neural Networks',
+     'Deep learning uses multi-layer neural networks',
+     CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                          'Deep learning uses multi-layer neural networks')
+             USING utf8mb4));
+
+-- Confirm the vectors parsed as JSON
+SELECT id, JSON_LENGTH(embedding) AS dimensions FROM documents;
+```
+
+### 既存の行への埋め込みのバックフィル {#backfilling-embeddings-on-existing-rows}
+
+```sql
+ALTER TABLE documents ADD COLUMN embedding JSON;
+
+SET @key = 'your-openai-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE documents
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, content)
+                        USING utf8mb4)
+WHERE embedding IS NULL
+LIMIT 50;  -- Process in batches
+```
+
+## モデルの選択 {#choosing-a-model}
+
+| プロバイダー | モデル | 次元数 | 使う場面 |
+|:---|:---|:---|:---|
+| `'openai'` | `text-embedding-3-small` | 1536 | 最もコストパフォーマンスが良い — 良好な精度、低いコスト |
+| `'openai'` | `text-embedding-3-large` | 3072 | より高い精度が必要 |
+| `'google'` | `gemini-embedding-001` | 3072 | Google エコシステム |
+| `'local'` | 任意の Ollama モデル(例: `nomic-embed-text`) | 可変 | プライベートなデータ。API キー不要 |
+
+1 つのテーブル内のすべての埋め込みには同じモデルを使ってください。異なるモデルの埋め込みは比較できません。混在させると無意味な類似度スコアになります。
+
+Anthropic は現在、埋め込み API を提供していません。
+
+## セマンティック検索 {#semantic-search}
+
+MySQL も VillageSQL も、ネイティブのベクトル距離関数を提供しません。完全な類似度検索 — 大きなテーブルで最も近いベクトルを見つけること — はアプリケーションコードで実行します。典型的なアーキテクチャは、埋め込みを MySQL に保存し、それらを取得し、アプリケーションでコサイン類似度を計算し、上位の一致を返すというものです。
+
+```sql
+-- Generate a query embedding
+SET @query_embedding = ai_embedding('openai', 'text-embedding-3-small', @key, 'neural networks');
+
+-- Retrieve stored embeddings to process in application code
+SELECT id, title, embedding FROM documents;
+```
+
+結果をベクトル類似度ライブラリ(NumPy、scikit-learn、Faiss)に渡して最近傍を見つけます。本番規模の検索には、MySQL と並べて専用のベクトルデータベースを検討してください。
+
+## 何を埋め込むか {#what-to-embed}
+
+埋め込みの品質は、何を埋め込むかに依存します。いくつかのパターンを示します。
+
+```sql
+-- Embed the full content for document search
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, content)
+                        USING utf8mb4);
+
+-- Embed a specific field for product search
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, product_description)
+                        USING utf8mb4);
+
+-- Embed concatenated fields for richer context
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                            CONCAT(product_name, '. ', category, '. ', product_description))
+                        USING utf8mb4);
+```
+
+埋め込むテキストは数千トークン未満に保ってください。それより長いテキストは埋め込みモデルによって切り詰められます。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 異なるモデルの埋め込みを比較できますか? {#can-i-compare-embeddings-from-different-models}
+
+いいえ。`text-embedding-3-small` と `gemini-embedding-001` の埋め込みは異なるベクトル空間にあります。互いに比較した類似度スコアは無意味です。列ごとに 1 つのモデルに統一してください。
+
+#### 埋め込みはどのくらいのストレージを使いますか? {#how-much-storage-do-embeddings-take}
+
+1536 個の浮動小数点数の JSON 配列は、テキスト文字列として 1 行あたりおよそ 10〜15 KB です。大きなテーブルでは、これが積み上がります。すべての埋め込みを保存する必要があるのか、それともクエリの対象にするものだけでよいのかを検討してください。
+
+#### ai_embedding() はバッチ入力をサポートしますか? {#does-ai_embedding-support-batch-input}
+
+いいえ。各呼び出しは 1 つのテキスト入力を処理します。一括での埋め込みには、アプリケーションで行をループし、`UPDATE` をバッチで呼び出してください。
+
+#### テキストが長すぎるとどうなりますか? {#what-happens-if-the-text-is-too-long}
+
+埋め込みモデルは、そのトークン制限(OpenAI のモデルでは通常 8191 トークン)で入力を切り詰めます。埋め込みは切り詰められたテキストに対して計算されます。長い文書では、全文ではなく、要約または最初の数段落を埋め込んでください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.ai_embedding does not exist` | `INSTALL EXTENSION vsql_ai` を実行する |
+| `ERROR 3144: Cannot create a JSON value from a string with CHARACTER SET 'binary'` | 呼び出しを `CONVERT(... USING utf8mb4)` で包む — [文字セットの変換](#the-charset-conversion)を参照 |
+| `ai_embedding()` が NULL を返す | API キーを確認し、モデル名を検証し、`max_execution_time` を確認する |
+| 類似度検索が誤った結果を返す | すべての埋め込みが同じモデルを使っていることを確認する。埋め込みが検索対象とは異なる内容から生成されていないか確認する |
+| 埋め込みの生成に時間がかかりすぎる | LIMIT でバッチにする。埋め込みは API 呼び出しごとに約 1〜3 秒かかる |
+
+## 関連項目 {#see-also}
+
+- [MySQL を AI API に接続する](/ja/guides/ai-api-setup) — vsql_ai 拡張機能のインストールと設定
+- [MySQL のクエリから AI モデルを実行する](/ja/guides/ai-prompts-in-mysql) — 埋め込みを補完するテキスト生成
+- [MySQL の UUID](/ja/guides/uuids) — 埋め込みの参照テーブルのための安定した行識別子
+- [多次元の範囲クエリ](/ja/guides/cube-queries) — AI のベクトルを使わない幾何学的な包含と距離のクエリ

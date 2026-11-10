@@ -1,0 +1,233 @@
+---
+title: "MySQL の GROUP BY"
+sidebarTitle: "GROUP BY"
+description: "GROUP BY が MySQL の行をグループに分けてグループごとに 1 行を返す仕組み、複数の列でグループ化する方法、および ERROR 1055 が伝えていること。"
+keywords: "mysql group by, group by mysql, mysql group by count, mysql group by multiple columns, mysql only_full_group_by, mysql group by clause"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`GROUP BY` のない集計関数は、テーブル全体を 1 つのグループとして扱い、1 行を
+返します。`GROUP BY` はまず行をグループに分けるため、グループごとに 1 行が得られ
+ます。「映画は何本あるか」が「レーティングごとに映画は何本あるか」になるのは
+こうしてです。
+
+始める前に `mysql -u root -p sakila` でクライアントを開いてください。
+
+## GROUP BY の仕組み {#how-group-by-works}
+
+```sql
+SELECT GROUPING_COLUMN, AGGREGATE_FUNCTION(COLUMN_NAME)
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN;
+```
+
+`GROUPING_COLUMN` をその値がグループを定める列に、`TABLE_NAME` をテーブルに、
+`AGGREGATE_FUNCTION(COLUMN_NAME)` を各グループについて計算したいものに置き換え
+ます。
+
+サーバーは行を、グループ化列の異なる値ごとに 1 つのバケットに振り分け、各
+バケットに対して別々に集計関数を実行します。結果の行数は、異なる値の数と同じ
+です。
+
+`GROUP BY` は `WHERE` の後、`ORDER BY` の前に置きます。これは結果が定義される
+順序でもあります。行をフィルタし、残ったものをグループ化し、それからグループを
+並べ替えます。
+
+## 例 {#examples}
+
+### 1) 値ごとに 1 行 {#1-one-row-per-value}
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
+| NC-17  |   210 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+`rating` には 5 つの異なる値があるため 5 グループで、5 つの件数を足すと 1,000 に
+なります。行はアルファベット順ではなく `ENUM` の宣言順で出てきます。これは
+[SELECT DISTINCT](/ja/tutorial/select-distinct) のレッスンで説明しています。
+
+### 2) 2 つの列でグループ化する {#2-group-on-2-columns}
+
+2 つの列を指定すると、グループはそれぞれの値ではなく、異なる組み合わせになり
+ます。
+
+```sql
+SELECT rating, rental_rate, COUNT(*) AS films
+FROM film
+GROUP BY rating, rental_rate
+ORDER BY rating, rental_rate;
+```
+
+```text
++--------+-------------+-------+
+| rating | rental_rate | films |
++--------+-------------+-------+
+| G      |        0.99 |    64 |
+| G      |        2.99 |    59 |
+| G      |        4.99 |    55 |
+| PG     |        0.99 |    62 |
+| PG     |        2.99 |    64 |
+| PG     |        4.99 |    68 |
+...
++--------+-------------+-------+
+15 rows in set (0.01 sec)
+```
+
+5 つのレーティングかける 3 つの料金で 15 グループです。これは
+`SELECT DISTINCT rating, rental_rate` が返すのと同じ形に、各行の件数を付けた
+ものです。
+
+### 3) グループ化の前に行をフィルタする {#3-filter-the-rows-before-grouping}
+
+`WHERE` が先に実行されるため、件数はそれを通過した行に対するものです。
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+WHERE length > 120
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |    72 |
+| PG     |    82 |
+| PG-13  |   118 |
+| R      |    90 |
+| NC-17  |    95 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+依然として 5 グループですが、すべて小さくなっています。グループが完全に消えるのは、
+`WHERE` がそのグループの行をすべて取り除いたときだけです。
+
+### 4) 計算したものでグループ化する {#4-group-on-something-you-computed}
+
+グループ化列は列である必要はありません。任意の式が使え、エイリアスで名前を付けて
+それでグループ化できます。
+
+```sql
+SELECT LEFT(title, 1) AS initial, COUNT(*) AS films
+FROM film
+GROUP BY initial
+ORDER BY initial
+LIMIT 5;
+```
+
+```text
++---------+-------+
+| initial | films |
++---------+-------+
+| A       |    46 |
+| B       |    63 |
+| C       |    92 |
+| D       |    65 |
+| E       |    32 |
++---------+-------+
+5 rows in set (0.00 sec)
+```
+
+`GROUP BY` は選択リストのエイリアスを受け入れますが、`WHERE` は受け入れません。
+レポートが月ごとにグループ化されるのはこうしてです。月を計算し、それでグループ化
+します。
+
+### 5) 結合に対してグループ化する {#5-group-over-a-join}
+
+グループ化が最も役立つのは、行が複数のテーブルから来るときです。これは各顧客の
+支払いを数えます。
+
+```sql
+SELECT c.last_name, COUNT(*) AS payments
+FROM customer AS c
+INNER JOIN payment AS p ON p.customer_id = c.customer_id
+GROUP BY c.customer_id, c.last_name
+ORDER BY payments DESC, c.last_name
+LIMIT 5;
+```
+
+```text
++-----------+----------+
+| last_name | payments |
++-----------+----------+
+| HUNT      |       46 |
+| SEAL      |       45 |
+| DEAN      |       42 |
+| SHAW      |       42 |
+| SANDERS   |       41 |
++-----------+----------+
+5 rows in set (0.01 sec)
+```
+
+結合が先に実行されて支払いごとに 1 行を生成し、それからグループ化がそれらの行を
+顧客ごとにまとめます。`GROUP BY` に `last_name` だけでなく `customer_id` も入って
+いるのは、2 人の顧客が同じ姓を共有し得るため、それらを別々に数えたいからです。
+
+## 選択したすべての列はグループ化されるか集計されなければならない {#every-selected-column-must-be-grouped-or-aggregated}
+
+グループは多数の行です。グループ化列でもなく集計関数の中にもない列を求めるのは、
+その多数の行のどれを表示するかをサーバーに尋ねることであり、サーバーに答えは
+ありません。デフォルトで有効な `only_full_group_by` 設定が、サーバーに推測では
+なくそう言わせるものです。
+
+```sql
+SELECT rating, title FROM film GROUP BY rating;
+```
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'sakila.film.title' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+`ERROR 1055` は解決できなかった列を名指しします。ここでは `title` です。出口は
+3 つあり、どれが正しいかは意図によります。
+
+- より細かいグループが欲しかったなら、その列を `GROUP BY` に追加します。
+- どれか 1 つの値でよいなら、`MIN(title)` のような集計関数で包みます。
+- 必要なかったなら、選択リストから外します。
+
+`only_full_group_by` を無効にすると、同じクエリは実行され、サーバーが選んだ
+プラン次第で任意のタイトルを返します。
+[MySQL の GROUP BY のパフォーマンス](/ja/guides/group-by-having)のガイドでは、この
+設定と、意図的に任意の行を求める方法である `ANY_VALUE()` を扱っています。
+
+## GROUP BY は順序を約束しない {#group-by-does-not-promise-an-order}
+
+グループは、サーバーが都合の良いと判断した順序で返ってきます。ここのすべての例に
+`ORDER BY` があるのは、[LIMIT](/ja/tutorial/limit) と同じく、それが順序を固定する
+唯一の方法だからです。
+
+## まとめ {#summary}
+
+- 全体で 1 行ではなく、異なる値ごとに 1 行の結果を得るには `GROUP BY` を使います。
+- 複数の列を指定すると、異なる組み合わせごとにグループができると考えてください。
+- `WHERE` はグループ化が起きる前に行をフィルタすると考えてください。
+- `ERROR 1055` は、グループ化も集計もされていない列と読んでください。
+- グループの順序が重要なときは `ORDER BY` を追加します。
+
+## 関連項目 {#see-also}
+
+- [集計関数](/ja/tutorial/aggregate-functions) — グループごとに計算するもの
+- [HAVING](/ja/tutorial/having) — 作られた後のグループをフィルタする
+- [WITH ROLLUP](/ja/tutorial/with-rollup) — グループの下に合計行を追加する
+- [MySQL の GROUP BY のパフォーマンス](/ja/guides/group-by-having) — これが作り得る一時テーブル

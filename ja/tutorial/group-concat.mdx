@@ -1,0 +1,154 @@
+---
+title: "MySQL の GROUP_CONCAT"
+sidebarTitle: "GROUP_CONCAT"
+description: "GROUP_CONCAT が MySQL のグループ内の値を 1 つの文字列に連結する仕組み、並べ替えと区切りの方法、および警告だけで切り捨てるバイト数の制限。"
+keywords: "mysql group_concat, group_concat mysql, mysql concatenate rows, mysql group_concat separator, mysql group_concat order by, group_concat_max_len"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`COUNT` はグループに何行あるかを教えてくれます。`GROUP_CONCAT` は、それらの値を
+1 つの文字列に連結して、何があったかを教えてくれます。詳細を数に減らすのではなく、
+詳細を保つ集計関数です。
+
+始める前に `mysql -u root -p sakila` でクライアントを開いてください。
+
+## GROUP_CONCAT の仕組み {#how-group_concat-works}
+
+```sql
+SELECT GROUPING_COLUMN,
+       GROUP_CONCAT(COLUMN_NAME ORDER BY COLUMN_NAME SEPARATOR 'SEPARATOR_TEXT')
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN;
+```
+
+`GROUPING_COLUMN` をグループを定める列に、`TABLE_NAME` をテーブルに、
+`COLUMN_NAME` を連結する列に、`SEPARATOR_TEXT` を値の間に入れるものに置き換え
+ます。`ORDER BY` と `SEPARATOR` はどちらも省略でき、周りのクエリではなく括弧の
+中に置きます。
+
+`SEPARATOR` がないと、値は空白なしのカンマで連結されます。`ORDER BY` がないと、
+値は特定の順序なしに並びます。
+
+## 例 {#examples}
+
+### 1) 各グループの値を連結する {#1-join-the-values-in-each-group}
+
+```sql
+SELECT rating, GROUP_CONCAT(title ORDER BY title SEPARATOR ', ') AS titles
+FROM film
+WHERE length = 185
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+--------------------------------------------------+
+| rating | titles                                           |
++--------+--------------------------------------------------+
+| G      | CONTROL ANTHEM, DARN FORRESTER, MUSCLE BRIGHT    |
+| PG     | WORST BANGER                                     |
+| PG-13  | CHICAGO NORTH, GANGS PRIDE, POND SEATTLE         |
+| R      | HOME PITY, SOLDIERS EVOLUTION, SWEET BROTHERHOOD |
++--------+--------------------------------------------------+
+4 rows in set (0.00 sec)
+```
+
+5 行ではなく 4 行です。185 分の `NC-17` の映画はなく、`WHERE` がグループ化の前に
+その行を取り除いたからです。行が残らなかったグループは現れません。
+
+### 2) 重複を落とす {#2-drop-the-repeats}
+
+括弧の中の `DISTINCT` は、各グループ内の重複する値を取り除きます。
+
+```sql
+SELECT rating, GROUP_CONCAT(DISTINCT rental_rate ORDER BY rental_rate) AS rates
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+----------------+
+| rating | rates          |
++--------+----------------+
+| G      | 0.99,2.99,4.99 |
+| PG     | 0.99,2.99,4.99 |
+| PG-13  | 0.99,2.99,4.99 |
+| R      | 0.99,2.99,4.99 |
+| NC-17  | 0.99,2.99,4.99 |
++--------+----------------+
+5 rows in set (0.00 sec)
+```
+
+`DISTINCT` がなければ、各文字列はグループ内の映画ごとに料金を 1 つずつ、178 から
+223 個保持し、長いほうの 2 つは次のセクションで扱う制限にぶつかります。これは
+デフォルトの区切り文字でもあります。カンマだけで、他には何もありません。
+
+## 結果は group_concat_max_len バイトで切り捨てられる {#the-result-is-cut-off-at-group_concat_max_len-bytes}
+
+これが罠です。サーバーは長くなりすぎた `GROUP_CONCAT` の結果を切り捨て、
+エラーを出しません。制限は設定なので、下の数値は MySQL の性質ではなくこの
+サーバーのものであり、文字数ではなくバイト数を数えます。
+
+```sql
+SELECT LENGTH(GROUP_CONCAT(title)) AS bytes FROM film;
+```
+
+```text
++-------+
+| bytes |
++-------+
+|  1024 |
++-------+
+1 row in set, 1 warning (0.00 sec)
+```
+
+ちょうど 1,024 で、それ自体が怪しい数です。実際の合計が切りの良い数になることは
+めったにありません。設定と照らし合わせてください。
+
+```sql
+SELECT @@group_concat_max_len AS max_len;
+```
+
+```text
++---------+
+| max_len |
++---------+
+|    1024 |
++---------+
+1 row in set (0.00 sec)
+```
+
+最初のクエリのフッターは警告を 1 件報告しており、`SHOW WARNINGS` が何が失われた
+かを教えてくれます。`Warning 1260 Row 65 was cut by GROUP_CONCAT()` です。
+文字列は 1,000 本のうち 64 本のタイトルを丸ごと保持し、65 本目の途中で止まって
+います。
+
+`GROUP_CONCAT` の後に自分で `SHOW WARNINGS` を実行すると、同じメッセージが
+見られます。
+
+`SET SESSION group_concat_max_len = 100000;` は、接続の残りの間だけ制限を引き
+上げ、再接続すると元に戻ります。制限はバイト数を数えるため、ASCII 以外の
+テキストは数値が示すより早く切られます。`utf8mb4` では 1 文字が最大 4 バイトを
+取り得ます。
+
+長さが `group_concat_max_len` とちょうど等しい結果は、確認するまで切り捨てられた
+ものとして扱い、フッターの警告数に注意してください。
+
+## まとめ {#summary}
+
+- グループ内の値を 1 つの文字列に連結するには `GROUP_CONCAT` を使います。
+- `ORDER BY`、`SEPARATOR`、および `DISTINCT` は括弧の中に置きます。
+- 区切り文字を指定しないときは、空白なしのカンマになると考えてください。
+- `group_concat_max_len` バイトで切り捨てられ、エラーではなく警告が出ると考えてください。
+- 長さが制限とちょうど等しいときは、常に切り捨てを疑います。
+
+## 関連項目 {#see-also}
+
+- [集計関数](/ja/tutorial/aggregate-functions) — 数を返す集計関数
+- [GROUP BY](/ja/tutorial/group-by) — この関数が連結するグループを作る
+- [MySQL の文字列関数](/ja/guides/string-functions) — その後で文字列を加工する
+- [MySQL の GROUP BY のパフォーマンス](/ja/guides/group-by-having) — 大規模にこれらの文字列を作るコスト

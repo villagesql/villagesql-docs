@@ -1,0 +1,145 @@
+---
+title: "MySQL のスロークエリログ"
+sidebarTitle: "スロークエリログを使う"
+description: "MySQL のスロークエリログを有効にして、最適化が必要なクエリを見つける方法。ログの形式、重要なフィールド、および mysqldumpslow を含みます。"
+keywords: "mysql slow query log, mysql long_query_time, mysql enable slow query log, mysqldumpslow, mysql find slow queries, mysql query optimization"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+スロークエリログは、注意が必要なクエリを見つけるための MySQL 組み込みのツールです。設定可能なしきい値より長くかかったクエリを捕捉し、ログファイルに書き込みます。どのクエリを最適化すべきか分からない場合は、ここから始めてください。
+
+## スロークエリログの有効化 {#enabling-the-slow-query-log}
+
+サーバーを再起動せずに、実行時に有効にできます。
+
+```sql
+-- Enable the log
+SET GLOBAL slow_query_log = 'ON';
+
+-- Log queries that take longer than 1 second
+SET GLOBAL long_query_time = 1;
+
+-- Check where the log file is being written
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+これらの設定は直ちに適用されますが、サーバーの再起動時にリセットされます。恒久的にするには、`my.cnf` または `my.ini` に追加します。
+
+```ini
+[mysqld]
+slow_query_log = ON
+long_query_time = 1
+slow_query_log_file = /var/log/mysql/slow.log
+```
+
+## 何が記録されるか {#what-gets-logged}
+
+典型的なエントリは次のようになります。
+
+```
+# Time: 2024-03-15T14:23:01.234567Z
+# User@Host: app_user[app_user] @ localhost []  Id: 142
+# Query_time: 4.521893  Lock_time: 0.000123  Rows_sent: 1  Rows_examined: 847293
+SET timestamp=1710509381;
+SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+最も重要なヘッダーフィールドは次のとおりです。
+
+| フィールド | 分かること |
+|:------|:-----------------|
+| `Query_time` | 合計実行時間(秒) |
+| `Lock_time` | ロック待ちに費やした時間(実行とは別) |
+| `Rows_sent` | クライアントに返された行数 |
+| `Rows_examined` | 結果を生成するために MySQL が読み取った行数 |
+
+**`Rows_examined` / `Rows_sent` の比率が重要なシグナルです。** MySQL が 1 行を返すために 847,293 行を調べたなら、1 つの結果を見つけるためにテーブルのほぼ全体をスキャンしています。それがインデックスを必要とするクエリです。
+
+## インデックスを使わないクエリの記録 {#logging-queries-without-indexes}
+
+オーバーヘッドの小さい別の方法として、実行時間に関係なく、インデックスをまったく使わないクエリだけを記録できます。
+
+```sql
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+```
+
+これは、明らかなインデックス不足の問題がパフォーマンス問題になる前に捕捉するのに役立ちます。混雑したサーバーでは大量のログエントリが生成されることがあるため、`log_throttle_queries_not_using_indexes` と組み合わせて頻度を制限します。
+
+```sql
+-- Log at most 10 no-index queries per minute
+SET GLOBAL log_throttle_queries_not_using_indexes = 10;
+```
+
+## mysqldumpslow によるログの分析 {#analyzing-the-log-with-mysqldumpslow}
+
+混雑したサーバーでは、スロークエリログは急速に肥大化します。`mysqldumpslow` は類似のクエリを集約して合計時間で順位付けするため、最初に修正すべきものを簡単に見つけられます。
+
+```bash
+# Top 10 queries by total execution time
+mysqldumpslow -s t -t 10 /var/log/mysql/slow.log
+
+# Top 10 by average execution time
+mysqldumpslow -s at -t 10 /var/log/mysql/slow.log
+
+# Top 10 queries that examined the most rows
+mysqldumpslow -s r -t 10 /var/log/mysql/slow.log
+```
+
+出力はクエリをその構造でグループ化し、リテラル値を `N` と `S` に置き換えます。
+
+```
+Count: 523  Time=4.52s (2364s)  Lock=0.00s (0s)  Rows=1.0 (523), app_user@localhost
+  SELECT * FROM orders WHERE status = 'S' ORDER BY created_at LIMIT N
+```
+
+このクエリは 523 回実行され、平均 4.52 秒、合計 2,364 秒のサーバー時間を消費しました。ここから始めるべきです。
+
+## スロークエリを EXPLAIN にかける {#turning-slow-queries-into-explain}
+
+コストの高いクエリを特定したら、それらに `EXPLAIN` を実行して実行計画を確認します。
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+`type: ALL`(フルテーブルスキャン)と `Extra: Using filesort` を探してください。どちらもインデックスで修正できます。[MySQL のインデックスの仕組み](/ja/guides/mysql-indexes)と [MySQL の EXPLAIN の読み方](/ja/guides/reading-explain)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### `long_query_time` は何に設定すべきですか? {#what-should-i-set-long_query_time-to}
+`1` 秒から始めてください。最悪のクエリに対処したら、中程度の問題を捕捉するために `0.1` に下げます。パフォーマンスが重要なアプリケーションでは、`0.05` 以下がよく使われます。`0` に設定するとすべてのクエリが記録されます。これは特定の操作のプロファイリングには便利ですが、本番環境の監視には向きません。
+
+#### スロークエリログを有効にするとパフォーマンスに影響しますか? {#does-enabling-the-slow-query-log-affect-performance}
+ごくわずかです。オーバーヘッドは、記録されるクエリごとの少量の I/O です。`long_query_time = 1` の混雑した本番サーバーでは、本当に遅いクエリだけが書き込まれるため、一般的なオーバーヘッドは無視できる程度です。すべてのクエリを記録する(`long_query_time = 0`)と測定可能なオーバーヘッドが生じるため、一時的にのみ使用してください。
+
+#### ファイルを読む代わりに、SQL からスローログをクエリできますか? {#can-i-query-the-slow-log-from-sql-instead-of-reading-the-file}
+はい。`log_output = TABLE` を設定していれば、`mysql.slow_log` テーブルを使えます。`performance_schema` にスローログのテーブルはありません。
+
+```sql
+SET GLOBAL log_output = 'TABLE';
+SELECT * FROM mysql.slow_log ORDER BY start_time DESC LIMIT 10;
+```
+
+本番環境では一般にファイル出力が好まれます。テーブル方式は、記録されるクエリごとに書き込みのオーバーヘッドを追加します。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| ログファイルが作成されない | MySQL がログディレクトリへの書き込み権限を持っているか確認します |
+| 遅いクエリがあるのにエントリがない | `SHOW VARIABLES LIKE 'slow_query_log'` で `slow_query_log = ON` を確認します |
+| ログの増加が速すぎる | `long_query_time` を増やすか、`log_throttle_queries_not_using_indexes` を有効にします |
+| `mysqldumpslow` が見つからない | MySQL に同梱されています。MySQL の bin ディレクトリを確認します(`which mysqldumpslow`、または `/usr/bin` を調べます) |
+
+スロークエリログと `mysqldumpslow` は、拡張機能を備えた MySQL のドロップイン代替である [VillageSQL](https://villagesql.com/install) でもまったく同じように動作します。
+
+## 関連項目 {#see-also}
+
+- [MySQL の EXPLAIN の読み方](/ja/guides/reading-explain) — 見つけたスロークエリを分析する
+- [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes) — スロークエリの最も一般的な修正
+- [MySQL のコネクションプーリング](/ja/guides/connection-pooling) — スロークエリログでは捕捉できないもう 1 つの遅延の原因
+- [MySQL のクエリが遅いのはなぜ?](/ja/guides/mysql-query-performance) — ログが明らかにしたクエリにどう対処するか
+- [ORM で MySQL を使う: Django、Rails、Prisma](/ja/guides/mysql-with-orms) — ORM が生成するものを捕捉する

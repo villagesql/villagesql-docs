@@ -1,0 +1,161 @@
+---
+title: "MySQL での IPv6 の保存"
+sidebarTitle: "IPv6 アドレスの保存"
+description: "MySQL で IPv6 アドレスを保存する方法。INET6_ATON を使った VARBINARY(16) と、VillageSQL の INET 型が IPv4 と IPv6 を 1 つの統合された列で扱う仕組み。"
+keywords: "mysql ipv6 storage, mysql inet6_aton, mysql ipv6 column, mysql store ipv6 address, mysql ipv4 ipv6 unified, mysql varbinary ipv6"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+IPv4 は 4 バイトの整数に収まります。IPv6 は 128 ビットで、16 バイトのバイナリ保存が必要です。MySQL はこのために `INET6_ATON()` と `INET6_NTOA()` を提供しており、これらは動作しますが、IPv4 と IPv6 を 1 つの列に混在させるには追加の注意が必要です。VillageSQL の `INET` 型は、両方のファミリーを一貫した API で 1 つの列に保存します。
+
+## MySQL の IPv6 の手法: VARBINARY(16) {#mysqls-ipv6-approach-varbinary16}
+
+MySQL は、バイナリでの IPv6 の保存のために `INET6_ATON()` と `INET6_NTOA()` を提供しています。`INET6_ATON()` は IPv4 と IPv6 の両方を扱います。
+
+```sql
+SELECT HEX(INET6_ATON('192.168.1.5'));      -- Returns 4-byte IPv4
+SELECT HEX(INET6_ATON('2001:db8::1'));      -- Returns 16-byte IPv6
+SELECT LENGTH(INET6_ATON('192.168.1.5'));   -- Returns 4
+SELECT LENGTH(INET6_ATON('2001:db8::1'));   -- Returns 16
+```
+
+両方のファミリーを 1 つの列に保存します。
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address VARBINARY(16),     -- 4 bytes for IPv4, 16 bytes for IPv6
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (INET6_ATON('192.168.1.5')),
+    (INET6_ATON('2001:db8::1'));
+
+SELECT INET6_NTOA(ip_address), accessed_at FROM access_log;
+```
+
+`INET6_NTOA()` は IPv4 をドット付き 10 進表記で、IPv6 を圧縮表記で返します。`VARBINARY(16)` 列は両方を保持します。これが標準的な手法であり、動作します。
+
+摩擦が生じるのは、行がどちらのファミリーを含むかを知る必要がある操作です。
+
+```sql
+-- Filter only IPv6
+SELECT INET6_NTOA(ip_address) FROM access_log
+WHERE LENGTH(ip_address) = 16;
+
+-- Under MySQL 8.4's default strict mode this raises ERROR 1411 and the row is
+-- rejected. A bare SELECT INET6_ATON('not-an-ip') returns NULL with a warning.
+INSERT INTO access_log (ip_address) VALUES (INET6_ATON('not-an-ip'));
+```
+
+`VARBINARY` 列からプレフィックス長、ネットマスク、またはネットワークアドレスを取り出す組み込みの手段はありません。
+
+## VillageSQL の場合: 統合された INET 型 {#with-villagesql-unified-inet-type}
+
+VillageSQL の `vsql_network_address` 拡張機能は、IPv4 と IPv6 の両方をネイティブに保存する `INET` 型を提供します。同じ関数が両方のファミリーで動作し、長さのチェックや別々のコードパスは必要ありません。
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.5')),
+    (inet_from_string('2001:db8::1')),
+    (inet_from_string('::1')),            -- IPv6 loopback
+    (inet_from_string('fe80::1'));        -- link-local
+
+SELECT inet_to_string(ip_address), inet_family(ip_address) AS family
+FROM access_log;
+```
+
+### IPv6 に特有の操作 {#working-with-ipv6-specifically}
+
+IPv6 アドレスは展開表記で保存および取得されます。
+
+```sql
+-- Compressed input → expanded storage
+SELECT inet_to_string(inet_from_string('2001:db8::1'));
+-- Returns: 2001:0db8:0000:0000:0000:0000:0000:0001
+
+-- Extract just the address without prefix
+SELECT inet_host(inet_from_string('2001:db8::1/64'));
+-- Returns: 2001:0db8:0000:0000:0000:0000:0000:0001
+
+-- Get prefix length
+SELECT inet_masklen(inet_from_string('2001:db8::1/64'));
+-- Returns: 64
+
+-- Get network address
+SELECT cidr_to_string(inet_network(inet_from_string('2001:db8::1/64')));
+-- Returns: 2001:0db8:0000:0000:0000:0000:0000:0000/64
+
+-- Get netmask
+SELECT inet_to_string(inet_netmask(inet_from_string('2001:db8::1/64')));
+-- Returns: ffff:ffff:ffff:ffff:0000:0000:0000:0000
+```
+
+### アドレスファミリーによるフィルタ {#filtering-by-address-family}
+
+```sql
+-- Only IPv6 connections
+SELECT inet_to_string(ip_address), accessed_at
+FROM access_log
+WHERE inet_family(ip_address) = 6;
+
+-- Only IPv4 connections
+SELECT inet_to_string(ip_address), accessed_at
+FROM access_log
+WHERE inet_family(ip_address) = 4;
+```
+
+## IPv6 における MySQL と VillageSQL の比較 {#mysql-vs-villagesql-for-ipv6}
+
+| 手法 | IPv6 の保存 | ファミリーの検出 | プレフィックスのサポート | 挿入時の検証 |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(45)` | はい | 手動の文字列チェック | いいえ | いいえ |
+| `VARBINARY(16)` + `INET6_ATON` | はい | `LENGTH() = 16` | いいえ | いいえ（不正な入力には NULL を返す） |
+| `INET`（VillageSQL） | はい | `inet_family() = 6` | はい | はい |
+
+## よくある質問 {#frequently-asked-questions}
+
+#### INET 型は IPv4 を IPv4 射影 IPv6 形式（::ffff:x.x.x.x）で保存しますか？ {#does-the-inet-type-store-ipv4-in-ipv4-mapped-ipv6-format-ffffxxxx}
+
+いいえ。IPv4 アドレスは IPv4 射影 IPv6 ではなく、ネイティブの IPv4 として保存されます。`inet_family()` は、どのように書かれたかにかかわらず、IPv4 アドレスに対して `4` を返します。
+
+#### INET は ::1 のような IPv6 の圧縮表記を扱えますか？ {#does-inet-handle-ipv6-compressed-notation-like-1}
+
+はい。`inet_from_string('::1')` と `inet_from_string('fe80::1')` はどちらも正しく解析されます。圧縮表記は入力で受け入れられ、出力は常に展開形式です。
+
+#### 高速な検索のために INET 列にインデックスを作れますか？ {#can-i-index-an-inet-column-for-fast-lookups}
+
+はい。`CREATE INDEX idx_ip ON access_log(ip_address)` が動作します。等価検索と範囲スキャン（サブネットのクエリ用）はインデックスを使います。パターンについては [MySQL でのサブネットによる問い合わせ](/ja/guides/subnet-queries)を参照してください。
+
+#### VARBINARY(16) + INET6_ATON は間違いですか？ {#is-varbinary16-inet6_aton-wrong}
+
+いいえ。これは MySQL のみでの正しい手法です。INET よりコンパクトです（固定の 19 バイトに対して 4 または 16 バイト）が、組み込みのファミリー検出、プレフィックスの処理、および検証は失われます。IPv4 と IPv6 の両方にまたがり、プレフィックスを意識した操作が必要なスキーマでは、`INET` のほうが扱いやすいです。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.inet_from_string does not exist` | `INSTALL EXTENSION vsql_network_address` を実行します |
+| IPv6 アドレスが展開形式で表示される | 想定どおりです。`2001:db8::1` は `2001:0db8:0000:0000:0000:0000:0000:0001` として保存されます |
+| 有効な IPv6 に対して `inet_from_string()` が NULL を返す | 入力ミスを確認します。問題を切り分けるために、展開形式のアドレスを試します |
+| `INET6_ATON` が `inet_from_string` と異なる値を返す | 元になるバイナリのサイズが異なります（固定の 19 バイトに対して 4 または 16 バイト）。両者に互換性はありません |
+
+## 関連項目 {#see-also}
+
+- [MySQL での IP アドレスの保存](/ja/guides/storing-ip-addresses) — INET による IPv4/IPv6 の全体像
+- [MySQL でのサブネットによる問い合わせ](/ja/guides/subnet-queries) — INET 型を使ったサブネット範囲のクエリ
+- [MySQL での MAC アドレスの保存](/ja/guides/storing-mac-addresses) — 同じ拡張機能の MACADDR 型

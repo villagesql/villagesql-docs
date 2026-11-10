@@ -1,0 +1,207 @@
+---
+title: "MySQL のバイナリログ"
+sidebarTitle: "バイナリログの使用"
+description: "MySQL のバイナリログの仕組み: 有効化、レプリケーションと変更データキャプチャのための ROW、STATEMENT、または MIXED 形式の選択、mysqlbinlog によるログの読み取り、ポイントインタイムリカバリ、および古いログのパージ。"
+keywords: "mysql binary log, mysql binlog, mysql enable binary logging, mysql mysqlbinlog, mysql point in time recovery, mysql binlog format, mysql replication log, mysql binlog row format, mysql binary log position, mysql binlog row vs statement, mysql point in time recovery binlog, mysql change data capture, mysql cdc binlog, mysql replication setup"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL のバイナリログは、データベースに対するすべての変更（挿入、更新、削除、スキーマ変更）を記録します。レプリケーションとポイントインタイムリカバリの基盤です。ほとんどの本番 MySQL サーバーは、バイナリログを有効にして動作しています。
+
+## バイナリログの有効化 {#enabling-binary-logging}
+
+MySQL 8.0 ではバイナリログはデフォルトで有効です。確認するには次のようにします。
+
+```sql
+SHOW VARIABLES LIKE 'log_bin';
+-- log_bin  ON
+```
+
+`my.cnf` / `my.ini` で構成します。
+
+```ini
+[mysqld]
+log_bin = /var/log/mysql/mysql-bin
+binlog_format = ROW
+server_id = 1          -- required for replication; good practice to set always
+binlog_expire_logs_seconds = 604800  -- auto-purge logs older than 7 days
+max_binlog_size = 100M -- rotate to a new file when this size is reached
+```
+
+`log_bin` を設定すると、MySQL は binlog ファイルに `mysql-bin.000001`、`mysql-bin.000002` のような名前を付け、それらすべてを列挙するインデックスファイル（`mysql-bin.index`）を作成します。
+
+## バイナリログの形式 {#binary-log-formats}
+
+MySQL は 3 つの binlog 形式をサポートしています。
+
+| 形式 | 記録される内容 | レプリケーションの安全性 | ログサイズ | パフォーマンスへの影響 | 最適な用途 |
+|:-------|:-------------|:------------------|:---------|:------------------|:---------|
+| `ROW` | 影響を受けた各行の実際の変更前/変更後の行データ | 最も安全 — レプリカの状態に関係なく決定的 | 最大（データ量に応じて増加、特に一括更新で顕著） | ソース側の書き込みオーバーヘッドが最大 | 本番のレプリケーション、PITR、CDC/変更データキャプチャ |
+| `STATEMENT` | 変更の原因となった SQL ステートメント | 呼び出しごとに非決定的な関数（`RAND()`、`UUID()`）では安全でない。`NOW()` は安全（ステートメントのタイムスタンプが binlog イベントに含まれるため） | 最小 | オーバーヘッドが最小 | ログサイズが重要で、すべてのステートメントが決定的な読み取り中心のワークロード |
+| `MIXED` | デフォルトは STATEMENT で、安全でないステートメントでは ROW に切り替わる | 安全（必要に応じて ROW を使用） | 中 | 中 | STATEMENT から移行するレガシーなセットアップ。新規デプロイには非推奨 |
+
+`ROW` 形式が推奨されるデフォルトです。`RAND()` や `UUID()` のような非決定的な関数が関係していても正しくレプリケートされます。欠点はログファイルが大きくなることです。数百万行に影響する 1 つの `UPDATE` は、STATEMENT 形式では 1 つのステートメントになりますが、ROW 形式では影響を受けた行ごとに 1 つの行イベントになります。
+
+### バイナリログを有効にすべき場面と選ぶべき形式 {#when-to-enable-binary-logging-and-which-format-to-choose}
+
+MySQL 8.0 以降ではバイナリログはデフォルトで有効です。問題になるのはたいてい、どの形式を使うか、そしてそもそも有効のままにしておくかどうかです。
+
+| シナリオ | 推奨 |
+|:---------|:---------------|
+| レプリカを運用している | バイナリログを有効にし、`ROW` 形式を使う — Group Replication では必須で、標準のレプリケーションでも推奨 |
+| ポイントインタイムリカバリが必要 | バイナリログを有効にする。形式は PITR の可否に影響しないが、`ROW` が最も正確な再生を実現する |
+| Debezium、Kafka Connect などによる変更データキャプチャ（CDC） | バイナリログを有効にし、`ROW` 形式が必須 — CDC ツールは行レベルのイベントを直接読み取る |
+| レプリケーションも PITR もない単体の開発/テストインスタンス | バイナリログを無効にする（`--skip-log-bin`）と、書き込みオーバーヘッドとディスク使用量が減る |
+| 書き込みスループットが非常に高く、ログサイズが懸念 | STATEMENT に切り替えるのではなく、`binlog_row_image = MINIMAL`（変更された列だけを記録）を検討する |
+| 監査またはコンプライアンス | `ROW` 形式と `binlog_row_image = FULL`（デフォルト）で、完全な変更前/変更後の記録が得られる |
+
+形式の確認と変更は次のようにします。
+
+```sql
+SHOW VARIABLES LIKE 'binlog_format';
+SET SESSION binlog_format = 'ROW';  -- change for current session
+```
+
+## バイナリログの一覧表示と閲覧 {#listing-and-viewing-binary-logs}
+
+すべてのバイナリログファイルを一覧表示します。
+
+```sql
+SHOW BINARY LOGS;
+```
+
+現在の binlog ファイルと位置を確認します。
+
+```sql
+SHOW BINARY LOG STATUS;
+```
+
+SQL から binlog 内のイベントを閲覧します。
+
+```sql
+SHOW BINLOG EVENTS IN 'mysql-bin.000003' LIMIT 20;
+SHOW BINLOG EVENTS IN 'mysql-bin.000003' FROM 154 LIMIT 10;
+```
+
+## mysqlbinlog {#mysqlbinlog}
+
+`mysqlbinlog` ツールは、バイナリログファイルを人が読める SQL にデコードします。ポイントインタイムリカバリと監査に使われます。
+
+```bash
+# Read a local binlog file
+mysqlbinlog /var/log/mysql/mysql-bin.000003
+
+# Filter by time range
+mysqlbinlog --start-datetime="2024-06-15 10:00:00" \
+            --stop-datetime="2024-06-15 12:00:00" \
+            /var/log/mysql/mysql-bin.000003
+
+# Decode ROW format events (shows actual data changes)
+mysqlbinlog --verbose /var/log/mysql/mysql-bin.000003
+
+# Read directly from a running server
+mysqlbinlog --read-from-remote-server \
+            --host=127.0.0.1 --user=root --password \
+            mysql-bin.000003
+```
+
+## ポイントインタイムリカバリ {#point-in-time-recovery}
+
+フルバックアップとバイナリログを組み合わせると、バックアップ取得後の任意の時点に復元できます。
+
+**典型的なワークフロー:**
+
+1. `mysqldump --single-transaction --source-data` でフルバックアップを取ります。
+
+```bash
+mysqldump --single-transaction --source-data=2 --all-databases \
+  -u root -p > backup.sql
+```
+
+`--source-data=2` は、binlog のファイル名と位置をダンプ内にコメントとして書き込みます。これが復旧の開始点です。
+
+2. フルバックアップを復元します。
+
+```bash
+mysql -u root -p < backup.sql
+```
+
+3. ダンプから binlog のファイルと位置を探します。
+
+```bash
+head -50 backup.sql | grep "SOURCE_LOG_FILE"
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='mysql-bin.000003', SOURCE_LOG_POS=154;
+```
+
+4. その位置から、取り消したいイベントの直前まで binlog を再生します。
+
+```bash
+mysqlbinlog --start-position=154 \
+            --stop-datetime="2024-06-15 11:59:00" \
+            mysql-bin.000003 mysql-bin.000004 | mysql -u root -p
+```
+
+## バイナリログの管理 {#managing-binary-logs}
+
+古いバイナリログを手動でパージします。
+
+```sql
+-- Purge all logs before a specific log file
+PURGE BINARY LOGS TO 'mysql-bin.000010';
+
+-- Purge all logs older than a date
+PURGE BINARY LOGS BEFORE '2024-06-01 00:00:00';
+```
+
+`binlog_expire_logs_seconds` で自動パージします（MySQL 8.0 以降。`expire_logs_days` は削除されました）。
+
+```sql
+SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';
+SET GLOBAL binlog_expire_logs_seconds = 604800;  -- 7 days in seconds
+```
+
+binlog ファイルを `rm` で直接削除してはいけません。インデックスファイルの一貫性を保つため、`PURGE BINARY LOGS` を使ってください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### バイナリログは書き込みパフォーマンスに影響しますか? {#does-binary-logging-affect-write-performance}
+
+はい、ただし影響は小さいです。ROW 形式のログは、変更されたデータ量に比例するオーバーヘッドを追加します。書き込み中心のワークロードでは、オーバーヘッドは通常 5〜15% です。それによって得られる復旧とレプリケーションの能力を考えれば、ほぼ常に見合う価値があります。
+
+#### 特定のセッションだけバイナリログを省略できますか? {#can-i-skip-binary-logging-for-a-specific-session}
+
+```sql
+SET SESSION sql_log_bin = 0;
+-- ... operations that won't be logged ...
+SET SESSION sql_log_bin = 1;
+```
+
+これは、さらに先へ伝播させる必要のないレプリカへのデータロードや、ポイントインタイムリカバリの範囲から除外したい一括操作に役立ちます。`SUPER`、`SYSTEM_VARIABLES_ADMIN`、または `SESSION_VARIABLES_ADMIN` が必要です。`BINLOG_ADMIN` だけでは不十分で、試みは ERROR 1227 で失敗します。
+
+#### バイナリログがどれだけのディスク容量を使っているかを知るには? {#how-do-i-know-how-much-disk-space-my-binary-logs-are-using}
+
+```sql
+SHOW BINARY LOGS;
+-- Sum the File_size column
+```
+
+またはディスク上で: `du -sh /var/log/mysql/mysql-bin.*`
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| バイナリログファイルがディスクを圧迫している | `binlog_expire_logs_seconds` を設定するか、`PURGE BINARY LOGS BEFORE` を実行します。ファイルを `rm` で直接削除してはいけません |
+| ROW 形式で `mysqlbinlog` の出力が読めない | `--verbose`（または `-v`）を追加して、行イベントを疑似 SQL にデコードします |
+| ポイントインタイムリカバリで一部の変更が欠けた | 範囲内のすべての binlog ファイルが含まれていることを確認します。ファイルリストの抜けは再生に穴を残します |
+| レプリケーションで `ERROR: Binary logging not possible` | レプリカで `log_bin` を有効にし、一意の `server_id` を設定する必要があるかもしれません。両方が必須です |
+| レプリケーションラグが大きい | ROW 形式はより多くのデータを生成します。`SHOW REPLICA STATUS\G` でレプリカの I/O スレッドと SQL スレッドのラグを確認します |
+
+## 関連項目 {#see-also}
+
+- [MySQL のバックアップ戦略](/ja/guides/backup-strategies) — バイナリログがポイントインタイムリカバリを可能にする仕組み
+- [MySQL レプリケーションの基本](/ja/guides/replication-basics) — レプリケーションはバイナリログをデータストリームとして使う
+- [MySQL のリードレプリカ](/ja/guides/read-replicas) — レプリカが再生するログストリームによる読み取りのスケーリング

@@ -1,0 +1,350 @@
+---
+title: "FastAPI と SQLAlchemy 2.0 を MySQL で使う"
+sidebarTitle: "FastAPI と SQLAlchemy"
+description: "SQLAlchemy 2.0 の型付き ORM、非同期ドライバ、および Alembic マイグレーションを使って、MySQL 上に非同期の FastAPI アプリを構築する方法。greenlet の依存関係や、その他の実際のセットアップの落とし穴を含みます。"
+keywords: "fastapi mysql, sqlalchemy 2.0 async, fastapi sqlalchemy, asyncmy, aiomysql, alembic async migration, sqlalchemy mapped_column, fastapi depends session, villagesql fastapi"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+FastAPI の非同期リクエスト処理が効果を発揮するのは、その下のデータベース呼び出しも非同期である場合だけです。SQLAlchemy 2.0 は型付きの ORM スタイルと非同期エンジンでこれをサポートしますが、MySQL に対して両者をつなぐには、最初の試みで間違えやすいセットアップの手順がいくつかあります。
+
+## 非同期ドライバの選択 {#choosing-an-async-driver}
+
+SQLAlchemy 2.0 は、2 つの非同期 MySQL ドライバ、`asyncmy` と `aiomysql` のダイアレクトを同梱しています。どちらか一方が公式の推奨として文書化されているわけではありません。`asyncmy` は Cython で書かれたコンパイル済みのドライバで、現行の Python バージョン向けにビルド済みの wheel を提供しています。このガイドでそれを使うのはそのためです。
+
+```bash
+pip install "sqlalchemy[asyncio]" asyncmy cryptography
+```
+
+`sqlalchemy[asyncio]` ではなく素の `sqlalchemy` をインストールするのが、最初の本当の罠です。SQLAlchemy の非同期 ORM 層は `greenlet` ライブラリで非同期コードと同期コードをつないでおり、それは基本パッケージの依存関係ではありません。`[asyncio]` エクストラを省略すると、非同期エンジンに初めて触れたときに次のエラーが出ます。
+
+```
+ValueError: the greenlet library is required to use this function. No module named 'greenlet'
+```
+
+対処は `pip install greenlet` か、より良いのは、常に `[asyncio]` エクストラ付きで SQLAlchemy をインストールして自動的に取り込まれるようにすることです。
+
+2 番目の罠は `cryptography` です。MySQL 8 と VillageSQL は、新しいアカウントのデフォルトを `caching_sha2_password` 認証プラグインにしています。これは、あるアカウントがあるクライアントライブラリから初めて認証するときにパスワードを送るために、RSA 鍵交換を必要とします。`asyncmy` は RSA の実装を同梱していないため、この完全なハンドシェイクを行う必要がある接続は次のエラーで失敗します。
+
+```
+RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods
+```
+
+アカウントが一度完全な認証を終えると（`mysql` CLI を含む任意のクライアントから）、サーバーはその結果をキャッシュし、以降の接続は RSA のステップを省く高速なパスを使います。このエラーが、そのアカウントに最後に何が接続したかによって現れたり消えたりするように見えるのはそのためです。`cryptography` を最初からインストールしておけば、そのキャッシュへの依存が完全になくなり、これが確実な対処です。
+
+## データベースとユーザーの作成 {#creating-the-database-and-user}
+
+root として接続するのではなく、専用のデータベースとアプリケーションユーザーを作成します。
+
+```sql
+CREATE DATABASE IF NOT EXISTS fastapi_guide CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS 'fastapi_app'@'127.0.0.1' IDENTIFIED BY 'fastapi_pw_123!';
+GRANT ALL PRIVILEGES ON fastapi_guide.* TO 'fastapi_app'@'127.0.0.1';
+```
+
+ユーザーのスコープは `localhost` ではなく `127.0.0.1` です。このガイドの接続文字列は TCP で `127.0.0.1` に接続するため、権限付与はそのホストに一致しなければなりません。Unix ソケット接続は、アカウントの IP ベースの権限付与に関係なく、代わりに `localhost` に対して照合されます。
+
+## プロジェクトのレイアウト {#project-layout}
+
+```
+fastapi-sqlalchemy-mysql/
+├── alembic/
+│   ├── env.py
+│   └── versions/
+├── alembic.ini
+├── app/
+│   ├── __init__.py
+│   ├── database.py
+│   ├── models.py
+│   ├── schemas.py
+│   └── main.py
+└── requirements.txt
+```
+
+`requirements.txt`:
+
+```
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]>=2.0
+asyncmy
+cryptography
+alembic
+pydantic
+```
+
+## 非同期エンジンとセッション {#the-async-engine-and-session}
+
+`app/database.py` は、非同期エンジン、セッションファクトリ、およびすべてのモデルが使う宣言的ベースを作成します。
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+DATABASE_URL = "mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide"
+
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+
+`expire_on_commit=False` は FastAPI にとって重要です。デフォルトの `expire_on_commit=True` では、コミットされたオブジェクトのすべての属性が古いものとして印を付けられ、その属性の次の読み取りが、それを更新するための新しい `SELECT` を発行します。`await` の外から引き起こされると、その更新は次のエラーで失敗します。
+
+```
+sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() here. Was IO attempted in an unexpected place?
+```
+
+そして、セッションが完全に閉じた後は、同じ属性の読み取りが代わりに次のエラーで失敗します。
+
+```
+sqlalchemy.orm.exc.DetachedInstanceError: Instance <Post at 0x...> is not bound to a Session; attribute refresh operation cannot proceed
+```
+
+`expire_on_commit=False` は、すでに読み込まれた値をコミット後もオブジェクト上で使える状態に保ち、どちらも回避します。
+
+`get_session()` はジェネレータ関数であり、これにより FastAPI の `Depends()` は、リクエストが成功しても例外を送出しても、終了後にセッションを自動的に閉じられます。
+
+## モデル {#the-model}
+
+`app/models.py` は、従来の `Column` のみのスタイルではなく、SQLAlchemy 2.0 の型付き宣言的スタイルである `Mapped` と `mapped_column` を使って `Post` テーブルを定義します。
+
+```python
+import datetime
+
+from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database import Base
+
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+```
+
+`server_default=func.now()` はタイムスタンプのデフォルトを MySQL 自身に委ねるため、アプリケーションの外から挿入された行でも正しく設定されます。
+
+## Alembic のセットアップ {#setting-up-alembic}
+
+非同期テンプレートで Alembic を初期化します。これにより、非同期エンジン向けにすでに配線された `env.py` が生成されます。
+
+```bash
+alembic init -t async alembic
+```
+
+これはプロジェクトディレクトリの中から実行してください。Alembic は、`init` に渡されたパスに関係なく、`alembic.ini` を現在の作業ディレクトリに書き込みます。`alembic/` スクリプトフォルダ自体は指定されたパスに作成されますが、誤ったディレクトリから実行すると、予期しない場所に `alembic.ini` が取り残されます。
+
+`alembic.ini` を実際のデータベースに向けます。
+
+```ini
+sqlalchemy.url = mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide
+```
+
+次に、autogenerate がモデルを認識できるように、`alembic/env.py` を編集してモデルをインポートします。
+
+```python
+from app.database import Base
+from app.models import Post  # noqa: F401  (registers Post on Base.metadata)
+
+target_metadata = Base.metadata
+```
+
+マイグレーションを生成して実行します。
+
+```bash
+alembic revision --autogenerate -m "create posts table"
+alembic upgrade head
+```
+
+autogenerate のステップは新しいテーブルを検出し、マイグレーションを書きました。
+
+```
+INFO  [alembic.autogenerate.compare.tables] Detected added table 'posts'
+Generating alembic/versions/4f5ba2a8774a_create_posts_table.py ...  done
+```
+
+VillageSQL に対する適用は成功しました。
+
+```
+INFO  [alembic.runtime.migration] Running upgrade  -> 4f5ba2a8774a, create posts table
+```
+
+実際のサーバーに対して直接確認します。
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SHOW TABLES;"
+```
+
+```
+Tables_in_fastapi_guide
+alembic_version
+posts
+```
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "DESCRIBE posts;"
+```
+
+```
+Field       Type          Null    Key     Default    Extra
+id          int           NO      PRI     NULL       auto_increment
+title       varchar(200)  NO              NULL
+body        text          NO              NULL
+created_at  datetime      NO              now()      DEFAULT_GENERATED
+```
+
+## Pydantic スキーマ {#the-pydantic-schemas}
+
+`app/schemas.py` は、ORM モデルとは別に、リクエストとレスポンスの形を定義します。
+
+```python
+import datetime
+
+from pydantic import BaseModel, ConfigDict
+
+
+class PostCreate(BaseModel):
+    title: str
+    body: str
+
+
+class PostRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    body: str
+    created_at: datetime.datetime
+```
+
+`from_attributes=True` により、`PostRead` は辞書ではなく `Post` ORM インスタンスから直接レスポンスを構築できます。
+
+## FastAPI のルート {#the-fastapi-routes}
+
+`app/main.py` は `Depends()` を通じてセッションを各ルートに配線するため、すべてのリクエストは 1 つのグローバルな接続を共有するのではなく、それぞれ独自のセッションを得ます。
+
+```python
+from fastapi import Depends, FastAPI
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_session
+from app.models import Post
+from app.schemas import PostCreate, PostRead
+
+app = FastAPI(title="FastAPI + SQLAlchemy 2.0 + VillageSQL")
+
+
+@app.get("/posts", response_model=list[PostRead])
+async def list_posts(session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Post).order_by(Post.id))
+    return result.scalars().all()
+
+
+@app.post("/posts", response_model=PostRead, status_code=201)
+async def create_post(payload: PostCreate, session: AsyncSession = Depends(get_session)):
+    post = Post(title=payload.title, body=payload.body)
+    session.add(post)
+    await session.commit()
+    await session.refresh(post)
+    return post
+```
+
+リクエスト間で共有されるグローバルなセッションは、並行負荷のもとで、やがて同じ接続に順序の乱れたクエリが交互に届く事態を招きます。`Depends()` を通じてリクエストごとに作成されるセッションはそれを回避します。各リクエストが独自のセッションと、プールから取り出した独自の接続を得るためです。
+
+## 実行と確認 {#running-and-verifying}
+
+アプリを起動します。
+
+```bash
+uvicorn app.main:app --host 127.0.0.1 --port 8010
+```
+
+空のテーブルは空のリストを返します。
+
+```bash
+curl -s http://127.0.0.1:8010/posts
+```
+
+```json
+[]
+```
+
+投稿を作成します。
+
+```bash
+curl -s -X POST http://127.0.0.1:8010/posts \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Hello VillageSQL", "body": "First post via FastAPI + SQLAlchemy 2.0"}'
+```
+
+```json
+{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}
+```
+
+HTTP 201 ステータスとともに返ります。もう一度一覧すると、新しい行が表示されます。
+
+```json
+[{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}]
+```
+
+データベースを直接クエリすると、API のレスポンスだけでなく、書き込みが実際に届いたことを確認できます。
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SELECT * FROM posts;"
+```
+
+```
+id  title             body                                       created_at
+1   Hello VillageSQL  First post via FastAPI + SQLAlchemy 2.0     2026-08-28 12:04:36
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 非同期エンジンには、同期エンジンとは異なる接続文字列が必要なのはなぜですか? {#why-does-the-async-engine-need-a-different-connection-string-than-a-sync-one}
+
+接続文字列のドライバ名は、どの DBAPI を読み込むかを SQLAlchemy に伝えます。同期のセットアップは `mysql+pymysql://` または `mysql+mysqldb://` を使います。非同期のセットアップには `asyncio` 上に構築されたドライバが必要なため、文字列は代わりに `mysql+asyncmy://` を使います。同期ドライバの名前を `create_async_engine` で使うと即座に失敗します。そのドライバには、SQLAlchemy が呼び出せる非同期インターフェースがないためです。
+
+#### `expire_on_commit=False` は必要ですか? {#do-i-need-expire_on_commitfalse}
+
+厳密には必要ではありませんが、省略すると、コミットされたオブジェクトのすべての属性アクセスが、それを再読み込みするための新しいデータベースラウンドトリップを引き起こし、そのラウンドトリップは、有効な非同期コンテキストの中で起こる場合にしか機能しません。属性がどこで読まれるかに応じて、これは `MissingGreenlet` として、またはセッションが閉じた後は `DetachedInstanceError` として現れます。Web アプリケーションにとって安全なデフォルトは `expire_on_commit=False` です。
+
+#### Alembic の同期的な autogenerate ワークフローは引き続き使えますか? {#can-i-still-use-alembics-synchronous-autogenerate-workflow}
+
+はい。非同期テンプレートの `env.py` でも、`revision --autogenerate` と `upgrade` は通常のコマンドラインから実行できます。非同期の部分が影響するのは、`env.py` がスキーマを調べて変更するために自身の接続を開く方法だけです。Alembic の CLI コマンド自体については何も変わりません。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `ValueError: the greenlet library is required to use this function` | 素の `sqlalchemy` ではなく `sqlalchemy[asyncio]` をインストールするか、直接 `pip install greenlet` を実行します |
+| `RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods` | `pip install cryptography` を実行します。`asyncmy` は、MySQL のデフォルトの `caching_sha2_password` 認証の RSA ステップにそれを必要とします |
+| `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` | ORM の属性が `await` された呼び出しの外で読まれました。通常は、セッションがコミット時にオブジェクトを期限切れにしたためです。セッションファクトリに `expire_on_commit=False` を設定します |
+| `sqlalchemy.orm.exc.DetachedInstanceError` | 属性が読まれる前に、オブジェクトのセッションがすでに閉じていました。`expire_on_commit=False` を維持するか、リクエストが終わる前に必要なすべての属性を読みます |
+| `alembic init -t async <path>` の後、`alembic.ini` が誤ったディレクトリに現れる | `alembic init` をプロジェクトディレクトリの中から実行します。ini ファイルはパス引数ではなく、現在の作業ディレクトリに従います |
+| `alembic revision --autogenerate` が空のマイグレーションを生成する | `alembic/env.py` の `target_metadata` がまだ `None` であるか、モデルがインポートされていないため `Base.metadata` に登録されていません |
+| `Access denied for user 'fastapi_app'@'127.0.0.1'` | ユーザーが `localhost` などの別のホスト向けに作成されています。このガイドの接続文字列は TCP で `127.0.0.1` に接続するため、権限付与はそのホストに一致しなければなりません |
+| FastAPI のレスポンスに、モデルにあるフィールドが欠けている | `PostRead` が辞書ではなく ORM オブジェクトから読み取るには、`model_config = ConfigDict(from_attributes=True)` が必要です |
+
+## 関連項目 {#see-also}
+
+- [ORM での MySQL の使用: Django、Rails、および Prisma](/ja/guides/mysql-with-orms) — 同じ文字セットと厳密モードの設定が SQLAlchemy にも当てはまります
+- [MySQL の接続プーリング](/ja/guides/connection-pooling) — 並行する FastAPI リクエストのもとでの非同期エンジンのプールサイズの調整

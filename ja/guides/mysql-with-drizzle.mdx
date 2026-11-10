@@ -1,0 +1,349 @@
+---
+title: "Next.js と Drizzle で MySQL を使う"
+sidebarTitle: "Next.js と Drizzle"
+description: "Drizzle ORM と mysql2 ドライバーを使って Next.js App Router アプリケーションを MySQL に接続する方法: スキーマ定義、drizzle-kit によるマイグレーション、Server Components、Server Actions、そして古いデータベース行を配信してしまう静的レンダリングの罠。"
+keywords: "nextjs mysql drizzle, drizzle orm mysql, drizzle-kit migrate, nextjs server action mysql, mysql2 nextjs, drizzle mysql2 driver, nextjs app router database, drizzle orm mysql2"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Drizzle ORM は TypeScript のクエリビルダーで、スキーマファイルから SQL マイグレーションを生成し、独自の中間クエリ言語を介さずに型付きのクエリ API を提供します。このガイドでは、Drizzle と `mysql2` ドライバーを通じて Next.js App Router アプリケーションを MySQL に接続し、スキーマ、マイグレーション、Server Component からの読み取り、Server Action からの書き込みを扱います。`create-next-app --src-dir` でスキャフォールドされた既存のアプリを前提としており、このコマンドがコードサンプルで使う `@/*` インポートエイリアスを設定します。
+
+## Drizzle と MySQL ドライバーのインストール {#install-drizzle-and-the-mysql-driver}
+
+Drizzle が MySQL と通信するには `mysql2` ドライバーが必要で、マイグレーションの生成と実行には `drizzle-kit` が必要です。
+
+```bash
+npm install drizzle-orm mysql2
+npm install -D drizzle-kit tsx dotenv
+```
+
+`drizzle-kit` は変化が速く、`latest` と並んで `dist-tags` の下にプレリリースタグ (`beta`、`rc`) を公開しています。インストールの前に `npm view drizzle-orm dist-tags` と `npm view drizzle-kit dist-tags` を確認し、`latest` がリリース候補ではなく実際に安定版リリースを指していることを確かめてください。
+
+`.env` に接続文字列を設定します。
+
+```bash
+DATABASE_URL="mysql://drizzle_app:your_password@127.0.0.1:3306/your_database"
+```
+
+## データベースユーザーの作成 {#create-the-database-user}
+
+アプリケーションを `root` として接続するのではなく、専用のデータベースと、それに限定されたユーザーを作成します。
+
+```sql
+CREATE DATABASE drizzle_guide;
+CREATE USER 'drizzle_app'@'127.0.0.1' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON drizzle_guide.* TO 'drizzle_app'@'127.0.0.1';
+```
+
+Unix ソケット経由の接続は、どの IP ベースの権限付与が存在するかに関係なく、常に `'localhost'` ホストと照合されます。`'drizzle_app'@'127.0.0.1'` としてのみ作成されたユーザーは、ソケット経由では認証できません。`127.0.0.1` への TCP 接続は逆引き DNS で照合されるため、それが `'localhost'` の権限付与も満たすかどうかは、固定された MySQL のルールではなく、サーバーが `127.0.0.1` をどう解決するかに依存します。アプリケーションが実際に使うホストに権限を付与し、`127.0.0.1` と `localhost` が交換可能であることに頼らないでください。
+
+## スキーマの定義 {#define-the-schema}
+
+Drizzle の MySQL スキーマは、`drizzle-orm/mysql-core` の関数を使って各列を記述します。
+
+```typescript src/db/schema.ts
+import { int, mysqlTable, text, timestamp, varchar } from "drizzle-orm/mysql-core";
+
+export const posts = mysqlTable("posts", {
+  id: int("id").autoincrement().primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+```
+
+`varchar` には明示的な `length` が必要です。MySQL は PostgreSQL と異なり、最大長を列の型に組み込んだ形で `VARCHAR` を格納するため、Drizzle にはフォールバックするデフォルトがなく、最初から値が必要になります。
+
+## drizzle-kit の設定 {#configure-drizzle-kit}
+
+`drizzle-kit` は、スキーマの場所とデータベースへの到達方法を知るために設定ファイルを読みます。
+
+```typescript drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+export default defineConfig({
+  out: "./drizzle",
+  schema: "./src/db/schema.ts",
+  dialect: "mysql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL,
+  },
+});
+```
+
+`drizzle-kit` は設定ファイルが実行される前に自身で `.env` を読み込むため、ここでは `dotenv` のインポートなしで `process.env.DATABASE_URL` がすでに設定されています。これは `drizzle-kit` に固有の動作です。素の Node や `tsx` のスクリプトにはそのようなローダーは組み込まれておらず、このガイドの後半の検証スクリプトがそれを示しています。
+
+`package.json` にマイグレーション用のスクリプトを追加します。
+
+```json package.json
+{
+  "scripts": {
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
+  }
+}
+```
+
+## マイグレーションの生成と実行 {#generate-and-run-the-migration}
+
+`drizzle-kit generate` はスキーマファイルを最後に生成されたマイグレーションと比較し、新しい SQL ファイルを書き出します。
+
+```bash
+npm run db:generate
+```
+
+```
+No config path provided, using default 'drizzle.config.ts'
+Reading config file '/path/to/your-app/drizzle.config.ts'
+Reading schema files:
+/path/to/your-app/src/db/schema.ts
+
+1 tables
+posts 4 columns 0 indexes 0 fks
+
+[✓] Your SQL migration file ➜ drizzle/0000_premium_tiger_shark.sql 🚀
+```
+
+`drizzle-kit` は設定とスキーマのパスを絶対パスで出力します。上の `/path/to/your-app` はプロジェクトディレクトリの代わりです。生成されるファイル名にはランダムな 2 語のサフィックスが含まれるため、あなたの環境では異なります。順序付けに意味があるのは数値のプレフィックス (`0000`) だけです。スキーマを変更せずに `db:generate` を再実行すると、2 つ目のファイルを書き出す代わりに `No schema changes, nothing to migrate` と報告します。マイグレーションそのものは素の SQL です。
+
+```sql drizzle/0000_premium_tiger_shark.sql
+CREATE TABLE `posts` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`title` varchar(255) NOT NULL,
+	`body` text NOT NULL,
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `posts_id` PRIMARY KEY(`id`)
+);
+```
+
+適用します。
+
+```bash
+npm run db:migrate
+```
+
+`drizzle-kit migrate` は初回の実行時に `__drizzle_migrations` テーブルを作成し、どのマイグレーションファイルがすでに適用済みかを追跡します。両方のテーブルが存在することを確認します。
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u drizzle_app -p drizzle_guide -e "SHOW TABLES;"
+```
+
+```
+Tables_in_drizzle_guide
+__drizzle_migrations
+posts
+```
+
+## データベースクライアントの作成 {#create-the-database-client}
+
+`mysql2` ドライバーはプールを通じて接続し、Drizzle がそのプールをラップします。
+
+```typescript src/db/index.ts
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import * as schema from "./schema";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+const poolConnection = mysql.createPool(process.env.DATABASE_URL);
+
+export const db = drizzle(poolConnection, { schema, mode: "default" });
+```
+
+`mode: "default"` オプションは `mysql2` ドライバーに固有のもので、Drizzle の PostgreSQL や SQLite ドライバーには相当するものがありません。これを省略すると、暗黙のデフォルトにはならず、型エラーになります。
+
+## Server Component での投稿の読み取り {#read-posts-in-a-server-component}
+
+Server Component は、間に API ルートを挟まずに、レンダリング中に `db.select()` を直接呼び出せます。
+
+```typescript src/app/page.tsx
+import { db } from "@/db";
+import { posts } from "@/db/schema";
+import { desc } from "drizzle-orm";
+import { createPost } from "./actions";
+
+export const dynamic = "force-dynamic";
+
+export default async function Home() {
+  const allPosts = await db.select().from(posts).orderBy(desc(posts.createdAt));
+
+  return (
+    <main>
+      <h1>Posts</h1>
+      <form action={createPost}>
+        <div>
+          <label htmlFor="title">Title</label>
+          <input id="title" name="title" type="text" required />
+        </div>
+        <div>
+          <label htmlFor="body">Body</label>
+          <textarea id="body" name="body" required />
+        </div>
+        <button type="submit">Create post</button>
+      </form>
+      <ul>
+        {allPosts.map((post) => (
+          <li key={post.id}>
+            <strong>{post.title}</strong>
+            <p>{post.body}</p>
+            <small>{post.createdAt.toISOString()}</small>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+## Server Action での投稿の挿入 {#insert-posts-with-a-server-action}
+
+Server Action はサーバー上で実行され、フォームの `action` プロパティに直接渡せます。
+
+```typescript src/app/actions.ts
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { db } from "@/db";
+import { posts } from "@/db/schema";
+
+export async function createPost(formData: FormData) {
+  const title = formData.get("title");
+  const body = formData.get("body");
+
+  if (typeof title !== "string" || title.trim() === "") {
+    throw new Error("Title is required");
+  }
+  if (typeof body !== "string" || body.trim() === "") {
+    throw new Error("Body is required");
+  }
+
+  await db.insert(posts).values({ title, body });
+
+  revalidatePath("/");
+}
+```
+
+`revalidatePath("/")` は、リクエストごとにレンダリングされるルートであっても必要です。これがないと、Server Action のレスポンスに、呼び出し元ページの更新されたコピーが含まれることは保証されません。
+
+## 静的レンダリングの罠 {#the-static-rendering-trap}
+
+`npm run build` はアプリケーションをコンパイルしますが、同時にルートごとに、ページをビルド時に一度だけプリレンダリングできるか、それともリクエストごとにレンダリングしなければならないかを決定します。同じルート内に他の動的 API (`cookies()` も `headers()` も `searchParams` もない) を持たずにデータベースを読む Server Component は、Next.js にリクエストごとのレンダリングを強制するものを何も与えないため、ビルド中にページを一度だけプリレンダリングし、その後はすべての訪問者に同じ HTML を配信します。
+
+これは再現可能でした。`page.tsx` から `export const dynamic = "force-dynamic";` を削除して再ビルドすると、ルートは static とマークされました。
+
+```
+Route (app)
+┌ ○ /
+└ ○ /_not-found
+
+○  (Static)  prerendered as static content
+```
+
+そのビルドの後にデータベースへ直接挿入した行は、ビルド済みアプリケーションを `npm run start` で起動しても表示されませんでした。ページはビルド時に取り込んだ行数と内容を配信し続けました。`page.tsx` に `export const dynamic = "force-dynamic";` を追加して再ビルドすると、ルートは dynamic に変わりました。
+
+```
+Route (app)
+┌ ƒ /
+└ ○ /_not-found
+
+ƒ  (Dynamic)  server-rendered on demand
+```
+
+この変更の後、ビルド後に挿入した行は、再ビルドなしで次のリクエストですぐに表示されました。データベースから読み取り、ビルド後に行われた書き込みを反映する必要があるページには、`export const dynamic = "force-dynamic";` か、リクエストごとのレンダリングを強制するという同じ効果を持つ別の Next.js API (`cookies()` の読み取りなど) が必要です。
+
+## ORM とは独立して書き込みパスを検証する {#verify-the-write-path-independently-of-the-orm}
+
+Drizzle を通じて挿入し、Drizzle 自身の戻り値だけを確認するスクリプトでは、行がデータベースに到達したことは証明できません。証明できるのは、ドライバーが例外を投げずに戻ったことだけです。別のクエリで検証してください。
+
+```typescript src/db/verify-insert.ts
+import "dotenv/config";
+import { db } from "./index";
+import { posts } from "./schema";
+
+async function main() {
+  const [inserted] = await db.insert(posts).values({
+    title: "Verification post",
+    body: "Inserted by verify-insert.ts to confirm the write path works.",
+  });
+
+  console.log("Insert result:", inserted);
+  process.exit(0);
+}
+
+main();
+```
+
+TypeScript を直接実行する `tsx` で実行します。
+
+```bash
+npx tsx src/db/verify-insert.ts
+```
+
+```
+Insert result: ResultSetHeader {
+  fieldCount: 0,
+  affectedRows: 1,
+  insertId: 1,
+  info: '',
+  serverStatus: 2,
+  warningStatus: 0,
+  changedRows: 0
+}
+```
+
+スクリプト先頭の `import "dotenv/config"` はここでは必須です。Next.js はアプリケーションのために `.env` を自動的に読み込みますが、`tsx` で実行する独立したスクリプトはフレームワークの配線を持たない素の Node プロセスであり、Node 自身は `.env` ファイルを読みません。
+
+次に、アプリケーションを一切経由しないクエリで行の存在を確認します。
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u drizzle_app -p drizzle_guide -e "SELECT id, title, body, created_at FROM posts;"
+```
+
+```
+id	title	body	created_at
+1	Verification post	Inserted by verify-insert.ts to confirm the write path works.	2026-08-28 11:59:54
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### これは MySQL と同じように VillageSQL でも動作しますか？ {#does-this-work-the-same-way-with-villagesql-as-with-mysql}
+
+はい。Drizzle の MySQL 方言と `mysql2` ドライバーは標準の MySQL ワイヤプロトコルで通信し、VillageSQL は同じプロトコルとクライアントツールを持つ MySQL のドロップイン代替です。上のスキーマ、マイグレーション、クエリのコードには、MySQL のバージョンに固有のものは何もありません。
+
+#### `drizzle-kit generate` と `migrate` を使うべきですか、それとも `drizzle-kit push` ですか？ {#should-i-use-drizzle-kit-generate-and-migrate-or-drizzle-kit-push}
+
+`generate` と `migrate` の組み合わせは、データベースに対して実行する前にレビューしてコミットできる SQL マイグレーションファイルを書き出します。このガイドが使うのはこちらです。`drizzle-kit push` はスキーマファイルを稼働中のデータベースと比較し、マイグレーションファイルなしで差分を直接適用します。`push` は初期のプロトタイピングでは速いですが、何がいつ変わったかの記録を残さないため、他の開発者や環境がスキーマに依存するようになった後では、マイグレーションファイルの代わりにはなりません。
+
+#### なぜマイグレーションフォルダーに `__drizzle_migrations` というテーブルがあるのですか？ {#why-does-the-migration-folder-have-a-table-called-__drizzle_migrations}
+
+`drizzle-kit migrate` は初回実行時にこのテーブルを作成し、どのマイグレーションファイルをすでに適用したかをハッシュで記録します。これによって `migrate` は、すでに実行済みのマイグレーションを二重に適用せずにスキップできます。
+
+#### Server Action の代わりに Server Component から直接 `db.insert()` を呼べますか？ {#can-i-call-dbinsert-directly-from-a-server-component-instead-of-a-server-action}
+
+Server Component はレンダリング中にしか実行されません。ユーザーの操作に応じて書き込みを起動するブラウザからのリクエストは存在しません。書き込みパスには、Server Action、Route Handler、または API ルートを呼び出すクライアント側のコードが必要です。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `Access denied for user 'drizzle_app'@'localhost' (using password: YES)` | `DATABASE_URL` のパスワードが間違っています。接続先が `127.0.0.1` であっても、エラーに表示されるホストは `localhost` になることがあります。アカウントのホスト部分が問題だという意味ではありません。まずパスワードを確認してください。 |
+| `ERROR 1146 (42S02): Table 'drizzle_guide.posts' doesn't exist` | このデータベースに対してマイグレーションが一度も実行されていません。`npm run db:migrate` を実行してください。 |
+| `npm run build` の後に挿入した行がページに表示されない | ルートがビルド時にプリレンダリングされています。ページに `export const dynamic = "force-dynamic";` を追加して再ビルドしてください。 |
+| `drizzle-kit generate` または `migrate` の実行時に `DATABASE_URL is not set` | `.env` がないか、コマンドをプロジェクトルート以外のディレクトリから実行したため、`drizzle-kit` が `.env` を見つけられませんでした。 |
+| `drizzle()` 呼び出し時に `mode` オプションで型エラー | `mysql2` ドライバーには `mode: "default"` (PlanetScale 固有の動作には `"planetscale"`) が必要です。このオプションは Drizzle の PostgreSQL や SQLite ドライバーには存在しません。 |
+
+## 関連項目 {#see-also}
+
+- [Next.js と Prisma で MySQL を使う](/ja/guides/mysql-with-prisma) — Drizzle の代わりに Prisma で構築した同じアプリ
+- [Next.js で MySQL を使う](/ja/guides/nextjs-mysql) — ORM を一切使わない接続設定、Server Actions、Route Handler のパターン
+- [ORM で MySQL を使う: Django、Rails、Prisma](/ja/guides/mysql-with-orms) — Drizzle 以外の ORM で MySQL 固有の設定を構成する
+- [MySQL のコネクションプーリング](/ja/guides/connection-pooling) — `mysql2` が作成するコネクションプールが MySQL の接続制限とどう関係するか

@@ -1,0 +1,190 @@
+---
+title: "MySQL 8.4 のウィンドウ関数"
+sidebarTitle: "ウィンドウ関数の使用"
+description: "MySQL 8.4 のウィンドウ関数の仕組み: ROW_NUMBER、RANK、LAG、LEAD、累計、そして GROUP BY の集計との違い。"
+keywords: "mysql window functions, mysql row_number, mysql rank, mysql over clause, mysql partition by, mysql lag lead, mysql running total, mysql 8.4 analytics"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ウィンドウ関数は、現在の行に関連する行の集合にわたって値を計算します。`GROUP BY` のようにそれらの行を 1 つの出力行にまとめることはありません。以前はサブクエリやアプリケーション層での処理を必要とした分析クエリを可能にします。
+
+## ウィンドウ関数と GROUP BY の違い {#how-window-functions-differ-from-group-by}
+
+```sql
+-- GROUP BY: collapses rows — you lose the individual order details
+SELECT customer_id, SUM(amount) AS total
+FROM orders
+GROUP BY customer_id;
+
+-- Window function: adds a column without collapsing rows
+SELECT
+    id,
+    customer_id,
+    amount,
+    SUM(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM orders;
+```
+
+2 つ目のクエリは注文ごとに 1 行を返し、各行にはその顧客の合計も表示されます。`GROUP BY` にはこれができません。個々の行を取り除いてしまうからです。
+
+## OVER 句 {#the-over-clause}
+
+すべてのウィンドウ関数は、ウィンドウ — 計算の対象となる行の集合 — を定義する `OVER` 句を使います。
+
+```sql
+function() OVER (
+    PARTITION BY col    -- divide rows into groups (optional)
+    ORDER BY col        -- define row order within the window (required for ranking/offset functions)
+    ROWS BETWEEN ...    -- define the frame (optional)
+)
+```
+
+空の `OVER()` は、ウィンドウが結果セット全体であることを意味します。
+
+## ランキング関数 {#ranking-functions}
+
+```sql
+SELECT
+    name,
+    score,
+    ROW_NUMBER() OVER (ORDER BY score DESC) AS row_num,
+    RANK()       OVER (ORDER BY score DESC) AS `rank`,
+    DENSE_RANK() OVER (ORDER BY score DESC) AS `dense_rank`
+FROM leaderboard;
+```
+
+| 関数 | 同じ値がある場合の振る舞い |
+|:---------|:-----------------|
+| `ROW_NUMBER()` | 一意の連番 — 同じ値でも異なる番号になる(順序は任意) |
+| `RANK()` | 同じ値の行は同じ順位を共有し、次の順位は飛ぶ(1, 1, 3) |
+| `DENSE_RANK()` | 同じ値の行は同じ順位を共有し、次の順位は飛ばない(1, 1, 2) |
+
+出力の例を示します。
+
+```
+name   | score | row_num | rank | dense_rank
+-------+-------+---------+------+-----------
+Alice  |   100 |       1 |    1 |          1
+Bob    |    95 |       2 |    2 |          2
+Carol  |    95 |       3 |    2 |          2
+Dave   |    90 |       4 |    4 |          3
+```
+
+## PARTITION BY: グループごとのランキング {#partition-by-per-group-rankings}
+
+結果セット全体ではなくグループ内で順位を付けるには、`PARTITION BY` を追加します。
+
+```sql
+-- Rank orders within each customer, newest first
+SELECT
+    customer_id,
+    id AS order_id,
+    created_at,
+    ROW_NUMBER() OVER (
+        PARTITION BY customer_id
+        ORDER BY created_at DESC
+    ) AS order_rank
+FROM orders;
+```
+
+各顧客の最新の注文を取得するには次のようにします。
+
+```sql
+SELECT customer_id, order_id, created_at
+FROM (
+    SELECT
+        customer_id,
+        id AS order_id,
+        created_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY created_at DESC
+        ) AS rn
+    FROM orders
+) ranked
+WHERE rn = 1;
+```
+
+## LAG と LEAD: 隣接する行へのアクセス {#lag-and-lead-accessing-adjacent-rows}
+
+`LAG` は前の行に、`LEAD` は後の行にアクセスします。自己結合は不要です。
+
+```sql
+SELECT
+    date,
+    revenue,
+    LAG(revenue)  OVER (ORDER BY date) AS prev_day_revenue,
+    LEAD(revenue) OVER (ORDER BY date) AS next_day_revenue,
+    revenue - LAG(revenue) OVER (ORDER BY date) AS day_over_day_change
+FROM daily_revenue
+ORDER BY date;
+```
+
+どちらの関数も、省略可能なオフセット(デフォルトは 1)と、隣接する行が存在しないときのデフォルト値を受け取ります。
+
+```sql
+LAG(revenue, 1, 0) OVER (ORDER BY date)  -- use 0 when there's no previous row
+```
+
+## 累計と移動平均 {#running-totals-and-moving-averages}
+
+`ROWS BETWEEN` を使ってフレーム — 計算に含める行の部分集合 — を定義します。
+
+```sql
+SELECT
+    date,
+    amount,
+    -- Running total (all rows from start to current)
+    SUM(amount) OVER (ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+    -- 7-day moving average
+    AVG(amount) OVER (ORDER BY date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving_avg_7d
+FROM daily_sales;
+```
+
+よく使うフレームの指定は次のとおりです。
+
+| フレーム | 意味 |
+|:------|:--------|
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | 最初の行から現在の行まで(累計) |
+| `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` | 現在の行と先行する 6 行(7 行のウィンドウ) |
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` | パーティション全体 |
+
+## よくある質問 {#frequently-asked-questions}
+
+#### WHERE 句でウィンドウ関数の結果を使って絞り込めますか? {#can-i-filter-on-a-window-function-result-in-a-where-clause}
+
+いいえ。ウィンドウ関数は `WHERE` の後に評価されます。ウィンドウ関数の結果で絞り込むには、クエリをサブクエリまたは CTE で包みます。
+
+```sql
+SELECT * FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+    FROM orders
+) t
+WHERE rn = 1;
+```
+
+#### フレーム句の ROWS と RANGE の違いは何ですか? {#whats-the-difference-between-rows-and-range-in-the-frame-clause}
+
+`ROWS` は物理的な行を数えます。`RANGE` は同じ `ORDER BY` の値を持つ行をまとめます。ほとんどの用途(累計、移動平均)では、`ROWS` が期待どおりの振る舞いをします。`RANGE` は、順序付けの列に同じ値があるときに意外な結果を生むことがあります。
+
+#### ウィンドウ関数はインデックスを使いますか? {#do-window-functions-work-with-indexes}
+
+ウィンドウ関数はウィンドウの計算自体にはインデックスを使いませんが、クエリは `WHERE` 句にインデックスを使って処理対象の行を減らせます。複雑なウィンドウクエリでは、実行計画を理解するために [MySQL の EXPLAIN の読み方](/ja/guides/reading-explain)が役立ちます。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| ウィンドウ関数の構文で `ERROR 1064` | ウィンドウ関数のサポート以前の古い MySQL バージョンを実行している — `SELECT VERSION()` で確認する |
+| WHERE 句でウィンドウ関数の結果を使うと失敗する | 絞り込みを外側のクエリまたは CTE に移す — WHERE はウィンドウ関数を参照できない |
+| `RANK()` が予期せず番号を飛ばす | 期待どおりの振る舞い — 飛ばしたくなければ `DENSE_RANK()` を使う |
+| ウィンドウ関数のクエリが遅い | ソートを高速化するために、`PARTITION BY` と `ORDER BY` の列にインデックスを追加する |
+
+## 関連項目 {#see-also}
+
+- [MySQL の CTE が派生テーブルより優れる場合](/ja/guides/ctes-in-mysql) — 複数ステップの分析でウィンドウ関数とよく組み合わせる
+- [MySQL の GROUP BY のパフォーマンス](/ja/guides/group-by-having) — 行をまとめる種類の集計と、そのコスト
+- [MySQL の GROUP BY](/ja/tutorial/group-by) — この句自体についてのチュートリアルのレッスン

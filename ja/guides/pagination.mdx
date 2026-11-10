@@ -1,0 +1,97 @@
+---
+title: "MySQL のページネーション: キーセットと OFFSET の比較"
+sidebarTitle: "結果のページネーション"
+description: "OFFSET によるページネーションが深いページで遅くなる理由と、キーセット（カーソル）ページネーションが 10,000 ページ目を 1 ページ目と同じ速さに保つ仕組み。"
+keywords: "mysql pagination, keyset pagination, cursor pagination mysql, limit offset slow, mysql offset performance, seek method"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`LIMIT 20 OFFSET 200000` は 200,020 行を読み、そのうち 200,000 行を捨てます。これはバグではなく、OFFSET の意味そのものです。サーバーには任意の並び順で 200,001 行目に直接ジャンプする方法がないため、そこまで歩いて行きます。1 ページ目は速く、10,000 ページ目は遅く、その遅さはページの深さに比例して増えます。キーセットページネーションは、先頭から数えるのではなく、直前のページがどこで終わったかを覚えておくことでこれを解決します。
+
+## OFFSET ページネーション: 問題が出るまでは問題ない {#offset-pagination-fine-until-it-isnt}
+
+おなじみのパターンです。
+
+```sql
+SELECT id, title, created_at
+FROM articles
+ORDER BY id
+LIMIT 20 OFFSET 40;   -- page 3
+```
+
+これは浅いページングには問題ありません。管理画面や、人間が 20 ページ目より先までスクロールすることのない結果セットなどです。問題は深いページで現れます。
+
+- **コストがページ番号とともに増える。** `OFFSET 200000` は、何かを返す前に 200,000 件のインデックスエントリをスキャンして捨てます。
+- **リクエストの間に行がずれる。** ユーザーがページをめくっている間に行が挿入されると、ページの境界が動き、ユーザーは重複を見るか、行を見逃します。
+
+## キーセットページネーション: 止まった場所を覚える {#keyset-pagination-remember-where-you-stopped}
+
+行を数える代わりに、クライアントが最後に見た値で絞り込みます。
+
+```sql
+-- First page
+SELECT id, title, created_at
+FROM articles
+ORDER BY id
+LIMIT 20;
+
+-- Next page: the client sends back the last id it received (say, 20)
+SELECT id, title, created_at
+FROM articles
+WHERE id > 20
+ORDER BY id
+LIMIT 20;
+```
+
+`WHERE id > 20` 句によって、サーバーはインデックス内を直接シークし、ページの深さに関係なくちょうど 20 行だけを読めます。10,000 ページ目のコストは 1 ページ目と同じです。境界は位置ではなく値なので、挿入された行がページの境界をずらすこともありません。
+
+トレードオフ: キーセットページネーションが提供するのは「次へ」と「前へ」であり、「47 ページ目へジャンプ」ではありません。無限スクロールや API では、たいていそれが本来望んでいたインターフェースです。
+
+## キー以外で並べ替える {#sorting-by-something-other-than-the-key}
+
+実際の一覧が `id` で並ぶことはまれです。一意でない列で並べ替える場合はタイブレーカーが必要です。そうしないと、同じ値を持つ行がページをまたいでスキップされたり繰り返されたりします。クライアントは最後に見た行の両方の値を送り返し、クエリは両方で比較します。
+
+```sql
+-- Sorted by created_at, with id as the tiebreaker
+SELECT id, title, created_at
+FROM articles
+WHERE created_at > '2026-08-01 12:00:00'
+   OR (created_at = '2026-08-01 12:00:00' AND id > 143)
+ORDER BY created_at, id
+LIMIT 20;
+```
+
+SQL には、`WHERE (created_at, id) > ('2026-08-01 12:00:00', 143)` という、より短い行コンストラクタの書き方もあります。同じ行を返しますが、MySQL のオプティマイザはこれをインデックスの範囲シークに変換しません。`EXPLAIN` は、行コンストラクタに対してはフルスキャン（クエリがインデックスでカバーされるかどうかに応じて `type: ALL` または `type: index`）を、上に示した展開形に対してはシーク（`type: range`）を示します。展開形を使用してください。
+
+どちらの場合も、インデックスは ORDER BY と一致していなければなりません。
+
+```sql
+CREATE INDEX idx_articles_created_id ON articles (created_at, id);
+```
+
+`EXPLAIN` でプランを確認してください。そのインデックスに対する `type: range` が表示され、filesort がないことが望ましい状態です。何を見るべきかについては、[EXPLAIN の読み方](/ja/guides/reading-explain)を参照してください。
+
+## 総件数は必要ですか？ {#do-you-need-a-total-count}
+
+大きな絞り込み済みセットに対する `SELECT COUNT(*)` は、ページクエリ自体よりもコストがかかることがあります。キーセットページネーションの上に構築されたインターフェースは、たいてい正確な件数をやめて「さらに読み込む」という操作に置き換えます。プロダクトが本当に件数を必要とする場合は、リクエストごとに数えるのではなく、キャッシュするか集計テーブルで管理してください。
+
+## どちらを使うか {#which-one-to-use}
+
+| 状況 | 使用するもの |
+|---|---|
+| 数百行の管理テーブル | OFFSET。より単純です |
+| ユーザーが行き来できる番号付きページリンク | OFFSET。キーセットはジャンプできません |
+| API の結果のページネーション | キーセット。不透明なカーソルを返します |
+| 無限スクロール | キーセット |
+| 約 10 万行を超えて増える可能性のある一覧 | キーセット |
+
+## 関連項目 {#see-also}
+
+- [MySQL のインデックス](/ja/guides/mysql-indexes) — キーセットページネーションが依存するインデックス設計
+- [EXPLAIN の読み方](/ja/guides/reading-explain) — スキャンではなくシークであることの確認
+- [主キーの戦略](/ja/guides/primary-key-strategies) — 並べ替え可能なキー（UUIDv7 など）は良いカーソルになります
+- [MySQL の LIMIT](/ja/tutorial/limit) — LIMIT と OFFSET に関するチュートリアルのレッスン
+- [MySQL の ORDER BY](/ja/tutorial/order-by) — ページングが依存する並べ替え

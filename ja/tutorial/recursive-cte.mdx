@@ -1,0 +1,134 @@
+---
+title: "MySQL の再帰 CTE"
+sidebarTitle: "再帰 CTE"
+description: "MySQL の再帰 CTE が自身の出力から行を作る仕組み、すべての再帰 CTE に必要な 2 つの部分、および暴走したクエリを ERROR 3636 で止める深さの制限。"
+keywords: "mysql recursive cte, mysql with recursive, mysql hierarchical query, mysql generate series, mysql error 3636, mysql anchor member"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+通常の CTE はテーブルを読みます。再帰 CTE は自分自身を読むため、各ラウンドの
+行が次のラウンドの行を生み出します。これが、SQL が階層をたどったり連番を
+生成したりする方法であり、どちらも単純な `SELECT` にはできません。
+
+始める前に、`mysql -u root -p sakila` でクライアントを開いてください。
+
+## 再帰 CTE の仕組み {#how-a-recursive-cte-works}
+
+```sql
+WITH RECURSIVE CTE_NAME AS (
+  SELECT SEED_VALUE AS COLUMN_NAME
+  UNION ALL
+  SELECT NEXT_EXPRESSION FROM CTE_NAME WHERE STOP_CONDITION
+)
+SELECT COLUMN_NAME FROM CTE_NAME;
+```
+
+`CTE_NAME` を結果の名前に、`COLUMN_NAME` を CTE が生成する列に、`SEED_VALUE` を
+開始値に、`NEXT_EXPRESSION` を前の行から次の行を作る式に、`STOP_CONDITION` を
+いずれ偽になる条件に置き換えます。
+
+再帰 CTE には、`UNION ALL` でつながれた 2 種類の部分があります。
+
+- **シード**。アンカーメンバーとも呼ばれ、CTE をまったく参照せず、開始行を
+  生成します。
+- **再帰メンバー**。CTE 自身から選択します。
+
+ほとんどの再帰 CTE はそれぞれをちょうど 1 つずつ持ち、下の例もその形です。
+MySQL はどちらも 2 つ以上を受け入れ、`UNION ALL` の代わりに `UNION` も
+受け入れます。`UNION` は各ラウンドの重複を取り除きます。どちらも一般的では
+ありませんが、出会ったときにそれと分かるようにしておく価値はあります。
+
+サーバーはシードを実行し、次に前のラウンドが生成したものに対して再帰部分を
+実行します。これを、あるラウンドが行を 1 つも生成しなくなるまで繰り返します。
+再帰部分の `WHERE` が、いずれそれを起こすものです。
+
+キーワードは `WITH RECURSIVE` で、CTE ではなく `WITH` に付けます。
+
+## 5 まで数える {#counting-to-5}
+
+```sql
+WITH RECURSIVE numbers AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM numbers WHERE n < 5
+)
+SELECT n FROM numbers;
+```
+
+```text
++------+
+| n    |
++------+
+|    1 |
+|    2 |
+|    3 |
+...
++------+
+5 rows in set (0.00 sec)
+```
+
+シードが行 1 を作ります。再帰部分はその行を受け取って 2 を作り、次に 2 を
+受け取って 3 を作り、5 に達したところで止まります。`WHERE n < 5` が次の行を
+生成しないためです。
+
+このような連番は見た目以上に役に立ちます。実データと結合すると、何も起きな
+かった日も含めて範囲内のすべての日に 1 行ずつが得られます。これはデータだけに
+対するクエリでは生成できません。
+
+## 停止条件を省く {#leaving-out-the-stop-condition}
+
+`WHERE` を取り除くと、再帰部分は常に次の行を生成します。
+
+```sql
+WITH RECURSIVE numbers AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM numbers
+)
+SELECT n FROM numbers;
+```
+
+```text
+ERROR 3636 (HY000): Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.
+```
+
+サーバーは永遠に実行し続けるのではなく、これを止めます。制限は設定です。
+
+```sql
+SELECT @@cte_max_recursion_depth AS max_depth;
+```
+
+```text
++-----------+
+| max_depth |
++-----------+
+|      1000 |
++-----------+
+1 row in set (0.01 sec)
+```
+
+メッセージ内の回数は設定より 1 大きくなります。制限を超えたラウンドが、
+サーバーが止まる前に数えられるためです。
+
+`ERROR 3636` は、まず停止条件の欠落または誤りとして読んでください。
+`SET SESSION cte_max_recursion_depth = 5000;` で制限を上げるのが正しいのは、
+デフォルトが許すより多くのラウンドが本当に必要なときだけです。クエリが
+そもそも止まらないものだった場合、それは誤りです。失敗するまでの時間が
+長くなるだけで、結局は失敗します。この設定は変数なので、上の 1,000 は
+MySQL の固定の性質ではなく、このサーバーの値です。
+
+## まとめ {#summary}
+
+- CTE が自分自身を読むときは `WITH RECURSIVE` と書きます。
+- シード部分と再帰メンバーを与え、`UNION ALL` でつなぎます。
+- 停止条件は再帰部分の `WHERE` に置きます。
+- `ERROR 3636` は、設定に手を伸ばす前に、暴走した再帰として読みます。
+
+## 関連項目 {#see-also}
+
+- [共通テーブル式](/ja/tutorial/cte) — 再帰しない種類
+- [UNION](/ja/tutorial/union) — 2 つの部分をつなぐ演算子
+- [MySQL の CTE が派生テーブルより優れる場合](/ja/guides/ctes-in-mysql) — オプティマイザがそれらをどう扱うか

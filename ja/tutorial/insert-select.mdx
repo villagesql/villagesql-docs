@@ -1,0 +1,157 @@
+---
+title: "MySQL の INSERT SELECT"
+sidebarTitle: "INSERT SELECT"
+description: "INSERT INTO ... SELECT がクエリの行を MySQL のテーブルにコピーする仕組み、列の対応のしかた、そして対応しないときに ERROR 1136 が伝えていること。"
+keywords: "mysql insert select, insert into select mysql, mysql copy rows between tables, mysql insert from query, mysql error 1136"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+{/* verify-db: sakila_practice */}
+{/* verify-reset */}
+
+`VALUES` は入力した行を与えます。その場所に置いた `SELECT` はサーバーが
+求めた行を与えるので、クエリで得られる集計は保存できる集計になります。
+レポート用のテーブルはこうして埋められ、行はこうしてテーブル間を移動します。
+
+これらの例では、[INSERT](/ja/tutorial/insert) の `sakila_practice` データベースを
+使います。始める前にそこにあるセットアップブロックをもう一度実行し、次に
+`mysql -u root -p sakila_practice` でクライアントを開いてください。
+
+## INSERT SELECT の仕組み {#how-insert-select-works}
+
+```sql
+INSERT INTO TARGET_TABLE (COLUMN_LIST)
+SELECT SOURCE_COLUMNS FROM SOURCE_TABLE;
+```
+
+`TARGET_TABLE` を書き込み先のテーブルに、`COLUMN_LIST` をその列に、
+`SOURCE_COLUMNS` をクエリが返すものに、`SOURCE_TABLE` を読み取り元の
+テーブルに置き換えます。
+
+`VALUES` キーワードはありません。列は位置で対応するので、`SELECT` が最初に
+返すものは最初に指定した列に入ります。2 つの名前が何であっても同じです。
+クエリが返すすべての行が、対象テーブルの行になります。
+
+## 例 {#examples}
+
+### 1) 集計を保存する {#1-store-a-summary}
+
+`rating_count` は空で、`sakila.film` が答えを持っています。テーブルを
+`database.table` と書くと別のデータベースから読めるので、1 つの文で 2 つの
+データベースをまたげます。
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT rating, COUNT(*) FROM sakila.film GROUP BY rating;
+```
+
+```text
+Query OK, 5 rows affected (0.00 sec)
+Records: 5  Duplicates: 0  Warnings: 0
+```
+
+`GROUP BY` が 5 行を生成し、5 行が書き込まれました。
+
+```sql
+SELECT * FROM rating_count ORDER BY films DESC;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| PG-13  |   223 |
+| NC-17  |   210 |
+| R      |   195 |
+| PG     |   194 |
+| G      |   178 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+これらは今や普通の行であり、スナップショットです。`film` が変わっても、
+何もこれらを更新しません。
+
+### 2) 挿入の途中で値を組み立てる {#2-build-values-on-the-way-in}
+
+`SELECT` は何でも計算できるので、挿入する行がその形でどこかに存在している
+必要はありません。
+
+```sql
+INSERT INTO member (first_name, last_name, email, joined)
+SELECT first_name, last_name, CONCAT(LOWER(first_name), '.', LOWER(last_name), '@example.net'), '2026-05-01'
+FROM sakila.staff;
+```
+
+```text
+Query OK, 2 rows affected (0.01 sec)
+Records: 2  Duplicates: 0  Warnings: 0
+```
+
+```sql
+SELECT member_id, first_name, last_name, email FROM member WHERE joined = '2026-05-01';
+```
+
+```text
++-----------+------------+-----------+--------------------------+
+| member_id | first_name | last_name | email                    |
++-----------+------------+-----------+--------------------------+
+|         4 | Mike       | Hillyer   | mike.hillyer@example.net |
+|         5 | Jon        | Stephens  | jon.stephens@example.net |
++-----------+------------+-----------+--------------------------+
+2 rows in set (0.00 sec)
+```
+
+アドレスの列は `CONCAT` で作られ、日付はすべての行で繰り返される定数です。
+
+## ERROR 1136 は 2 つのリストの長さが違うという意味 {#error-1136-means-the-2-lists-are-different-lengths}
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT rating FROM sakila.film GROUP BY rating;
+```
+
+```text
+ERROR 1136 (21S01): Column count doesn't match value count at row 1
+```
+
+2 列を指定し、1 列が返されました。このエラーが出るとき、2 つのリストの
+長さは必ず異なるので、数えてください。名前や意味は何も確認されないので、
+正しい数の誤った列を返す `SELECT` は受け入れられ、意味のないデータを書き
+込みます。まず `SELECT` を単独で実行し、何が返るかを読んでください。
+
+## 2 回目の実行はテーブルのキーにぶつかる {#a-second-run-meets-the-tables-keys}
+
+クエリが返すすべての行がテーブルに差し出され、テーブルのルールは依然として
+適用されます。
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT rating, COUNT(*) FROM sakila.film WHERE rating = 'G' GROUP BY rating;
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'G' for key 'rating_count.PRIMARY'
+```
+
+`rating` は主キーであり、`G` は既に保存されています。一度作るだけでなく
+更新したい集計には [upsert](/ja/tutorial/upsert) が必要です。upsert は失敗する
+代わりに保存済みの行を更新します。
+
+## まとめ {#summary}
+
+- `VALUES` を置く場所に `SELECT` を置き、`VALUES` キーワードは書きません。
+- 列は位置で対応し、名前では決して対応しません。
+- `ERROR 1136` は、2 つのリストの長さが違うという意味です。
+- 同じ文の中で別のデータベースから読むには、テーブルを `database.table` と書きます。
+- 2 回目の実行は、他の挿入と同じように対象テーブルのキーにぶつかります。
+
+## 関連項目 {#see-also}
+
+- [INSERT](/ja/tutorial/insert) — 入力した値を受け取る形式
+- [複数行の挿入](/ja/tutorial/insert-multiple-rows) — クエリを使わずに多数の行を挿入する
+- [Upsert](/ja/tutorial/upsert) — 2 回目の実行で衝突する行を更新する
+- [MySQL の一括挿入](/ja/guides/bulk-inserts) — 大量のデータを移動する方法とそのコスト

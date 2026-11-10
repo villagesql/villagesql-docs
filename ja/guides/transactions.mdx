@@ -1,0 +1,147 @@
+---
+title: "MySQL のトランザクション"
+sidebarTitle: "トランザクションの使用"
+description: "MySQL のトランザクションの仕組み: COMMIT、ROLLBACK、分離レベル、そしてデータの一貫性を保つためにトランザクションを使う方法。"
+keywords: "mysql transactions, mysql isolation level, mysql repeatable read, mysql read committed, mysql transaction locking, mysql transaction isolation levels"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+トランザクションは、複数の SQL ステートメントを 1 つの作業単位にまとめます。すべてが成功するか、何も起きないかのどちらかです。トランザクションがなければ、複数ステップの操作 — 支払い、送金、注文 — の途中での失敗は、データを壊れた中間状態のまま残しかねません。
+
+## 基本: BEGIN、COMMIT、ROLLBACK {#the-basics-begin-commit-rollback}
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- debit Alice
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- credit Bob
+
+COMMIT;  -- both changes are saved
+```
+
+2 つの更新の間で何かがうまくいかない場合は次のようにします。
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+
+-- error occurs here, or you decide to cancel
+
+ROLLBACK;  -- neither change is saved — balance unchanged
+```
+
+`ROLLBACK` は `START TRANSACTION` まで戻ってすべてを取り消します。データベースは、トランザクションが始まる前の状態のまま残ります。
+
+`BEGIN` と `START TRANSACTION` は同等です。どちらも新しいトランザクションを開始します。
+
+## オートコミット {#autocommit}
+
+デフォルトでは、MySQL はオートコミットモードで動作します。各ステートメントがそれ自体で 1 つのトランザクションであり、すぐにコミットされます。`DELETE FROM orders WHERE id = 5` が明示的な `COMMIT` なしですぐに反映されるのはそのためです。
+
+`START TRANSACTION` を呼び出すと、そのトランザクションの間、オートコミットが一時的に停止します。
+
+```sql
+-- Check current autocommit setting
+SHOW VARIABLES LIKE 'autocommit';
+
+-- Disable autocommit for the session
+SET autocommit = 0;
+
+-- Now every statement is part of a transaction until you COMMIT or ROLLBACK
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+```
+
+オートコミットを無効にすると、すべての操作の後に明示的に `COMMIT` または `ROLLBACK` する必要があります。コミットせずに切断すると、MySQL は開いているトランザクションをロールバックします。
+
+## 分離レベル {#isolation-levels}
+
+複数のトランザクションが同時に実行されるとき、分離レベルは、各トランザクションが他のトランザクションから何を見られるかを制御します。MySQL のデフォルトは `REPEATABLE READ` です。
+
+| レベル | ダーティリード | ノンリピータブルリード | ファントムリード |
+|:------|:------------|:---------------------|:--------------|
+| `READ UNCOMMITTED` | 起こりうる | 起こりうる | 起こりうる |
+| `READ COMMITTED` | 防止される | 起こりうる | 起こりうる |
+| `REPEATABLE READ` | 防止される | 防止される | 防止される* |
+| `SERIALIZABLE` | 防止される | 防止される | 防止される |
+
+*InnoDB の REPEATABLE READ はギャップロックによってファントムリードを防止します。これは SQL 標準が要求するより厳格です。
+
+**READ COMMITTED** は、スループットを優先するアプリケーションでよく選ばれます。ダーティリード(他のトランザクションのコミットされていないデータを見ること)を防止しますが、ノンリピータブルリード(1 つのトランザクションの中で同じ行を 2 回読んだとき、その間に別のトランザクションがコミットしていれば異なる値が返ること)は許可します。
+
+```sql
+-- Set isolation level for the current session
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- Or for the next transaction only
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+-- ...
+```
+
+## セーブポイント {#savepoints}
+
+セーブポイントを使うと、トランザクション全体を放棄せずに、その一部だけをロールバックできます。
+
+```sql
+START TRANSACTION;
+
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+SAVEPOINT after_order;
+
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 42);
+
+-- something went wrong with the item — roll back just this part
+ROLLBACK TO SAVEPOINT after_order;
+
+-- the order is still there; we can retry the item insert
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 43);
+
+COMMIT;
+```
+
+## トランザクションが対象としないもの {#what-transactions-dont-cover}
+
+すべての MySQL ステートメントがロールバックできるわけではありません。DDL ステートメント(`CREATE TABLE`、`ALTER TABLE`、`DROP TABLE`)は暗黙のコミットを引き起こします。MySQL はそれらを実行する前に開いているトランザクションをコミットし、DDL 自体はロールバックできません。
+
+```sql
+START TRANSACTION;
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+
+DROP TABLE temp_data;  -- implicit commit happens here — the INSERT is committed
+
+ROLLBACK;  -- nothing to roll back; everything was already committed
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### トランザクションが一度もコミットされないとどうなりますか? {#what-happens-if-a-transaction-is-never-committed}
+コミットせずに接続を閉じると、MySQL は開いているトランザクションを自動的にロールバックします。サーバーがクラッシュした場合、InnoDB の redo ログが起動時にコミット済みのトランザクションを回復し、コミットされていないものをロールバックします。
+
+#### MyISAM でトランザクションを使えますか? {#can-i-use-transactions-with-myisam}
+いいえ。トランザクションにはトランザクション対応のストレージエンジンが必要です。InnoDB(MySQL のデフォルトエンジン)はトランザクションを完全にサポートします。MyISAM はサポートしません。MyISAM テーブルに対するステートメントはすぐに反映され、ロールバックできません。
+
+#### トランザクションはどのくらいの時間開いたままにできますか? {#how-long-can-a-transaction-stay-open}
+技術的には必要なだけ開いておけますが、長時間実行されるトランザクションはロックを保持し、undo ログの領域を消費するので、他のトランザクションにパフォーマンスの問題を引き起こします。`innodb_lock_wait_timeout` 変数(デフォルト: 50 秒)は、トランザクションがエラーを返す前にロックをどのくらい待つかを制御します。トランザクションは短く保ち、作業が終わったらすぐにコミットしてください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| 変更が永続化されない | オートコミットがオフになっていないか確認する — 明示的に `COMMIT` を呼ぶ必要があるかもしれない |
+| `ROLLBACK` が効かない | DDL ステートメント(`CREATE`、`ALTER`、`DROP`)がトランザクションの途中で暗黙のコミットを引き起こした |
+| トランザクションが他のクエリをブロックしている | 長時間実行されるトランザクションがロックを保持している — すぐにコミットまたはロールバックする。ロック情報は `SHOW ENGINE INNODB STATUS` で確認する |
+| `ERROR 1205: Lock wait timeout exceeded` | 別のトランザクションが競合するロックを保持している。ブロックしているトランザクションの完了後に再試行する |
+
+## 関連項目 {#see-also}
+
+- [MySQL の外部キー](/ja/guides/foreign-keys) — 外部キーのチェックはトランザクションの作業の一部
+- [MySQL のデッドロック](/ja/guides/deadlocks) — 2 つのトランザクションが互いをロックし合うと何が起きるか
+- [MySQL の UPSERT](/ja/guides/upsert) — トランザクション内での INSERT ... ON DUPLICATE KEY UPDATE
+- [MySQL での一括挿入](/ja/guides/bulk-inserts) — 速度のために書き込みをトランザクションにまとめる
+- [MySQL の COMMIT と ROLLBACK](/ja/tutorial/transactions) — 実例付きの START TRANSACTION、COMMIT、ROLLBACK

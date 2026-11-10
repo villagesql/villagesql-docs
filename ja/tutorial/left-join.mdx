@@ -1,0 +1,193 @@
+---
+title: "MySQL の LEFT JOIN"
+sidebarTitle: "LEFT JOIN"
+description: "MySQL の LEFT JOIN が何にも一致しない行を残す仕組み、IS NULL でそれらの行を列挙する方法、そして WHERE のフィルタが内部結合に戻してしまう理由。"
+keywords: "mysql left join, left join mysql, mysql outer join, mysql left outer join, mysql left join is null, mysql find rows with no match"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+内部結合は一致したものを報告します。`LEFT JOIN` は一致の有無にかかわらず
+左テーブルのすべての行を残します。これが、もう一方の問い、つまり何が一致
+しなかったかに答える方法です。
+
+始める前に `mysql -u root -p sakila` でクライアントを開いてください。
+
+## LEFT JOIN の仕組み {#how-left-join-works}
+
+```sql
+SELECT COLUMN_LIST
+FROM LEFT_TABLE
+LEFT JOIN RIGHT_TABLE ON LEFT_TABLE.COLUMN_NAME = RIGHT_TABLE.COLUMN_NAME;
+```
+
+`COLUMN_LIST` を欲しい列に、`LEFT_TABLE` をすべての行を残したいテーブルに、
+`RIGHT_TABLE` を追加の列を取り出すテーブルに、各 `COLUMN_NAME` をそれぞれの
+側で両者をつなぐ列に置き換えます。
+
+一致する行については、サーバーは内部結合として振る舞います。何にも一致
+しない左の行については、その行をそのまま残し、右テーブルのすべての列を
+NULL で埋めます。`LEFT OUTER JOIN` は同じ句を省略せずに書いたもので、
+`OUTER` という語は何も加えません。
+
+## 例 {#examples}
+
+### 1) 一致しない行を残す {#1-keep-the-unmatched-rows}
+
+Sakila には 6 つの言語があり、すべての映画は英語なので、5 つの言語はどの
+映画にも一致しません。内部結合はそれらを除外します。この結合は除外しません。
+
+```sql
+SELECT l.name, f.title
+FROM language AS l
+LEFT JOIN film AS f ON l.language_id = f.language_id
+ORDER BY l.name, f.title;
+```
+
+```text
++----------+-----------------------------+
+| name     | title                       |
++----------+-----------------------------+
+| English  | ACADEMY DINOSAUR            |
+| English  | ACE GOLDFINGER              |
+| English  | ADAPTATION HOLES            |
+...
++----------+-----------------------------+
+1005 rows in set (0.00 sec)
+```
+
+1,005 行です。1,000 件の一致に加えて、何にも一致しなかった 5 つの言語それぞれに
+1 行です。
+
+### 2) 何にも一致しなかった行だけを列挙する {#2-list-only-the-rows-that-matched-nothing}
+
+本当の一致では決して NULL になりえない右テーブルの列に `WHERE` を加えると、
+一致しなかった行だけがちょうど残ります。
+
+```sql
+SELECT l.name, f.title
+FROM language AS l
+LEFT JOIN film AS f ON l.language_id = f.language_id
+WHERE f.film_id IS NULL
+ORDER BY l.name;
+```
+
+```text
++----------+-------+
+| name     | title |
++----------+-------+
+| French   | NULL  |
+| German   | NULL  |
+| Italian  | NULL  |
+| Japanese | NULL  |
+| Mandarin | NULL  |
++----------+-------+
+5 rows in set (0.00 sec)
+```
+
+`f.film_id` は `film` の主キーなので、一致した行には必ず値があります。そこが
+NULL なのは、結合が何にも一致しなかった行を埋めた場合に限られます。右テーブルの
+どの `NOT NULL` 列をテストしても同じ理屈が成り立ちます。主キーが最も安全な
+選択です。どのテーブルでも `NOT NULL` だからです。
+
+### 3) 実務でこれが答える問い {#3-the-question-this-answers-in-practice}
+
+カタログにあるすべての映画が棚にあるわけではありません。`inventory` は在庫を
+保持するので、`inventory` の行がない映画は誰も借りられない映画です。
+
+```sql
+SELECT f.title
+FROM film AS f
+LEFT JOIN inventory AS i ON f.film_id = i.film_id
+WHERE i.film_id IS NULL
+ORDER BY f.title;
+```
+
+```text
++------------------------+
+| title                  |
++------------------------+
+| ALICE FANTASIA         |
+| APOLLO TEEN            |
+| ARGONAUTS TOWN         |
+...
++------------------------+
+42 rows in set (0.00 sec)
+```
+
+1,000 本のうち 42 本の映画には在庫がありません。このパターン、つまり
+`LEFT JOIN` に `WHERE <右のキー> IS NULL` を加えたものが、あるテーブルの行の
+うち別のテーブルに対応するものがない行を見つける方法です。
+
+## WHERE のフィルタは外部結合を打ち消す {#a-filter-in-where-undoes-the-outer-join}
+
+これは `LEFT JOIN` で人が最も時間を失う間違いです。右テーブルに普通の条件を
+加えるのは無害に見えます。
+
+```sql
+SELECT l.name, f.title
+FROM language AS l
+LEFT JOIN film AS f ON l.language_id = f.language_id
+WHERE f.title LIKE 'ACADEMY%'
+ORDER BY l.name, f.title;
+```
+
+```text
++---------+------------------+
+| name    | title            |
++---------+------------------+
+| English | ACADEMY DINOSAUR |
++---------+------------------+
+1 row in set (0.00 sec)
+```
+
+1 行です。一致しなかった 5 つの言語が消えたので、何と書いてあろうと、この
+クエリは今や内部結合です。理由は順序です。結合が先に実行されて `f.title` が
+NULL の 5 行を生成し、次に `WHERE` が各行をテストしますが、
+`NULL LIKE 'ACADEMY%'` は真ではなく NULL なので、`WHERE` はそれらを除外します。
+
+同じ条件を `ON` に移すと、何を一致とみなすかの一部になります。
+
+```sql
+SELECT l.name, f.title
+FROM language AS l
+LEFT JOIN film AS f ON l.language_id = f.language_id AND f.title LIKE 'ACADEMY%'
+ORDER BY l.name, f.title;
+```
+
+```text
++----------+------------------+
+| name     | title            |
++----------+------------------+
+| English  | ACADEMY DINOSAUR |
+| French   | NULL             |
+| German   | NULL             |
+| Italian  | NULL             |
+| Japanese | NULL             |
+| Mandarin | NULL             |
++----------+------------------+
+6 rows in set (0.00 sec)
+```
+
+6 つの言語すべてが返り、そのうち 1 つだけが一致する映画を見つけました。
+このルールは覚えておく価値があります。`LEFT JOIN` では、右テーブルに対する
+条件は `ON` に、左テーブルに対する条件は `WHERE` に置きます。唯一の意図的な
+例外は例 2 の `IS NULL` で、この場合は一致した行を除外すること自体が目的です。
+
+## まとめ {#summary}
+
+- 一致の有無にかかわらず左テーブルのすべての行を残すには `LEFT JOIN` を使います。
+- 何にも一致しなかった行では、右側のすべての列に NULL が入ります。
+- 一致しなかった行だけを列挙するには、右テーブルの `NOT NULL` 列を `IS NULL` でテストします。
+- 右テーブルに対する条件は `ON` に置きます。`WHERE` に置くと一致しなかった行が除外されます。
+- `LEFT OUTER JOIN` は同じ句の別の書き方です。
+
+## 関連項目 {#see-also}
+
+- [INNER JOIN](/ja/tutorial/inner-join) — 一致だけを残す結合
+- [RIGHT JOIN](/ja/tutorial/right-join) — 同じ考え方を反対側から見たもの
+- [IS NULL](/ja/tutorial/is-null) — 一致しなかった行を見えるようにするテスト
+- [EXISTS](/ja/tutorial/exists) — 結合を使わずに同じ問いを立てる
+- [MySQL の JOIN のパフォーマンスとよくある間違い](/ja/guides/joins) — 同じ罠をバグ報告として見たもの

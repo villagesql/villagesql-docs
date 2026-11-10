@@ -1,0 +1,166 @@
+---
+title: "MySQL データのセンチメント分析"
+sidebarTitle: "センチメントの分析"
+description: "VillageSQL の ai_prompt() を使って、MySQL に保存されたテキストのセンチメント分析を実行する方法。SQL を離れずに、レビュー、サポートチケット、およびフィードバックをスコアリングします。"
+keywords: "mysql sentiment analysis, mysql ai sentiment, mysql review sentiment, mysql positive negative neutral, mysql text sentiment score, mysql ai_prompt sentiment"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+センチメント分析は、テキストが肯定的、否定的、または中立的な感情を表しているかを教えてくれます。最も一般的な用途は商品レビューとサポートチケットです。すべての行を読まなくても、顧客が満足しているか不満を抱いているかが一目で分かります。MySQL には組み込みのセンチメント関数がありません。VillageSQL の `ai_prompt()` がそれを追加します。
+
+## 標準的なアプローチ: アプリケーション層でのセンチメント分析 {#standard-approach-application-layer-sentiment}
+
+一般的な構成では、センチメントのスコアリングを MySQL の外で実行します。行を Python スクリプトに取り出し、センチメントライブラリまたは AI API を呼び出してから、スコアを書き戻します。これは機能しますが、データパイプラインが分断されます。一部のロジックは SQL に、一部は Python にあり、一括での再スコアリングにはスクリプトの実行が必要です。
+
+## VillageSQL の場合: SQL でのセンチメント分析 {#with-villagesql-sentiment-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+センチメント分析は分類タスクです。プロンプトで尺度を指定し、1 語の結果を求めます。
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE reviews ADD COLUMN sentiment VARCHAR(10);
+
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE reviews
+SET sentiment = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'What is the sentiment of this review? ',
+        'Reply with exactly one word: positive, negative, or neutral.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment IS NULL
+LIMIT 100;
+```
+
+ラベル付けが終われば、センチメントを他の列と同じようにクエリできます。
+
+```sql
+-- Sentiment distribution
+SELECT sentiment, COUNT(*) AS count
+FROM reviews
+GROUP BY sentiment
+ORDER BY count DESC;
+
+-- Recent negative reviews that need attention
+SELECT id, review_text, created_at
+FROM reviews
+WHERE sentiment = 'negative'
+  AND created_at > NOW() - INTERVAL 7 DAY
+ORDER BY created_at DESC;
+```
+
+### 数値スコアの追加 {#adding-a-numeric-score}
+
+傾向分析や平均の算出には、ラベルの代わりに 1 から 5 のスコアを求めます。
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_score TINYINT;
+
+UPDATE reviews
+SET sentiment_score = CAST(ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Rate the sentiment of this review from 1 (very negative) to 5 (very positive). ',
+        'Reply with a single digit only.\n\n',
+        'Review: ', review_text
+    )
+) AS SIGNED)
+WHERE sentiment_score IS NULL
+LIMIT 100;
+
+-- Average sentiment over time
+SELECT DATE(created_at) AS day,
+       ROUND(AVG(sentiment_score), 2) AS avg_score,
+       COUNT(*) AS review_count
+FROM reviews
+WHERE sentiment_score IS NOT NULL
+GROUP BY DATE(created_at)
+ORDER BY day DESC;
+```
+
+### アスペクトベースのセンチメント {#aspect-based-sentiment}
+
+センチメントをトピック別(製品の品質、配送、カスタマーサービスなど)に分けたい場合は、構造化された JSON 出力を求めます。
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_detail JSON;
+
+UPDATE reviews
+SET sentiment_detail = ai_prompt(
+    'anthropic',
+    'claude-sonnet-5',  -- better model for nuanced structured output
+    @key,
+    CONCAT(
+        'Analyze this review and return JSON with sentiment scores for each aspect. ',
+        'Keys: product_quality, shipping, customer_service. ',
+        'Values: positive, negative, neutral, or null if not mentioned. ',
+        'Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment_detail IS NULL
+LIMIT 50;
+
+SELECT
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.product_quality')) AS product,
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.shipping')) AS shipping,
+    review_text
+FROM reviews
+WHERE JSON_EXTRACT(sentiment_detail, '$.shipping') = '"negative"';
+```
+
+## 精度に関する注意 {#accuracy-notes}
+
+高速で安価なモデル(Claude Haiku、GPT-4o mini)は、単純な肯定的/否定的/中立的の分類には信頼できます。皮肉、評価が混在するレビュー、分野固有の言い回しといった微妙なケースでは、より高性能なモデルが有利です。精度が重要な場合は、完全なバックフィルを実行する前に、モデル出力のサンプルを人間によるラベルと照合して検証してください。
+
+セットアップとプロバイダーの選択肢については、[MySQL を AI API に接続する](/ja/guides/ai-api-setup)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### テキスト分類とはどう違いますか? {#how-is-this-different-from-text-classification}
+
+センチメント分析は、感情的なトーンに焦点を当てた特定の分類タスクです。[AI による MySQL でのテキスト分類](/ja/guides/text-classification)では一般的なパターンを扱っています。このガイドでは、センチメントに特化したプロンプトと、スコアベースの出力を示します。
+
+#### 行の挿入時にセンチメント分析を実行できますか? {#can-i-run-sentiment-analysis-as-rows-are-inserted}
+
+トリガーを使えば可能ですが、API 呼び出しの実行中、各 INSERT に 5 から 30 秒かかります。センチメントのスコアリングは、スケジュールされたバッチジョブで実行するほうが適切です。
+
+#### 英語以外のテキストはどうですか? {#what-about-non-english-text}
+
+高性能な AI モデルは多くの言語をうまく処理します。精度が下がる場合は、プロンプトで想定する言語を指定してください。「このフランス語のレビューのセンチメントを評価してください...」のようにします。
+
+#### NULL の結果はどう扱えばよいですか? {#how-do-i-handle-null-results}
+
+`ai_prompt()` は失敗時に NULL を返します。NULL の行がなくなるまで UPDATE のバッチループを実行し、アプリケーション側でレート制限を考慮したペース配分を行ってください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | `INSTALL EXTENSION vsql_ai` を実行します |
+| NULL が返る | API キー、`max_execution_time`、およびモデル名を確認します |
+| スコア列が NULL ではなく 0 で埋まる | `CAST('positive' AS SIGNED)` は 0 を返します。モデルが数値以外のテキストを返しました。プロンプトを厳密にします: 「1 桁の数字のみを返し、他のテキストは含めないでください。」 |
+| ラベルが一貫しない | プロンプトに「正確に 1 語で答えてください」を追加します。UPDATE 後のクエリで正規化します |
+
+## 関連項目 {#see-also}
+
+- [MySQL のクエリから AI モデルを実行する](/ja/guides/ai-prompts-in-mysql) — センチメントのスコアリングを支える ai_prompt() 関数
+- [AI による MySQL でのテキスト分類](/ja/guides/text-classification) — センチメントと並行してテキストをカテゴリ別にラベル付けする
+- [MySQL での AI 要約](/ja/guides/ai-summarization) — スコアリング対象のテキストを要約する

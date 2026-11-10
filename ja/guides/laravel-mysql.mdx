@@ -1,0 +1,267 @@
+---
+title: "Laravel 12 と MySQL"
+sidebarTitle: "Laravel と Eloquent"
+description: "MySQL に対して Laravel 12 をセットアップする: .env の接続ブロック、マイグレーションの実行、Eloquent モデル、$fillable によるマスアサインメント保護、およびライブデータベースに対する書き込みの検証。"
+keywords: "laravel mysql, laravel 12 mysql, laravel eloquent mysql, laravel migrate mysql, laravel .env database, laravel fillable, laravel database connection, villagesql laravel"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+新しい Laravel 12 プロジェクトには、`.env` の有効な `DB_CONNECTION` 行の直下に、コメントアウトされた MySQL の接続ブロックが付属しています。あらゆる MySQL クライアントが期待するのと同じ、ホスト、ポート、データベース、ユーザー名、パスワードの形です。このコメントを外して実際の値を入れることが、統合のすべてです。このガイドでは、そのセットアップを最初から最後まで順に進めます。接続し、マイグレーションを実行し、Eloquent を通して読み書きします。
+
+## プロジェクトの作成 {#creating-the-project}
+
+```bash
+composer create-project laravel/laravel laravel-mysql "12.*"
+```
+
+これは Laravel 12 とその依存関係をインストールし、アプリケーションキーを生成し、デフォルトの SQLite データベースを作成します。そのため、アプリは設定なしで直ちに動きます。バージョンを確認します。
+
+```bash
+php artisan --version
+```
+
+```
+Laravel Framework 12.68.0
+```
+
+Laravel 12 には PHP 8.2 以降が必要です。PHP がまだインストールされていない macOS では、`brew install php composer` で両方がインストールされます。Homebrew の PHP 8.5 ビルドにはデフォルトで `pdo_mysql` と `mysqli` が含まれるため、MySQL 用の追加の拡張機能のセットアップは不要です。
+
+## データベースとユーザーの作成 {#creating-the-database-and-user}
+
+アプリケーションを `root` に向けるのではなく、専用のデータベースと範囲を絞ったユーザーを作成します。
+
+```sql
+CREATE DATABASE laravel_guide;
+CREATE USER 'laravel_app'@'127.0.0.1' IDENTIFIED BY 'your-password';
+GRANT ALL PRIVILEGES ON laravel_guide.* TO 'laravel_app'@'127.0.0.1';
+```
+
+## 接続の設定 {#configuring-the-connection}
+
+`.env` を開き、`DB_CONNECTION` を `sqlite` から `mysql` に切り替えてから、接続の詳細を入れます。
+
+```bash
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=laravel_guide
+DB_USERNAME=laravel_app
+DB_PASSWORD=your-password
+```
+
+ここで Laravel は TCP で `127.0.0.1` に接続します。これは、上の `CREATE USER` ステートメントが権限を付与したのと同じホストです。VillageSQL は MySQL のドロップイン代替であるため、`config/database.php` にも `.env` のキーにも変更はありません。
+
+`config/database.php` は、デフォルトで `mysql` 接続に `'strict' => true` を設定します。これによりセッションは MySQL の標準的な strict SQL モードになります。
+
+```sql
+SELECT @@sql_mode;
+```
+
+```
+ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+このモードの組み合わせは、VillageSQL に対して変更なしで動きます。互換性のために無効化したり回避したりする strict モードのフラグはありません。
+
+## マイグレーションの実行 {#running-migrations}
+
+Laravel のデフォルトのマイグレーションは、`users`、`cache`、および `jobs` テーブルを作成します。設定した接続に対して実行します。
+
+```bash
+php artisan migrate:fresh
+```
+
+```
+INFO  Preparing database.
+
+Creating migration table ....................................... 2.76ms DONE
+
+INFO  Running migrations.
+
+0001_01_01_000000_create_users_table ........................... 8.69ms DONE
+0001_01_01_000001_create_cache_table ........................... 4.42ms DONE
+0001_01_01_000002_create_jobs_table ............................ 6.31ms DONE
+```
+
+`posts` テーブル用に、独自のマイグレーションを持つモデルを生成します。
+
+```bash
+php artisan make:model Post -m
+```
+
+```
+INFO  Model [app/Models/Post.php] created successfully.
+
+INFO  Migration [database/migrations/..._create_posts_table.php] created successfully.
+```
+
+生成されたマイグレーションに `title` 列と `body` 列を追加します。
+
+```php
+Schema::create('posts', function (Blueprint $table) {
+    $table->id();
+    $table->string('title');
+    $table->text('body');
+    $table->timestamps();
+});
+```
+
+実行してから、テーブルの形をサーバーに対して直接確認します。
+
+```bash
+php artisan migrate
+```
+
+```sql
+DESCRIBE posts;
+```
+
+```
+Field       Type              Null  Key  Default  Extra
+id          bigint unsigned   NO    PRI  NULL     auto_increment
+title       varchar(255)      NO         NULL
+body        text              NO         NULL
+created_at  timestamp         YES        NULL
+updated_at  timestamp         YES        NULL
+```
+
+## Eloquent とマスアサインメント保護 {#eloquent-and-mass-assignment-protection}
+
+Laravel の Eloquent モデルは、フィールドが `$fillable` に列挙されていない限り、デフォルトでマスアサインメントをブロックします。
+
+```php
+class Post extends Model
+{
+    protected $fillable = ['title', 'body'];
+}
+```
+
+`id`、`created_at`、および `updated_at` は意図的に除外されています。`create()` に `id` を渡してもエラーにはならず、値も上書きされません。Eloquent は `$fillable` にないキーを黙って捨てます。
+
+```php
+$post = Post::create(['title' => 'Tinker test', 'body' => 'via fillable', 'id' => 999]);
+echo $post->id;
+```
+
+```
+1
+```
+
+この行は `999` ではなく、次の auto-increment 値を受け取りました。これは、`store()` メソッドがリクエストボディを直接受け取る場合に重要です。`$fillable` で列を絞らないと、クライアントが `id` やタイムスタンプのフィールドを渡し、それがそのまま受け入れられる可能性があります。`$fillable` はモデルを守ります。リクエストのバリデーションは別の関心事で、入ってくるデータの形を検査します。
+
+## ルートとコントローラー {#routes-and-a-controller}
+
+Laravel 12 のデフォルトのスケルトンは、ルーティングを最小限に保ちます。`routes/web.php` がルートを持ち、`bootstrap/app.php` が、以前の `Http/Kernel.php` ファイルなしでミドルウェアと例外処理を設定します。コントローラーを生成します。
+
+```bash
+php artisan make:controller PostController
+```
+
+```php
+class PostController extends Controller
+{
+    public function index(): JsonResponse
+    {
+        return response()->json(Post::latest()->get());
+    }
+
+    public function store(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'body' => 'required|string',
+        ]);
+
+        $post = Post::create($validated);
+
+        return response()->json($post, 201);
+    }
+}
+```
+
+ルートを登録します。
+
+```php
+use App\Http\Controllers\PostController;
+
+Route::get('/posts', [PostController::class, 'index']);
+Route::post('/posts', [PostController::class, 'store']);
+```
+
+`routes/web.php` は Laravel のセッションベースの CSRF ミドルウェアの背後で動くため、プレーンな `curl -X POST` は、リクエストが CSRF トークンを持たないので `419 Page Expired` で拒否されます。ブラウザ向けのフォームのルートでは、これは想定どおりです。実際のフォームは、hidden フィールドでトークンを送信します。フォームもトークンもなしで直接呼び出すためのルートでは、`bootstrap/app.php` でそのルートを除外します。
+
+```php
+->withMiddleware(function (Middleware $middleware): void {
+    $middleware->validateCsrfTokens(except: [
+        'posts',
+    ]);
+})
+```
+
+## エンドツーエンドの検証 {#verifying-end-to-end}
+
+組み込みサーバーを起動し、両方のルートを試します。テーブルには上の `$fillable` のデモで作った行がすでにあるため、index ルートはそれを返します。
+
+```bash
+php artisan serve --port=8123
+```
+
+```bash
+curl -s http://127.0.0.1:8123/posts
+```
+
+```json
+[{"id":1,"title":"Tinker test","body":"via fillable","created_at":"2026-08-28T19:49:05.000000Z","updated_at":"2026-08-28T19:49:05.000000Z"}]
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8123/posts -d "title=Hello VillageSQL" -d "body=First post from curl"
+```
+
+```json
+{"title":"Hello VillageSQL","body":"First post from curl","updated_at":"2026-08-28T19:49:21.000000Z","created_at":"2026-08-28T19:49:21.000000Z","id":2}
+```
+
+JSON レスポンスだけを信頼するのではなく、データベースに直接クエリして、両方の行が入ったことを確認します。
+
+```sql
+SELECT * FROM laravel_guide.posts;
+```
+
+```
+id  title              body                    created_at           updated_at
+1   Tinker test        via fillable            2026-08-28 19:49:05  2026-08-28 19:49:05
+2   Hello VillageSQL   First post from curl    2026-08-28 19:49:21  2026-08-28 19:49:21
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### Laravel はなぜ MySQL ではなく SQLite をデフォルトにするのですか? {#why-does-laravel-default-to-sqlite-instead-of-mysql}
+
+最近の Laravel バージョンは、`php artisan serve` が設定なしで直ちに動くように、新しいプロジェクトのデフォルトを SQLite にしています。`.env` ファイルは、有効な `DB_CONNECTION` 行の直下に、コメントアウトされた MySQL の接続キーをそのまま持っています。MySQL への切り替えは、コメントを外して 5 つの値を入れるだけで、新しい設定セクションを書くことではありません。
+
+#### Eloquent が VillageSQL で動くために特別な設定は必要ですか? {#does-eloquent-need-any-special-configuration-to-work-with-villagesql}
+
+いいえ。VillageSQL は MySQL のドロップイン代替であり、同じワイヤプロトコルを話すため、Laravel の `mysql` ドライバー、その strict SQL モードの設定、およびそのクエリ文法はすべて変更なしで動きます。
+
+#### `$fillable` とリクエストのバリデーションの違いは何ですか? {#whats-the-difference-between-fillable-and-request-validation}
+
+`$request->validate()` は、入ってくるリクエストからどのフィールドを受け入れるかを決め、不正な入力を 422 レスポンスで拒否します。モデルの `$fillable` は、`create()` または `fill()` に渡したフィールドのうち、どれが実際にデータベースに書き込まれるかを決めます。`$request->validate()` だけでは、別の場所のコントローラーが `Post::create($request->all())` を呼ぶと、モデルはマスアサインメントに対して無防備なままです。`$fillable` は、どのコントローラーが呼んでもモデルを守ります。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| POST リクエストで `419 Page Expired` | ルートが CSRF ミドルウェアの背後で動いています。`@csrf` 付きの実際のフォームを送信するか、直接呼び出すためのルートであれば `bootstrap/app.php` で `validateCsrfTokens(except: [...])` によってそのルートを除外します。 |
+| `SQLSTATE[HY000] [2002] Connection refused` | `.env` の `DB_PORT` が、VillageSQL が実際に待ち受けているポートと一致しません。サーバーが起動されたポートを確認します。 |
+| `SQLSTATE[HY000] [1045] Access denied for user '<user>'@'localhost' (using password: YES)` | `DB_USERNAME` または `DB_PASSWORD` が間違っているか、ユーザーに `DB_DATABASE` に届く権限がありません。`DB_HOST` が `127.0.0.1` でも、エラーは `'localhost'` と言うことがあります。MySQL は `skip_name_resolve` がオンでない限り、接続元の IP を逆引き DNS で解決し、一致したホスト名を報告します。エラーが実際に示すホスト（`DB_HOST` の値とは限りません）に対して権限が作成されていることを確認します。 |
+| `create()` に渡したフィールドが保存されない | モデルの `$fillable` 配列に列挙されていません。`$fillable` が空でない場合、Eloquent は例外を投げずにそのフィールドを黙って捨てます。`$fillable` に追加するか、意図的にガードを迂回するなら `forceFill()` を使います。 |
+
+## 関連項目 {#see-also}
+
+- [ORM で MySQL を使う: Django、Rails、および Prisma](/ja/guides/mysql-with-orms) — 同じ接続レベルの設定と N+1 パターンを、ORM に依存しない視点から
+- [MySQL のスキーママイグレーション](/ja/guides/schema-migrations) — Laravel のマイグレーションファイルが `ALTER TABLE` の下でテーブルに行っていること
+- [MySQL のコネクションプーリング](/ja/guides/connection-pooling) — 実際のトラフィック下の Laravel アプリで永続接続を設定する

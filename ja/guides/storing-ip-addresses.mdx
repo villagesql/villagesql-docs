@@ -1,0 +1,156 @@
+---
+title: "MySQL での IP アドレスの保存"
+sidebarTitle: "IP アドレスの保存"
+description: "MySQL で IP アドレスを効率的に保存する方法。VARCHAR と INT が不十分な理由と、VillageSQL の INET 型が IPv4 と IPv6 を 1 つの列で扱う仕組み。"
+keywords: "mysql store ip address, mysql inet type, mysql ip address column, mysql ipv4 storage, mysql ip validation, mysql ip address best practice"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ほとんどの MySQL スキーマは、IP アドレスを `VARCHAR(45)` として保存しています。動作はしますが、領域を無駄にし、形式の検証を何も行わず、数値順ではなく辞書順でソートします。そのため `192.168.1.10` が `192.168.1.9` より前に並びます。VillageSQL の `INET` 型はこれらすべてを解決し、IPv4 と IPv6 を同じ列で扱います。
+
+## MySQL のデフォルト: VARCHAR {#the-mysql-default-varchar}
+
+素直なアプローチです。
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address VARCHAR(45),    -- fits IPv4 (15 chars) and IPv6 (39 chars)
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES ('192.168.1.5');
+```
+
+`VARCHAR(45)` は、与えられた文字列を何でも保存します。検証はなく、`'not-an-ip'` もエラーなしで挿入されます。ソートは数値順にならず、サブネットとの比較には文字列操作または変換関数が必要です。
+
+## 標準的な回避策: INT UNSIGNED + INET_ATON {#the-standard-workaround-int-unsigned--inet_aton}
+
+IPv4 の場合、MySQL の `INET_ATON()` はドット区切りの 10 進数文字列を 4 バイトの整数に変換します。これはコンパクトで、正しくソートされます。
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INT UNSIGNED,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address)
+VALUES (INET_ATON('192.168.1.5'));
+
+SELECT INET_NTOA(ip_address) AS ip FROM access_log;
+```
+
+これは IPv4 のみのスキーマではうまく機能します。問題は IPv6 です。`INT UNSIGNED` は 128 ビットのアドレスを保持できません。IPv6 には `VARBINARY(16)` と `INET6_ATON()` / `INET6_NTOA()` が必要になり、IPv6 対応が必要になった時点でスキーマ変更が発生します。
+
+## VillageSQL の場合: INET 型 {#with-villagesql-the-inet-type}
+
+VillageSQL の `vsql_network_address` 拡張機能は、IPv4 と IPv6 の両方のアドレスをコンパクトなバイナリ形式で保存するネイティブの `INET` 型を追加します。どちらのファミリーでも 1 行あたり固定の 19 バイトで、IPv4 の値はその幅までパディングされます。また、入力時に値を検証します。
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- IPv4 and IPv6 in the same column
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.5')),
+    (inet_from_string('10.0.0.1')),
+    (inet_from_string('2001:db8::1'));
+
+-- Read back as strings
+SELECT inet_to_string(ip_address), accessed_at FROM access_log;
+
+-- Sort by IP address numerically (not lexicographically)
+SELECT inet_to_string(ip_address) FROM access_log ORDER BY ip_address;
+```
+
+無効な文字列はステートメントを中止しません。`inet_from_string()` は Warning 3200 とともに NULL を返すため、行は NULL 値で挿入されます。不正な入力で挿入を失敗させたい場合は、列を `NOT NULL` として宣言してください。
+
+### 保存されたアドレスの操作 {#working-with-stored-addresses}
+
+```sql
+-- Extract address family
+SELECT inet_to_string(ip_address),
+       inet_family(ip_address) AS family   -- 4 or 6
+FROM access_log;
+
+-- Check if an address is IPv6
+SELECT * FROM access_log
+WHERE inet_family(ip_address) = 6;
+
+-- Store with a netmask (INET allows host bits)
+INSERT INTO access_log (ip_address)
+VALUES (inet_from_string('192.168.1.5/24'));
+
+SELECT inet_host(ip_address)    AS host_part,
+       inet_masklen(ip_address) AS prefix_len
+FROM access_log WHERE id = 1;
+```
+
+### インデックス作成 {#indexing}
+
+```sql
+CREATE INDEX idx_ip ON access_log(ip_address);
+
+-- Equality lookups use the index
+SELECT * FROM access_log
+WHERE ip_address = inet_from_string('192.168.1.5');
+```
+
+## 保存方法の選択 {#choosing-a-storage-approach}
+
+| アプローチ | IPv6 対応 | 挿入時の検証 | 正しいソート | ストレージ |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(45)` | あり | なし | なし(辞書順) | 15 から 45 バイト |
+| `INT UNSIGNED` + `INET_ATON` | なし | なし | あり(数値順) | 4 バイト |
+| `VARBINARY(16)` + `INET6_ATON` | あり | なし | あり | 4 または 16 バイト |
+| `INET`(VillageSQL) | あり | あり | あり | 19 バイト |
+
+組み込みの検証を備え、IPv4 と IPv6 の両方を必要とする新しいスキーマには、`INET` が最もすっきりした選択肢です。VillageSQL に依存しない IPv4 のみのスキーマには、`INET_ATON` / `INET_NTOA` を使った `INT UNSIGNED` が確立されたアプローチです。
+
+保存されたアドレスに対するサブネットクエリについては、[MySQL でのサブネットによるクエリ](/ja/guides/subnet-queries)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### INET は 192.168.1.5/24 のようなネットマスク付きのアドレスを保存できますか? {#can-inet-store-addresses-with-a-netmask-like-1921681524}
+
+はい。`INET` はホストビットを許可します。`192.168.1.5/24` は有効です。ホストビットがゼロであること(純粋なネットワークアドレス)を強制したい場合は、代わりに `CIDR` 型を使ってください。
+
+#### INET は挿入時にアドレスを検証しますか? {#does-inet-validate-the-address-on-insert}
+
+はい。`inet_from_string('not-an-ip')` は、不正な値を保存するのではなく NULL を返します。NOT NULL 制約のある INET 列に NULL を渡すと、挿入は失敗します。
+
+#### ORDER BY ip_address は IPv4 と IPv6 の混在をどうソートしますか? {#how-does-order-by-ip_address-sort-mixed-ipv4ipv6}
+
+IPv4 アドレスが IPv6 アドレスより前にソートされます。各ファミリーの中では、アドレスは数値順にソートされます。これは PostgreSQL の INET のソート順と一致します。
+
+#### INET は PostgreSQL の inet 型と同じですか? {#is-inet-the-same-as-postgresqls-inet-type}
+
+機能的には同じです。同じ型(INET、CIDR、MACADDR、MACADDR8)、同じ関数の命名規則、同じ検証ルールです。主な違いは、VillageSQL が比較とサブネットチェックに演算子ではなく関数を提供することです。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.inet_from_string does not exist` | `INSTALL EXTENSION vsql_network_address` を実行します |
+| `inet_from_string()` が NULL を返す | 入力文字列が有効な IP アドレスではありません |
+| IPv6 アドレスが展開形式で表示される | 想定どおりの動作です。`2001:db8::1` は `2001:0db8:0000:0000:0000:0000:0000:0001` として保存および取得されます |
+| `192.168.1.5/24` に対して `Incorrect CIDR value` | CIDR はホストビットがゼロであることを要求します。`192.168.1.0/24` を使うか、代わりに INET を使います。不正な値を CIDR 列に直接挿入すると、非 strict SQL モードでは警告とともに NULL が保存されます。strict SQL モード(デフォルト)ではエラーが発生し、ステートメントは拒否されます。関数として `cidr_from_string('192.168.1.5/24')` を呼び出すと、テストしたすべての SQL モードで警告とともに NULL が返ります。 |
+| IP によるソートが正しくない | `VARCHAR` のコピーではなく、INET 列でソートしているか確認します |
+
+## 関連項目 {#see-also}
+
+- [MySQL での IPv6 の保存](/ja/guides/ipv6-storage) — INET 型による IPv4 と IPv6 の統合した保存
+- [MySQL でのサブネットによるクエリ](/ja/guides/subnet-queries) — INET を使ってネットワーク範囲で行を絞り込む
+- [MySQL での IP による位置情報の検索](/ja/guides/ip-geolocation) — IP アドレスに地理データを付加する
+- [MySQL での MAC アドレスの保存](/ja/guides/storing-mac-addresses) — ハードウェアアドレスに対する同じアプローチ

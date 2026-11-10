@@ -1,0 +1,319 @@
+---
+title: "サーバーレスランタイムで Drizzle と MySQL を使う"
+sidebarTitle: "Drizzle とサーバーレス"
+description: "サーバーレスランタイムでのコネクションプーリングが、長時間稼働する Node サーバーとは異なる仕組みで動作する理由と、関数の呼び出しごとに新しい接続を開くコードが、同時負荷のもとで MySQL の接続上限を使い果たす過程。"
+keywords: "mysql serverless, drizzle orm serverless, mysql connection pooling serverless, hono mysql, mysql2 serverless, mysql too many connections, serverless cold start database, max_user_connections mysql, mysql lambda connections"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+長時間稼働する Node サーバーは、プロセスの起動時に 1 つのコネクションプールを開き、プロセスが終了するまですべてのリクエストでそれを再利用します。サーバーレス関数にはその保証がありません。各呼び出しは、前回の記憶を持たない新しい実行環境で実行される可能性があります。そのため、「普通のやり方」でプールを作成するコードは、リクエストのたびにまったく新しいプール、またはまったく新しい接続を作成してしまうことがあります。このガイドでは、Hono、Drizzle ORM、および `mysql2` で小さなアプリケーションを構築し、それぞれのパターンで同時負荷をかけたときに MySQL の接続数がどうなるかを測定します。
+
+## このガイドで検証したこと、しなかったこと {#what-this-guide-tested-and-what-it-did-not}
+
+以下の内容はすべて、実際のローカル VillageSQL サーバーと実際の Node プロセスに対して実行しました。アプリケーションは `nodejs` テンプレート(`npm create hono@latest`)で構築した Hono アプリで、このガイドの検証中は通常の長時間稼働する Node プロセスとして動作しました。Cloudflare Workers、AWS Lambda、または Vercel のエッジランタイムにはデプロイしていません。
+
+これは、このガイドが主張する 1 つの点と、主張しない 1 つの点に関わります。
+
+- **実際に検証したこと**: 実行のたびに新しい MySQL 接続を開くリクエストハンドラーと、モジュールの読み込み時に一度だけ作成したコネクションプールを再利用するハンドラーの比較です。それぞれのバージョンに同時 HTTP リクエストを送り、MySQL の接続数を観察することは、1 つのサーバーレス関数インスタンスが同時呼び出しを処理する場合、またはコールドスタートするインスタンスのモジュールレベルのコードが再実行される場合に起きることの忠実な再現です。
+- **検証しなかったこと**: 多数の独立した実行環境が同時にコールドスタートし、それぞれがこのプロセスのコピーを実行して独自のプールを開くという乗算効果です。AWS Lambda や Cloudflare Workers で実際にトラフィックが急増すると、数十の分離されたインスタンスが同時に起動することがあり、それぞれに 10 接続のプールがあれば、このガイドの修正を適用していても合計はすぐに膨らみます。後述の「単一インスタンスの先へ」のセクションでその対処法を扱いますが、このガイドの Node プロセスは定義上 1 つのインスタンスであるため、再現できませんでした。
+
+## データベースのセットアップ {#set-up-the-database}
+
+専用のデータベースと、それに限定したユーザーを作成します。
+
+```sql
+CREATE DATABASE serverless_guide;
+CREATE USER 'serverless_app'@'127.0.0.1' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON serverless_guide.* TO 'serverless_app'@'127.0.0.1';
+```
+
+## アプリケーションのスキャフォールド {#scaffold-the-application}
+
+このガイドでは Hono の `nodejs` テンプレートを使用します。これは `@hono/node-server` 上で動作し、開発に特定のクラウドプラットフォームを必要としません。
+
+```bash
+npm create hono@latest serverless-mysql-drizzle -- --template nodejs
+```
+
+Drizzle、`mysql2` ドライバー、および `drizzle-kit` をインストールします。
+
+```bash
+npm install drizzle-orm mysql2 dotenv
+npm install -D drizzle-kit tsx
+```
+
+`drizzle-orm` と `drizzle-kit` はどちらも、`latest` と並んで `dist-tags` にプレリリースタグ(`beta`、`rc`)を公開しています。インストールする前に確認してください。
+
+```bash
+npm view drizzle-orm dist-tags
+npm view drizzle-kit dist-tags
+```
+
+執筆時点では、`drizzle-orm` の `latest` は `0.45.2` に、`drizzle-kit` の `latest` は `0.31.10` に解決されます。どちらもリリース候補ではなく安定版リリースです。
+
+`.env` に接続文字列を設定します。
+
+```bash
+DATABASE_URL="mysql://serverless_app:your_password@127.0.0.1:3306/serverless_guide"
+```
+
+## スキーマの定義とマイグレーションの実行 {#define-the-schema-and-run-the-migration}
+
+```typescript src/db/schema.ts
+import { int, mysqlTable, text, timestamp, varchar } from "drizzle-orm/mysql-core";
+
+export const posts = mysqlTable("posts", {
+  id: int("id").autoincrement().primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+```
+
+```typescript drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+export default defineConfig({
+  out: "./drizzle",
+  schema: "./src/db/schema.ts",
+  dialect: "mysql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL,
+  },
+});
+```
+
+マイグレーションを生成して適用します。
+
+```bash
+npx drizzle-kit generate
+npx drizzle-kit migrate
+```
+
+```
+Reading config file 'drizzle.config.ts'
+Reading schema files:
+src/db/schema.ts
+
+1 tables
+posts 4 columns 0 indexes 0 fks
+
+[✓] Your SQL migration file ➜ drizzle/0000_eminent_corsair.sql 🚀
+```
+
+テーブルが存在することを確認します。
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u serverless_app -p serverless_guide -e "SHOW TABLES; DESCRIBE posts;"
+```
+
+```
+Tables_in_serverless_guide
+__drizzle_migrations
+posts
+Field	Type	Null	Key	Default	Extra
+id	int	NO	PRI	NULL	auto_increment
+title	varchar(255)	NO		NULL	
+body	text	NO		NULL	
+created_at	timestamp	NO		now()	DEFAULT_GENERATED
+```
+
+## アンチパターン: リクエストごとの接続 {#the-anti-pattern-a-connection-per-request}
+
+この問題が最もよく現れるのは、単独で見れば妥当に見えるコードです。リクエストハンドラーの中で `mysql2` の接続を開き、クエリを実行し、接続を閉じます。
+
+```typescript src/index.bad.ts
+import "dotenv/config";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import { desc } from "drizzle-orm";
+import { posts } from "./db/schema.js";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+const app = new Hono();
+
+// Anti-pattern: a fresh connection is opened inside the handler, on every
+// request. This is what naively porting a "just create a pool" snippet
+// into a function-per-invocation runtime produces.
+app.get("/posts", async (c) => {
+  try {
+    const connection = await mysql.createConnection(process.env.DATABASE_URL as string);
+    const db = drizzle(connection, { schema: { posts }, mode: "default" });
+
+    const rows = await db.select().from(posts).orderBy(desc(posts.createdAt)).limit(5);
+
+    await connection.end();
+    return c.json(rows);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) }, 503);
+  }
+});
+
+serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
+  console.log(`[bad] listening on http://localhost:${info.port}`);
+});
+```
+
+同時実行数が少ないうちは、これで動作します。5 つの同時クライアントで 3 秒間アクセスしても、失敗したレスポンスはゼロでした。問題が現れるのは、同時呼び出しの数が、そのユーザーに対してデータベースが許可する数を超えたときだけです。
+
+## 枯渇を実演する {#demonstrating-the-exhaustion}
+
+MySQL の `max_connections` はサーバー全体の上限であり、共有サーバーでこれを下げて障害を強制すると、そのインスタンス上の他のすべての接続に影響します。1 つのアプリケーションに対する接続上限をより的を絞って再現する方法、そしてクラウドの MySQL プロバイダーがまさにこの理由で使う方法は、アカウント自体に対する `MAX_USER_CONNECTIONS` です。
+
+```sql
+ALTER USER 'serverless_app'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 15;
+```
+
+```sql
+SELECT user, host, max_user_connections FROM mysql.user WHERE user = 'serverless_app';
+```
+
+```
+user	host	max_user_connections
+serverless_app	127.0.0.1	15
+```
+
+アンチパターンのサーバーを実行し、`serverless_app` を 15 接続に制限した状態で、30 の同時リクエストを 5 秒間送り続ける([autocannon](https://github.com/mcollina/autocannon) を使用)と、次の結果になりました。
+
+```bash
+npx autocannon -c 30 -d 5 http://localhost:3000/posts
+```
+
+```
+20916 2xx responses, 3614 non 2xx responses
+25k requests in 5.01s, 6.6 MB read
+```
+
+バースト中に `SELECT COUNT(*) FROM information_schema.processlist WHERE user = 'serverless_app'` で 150ms ごとに `serverless_app` のアクティブな接続数をサンプリングすると、接続数が 15 接続の上限に達し、それを超えて上昇するのが観察できました(最も高いサンプルで 15、15、16、17、17、17、17、25)。`3614` の非 2xx レスポンスは、その上限に達したものです。上のハンドラーはエラーを捕捉して各 `503` のボディで返すため、失敗したレスポンスには次の内容が含まれていました。
+
+```
+Error: User 'serverless_app' has exceeded the 'max_user_connections' resource (current value: 15)
+    code: 'ER_USER_LIMIT_REACHED',
+    errno: 1226,
+    sqlState: '42000',
+```
+
+これは `MAX_USER_CONNECTIONS` に固有のことではありません。ユーザーごとの制限がまったくないサーバーでも、代わりに `max_connections` に対して同じように接続数が上昇し、サーバー全体の上限に達した時点で、別の名前の同じエラー(`ERROR 1040 (08004): Too many connections`)が発生します。ユーザーごとの上限は、同じサーバーで実行されている他のものを妨げずにこれを再現できるようにするためのものです。
+
+## 修正: プールをハンドラーの外で一度だけ作成する {#the-fix-create-the-pool-once-outside-the-handler}
+
+修正とは、プーリングをやめることではありません。各リクエストを処理する関数の中ではなく、モジュールの読み込み時に、プールがちょうど一度だけ作成されるようにすることです。
+
+```typescript src/db/index.ts
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import * as schema from "./schema.js";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+// Module-level pool: created once when this module is first loaded, not
+// inside a request handler. A warm serverless invocation reuses the same
+// module instance and therefore the same pool; only a cold start re-runs
+// this file and opens a fresh one.
+const poolConnection = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  connectionLimit: 10,
+  waitForConnections: true,
+  queueLimit: 0,
+});
+
+export const db = drizzle(poolConnection, { schema, mode: "default" });
+```
+
+```typescript src/index.ts
+import "dotenv/config";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { desc } from "drizzle-orm";
+import { db } from "./db/index.js";
+import { posts } from "./db/schema.js";
+
+const app = new Hono();
+
+app.get("/posts", async (c) => {
+  const rows = await db.select().from(posts).orderBy(desc(posts.createdAt)).limit(20);
+  return c.json(rows);
+});
+
+app.post("/posts", async (c) => {
+  const body = await c.req.json();
+  if (typeof body.title !== "string" || body.title.trim() === "") {
+    return c.json({ error: "title is required" }, 400);
+  }
+  if (typeof body.body !== "string" || body.body.trim() === "") {
+    return c.json({ error: "body is required" }, 400);
+  }
+  const [result] = await db.insert(posts).values({ title: body.title, body: body.body });
+  return c.json({ insertId: result.insertId }, 201);
+});
+
+serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
+  console.log(`Server is running on http://localhost:${info.port}`);
+});
+```
+
+`db/index.ts` は、モジュールが最初にインポートされたときに、トップレベルの `mysql.createPool()` 呼び出しをちょうど一度だけ実行します。長時間稼働する Node サーバーでは、それはプロセスの起動時の一度です。プロバイダーがコールドスタートなしに後続のリクエストのために実行環境を再利用するサーバーレスランタイムでは、インポートされたモジュールはまだメモリ上にあるため、最初の呼び出しで作成したプールが再作成されずに再利用されます。モジュールを最初から読み込み直す本当のコールドスタートだけが、新しいプールを開きます。
+
+`serverless_app` を 15 接続に制限したまま、このバージョンに対して同じ 30 同時・5 秒間のバーストを実行します。
+
+```
+77k requests in 5.01s, 20.7 MB read
+```
+
+非 2xx レスポンスはまったくありません。このバースト中に同じユーザーごとの接続数をサンプリングすると、取得したすべてのサンプルで、プール自身の `connectionLimit` であるちょうど 10 のまま安定していました。到着する同時リクエストの数に関係なく、プールは設定された保持数を超える接続を MySQL に要求しませんでした。同じ 5 秒間の合計スループットも約 3 倍になりました(25,000 リクエストに対して 77,000 リクエスト)。この差の一部は、プール版がリクエストごとの完全な TCP ハンドシェイクと認証の往復を省略したことによるものです。もう一部は、アンチパターン版の 25,000 リクエストの多くが、接続上限に達した後は完了したクエリではなく高速な `503` の失敗であったことによります。これは実際の仕事をせずにリクエスト数を水増しします。
+
+## 単一インスタンスの先へ {#beyond-a-single-instance}
+
+上の修正は、このガイドが再現できた問題、つまり 1 つの実行中インスタンス内での同時リクエストを解決します。実際のサーバーレスプラットフォームでしか現れない 2 つ目の問題は解決しません。トラフィックの急増のもとで多数の独立したインスタンスが同時にコールドスタートし、それぞれがこのコードのコピーを実行して独自のプールを開く問題です。プールは必要になるまで接続を開かず、同時リクエストが実際に必要とするときにだけ開くため、10 個のアイドル状態のインスタンスが存在するだけで 100 接続を開くことはありません。しかし、各インスタンスがごく普通の控えめなトラフィックを処理し始めると、`connectionLimit` が 10 のインスタンス 10 個で、ワークロードが異常に見えるよりずっと前に合計 100 接続に達することがあります。このガイドの Node プロセスは、多数ではなく 1 つのプロセスであるため、これを再現できませんでした。
+
+2 つのアプローチがこれに対処します。どちらも上の修正の代わりにはならず、追加で行うものです。
+
+- **インスタンスごとの `connectionLimit` をずっと小さくする**。ほとんどのサーバーレスプラットフォームでは、同時に実行される各インスタンスが一度に処理するリクエストは少数であるため、10 ではなく 1 または 2 にすることがよくあります。
+- **MySQL の前にコネクションプーリングプロキシを置く**。ProxySQL などを使い、多数の独立したサーバーレスインスタンスが、ずっと少ない数の実際の MySQL 接続を共有するようにします。ProxySQL がここにどう当てはまるかについては、[MySQL のコネクションプーリング](/ja/guides/connection-pooling)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### `max_connections` を増やすだけではだめですか? {#why-not-just-increase-max_connections}
+
+上限は上がりますが、なくなりはしません。また、すべての接続はサーバー上で実際のメモリコストを伴います(接続ごとのコストの内訳については、[MySQL のコネクションプーリング](/ja/guides/connection-pooling)を参照してください)。数百の同時インスタンスまでスケールできるサーバーレスワークロードは、いずれどんな固定の上限にも達します。修正とは、各インスタンスが必要以上の接続を開かないようにすることであり、それらのインスタンスが使い果たせる数を増やすことではありません。
+
+#### これは Hono だけでなく Express にも当てはまりますか? {#does-this-apply-to-express-as-well-as-hono}
+
+はい。この障害モードは、リクエストハンドラーに対してプールまたは接続がどこで作成されるかに関するものであり、どの Web フレームワークがリクエストをルーティングするかには関係ありません。ルートハンドラーの中で `mysql.createConnection()` を呼び出す Express アプリにはまったく同じ問題があり、モジュールスコープで一度だけ `mysql.createPool()` を呼び出すことがまったく同じ修正になります。
+
+#### `mysql2` の組み込みプールで十分ですか、それとも ProxySQL のようなものが必要ですか? {#is-mysql2s-built-in-pool-enough-or-do-i-need-something-like-proxysql}
+
+単一の長時間稼働するサーバーであれば、`mysql2` のプールだけで十分です。それが[MySQL のコネクションプーリング](/ja/guides/connection-pooling)で扱っている内容です。サーバーレスプラットフォームでは、このガイドのモジュールレベルのプールパターンによって、1 つのインスタンスが `connectionLimit` を超える接続を開くことは防げますが、同時に実行される別々のインスタンス間で調整することはできません。インスタンス間で調整するのが、ProxySQL のようなプロキシです。
+
+#### 修正版の接続数は、なぜテストの同時実行数に合わせて 30 まで上昇せず、ちょうど 10 にとどまったのですか? {#why-did-the-fixed-versions-connection-count-sit-exactly-at-10-instead-of-climbing-to-30-matching-the-concurrency-of-the-test}
+
+プールが `waitForConnections: true` と `connectionLimit` 10 を持つためです。10 接続が貸し出されると、11 番目の同時リクエストは新しい接続を開くのではなく、接続がプールに返されるのを待ちます。プールが際限なく拡大する代わりに、リクエストが短時間キューに入ります。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `ERROR 1226 (42000): User '<user>' has exceeded the 'max_user_connections' resource` | アカウントが `MAX_USER_CONNECTIONS` の上限に達しました。接続またはプールの作成をリクエストハンドラーの外に移すか、ワークロードが本当にそれ以上を必要とする場合は `ALTER USER ... WITH MAX_USER_CONNECTIONS n` で上限を引き上げます。 |
+| `ERROR 1040 (08004): Too many connections` | サーバー全体の `max_connections` の上限に達しました。ユーザーごとの上限が設定されていない場合、根本原因は上のユーザーごとのエラーと同じです。制限を引き上げる前に、まず接続のパターンを修正します。 |
+| 接続数が着実に増え続け、バーストが終わっても元に戻らない | どこかのコードパスで接続またはプールが作成されたまま閉じられていません。エラーパスを含むハンドラー内のすべてのコードパスで、接続を閉じるか、上限のあるプールにライフサイクルを管理させる必要があります。 |
+| ローカルではプールが機能するが、本番ではインスタンスが接続を積み上げ続ける | このガイドの単一インスタンスの修正は、同時に実行される別々のサーバーレスインスタンス間では調整しません。上の「単一インスタンスの先へ」を参照してください。 |
+
+## 関連項目 {#see-also}
+
+- [MySQL のコネクションプーリング](/ja/guides/connection-pooling) — 長時間稼働するサーバーでのプーリングの仕組みと、ProxySQL が複数のアプリケーションサーバー間でプーリングを調整する方法
+- [Next.js と Drizzle で MySQL を使う](/ja/guides/mysql-with-drizzle) — 長時間稼働する Next.js サーバー上での、サーバーレスの接続ライフサイクルを伴わない同じスキーマと Drizzle のセットアップ
+- [ORM で MySQL を使う: Django、Rails、Prisma](/ja/guides/mysql-with-orms) — Drizzle 以外の ORM での MySQL 固有のプール設定

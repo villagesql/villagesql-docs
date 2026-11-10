@@ -1,0 +1,155 @@
+---
+title: "MySQL の正規化"
+sidebarTitle: "スキーマの正規化"
+description: "MySQL のデータベーススキーマを正規化する方法: 第一、第二、第三正規形を例とともに解説し、非正規化が理にかなうときも扱います。"
+keywords: "mysql normalization, database normalization mysql, mysql normal forms, 1nf 2nf 3nf mysql, mysql schema design, mysql denormalization, mysql third normal form"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+データベースの正規化とは、冗長性を減らし、更新の異常を防ぐためにテーブルを整理するプロセスです。ほとんどのアプリケーションは第三正規形 (3NF) に到達すべきです。それより先では、得られるものは主に理論的であり、結合の複雑さは現実のものです。
+
+## 第一正規形 (1NF) {#first-normal-form-1nf}
+
+テーブルは、すべての列が原子的な値 (セルごとに 1 つの値) を保持し、繰り返しグループが存在しないとき、1NF にあります。
+
+**1NF に違反** — 1 つの列に複数の値が詰め込まれている:
+
+```sql
+CREATE TABLE orders (
+    id          INT PRIMARY KEY,
+    customer    VARCHAR(100),
+    product_ids VARCHAR(255)  -- "1,4,7" — not atomic
+);
+```
+
+**1NF を満たす** — セルごとに 1 つの値、繰り返しグループは子テーブルに抽出:
+
+```sql
+CREATE TABLE orders (
+    id       INT PRIMARY KEY,
+    customer VARCHAR(100)
+);
+
+CREATE TABLE order_items (
+    order_id   INT,
+    product_id INT,
+    PRIMARY KEY (order_id, product_id)
+);
+```
+
+## 第二正規形 (2NF) {#second-normal-form-2nf}
+
+テーブルは、1NF にあり、かつすべての非キー列が主キーの一部ではなく主キー**全体**に依存しているとき、2NF にあります。これは複合主キーを持つテーブルにのみ当てはまります。
+
+**2NF に違反** — `product_name` は完全なキー `(order_id, product_id)` ではなく `product_id` にのみ依存している:
+
+```sql
+CREATE TABLE order_items (
+    order_id     INT,
+    product_id   INT,
+    product_name VARCHAR(100),  -- partial dependency: only needs product_id
+    quantity     INT,
+    PRIMARY KEY (order_id, product_id)
+);
+```
+
+**2NF を満たす** — `product_name` を独自のテーブルに移動:
+
+```sql
+CREATE TABLE products (
+    id   INT PRIMARY KEY,
+    name VARCHAR(100)
+);
+
+CREATE TABLE order_items (
+    order_id   INT,
+    product_id INT,
+    quantity   INT,
+    PRIMARY KEY (order_id, product_id),
+    FOREIGN KEY (product_id) REFERENCES products (id)
+);
+```
+
+## 第三正規形 (3NF) {#third-normal-form-3nf}
+
+テーブルは、2NF にあり、かつどの非キー列も別の非キー列に依存していないとき、3NF にあります。こうした依存は推移的依存と呼ばれます。
+
+**3NF に違反** — `city` と `state` は `customer_id` に直接ではなく `zip_code` に依存している:
+
+```sql
+CREATE TABLE customers (
+    id       INT PRIMARY KEY,
+    name     VARCHAR(100),
+    zip_code VARCHAR(10),
+    city     VARCHAR(100),  -- transitively depends on zip_code
+    state    CHAR(2)        -- transitively depends on zip_code
+);
+```
+
+**3NF を満たす** — 推移的依存を抽出:
+
+```sql
+CREATE TABLE zip_codes (
+    zip_code VARCHAR(10) PRIMARY KEY,
+    city     VARCHAR(100),
+    state    CHAR(2)
+);
+
+CREATE TABLE customers (
+    id       INT PRIMARY KEY,
+    name     VARCHAR(100),
+    zip_code VARCHAR(10),
+    FOREIGN KEY (zip_code) REFERENCES zip_codes (zip_code)
+);
+```
+
+実際には、郵便番号を別のテーブルに抽出するのは、ほとんどのアプリケーションにとってやりすぎです。あらゆるエッジケースで機械的に準拠することよりも、原則のほうが重要です。
+
+## 非正規化すべきとき {#when-to-denormalize}
+
+正規化は書き込みの整合性を高め、冗長性を減らしますが、読み取り時に結合のオーバーヘッドを加えます。読み取り中心や分析のワークロードでは、意図的な非正規化が正当化されることがあります。
+
+| シナリオ | 正規化 | 非正規化 |
+|:---------|:----------|:------------|
+| 書き込みが頻繁で、データ整合性が重要 | はい | — |
+| 6 つ以上のテーブルを結合するレポートクエリ | — | 検討する |
+| 小さなデータセット (10 万行未満) | はい | 不要 |
+| データウェアハウスまたは分析用レプリカ | — | はい |
+| 読み書きが混在する OLTP アプリケーション | はい | ホットパスのみ |
+
+非正規化の前にインデックスを確認してください。遅い結合の問題のほとんどは、インデックス不足の問題です。結合列にカバリングインデックスを追加するだけで十分なことがよくあります。[MySQL のインデックスの仕組み](/ja/guides/mysql-indexes)を参照してください。
+
+非正規化は、アプリケーションが書き込むのと同じテーブルではなく、リードレプリカや OLAP ストアで最もうまく機能します。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 3NF より先に進む必要はありますか？ {#do-i-need-to-go-beyond-3nf}
+
+ほとんどのアプリケーションでは 3NF で十分です。Boyce-Codd 正規形 (BCNF) は、重なり合う候補キーが 3NF でもなお異常を許してしまうエッジケースに対処します。学術的な演習の外ではめったに生じない状況です。排除したい特定の異常がない限り、3NF で止めてください。
+
+#### パフォーマンスのために非正規化すべきですか？ {#should-i-denormalize-for-performance}
+
+再構築の前にプロファイルを取ってください。遅いクエリのほとんどは、結合ではなくインデックスの欠如が原因です。まずインデックスを追加してください。適切にインデックスされたクエリが大きなテーブルでなお遅いなら、トランザクション用のデータベースではなく、リードレプリカまたはマテリアライズドな集計テーブルでの非正規化を検討してください。
+
+#### 2NF 違反と 3NF 違反の違いは何ですか？ {#whats-the-difference-between-a-2nf-violation-and-a-3nf-violation}
+
+2NF 違反は、主キーの*一部*に依存する列です (複合主キーでのみ起こり得ます)。3NF 違反は、*別の非キー列*に依存する列です。2NF は部分的なキー依存に関するもので、3NF は非キー列を介した推移的依存に関するものです。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| 行をまたいで重複したデータが現れる | 2NF または 3NF 違反の可能性が高い — 繰り返されるデータを独自のテーブルに移す |
+| 更新の異常 (1 行を変更すると他の行が古くなる) | 推移的依存 — ルックアップテーブルに抽出する |
+| 5 つ以上のテーブルを結合するクエリが遅い | まず FK 列のインデックスを確認する。インデックスで改善しない場合にのみ非正規化する |
+| 正規化されたスキーマが複雑すぎてクエリできない | 読み取りに最適化されたビュー、または非正規化した分析用レプリカを検討する |
+
+## 関連項目 {#see-also}
+
+- [MySQL のデータ型の選択](/ja/guides/choosing-data-types) — スキーマを正規化した後に正しい型を選ぶ
+- [MySQL の外部キー](/ja/guides/foreign-keys) — 正規化が生み出す関係を強制する
+- [MySQL の CHECK 制約](/ja/guides/check-constraints) — 外部キーの整合性を超える追加のルール
+- [Sakila サンプルデータベース](/ja/tutorial/sakila-database) — 練習用の正規化されたスキーマ

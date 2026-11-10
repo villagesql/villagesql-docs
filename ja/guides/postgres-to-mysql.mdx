@@ -1,0 +1,222 @@
+---
+title: "PostgreSQL から MySQL への変換: 移行ガイド"
+sidebarTitle: "PostgreSQL からの移行"
+description: "PostgreSQL データベースを MySQL に移行する方法: データ型の対応、AUTO_INCREMENT とシーケンスの比較、SQL 方言の違い、そして避けるべき移行の落とし穴。"
+keywords: "postgresql to mysql migration, postgres to mysql, mysql vs postgresql differences, mysql auto_increment vs sequence, mysql migration guide, convert postgresql schema to mysql, mysql dialect differences, convert postgresql to mysql, postgresql to mysql converter, convert postgres to mysql, migrate data from postgres to mysql, migrate postgres database to mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+PostgreSQL と MySQL は ANSI SQL の構文を共有していますが、移行にあたってデータ型、デフォルトの動作、SQL 方言の違いに注意深く向き合う必要があるほどには分岐しています。作業の大部分は、スキーマの変換と、PostgreSQL 固有の機能に依存するクエリの修正です。
+
+このガイドは PostgreSQL から MySQL への移行を扱います。これは、[VillageSQL](https://villagesql.com/install) のような MySQL 互換サーバーへ移るときの一般的な方向です。VillageSQL は、PostgreSQL スタイルの拡張機能フレームワークを上に加えた、オープンソースの MySQL のドロップイン代替です。そのフレームワークがあるからこそ、このガイドにはスキーマとデータだけでなく、PostgreSQL の拡張機能の行き先もあります。後述の[拡張機能を持ち込む](#bringing-your-extensions)を参照してください。逆方向にデータを移す場合でも、以下の型の対応と方言の違いは逆向きに当てはまりますが、移行ツールのセクションは当てはまりません。
+
+## どのアプローチを使うべきか {#which-approach-should-i-use}
+
+- **一回限りの切り替え** — `pg_dump` と `LOAD DATA INFILE` によるダンプとリストア。後述の[移行ツール](#migration-tools)と[移行の手順](#migration-approach)を参照してください。
+- **移行中も移行元データベースを稼働させ書き込み可能にしておく必要がある、または継続的な同期が必要** — 一回限りのダンプの代わりに、JDBC シンクコネクタを使った Debezium で継続的なレプリケーションを設定します。
+
+## 移行ツール {#migration-tools}
+
+**`pg_dump` と手作業でのスキーマ変換**が主要な道であり、標準の PostgreSQL と MySQL のクライアントツール以外は何も必要としません。
+
+```bash
+# Schema only, plain SQL text
+pg_dump -s -f schema.sql mydb
+
+# Data only, as INSERT statements (portable, but slower to load than COPY)
+pg_dump -a --inserts -f data.sql mydb
+```
+
+`pg_dump` のスキーマ出力は PostgreSQL の構文 (`SERIAL`、`BOOLEAN`、PostgreSQL 固有の `CREATE TABLE` 句) を使うため、MySQL に対して実行する前に、後述の型の対応表を使ってスキーマファイルを手作業で変換する必要があります。この変換をあらゆるケースで自動的かつ正しく行うツールはありません。これをほとんどの移行のデフォルトの道として扱ってください。
+
+**JDBC シンクコネクタを使った Debezium** ([debezium.io](https://debezium.io)、Apache-2.0 ライセンス、活発に保守されている) は、PostgreSQL の先行書き込みログを読み、Kafka Connect を通じて変更を MySQL にストリーミングし、一回限りのコピーではなく継続的なレプリケーションを提供します。移行中に移行元データベースを稼働させ書き込み可能にしておく必要があるとき、または切り替えではなく継続的な同期が必要なときには、これが正しいツールです。稼働中の Kafka と Kafka Connect のクラスタが必要で、これは一回限りの移行に必要な以上のインフラです。単一の切り替えには、代わりに `pg_dump` を使ってください。
+
+## データ型の対応 {#data-type-mapping}
+
+| PostgreSQL の型 | MySQL の同等物 | 備考 |
+|:----------------|:----------------|:------|
+| `SERIAL` / `BIGSERIAL` | `INT AUTO_INCREMENT` / `BIGINT AUTO_INCREMENT` | MySQL はシーケンスではなく AUTO_INCREMENT を使う |
+| `TEXT` | `TEXT` または `LONGTEXT` | MySQL の TEXT は 65,535 バイトに制限される。より大きな値には LONGTEXT を使う |
+| `VARCHAR` (制限なし) | サポートされない | MySQL の VARCHAR には長さが必要。代わりに TEXT を使う |
+| `BOOLEAN` | `TINYINT(1)` | MySQL には真のブール型がない。0/1 の規約 |
+| `BYTEA` | `BLOB` または `LONGBLOB` | バイナリデータ |
+| `JSONB` | `JSON` | MySQL の JSON は検証付きのテキストとして格納される。JSONB のバイナリ形式はない |
+| `UUID` | `CHAR(36)` または `BINARY(16)` | ネイティブの UUID 型はない。[MySQL の UUID](/ja/guides/uuids) を参照 |
+| `TIMESTAMP WITH TIME ZONE` | `DATETIME` + 明示的なタイムゾーン処理 | MySQL の DATETIME にはタイムゾーンがない。[タイムスタンプとタイムゾーン](/ja/guides/timestamps-timezones)を参照 |
+| `NUMERIC` / `DECIMAL` | `DECIMAL(p,s)` | MySQL では精度とスケールが必要 |
+| `ARRAY` | サポートされない | 子テーブルに正規化する |
+| `HSTORE` | `JSON` | キーと値のペア。MySQL では JSON を使う |
+| `INTERVAL` | 列型としてはサポートされない | INT の秒数として保存するか、アプリケーション側のロジックを使う |
+
+## シーケンスと AUTO_INCREMENT {#sequences-vs-auto_increment}
+
+PostgreSQL は自動増分の値にシーケンス (独立したオブジェクト) を使います。MySQL は列の属性として `AUTO_INCREMENT` を使います。
+
+**PostgreSQL:**
+```sql
+CREATE SEQUENCE orders_id_seq;
+CREATE TABLE orders (
+    id INTEGER DEFAULT nextval('orders_id_seq') PRIMARY KEY
+);
+```
+
+**MySQL の同等物:**
+```sql
+CREATE TABLE orders (
+    id INT AUTO_INCREMENT PRIMARY KEY
+);
+```
+
+MySQL で最後に挿入された ID を取得するには、`SELECT LAST_INSERT_ID();` を使います (PostgreSQL の `currval()` または `RETURNING id` に相当)。
+
+## SQL 方言の違い {#sql-dialect-differences}
+
+**文字列の連結:**
+```sql
+-- PostgreSQL
+SELECT first_name || ' ' || last_name FROM users;
+
+-- MySQL
+SELECT CONCAT(first_name, ' ', last_name) FROM users;
+```
+
+**文字列の引用符:**
+```sql
+-- PostgreSQL: double quotes for identifiers, single quotes for strings
+SELECT "first_name" FROM users WHERE status = 'active';
+
+-- MySQL: backticks for identifiers, single quotes for strings
+SELECT `first_name` FROM users WHERE status = 'active';
+```
+
+MySQL が識別子に二重引用符を受け入れるのは、`ANSI_QUOTES` SQL モードが有効な場合だけです。
+
+**ILIKE (大文字小文字を区別しない LIKE):**
+```sql
+-- PostgreSQL
+SELECT * FROM users WHERE name ILIKE '%alice%';
+
+-- MySQL (case-insensitive by default with ci collations)
+SELECT * FROM users WHERE name LIKE '%alice%';
+```
+
+MySQL の文字列比較は、`utf8mb4_0900_ai_ci` (MySQL 8.x のデフォルト) または同様の `_ci` 照合順序では、デフォルトで大文字小文字を区別しません。大文字小文字を区別する一致が必要な場合は、`_bin` 照合順序を使ってください。
+
+**RETURNING 句:**
+```sql
+-- PostgreSQL
+INSERT INTO users (name) VALUES ('Alice') RETURNING id;
+
+-- MySQL (no RETURNING)
+INSERT INTO users (name) VALUES ('Alice');
+SELECT LAST_INSERT_ID();
+```
+
+**LIMIT / OFFSET:**
+```sql
+-- PostgreSQL
+SELECT * FROM orders LIMIT 10 OFFSET 20;
+
+-- MySQL (same syntax)
+SELECT * FROM orders LIMIT 10 OFFSET 20;
+-- or shorthand:
+SELECT * FROM orders LIMIT 20, 10;  -- LIMIT offset, count
+```
+
+**スキーマとデータベース:**
+PostgreSQL はデータベース内のスキーマ (`mydb.public.orders`) を使います。MySQL は「スキーマ」と「データベース」を同じ意味で使い、データベース内のスキーマという概念はありません。PostgreSQL がスキーマと呼ぶものを、MySQL はデータベースと呼びます。
+
+**UNIQUE インデックスでの NULL の扱い:**
+PostgreSQL は一意列に複数の NULL 値を許します (NULL は互いに等しくありません)。MySQL (InnoDB) も一意インデックスに複数の NULL を許します。動作は同じです。
+
+**CTE:**
+MySQL は再帰 CTE を含む CTE をサポートしています。[MySQL の共通テーブル式](/ja/tutorial/cte)を参照してください。
+
+**ウィンドウ関数:**
+MySQL はウィンドウ関数をサポートしています。[MySQL のウィンドウ関数](/ja/guides/window-functions)を参照してください。
+
+**ストアドプロシージャと関数:**
+PostgreSQL は手続き型のロジックを PL/pgSQL で書き、例外処理と豊富な制御フローを備えています。MySQL は独自の手続き型 SQL 方言を使い、PL/pgSQL をサポートせず、プロシージャ本体内のセミコロンがステートメントの終わりとして解析されないように、クライアントツールで `DELIMITER` の変更を必要とします。
+
+```sql
+-- MySQL: a stored procedure with an OUT parameter
+DELIMITER ;;
+CREATE PROCEDURE total_orders(IN cust_id INT, OUT total INT)
+BEGIN
+    SELECT COUNT(*) INTO total FROM orders WHERE customer_id = cust_id;
+END;;
+DELIMITER ;
+
+CALL total_orders(1, @t);
+SELECT @t;
+```
+
+PL/pgSQL から MySQL の手続き型構文への自動変換はありません。各プロシージャを手作業で書き直してください。MySQL の `DECLARE ... HANDLER` は動作が異なるため、例外処理のロジック (`EXCEPTION WHEN ...` ブロック) に最も多くの手直しが必要になると見込んでください。[MySQL のストアドプロシージャ](/ja/guides/stored-procedures)を参照してください。
+
+**識別子の大文字小文字の区別:**
+PostgreSQL は引用符のない識別子を小文字に畳み込み、引用符付きの識別子 (`"MyTable"`) を大文字小文字を区別するものとして扱います。MySQL のルールは異なります。データベース名とテーブル名が大文字小文字を区別するかどうかは、引用符ではなく、`lower_case_table_names` システム変数と基盤のファイルシステムに依存します。列、インデックス、ストアドルーチンの名前は、プラットフォームに関係なく、名前解決においては決して大文字小文字を区別しません。大文字小文字を区別する PostgreSQL のテーブル名に依存していたスキーマが、移行後も同じように動作すると仮定しないでください。移行先サーバーの `lower_case_table_names` を確認してください。
+
+## MySQL に同等物がない機能 {#features-without-mysql-equivalents}
+
+一部の PostgreSQL の機能には直接の同等物がありません。
+
+| PostgreSQL の機能 | MySQL での状況 |
+|:-------------------|:----------------|
+| 列型としての配列 | 子テーブルに正規化する |
+| テーブル継承 | サポートされない。別々のテーブルを使う |
+| カスタム演算子 | サポートされない |
+| 完全な `LISTEN`/`NOTIFY` | サポートされない。アプリケーション側のポーリングまたはメッセージキューを使う |
+| 部分インデックス (インデックスの `WHERE` 句) | サポートされない。生成列を使って部分集合にインデックスを付ける |
+| マテリアライズドビュー | ネイティブにはサポートされない。テーブルとストアドプロシージャで近似する |
+| 一括ロードの `COPY` コマンド | `LOAD DATA INFILE` または MySQL Shell の `loadDump` を使う |
+
+## 拡張機能を持ち込む {#bringing-your-extensions}
+
+PostgreSQL は、ネイティブに備えていない機能のために `pgcrypto`、`pg_trgm`、`uuid-ossp` のような拡張機能に依存しています。素の MySQL にはこの種の機能を追加する同等の仕組みがありませんが、VillageSQL にはあります。VillageSQL Extension Framework (VEF) を使うと、`INSTALL EXTENSION` でカスタムの SQL 関数と型をサーバーにインストールできます。VillageSQL の拡張機能の一部は、上の PostgreSQL 拡張機能の直接の移植です。
+
+| PostgreSQL の拡張機能 | VillageSQL の拡張機能 | カバーする範囲 |
+|:----------------------|:----------------------|:-------|
+| `pgcrypto` | `vsql_crypto` | ハッシュ、HMAC、AES 暗号化、パスワードハッシュ (PBKDF2 のみ — bcrypt のハッシュは引き継げない)。[MySQL でのデータのハッシュ](/ja/guides/hashing-data)を参照。 |
+| `uuid-ossp` | `vsql_uuid` | ネイティブの UUID 列型と v1〜v7 の生成関数。[MySQL の UUID](/ja/guides/uuids) を参照。 |
+| — (組み込みの `inet`/`cidr`/`macaddr` 型) | `vsql_network_address` | IPv4、IPv6、MAC アドレスの型。[MySQL での IP アドレスの保存](/ja/guides/storing-ip-addresses)を参照。 |
+| `pg_trgm` | `vsql_trgm` | トライグラムに基づく文字列の類似度検索。[MySQL でのトライグラム類似度](/ja/guides/trigram-similarity)を参照。 |
+
+PostgreSQL データベースがここに挙げていない拡張機能に依存している場合、まだ VillageSQL の同等物がないかもしれません。その機能が永久に失われると決めつける前に、VillageSQL ドキュメントの拡張機能カタログを確認してください。また、依存先が自分のチームが書いたカスタムの PostgreSQL 拡張機能なら、VEF はそれを移植するためのツールでもあります。[`vsql-extension-builder`](https://github.com/villagesql/villagesql-skills/tree/main/skills/vsql-extension-builder) スキルは、要件からテスト済みでドキュメント化された `.veb` パッケージまで、AI コーディングエージェントが VillageSQL 上でカスタム拡張機能を作り直す手順を案内します。
+
+## 移行の手順 {#migration-approach}
+
+1. **スキーマをエクスポート**します。PostgreSQL から (`pg_dump --schema-only`) エクスポートし、上の型の対応を使って各テーブルを手作業で変換します。
+2. **データをエクスポート**します。PostgreSQL から CSV として (`COPY table TO '/tmp/table.csv' CSV HEADER`) エクスポートします。
+3. **データをロード**します。`LOAD DATA INFILE` または `mysqlimport` で MySQL にロードします。
+4. **クエリをテスト**します。PostgreSQL 固有の構文をすべて見つけて書き直します。
+5. **件数とチェックサムを検証**します。すべてのテーブルで `SELECT COUNT(*)` を実行し、主要な行を抜き取り検査します。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### MySQL は PostgreSQL の `ON CONFLICT` のような `UPSERT` をサポートしていますか？ {#does-mysql-support-upsert-like-postgresqls-on-conflict}
+
+はい、ただし構文は異なります。[MySQL の UPSERT](/ja/guides/upsert) を参照してください。MySQL の `INSERT ... ON DUPLICATE KEY UPDATE` と `REPLACE INTO` は、PostgreSQL の `ON CONFLICT DO UPDATE` と `ON CONFLICT DO NOTHING` と同じユースケースをカバーします。
+
+#### PostgreSQL の `BOOLEAN` 列は MySQL でどう扱えばよいですか？ {#how-do-i-handle-postgresqls-boolean-columns-in-mysql}
+
+`TINYINT(1)` を使ってください。true には 1、false には 0 を保存します。ほとんどの MySQL クライアントライブラリと ORM はこれを自動的に処理し、TINYINT(1) 列をブール値として提示します。`BIT(1)` も使えますが、TINYINT(1) のほうがツールのサポートが広いです。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `||` による連結で構文エラー | `CONCAT()` に置き換える |
+| `ILIKE` が認識されない | `LIKE` を使う (ci 照合順序ではデフォルトで大文字小文字を区別しない) |
+| 二重引用符付きの識別子が動作しない | `ANSI_QUOTES` SQL モードを有効にするか、バッククォートによる引用に切り替える |
+| `RETURNING` 句が動作しない | INSERT の後に `LAST_INSERT_ID()` を使う。MySQL に同等物はない |
+| `SERIAL` の動作が Postgres と異なる | MySQL は `SERIAL` を受け入れるが、それは `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE` のエイリアスであり、Postgres の `SERIAL` より幅が広く、暗黙の一意キーを伴う。より狭い Postgres の同等物には明示的な `INT AUTO_INCREMENT` を使う |
+| 配列の列が失敗する | 外部キーを持つ子テーブルに正規化する |
+
+## 関連項目 {#see-also}
+
+- [MySQL のスキーママイグレーション](/ja/guides/schema-migrations) — 移行に必要な DDL の変更を実行する
+- [MySQL のデータ型の選択](/ja/guides/choosing-data-types) — PostgreSQL の型を MySQL の同等物に対応付ける
+- [MySQL と PostgreSQL の比較: どちらを使うべきか](/ja/guides/mysql-vs-postgresql) — この移行の背景にある機能ごとの比較

@@ -1,0 +1,234 @@
+---
+title: "MySQL の JOIN のパフォーマンスとよくある間違い"
+sidebarTitle: "JOIN のパフォーマンス"
+description: "MySQL の JOIN が遅くなる、または誤った行を返す理由: インデックスの欠如、LEFT JOIN を打ち消す WHERE、重複行、NULL の結合キー、および FULL OUTER JOIN の不在。"
+keywords: "mysql join performance, mysql slow join, mysql left join returns fewer rows, mysql join duplicate rows, mysql full outer join, mysql join index, mysql join explain"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+JOIN は最初は動作し、後になって問題を起こします。クエリは正しい SQL であり、
+サーバーは何も報告しませんが、返ってくるのは予想外の行数や、40 秒かかる
+レポートです。このガイドではそうしたケースを扱います。結合を遅くするものと、
+結合が静かに誤った行を返す 4 つのパターンです。
+
+どの種類の結合を書くかをまだ決めかねている場合は、チュートリアルがサンプル
+データベースを使って各結合を教えています。
+[結合の仕組み](/ja/tutorial/joins)、[INNER JOIN](/ja/tutorial/inner-join)、
+[LEFT JOIN](/ja/tutorial/left-join)、[RIGHT JOIN](/ja/tutorial/right-join)、
+[CROSS JOIN](/ja/tutorial/cross-join)、および[自己結合](/ja/tutorial/self-join)です。
+
+## このガイドで使用するテーブル {#the-tables-used-in-this-guide}
+
+```sql
+CREATE TABLE customers (
+    id    INT PRIMARY KEY AUTO_INCREMENT,
+    name  VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT,    -- nullable: orders without a customer
+    amount      DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+INSERT INTO orders VALUES
+    (1, 1, 99.00),   -- Alice's order
+    (2, 1, 45.00),   -- Alice's second order
+    (3, 2, 120.00),  -- Bob's order
+    (4, NULL, 15.00); -- order with no customer
+```
+
+## 結合列にインデックスを作成する {#index-the-join-column}
+
+結合に使う列にインデックスがない場合、サーバーは一方の側にハッシュテーブルを
+構築し、もう一方をスキャンします。`EXPLAIN FORMAT=TREE` がそれを示します。
+
+```sql
+EXPLAIN FORMAT=TREE SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id\G
+```
+
+```text
+*************************** 1. row ***************************
+EXPLAIN: -> Inner hash join (o.customer_id = c.id)  (cost=2 rows=3)
+    -> Table scan on o  (cost=0.117 rows=4)
+    -> Hash
+        -> Table scan on c  (cost=0.55 rows=3)
+```
+
+ハッシュ結合は各テーブルを 1 回ずつ読みます。7 行では何の問題もありません。
+実際のテーブルでは、2 回のフルテーブルスキャンに加えてハッシュを保持する
+メモリが必要になり、構築側が `join_buffer_size` に収まらない場合、サーバーは
+それをバッチ単位でディスクに退避します。インデックスを追加すると、そのすべてが
+インデックス検索に置き換わります。
+
+```sql
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+```
+
+同じプランをもう一度要求すると、ハッシュは消えています。
+
+```sql
+EXPLAIN FORMAT=TREE SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id\G
+```
+
+```text
+*************************** 1. row ***************************
+EXPLAIN: -> Nested loop inner join  (cost=1.95 rows=4)
+    -> Table scan on c  (cost=0.55 rows=3)
+    -> Index lookup on o using idx_orders_customer (customer_id=c.id)  (cost=0.378 rows=1.33)
+```
+
+一対多の関係の「多」側にある外部キー列にインデックスを作成してください。
+「一」側の主キーにはすでにインデックスがあるため、そちら側には何も必要
+ありません。
+
+デフォルトの `EXPLAIN` 出力では、同じ 2 つのプランは `Extra: Using join
+buffer (hash join)` と `type: ref` として表示されます。この表には、サーバーが
+選んだ結合の順序も示されます。これはクエリに 3 つ以上のテーブルが含まれると
+すぐに重要になります。サーバーは上から下へテーブルを読み、最初のテーブルの
+行数の見積もりが、その下のすべてに掛け合わされるためです。
+プランの残りの部分については、[EXPLAIN 出力の読み方](/ja/guides/reading-explain)で説明しています。
+
+ハッシュ結合が検索できるのは等価条件です。代わりに範囲や不等式で結合すると、
+サーバーはハッシュを構築しますが、検索に使えるものがありません。プランには
+`Inner hash join (no condition)` と表示され、その上に条件を評価する `Filter` が
+置かれるため、すべての行の組み合わせが生成されてから捨てられます。これが、
+インデックス付きの等価結合が回避するコストです。
+
+## WHERE 句が LEFT JOIN を INNER JOIN に戻してしまう {#a-where-clause-turns-a-left-join-back-into-an-inner-join}
+
+最もよくある行数の誤りのバグであり、何も警告してくれません。
+
+```sql
+-- Excludes customers with no orders, so this is an inner join now
+SELECT c.name, o.amount
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 50;
+
+-- Keeps customers with no orders
+SELECT c.name, o.amount
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id AND o.amount > 50;
+```
+
+結合が先に実行され、一致しない顧客には NULL の `o.amount` が与えられます。
+次に `WHERE` が各行を評価しますが、`NULL > 50` は真ではなく NULL になるため、
+それらの行は除外されます。条件を `ON` に移すと、代わりに何を一致とみなすかの
+一部になります。
+
+ルールはこうです。外部結合では、内側のテーブルに対する条件は `ON` に、保持
+されるテーブルに対する条件は `WHERE` に置きます。例外は
+`WHERE <内側のテーブルのキー> IS NULL` で、この場合は一致した行を除外すること
+自体が目的です。
+
+## 結合列の NULL は何にも一致しない {#a-null-in-the-join-column-matches-nothing}
+
+`orders.customer_id` は NULL を許容し、注文 4 には顧客がいません。内部結合は
+この行を除外します。NULL は、別の NULL を含め、何とも等しくないためです。
+
+```sql
+SELECT c.name, o.amount
+FROM customers c
+INNER JOIN orders o ON o.customer_id = c.id
+ORDER BY c.name, o.amount;
+```
+
+```text
++-------+--------+
+| name  | amount |
++-------+--------+
+| Alice |  45.00 |
+| Alice |  99.00 |
+| Bob   | 120.00 |
++-------+--------+
+3 rows in set (0.00 sec)
+```
+
+4 件の注文から 3 行です。Carol がいないのは注文がないからで、これは予想どおりの
+部分です。注文 4 がないのは `customer_id` が NULL だからで、これが人を驚かせる
+部分です。行は存在し、金額は実在するのに、どの結合条件もそこに届きません。
+この結合に基づいて作った売上合計は 15.00 足りず、何もそれを教えてくれません。
+
+結合列が NULL を許容する場合は、結合を書く前に、孤立した行をどう扱うかを
+決めてください。`orders` からの `LEFT JOIN` は、顧客名を NULL にしてその行を
+保持します。背後にある比較のルールは、[MySQL における NULL](/ja/guides/null-in-mysql)で説明しています。
+
+## 一対多の結合は行を増やす {#a-one-to-many-join-multiplies-your-rows}
+
+結合は一致ごとに 1 行を返すため、一致する行を複数持つテーブルと結合すると、
+左側の行が一致の数だけ繰り返されます。その結果に対して計算した合計は誤りで、
+たいていは大きすぎますが、クエリは正しく見えたままです。
+
+```sql
+-- Alice appears twice, because she has 2 orders
+SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON o.customer_id = c.id;
+```
+
+重複行をバグとして扱う前に、その関係が本当に一対一かどうかを確認してください。
+一対多であり、顧客ごとに 1 行が欲しい場合は集計します。`GROUP BY c.id` と、
+結合先の列に対する `SUM` または `COUNT` を使います。
+[MySQL の GROUP BY のパフォーマンス](/ja/guides/group-by-having)を参照してください。
+
+1 つのクエリに 2 つの一対多結合があると、同じ計算がさらに早く狂います。2 組の
+一致が互いに掛け合わされるためです。両方を一度に結合するのではなく、それぞれを
+独自のサブクエリで集計してください。
+
+## ON がないとすべての組み合わせが返る {#a-missing-on-gives-you-every-combination}
+
+MySQL は `ON` 句のない `INNER JOIN` を受け入れ、クロス結合として解釈します。
+そのため、入力ミスはエラーではなく両テーブルの直積を生みます。10,000 行の
+テーブル 2 つで 1 億行になります。
+
+結合が不自然に切りの良い、不自然に大きな数を返したときは、何よりも先に `ON` の
+欠落を疑ってください。`FROM` でテーブルをカンマで区切るのは古い構文での同じ
+ものであり、一致条件はたいてい後方の `WHERE` にあります。
+
+## MySQL には FULL OUTER JOIN がない {#mysql-has-no-full-outer-join}
+
+MySQL に `FULL OUTER JOIN` はありません。2 つの部分を `UNION` で結合します。
+
+```sql
+SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+UNION
+SELECT c.name, o.amount FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id;
+```
+
+`UNION` は重複行を取り除きます。これによって 2 つの部分がきれいにつながります。
+`UNION ALL` は完全外部結合をまったく模倣しません。一致した各行を、それぞれの
+部分から 1 回ずつ、計 2 回返します。保持しなければならない重複行がデータに
+ある場合は、`UNION ALL` に頼るのではなく、キー列で重複を取り除いてください。
+
+## JOIN かサブクエリか {#join-or-subquery}
+
+結合と `IN` サブクエリは同じフィルタを表現することが多く、オプティマイザが
+どちらを好むかはデータ次第です。関連する行が存在するかどうかだけを知りたく、
+その列は一切不要な場合、たいていは `EXISTS` のほうが読みやすく、サーバーは
+最初の一致で停止できます。
+[MySQL におけるサブクエリと JOIN の比較](/ja/guides/subqueries-vs-joins)では、
+プランを使って両者を比較しています。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 原因と対処 |
+|:--------|:---------|
+| `LEFT JOIN` が予想より少ない行を返す | 右側のテーブルに対する `WHERE` 条件が NULL の行を除外しています。`ON` に移します。 |
+| 大きなテーブルの結合が遅い | 「多」側の結合列にインデックスがありません。`EXPLAIN` で `type: ALL` を確認します。 |
+| 予期しない重複行 | 関係が一対多です。`GROUP BY` で集計するか、一対一であるべきかを確認します。 |
+| 合計が大きすぎる | 同じ原因です。結合が左側の行を繰り返したため、合計がそれを複数回数えています。 |
+| 結合が非常に大きく切りの良い行数を返す | `ON` 句がないため、結合がクロス結合になっています。 |
+| 両方のテーブルに存在する行が欠けている | 一方の側で結合列が NULL のため、何にも一致しません。 |
+| `RIGHT JOIN` が追いにくい | テーブルを入れ替えて `LEFT JOIN` に書き直します。結果は同じです。 |
+
+## 関連項目 {#see-also}
+
+- [EXPLAIN 出力の読み方](/ja/guides/reading-explain) — 結合がどのインデックスを使ったかを教えてくれるプラン
+- [MySQL の外部キー](/ja/guides/foreign-keys) — どの列にインデックスを作成するかを決める制約
+- [MySQL の GROUP BY のパフォーマンス](/ja/guides/group-by-having) — 一対多の結合を 1 行に集計し直す
+- [結合の仕組み](/ja/tutorial/joins) — まず基本から学びたい場合のチュートリアル

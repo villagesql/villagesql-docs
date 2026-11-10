@@ -1,0 +1,178 @@
+---
+title: "MySQL のクエリから AI モデルを実行する"
+sidebarTitle: "AI プロンプトの実行"
+description: "VillageSQL の ai_prompt() 関数を使って MySQL のクエリから AI 言語モデルを直接呼び出す方法: 行のエンリッチ、データの分類、およびテキストのバッチ処理。"
+keywords: "mysql ai prompt, mysql call ai model, mysql ai_prompt function, mysql llm query, mysql anthropic openai, mysql ai text generation"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL には AI モデルを呼び出す手段がありません。データを SQL で処理し、AI の処理のたびにアプリケーションコードへ移し、結果を戻すことになります。VillageSQL の `vsql_ai` 拡張機能は `ai_prompt()` を追加します。これはクエリから AI モデルを直接呼び出す関数で、エンリッチ、分類、および生成を、データがすでにある場所で行えるようにします。
+
+## 問題: SQL と AI の間のコンテキスト切り替え {#the-problem-context-switching-between-sql-and-ai}
+
+VillageSQL がない場合の典型的なパターンです。
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, review_text FROM reviews WHERE ai_label IS NULL")
+
+# Call AI for each row
+for row in rows:
+    label = openai.chat(model="gpt-4o-mini", prompt=row["review_text"])
+    db.execute("UPDATE reviews SET ai_label = ? WHERE id = ?", label, row["id"])
+```
+
+これは動作しますが、行ごとに SELECT、AI 呼び出し、UPDATE の 3 回のラウンドトリップが必要です。大きなテーブルでは調整のオーバーヘッドが積み重なり、エンリッチのロジックはデータがあるスキーマではなくアプリケーションコードに置かれます。
+
+## VillageSQL の場合: SQL の中の ai_prompt() {#with-villagesql-ai_prompt-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+`ai_prompt(provider, model, api_key, prompt)` は API 呼び出しを行い、応答を文字列として返します。スカラー関数が使える場所ならどこでも使えます。
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+-- Enrich a single row
+SELECT review_text,
+       ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+                 CONCAT('Classify this review as positive, negative, or neutral: ', review_text)
+       ) AS sentiment
+FROM reviews
+WHERE id = 1;
+```
+
+### 行を一括で更新する {#updating-rows-in-bulk}
+
+最も一般的な用途は、既存の行に対してエンリッチ用の列をバックフィルすることです。
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_label VARCHAR(50);
+
+SET @key = 'sk-ant-your-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE reviews
+SET ai_label = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT('Classify as positive, negative, or neutral. Reply with one word only: ', review_text)
+)
+WHERE ai_label IS NULL
+LIMIT 100;  -- Process in batches to stay within rate limits
+```
+
+NULL の行がなくなるまで、アプリケーションからこの UPDATE をループで実行します。
+
+### プロンプトの結果を WHERE で使う {#using-prompt-results-in-where}
+
+AI の出力でフィルタすることもできますが、スキャン対象のすべての行についてモデルが呼び出されます。
+
+```sql
+-- Flag reviews that need human review
+SELECT id, review_text FROM reviews
+WHERE ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+    CONCAT('Does this review mention a refund request? Reply yes or no: ', review_text)
+) = 'yes'
+LIMIT 20;
+```
+
+パフォーマンスのためには、WHERE 句で `ai_prompt()` を呼び出すのではなく、保存された列を更新してその列に対してクエリすることを優先してください。
+
+### 複数の列からプロンプトを組み立てる {#building-prompts-from-multiple-columns}
+
+モデルに完全なコンテキストを与えるには、複数の列をプロンプトに連結します。
+
+```sql
+UPDATE support_tickets
+SET ai_summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Summarize this support ticket in one sentence.\n',
+        'Subject: ', subject, '\n',
+        'Body: ', body
+    )
+)
+WHERE ai_summary IS NULL
+LIMIT 50;
+```
+
+## パフォーマンスとレート制限 {#performance-and-rate-limits}
+
+`ai_prompt()` の各呼び出しは独立した HTTPS リクエストです。一括処理では次の点に注意してください。
+
+- **UPDATE で LIMIT を使う** — AI 呼び出しは 1 回あたり 5〜30 秒かかるため、100 行に対する一括 `UPDATE` には数分かかります。プロバイダーのレート制限内に収まるよう、50〜100 行ずつのバッチで処理してください。`max_execution_time` は `SELECT` のみを制限し、ここでは何の効果もありません。実行中の `UPDATE` を打ち切るには、別のセッションから `KILL QUERY <connection_id>` を使います。
+- **結果を保存する** — 結果を保存せずに SELECT の中で `ai_prompt()` を呼び出してはいけません。SELECT を繰り返すたびに API 呼び出しが再実行されます。
+
+```sql
+-- Batch loop pattern (run repeatedly until done)
+UPDATE reviews
+SET ai_label = ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+    CONCAT('Label as positive, negative, or neutral. One word: ', review_text))
+WHERE ai_label IS NULL
+LIMIT 100;
+
+-- Check progress
+SELECT COUNT(*) AS remaining FROM reviews WHERE ai_label IS NULL;
+```
+
+## モデルの選択 {#choosing-a-model}
+
+| モデル | 速度 | コスト | 使う場面 |
+|:---|:---|:---|:---|
+| `claude-haiku-4-5` | 高速 | 低 | 一括分類、単純なラベル付け |
+| `claude-sonnet-5` | 中程度 | 中 | 複雑な推論、ニュアンスのある出力 |
+| `claude-opus-5` | 低速 | 高 | 推奨デフォルト — エージェント的な作業やエンタープライズの作業 |
+| `claude-fable-5` | 低速 | 高 | 最も高性能 — 高度な推論、長期にわたる作業 |
+| `gpt-4o-mini` | 高速 | 低 | OpenAI エコシステム、単純なタスク |
+| `gemini-2.5-flash` | 高速 | 低 | Google エコシステム、バランスの取れたタスク |
+
+分類やラベル付けのタスクでは、許容できる精度が得られる範囲で最も高速かつ安価なモデルを使ってください。より高性能なモデルは、スループットよりも出力品質が重要なタスクのために取っておきます。
+
+セットアップとプロバイダーの構成については、[MySQL を AI API に接続する](/ja/guides/ai-api-setup)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### DEFAULT 式の中で ai_prompt() を使えますか? {#can-i-use-ai_prompt-in-a-default-expression}
+
+いいえ。MySQL では、非決定的な関数（`ai_prompt()` はこれに該当します）を DEFAULT 式や生成列で使うことはできません。
+
+#### ストアドプロシージャの中で ai_prompt() を使えますか? {#can-i-use-ai_prompt-in-a-stored-procedure}
+
+はい。ストアドプロシージャ、トリガー、および関数はいずれも `ai_prompt()` を呼び出せます。タイムアウトの制約は同じです。トリガーには注意してください。INSERT のたびに AI を呼び出すと、すべての書き込みが遅くなります。
+
+#### 応答の形式はどう制御しますか? {#how-do-i-control-the-response-format}
+
+プロンプトで制御します。「Reply with one word: positive, negative, or neutral」と指示すると、分類に適した予測可能な出力が得られます。「Return valid JSON with keys: category, confidence」と指示すると、構造化された出力が得られます。指示が具体的であれば、モデルは確実に指示に従います。
+
+#### ai_prompt() は失敗時に再試行しますか? {#does-ai_prompt-retry-on-failure}
+
+いいえ。API 呼び出しが失敗すると NULL を返します。アプリケーションのバッチループに再試行ロジックを実装する前に、`SHOW WARNINGS` を実行して理由を確認してください。`vsql_ai` は実際の失敗理由を含む `Warning 3200` を発生させます。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | `INSTALL EXTENSION vsql_ai` を実行します |
+| NULL が返る | API キーの誤り、レート制限への到達、またはタイムアウトです。`max_execution_time` を確認します |
+| 応答が文の途中で止まる | `SHOW WARNINGS` を実行します。「Prompt response truncated to fit the result buffer」という警告は、応答が結果に収まらなかったことを意味します。モデルにより短い応答を求めてください |
+| UPDATE の実行時間が長すぎる | より小さい `LIMIT` のバッチを使います。`max_execution_time` は `UPDATE` には適用されないため、代わりに別のセッションから `KILL QUERY <connection_id>` を使います |
+| モデルが予期しない形式を返す | プロンプトを厳密にします。正確な出力形式を指定し、例を示します |
+| レート制限のエラー | バッチサイズを減らします。UPDATE のバッチの間に `SELECT SLEEP(1);` を挟むか、アプリケーションのループにスリープを追加します |
+
+## 関連項目 {#see-also}
+
+- [MySQL を AI API に接続する](/ja/guides/ai-api-setup) — まず vsql_ai 拡張機能をインストールして構成する
+- [MySQL での AI 要約](/ja/guides/ai-summarization) — ai_prompt() で長いテキストを要約する
+- [MySQL で AI を使ってテキストを分類する](/ja/guides/text-classification) — ai_prompt() を使って行をカテゴリでラベル付けする
+- [MySQL データのセンチメント分析](/ja/guides/sentiment-analysis) — テキストのトーンとセンチメントをスコア化する

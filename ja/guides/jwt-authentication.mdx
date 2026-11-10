@@ -1,0 +1,193 @@
+---
+title: "JWT で MySQL ユーザーを認証する方法"
+sidebarTitle: "JWT 認証"
+description: "VillageSQL の vsql_oauth2 拡張機能を使って MySQL アカウントを JSON Web Token でサインインさせる方法 — 署名鍵、クレームのマッピング、ロールの付与、および拒否されたトークンがパスワード間違いのように見える理由。"
+keywords: "mysql jwt authentication, mysql oauth login, mysql oidc, jwks mysql, mysql token login, vsql_oauth2"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  このガイドはプレビュー機能を使用します。サーバーを
+  `--vsql_allow_preview_extensions=ON` で起動してください。そうしないと `INSTALL EXTENSION` は拒否されます。
+</Note>
+
+ID プロバイダーがすでに存在すると、データベースのパスワードは管理しにくくなります。パスワードは別々に発行され、別々にローテーションされ、与えられた人がいなくなった後も残ります。VillageSQL の `vsql_oauth2` 拡張機能を使うと、アカウントは代わりに JSON Web Token でサインインできます。プロバイダーがトークンを発行し、サーバーが署名と有効期限を検証し、トークン内のクレームがアカウントを指定します。
+
+## 署名鍵の設定 {#set-up-a-signing-key}
+
+この拡張機能は、JWKS エンドポイントから取得した鍵（実際のプロバイダーで使う方法）か、貼り付けた 1 つの公開鍵のどちらかで署名を検証します。静的な鍵は、経路全体が動くことを確認する最も手早い方法なので、このガイドはそこから始めます。
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt_private.pem
+openssl rsa -pubout -in jwt_private.pem -out jwt_public.pem
+```
+
+```sql
+INSTALL EXTENSION vsql_oauth2;
+
+SET GLOBAL vsql_oauth2.public_key = '-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----';
+SET GLOBAL vsql_oauth2.username_claim = 'sub';
+```
+
+`username_claim` は、アカウント名を運ぶクレームを指定します。デフォルトは `sub` で、以下の例のトークンもこれを使います。
+
+実際のプロバイダーでは、代わりに `jwks_url` を設定します。拡張機能は鍵を取得し、`jwks_refresh_interval` の間隔で再取得し、キャッシュにない鍵 ID をトークンが指定したときには直ちに再取得します。`issuer` と `audience` も設定してください。そうすれば、別のシステム向けに発行されたトークンはここでは受け入れられません。
+
+## アカウントの作成 {#create-the-account}
+
+アカウントは通常の MySQL アカウントで、作成時にこの拡張機能で認証するものとして指定します。アカウントは自身の権限を持ちます。
+
+```sql
+CREATE USER 'analyst'@'%' IDENTIFIED WITH vsql_oauth2;
+GRANT SELECT ON shop.* TO 'analyst'@'%';
+```
+
+設定するパスワードはなく、ローテーションするパスワードもありません。
+
+セッションは、接続したアカウントではなく、トークンが指定するアカウントとして実行されます。その名前は `username_claim` のクレーム（デフォルトでは `sub`）から取られます。そのクレームが `analyst` と言っている限り、上のステートメントで十分です。プロバイダーがそこに別のもの、たとえばメールアドレスを入れる場合は、そのアカウントも作成し、接続するアカウントをそこへプロキシさせます。
+
+```sql
+CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
+CREATE USER 'alice@example.com';
+GRANT SELECT ON shop.* TO 'alice@example.com';
+GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
+```
+
+誰も `alice@example.com` として直接サインインしないため、このアカウントに独自のパスワードは不要です。`validate_password` を実行しているサーバーは、パスワードのないアカウントの作成を `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements` で拒否します。それが当てはまる場合は、誰も保持しないパスワードを与えるか、ログインをまったく許可しない認証プラグインを与えてください。
+
+プロキシの付与がないと、ログインは `ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing proxy privilege.` で拒否されます。
+
+## ログイン {#log-in}
+
+トークンは、通常パスワードが通る場所を通ります。組み込みの `mysql_clear_password` プラグイン経由で、クライアントはこれを明示的に有効にする必要があります。
+
+```bash
+MYSQL_PWD="$TOKEN" mysql -h 127.0.0.1 -u analyst --enable-cleartext-plugin
+```
+
+トークンを `--password=` で渡すとプロセス一覧に載るため、トークンは代わりに環境変数に入れます。
+
+セッション内では、`CURRENT_USER()` がデータベースのアカウントで、`@@external_user` はトークンが運んだ ID を保持します。これは監査証跡で求められるものです。
+
+```sql
+SELECT CURRENT_USER() AS logged_in_as, @@external_user AS token_identity;
+```
+
+```
++--------------+----------------+
+| logged_in_as | token_identity |
++--------------+----------------+
+| analyst@%    | analyst        |
++--------------+----------------+
+```
+
+<Warning>
+  `mysql_clear_password` はプロトコルレベルでトークンを平文で送信します。この方法で
+  認証するすべての接続で TLS を使ってください。そうしないと、経路上のあらゆるものが
+  トークンを読め、有効期限が切れるまで再利用できます。
+</Warning>
+
+## トークンからのロールのマッピング {#mapping-roles-from-the-token}
+
+アカウントは、トークンから権限を受け取ることもできます。ロールを運ぶクレームを拡張機能に指定し、付与を有効にします。
+
+```sql
+SET GLOBAL vsql_oauth2.roles_claim = 'roles';
+SET GLOBAL vsql_oauth2.auto_grant = ON;
+```
+
+ロールと、独自の権限を持たないアカウントを作成します。
+
+```sql
+CREATE ROLE 'shop_reader';
+GRANT SELECT ON shop.* TO 'shop_reader';
+
+CREATE USER 'dana'@'%' IDENTIFIED WITH vsql_oauth2;
+```
+
+`"roles": ["shop_reader"]` を運ぶトークンは、そのロールが有効な状態でログインします。
+
+```sql
+SELECT CURRENT_USER() AS account, CURRENT_ROLE() AS roles_now;
+```
+
+```
++---------+-------------------+
+| account | roles_now         |
++---------+-------------------+
+| dana@%  | `shop_reader`@`%` |
++---------+-------------------+
+```
+
+`roles_filter` は考慮されるロール名を絞り込み、`roles_transform_pattern` と `roles_transform_replacement` は、グループ名がロール名のように見えないプロバイダーのために、プロバイダー側の名前をデータベースのロール名に書き換えます。
+
+<Warning>
+  `auto_grant` は実際の付与を書き込み、それはログインの後も残ります。上のログインの
+  後、付与はサーバー内にあります。
+
+```sql
+SELECT FROM_USER AS role_granted, TO_USER AS to_account
+FROM mysql.role_edges WHERE TO_USER = 'dana';
+```
+
+```
++--------------+------------+
+| role_granted | to_account |
++--------------+------------+
+| shop_reader  | dana       |
++--------------+------------+
+```
+
+  後で `auto_grant` をオフにしても、付与は取り消されません。一度見た 1 つのトークンが、
+  誰かがロールを取り消すまでそのアカウントの権限を広げます。有効にする前に
+  `roles_filter` の範囲を絞り、このクレームは、プロバイダーが正しく設定すると信頼するほかないものとして
+  扱ってください。
+</Warning>
+
+`auto_grant` がオフの場合、同じトークンでログインはできますが、ロールは付与されずにスキップされ、`CURRENT_ROLE()` は `NONE` になります。スキップされた各ロールはエラーログに書き込まれます: `VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`。`auto_create` はアカウントについて同じように動作し、サーバーが見たことのないサブジェクトの初回ログイン時にアカウントを作成します。どちらもデフォルトではオフで、どちらもこのサーバーに対する権限をプロバイダーに委ねます。
+
+## 拒否されたトークンはパスワード間違いのように見える {#a-rejected-token-looks-like-a-wrong-password}
+
+すべての失敗は 1 つのエラーを生み、それは通常のエラーです。
+
+```
+ERROR 1045 (28000): Access denied for user 'analyst'@'localhost' (using password: NO)
+```
+
+期限切れのトークン、誤った鍵で署名されたトークン、間違って入力された通常のパスワードは、すべてまったく同じこのエラーを生みます。`using password: NO` も含めてです。トークンは送られているので、これは誤解を招きます。サーバーのエラーログにも、`log_error_verbosity=3` であっても、区別できるものは何も出ません。
+
+そのため、エラーではなくトークンからデバッグしてください。トークンをデコードし、次の 4 点をこの順に確認します。
+
+1. **`exp`** が未来である。プロバイダーとサーバーの間のクロックのずれがここで影響します。
+2. **署名鍵が一致する。** トークンの `kid` が、JWKS ドキュメントがまだ公開しているものであることを確認します。ドキュメントがもう持っていない鍵は、偽造トークンとまったく同じに見えます。
+3. **`iss` と `aud`** が、設定した場合はその設定値と一致する。
+4. **`username_claim` のクレームが存在するアカウントを指定している**。アカウントの綴りどおりに。
+
+ペイロードのデコードには、シェル以外のツールは不要です。
+
+```bash
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null
+```
+
+## トラブルシューティング {#troubleshooting}
+
+| 症状 | 修正 |
+|---|---|
+| インストール時に `ERROR 3219 ... requires preview capabilities` | サーバーを `--vsql_allow_preview_extensions=ON` で起動します |
+| すべての試行で `Access denied` | 上の 4 つの確認を順に行います。メッセージはどの原因でも同じです |
+| クライアントがトークンを送らない | `--enable-cleartext-plugin` を渡します。他のクライアントには、`mysql_clear_password` 用の独自の有効化手段があります |
+| ログインが動いていたのに、まとめて止まった | プロバイダーが鍵をローテーションしました。`jwks_url` に到達でき、トークンの `kid` が返されるドキュメントに含まれることを確認します |
+| 誰も付与していない権限をアカウントが持っている | `auto_grant` がトークンのクレームから付与しました。`mysql.role_edges` を確認し、取り消します |
+| 拡張機能の再インストール後に設定が消えた | `UNINSTALL EXTENSION` は永続化された設定を削除します。再適用します |
+
+## 関連項目 {#see-also}
+
+- [vsql_oauth2](/ja/extensions/vsql-oauth2) — 拡張機能のリファレンスページ。追加されるすべての設定を掲載
+- [MySQL のユーザー管理](/ja/guides/user-management) — トークンで認証するアカウントにも必要な権限
+- [MySQL のセキュリティ強化](/ja/guides/security-hardening) — TLS と接続面のその他の要素
+- [MySQL での HMAC 署名](/ja/guides/hmac-mysql) — ログイン時ではなく SQL 内で署名を検証する

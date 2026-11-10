@@ -1,0 +1,152 @@
+---
+title: "MySQL におけるサブクエリと JOIN の比較"
+sidebarTitle: "サブクエリと JOIN の比較"
+description: "MySQL でサブクエリと JOIN のどちらを使うべきか: 相関サブクエリと非相関サブクエリ、EXISTS と IN、パフォーマンスの違い、および MySQL のオプティマイザがそれぞれをどう処理するか。"
+keywords: "mysql subquery vs join, mysql subquery performance, mysql semi join, mysql rewrite subquery as join, mysql subquery optimizer, mysql join or subquery faster"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+サブクエリと JOIN は、多くの場合同じ結果を生成します。どちらを選ぶかは、読みやすさ、NULL に対する正しさ、そして場合によってはパフォーマンスに影響します。
+
+## サブクエリの種類 {#types-of-subqueries}
+
+**非相関サブクエリ**は一度だけ実行され、その結果が外側のクエリで使われます。
+
+```sql
+-- Runs once: find all orders over the average amount
+SELECT id, amount
+FROM orders
+WHERE amount > (SELECT AVG(amount) FROM orders);
+```
+
+**相関サブクエリ**は外側のクエリの列を参照するため、行ごとに一度実行されます。
+
+```sql
+-- Runs once per customer: find customers who have at least one order over $500
+SELECT c.name
+FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+```
+
+相関サブクエリは大きなテーブルでは遅くなることがあります。外側のクエリのすべての行に対してサブクエリが実行されるためです。MySQL がどう実行しているかは `EXPLAIN` で確認してください。
+
+## IN と EXISTS と JOIN の比較 {#in-vs-exists-vs-join}
+
+この 3 つのパターンは、多くの場合同じ問題を解決します。
+
+```sql
+-- IN subquery
+SELECT name FROM customers
+WHERE id IN (SELECT customer_id FROM orders WHERE amount > 500);
+
+-- EXISTS
+SELECT name FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+
+-- JOIN (with DISTINCT to avoid duplicates)
+SELECT DISTINCT c.name
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 500;
+```
+
+| アプローチ | 使う場面 |
+|:---------|:------------|
+| `IN (subquery)` | サブクエリが小さく静的なリストを返す。単純なケースでは読みやすい |
+| `EXISTS` | 存在だけを確認する。最初の一致で停止する。NULL に対して安全 |
+| `JOIN` | 両方のテーブルの列が必要。MySQL のオプティマイザの自由度が高い |
+
+MySQL のオプティマイザは `IN (subquery)` を内部的にセミジョインに書き換えることが多いため、パフォーマンスの差は無視できることがよくあります。サブクエリの結果セットが大きい場合は、`EXISTS` または `JOIN` のほうが信頼できます。
+
+## NOT IN の NULL 問題 {#the-null-problem-with-not-in}
+
+`NOT IN` は、サブクエリが 1 つでも NULL を返すと予想外の動作をします。
+
+```sql
+-- This returns zero rows if ANY customer_id in orders is NULL
+SELECT name FROM customers
+WHERE id NOT IN (SELECT customer_id FROM orders);
+```
+
+`orders.customer_id` に NULL の行が 1 つでもあると、`NOT IN` 全体が空を返します。これは正しい SQL の動作です。`NULL` は不明なので、`NOT IN (NULL, 1, 2)` はすべての比較に対して UNKNOWN になります。代わりに `NOT EXISTS` を使ってください。
+
+```sql
+-- Safe: returns customers with no orders, even if some order rows have NULL customer_id
+SELECT name FROM customers c
+WHERE NOT EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id
+);
+```
+
+MySQL の NULL の動作の詳細は、[MySQL の NULL](/ja/guides/null-in-mysql)を参照してください。
+
+## FROM 内のサブクエリ(派生テーブル) {#subqueries-in-from-derived-tables}
+
+`FROM` 句のサブクエリは派生テーブルを作ります。
+
+```sql
+SELECT dept, avg_salary
+FROM (
+    SELECT department AS dept, AVG(salary) AS avg_salary
+    FROM employees
+    GROUP BY department
+) dept_stats
+WHERE avg_salary > 80000;
+```
+
+このパターンでは、通常 CTE のほうが分かりやすくなります。ロジックがインラインで入れ子になるのではなく、先頭で名前を付けて定義されるためです。[MySQL の CTE が派生テーブルより優れる場合](/ja/guides/ctes-in-mysql)を参照してください。
+
+## パフォーマンスに関する考慮事項 {#performance-considerations}
+
+MySQL のオプティマイザは、多くのサブクエリのパターンを書き換えます。手動で最適化する前に、次のことを行ってください。
+
+1. サブクエリ版と JOIN 版の両方に `EXPLAIN` を実行し、MySQL が実際に何を実行しているかを確認する
+2. 結合列や相関列にインデックスがあることを確認する。通常はここがボトルネックになります
+3. `EXPLAIN` が実行計画に大きな差を示す場合にのみ書き換える
+
+| パターン | 注意点 |
+|:--------|:----------|
+| SELECT 内の相関サブクエリ | 行ごとに実行される。大きなテーブルでは O(n²) になりうる |
+| 大きな結果セットを返す `IN (subquery)` | 通常はセミジョインへの書き換えで最適化される。`EXPLAIN` で確認する |
+| NULL を含みうる `NOT IN` | 誤った結果になる。`NOT EXISTS` を使う |
+| FROM 内の派生テーブル | オプティマイザがマージする場合としない場合がある。`EXPLAIN` で確認する |
+
+## よくある質問 {#frequently-asked-questions}
+
+#### JOIN は常にサブクエリより速いですか? {#is-join-always-faster-than-a-subquery}
+
+必ずしもそうではありません。MySQL 8.0 のオプティマイザは、多くの場合 `IN (subquery)` をセミジョインに書き換え、明示的な JOIN と同じ実行計画を生成します。一方が常に速いと決めつけず、`EXPLAIN` で測定してください。
+
+#### IN の代わりに EXISTS を使うべきなのはいつですか? {#when-should-i-use-exists-instead-of-in}
+
+一致が存在するかどうかだけが重要な場合(一致したデータの内容は不要)、サブクエリが NULL を返す可能性がある場合、またはサブクエリが大きな結果セットを返す場合に `EXISTS` を使います。`EXISTS` は最初の一致で短絡しますが、`IN` は完全なリストを構築する必要があります。
+
+#### セミジョインとは何ですか? {#whats-a-semi-join}
+
+セミジョインは、右側に少なくとも 1 つの一致する行がある左側のテーブルの行を返します。複数の一致があっても、左側のテーブルの行を重複して生成しません。MySQL のオプティマイザは、`IN (subquery)` と `EXISTS` を効率的に実行するために、内部的にセミジョインを使います。SQL でセミジョインを直接書くことはできませんが、`EXISTS` と `IN (subquery)` はどちらも、オプティマイザにセミジョインの検討を促します。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `NOT IN` が予想外に空の結果を返す | サブクエリの結果に NULL があります。`NOT EXISTS` に切り替えます |
+| 相関サブクエリが非常に遅い | 相関列にインデックスを追加します。JOIN への書き換えを検討します |
+| 同じクエリが IN サブクエリより JOIN のほうが速い | オプティマイザが IN サブクエリを書き換えていない可能性があります。JOIN への書き換えを試します |
+| 派生テーブルのクエリが遅い | MySQL が派生テーブルをマテリアライズしたか確認します。CTE または JOIN への書き換えを試します。`SQL_NO_CACHE` に手を出さないでください。それが制御していたクエリキャッシュは MySQL 8.0 で削除されたため、このヒントは非推奨の警告を出すだけです |
+
+## 関連項目 {#see-also}
+
+- [MySQL の JOIN のパフォーマンスとよくある間違い](/ja/guides/joins) — この比較の JOIN 側を遅くするもの
+- [MySQL の CTE が派生テーブルより優れる場合](/ja/guides/ctes-in-mysql) — 深く入れ子になったサブクエリに代わる、よりすっきりした選択肢
+- [MySQL のサブクエリ](/ja/tutorial/subqueries)と[相関サブクエリ](/ja/tutorial/correlated-subqueries) — それらの書き方を学ぶチュートリアルのレッスン
+- [MySQL の EXISTS](/ja/tutorial/exists) — 行を決して増やさない形

@@ -1,0 +1,249 @@
+---
+title: "MySQL のセキュリティ強化"
+sidebarTitle: "MySQL の強化"
+description: "MySQL サーバーを保護する方法: mysql_secure_installation の実行、匿名ユーザーの削除、root アクセスの制限、パスワードポリシーの強制、権限の監査、SSL/TLS の有効化、および攻撃対象領域の縮小。"
+keywords: "mysql security, mysql hardening, mysql secure installation, mysql ssl tls, mysql password policy, mysql root security, mysql user privileges audit, mysql security best practices"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+デフォルトの MySQL インストールは、セキュリティよりもセットアップの容易さを優先しています。本番サーバーの強化とは、開発者のラップトップでは理にかなっていたものの、サーバーがアプリケーションやネットワークから到達可能になると不適切になるデフォルトを取り除くことです。
+
+## デプロイ環境ごとの強化 {#hardening-by-deployment-context}
+
+すべての強化ステップが同じリスクと手間のトレードオフを持つわけではありません。優先順位付けにはこの表を使ってください。
+
+| ステップ | インターネットに面した本番環境 | 内部/プライベートネットワーク | 開発 / ステージング |
+|:-----|:--------------------------|:------------------------|:--------------|
+| `mysql_secure_installation` の実行 | 必須 | 必須 | 推奨 |
+| 匿名ユーザーの削除 | 必須 | 必須 | 推奨 |
+| root を localhost に制限 | 必須 | 必須 | 推奨 |
+| test データベースの削除 | 必須 | 必須 | 任意 |
+| `validate_password` コンポーネント | 必須 | 必須 | 任意 — 素早い反復を妨げることがある |
+| パスワード有効期限ポリシー | 必須 | 推奨 | 省略 |
+| 最小権限のアプリアカウント | 必須 | 必須 | 推奨 |
+| 権限付与でのホスト制限（`'%'` を使わない） | 必須 | 必須 | 任意 |
+| アカウントへの `REQUIRE SSL` | 必須 | 推奨 | 省略 |
+| カスタム CA 署名の TLS 証明書 | 必須 | 任意 — 自己署名でも可 | 省略 |
+| `bind-address` を内部 IP に | 必須 | 推奨 | 任意 |
+| `local_infile` の無効化 | 必須 | 推奨 | 任意 |
+| `skip_name_resolve` | 推奨 | 推奨 | 任意 |
+| 未使用アカウントのロックまたは削除 | 必須 | 必須 | 任意 |
+
+**インターネットに面した**とは、ロードバランサーの背後であっても、ポート 3306 がプライベートネットワークの外から到達可能であることを意味します。「必須」の行はすべて例外なく適用してください。
+
+**内部/プライベートネットワーク**は、VPC、プライベートサブネット、またはオフィスネットワーク内からのみアクセスできるサーバーを指します。一部の緩和策（CA 署名の証明書、すべてのアカウントでの SSL 強制）は、わずかな利益のために運用上のオーバーヘッドを加えます。しかし、強力なパスワード、最小権限、および bind-address の制限は依然として譲れません。
+
+**開発/ステージング**のマシンは、資格情報漏えいの最も一般的な発生源です。パスワードの複雑さを省略したり、ホスト `'%'` への権限付与を残したりしてよいのは、そのインスタンスにラップトップや CI 環境の外から到達できない場合だけです。ステージングが本番データとネットワークを共有しているなら、最低でも内部/プライベートとして扱ってください。
+
+## mysql_secure_installation {#mysql_secure_installation}
+
+ローカルの開発マシンでないサーバーに MySQL をインストールしたら、直ちにこれを実行します。
+
+```bash
+mysql_secure_installation
+```
+
+最も重要な強化ステップを順に案内します。
+
+- root パスワードの設定（まだ設定されていない場合）
+- 匿名ユーザーの削除
+- リモートからの root ログインの禁止
+- test データベースの削除
+- 権限テーブルの再読み込み
+
+これらの 4 つのステップは、新規インストールで最も一般的な攻撃対象領域を取り除きます。
+
+## root アカウントの制限 {#root-account-restrictions}
+
+root は `localhost` からのみ接続できるべきです。これを確認し、強制します。
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = 'root';
+-- Should show only 'localhost', '127.0.0.1', '::1'
+```
+
+root に `'%'` ホストのエントリがある場合は削除します。
+
+```sql
+DROP USER 'root'@'%';
+```
+
+リモート管理には、root をリモートで使う代わりに、ホストアクセスを限定した名前付きの DBA アカウントを作成します。
+
+## 匿名ユーザーと test データベースの削除 {#remove-anonymous-users-and-test-database}
+
+```sql
+-- Remove any anonymous accounts
+DELETE FROM mysql.user WHERE user = '';
+FLUSH PRIVILEGES;
+
+-- Remove the test database (readable by anonymous users by default)
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE db = 'test' OR db = 'test\\_%';
+FLUSH PRIVILEGES;
+```
+
+## パスワードポリシー {#password-policy}
+
+MySQL 8.0 以降には、パスワードの複雑さのルールを強制する `validate_password` コンポーネントが含まれています。使用前にインストールが必要で、`mysql_secure_installation` は自動でのインストールを提案します。手動でインストールするには次のようにします。
+
+```sql
+INSTALL COMPONENT 'file://component_validate_password';
+```
+
+有効になっていることを確認します。
+
+```sql
+SHOW VARIABLES LIKE 'validate_password%';
+```
+
+最低要件を設定します。
+
+```sql
+SET GLOBAL validate_password.length = 12;
+SET GLOBAL validate_password.mixed_case_count = 1;
+SET GLOBAL validate_password.number_count = 1;
+SET GLOBAL validate_password.special_char_count = 1;
+SET GLOBAL validate_password.policy = 'MEDIUM';
+```
+
+ポリシーのレベル: `LOW`（長さのみ）、`MEDIUM`（長さ + 文字種）、`STRONG`（+ 辞書チェック）。
+
+忘れられる可能性のあるアカウントには、パスワードの有効期限を設定します。
+
+```sql
+ALTER USER 'admin'@'localhost' PASSWORD EXPIRE INTERVAL 90 DAY;
+```
+
+## 最小権限のユーザーアカウント {#least-privilege-user-accounts}
+
+アプリケーションのアカウントには、必要最小限の権限を与えるべきです。GRANT の完全な構文は [MySQL のユーザー管理](/ja/guides/user-management)を参照してください。
+
+一般的なパターンは次のとおりです。
+
+```sql
+-- Read-only replica account
+CREATE USER 'app_read'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT ON myapp.* TO 'app_read'@'10.0.1.%';
+
+-- Application write account (no schema changes)
+CREATE USER 'app_write'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT, INSERT, UPDATE, DELETE ON myapp.* TO 'app_write'@'10.0.1.%';
+
+-- Migration account (schema changes allowed, used only by deploy scripts)
+CREATE USER 'app_migrate'@'localhost' IDENTIFIED BY 'strong_password';
+GRANT ALL PRIVILEGES ON myapp.* TO 'app_migrate'@'localhost';
+```
+
+ホストはできる限り厳しく制限します。`'%'` ではなく、サブネット表記または特定の IP を使ってください。
+
+## 既存の権限の監査 {#auditing-existing-privileges}
+
+すべてのアカウントとその権限を確認します。
+
+```sql
+-- List all user accounts
+SELECT user, host, account_locked, password_expired
+FROM mysql.user
+ORDER BY user, host;
+
+-- Check for overly broad grants
+SELECT user, host, Select_priv, Insert_priv, Update_priv, Delete_priv,
+       Super_priv, Grant_priv
+FROM mysql.user
+WHERE host = '%' OR Super_priv = 'Y';
+```
+
+使われていないアカウントは削除するかロックします。
+
+```sql
+ALTER USER 'old_account'@'%' ACCOUNT LOCK;
+-- Or drop entirely:
+DROP USER 'old_account'@'%';
+```
+
+## SSL/TLS 接続 {#ssltls-connections}
+
+MySQL 8.0 はデフォルトで SSL/TLS を有効にし、起動時に証明書を自動生成します。有効になっていることを確認します。
+
+```sql
+SHOW VARIABLES LIKE '%ssl%';
+-- ssl_ca, ssl_cert, ssl_key should show file paths
+-- have_ssl no longer exists on MySQL 8.4 (ERROR 1193). To confirm TLS is in
+-- use, run SHOW STATUS LIKE 'Ssl_cipher' on an actual TLS connection.
+```
+
+特定のアカウントに SSL を必須にします。
+
+```sql
+ALTER USER 'app_write'@'%' REQUIRE SSL;
+```
+
+クライアント接続が SSL を使っていることを確認するには次のようにします。
+
+```sql
+SHOW STATUS LIKE 'Ssl_cipher';
+-- Non-empty value means the current connection is encrypted
+```
+
+本番環境では、自動生成された自己署名証明書を、信頼できる CA の証明書に置き換えてください。
+
+## ネットワークアクセス {#network-access}
+
+MySQL が必要なインターフェイスだけで待ち受けるように制限します。`my.cnf` で次のように設定します。
+
+```ini
+[mysqld]
+bind-address = 127.0.0.1     # local only
+# or
+bind-address = 10.0.1.5      # specific internal IP
+```
+
+MySQL にネットワークから一切到達できないようにすべき場合（アプリケーションが同じホストにある場合）は、`127.0.0.1` にバインドし、ポート 3306 を外部に公開しないでください。ファイアウォールのルールは第二の防御層であり、バインドアドレスの制限の代わりにはなりません。
+
+## 危険な機能の無効化 {#disabling-risky-features}
+
+アプリケーションが使わない機能はオフにします。
+
+```sql
+-- Prevent MySQL from reading/writing files on the server filesystem
+-- (prevents SQL injection attacks that use LOAD DATA INFILE to read /etc/passwd)
+SET GLOBAL local_infile = 0;
+```
+
+`my.cnf` では次のとおりです。
+
+```ini
+[mysqld]
+local_infile = 0
+skip_name_resolve = 1       # don't do reverse DNS lookups; use IPs in grants
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### デフォルトの MySQL 8.4 のインストールは安全ですか? {#is-the-default-mysql-84-install-secure}
+
+古い MySQL のデフォルトよりは良いですが、本番環境向けに強化されてはいません。MySQL 8.4 はランダムな root パスワードを生成し、デフォルトで SSL を有効にします。それでも、root パスワードが強力であることの確認、匿名ユーザーの削除、ホストアクセスの制限、および `validate_password` コンポーネントの設定は必要です。
+
+#### MySQL を root で実行すべきですか? {#should-i-run-mysql-as-root}
+
+決してしないでください。MySQL は専用の低権限システムユーザー（通常は `mysql`）として実行すべきです。サーバープロセスを root で実行すると、MySQL の脆弱性がシステム全体の侵害につながる可能性があります。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 1045: Access denied for user 'root'@'%'` | root のリモートログインが正しくブロックされている — 特定のホストアクセスを持つ名前付きの管理ユーザーを作成する |
+| `REQUIRE SSL` を追加した後にアプリケーションが接続できない | クライアントは SSL フラグ `--ssl-mode=REQUIRED` を使う必要がある。サーバー証明書が有効であることを確認する |
+| `validate_password` がパスワードを拒否する | 現在のポリシーを確認する: `SHOW VARIABLES LIKE 'validate_password%'`。パスワードがすべての要件を満たしていることを確認する |
+| 新規インストールで root パスワードが見つからない | MySQL 8.0 は初回起動時に一時的な root パスワードをエラーログに記録する — `SELECT @@GLOBAL.log_error;` でログのパスを見つけ、`grep 'temporary password' <path>` を実行する |
+| DELETE の後もホスト `'%'` への権限付与が見える | `mysql.user` を直接変更した後は `FLUSH PRIVILEGES` を実行する |
+
+## 関連項目 {#see-also}
+
+- [MySQL のユーザー管理](/ja/guides/user-management) — ユーザーの作成と最小権限のアクセスの付与
+- [MySQL でのパスワードハッシュ](/ja/guides/password-hashing) — MySQL に保存するアプリケーションレベルの資格情報の保護
+- [MySQL の JWT 認証](/ja/guides/jwt-authentication) — 資格情報の発行とローテーションを ID プロバイダーへ移す

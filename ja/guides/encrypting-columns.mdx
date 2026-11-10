@@ -1,0 +1,141 @@
+---
+title: "MySQL での列の暗号化"
+sidebarTitle: "列の暗号化"
+description: "MySQL で機密性の高い列データを暗号化する方法: MySQL の AES_ENCRYPT が安全でないデフォルトのモードを使う理由、および VillageSQL の encrypt() がそれを自動的に修正する仕組み。"
+keywords: "mysql encrypt column, mysql AES_ENCRYPT secure, mysql column encryption, mysql encrypt PII, mysql aes cbc iv, mysql encrypt decrypt data"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL には `AES_ENCRYPT()` が組み込まれています。問題は、そのデフォルトのモードである `aes-128-ecb` が安全でないことです。ECB 暗号化は決定的です。同じ平文を同じ鍵で暗号化すると、常に同じ暗号文が生成されます。暗号化された列を見た攻撃者は、鍵を知らなくても繰り返される値を見つけられます。VillageSQL の `encrypt()` はランダムな IV を使った CBC モードを自動的に使うため、同一の入力でも毎回異なる出力が生成されます。
+
+## MySQL のデフォルト: ECB モード {#the-mysql-default-ecb-mode}
+
+MySQL の `AES_ENCRYPT(data, key)` は、デフォルトで `aes-128-ecb`（`block_encryption_mode`）です。ECB（Electronic Codebook）は、ランダム性なしに各ブロックを独立して暗号化します。同じ値を持つ 2 つの行は同じ暗号文を生成します。
+
+```sql
+-- These two rows will have identical encrypted values
+INSERT INTO users (email, ssn_enc)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'secretkey')),
+       ('bob@example.com',   AES_ENCRYPT('123-45-6789', 'secretkey'));
+
+-- An attacker can see that Alice and Bob have the same SSN
+-- without knowing the key or the plaintext
+SELECT HEX(ssn_enc) FROM users;
+```
+
+MySQL 8.0 では `block_encryption_mode` を変更して CBC を使えますが、その場合は IV を自分で管理しなければなりません。生成し、暗号文と並べて格納し、毎回 `AES_DECRYPT()` に渡し直す必要があります。
+
+## 標準的な回避策: AES-CBC での手動 IV {#the-standard-workaround-manual-iv-with-aes-cbc}
+
+MySQL で CBC モードを正しく使うには、IV を明示的に格納して渡す必要があります。
+
+```sql
+SET @@block_encryption_mode = 'aes-256-cbc';
+
+-- Must generate and store IV alongside ciphertext
+SET @iv = RANDOM_BYTES(16);
+INSERT INTO users (email, ssn_enc, ssn_iv)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'key', @iv), @iv);
+
+-- Must retrieve IV to decrypt
+SELECT AES_DECRYPT(ssn_enc, 'key', ssn_iv) AS ssn
+FROM users WHERE email = 'alice@example.com';
+```
+
+これは正しいのですが冗長です。すべてのテーブルに追加の IV 列が必要で、暗号化されたデータに触れるすべてのクエリが IV を渡さなければなりません。
+
+## VillageSQL の場合: 自動的な IV 管理 {#with-villagesql-automatic-iv-management}
+
+VillageSQL の `vsql_crypto` 拡張機能は、IV を自動的に処理する `encrypt()` と `decrypt()` を追加します。IV は呼び出しごとに新しく生成され、格納される値の中で暗号文の前に付加されます。`decrypt()` は、利用者が意識しなくてもそれを取り出します。
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+CREATE TABLE users (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    email   VARCHAR(255),
+    ssn_enc VARBINARY(255)   -- IV + ciphertext stored together
+);
+
+SET @key = 'my-32-byte-key-for-aes-256-here!';  -- 32 bytes → AES-256
+
+-- Same plaintext encrypts to different ciphertext every time
+INSERT INTO users (email, ssn_enc) VALUES
+    ('alice@example.com', encrypt('123-45-6789', @key, 'aes-256')),
+    ('bob@example.com',   encrypt('123-45-6789', @key, 'aes-256'));
+
+-- Decrypt in a SELECT
+SELECT email, decrypt(ssn_enc, @key, 'aes-256') AS ssn FROM users;
+```
+
+IV 列も、クエリ内の IV パラメータも不要です。同じ SSN を持つ 2 つの行は異なる暗号文を生成し、パターンの漏洩はありません。
+
+### 鍵のサイズ {#key-sizes}
+
+| 暗号の種類 | 鍵の長さ | 使う場面 |
+|:---|:---|:---|
+| `'aes'` または `'aes-128'` | 16 バイト | 機密性の低いデータ、パフォーマンスが重要なワークロード |
+| `'aes-192'` | 24 バイト | 中程度のセキュリティ |
+| `'aes-256'` | 32 バイト | PII、金融データ、規制対象のあらゆるもの。推奨されるデフォルト |
+
+暗号が必要とする長さより短い鍵は、`ERROR 3200: VDF error in function 'encrypt': key too short for <cipher>: need N bytes, got M` を発生させます。ゼロで埋められることはありません。長い鍵は黙って切り詰められます。ちょうど 16、24、または 32 バイトを使ってください。
+
+### 何を格納するか {#what-to-store}
+
+`VARBINARY` 列は、暗号文と、その前に付加された IV（16 バイト）を保持します。PKCS7 パディングは、平文の長さがすでに 16 のちょうど倍数であるとき、常に完全な AES ブロック 1 つ分（16 バイト）を追加します。パディングが 0 バイトになることはありません。したがって安全な計算式は、平文の長さ + 合計 32 バイト（IV に 16、パディングに最大 16）です。余裕を持って列のサイズを決めてください。
+
+```sql
+-- For strings up to ~200 chars: VARBINARY(255) is sufficient
+-- For longer text: VARBINARY(500) or BLOB
+ssn_enc   VARBINARY(64),    -- SSNs, short codes
+addr_enc  VARBINARY(512),   -- Addresses, longer strings
+notes_enc BLOB              -- Free-form text
+```
+
+## これがカバーしないもの {#what-this-doesnt-cover}
+
+SQL での列レベルの暗号化は、データベースへのアクセス権はあるが鍵を持たない人物から、保存されているデータを保護します。次のものからは保護しません。
+
+- 鍵を保持し、復号したデータをクエリするアプリケーションコード。アプリを侵害した攻撃者は両方を手に入れます
+- 暗号化された列でフィルタまたはソートするクエリ（復号せずに `WHERE ssn = ?` はできません）
+
+検索可能な暗号化や、エンベロープ鍵管理（すべてのデータを再暗号化せずに鍵をローテーションする）には、アプリケーション層に追加の基盤が必要です。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 暗号鍵はどこに保管すべきですか? {#where-should-i-store-the-encryption-key}
+
+データベースの中ではありません。鍵は、シークレットマネージャ（AWS Secrets Manager、HashiCorp Vault、GCP Secret Manager）または環境変数に置き、アプリケーションが実行時に読み込みます。暗号化対象と同じデータベースに保管された鍵は、何の保護にもなりません。
+
+#### 暗号化された列を検索できますか? {#can-i-search-on-encrypted-columns}
+
+直接はできません。一致を見つけるためにすべての行を復号するのはフルテーブルスキャンです。よくあるパターンは、等価検索のために値の決定的なハッシュを暗号化された列と並べて格納する（SSN 検索のための `sha256(ssn)`）か、アプリケーション層で復号して暗号化された検索インデックスを構築することです。
+
+#### 鍵を失うとどうなりますか? {#what-happens-if-i-lose-the-key}
+
+データは復元できません。鍵はデータベースとは別にバックアップしてください。エンベロープ暗号化（データ鍵をマスター鍵で包む）を検討してください。すべてを再暗号化せずにマスター鍵をローテーションできます。
+
+#### DEFAULT 式で列を暗号化できますか? {#can-i-encrypt-a-column-with-a-default-expression}
+
+現在はできません。非決定的な関数（ランダムな IV のため、`encrypt()` はそうです）は DEFAULT 式で使えません。暗号化された値は各 INSERT で生成してください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.encrypt does not exist` | `INSTALL EXTENSION vsql_crypto` を実行します |
+| `decrypt()` が NULL を返す | 暗号文が壊れているか、鍵が誤っているか、暗号の種類の指定が誤っています |
+| 同じ平文に対して暗号化された値が同一になる | ECB モードの MySQL の `AES_ENCRYPT` を使っています。`encrypt()` に切り替えます |
+| 暗号文に対して列が小さすぎる | VARBINARY のサイズに 32 バイトを追加します（IV に 16 + パディングに最大 16） |
+| 鍵の長さが誤っている | AES-128 は 16 バイト、AES-192 は 24 バイト、AES-256 は 32 バイトが必要です。`LENGTH(@key)` を確認します |
+
+## 関連項目 {#see-also}
+
+- [MySQL での対称暗号化](/ja/guides/symmetric-encryption) — この背後にある暗号化アルゴリズムと鍵管理
+- [MySQL でのパスワードのハッシュ化](/ja/guides/password-hashing) — 資格情報には、暗号化よりハッシュ化のほうが適しています
+- [MySQL でのデータのハッシュ化](/ja/guides/hashing-data) — 復号が不要な場合の一方向のフィンガープリント

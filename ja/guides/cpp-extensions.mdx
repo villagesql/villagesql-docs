@@ -1,0 +1,184 @@
+---
+title: "C++ 拡張機能の作成"
+sidebarTitle: "C++ 拡張機能の作成"
+description: "VillageSQL の拡張機能を C++ で書く方法: C++ を選ぶべき場合、CMake の設定、型付きラッパー、ビルド、およびテスト。"
+keywords: "villagesql extension c++, vef sdk, vdf c++, custom sql function c++, vsql extension template"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+VillageSQL の拡張機能は、サーバーが実行時にロードする共有ライブラリです。VEF SDK は型付きの C++ ラッパーを提供するため、生の FFI に触れることなく拡張機能の関数を書けます。このガイドでは、最小限の拡張機能をゼロから構築する手順を説明します。
+
+## C++ を選ぶべき場合 {#when-to-choose-c}
+
+次の場合は C++ が適切な選択です。
+
+- チームにすでに C++ のコードベースがあり、拡張機能も同じ言語で保守したい
+- 正確なバイナリレイアウトを持つカスタム型が必要である（C++ の型ビルダーは最も完全な API です）
+- SQL 関数として公開したい既存の C++ ライブラリを使って作業している
+
+Rust のほうが好みで、C++ 固有の要件がない場合は、[Rust 拡張機能の作成](/ja/guides/rust-extensions)を参照してください。
+
+## 前提条件 {#prerequisites}
+
+拡張機能のコードを書く前に、VillageSQL のビルドが必要です。拡張機能はサーバーの SDK ヘッダーとビルドツリーに対してリンクされます。
+
+次のものも必要です。
+
+- **C++17 コンパイラ** — GCC 8 以降、Clang 8 以降、または MSVC 2019 以降
+- **CMake 3.18 以降** — 拡張機能テンプレートは CMake を使用します
+
+サーバーをまだビルドしていない場合は、先に[ソースからのビルド](/ja/8.4/stable/source)ガイドに従ってください。
+
+## CMake の設定 {#cmake-setup}
+
+最も早く始める方法は、[vsql-extension-template](https://github.com/villagesql/vsql-extension-template) を使うことです。フォークするか、クローンします。
+
+```bash
+git clone https://github.com/villagesql/vsql-extension-template my-extension
+cd my-extension
+```
+
+テンプレートの `CMakeLists.txt` が VEF のビルド設定を処理します。CMake をゼロから書くのではなく、テンプレートをコピーして適応させてください。`-DVillageSQL_BUILD_DIR` でビルドディレクトリを設定します。
+
+```bash
+mkdir build && cd build
+cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+make
+```
+
+`-DVillageSQL_BUILD_DIR` は、SDK ヘッダーを見つけられるように、VillageSQL のビルドがどこにあるかを CMake に伝えます。これにより、ビルド出力に `.veb` ファイルが生成されます。CMake 設定の全体については、[拡張機能の作成](/ja/extensions/build/create)と [vsql-extension-template](https://github.com/villagesql/vsql-extension-template) を参照してください。
+
+## C++ での最小限の VDF {#a-minimal-vdf-in-c}
+
+VEF SDK ヘッダーをインクルードし、ビルダー API を使って関数を登録します。文字列を反転する関数を実装した完全な拡張機能を次に示します。
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+void my_reverse_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();   // std::string_view
+    auto buf = out.buffer();   // Span<char>
+
+    if (sv.size() > buf.size()) {
+        out.error("my_reverse: input exceeds buffer size");
+        return;
+    }
+
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = sv[sv.size() - 1 - i];
+    }
+    out.set_length(sv.size());
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&my_reverse_impl>("my_reverse")
+            .returns(STRING)
+            .param(STRING)
+            .build())
+)
+```
+
+注目すべき点がいくつかあります。
+
+- `<villagesql/extension.h>`（古い V1 ヘッダー）ではなく、`<villagesql/vsql.h>` をインクルードします
+- 型付きの引数ラッパー（`StringArg`、`IntArg`、`RealArg`）は NULL をチェックし、型付きの値を公開します。生のポインタ演算は不要です
+- `out.set_null()`、`out.warning(msg)`、および `out.error(msg)` が、成功以外の 3 つの戻り方です
+- `VEF_GENERATE_ENTRY_POINTS` は、生の構造体ではなく `make_extension()` ビルダーを受け取ります
+
+整数または実数を返す関数の場合:
+
+```cpp
+void count_vowels_impl(StringArg input, IntResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    long long count = 0;
+    for (char c : input.value()) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    out.set(count);
+}
+```
+
+関数を決定的（同じ入力が常に同じ出力を生成する）と宣言するには、ビルダーチェーンに `.deterministic()` を追加します。
+
+```cpp
+.func(make_func<&my_reverse_impl>("my_reverse")
+    .returns(STRING)
+    .param(STRING)
+    .deterministic()
+    .build())
+```
+
+決定的な関数は、生成列と関数インデックスで使用できます。`.deterministic()` は、それが実際に真である場合にのみ追加してください。
+
+## ビルド {#building}
+
+上の「CMake の設定」セクションの cmake configure ステップの後、ビルドしてインストールします。
+
+```bash
+make
+make install
+```
+
+`make install` は `.veb` ファイルを VillageSQL の拡張機能ディレクトリにコピーします。
+
+## インストールとテスト {#installing-and-testing}
+
+VillageSQL に接続し、拡張機能をインストールします。
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+ロードされたことを確認します。
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+関数を呼び出します。
+
+```sql
+SELECT my_reverse('Hello, World!');
+-- → !dlroW ,olleH
+```
+
+自動テストには、`mysql-test/t/` に MySQL Test Framework のスイートを書きます。
+
+```sql
+-- mysql-test/t/basic.test
+INSTALL EXTENSION my_extension;
+SELECT my_reverse('abc');
+SELECT my_reverse('');
+SELECT my_reverse(NULL);
+UNINSTALL EXTENSION my_extension;
+```
+
+期待される結果を生成して実行します。
+
+```bash
+cd /path/to/villagesql/build/mysql-test
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test --record
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test
+```
+
+## 関連項目 {#see-also}
+
+- [拡張機能の作成](/ja/extensions/build/create) — C++ SDK の完全なリファレンス: 型付きラッパー、カスタム型、集約、システム変数
+- [拡張機能 API リファレンス](/ja/sdk/cpp/extension-api-reference) — VDF の契約、NULL の処理、バッファサイズ、エラーのセマンティクス
+- [Rust 拡張機能の作成](/ja/guides/rust-extensions) — 同じ作業を Rust で行う方法

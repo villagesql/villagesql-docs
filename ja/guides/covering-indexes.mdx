@@ -1,0 +1,133 @@
+---
+title: "MySQL のカバリングインデックス"
+sidebarTitle: "カバリングインデックスの使用"
+description: "MySQL のカバリングインデックスとは何か、どのように行の検索をなくすのか、そして最も重要なクエリのためにどう設計するか。"
+keywords: "mysql covering index, mysql using index, mysql index only scan, mysql composite index performance, mysql explain using index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+カバリングインデックスとは、クエリが必要とするすべての列を含むインデックスです。まずインデックスの基本的な仕組みを理解しておくと役立ちます。[MySQL のインデックスの仕組み](/ja/guides/mysql-indexes)では、ここにも当てはまる B ツリー構造、キー長、および選択性のルールを説明しています。MySQL が実際のテーブルの行に触れずに、インデックスだけでクエリに答えられる場合、これをインデックスオンリースキャンと呼びます。大きなテーブルでは、これは単一クエリに対して使える最大級の最適化の 1 つです。
+
+## 行の検索の仕組み（とそれが高コストな理由） {#how-row-lookups-work-and-why-theyre-expensive}
+
+通常のインデックス検索は 2 つのステップからなります。
+
+1. MySQL はインデックスを検索して、どの行が一致するかを見つける
+2. 一致する各行について、MySQL はテーブルから完全な行を取得する（「行の検索」または「テーブルへの戻り検索」）
+
+ステップ 2 が高コストな部分です。InnoDB のクラスタ化インデックスでは、テーブルのデータは主キーで物理的にソートされています。セカンダリインデックスで行を検索すると、主キーの値は散らばっているため、各行の検索は別のディスクページに対するランダム I/O になる可能性が高くなります。規模が大きくなると、これらのランダム読み取りがクエリ時間を支配します。
+
+カバリングインデックスは、ステップ 2 を完全になくします。
+
+## EXPLAIN でカバリングインデックスを見分ける {#identifying-a-covering-index-in-explain}
+
+`EXPLAIN` は、カバリングインデックスが使われているときにそれを教えてくれます。`Extra: Using index` を探してください。EXPLAIN の出力にまだ慣れていない場合は、[MySQL の EXPLAIN の読み方](/ja/guides/reading-explain)で主要な列をすべて説明しています。
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+CREATE INDEX idx_user_status_created ON orders (user_id, status, created_at);
+
+-- All three columns in the SELECT are in the index
+EXPLAIN SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------------+
+| type  | key                       | rows | Extra       |
++-------+---------------------------+------+-------------+
+| ref   | idx_user_status_created   |   12 | Using index |
++-------+---------------------------+------+-------------+
+```
+
+`Using index` — MySQL はインデックスだけを読みました。行の検索はありません。
+
+次に、インデックスに含まれない列を追加します。
+
+```sql
+-- order_total is not in the index
+EXPLAIN SELECT user_id, status, created_at, order_total FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------+
+| type  | key                       | rows | Extra |
++-------+---------------------------+------+-------+
+| ref   | idx_user_status_created   |   12 | NULL  |
++-------+---------------------------+------+-------+
+```
+
+`Extra` が空になりました。MySQL はインデックスを使って行を見つけ、次に `order_total` を得るために完全な行を取得します。行の検索が戻ってきました。
+
+## カバリングインデックスの設計 {#designing-a-covering-index}
+
+目標は、クエリが触れるすべての列（`WHERE`、`ORDER BY`、`GROUP BY`、および `SELECT` リスト内の列）を含めることです。列の順序は、`WHERE` と `ORDER BY` のフィルタリングについては引き続き左端プレフィックスのルールに従います。
+
+```sql
+-- Query pattern:
+SELECT status, created_at FROM orders
+WHERE user_id = 42
+ORDER BY created_at;
+
+-- Covering index: equality column first, then sort column, then SELECT columns
+CREATE INDEX idx_covering ON orders (user_id, created_at, status);
+```
+
+- `user_id` が最初 — 等価フィルタ
+- `created_at` が 2 番目 — ソート列（インデックスはすでに並んでいるため、filesort は不要）
+- `status` が最後 — `SELECT` にだけ含まれ、フィルタリングにもソートにも使われない
+
+`SELECT` の列が最後に来るのは、それらがどの行が見つかるか、どの順序になるかに影響しないためです。ただ同乗しているだけです。
+
+## カバリングインデックスが価値を持つ場面 {#when-covering-indexes-are-worth-it}
+
+| シナリオ | 価値があるか? |
+|:---------|:----------|
+| 大きなテーブルに対する高トラフィックのクエリ | はい |
+| 狭い `SELECT` リスト（少数の列） | はい |
+| 読み取り中心のワークロード | はい |
+| 小さなテーブル | いいえ — 行の検索はどのみち速い |
+| `SELECT *` のクエリ | いいえ — テーブル全体をインデックス化しない限り、すべての列をカバーできない |
+| 書き込み中心のテーブル | 要評価 — すべての `INSERT`/`UPDATE`/`DELETE` がインデックスを更新する |
+
+```sql
+-- Not a candidate: SELECT * means no index can cover this
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Good candidate: narrow SELECT, high-traffic query
+SELECT id, status FROM orders WHERE user_id = 42 AND created_at > '2024-01-01';
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### カバリングインデックスは `SELECT *` に役立ちますか? {#does-a-covering-index-help-with-select-}
+いいえ。インデックスがクエリをカバーできるのは、`SELECT` リストのすべての列を含む場合だけです。`SELECT *` はすべての列を選択するため、すべての列をインデックス化する必要があります。その時点で、テーブルをインデックスとして実質的に複製したことになり、有用ではありません。
+
+#### それでもカバリングインデックスは `SELECT *` のクエリを速くできますか? {#can-a-covering-index-still-speed-up-select--queries}
+はい、部分的には。MySQL が行の検索を行わなければならない場合でも、インデックスは取得する行を絞り込みます。改善は `WHERE` のフィルタリングから来るもので、行の検索をなくすことから来るものではありません。
+
+#### カバリングインデックスが役立つかどうかはどう判断しますか? {#how-do-i-know-if-a-covering-index-would-help}
+`EXPLAIN` を実行して `Extra` を確認します。`Using index condition` が表示されるか、何も表示されず（`Using index` がなく）、`rows` が大きい場合、カバリングインデックスが役立つかもしれません。`EXPLAIN ANALYZE` は実際の行数と推定の行数を表示するため、オプティマイザの選択を確認するのに役立ちます。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `Extra` に `Using index` ではなく何も表示されない | `SELECT` 内の列がインデックスに含まれていません。追加するか、クエリから取り除きます |
+| `Extra: Using index` ではなく `Extra: Using index condition` | インデックスはフィルタリングに使われていますが、完全にはカバーしていません。残りの `SELECT` の列を追加します |
+| インデックスはあるが `key` が `NULL` | `ANALYZE TABLE` を実行して統計を更新します。クエリの `WHERE` がインデックスの左端の列を使っているか確認します |
+| カバリングインデックスが書き込みを遅くしている | 想定されるトレードオフです。ワークロードについて、読み取りの利点が書き込みのコストを上回るかどうかを評価します |
+
+## 関連項目 {#see-also}
+
+- [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes) — カバリングインデックスの基礎となる B ツリーの基本
+- [MySQL の EXPLAIN の読み方](/ja/guides/reading-explain) — EXPLAIN の出力で `Using index` を確認する方法
+- [InnoDB のデータ格納の仕組み](/ja/guides/innodb-storage) — 行の検索が高コストである理由と、カバリングがそれを避ける理由

@@ -1,0 +1,149 @@
+---
+title: "MySQL でのトライグラム類似度検索"
+sidebarTitle: "トライグラム類似度"
+description: "VillageSQL の vsql_trgm 拡張機能を使って MySQL で類似した文字列を見つける方法 — トライグラムモデルに基づく類似度スコアリング、あいまい一致、および単語レベルの類似度。"
+keywords: "mysql trigram similarity, mysql fuzzy search, mysql similar strings, mysql pg_trgm, vsql_trgm, mysql text similarity"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  このガイドには VillageSQL 0.0.4 以降が必要です。
+</Note>
+
+MySQL の組み込み文字列関数 — `LIKE`、`SOUNDEX`、`LEVENSHTEIN` — は基本的な一致をカバーしますが、並べ替えやしきい値の判定に使える連続的な類似度スコアを与えるものはありません。VillageSQL の `vsql_trgm` 拡張機能はトライグラムに基づく類似度を追加します。2 つの文字列がどれだけ似ているかを測る 0 から 1 の間の数値で、1 つのクエリで結果をランク付けし、類似度で絞り込めます。
+
+## トライグラムの仕組み {#how-trigrams-work}
+
+トライグラムは連続する 3 文字のグループです。`vsql_trgm` は入力を小文字にし、英数字以外の文字で分割し、各単語の先頭に 2 つ、末尾に 1 つの空白を付けてから、パディングされた各単語の上で 3 文字の窓をスライドさせます。類似度は、2 つの入力が共有するトライグラムの数を、両方にわたる異なるトライグラムの数 — 大きいほうの集合のサイズではなく、和集合のサイズ — で割ったものです。
+
+```
+"cat" → pad to "  cat " → ["  c", " ca", "cat", "at "]
+"car" → pad to "  car " → ["  c", " ca", "car", "ar "]
+shared: 2, union: 4 + 4 − 2 = 6 → similarity 0.333
+```
+
+複数単語の文字列について知っておくべきことが 2 つあります。処理の前に**小文字化**されるので、`"Cat"` と `"cat"` は同じトライグラムを生成します。また**英数字以外の文字で分割**されるので、各単語は独立してパディングされトライグラム化されます。`"hello world"` は、1 つのパディングされた文字列からではなく、`"  hello "` と `"  world "` から別々にトライグラムを生成します。`"o w"` や `" wo"` というトライグラムはありません。
+
+類似度は 0(共通点なし)から 1(同一)の範囲です。
+
+## はじめに {#getting-started}
+
+```sql
+INSTALL EXTENSION vsql_trgm;
+```
+
+## 主要な関数 {#core-functions}
+
+### trgm_similarity — 連続的なスコア {#trgm_similarity--continuous-score}
+
+```sql
+SELECT vsql_trgm.trgm_similarity('adidas', 'adidos');   -- 0.4
+SELECT vsql_trgm.trgm_similarity('cat', 'dog');          -- 0
+SELECT vsql_trgm.trgm_similarity('mysql', 'mysql');      -- 1
+```
+
+すべての関数は、いずれかの引数が NULL のとき NULL を返します。
+
+### trgm_similar — しきい値の判定 {#trgm_similar--threshold-check}
+
+類似度が 0.3(PostgreSQL のデフォルト)以上なら 1、そうでなければ 0 を返します。
+
+```sql
+SELECT vsql_trgm.trgm_similar('cat', 'car');   -- 1
+SELECT vsql_trgm.trgm_similar('cat', 'dog');   -- 0
+```
+
+独自のしきい値を使う場合は次のようにします。
+
+```sql
+SELECT vsql_trgm.trgm_similar_threshold('cat', 'car', 0.6);  -- 0
+SELECT vsql_trgm.trgm_similar_threshold('cat', 'car', 0.3);  -- 1
+```
+
+### trgm_distance — 類似度の補数 {#trgm_distance--complement-of-similarity}
+
+`1 - similarity` です。最も近いものを先頭にしたい ORDER BY に便利です。
+
+```sql
+SELECT vsql_trgm.trgm_distance('mysql', 'mysqk');  -- 0.5
+```
+
+## テーブル内の近似一致の検索 {#finding-near-matches-in-a-table}
+
+最も一般的な用途は、検索語に似た行を見つけることです。
+
+```sql
+SELECT
+    name,
+    vsql_trgm.trgm_similarity(name, 'adidas') AS score
+FROM products
+WHERE vsql_trgm.trgm_similarity(name, 'adidas') > 0.3
+ORDER BY score DESC
+LIMIT 10;
+```
+
+これはタイプミス、別の綴り、部分一致 — `LIKE '%adidas%'` では取りこぼすケース — を扱えます。
+
+## 単語の類似度 {#word-similarity}
+
+`trgm_word_similarity` は、クエリ文字列と、対象の任意の連続した部分文字列との間の最良の一致を見つけます。検索語がより長い文字列の中の 1 単語かもしれない場合に便利です。
+
+```sql
+-- Find products whose name contains something close to "widget"
+SELECT name, vsql_trgm.trgm_word_similarity('widget', name) AS score
+FROM products
+WHERE vsql_trgm.trgm_word_similar('widget', name) = 1
+ORDER BY score DESC;
+```
+
+`trgm_strict_word_similarity` は、一致が単語境界に揃うことを要求する、より厳格な変種です。
+
+| 関数 | しきい値 |
+|---|---|
+| `trgm_word_similar(a, b)` | 0.6 |
+| `trgm_strict_word_similar(a, b)` | 0.5 |
+
+## トライグラムの確認 {#inspecting-trigrams}
+
+`trgm_show` は、文字列のソートされたトライグラム集合を JSON 配列として返します。
+
+```sql
+SELECT vsql_trgm.trgm_show('cat');
+-- '["  c"," ca","at ","cat"]'
+```
+
+これは、2 つの文字列がなぜそのスコアになるのかをデバッグするのに便利です。
+
+## 関数リファレンス {#function-reference}
+
+| 関数 | 戻り値 | 備考 |
+|---|---|---|
+| `trgm_similarity(a, b)` | REAL | 0〜1 の類似度スコア |
+| `trgm_distance(a, b)` | REAL | 1 − similarity |
+| `trgm_similar(a, b)` | INT | similarity ≥ 0.3 なら 1 |
+| `trgm_similar_threshold(a, b, t)` | INT | similarity ≥ t なら 1 |
+| `trgm_word_similarity(a, b)` | REAL | 最良の部分文字列一致スコア |
+| `trgm_word_distance(a, b)` | REAL | 1 − word_similarity |
+| `trgm_word_similar(a, b)` | INT | word_similarity ≥ 0.6 なら 1 |
+| `trgm_strict_word_similarity(a, b)` | REAL | 単語境界に揃えたスコア |
+| `trgm_strict_word_distance(a, b)` | REAL | 1 − strict_word_similarity |
+| `trgm_strict_word_similar(a, b)` | INT | strict_word_similarity ≥ 0.5 なら 1 |
+| `trgm_show(text)` | TEXT | トライグラムの JSON 配列 |
+
+## 既知の制限 {#known-limitations}
+
+**インデックスによる高速化はありません。** カスタムインデックス型のプレビュー機能は拡張機能 SDK に含まれていますが、それを付与する DDL はすべてのビルドで拒否される(`ERROR 3219: Extended Index feature not yet implemented`)ので、`WHERE trgm_similarity(col, 'term') > 0.3` はフルテーブルスキャンを必要とします。大きなテーブルでは、`LIKE` または全文検索で事前に絞り込んで候補集合を減らし、その後 `trgm_similarity` で再スコアリングしてください。
+
+**セッションレベルのしきい値はありません。** PostgreSQL の `set_limit()` / `show_limit()` は VEF では実装できません(VEF の関数はステートレスです)。`trgm_similar_threshold(a, b, t)` を使ってしきい値を明示的に渡してください。
+
+**配列の戻り値はありません。** `trgm_show` はネイティブの配列型ではなく JSON 文字列を返します。
+
+## 関連項目 {#see-also}
+
+- [MySQL で全文検索を実装する方法](/ja/guides/full-text-search)
+- [MySQL で名前を音声的に、また編集距離で一致させる方法](/ja/guides/fuzzy-string-matching)
+- [SQL で文字列を操作および変換する方法](/ja/guides/string-functions)
+- [MySQL で LIKE を使ってパターンに一致させる方法](/ja/tutorial/like)

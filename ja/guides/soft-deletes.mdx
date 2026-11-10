@@ -1,0 +1,98 @@
+---
+title: "MySQL のソフトデリート"
+sidebarTitle: "ソフトデリート"
+description: "deleted_at 列でソフトデリートを実装する方法、ソフトデリートされた行に対して一意制約を機能させ続ける方法、およびハードデリートのほうが適切な場合の判断。"
+keywords: "mysql soft delete, deleted_at column, soft delete unique constraint, mysql logical delete, restore deleted rows mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ソフトデリートは、行を削除する代わりに削除済みとしてマークします。行はテーブルに残り、アプリケーションからは見えず、1 つのステートメントで復元できます。「ユーザーが何かを削除して、元に戻したがっている」に対する標準的な答えですが、採用する前に理解しておくべき 2 つの問題を生みます。すべてのクエリがフィルタを忘れてはならないこと、そして一意制約が思っている意味を持たなくなることです。
+
+## 基本パターン {#the-basic-pattern}
+
+NULL 許容のタイムスタンプを追加します。`NULL` は有効、タイムスタンプは削除済みを意味し、いつ削除されたかを記録します。
+
+```sql
+CREATE TABLE customers (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  name VARCHAR(100),
+  deleted_at TIMESTAMP NULL DEFAULT NULL
+);
+
+-- Delete
+UPDATE customers SET deleted_at = NOW() WHERE id = 42;
+
+-- Restore
+UPDATE customers SET deleted_at = NULL WHERE id = 42;
+
+-- Every read now needs the filter
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+`deleted` ブール値よりもタイムスタンプを選んでください。コストは同じで、サポートチケットが必ず尋ねる「いつ」に追加コストなしで答えられます。
+
+## 問題 1: 一意制約 {#problem-1-unique-constraints}
+
+`email` に対する一意インデックスは、再登録を永久にブロックします。ソフトデリートされた行がまだその値を占有しているためです。
+
+```sql
+ALTER TABLE customers ADD UNIQUE KEY uq_email (email);
+UPDATE customers SET deleted_at = NOW() WHERE email = 'a@example.com';
+INSERT INTO customers (email, name) VALUES ('a@example.com', 'Again');
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'a@example.com' for key 'customers.uq_email'
+```
+
+解決策は関数インデックスの手法です。有効な行では一定で、削除済みの行では一意になる列を一意キーに含めます。生成列を使うときれいに実現できます。
+
+```sql
+ALTER TABLE customers DROP KEY uq_email;
+ALTER TABLE customers
+  ADD COLUMN email_live VARCHAR(255)
+    GENERATED ALWAYS AS (IF(deleted_at IS NULL, email, NULL)) VIRTUAL,
+  ADD UNIQUE KEY uq_email_live (email_live);
+```
+
+MySQL の一意インデックスは任意の数の `NULL` を許容するため、削除済みの行が衝突することはなく、同じメールアドレスを持つ 2 つの有効な行は引き続き失敗します。仕組みについては[生成列](/ja/guides/generated-columns)を参照してください。
+
+## 問題 2: すべてのクエリが覚えていなければならない {#problem-2-every-query-must-remember}
+
+`WHERE deleted_at IS NULL` を 1 つ忘れるだけで、削除済みのデータがレポートや API レスポンスに漏れます。緩和策は 2 つあります。
+
+- **有効な行のサブセットのビュー。** 読み取り経路をビューに向ければ、フィルタを忘れることはできません。
+
+```sql
+CREATE VIEW live_customers AS
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+- **ORM のスコープ。** ほとんどの ORM は、フィルタをグローバルに適用できます（Rails の `default_scope`、Django のマネージャー、Prisma のミドルウェア）。すべてのクエリを監査する代わりに、1 か所で有効にします。
+
+外部キーにも検討が必要です。ソフトデリートされた親はまだ存在するため、`ON DELETE CASCADE` は決して発火しません。子が親と一緒に消えるべきなら、アプリケーション（またはトリガー）が自ら `deleted_at` をカスケードしなければなりません。
+
+## ソフトデリートすべきでない場合 {#when-not-to-soft-delete}
+
+- **規制上の消去。** GDPR の削除要求は、データが隠されるのではなく消えることを意味します。ソフトデリートされた行も個人データとして数えられます。
+- **入れ替わりの激しいテーブル。** セッション、キューのジョブ、ログなど数百万件単位で削除されるものは、テーブルとそのすべてのインデックスを肥大化させるだけです。
+- **誰も復元しないデータ。** 元に戻すユースケースがなければ、フィルタの負担は何ももたらしません。
+
+よくある中間策: ユーザーの操作ではソフトデリートし、その後スケジュールされたジョブが、`deleted_at` が保持期間より古い行をハードデリートします。
+
+```sql
+DELETE FROM customers
+WHERE deleted_at IS NOT NULL
+  AND deleted_at < NOW() - INTERVAL 90 DAY;
+```
+
+## 関連項目 {#see-also}
+
+- [生成列](/ja/guides/generated-columns) — 一意制約の修正の背後にある仕組み
+- [ビュー](/ja/guides/views) — フィルタを忘れることのできない有効行のビュー
+- [外部キー](/ja/guides/foreign-keys) — ソフトデリートでカスケードが発火しない理由
+- [MySQL の DELETE](/ja/tutorial/delete) — このパターンが置き換えるハードデリート

@@ -1,0 +1,107 @@
+---
+title: "ORM で MySQL を使う: Django、Rails、Prisma"
+sidebarTitle: "ORM で MySQL を使う"
+description: "Django、Rails、Prisma を MySQL 向けに正しく設定する: 文字セットと厳格モードの設定、N+1 問題、そして生の SQL に切り替えるべきとき。"
+keywords: "django mysql settings, rails mysql config, prisma mysql, orm n+1 queries, mysql strict mode orm, activerecord mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ほとんどのアプリケーションは実際には ORM を通じて MySQL と通信しており、ORM の問題の大半は、ひと握りの設定行と 1 つのクエリパターンにたどり着きます。このガイドでは、Django、Rails、Prisma の MySQL 側の設定と、ORM が生成する SQL を製品の遅い部分にしないための習慣を扱います。VillageSQL は MySQL のドロップイン代替なので、ここにある設定はすべて変更なしで VillageSQL でも動作します。ORM には違いが分かりません。
+
+## どこでも重要な設定 {#the-settings-that-matter-everywhere}
+
+フレームワークが何であれ、3 つのことが成り立っていなければなりません。
+
+- **接続が `utf8mb4` を使っている**こと。そうでないと絵文字が転送中に壊れます。[utf8mb4 と絵文字](/ja/guides/utf8mb4)を参照してください。
+- **厳格 SQL モードがオンである**こと (MySQL 8.x のデフォルトです)。不正なデータが黙って切り捨てられる代わりにエラーになります。
+- **プールサイズが意図的に決められている**こと。どのフレームワークもプロセスごとにプールを開きます。数値を選ぶ前にプロセス数を掛けてください。[コネクションプーリング](/ja/guides/connection-pooling)を参照してください。
+
+## Django {#django}
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.mysql",
+        "NAME": "myapp",
+        "USER": "app",
+        "PASSWORD": environ["DB_PASSWORD"],
+        "HOST": "127.0.0.1",
+        "PORT": "3306",
+        "OPTIONS": {
+            "charset": "utf8mb4",
+            "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
+    }
+}
+```
+
+Django 固有の注意点:
+
+- Django のドキュメントが推奨する、保守されている C ドライバーの `mysqlclient` を使ってください。
+- Django は一部の制約を Python でエミュレートします。実際のデータベース制約も追加してください (`unique=True` は実際の一意インデックスになりますが、チェック制約には `Meta` の `CheckConstraint` が必要です)。
+- `select_related()` (JOIN) と `prefetch_related()` (2 番目のクエリ) が N+1 のためのツールです。使うべき場面は後述します。
+
+## Rails {#rails}
+
+```yaml
+# config/database.yml
+production:
+  adapter: mysql2
+  database: myapp
+  username: app
+  password: <%= ENV["DB_PASSWORD"] %>
+  host: 127.0.0.1
+  encoding: utf8mb4
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+```
+
+Rails 固有の注意点:
+
+- `database.yml` の `encoding: utf8mb4` は、接続の文字セットと `rails db:create` のデフォルトの両方を設定します。
+- ActiveRecord のバリデーション (`validates_uniqueness_of`) は並行実行で競合します。すべての一意性バリデーションを実際の一意インデックスで裏付け、[1062 重複キーエラー](/ja/guides/common-mysql-errors)を最後の防衛線にしてください。
+- `includes` が N+1 のためのツールです。`strict_loading` モードは遅延読み込みをエラーに変えるため、N+1 は出荷される代わりに開発中に失敗します。
+- Rails 8.1 は `database.yml` に、古いバージョンが `pool` を生成していた場所に `max_connections` を生成します。`pool:` キーは `max_connections` が読むフォールバックとして今も黙って動作します。両方を異なる値に設定すると起動時に例外が発生します。Rails 8 がもはや MySQL をデフォルトにしないために必要な `--database=mysql` フラグを含む完全なアプリについては、[Rails 8 で MySQL を使う](/ja/guides/rails-mysql)を参照してください。
+
+## Prisma {#prisma}
+
+```prisma
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+```
+
+```text
+DATABASE_URL="mysql://app:password@127.0.0.1:3306/myapp?connection_limit=10"
+```
+
+Prisma 固有の注意点:
+
+- Prisma はデフォルトで utf8mb4 を使います。注意すべき設定は URL の `connection_limit` で、デフォルトは低めです。
+- `prisma migrate` はスキーマの差分から DDL を生成します。手書きのマイグレーションと同じように、本番環境に適用する前に生成された SQL を読んでください。[スキーママイグレーション](/ja/guides/schema-migrations)を参照してください。
+- リレーションのクエリは `include` を使います。N+1 の形は、結果をループしてリレーションに 1 つずつアクセスするときに現れます。
+- Prisma 7 は、上の接続 URL を `schema.prisma` から別の設定ファイルへ移し、接続にはドライバーアダプターを必要とします。完全な Prisma 7 アプリについては、[Next.js と Prisma で MySQL を使う](/ja/guides/mysql-with-prisma)を参照してください。
+
+## N+1 問題をまとめて解説 {#the-n1-problem-once}
+
+普遍的な ORM のパフォーマンスバグです。100 件の注文を読み込み、次に各注文の顧客を遅延読み込みすると、ORM は 101 回のクエリを発行します。修正はどのフレームワークでも同じ考え方です。必要なリレーションを前もって宣言し、ORM が 1 回か 2 回のクエリでそれらを取得するようにします (`select_related` / `includes` / `include`)。検出ツールも普遍的です。開発環境でクエリログをオンにして ORM が実際に送っているものを読むか、本番環境で[スロークエリログ](/ja/guides/slow-query-log)を監視してください。
+
+## SQL に切り替えるべきとき {#when-to-drop-to-sql}
+
+ORM は CRUD で元を取り、分析では元を取れません。ウィンドウ関数、CTE、一括 upsert、複数テーブルのレポートクエリは、それを表現しようとするクエリビルダーのチェーンよりも SQL のほうが明快です。どの ORM にも抜け道があります (Django の `raw()`、Rails の `find_by_sql`、Prisma の `$queryRaw`)。それに値する 5 パーセントのクエリにそれを使うのは、敗北ではなく良いエンジニアリングです。これは VillageSQL の拡張機能の関数が ORM アプリケーションに届く方法でもあります。`SELECT UUID_V7()` や `ai_prompt(...)` は、ORM が SQL をそのまま通すだけなので、これらの抜け道のどれを通しても動作します。
+
+## 関連項目 {#see-also}
+
+- [Next.js と Prisma で MySQL を使う](/ja/guides/mysql-with-prisma) — 設定だけでなく、Prisma 7 上の完全なアプリ
+- [Next.js と Drizzle で MySQL を使う](/ja/guides/mysql-with-drizzle) — 上では扱わない、より軽量で SQL ファーストの代替である Drizzle 上の完全なアプリ
+- [Next.js で MySQL を使う](/ja/guides/nextjs-mysql) — ORM を一切使わない接続設定とクエリパターン
+- [Rails 8 で MySQL を使う](/ja/guides/rails-mysql) — Rails 8 が MySQL を選ぶために必要なスキャフォールドのフラグを含む完全なアプリ
+- [Laravel 12 で MySQL を使う](/ja/guides/laravel-mysql) — 上では扱わない、Laravel の Eloquent ORM 上の完全なアプリ
+- [Go と sqlc で MySQL を使う](/ja/guides/go-sqlc-mysql) — ランタイム ORM の代わりに生成された型安全なクエリ
+- [コネクションプーリング](/ja/guides/connection-pooling) — プロセスをまたいだプールのサイズ決定
+- [utf8mb4 と絵文字](/ja/guides/utf8mb4) — 上のすべての設定が設定している文字セット
+- [スロークエリログ](/ja/guides/slow-query-log) — ORM が生成するものを捕まえる
+- [スキーママイグレーション](/ja/guides/schema-migrations) — ORM が生成した DDL を安全に適用する

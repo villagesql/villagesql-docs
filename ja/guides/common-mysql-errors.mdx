@@ -1,0 +1,99 @@
+---
+title: "よくある MySQL のエラーとその修正方法"
+sidebarTitle: "よくあるエラー"
+description: "誰もが遭遇する MySQL のエラーを読み解く: アクセス拒否（1045）、接続できない（2002）、ONLY_FULL_GROUP_BY（1055）、構文エラー（1064）、および重複キー（1062）。"
+keywords: "mysql error 1045 access denied, mysql error 2002 can't connect, only_full_group_by error, mysql error 1055, mysql error 1064, mysql duplicate entry 1062"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL のサポートの質問の大半は、5 つのエラーで占められています。以下では、それぞれをサーバーが出力するとおりに示し、実際の意味と修正方法を説明します。これらはすべて VillageSQL でもまったく同じように動作します。
+
+## ERROR 2002: ソケット経由で接続できない {#error-2002-cant-connect-through-socket}
+
+```text
+ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/tmp/nosuch.sock' (2)
+```
+
+クライアントはサーバーに到達していません。これは認証の問題ではなく接続の問題です。サーバーが実行されていないか、クライアントが誤った場所を探しています。`(2)` は errno 2、「no such file」（そのようなファイルはない）です。
+
+- サーバーが起動していることを確認します: `pgrep mysqld` またはサービスマネージャーを使います。
+- `mysql -h localhost` は Unix ソケットを使います。サーバーが別のソケットパスで待ち受けている場合は、それを渡します: `mysql -S /path/to/mysql.sock`。
+- ソケットの代わりに TCP を強制するには、`-h localhost` ではなく `-h 127.0.0.1` を使います。
+
+## ERROR 1045: アクセス拒否 {#error-1045-access-denied}
+
+```text
+ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)
+```
+
+2002 とは逆です。サーバーには到達しましたが、サーバーが資格情報を拒否しました。メッセージを正確に読んでください。3 つの事実が示されています。
+
+- サーバーがあなたをどの**ユーザー**とみなしているか。
+- どの**ホスト**から接続したか。MySQL のアカウントは `user@host` の組です。`'app'@'localhost'` と `'app'@'%'` は、パスワードも権限も異なる別のアカウントです。
+- **`using password: YES/NO`** — パスワードがそもそも送られたかどうか。`NO` は多くの場合、クライアントが読み取った環境や構成ファイルにパスワードが見つからなかったことを意味します。
+
+修正するには、自分のホストに対してどのアカウントが存在するかを確認し（管理者として `SELECT user, host FROM mysql.user;`）、`ALTER USER` でそのパスワードをリセットします。[ユーザー管理](/ja/guides/user-management)を参照してください。
+
+## ERROR 1055: ONLY_FULL_GROUP_BY {#error-1055-only_full_group_by}
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'myapp.orders.total' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+これを引き起こしたクエリは次のとおりです。
+
+```sql
+SELECT customer_id, total
+FROM orders
+GROUP BY customer_id;
+```
+
+各グループには 1 つの `customer_id` がありますが、`total` の値は多数あり、クエリはどれが欲しいのかを示していません。古い MySQL のバージョンは任意の 1 つを選んでいました。5.7 以降、デフォルトの `ONLY_FULL_GROUP_BY` モードがこれをエラーにします。これは、もともと誤っていたクエリからあなたを守っているのです。本当の修正は 3 つあります。
+
+```sql
+-- Say what you meant with an aggregate
+SELECT customer_id, SUM(total) FROM orders GROUP BY customer_id;
+
+-- Or group by every selected column
+SELECT customer_id, total FROM orders GROUP BY customer_id, total;
+
+-- Or, if any value from the group is genuinely fine, say so explicitly
+SELECT customer_id, ANY_VALUE(total) FROM orders GROUP BY customer_id;
+```
+
+`sql_mode` で `ONLY_FULL_GROUP_BY` を無効にしても動作しますが、それは誤った答えです。エラーを、静かに任意の結果を返す状態に戻してしまいます。`ANY_VALUE()` が何を約束し、何を約束しないかについては、[MySQL の GROUP BY のパフォーマンス](/ja/guides/group-by-having)を参照してください。
+
+## ERROR 1064: 構文エラー {#error-1064-syntax-error}
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'SELEC 1' at line 1
+```
+
+引用された断片は、パーサーが受け入れられなかった最初のトークンから始まります。そのため、実際の誤りは引用の開始位置か、その直前にあります。よくある原因は、キーワードのタイプミス、列リストのカンマの欠落、バッククォートなしで識別子として使われた予約語、またはステートメントの半分を文字列に変えてしまった余分な引用符です。
+
+## ERROR 1062: 重複エントリ {#error-1062-duplicate-entry}
+
+```text
+ERROR 1062 (23000): Duplicate entry '1' for key 'orders.PRIMARY'
+```
+
+ユニーク制約が仕事をしました。メッセージが値とインデックスを示しているため、診断は済んでいます。決めるべきは、その挿入が何を意味すべきかです。
+
+- 行が 2 回存在すべきではない場合: 重複キーの生成元を修正します。
+- 挿入の代わりに既存の行を更新すべき場合: `INSERT ... ON DUPLICATE KEY UPDATE` を使います。[Upsert](/ja/guides/upsert) を参照してください。
+- 挿入を静かにスキップすべき場合: `INSERT IGNORE` を使います。ただし、他のエラーも黙らせてしまうため、控えめに使ってください。
+
+## あらゆる MySQL のエラーの読み方 {#reading-any-mysql-error}
+
+`ERROR <number> (<SQLSTATE>): <message>` というパターンは 3 つのシグナルを運びます。番号は MySQL 固有で、最良の検索キーです。SQLSTATE のクラスは移植性があります。`28000` は認証、`42000` はクエリの問題、`23000` は制約違反、`HY000` は汎用のバケットです。クライアント側のエラー（2002 のような 2xxx）はサーバーに到達していません。サーバー側のエラー（1xxx）は接続が機能していることを意味します。
+
+## 関連項目 {#see-also}
+
+- [ユーザー管理](/ja/guides/user-management) — アクセス拒否エラーの背後にあるアカウントモデル
+- [MySQL の GROUP BY のパフォーマンス](/ja/guides/group-by-having) — ONLY_FULL_GROUP_BY と、それを無効にするのが誤った修正である理由
+- [MySQL GROUP BY](/ja/tutorial/group-by) — この句の書き方に関するチュートリアルのレッスン
+- [Upsert](/ja/guides/upsert) — 重複キーエラーを更新に変える
+- [MySQL チュートリアル用のサーバーをインストールする](/ja/tutorial/install-mysql) — 接続エラーと、それを再現するコマンド

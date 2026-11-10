@@ -1,0 +1,147 @@
+---
+title: "MySQL のスキーマ移行"
+sidebarTitle: "マイグレーションの実行"
+description: "MySQL のスキーマ移行を安全に実行する方法: ALTER TABLE の動作、オンライン DDL、大きなテーブルの移行、および pt-online-schema-change または gh-ost の使い方。"
+keywords: "mysql schema migration, mysql alter table, mysql online ddl, mysql alter table lock, pt-online-schema-change, gh-ost mysql, mysql add column production"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+稼働中の MySQL データベースでのスキーマ変更は、些細なもの（小さなテーブルに NULL 許容の列を追加する）から危険なもの（毎秒 5 万件の書き込みを処理する 500GB のテーブルの列を変更する）まで幅があります。その違いは、MySQL がテーブルをロックするかどうか、そしてどれだけの時間ロックするかです。
+
+## ALTER TABLE の仕組み {#how-alter-table-works}
+
+MySQL の `ALTER TABLE` には、操作とバージョンに応じて 2 つのモードがあります。
+
+**再構築 DDL**（従来の動作）: MySQL は新しいスキーマで新しいテーブルを作成し、すべての行をコピーし、テーブルを入れ替えて、元のテーブルを削除します。その間ずっとテーブルは書き込みに対してロックされます。大きなテーブルでは数分から数時間です。
+
+**オンライン DDL**: 多くの操作は、読み取りも書き込みもブロックせずに実行できます。MySQL はその場で変更を行うか、同時 DML を許可しながらバックグラウンドでテーブルを再構築します。特定の操作がどう動くかを調べるには、`ALGORITHM` 句と `LOCK` 句を明示的に追加します。要求した制約を満たせない場合、MySQL はステートメントを拒否します。
+
+```sql
+-- Fail fast if the operation would require any locking
+ALTER TABLE orders ADD COLUMN notes TEXT, LOCK=NONE;
+```
+
+## オンライン DDL のロックモード {#online-ddl-lock-modes}
+
+`ALGORITHM` 句と `LOCK` 句は、MySQL が変更をどう実行するかを制御します。
+
+| ALGORITHM | 動作 |
+|:----------|:---------|
+| `INSTANT` | メタデータだけを変更する — テーブルの再構築も行の読み取りもない。MySQL 8.0 で一部の操作に利用可能。 |
+| `INPLACE` | 最小限のロックでテーブルをその場で変更する。行は再構築されないことがある。 |
+| `COPY` | 新しいテーブルを作成し、すべての行をコピーする。最も遅い。一部の操作で必須。 |
+
+| LOCK | 動作 |
+|:-----|:---------|
+| `NONE` | ロックなし — 変更中も読み取りと書き込みは通常どおり進む |
+| `SHARED` | 読み取りロック — 読み取りは進み、書き込みはブロックされる |
+| `EXCLUSIVE` | 完全なロック — 読み取りも書き込みもブロックされる |
+
+```sql
+-- Request a specific algorithm; fails if MySQL can't do it that way
+ALTER TABLE orders
+    ADD COLUMN notes TEXT,
+    ALGORITHM=INSTANT;
+
+-- Fail if the operation would require a write lock
+ALTER TABLE orders
+    ADD COLUMN notes TEXT,
+    LOCK=NONE;
+```
+
+## 速いものと遅いもの {#whats-fast-vs-whats-slow}
+
+`ALGORITHM=INSTANT`（MySQL 8.0）を使う操作は、テーブルのサイズに関係なくほぼ瞬時です。
+- 任意の位置への列の追加（MySQL 8.0.29 以降）
+- 仮想生成列の追加/削除
+- 列のデフォルト値の変更
+
+`ALGORITHM=COPY` を必要とする操作は、その間ずっと書き込みをブロックします。
+- 列のデータ型の変更
+- 文字セットの変換
+- （全文インデックスの追加はこれに*含まれません*。`INPLACE` で実行されますが、常に少なくとも `LOCK=SHARED` が必要なため、読み取りは進み、書き込みはブロックされます。`LOCK=NONE` は ERROR 1846 で拒否されます）
+
+ほとんどのインデックス追加は `ALGORITHM=INPLACE, LOCK=NONE` を使います。テーブルの再構築はバックグラウンドで行われ、DML は進みます。100GB のテーブルへのインデックス追加には時間がかかりますが、アプリケーションをブロックしません。
+
+## 本番環境での大きなテーブルの移行 {#large-table-migrations-in-production}
+
+ロックするには大きすぎるテーブルで `ALGORITHM=COPY` を必要とする操作には、外部ツールを使います。
+
+### pt-online-schema-change（Percona Toolkit） {#pt-online-schema-change-percona-toolkit}
+
+```bash
+pt-online-schema-change \
+  --alter "ADD COLUMN notes TEXT" \
+  --execute \
+  D=mydb,t=orders
+```
+
+`pt-osc` はシャドウテーブルを作成し、行をバッチでコピーし、進行中の書き込みをトリガーで複製してから、テーブルを入れ替えます。アプリケーションのダウンタイムはありません。
+
+### gh-ost（GitHub） {#gh-ost-github}
+
+```bash
+gh-ost \
+  --user=root --host=localhost \
+  --database=mydb --table=orders \
+  --alter="ADD COLUMN notes TEXT" \
+  --execute
+```
+
+`gh-ost` はトリガーの代わりにバイナリログを使うため、高い書き込み負荷の下でより信頼性があります。トラフィックの多いテーブルに選ばれるツールです。
+
+どちらのツールも、テーブルに主キーが必要です。
+
+## マイグレーションツールとバージョン管理 {#migration-tools-and-version-control}
+
+スキーマ変更はバージョン管理されたマイグレーションファイルで追跡します。一般的なツールは次のとおりです。
+
+| ツール | 言語 | スタイル |
+|:-----|:---------|:------|
+| Flyway | Java/任意 | SQL ベース。バージョン付きファイル |
+| Liquibase | Java/任意 | XML/YAML/SQL。チェンジセット |
+| golang-migrate | Go | SQL ベース。番号付きファイル |
+| Alembic | Python | Python または SQL。モデルから自動生成 |
+
+各ツールは、どのマイグレーションが実行済みかを追跡するためにデータベース内にマイグレーションテーブルを保持するため、再実行は安全です。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### テーブルをロックせずに列を追加できますか? {#can-i-add-a-column-without-locking-the-table}
+
+NULL 許容の列を任意の位置に追加する操作は `ALGORITHM=INSTANT` を使い、テーブルのサイズに関係なくミリ秒で完了します（MySQL 8.0.29 以降）。そうならない場合は、`ALGORITHM=INPLACE, LOCK=NONE`、または pt-osc か gh-ost を使ってください。
+
+#### ALTER TABLE がテーブルをロックするかどうかはどう確認しますか? {#how-do-i-check-if-an-alter-table-will-lock-my-table}
+
+ステートメントに `ALGORITHM=INPLACE, LOCK=NONE` を追加します。MySQL は可能ならロックせずに実行し、不可能ならエラーを返します。どちらにしても、推測なしに確定的な答えが得られます。
+
+```sql
+-- If this succeeds, the index add won't lock the table
+ALTER TABLE orders ADD INDEX idx_customer (customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+本番環境の大きなテーブルについて確信が持てない場合は、まずテーブルのコピーでテストしてください。
+
+#### マイグレーションはトランザクション内で実行すべきですか? {#should-i-run-migrations-inside-a-transaction}
+
+DDL ステートメント（`ALTER TABLE`、`CREATE INDEX`、`DROP TABLE`）は MySQL で暗黙のコミットを引き起こし、ロールバックできません。`BEGIN`/`COMMIT` ブロックの中で実行しても保護にはなりません。トランザクションのロールバックに頼るのではなく、アプリケーションレベル（二重書き込み、フィーチャーフラグ）でロールバック戦略を計画してください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ALTER TABLE` が本番トラフィックをブロックする | 利用可能なら `ALGORITHM=INSTANT` を使うか、大きなテーブルには pt-osc/gh-ost を使う |
+| `ERROR 1846: ALGORITHM=INSTANT is not supported` | 操作にテーブルの再構築が必要 — `ALGORITHM=INPLACE` またはオンラインツールを使う |
+| pt-osc がトリガーのエラーで失敗する | テーブルにすでにトリガーがある — gh-ost（バイナリログベースでトリガー不要）を使う |
+| マイグレーションが 2 回実行された | マイグレーションツールの追跡テーブルが同期していない — スキーマバージョンのテーブルを確認する |
+| 長時間実行中の ALTER がロックを保持している | `KILL <query_id>` で終了させ、代わりにオンラインツールを使う |
+
+## 関連項目 {#see-also}
+
+- [MySQL のバックアップ戦略](/ja/guides/backup-strategies) — 移行の前には必ずバックアップを取る
+- [MySQL のトランザクション](/ja/guides/transactions) — MySQL でどの移行操作がトランザクショナルか
+- [MySQL のテーブルパーティショニング](/ja/guides/table-partitioning) — パーティショニングの変更もスキーマ移行
+- [ORM で MySQL を使う: Django、Rails、および Prisma](/ja/guides/mysql-with-orms) — ORM が生成した DDL を安全に適用する

@@ -1,0 +1,151 @@
+---
+title: "MySQL の CHECK 制約"
+sidebarTitle: "CHECK 制約の使用"
+description: "MySQL の CHECK 制約の仕組み: 構文、適用の動作、名前付き制約、制約の無効化、および CHECK とトリガーやアプリケーションレベルの検証との比較。"
+keywords: "mysql check constraint, mysql check constraint example, mysql add check constraint, mysql constraint validation, mysql 8 check constraint, mysql create table check, mysql enforce data rules"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL は `CHECK` 制約を適用します。古いバージョンでは構文は受け入れられても黙って無視されていました。この動作は、PostgreSQL から移行する多くの開発者を驚かせました。
+
+## CHECK 制約の定義 {#defining-check-constraints}
+
+`CHECK` 制約は、列と一緒にインラインで追加するか、テーブルレベルの制約として追加します。
+
+```sql
+CREATE TABLE products (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    name     VARCHAR(100) NOT NULL,
+    price    DECIMAL(10,2) NOT NULL,
+    quantity INT NOT NULL,
+
+    -- Inline constraints
+    CONSTRAINT chk_price    CHECK (price > 0),
+    CONSTRAINT chk_quantity CHECK (quantity >= 0)
+);
+```
+
+または、列定義と一緒にインラインで指定します。
+
+```sql
+CREATE TABLE orders (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    status     VARCHAR(20) CHECK (status IN ('pending', 'shipped', 'delivered', 'cancelled')),
+    discount   DECIMAL(5,2) CHECK (discount BETWEEN 0 AND 100)
+);
+```
+
+チェック式が複数の列にまたがる場合は、テーブルレベルの制約が必要です。
+
+```sql
+CREATE TABLE shipments (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    shipped_at   DATE,
+    delivered_at DATE,
+    CONSTRAINT chk_dates CHECK (delivered_at IS NULL OR delivered_at >= shipped_at)
+);
+```
+
+## 適用 {#enforcement}
+
+MySQL は `INSERT` と `UPDATE` で `CHECK` 制約を適用します。違反すると `ERROR 3819 (HY000): Check constraint 'name' is violated.` が返されます。
+
+```sql
+INSERT INTO products (name, price, quantity) VALUES ('Widget', -5.00, 10);
+-- ERROR 3819 (HY000): Check constraint 'chk_price' is violated.
+```
+
+エラーメッセージには制約名が含まれます。これが、制約に名前を付ける手間をかける価値がある理由です。
+
+`CHECK` 制約は `DELETE` では評価**されません**。また、既存のテーブルに制約自体を追加するときに再評価されることもありません。制約に違反する既存データを持つテーブルに制約を追加すると、すぐに失敗します。
+
+## 制約の追加と削除 {#adding-and-removing-constraints}
+
+既存のテーブルに制約を追加します。
+
+```sql
+ALTER TABLE products
+ADD CONSTRAINT chk_name_length CHECK (CHAR_LENGTH(name) >= 2);
+```
+
+名前付き制約を削除します。
+
+```sql
+ALTER TABLE products DROP CHECK chk_price;
+-- or the SQL standard syntax:
+ALTER TABLE products DROP CONSTRAINT chk_price;
+```
+
+テーブルのすべての制約を一覧表示します。
+
+```sql
+SELECT cc.constraint_name, cc.check_clause
+FROM information_schema.check_constraints cc
+JOIN information_schema.table_constraints tc
+    ON tc.constraint_schema = cc.constraint_schema
+   AND tc.constraint_name   = cc.constraint_name
+WHERE cc.constraint_schema = DATABASE()
+  AND tc.table_name = 'products';
+```
+
+## 適用の無効化 {#disabling-enforcement}
+
+特定の制約を削除せずに無効にします。
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price NOT ENFORCED;
+```
+
+再度有効にします。
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price ENFORCED;
+```
+
+`NOT ENFORCED` は、検証を一時的に回避する必要があるデータ移行の際に役立ちます。移行が完了したら、適用を再度有効にしてください。
+
+## CHECK、トリガー、アプリケーション検証の比較 {#check-vs-triggers-vs-application-validation}
+
+| | CHECK 制約 | トリガー | アプリケーションコード |
+|:--|:----------------|:--------|:-----------------|
+| 適用する主体 | MySQL（常に） | MySQL（常に） | アプリケーション（アプリの実行時のみ） |
+| パフォーマンス | 非常に低いオーバーヘッド | 行ごとの実行オーバーヘッド | ラウンドトリップのコスト |
+| エラーの可視性 | 制約名付きの SQL エラー | エラーを表面化するには SIGNAL が必要 | アプリケーションが定義 |
+| 列をまたぐチェック | 可 | 可 | 可 |
+| テーブルをまたぐチェック | 不可 | 可（他のテーブルを照会できる） | 可 |
+| 複雑さ | 単純な式のみ | 任意の SQL ロジック | 任意のコード |
+
+有効な範囲、許可される値、非負の数値、日付の順序といった、単純で自己完結したルールには `CHECK` を使用します。ルールが他のテーブルの照会を必要とする場合はトリガーを使用します。外部の状態（レート制限、利用可否の確認）に関わるルールにはアプリケーション検証を使用します。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### CHECK 制約はすべてのストレージエンジンで動作しますか？
+
+はい。一部の MySQL 機能とは異なり、`CHECK` 制約は InnoDB、MyISAM、およびその他のストレージエンジンで動作します。ただし、MyISAM テーブルでは構文的に有効な制約を定義できますが、このストレージエンジンにはロールバックがないため、MyISAM で制約が失敗すると部分的なデータが残ることがあります。InnoDB は完全なロールバックによって違反をクリーンに処理します。
+
+#### CHECK 制約は他のテーブルを参照できますか？
+
+いいえ。`CHECK` 式は、現在のテーブルの現在の行に限定されます。`CHECK` 式では、サブクエリ、ストアド関数、および他のテーブルへの参照は許可されません。テーブルをまたぐ検証にはトリガーを使用してください。
+
+#### CHECK 制約は昔から MySQL にありましたか？
+
+古い MySQL バージョンでも構文は受け入れられましたが、制約は黙って無視されていました。古いスキーマから移行する場合は、既存の `CHECK` 句が有効であり、適用したいルールを含んでいることを確認してください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 3819: Check constraint violated` | INSERT または UPDATE の値が制約を満たしていません。エラー内の制約名を確認して、どのルールに違反したかを特定します |
+| `ALTER TABLE ADD CONSTRAINT` がすぐに失敗する | テーブル内の既存の行が制約に違反しています。先にデータを修正するか、移行中は `NOT ENFORCED` を使用します |
+| CHECK 制約を定義したが適用されない | 適用が実装される前の古い MySQL バージョンを実行しています。アップグレードするか、トリガーを使用します |
+| 制約を削除できない | `DROP CHECK` または `DROP CONSTRAINT` には、列名ではなく制約名を使用します |
+| 制約名が不明 | `information_schema.check_constraints` を照会して、テーブルの制約名を調べます |
+
+## 関連項目 {#see-also}
+
+- [MySQL における正規化](/ja/guides/normalization) — CHECK 制約が補完するスキーマ設計
+- [MySQL のトリガー](/ja/guides/triggers) — 複雑な検証における CHECK 制約の代替手段
+- [MySQL における NULL](/ja/guides/null-in-mysql) — CHECK 制約と NULL は直感に反する形で相互作用します
