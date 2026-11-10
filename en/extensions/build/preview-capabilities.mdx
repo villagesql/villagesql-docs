@@ -51,7 +51,7 @@ Uninstall those extensions first, then turn the setting off.
 | Capability | Header | Status |
 |---|---|---|
 | `vsql::preview::auth` | `<villagesql/preview/auth.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
-| `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview |
+| `vsql::preview::column_store` | `<villagesql/preview/storage_builder.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`) |
 | `vsql::preview::index_profile` | `<villagesql/preview/index_builder.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`); see [Custom Indexes](/en/extensions/build/custom-indexes) |
 | `vsql::preview::index_type` | `<villagesql/preview/index_builder.h>` | Preview — dev ABI only (`-DVSQL_USE_DEV_ABI=ON`); see [Custom Indexes](/en/extensions/build/custom-indexes) |
 | `vsql::preview::keyring` | `<villagesql/preview/keyring.h>` | Preview |
@@ -716,7 +716,7 @@ running on the connection), never from a background thread worker**:
 ```cpp
 static auto SESSION_INT = SESSION_VARS.int_var("session_int_var");
 
-void read_session_int_var_impl(IntResult out) {
+void read_session_int_var_impl(vsql::IntResult out) {
   long long val = 0;
   if (SESSION_INT.read(val)) { out.set_null(); return; }
   out.set(val);
@@ -867,8 +867,7 @@ Setting it `ON` starts the worker: the server calls the work function with
 `VEF_WAKEUP_ENABLE`, then creates the thread, so the statement does not return
 until that first call has finished. Setting it `ON` again while the worker is
 already running does nothing. Setting it `OFF` returns after the thread has
-exited. The server releases its global system-variable lock around both, so the
-work function may read system variables and run SQL.
+exited. The server releases its global system-variable lock around both, so the work function may read system variables, but a query it runs during `VEF_WAKEUP_DISABLE` does not return any rows.
 
 ### Complete Example
 
@@ -1123,7 +1122,7 @@ array of floats that must live in dedicated pages. This is a capability
 feature: it enables new storage layouts, not a tuning knob for existing ones.
 
 <Warning>
-  Column storage is a preview ABI — under active development and may change
+  Column storage is a preview ABI that works only in an extension built with the dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`) — under active development and may change
   between releases. It currently covers row-level persistence only; a custom-stored column accepts only a
   [custom index](/en/extensions/build/custom-indexes), and an ordinary index is refused with
   `ERROR 3219 (HY000): InnoDB: Indexing for types with column storage is supported only with custom index.`
@@ -1405,14 +1404,14 @@ POSTEXECUTE phase every field is populated. Selected accessors:
 
 | Accessor | Meaning |
 |---|---|
-| `query()` | Query text, as a `string_view`. When the server has a rewritten form of the statement, this is that form — the same redacted text the general, slow, and binary logs record. |
+| `query()` | Query text, as a `string_view`. When the server has a rewritten form of the statement, this is that form — the same redacted text the general and slow logs record. |
 | `query_time_secs()` | Wall-clock execution time, in seconds. |
 | `lock_time_secs()` | Time spent waiting on locks, in seconds. |
 | `rows_sent()`, `rows_examined()`, `rows_affected()` | Row counters. |
 | `user()`, `client_ip()`, `connection_id()` | Connection identity. |
 | `schema()` | Default schema, or `NULL` if none is selected. |
 | `status()` | `0` on success, otherwise the MySQL error code. |
-| `warning_count()` | Number of conditions (notes, warnings, and errors) raised while the statement ran. |
+| `warning_count()` | Number of notes and warnings raised while the statement ran, or `0` when the statement failed. |
 | `digest_text()` | Normalized query form, for grouping similar queries. |
 | `no_index_used()` | `true` when the query ran without a usable index. |
 | `digest_hash()` | Statement digest as 64 lowercase hex characters — the value `performance_schema` exposes as `DIGEST`. A compact key for grouping identical statements; `NULL` whenever `digest_text()` is. |
@@ -1420,12 +1419,12 @@ POSTEXECUTE phase every field is populated. Selected accessors:
 | `client_pid()`, `client_name()`, `program_name()` | Client-supplied connection attributes sent once at handshake (`_pid`, `_client_name`, `program_name`): the client's OS process id, connector/driver library (e.g. `libmysql`, `mysql-connector-j`), and application name (e.g. `mysql`, `mysqldump`). Each is `NULL` when the client did not send that attribute. |
 
 <Info>
-**Changed in 0.0.8-dev.** When the statement itself failed, `warning_count()` counts one condition fewer.
+**Changed in 0.0.8-dev.** When the statement failed, `warning_count()` counts the notes and warnings raised before the error.
 </Info>
 
 Because `query()` returns the server's rewritten form when one exists,
 credential-bearing statements arrive with the secret obfuscated rather than in
-cleartext, matching how the general, slow, and binary logs already redact them:
+cleartext, matching how the general and slow logs already redact them:
 `SET PASSWORD`, `CREATE`/`ALTER USER ... IDENTIFIED BY`, `CHANGE REPLICATION
 SOURCE ... SOURCE_PASSWORD`, and `CREATE SERVER ... OPTIONS(PASSWORD ...)`.
 Statements with no rewrite rule are delivered verbatim.
@@ -1859,8 +1858,8 @@ if (c.account_unknown()) {
 `request_provision(account, roles, n_roles)` records intent and returns nothing.
 The server runs the DDL itself, after the handler returns `AuthResult::kOk`, and
 only for a login that was routed in as an unknown account — so a login the
-handler goes on to deny creates nothing, and a request naming an account that
-already exists is ignored. What the server runs is
+handler goes on to deny creates nothing, and when a request names an account that
+already exists, the account keeps its binding and still receives the named roles. What the server runs is
 `CREATE USER IF NOT EXISTS <account>@'%' IDENTIFIED WITH <method>`, followed by
 one `GRANT` per named role: the account is always created for host `%` and bound
 to the method that authenticated it, and `account` need not be the connecting

@@ -50,6 +50,14 @@ manifests name them by their GitHub address.
   text of the shared page, or the stable server page.
 - **A change that exists only on `main`:** edit the dev server page, or add a
   `Changed in <next>-dev` note to the shared page.
+- **A change in an extension:** an extension has its own version, and a
+  release ships the version that was bundled when it was built (0.0.7 shipped
+  `vsql_trgm` 0.0.3 after vsql-trgm had tagged 0.0.4). Find the shipped version
+  in the release tarball's `lib/veb/<name>.veb` manifest, and check the change
+  against that version's tag in the extension repo with
+  `git merge-base --is-ancestor <sha> <version>`. A change in the shipped
+  version goes in the page text; a newer change is a `Changed in <next>-dev`
+  note. The docs agent runs `release-ext-versions` for the first step.
 
 ## Cutting a release
 
