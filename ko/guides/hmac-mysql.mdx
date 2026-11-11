@@ -1,0 +1,158 @@
+---
+title: "MySQL의 HMAC 서명"
+sidebarTitle: "HMAC 서명 만들기"
+description: "VillageSQL의 hmac() 함수를 사용하여 MySQL에서 HMAC 서명을 계산하고 검증하는 방법 — 웹훅 검증, 데이터 무결성, 변조 감지용."
+keywords: "mysql hmac, mysql hmac sha256, mysql data integrity signature, mysql webhook verification, mysql tamper detection, mysql hmac function"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+해시는 데이터가 어떤 모습인지 알려줍니다. HMAC은 그 데이터가 비밀 키를 아는 사람에게서 왔다는 것을 알려줍니다. 이 차이는 행이 변조되지 않았는지, 웹훅 페이로드가 진짜인지, 토큰이 위조된 것이 아니라 여러분의 시스템에서 생성된 것인지 검증할 때 중요합니다. MySQL에는 내장 HMAC 함수가 없습니다 — 표준 답은 애플리케이션 코드에서 계산하는 것입니다. VillageSQL의 `hmac()`을 사용하면 SQL에서 할 수 있습니다.
+
+## 문제: 내장 HMAC 없음 {#the-problem-no-built-in-hmac}
+
+MySQL에는 해싱을 위한 `SHA2()`와 `MD5()`가 있지만, 키를 받는 것은 없습니다. HMAC(해시 기반 메시지 인증 코드)은 공유 비밀을 사용하여 인증 코드를 생성합니다 — 키가 없는 사람은 재현할 수 없기 때문에 일반 해시와 근본적으로 다릅니다.
+
+일반적인 접근 방식은 데이터베이스에 쓰기 전에 애플리케이션에서 HMAC을 계산하는 것입니다:
+
+```python
+# Python: compute HMAC in app code before writing
+import hmac, hashlib
+sig = hmac.new(b'secret_key', row_data.encode(), hashlib.sha256).hexdigest()
+db.execute("INSERT INTO audit_log (data, signature) VALUES (?, ?)", (row_data, sig))
+```
+
+이 방법은 동작하지만, 모든 쓰기 경로 — 모든 언어, 서비스, 대량 로더 — 가 서명 로직을 복제해야 한다는 뜻입니다. 애플리케이션을 우회하는 마이그레이션 스크립트는 서명되지 않은 행을 쓰게 됩니다.
+
+## VillageSQL과 함께: SQL의 hmac() {#with-villagesql-hmac-in-sql}
+
+VillageSQL의 `vsql_crypto` 확장은 `hmac(data, key, algorithm)`을 추가하며, 이 함수는 MySQL 안에서 완전히 계산된 `VARBINARY` 인증 코드를 반환합니다.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+### 트리거에서 행 서명 {#signing-rows-in-a-trigger}
+
+어떤 애플리케이션 경로가 행을 만들었는지와 관계없이, 트리거를 사용하여 쓰기 시점에 모든 행에 서명합니다:
+
+```sql
+CREATE TABLE audit_log (
+    id        INT AUTO_INCREMENT PRIMARY KEY,
+    event     VARCHAR(255),
+    payload   TEXT,
+    signature VARBINARY(32),   -- 32 bytes for HMAC-SHA256
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Sign every insert automatically
+DELIMITER $$
+CREATE TRIGGER sign_audit_log
+BEFORE INSERT ON audit_log
+FOR EACH ROW
+BEGIN
+    SET NEW.signature = hmac(
+        CONCAT(NEW.event, '|', COALESCE(NEW.payload, '')),
+        'your-hmac-secret-key',
+        'sha256'
+    );
+END$$
+DELIMITER ;
+```
+
+```sql
+INSERT INTO audit_log (event, payload)
+VALUES ('user.login', '{"user_id": 42, "ip": "10.0.1.5"}');
+
+-- Verify a row hasn't been tampered with
+SELECT
+    event,
+    payload,
+    signature = hmac(
+        CONCAT(event, '|', COALESCE(payload, '')),
+        'your-hmac-secret-key',
+        'sha256'
+    ) AS valid
+FROM audit_log;
+```
+
+### 웹훅 페이로드 검증 {#verifying-webhook-payloads}
+
+애플리케이션이 들어오는 웹훅 페이로드를 저장한다면, 처리하기 전에 SQL에서 직접 서명을 검증할 수 있습니다:
+
+```sql
+-- Webhook arrives with header X-Signature: <hex>
+-- Store the raw payload and verify before processing
+SELECT
+    payload,
+    HEX(hmac(payload, 'webhook-secret', 'sha256')) AS expected_sig,
+    incoming_sig = HEX(hmac(payload, 'webhook-secret', 'sha256')) AS valid
+FROM webhook_queue
+WHERE id = 1;
+```
+
+### 지원되는 알고리즘 {#supported-algorithms}
+
+| 알고리즘 | 호출 | 사용 시점 |
+|:---|:---|:---|
+| HMAC-SHA256 | `hmac(data, key, 'sha256')` | 범용 — 권장 기본값 |
+| HMAC-SHA512 | `hmac(data, key, 'sha512')` | 더 높은 보안 여유가 필요할 때 |
+| HMAC-SHA1 | `hmac(data, key, 'sha1')` | 레거시 시스템 호환성 전용 |
+| HMAC-MD5 | `hmac(data, key, 'md5')` | 레거시 시스템 호환성 전용 |
+
+새 코드에는 HMAC-SHA256을 사용하세요. HMAC 구성은 기반 해시의 충돌 취약점을 물려받지 않으므로, HMAC-SHA1은 일반 SHA-1처럼 깨지지는 않았습니다 — 그러나 SHA-1은 사용 중단되었고 규제 기관은 이를 레거시로 취급합니다. 새 코드에는 사용하지 마세요.
+
+## HMAC과 일반 해시 비교 {#hmac-vs-plain-hash}
+
+| | 일반 해시(`digest()`) | HMAC(`hmac()`) |
+|:---|:---|:---|
+| **키를 받음** | 아니요 | 예 |
+| **키 없이 위조 가능** | 예 — 누구나 같은 데이터를 해싱할 수 있음 | 아니요 |
+| **용도** | 체크섬, 중복 제거, 지문 생성 | 인증, 변조 감지, 서명 |
+| **검증 가능한 주체** | 누구나 | 키 보유자만 |
+
+보호하려는 데이터가 공개된 것이라면, 일반 해시는 아무것도 증명하지 못합니다. 데이터가 비밀을 아는 사람에 의해 생성되었음을 증명해야 할 때 HMAC을 사용하세요. 키 없는 해싱에 대해서는 [MySQL에서 데이터 해싱](/ko/guides/hashing-data)을 참조하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### HMAC 키를 트리거에 저장하는 것이 안전한가요? {#is-storing-the-hmac-key-in-the-trigger-safe}
+
+아니요 — 트리거 정의에 하드코딩되어 있어 `SHOW CREATE TRIGGER` 권한이 있는 누구나 볼 수 있습니다. 프로덕션에서는 안전한 구성 경로에서 키를 가져오거나, 애플리케이션이 연결 시 설정하는 세션 변수로 전달하세요. 키를 자격 증명으로 취급하세요.
+
+#### 쿼리 결과가 전송 중에 변경되지 않았는지 HMAC으로 검증할 수 있나요? {#can-i-use-hmac-to-verify-query-results-havent-been-altered-in-transit}
+
+HMAC은 무단 수정으로부터 보호하지, 도청으로부터 보호하지는 않습니다. 전송 중 보호에는 MySQL 연결에 TLS를 사용하세요. HMAC은 데이터가 데이터베이스에 도달한 뒤의 변조를 감지하는 데 유용합니다.
+
+#### HMAC 키는 어떻게 교체하나요? {#how-do-i-rotate-the-hmac-key}
+
+전환하기 전에 기존의 모든 행을 새 키로 다시 서명하세요:
+
+```sql
+UPDATE audit_log
+SET signature = hmac(
+    CONCAT(event, '|', COALESCE(payload, '')),
+    'new-hmac-key',
+    'sha256'
+);
+-- Then update the key in your application/trigger
+```
+
+#### hmac()은 같은 입력에 대해 같은 출력을 반환하나요? {#does-hmac-return-the-same-output-for-the-same-inputs}
+
+예 — HMAC은 결정적입니다. 같은 데이터 + 같은 키 + 같은 알고리즘은 항상 같은 결과를 생성합니다. 이것이 검증이 동작하는 이유입니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.hmac does not exist` | `INSTALL EXTENSION vsql_crypto`를 실행하세요 |
+| `hmac()`이 NULL을 반환함 | 데이터나 키 인자의 NULL, 또는 지원되지 않는 알고리즘 이름을 확인하세요 |
+| 검증이 항상 0을 반환함 | 데이터 문자열이 서명된 것과 바이트 단위로 동일한지 확인하세요 — 공백, 인코딩, NULL 처리가 모두 중요합니다 |
+| 서명 열이 NULL로 채워짐 | 트리거는 실행되지만 키나 데이터가 NULL입니다 — 널 허용 필드를 `COALESCE`로 감싸세요 |
+
+## 참고 {#see-also}
+
+- [MySQL에서 데이터 해싱](/ko/guides/hashing-data) — 지문 생성과 중복 제거를 위한 키 없는 해싱
+- [트리거에서 웹훅 보내기](/ko/guides/http-webhooks) — HMAC은 웹훅 페이로드에 서명하는 표준 방법

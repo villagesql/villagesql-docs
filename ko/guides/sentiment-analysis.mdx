@@ -1,0 +1,166 @@
+---
+title: "MySQL 데이터의 감성 분석"
+sidebarTitle: "감성 분석하기"
+description: "VillageSQL의 ai_prompt()를 사용해 MySQL에 저장된 텍스트에 감성 분석을 실행하는 방법 — SQL을 떠나지 않고 리뷰, 지원 티켓, 피드백에 점수를 매깁니다."
+keywords: "mysql sentiment analysis, mysql ai sentiment, mysql review sentiment, mysql positive negative neutral, mysql text sentiment score, mysql ai_prompt sentiment"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+감성 분석은 텍스트가 긍정, 부정, 중립 중 어떤 감정을 표현하는지 알려 줍니다. 가장 흔한 사용 사례는 제품 리뷰와 지원 티켓입니다 — 모든 행을 읽지 않고도 고객이 만족하는지 불만인지 한눈에 아는 것입니다. MySQL에는 내장 감성 함수가 없습니다. VillageSQL의 `ai_prompt()`가 그 기능을 추가합니다.
+
+## 표준 접근법: 애플리케이션 계층 감성 분석 {#standard-approach-application-layer-sentiment}
+
+일반적인 설정은 MySQL 밖에서 감성 점수를 매깁니다 — 행을 Python 스크립트로 가져와 감성 라이브러리나 AI API를 호출한 다음 점수를 다시 기록합니다. 이 방식은 동작하지만 데이터 파이프라인을 분리합니다: 일부 로직은 SQL에, 일부는 Python에 있고, 대량 재채점에는 스크립트 실행이 필요합니다.
+
+## VillageSQL과 함께: SQL에서의 감성 분석 {#with-villagesql-sentiment-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+감성 분석은 분류 작업입니다. 프롬프트가 척도를 지정하고 한 단어 결과를 요청합니다:
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE reviews ADD COLUMN sentiment VARCHAR(10);
+
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE reviews
+SET sentiment = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'What is the sentiment of this review? ',
+        'Reply with exactly one word: positive, negative, or neutral.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment IS NULL
+LIMIT 100;
+```
+
+레이블이 붙으면 감성을 다른 열처럼 쿼리하세요:
+
+```sql
+-- Sentiment distribution
+SELECT sentiment, COUNT(*) AS count
+FROM reviews
+GROUP BY sentiment
+ORDER BY count DESC;
+
+-- Recent negative reviews that need attention
+SELECT id, review_text, created_at
+FROM reviews
+WHERE sentiment = 'negative'
+  AND created_at > NOW() - INTERVAL 7 DAY
+ORDER BY created_at DESC;
+```
+
+### 숫자 점수 추가하기 {#adding-a-numeric-score}
+
+추세 분석과 평균 계산을 위해서는 레이블 대신 1–5 점수를 요청하세요:
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_score TINYINT;
+
+UPDATE reviews
+SET sentiment_score = CAST(ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Rate the sentiment of this review from 1 (very negative) to 5 (very positive). ',
+        'Reply with a single digit only.\n\n',
+        'Review: ', review_text
+    )
+) AS SIGNED)
+WHERE sentiment_score IS NULL
+LIMIT 100;
+
+-- Average sentiment over time
+SELECT DATE(created_at) AS day,
+       ROUND(AVG(sentiment_score), 2) AS avg_score,
+       COUNT(*) AS review_count
+FROM reviews
+WHERE sentiment_score IS NOT NULL
+GROUP BY DATE(created_at)
+ORDER BY day DESC;
+```
+
+### 측면 기반 감성 분석 {#aspect-based-sentiment}
+
+감성을 주제별로 — 제품 품질 대 배송 대 고객 서비스 — 나누어 보고 싶다면 구조화된 JSON 출력을 요청하세요:
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_detail JSON;
+
+UPDATE reviews
+SET sentiment_detail = ai_prompt(
+    'anthropic',
+    'claude-sonnet-5',  -- better model for nuanced structured output
+    @key,
+    CONCAT(
+        'Analyze this review and return JSON with sentiment scores for each aspect. ',
+        'Keys: product_quality, shipping, customer_service. ',
+        'Values: positive, negative, neutral, or null if not mentioned. ',
+        'Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment_detail IS NULL
+LIMIT 50;
+
+SELECT
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.product_quality')) AS product,
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.shipping')) AS shipping,
+    review_text
+FROM reviews
+WHERE JSON_EXTRACT(sentiment_detail, '$.shipping') = '"negative"';
+```
+
+## 정확도에 관한 참고 {#accuracy-notes}
+
+빠르고 저렴한 모델(Claude Haiku, GPT-4o mini)은 단순한 긍정/부정/중립 분류에 신뢰할 만합니다. 미묘한 경우 — 비꼬는 표현, 엇갈린 리뷰, 도메인 특화 언어 — 에는 더 유능한 모델이 도움이 됩니다. 정확도가 중요하다면 전체 백필을 실행하기 전에 모델 출력 샘플을 사람이 붙인 레이블과 비교해 검증하세요.
+
+설정과 공급자 옵션은 [MySQL을 AI API에 연결하기](/ko/guides/ai-api-setup)를 참조하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 텍스트 분류와 어떻게 다른가요? {#how-is-this-different-from-text-classification}
+
+감성 분석은 감정적 어조에 초점을 맞춘 특정 분류 작업입니다. [AI로 MySQL에서 텍스트 분류하기](/ko/guides/text-classification)는 일반적인 패턴을 다루고, 이 가이드는 감성에 특화된 프롬프트와 점수 기반 출력을 보여 줍니다.
+
+#### 행이 삽입될 때 감성 분석을 실행할 수 있나요? {#can-i-run-sentiment-analysis-as-rows-are-inserted}
+
+트리거로 가능하지만, API 호출이 실행되는 동안 각 INSERT가 5–30초 걸립니다. 감성 채점은 예약된 배치 작업으로 실행하는 편이 낫습니다.
+
+#### 영어가 아닌 텍스트는 어떤가요? {#what-about-non-english-text}
+
+유능한 AI 모델은 많은 언어를 잘 처리합니다. 정확도가 떨어지면 프롬프트에 예상 언어를 지정하세요: "Rate the sentiment of this French review..."
+
+#### NULL 결과는 어떻게 처리하나요? {#how-do-i-handle-null-results}
+
+`ai_prompt()`는 실패 시 NULL을 반환합니다. 애플리케이션에서 속도 제한을 고려한 간격으로, NULL 행이 남지 않을 때까지 UPDATE 배치 루프를 실행하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | `INSTALL EXTENSION vsql_ai`를 실행 |
+| NULL을 반환 | API 키, `max_execution_time`, 모델 이름을 확인 |
+| 점수 열이 NULL 대신 0으로 채워짐 | `CAST('positive' AS SIGNED)`는 0을 반환 — 모델이 숫자가 아닌 텍스트를 반환함. 프롬프트를 더 엄격하게: "Reply with a single digit only, no other text." |
+| 레이블이 일관되지 않음 | 프롬프트에 "Reply with exactly one word"를 추가; UPDATE 후 쿼리로 정규화 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 쿼리에서 AI 모델 실행하기](/ko/guides/ai-prompts-in-mysql) — 감성 채점을 구동하는 ai_prompt() 함수
+- [AI로 MySQL에서 텍스트 분류하기](/ko/guides/text-classification) — 감성과 함께 범주별로 텍스트에 레이블 붙이기
+- [MySQL의 AI 요약](/ko/guides/ai-summarization) — 채점하는 텍스트 요약하기

@@ -1,0 +1,173 @@
+---
+title: "MySQL에 MAC 주소 저장하기"
+sidebarTitle: "MAC 주소 저장하기"
+description: "MySQL에 MAC 주소를 저장하는 방법 — VARCHAR가 부족한 이유, 그리고 VillageSQL의 MACADDR과 MACADDR8 타입이 간결한 저장, 형식 정규화, OUI 추출을 제공하는 방식입니다."
+keywords: "mysql mac address storage, mysql macaddr type, mysql store mac address, mysql oui extraction, mysql network device table, mysql eui64"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL의 MAC 주소는 보통 `VARCHAR(17)`로 저장됩니다. 저장은 되지만 어떤 문자열이든 받아들이고, 아무것도 정규화하지 않으며, 6바이트면 충분한데 17바이트를 씁니다. VillageSQL의 `MACADDR` 타입은 삽입 시 형식을 검증하고, 일관된 표현으로 정규화하며, OUI 추출을 공짜로 제공합니다.
+
+## MySQL 기본: VARCHAR(17) {#the-mysql-default-varchar17}
+
+```sql
+CREATE TABLE devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address VARCHAR(17),
+    hostname    VARCHAR(255)
+);
+
+INSERT INTO devices (mac_address, hostname) VALUES
+    ('08:00:2b:01:02:03', 'server-01'),
+    ('08-00-2B-01-02-04', 'server-02');  -- different format, uppercase
+```
+
+두 행 모두 삽입됩니다. 이제 같은 열에 같은 벤더 접두사의 두 가지 표현이 있습니다. 중복 제거 쿼리는 문자열 정규화 문제가 됩니다. 열이 실제로 유효한 MAC 주소를 담고 있다는 강제가 없습니다.
+
+## 표준 우회책: BINARY(6) {#the-standard-workaround-binary6}
+
+간결한 저장: 삽입 시 바이너리로 변환하고, 읽을 때 문자열로 되돌립니다.
+
+```sql
+CREATE TABLE devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address BINARY(6),
+    hostname    VARCHAR(255)
+);
+
+-- No built-in conversion — typically done in application code
+-- or manually with UNHEX after stripping colons
+INSERT INTO devices (mac_address, hostname)
+VALUES (UNHEX(REPLACE('08:00:2b:01:02:03', ':', '')), 'server-01');
+
+SELECT LOWER(INSERT(INSERT(INSERT(INSERT(INSERT(
+    HEX(mac_address), 3,0,':'), 6,0,':'), 9,0,':'), 12,0,':'), 15,0,':'))
+AS mac FROM devices;
+```
+
+이것이 수동 재구성입니다. 동작하지만 장황하고 깨지기 쉬우며, 여전히 입력을 검증하지 않습니다.
+
+## VillageSQL과 함께: MACADDR과 MACADDR8 {#with-villagesql-macaddr-and-macaddr8}
+
+VillageSQL의 `vsql_network_address` 확장은 자동 형식 정규화와 검증을 갖춘 `MACADDR`(6바이트 IEEE 802 형식)과 `MACADDR8`(8바이트 EUI-64 형식) 타입을 추가합니다.
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address MACADDR,
+    hostname    VARCHAR(255)
+);
+
+-- All three formats parse to the same stored value
+INSERT INTO devices (mac_address, hostname) VALUES
+    (macaddr_from_string('08:00:2b:01:02:03'), 'server-01'),   -- colon notation
+    (macaddr_from_string('08-00-2b-01-02-04'), 'server-02'),   -- hyphen notation
+    (macaddr_from_string('0800.2b01.0206'),    'server-03');   -- Cisco dot notation
+
+-- Always returns normalized colon format
+SELECT macaddr_to_string(mac_address), hostname FROM devices;
+```
+
+출력:
+```
+08:00:2b:01:02:03   server-01
+08:00:2b:01:02:04   server-02
+08:00:2b:01:02:06   server-03
+```
+
+### OUI 추출 {#oui-extraction}
+
+MAC 주소의 첫 3바이트는 제조사를 식별합니다(OUI — Organizationally Unique Identifier). `macaddr_trunc()`는 마지막 3바이트를 0으로 만들어 OUI만 남깁니다:
+
+```sql
+-- Find all devices from the same manufacturer. CAST to CHAR here works
+-- around a known issue where GROUP BY truncates this expression's result
+-- to the underlying type's stored length instead of the full string.
+SELECT CAST(macaddr_to_string(macaddr_trunc(mac_address)) AS CHAR(20)) AS oui,
+       COUNT(*) AS device_count
+FROM devices
+GROUP BY CAST(macaddr_to_string(macaddr_trunc(mac_address)) AS CHAR(20))
+ORDER BY device_count DESC;
+
+-- Filter by manufacturer OUI
+SELECT hostname, macaddr_to_string(mac_address)
+FROM devices
+WHERE macaddr_trunc(mac_address) = macaddr_from_string('08:00:2b:00:00:00');
+```
+
+### 비교와 정렬 {#comparison-and-sorting}
+
+```sql
+-- Sort devices by MAC address
+SELECT hostname, macaddr_to_string(mac_address)
+FROM devices
+ORDER BY mac_address;
+
+-- Find a specific device
+SELECT hostname FROM devices
+WHERE mac_address = macaddr_from_string('08:00:2b:01:02:03');
+```
+
+### EUI-64 MAC 주소(MACADDR8) {#eui-64-mac-addresses-macaddr8}
+
+최신 하드웨어는 8바이트 EUI-64 식별자를 점점 더 많이 사용합니다. `MACADDR8` 타입이 이를 처리합니다:
+
+```sql
+CREATE TABLE modern_devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address MACADDR8
+);
+
+INSERT INTO modern_devices VALUES
+    (1, macaddr8_from_string('08:00:2b:01:02:03:04:05'));
+
+SELECT macaddr8_to_string(mac_address) FROM modern_devices;
+-- Returns: 08:00:2b:01:02:03:04:05
+```
+
+## 접근법 비교 {#comparing-approaches}
+
+| 방식 | 저장 공간 | 형식 검증 | 입력 정규화 | OUI 추출 |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(17)` | 17바이트 | 아니요 | 아니요 | 수동 문자열 자르기 |
+| `BINARY(6)` + 수동 UNHEX | 6바이트 | 아니요 | 아니요 | 수동 바이너리 마스크 |
+| `MACADDR` (VillageSQL) | 6바이트 | 예 | 예(콜론 형식) | `macaddr_trunc()` |
+| `MACADDR8` (VillageSQL) | 8바이트 | 예 | 예 | — |
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### MACADDR은 대문자 16진수를 받아들이나요? {#does-macaddr-accept-uppercase-hex}
+
+예 — `08:00:2B:01:02:03`과 `08:00:2b:01:02:03`은 둘 다 올바르게 파싱되고 동일하게 저장됩니다.
+
+#### MACADDR을 기본 키로 사용할 수 있나요? {#can-i-use-macaddr-as-a-primary-key}
+
+예. `MACADDR`은 인덱싱과 동등 비교를 지원합니다. MAC이 자연스러운 식별자인 네트워크 장치 테이블에서는 합리적인 기본 키입니다.
+
+#### MACADDR과 MACADDR8의 차이는 무엇인가요? {#whats-the-difference-between-macaddr-and-macaddr8}
+
+`MACADDR`은 대부분의 네트워크 하드웨어가 사용하는 6바이트 IEEE 802 MAC-48 형식입니다. `MACADDR8`은 일부 최신 네트워크 인터페이스와 IPv6 링크 로컬 주소 생성에 사용되는 8바이트 EUI-64 형식입니다. EUI-64 식별자를 저장할 때 `MACADDR8`을 사용하세요.
+
+#### MACADDR과 MACADDR8 사이를 어떻게 변환하나요? {#how-do-i-convert-between-macaddr-and-macaddr8}
+
+내장 변환 함수는 없습니다. MAC-48을 EUI-64로 확장해야 한다면(가운데에 `ff:fe` 삽입), `macaddr8_from_string()`을 호출하기 전에 애플리케이션 코드에서 하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.macaddr_from_string does not exist` | `INSTALL EXTENSION vsql_network_address`를 실행 |
+| `macaddr_from_string()`이 NULL을 반환 | 입력이 유효한 MAC 주소 형식이 아님 |
+| OUI 쿼리가 결과를 반환하지 않음 | 잘린 MAC을 전체 6바이트 형식으로 비교하고 있는지 확인: `macaddr_from_string('xx:xx:xx:00:00:00')` |
+| WHERE에서 섞인 MAC 형식이 일치하지 않음 | 일치합니다 — `MACADDR`은 삽입 시 모든 형식을 정규화함 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL에 IP 주소 저장하기](/ko/guides/storing-ip-addresses) — IP에 대한 같은 네트워크 주소 저장 패턴

@@ -1,0 +1,103 @@
+---
+title: "지원 종료 후 MySQL 8.0을 8.4로 업그레이드하기"
+sidebarTitle: "MySQL 8.0 EOL: 8.4로 업그레이드"
+description: "MySQL 8.0은 2026년 4월 30일에 지원이 종료되었습니다. MySQL 8.4 LTS로 업그레이드하는 방법: 클라이언트를 깨뜨리는 인증 변경, 제거된 구성 변수, 업그레이드 전 확인 사항, 그리고 유일한 롤백 수단인 백업입니다."
+keywords: "mysql 8.0 eol, mysql 8.0 end of life, upgrade mysql 8.0 to 8.4, mysql 8.4 upgrade, mysql_native_password 8.4, mysql lts upgrade"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+import AiNote from '/snippets/ai-note.mdx';
+
+<VillagesqlBanner />
+
+<AiNote />
+
+MySQL 8.0은 2026년 4월 30일에 지원이 종료되었고, 더 이상 보안 패치를 받지 않습니다. 업그레이드 대상은 MySQL 8.4 LTS이며, 프리미어 지원은 대략 2029년 4월까지, 연장 지원은 2032년 4월까지입니다. Oracle은 8.0에서 8.4로의 경로를 매끄럽게 설계했지만, 두 가지 변경이 실제 시스템을 깨뜨립니다: 기본 인증 플러그인과 제거된 구성 변수입니다. 이 가이드는 둘 다와, 시작하기 전에 실행할 확인 사항을 다룹니다.
+
+## 8.4에서 바뀌는 것 {#what-changes-in-84}
+
+업그레이드는 제자리에서 이루어집니다: 8.0 데이터 디렉터리 위에 8.4 바이너리를 설치하면 서버가 첫 시작 시 데이터 딕셔너리를 스스로 업그레이드합니다. 대부분의 스키마와 쿼리는 손대지 않고 넘어갑니다. 실제로 문제가 되는 변경:
+
+| 변경 | 누가 영향을 받는가 |
+|---|---|
+| `mysql_native_password`가 기본적으로 비활성화됨 | 오래된 클라이언트 라이브러리와 8.0 이전 인증 플러그인을 아직 사용하는 모든 계정 |
+| 8.0에서 사용 중단된 시스템 변수가 제거됨 | 그것을 설정하는 구성 파일과 스크립트. 서버는 알 수 없는 변수가 있으면 시작을 거부함 |
+| 사용 중단된 구문이 제거됨 | float/double 열에 `AUTO_INCREMENT`를 사용하는 스키마와 비표준 외래 키 제약 조건 |
+
+## 1단계: 옛 인증 플러그인을 사용하는 계정 찾기 {#step-1-find-accounts-on-the-old-auth-plugin}
+
+업그레이드하기 전에, 아직 `mysql_native_password`를 사용하는 모든 계정을 나열하세요:
+
+```sql
+SELECT user, host, plugin
+FROM mysql.user
+WHERE plugin = 'mysql_native_password';
+```
+
+각 계정을 `caching_sha2_password`로 마이그레이션하고 애플리케이션에 저장된 비밀번호를 갱신하세요:
+
+```sql
+ALTER USER 'app'@'%' IDENTIFIED WITH caching_sha2_password BY 'new-password';
+```
+
+8.4에서는 플러그인이 로드되지 않았으므로 옛 플러그인으로 계정을 만들면 실패합니다:
+
+```sql
+CREATE USER 'legacy'@'%' IDENTIFIED WITH mysql_native_password BY 'pw';
+```
+
+```text
+ERROR 1524 (HY000): Plugin 'mysql_native_password' is not loaded
+```
+
+업그레이드 전에 계정을 마이그레이션할 수 없다면, 8.4는 구성에 `--mysql-native-password=ON`을 넣어 플러그인을 명시적으로 로드할 수 있습니다. 그것을 목적지가 아니라 다리로 취급하세요: 플러그인은 사용 중단되었고 제거가 예정되어 있습니다.
+
+## 2단계: 구성 파일 정리하기 {#step-2-clean-your-configuration-file}
+
+MySQL 8.4는 8.0에서 사용 중단된 시스템 변수를 제거합니다. `my.cnf`가 그중 하나를 설정하면, 8.4 서버는 알 수 없는 변수 오류와 함께 시작을 거부합니다. 가장 흔한 두 가지:
+
+```sql
+-- Both fail on 8.4: the variables no longer exist
+SELECT @@default_authentication_plugin;
+SELECT @@expire_logs_days;
+```
+
+```text
+ERROR 1193 (HY000): Unknown system variable 'default_authentication_plugin'
+```
+
+`expire_logs_days`를 `binlog_expire_logs_seconds`로 바꾸고, `default_authentication_plugin`을 삭제하세요(8.4의 대체 변수 `authentication_policy`는 이미 `caching_sha2_password`를 기본값으로 합니다). 설정한 모든 변수를 구성에서 grep하고, 중단 시간 동안이 아니라 업그레이드 전에 각각을 8.4 참조 문서와 대조하세요.
+
+## 3단계: 제거된 구문이 스키마에 있는지 확인하기 {#step-3-check-the-schema-for-removed-syntax}
+
+모든 데이터베이스에 대해 `mysqlcheck`를 실행하고 출력을 검토하세요:
+
+```bash
+mysqlcheck -u root -p --all-databases --check-upgrade
+```
+
+FLOAT 또는 DOUBLE 열의 `AUTO_INCREMENT`와 비표준 외래 키 제약 조건에 특히 주의하세요. 둘 다 8.4에서 제거되었습니다.
+
+## 4단계: 백업한 다음 제자리에서 업그레이드하기 {#step-4-back-up-then-upgrade-in-place}
+
+8.4에서 8.0으로의 지원되는 제자리 다운그레이드는 없습니다. 데이터 딕셔너리가 업그레이드되면, 되돌아가는 유일한 방법은 백업을 복원하는 것입니다. 그러니 백업은 형식적인 절차가 아닙니다:
+
+```bash
+mysqldump -u root -p --all-databases --events --routines --triggers > pre84_backup.sql
+```
+
+그다음 업그레이드 자체입니다: 8.0 서버를 중지하고, 8.4 바이너리를 설치하고, 같은 데이터 디렉터리에서 서버를 시작하세요. 서버는 첫 시작 시 업그레이드 단계를 자동으로 실행합니다. 연결 준비가 되었다고 보고할 때까지 오류 로그를 지켜보세요. 결과를 확인하세요:
+
+```sql
+SELECT VERSION();
+```
+
+## VillageSQL 관점 {#the-villagesql-angle}
+
+VillageSQL Server는 MySQL 8.4의 드롭인 대체품입니다. 8.4에 올라서면, 스택에서 MySQL 8.4와 동작하는 모든 것이 VillageSQL과도 동작하며, 나중에 전환하는 것은 기능적으로 같은 데이터 디렉터리에서의 마이너 버전 교체입니다. 확장 프레임워크에 관심이 있다면, 어차피 하고 있는 8.4 업그레이드가 진입로입니다. 그 절차는 [VillageSQL로 업그레이드하기](/ko/guides/upgrade)를 보세요.
+
+## 함께 보기 {#see-also}
+
+- [VillageSQL로 업그레이드하기](/ko/guides/upgrade) — 8.4에 올라선 뒤의 드롭인 교체
+- [백업 전략](/ko/guides/backup-strategies) — 이 업그레이드가 의존하는 백업
+- [흔한 MySQL 오류](/ko/guides/common-mysql-errors) — 실패한 업그레이드가 만드는 오류 해독하기

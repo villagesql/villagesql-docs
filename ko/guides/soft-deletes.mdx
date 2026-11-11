@@ -1,0 +1,98 @@
+---
+title: "MySQL의 소프트 삭제"
+sidebarTitle: "소프트 삭제"
+description: "deleted_at 열로 소프트 삭제를 구현하고, 소프트 삭제된 행에서 고유 제약 조건이 계속 동작하게 하고, 하드 삭제가 더 나은 선택인 때를 판단하는 방법입니다."
+keywords: "mysql soft delete, deleted_at column, soft delete unique constraint, mysql logical delete, restore deleted rows mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+소프트 삭제는 행을 제거하는 대신 삭제된 것으로 표시합니다. 행은 테이블에 남아 있고, 애플리케이션에는 보이지 않으며, 문장 하나로 복원할 수 있습니다. "사용자가 무언가를 삭제했는데 되돌리고 싶어 한다"에 대한 표준 답이며, 도입하기 전에 이해해야 할 두 가지 문제를 만듭니다: 모든 쿼리가 필터를 기억해야 하고, 고유 제약 조건이 여러분이 생각하는 의미를 잃습니다.
+
+## 기본 패턴 {#the-basic-pattern}
+
+null 허용 타임스탬프를 추가하세요. `NULL`은 살아 있음을 뜻하고, 타임스탬프는 삭제되었음을 뜻하며 언제인지 기록합니다:
+
+```sql
+CREATE TABLE customers (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  name VARCHAR(100),
+  deleted_at TIMESTAMP NULL DEFAULT NULL
+);
+
+-- Delete
+UPDATE customers SET deleted_at = NOW() WHERE id = 42;
+
+-- Restore
+UPDATE customers SET deleted_at = NULL WHERE id = 42;
+
+-- Every read now needs the filter
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+`deleted` 불리언보다 타임스탬프를 선호하세요: 비용은 같고, 지원 티켓이 물어볼 "언제"에 공짜로 답해 줍니다.
+
+## 문제 1: 고유 제약 조건 {#problem-1-unique-constraints}
+
+`email`에 대한 고유 인덱스는 재등록을 영원히 차단합니다: 소프트 삭제된 행이 여전히 그 값을 차지하고 있기 때문입니다.
+
+```sql
+ALTER TABLE customers ADD UNIQUE KEY uq_email (email);
+UPDATE customers SET deleted_at = NOW() WHERE email = 'a@example.com';
+INSERT INTO customers (email, name) VALUES ('a@example.com', 'Again');
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'a@example.com' for key 'customers.uq_email'
+```
+
+해결책은 함수 기반 인덱스 기법입니다: 고유 키가 살아 있는 행에서는 일정하고 삭제된 행에서는 고유한 열을 다루게 만드세요. 생성 열이 이를 깔끔하게 해냅니다:
+
+```sql
+ALTER TABLE customers DROP KEY uq_email;
+ALTER TABLE customers
+  ADD COLUMN email_live VARCHAR(255)
+    GENERATED ALWAYS AS (IF(deleted_at IS NULL, email, NULL)) VIRTUAL,
+  ADD UNIQUE KEY uq_email_live (email_live);
+```
+
+MySQL 고유 인덱스는 `NULL`을 몇 개든 허용하므로 삭제된 행은 절대 충돌하지 않고, 같은 이메일을 가진 살아 있는 행 두 개는 여전히 실패합니다. 동작 원리는 [생성 열](/ko/guides/generated-columns)을 참조하세요.
+
+## 문제 2: 모든 쿼리가 기억해야 함 {#problem-2-every-query-must-remember}
+
+`WHERE deleted_at IS NULL`을 한 번만 잊어도 삭제된 데이터가 보고서나 API 응답으로 새어 나갑니다. 두 가지 완화책:
+
+- **살아 있는 부분집합에 대한 뷰.** 읽기 경로를 뷰로 향하게 하면 필터를 잊을 수 없습니다:
+
+```sql
+CREATE VIEW live_customers AS
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+- **ORM 스코프.** 대부분의 ORM은 필터를 전역으로 적용할 수 있습니다(Rails `default_scope`, Django 매니저, Prisma 미들웨어). 모든 쿼리를 감사하는 대신 한 곳에서 켜세요.
+
+외래 키도 생각해 봐야 합니다: 소프트 삭제된 부모는 여전히 존재하므로 `ON DELETE CASCADE`가 절대 발동하지 않습니다. 자식이 부모와 함께 사라져야 한다면, 애플리케이션(또는 트리거)이 `deleted_at`을 직접 캐스케이드해야 합니다.
+
+## 소프트 삭제를 하지 말아야 할 때 {#when-not-to-soft-delete}
+
+- **규제에 따른 삭제.** GDPR 삭제 요청은 데이터가 숨겨지는 것이 아니라 사라지는 것을 뜻합니다. 소프트 삭제된 행도 여전히 개인 데이터로 간주됩니다.
+- **변동이 많은 테이블.** 수백만 건씩 삭제되는 세션, 큐 작업, 로그는 테이블과 그 위의 모든 인덱스를 부풀릴 뿐입니다.
+- **아무도 복원하지 않을 데이터.** 되돌리기 시나리오가 없다면 필터 비용을 치러도 얻는 것이 없습니다.
+
+흔한 중간 경로: 사용자 동작 시 소프트 삭제하고, 예약된 작업이 `deleted_at`이 보존 기간보다 오래된 행을 하드 삭제합니다:
+
+```sql
+DELETE FROM customers
+WHERE deleted_at IS NOT NULL
+  AND deleted_at < NOW() - INTERVAL 90 DAY;
+```
+
+## 함께 보기 {#see-also}
+
+- [생성 열](/ko/guides/generated-columns) — 고유 제약 조건 해결책 뒤의 메커니즘
+- [뷰](/ko/guides/views) — 필터를 잊을 수 없는 살아 있는 행 뷰
+- [외래 키](/ko/guides/foreign-keys) — 소프트 삭제에서 캐스케이드가 발동하지 않는 이유
+- [MySQL DELETE](/ko/tutorial/delete) — 이 패턴이 대체하는 하드 삭제

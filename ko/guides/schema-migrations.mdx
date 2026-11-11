@@ -1,0 +1,147 @@
+---
+title: "MySQL의 스키마 마이그레이션"
+sidebarTitle: "마이그레이션 실행하기"
+description: "MySQL 스키마 마이그레이션을 안전하게 실행하는 방법: ALTER TABLE 동작, 온라인 DDL, 대형 테이블 마이그레이션, pt-online-schema-change와 gh-ost 사용법입니다."
+keywords: "mysql schema migration, mysql alter table, mysql online ddl, mysql alter table lock, pt-online-schema-change, gh-ost mysql, mysql add column production"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+운영 중인 MySQL 데이터베이스의 스키마 변경은 사소한 것(작은 테이블에 null 허용 열 추가)부터 위험한 것(초당 5만 건의 쓰기를 처리하는 500GB 테이블의 열 수정)까지 다양합니다. 그 차이는 MySQL이 테이블을 잠그는지, 그리고 얼마나 오래 잠그는지에 있습니다.
+
+## ALTER TABLE의 동작 방식 {#how-alter-table-works}
+
+MySQL의 `ALTER TABLE`에는 작업과 버전에 따라 두 가지 모드가 있습니다:
+
+**재구축 DDL**(이전 동작): MySQL이 새 스키마로 새 테이블을 만들고, 모든 행을 복사하고, 테이블을 교체하고, 원본을 삭제합니다. 전체 기간 동안 테이블이 쓰기에 대해 잠깁니다 — 대형 테이블에서는 몇 분에서 몇 시간까지 걸립니다.
+
+**온라인 DDL**: 많은 작업이 읽기나 쓰기를 차단하지 않고 실행될 수 있습니다. MySQL은 변경을 제자리에서 수행하거나 동시 DML을 허용하면서 백그라운드에서 테이블을 재구축합니다. 특정 작업이 어떻게 동작할지 확인하려면 `ALGORITHM`과 `LOCK` 절을 명시적으로 추가하세요 — 요청한 제약을 만족할 수 없으면 MySQL이 문장을 거부합니다:
+
+```sql
+-- Fail fast if the operation would require any locking
+ALTER TABLE orders ADD COLUMN notes TEXT, LOCK=NONE;
+```
+
+## 온라인 DDL 잠금 모드 {#online-ddl-lock-modes}
+
+`ALGORITHM`과 `LOCK` 절은 MySQL이 변경을 실행하는 방식을 제어합니다:
+
+| ALGORITHM | 동작 |
+|:----------|:---------|
+| `INSTANT` | 메타데이터만 변경 — 테이블 재구축도, 행 읽기도 없음. MySQL 8.0에서 일부 작업에 사용 가능. |
+| `INPLACE` | 최소한의 잠금으로 테이블을 제자리에서 수정. 행이 재구축되지 않을 수 있음. |
+| `COPY` | 새 테이블을 만들고 모든 행을 복사. 가장 느림; 일부 작업에 필수. |
+
+| LOCK | 동작 |
+|:-----|:---------|
+| `NONE` | 잠금 없음 — 변경 중에 읽기와 쓰기가 정상적으로 진행 |
+| `SHARED` | 읽기 잠금 — 읽기는 진행, 쓰기는 차단 |
+| `EXCLUSIVE` | 전체 잠금 — 읽기와 쓰기 모두 차단 |
+
+```sql
+-- Request a specific algorithm; fails if MySQL can't do it that way
+ALTER TABLE orders
+    ADD COLUMN notes TEXT,
+    ALGORITHM=INSTANT;
+
+-- Fail if the operation would require a write lock
+ALTER TABLE orders
+    ADD COLUMN notes TEXT,
+    LOCK=NONE;
+```
+
+## 빠른 작업과 느린 작업 {#whats-fast-vs-whats-slow}
+
+`ALGORITHM=INSTANT`(MySQL 8.0)를 사용하는 작업은 테이블 크기와 관계없이 거의 즉시 완료됩니다:
+- 어느 위치에든 열 추가(MySQL 8.0.29+)
+- 가상 생성 열 추가/삭제
+- 열의 기본값 변경
+
+`ALGORITHM=COPY`가 필요한 작업은 전체 기간 동안 쓰기를 차단합니다:
+- 열의 데이터 타입 변경
+- 문자 집합 변환
+- (전문 인덱스 추가는 여기에 해당하지 *않습니다* — `INPLACE`로 실행되지만 항상 최소 `LOCK=SHARED`가 필요하므로 읽기는 진행되고 쓰기는 차단됩니다; `LOCK=NONE`은 ERROR 1846으로 거부됩니다)
+
+대부분의 인덱스 추가는 `ALGORITHM=INPLACE, LOCK=NONE`을 사용합니다 — 테이블 재구축은 백그라운드에서 일어나고 DML은 진행됩니다. 100GB 테이블에 인덱스를 추가하면 시간은 걸리지만 애플리케이션을 차단하지는 않습니다.
+
+## 프로덕션에서의 대형 테이블 마이그레이션 {#large-table-migrations-in-production}
+
+잠그기에는 너무 큰 테이블에서 `ALGORITHM=COPY`가 필요한 작업에는 외부 도구를 사용하세요:
+
+### pt-online-schema-change (Percona Toolkit) {#pt-online-schema-change-percona-toolkit}
+
+```bash
+pt-online-schema-change \
+  --alter "ADD COLUMN notes TEXT" \
+  --execute \
+  D=mydb,t=orders
+```
+
+`pt-osc`는 섀도 테이블을 만들고, 행을 배치로 복사하고, 트리거를 사용해 진행 중인 쓰기를 복제한 다음, 테이블을 교체합니다. 애플리케이션 다운타임이 없습니다.
+
+### gh-ost (GitHub) {#gh-ost-github}
+
+```bash
+gh-ost \
+  --user=root --host=localhost \
+  --database=mydb --table=orders \
+  --alter="ADD COLUMN notes TEXT" \
+  --execute
+```
+
+`gh-ost`는 트리거 대신 바이너리 로그를 사용하므로 높은 쓰기 부하에서 더 안정적입니다. 트래픽이 많은 테이블에 선호되는 도구입니다.
+
+두 도구 모두 테이블에 기본 키가 있어야 합니다.
+
+## 마이그레이션 도구와 버전 관리 {#migration-tools-and-version-control}
+
+스키마 변경을 버전 관리되는 마이그레이션 파일로 추적하세요. 흔히 쓰는 도구:
+
+| 도구 | 언어 | 방식 |
+|:-----|:---------|:------|
+| Flyway | Java/모든 언어 | SQL 기반; 버전이 매겨진 파일 |
+| Liquibase | Java/모든 언어 | XML/YAML/SQL; 변경 세트 |
+| golang-migrate | Go | SQL 기반; 번호가 매겨진 파일 |
+| Alembic | Python | Python 또는 SQL; 모델에서 자동 생성 |
+
+각 도구는 데이터베이스에 마이그레이션 테이블을 유지하여 어떤 마이그레이션이 실행되었는지 추적하므로, 다시 실행해도 안전합니다.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 테이블을 잠그지 않고 열을 추가할 수 있나요? {#can-i-add-a-column-without-locking-the-table}
+
+null 허용 열을 어느 위치에든 추가하는 작업은 `ALGORITHM=INSTANT`를 사용하며 테이블 크기와 관계없이 밀리초 안에 완료됩니다(MySQL 8.0.29+). 그렇지 않다면 `ALGORITHM=INPLACE, LOCK=NONE`을 사용하거나, pt-osc 또는 gh-ost를 사용하세요.
+
+#### ALTER TABLE이 테이블을 잠글지 어떻게 확인하나요? {#how-do-i-check-if-an-alter-table-will-lock-my-table}
+
+문장에 `ALGORITHM=INPLACE, LOCK=NONE`을 추가하세요. MySQL은 가능하면 잠금 없이 실행하고, 불가능하면 오류를 반환합니다 — 어느 쪽이든 추측 없이 확정적인 답을 얻습니다:
+
+```sql
+-- If this succeeds, the index add won't lock the table
+ALTER TABLE orders ADD INDEX idx_customer (customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+프로덕션의 대형 테이블에 대해 확신이 없을 때는 먼저 테이블 사본에서 테스트하세요.
+
+#### 마이그레이션을 트랜잭션 안에서 실행해야 하나요? {#should-i-run-migrations-inside-a-transaction}
+
+DDL 문(`ALTER TABLE`, `CREATE INDEX`, `DROP TABLE`)은 MySQL에서 암시적 커밋을 일으킵니다 — 롤백할 수 없습니다. `BEGIN`/`COMMIT` 블록 안에서 실행해도 보호받지 못합니다. 트랜잭션 롤백에 의존하기보다 애플리케이션 수준에서 롤백 전략(이중 쓰기, 기능 플래그)을 계획하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `ALTER TABLE`이 프로덕션 트래픽을 차단 | 가능하면 `ALGORITHM=INSTANT`를 사용하고, 대형 테이블에는 pt-osc/gh-ost를 사용 |
+| `ERROR 1846: ALGORITHM=INSTANT is not supported` | 작업에 테이블 재구축이 필요 — `ALGORITHM=INPLACE` 또는 온라인 도구를 사용 |
+| pt-osc가 트리거 오류로 실패 | 테이블에 이미 트리거가 있음 — gh-ost(바이너리 로그 기반, 트리거 없음)를 사용 |
+| 마이그레이션이 두 번 실행됨 | 마이그레이션 도구의 추적 테이블이 동기화되지 않음 — 스키마 버전 테이블을 확인 |
+| 오래 실행되는 ALTER가 잠금을 보유 | `KILL <query_id>`로 종료하고 대신 온라인 도구를 사용 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 백업 전략](/ko/guides/backup-strategies) — 마이그레이션 전에 항상 백업하기
+- [MySQL의 트랜잭션](/ko/guides/transactions) — MySQL에서 어떤 마이그레이션 작업이 트랜잭션에 포함되는지
+- [MySQL의 테이블 파티셔닝](/ko/guides/table-partitioning) — 파티셔닝 변경도 스키마 마이그레이션입니다
+- [ORM과 함께 MySQL 사용하기: Django, Rails, Prisma](/ko/guides/mysql-with-orms) — ORM이 생성한 DDL을 안전하게 적용하기

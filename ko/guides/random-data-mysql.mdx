@@ -1,0 +1,142 @@
+---
+title: "MySQL의 랜덤 데이터 생성"
+sidebarTitle: "랜덤 데이터 생성하기"
+description: "MySQL에서 랜덤 데이터를 생성하는 방법 — RAND(), RANDOM_BYTES(), VillageSQL의 gen_random_bytes()를 사용해 암호학적으로 안전한 바이트, 랜덤 UUID, 테스트 데이터를 만듭니다."
+keywords: "mysql random data, mysql generate random bytes, mysql random uuid, mysql random token, mysql random test data, mysql gen_random_bytes"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL의 `RAND()`는 쿼리 결과 섞기 같은 용도로 의사 난수를 생성합니다. 암호학적으로 안전하지 않은데, 토큰, 솔트, 논스를 생성할 때는 그것이 중요합니다. `RANDOM_BYTES()`가 그 빈틈을 메우고, VillageSQL의 `vsql_crypto` 확장은 통합 암호화 API의 일부로 `gen_random_bytes()`와 `gen_random_uuid()`를 추가합니다.
+
+## MySQL의 랜덤 함수 {#mysqls-random-functions}
+
+MySQL은 목적이 매우 다른 두 가지 내장 랜덤 함수를 제공합니다:
+
+**`RAND()`** — 0과 1 사이의 의사 난수 실수를 반환합니다. 빠르고 보안과 무관한 용도에 적합합니다: 무작위 쿼리 결과, 가중 샘플링, 무작위 행 선택. 암호학적으로 안전하지 않습니다.
+
+```sql
+-- Shuffle query results
+SELECT * FROM products ORDER BY RAND() LIMIT 10;
+
+-- Random integer in a range
+SELECT FLOOR(RAND() * 100) AS random_0_to_99;
+```
+
+**`RANDOM_BYTES(n)`** — 암호학적으로 안전한 랜덤 바이트 `n`개를 `VARBINARY`로 반환합니다. 토큰, 솔트, 논스, 키에 이것을 사용하세요.
+
+```sql
+-- 16-byte cryptographic token
+SELECT HEX(RANDOM_BYTES(16)) AS token;
+
+-- Use as a session token
+INSERT INTO sessions (token, user_id, expires_at)
+VALUES (RANDOM_BYTES(32), 42, NOW() + INTERVAL 7 DAY);
+```
+
+## VillageSQL에서: gen_random_bytes()와 gen_random_uuid() {#with-villagesql-gen_random_bytes-and-gen_random_uuid}
+
+VillageSQL의 `vsql_crypto` 확장은 `gen_random_bytes()`와 `gen_random_uuid()`를 추가하며, 이들은 OpenSSL의 `RAND_bytes()` — `RANDOM_BYTES()`와 같은 엔트로피 소스 — 를 사용합니다.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+내장 함수 대신 이것들을 쓰는 주된 이유는 일관성입니다: 이미 `vsql_crypto`의 `digest()`, `hmac()`, 또는 `encrypt()`를 사용하고 있다면, 모든 암호화 작업을 하나의 확장에 두는 것이 업그레이드와 감사를 단순하게 만듭니다.
+
+```sql
+-- Cryptographically secure random bytes
+SELECT HEX(gen_random_bytes(16)) AS token_hex;
+SELECT HEX(gen_random_bytes(32)) AS session_key;
+
+-- Verify length
+SELECT LENGTH(gen_random_bytes(24));  -- Returns 24
+
+-- Random UUID v4
+SELECT gen_random_uuid();
+-- Returns: 'de2ae351-fc1b-4182-b6a5-72d11a341dc3' (different every call)
+```
+
+### 테스트 데이터 생성하기 {#generating-test-data}
+
+랜덤 함수는 테스트 테이블을 시딩할 때 유용합니다:
+
+```sql
+-- Insert 1000 rows of test data. WITH RECURSIVE must immediately precede
+-- the SELECT it attaches to, so it goes after the INSERT's column list.
+INSERT INTO test_users (username, email, score, token)
+WITH RECURSIVE n AS (
+    SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 1000
+)
+SELECT
+    CONCAT('user_', i),
+    CONCAT('user', i, '@example.com'),
+    FLOOR(RAND() * 100),
+    gen_random_bytes(16)
+FROM n;
+```
+
+### 일회용 토큰과 초대 코드 {#one-time-tokens-and-invite-codes}
+
+```sql
+CREATE TABLE invites (
+    token     VARBINARY(32) PRIMARY KEY,
+    email     VARCHAR(255),
+    used      TINYINT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO invites (token, email)
+VALUES (gen_random_bytes(32), 'newuser@example.com');
+
+-- Return token as hex for use in a URL
+SELECT HEX(token) AS invite_link, email FROM invites WHERE used = 0;
+```
+
+## 올바른 함수 선택하기 {#choosing-the-right-function}
+
+| 함수 | 출력 | 암호학적으로 안전 | 사용 시점 |
+|:---|:---|:---|:---|
+| `RAND()` | 실수 0–1 | 아니요 | 섞기, 샘플링, 가중 선택 |
+| `FLOOR(RAND() * n)` | 정수 0–(n-1) | 아니요 | 테스트 데이터용 무작위 정수 |
+| `RANDOM_BYTES(n)` | VARBINARY | 예 | 토큰, 논스, 솔트 — MySQL 내장 |
+| `gen_random_bytes(n)` | VARBINARY | 예 | RANDOM_BYTES와 동일, vsql_crypto API와 통합 |
+| `gen_random_uuid()` | VARCHAR(UUID 문자열) | 예 | 문자열 형태의 UUID v4 — vsql_uuid 불필요 |
+
+`RANDOM_BYTES()`와 `gen_random_bytes()`는 기능적으로 동등합니다 — 둘 다 같은 품질의 무작위성을 반환합니다. 이미 `vsql_crypto`를 사용하고 있다면, 암호화 표면을 한곳에 두기 위해 `gen_random_bytes()`를 사용하세요. 랜덤 바이트만 필요하고 다른 것은 필요 없다면 MySQL의 `RANDOM_BYTES()`로 충분합니다.
+
+정렬 가능한 변형(v7)과 바이너리 저장을 갖춘 UUID 타입이 필요하면 `gen_random_uuid()` 대신 `vsql_uuid` 확장을 사용하세요. 전체 비교는 [MySQL의 UUID](/ko/guides/uuids)를 보세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### RAND()는 토큰 생성에 안전한가요? {#is-rand-safe-for-generating-tokens}
+
+아니요. `RAND()`는 예측 가능한 상태에서 시드된 의사 난수 생성기입니다. `ORDER BY RAND()`와 비슷한 보안과 무관한 용도에는 괜찮지만, `RAND()`로 생성한 토큰은 이론적으로 예측될 수 있습니다. 보안에 민감한 모든 것에는 `RANDOM_BYTES()` 또는 `gen_random_bytes()`를 사용하세요.
+
+#### 안전한 토큰에 몇 바이트가 필요한가요? {#how-many-bytes-do-i-need-for-a-secure-token}
+
+세션 토큰과 API 키에는 32바이트(256비트)가 표준입니다. 16바이트(128비트)는 실용적인 보안의 최소값입니다. 안전하게 32를 사용하세요.
+
+#### gen_random_bytes()를 DEFAULT로 사용할 수 있나요? {#can-i-use-gen_random_bytes-as-a-default}
+
+아니요. MySQL 자체는 DEFAULT 표현식에 비결정론적 함수를 허용합니다 — `UUID()`, `RAND()`, `NOW()` 모두 거기서 동작합니다. `gen_random_bytes()`는 비결정론적 함수로 등록된 VillageSQL 확장 함수라는 바로 그 이유로 거부되며, VEF는 MySQL 자체가 무엇을 허용하든 DEFAULT 표현식에서 그런 함수를 차단합니다. 대신 각 INSERT 문에서 값을 생성하세요.
+
+#### gen_random_uuid()와 vsql_uuid의 UUID_V4()의 차이는 무엇인가요? {#whats-the-difference-between-gen_random_uuid-and-uuid_v4-from-vsql_uuid}
+
+`gen_random_uuid()`는 `VARCHAR` UUID 문자열을 반환합니다. `vsql_uuid` 확장의 `UUID_V4()`는 16바이트 바이너리 저장을 갖춘 네이티브 `UUID` 타입을 반환합니다. UUID를 기본 키로 사용한다면 `vsql_uuid`의 `UUID_V4()` 또는 `UUID_V7()`을 선호하세요. UUID 문자열이 필요하고 별도의 확장을 설치하고 싶지 않을 때 `gen_random_uuid()`를 사용하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.gen_random_bytes does not exist` | `INSTALL EXTENSION vsql_crypto`를 실행 |
+| 토큰이 순차적이거나 예측 가능해 보임 | `gen_random_bytes()` 대신 `RAND()`를 사용하고 있을 수 있음 |
+| `gen_random_bytes()`가 NULL을 반환 | 인수가 양의 정수인지 확인 |
+| `DEFAULT (gen_random_bytes(32))`가 거부됨 | MySQL은 비결정론적 기본값을 허용하지 않음 — 각 INSERT에서 생성 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 비밀번호 해싱](/ko/guides/password-hashing) — 자격 증명 저장을 위한 솔트로 랜덤 바이트 사용하기
+- [MySQL의 UUID](/ko/guides/uuids) — UUID v4는 암호학적 무작위성의 흔한 용도

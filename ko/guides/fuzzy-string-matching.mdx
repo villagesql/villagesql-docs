@@ -1,0 +1,189 @@
+---
+title: "MySQL에서 음성 매칭과 편집 거리"
+sidebarTitle: "퍼지 문자열 매칭"
+description: "VillageSQL의 vsql_fuzzystrmatch 확장을 사용하여 MySQL에서 소리와 편집 거리로 문자열을 매칭하는 방법 — Soundex, Levenshtein, Metaphone, Double Metaphone."
+keywords: "mysql soundex, mysql levenshtein, mysql metaphone, mysql phonetic matching, mysql edit distance, vsql_fuzzystrmatch, mysql name matching"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  이 가이드는 VillageSQL 0.0.4 이상이 필요합니다.
+</Note>
+
+같은 대상을 가리키는 두 문자열 — 사람 이름, 회사, 장소 — 은 실제로는 서로 다르게 보이는 경우가 많습니다. 철자 오류, 음역, 전사 오류, 지역별 변형은 모두 `=`와 `LIKE`가 놓치는 변형을 만들어 냅니다. VillageSQL의 `vsql_fuzzystrmatch` 확장은 네 가지 접근 방식을 제공합니다: Soundex(유사 발음 그룹화), Levenshtein 편집 거리(문자 단위 비용), Metaphone(발음 기반 인코딩), Double Metaphone(여러 언어적 기원에서 오는 모호한 발음 처리).
+
+## 설치 {#installation}
+
+```sql
+INSTALL EXTENSION vsql_fuzzystrmatch;
+```
+
+함수는 한정자 없이 동작합니다. 소유 확장의 이름으로 한정하여 `vsql_fuzzystrmatch.soundex(...)`처럼 호출할 수도 있습니다. 이것은 VEF 이름 해석이며 실제 스키마가 아니므로, `vsql_fuzzystrmatch`는 `SHOW DATABASES`에 나타나지 않습니다. 모든 함수는 인자 중 하나라도 NULL이면 NULL을 반환합니다.
+
+## Soundex {#soundex}
+
+Soundex는 영어 단어를 소리를 기준으로 4자 코드로 축약합니다. 같은 코드를 가진 단어는 음성적으로 일치하는 것으로 간주됩니다.
+
+```sql
+SELECT vsql_fuzzystrmatch.soundex('Robert');   -- R163
+SELECT vsql_fuzzystrmatch.soundex('Rupert');   -- R163
+SELECT vsql_fuzzystrmatch.soundex('Smith');    -- S530
+SELECT vsql_fuzzystrmatch.soundex('Smythe');   -- S530
+```
+
+`difference`는 두 문자열이 공유하는 Soundex 코드 문자 수를 0–4 점수로 반환합니다. 4 = 동일한 코드입니다.
+
+```sql
+SELECT vsql_fuzzystrmatch.difference('Robert', 'Rupert');   -- 4
+SELECT vsql_fuzzystrmatch.difference('Robert', 'Sylvia');   -- 0
+```
+
+**Soundex를 사용할 때:** 간단한 유사 발음 그룹화가 필요하고 데이터가 주로 영어 이름일 때입니다. 빠르고 설명하기 쉽지만, 관련 없는 이름을 하나로 묶을 수 있고 영어가 아닌 발음은 놓칩니다.
+
+### 테이블에서 음성 일치 찾기 {#finding-phonetic-matches-in-a-table}
+
+```sql
+SELECT name
+FROM customers
+WHERE vsql_fuzzystrmatch.soundex(name) = vsql_fuzzystrmatch.soundex('Smith')
+ORDER BY name;
+```
+
+음성적으로 가까운(반드시 동일한 코드일 필요는 없는) 모든 이름을 찾으려면:
+
+```sql
+SELECT name, vsql_fuzzystrmatch.difference(name, 'Johnson') AS score
+FROM customers
+WHERE vsql_fuzzystrmatch.difference(name, 'Johnson') >= 3
+ORDER BY score DESC;
+```
+
+## Levenshtein 편집 거리 {#levenshtein-edit-distance}
+
+Levenshtein은 한 문자열을 다른 문자열로 바꾸는 데 필요한 단일 문자 편집 — 삽입, 삭제, 치환 — 의 최소 횟수를 셉니다.
+
+```sql
+SELECT vsql_fuzzystrmatch.levenshtein('kitten', 'sitting');   -- 3
+SELECT vsql_fuzzystrmatch.levenshtein('mysql', 'mysql');      -- 0
+SELECT vsql_fuzzystrmatch.levenshtein('abc', 'xyz');          -- 3
+```
+
+**편집 거리를 사용할 때:** 적은 수의 오타만 다른 문자열을 매칭하고 싶고, 거리 임계값을 정밀하게 제어하고 싶을 때입니다.
+
+### 사용자 정의 연산 비용 {#custom-operation-costs}
+
+`levenshtein_cost`를 사용하면 삽입, 삭제, 치환에 서로 다른 가중치를 줄 수 있습니다:
+
+```sql
+-- Substitutions cost 2, insertions and deletions cost 1
+SELECT vsql_fuzzystrmatch.levenshtein_cost('abc', 'xyz', 1, 1, 2);  -- 6
+```
+
+### 조기 종료 임계값 {#early-exit-threshold}
+
+`levenshtein_less_equal`은 거리가 임계값을 초과하면 계산을 중단하므로 필터링에 더 효율적입니다. 실제 거리가 `max_d`를 초과하면 전체 거리를 계산하는 대신 `max_d + 1`을 반환합니다:
+
+```sql
+-- Distance is 3, max_d is 5: returns real distance
+SELECT vsql_fuzzystrmatch.levenshtein_less_equal('kitten', 'sitting', 5);   -- 3
+
+-- Distance is 3, max_d is 2: cap fires, returns max_d + 1
+SELECT vsql_fuzzystrmatch.levenshtein_less_equal('abc', 'xyz', 2);          -- 3 (= max_d + 1)
+```
+
+사용자 정의 비용과 결합하면:
+
+```sql
+SELECT vsql_fuzzystrmatch.levenshtein_less_equal_cost('abc', 'xyz', 1, 1, 1, 2);  -- 3
+```
+
+두 입력 문자열은 모두 255자 이하여야 합니다. 비용은 음수가 아니어야 합니다.
+
+### 편집 거리로 중복 제거 {#deduplication-by-edit-distance}
+
+```sql
+SELECT a.name, b.name, vsql_fuzzystrmatch.levenshtein(a.name, b.name) AS dist
+FROM companies a
+JOIN companies b ON a.id < b.id
+WHERE vsql_fuzzystrmatch.levenshtein_less_equal(a.name, b.name, 2) <= 2
+ORDER BY dist;
+```
+
+## Metaphone {#metaphone}
+
+Metaphone은 Soundex보다 더 많은 영어 발음 규칙을 적용하며 가변 길이 출력을 생성합니다. `max_output_length` 매개변수가 결과 길이를 제한합니다.
+
+```sql
+SELECT vsql_fuzzystrmatch.metaphone('Robert', 10);    -- RBRT
+SELECT vsql_fuzzystrmatch.metaphone('Thompson', 10);  -- 0MPSN
+SELECT vsql_fuzzystrmatch.metaphone('Robert', 2);     -- RB  (truncated)
+```
+
+**Metaphone을 사용할 때:** Soundex가 너무 많은 거짓 양성을 내거나 덜 흔한 이름의 일치를 놓칠 때입니다. 더 많은 발음 패턴(TH → 0, 묵음 등)을 처리합니다.
+
+## Double Metaphone {#double-metaphone}
+
+Double Metaphone은 여러 언어적 기원에서 오는 모호한 발음을 처리합니다 — 독일어, 슬라브어, 스페인어, 히브리어 등에서 유래하여 서로 다른 방식으로 영어화된 이름들입니다. 기본 코드와 대체 코드, 두 개의 코드를 생성합니다.
+
+```sql
+SELECT vsql_fuzzystrmatch.dmetaphone('Robert');      -- RPRT
+SELECT vsql_fuzzystrmatch.dmetaphone_alt('Robert');  -- RPRT  (no alternate)
+
+SELECT vsql_fuzzystrmatch.dmetaphone('Schmidt');     -- XMT
+SELECT vsql_fuzzystrmatch.dmetaphone_alt('Schmidt'); -- SMT   (alternate pronunciation)
+```
+
+대체 코드가 없으면 `dmetaphone_alt`는 기본 코드를 반환합니다.
+
+**Double Metaphone을 사용할 때:** 데이터에 여러 언어적 배경의 이름이 포함되어 있거나, 사람이라면 동등하다고 볼 일치를 Metaphone이 놓칠 때입니다.
+
+### 두 코드 모두로 매칭 {#matching-with-both-codes}
+
+```sql
+-- Match if either the primary or alternate code aligns
+SELECT name
+FROM customers
+WHERE vsql_fuzzystrmatch.dmetaphone(name) = vsql_fuzzystrmatch.dmetaphone('Schmidt')
+   OR vsql_fuzzystrmatch.dmetaphone_alt(name) = vsql_fuzzystrmatch.dmetaphone('Schmidt')
+   OR vsql_fuzzystrmatch.dmetaphone(name) = vsql_fuzzystrmatch.dmetaphone_alt('Schmidt');
+```
+
+## 접근 방식 선택 {#choosing-an-approach}
+
+| 상황 | 권장 접근 방식 |
+|---|---|
+| 영어 이름의 유사 발음 그룹화 | Soundex |
+| 거리 예산을 둔 오타 허용 | Levenshtein |
+| Soundex보다 나은 영어 음성 처리 | Metaphone |
+| 여러 언어적 배경의 이름 | Double Metaphone |
+| 임계값이 아닌 유사도 점수 | [trgm_similarity](/ko/guides/trigram-similarity) |
+
+## 함수 참조 {#function-reference}
+
+| 함수 | 반환 | 비고 |
+|---|---|---|
+| `soundex(text)` | TEXT | 4자 Soundex 코드 |
+| `difference(text, text)` | INT | 0–4 Soundex 중첩 점수 |
+| `levenshtein(s, t)` | INT | 편집 거리, 모든 연산 비용 1 |
+| `levenshtein_cost(s, t, ins, del, sub)` | INT | 사용자 정의 비용의 편집 거리 |
+| `levenshtein_less_equal(s, t, max_d)` | INT | max_d 이하이면 거리, 아니면 max_d+1 |
+| `levenshtein_less_equal_cost(s, t, ins, del, sub, max_d)` | INT | 사용자 정의 비용 + 조기 종료 |
+| `metaphone(text, max_len)` | TEXT | max_len으로 잘린 Metaphone 코드 |
+| `dmetaphone(text)` | TEXT | Double Metaphone 기본 코드 |
+| `dmetaphone_alt(text)` | TEXT | Double Metaphone 대체 코드 |
+
+## 알려진 제한 사항 {#known-limitations}
+
+**함수 오버로딩 없음.** VEF는 함수를 이름으로만 등록하므로, 같은 이름의 두 함수는 공존할 수 없습니다. PostgreSQL이 오버로드(인자 2개와 5개의 `levenshtein`)를 사용하는 곳에서, 이 확장은 별도의 이름(`levenshtein`과 `levenshtein_cost`)을 사용합니다.
+
+**문자열 길이 제한.** `levenshtein` 입력은 255자 이하여야 합니다.
+
+## 참고 {#see-also}
+
+- [MySQL에서 트라이그램 유사도로 유사한 문자열 찾기](/ko/guides/trigram-similarity)
+- [MySQL에서 전문 검색 구현하기](/ko/guides/full-text-search)
+- [SQL에서 문자열 조작과 변환](/ko/guides/string-functions)
+- [MySQL REGEXP](/ko/tutorial/regexp)

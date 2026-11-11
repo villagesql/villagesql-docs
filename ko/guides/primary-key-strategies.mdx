@@ -1,0 +1,157 @@
+---
+title: "MySQL의 기본 키 전략 선택하기"
+sidebarTitle: "기본 키 선택하기"
+description: "MySQL의 AUTO_INCREMENT, BINARY(16) UUID, 네이티브 UUID 타입을 비교합니다 — 각각이 적합한 경우와 나중에 발목을 잡는 트레이드오프를 피하는 방법입니다."
+keywords: "mysql primary key strategy, auto increment vs uuid mysql, mysql uuid primary key, mysql uuid binary, mysql distributed primary key, mysql uuid v7"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+기본 키 결정은 되돌리기 어렵습니다. 초기의 잘못된 선택 — 예를 들어 외래 키가 열두 개 테이블에 흩어진 뒤에 `INT AUTO_INCREMENT`에서 벗어나는 스키마 마이그레이션 — 은 고통스럽습니다. 이 가이드는 세 가지 주요 접근 방식, 각각이 올바른 도구인 경우, 그리고 VillageSQL이 여기에 더하는 것을 다룹니다.
+
+## MySQL의 기본값: AUTO_INCREMENT {#the-mysql-default-auto_increment}
+
+`AUTO_INCREMENT` 정수가 기본값인 데는 이유가 있습니다. 작고(4 또는 8바이트), 삽입이 빠르고, 자연스럽게 정렬되며, 디버거나 로그 파일에서 바로 사람이 읽을 수 있습니다.
+
+```sql
+CREATE TABLE orders (
+    id     BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+InnoDB의 클러스터형 인덱스는 행을 기본 키 순서로 저장합니다. 자동 증가 키에서는 모든 새 행이 B-트리의 끝에 들어갑니다. 즉 페이지 분할도, 인덱스 단편화도 없고, 순차 삽입이 빠릅니다. 대부분의 단일 데이터베이스 애플리케이션에서는 이것이 올바른 선택입니다.
+
+`AUTO_INCREMENT`의 문제는 확장하거나 통합할 때 드러납니다:
+
+- **행 수 노출**: 순차 ID는 `SELECT COUNT(*)`를 실행한 것처럼 API 클라이언트에게 주문이 몇 개 있는지 알려줍니다. URL의 순차 ID는 사용자가 레코드를 열거할 수 있게 합니다.
+- **분산 생성**: 여러 쓰기 노드에서 고유 ID를 생성하려면 조정이 필요합니다 — 시퀀스 서버, 지정된 쓰기 노드, 또는 수동 ID 범위.
+- **데이터 병합**: 서로 다른 데이터베이스의 두 테이블을 병합하면 ID 충돌이 생깁니다. 번호를 다시 매겨야 합니다.
+
+이 중 아무것도 해당하지 않으면 `AUTO_INCREMENT`가 아마 올바른 답입니다. 그대로 두세요.
+
+## 전역적으로 고유한 ID가 필요할 때 {#when-you-need-globally-unique-ids}
+
+표준 해법은 UUID입니다: 어떤 노드에서든 조정 없이 독립적으로 생성할 수 있고 실제로는 충돌하지 않는 128비트 무작위 식별자입니다.
+
+MySQL 내장 `UUID()`는 v1 UUID를 `CHAR(36)` 문자열로 반환합니다. 그대로 저장할 수 있지만 비용이 있습니다: `CHAR(36)`은 바이너리 등가물의 16바이트에 비해 36바이트이고, 무작위 UUID(v4)는 새 행이 인덱스 끝에 들어가지 않고 — 아무 데나 들어가서 페이지 분할을 강제하므로 — InnoDB 인덱스 단편화를 일으킵니다.
+
+표준 우회책은 수동 변환을 동반한 `BINARY(16)`입니다:
+
+```sql
+CREATE TABLE orders (
+    id      BINARY(16) PRIMARY KEY,
+    user_id INT NOT NULL,
+    placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert: convert string UUID to binary at write time
+INSERT INTO orders (id, user_id)
+VALUES (UUID_TO_BIN(UUID(), 1), 101);
+
+-- Read: convert back to readable format
+SELECT BIN_TO_UUID(id, 1), user_id FROM orders;
+```
+
+`UUID_TO_BIN()`의 `1` 플래그는 v1 UUID가 시간순으로 정렬되도록 타임스탬프 비트를 재배열합니다. 이는 특히 v1 UUID의 단편화를 줄이지만, 수동 인코딩/디코딩이 모든 쿼리에 마찰을 더합니다.
+
+## VillageSQL에서: 네이티브 UUID 타입과 정렬 가능한 버전 {#with-villagesql-native-uuid-type-and-sortable-versions}
+
+VillageSQL의 `vsql_uuid` 확장은 네이티브 `UUID` 열 타입과 UUID v1부터 v7까지의 생성 함수를 추가합니다. 수동 인코딩/디코딩이 없고, UUID v7은 삽입 단편화 문제를 깔끔하게 해결합니다.
+
+```sql
+INSTALL EXTENSION vsql_uuid;
+```
+
+```sql
+CREATE TABLE orders (
+    id      UUID PRIMARY KEY,
+    user_id INT NOT NULL,
+    placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- UUID_V7 embeds a Unix timestamp in the high bits —
+-- new values are always larger, so inserts always append to the index
+INSERT INTO orders (id, user_id) VALUES (UUID_V7(), 101);
+INSERT INTO orders (id, user_id) VALUES (UUID_V7(), 102);
+
+-- ORDER BY id is roughly chronological — v7 embeds a millisecond timestamp
+SELECT user_id, placed_at FROM orders ORDER BY id;
+
+-- The timestamp is recoverable as a datetime or Unix epoch
+SELECT UUID_TIMESTAMP(id), UUID_EPOCH(id), user_id FROM orders;
+```
+
+`UUID` 타입은 디스크에 16바이트를 저장하고 표준 36자 문자열 형식으로 자동 표시됩니다. 쿼리에 `UUID_TO_BIN`이나 `BIN_TO_UUID`가 없습니다.
+
+결정론적 ID — 같은 입력이 항상 같은 UUID를 만드는 — 가 필요하면 v3 또는 v5를 사용하세요:
+
+```sql
+-- Deterministic UUID from a namespace + name (useful for idempotent imports)
+-- UUID_NS_DNS() returns the RFC 9562 DNS namespace, so no literal is needed
+SELECT UUID_V5(UUID_NS_DNS(), 'user@example.com');
+```
+
+UUID 저장 메커니즘과 삽입 단편화 문제에 대한 자세한 내용은 [MySQL의 UUID](/ko/guides/uuids)를 보세요.
+
+### UUID 버전 참조 {#uuid-version-reference}
+
+| 버전 | 정렬 가능 | 사용 시점 |
+|:---|:---|:---|
+| `UUID_V4()` | 아니요 | 범용 무작위 ID, 낮은 삽입량 |
+| `UUID_V7()` | 예 | 기본 키, 높은 삽입량 — 권장 기본값 |
+| `UUID_V6()` | 예 | 정렬된 출력이 필요한 v1 시스템의 대체재 — v1의 타임스탬프 비트를 상위 위치로 재배열 |
+| `UUID_V1()` | 아니요 | 레거시 호환성 — v1은 타임스탬프를 포함하지만 정렬 불가능한 비트 순서 |
+| `UUID_V3()` | 아니요 | 네임스페이스 + 이름에서 결정론적 ID(MD5) |
+| `UUID_V5()` | 아니요 | 네임스페이스 + 이름에서 결정론적 ID(SHA-1) |
+
+추가 함수: `UUID_IS_VALID(string)`은 NULL이 아닌 문자열이 올바른 형식의 UUID인지에 따라 1 또는 0을 반환하고, 인수 자체가 NULL이면 NULL을 반환합니다. 텍스트를 받고 절대 오류를 일으키지 않으므로, 외부 시스템에서 들어오는 ID에 바로 원하는 것입니다. `UUID_VERSION(uuid)`은 버전 번호를 반환하며, 이미 `UUID`로 저장된 ID를 라우팅할 때 쓰입니다. `UUID_COMPARE(uuid1, uuid2)`는 명시적 사전순 비교를 위해 -1, 0, 또는 1을 반환합니다.
+
+## 전략 선택하기 {#choosing-a-strategy}
+
+| 전략 | 사용 시점 | 주의할 점 |
+|:---|:---|:---|
+| `BIGINT AUTO_INCREMENT` | 단일 데이터베이스 앱, 내부 ID, 높은 삽입량 | 행 수를 노출; 데이터베이스 간 병합 불가 |
+| `BINARY(16)` + `UUID_TO_BIN` | VillageSQL 의존성 없는 이식 가능한 UUID | 모든 쿼리에서 수동 인코딩/디코딩; 단편화를 줄이려면 `UUID_TO_BIN(UUID(), 1)` 사용 |
+| 네이티브 `UUID` + `UUID_V7()` | 분산 시스템, 공개 ID, 병합에 안전한 스키마 | VillageSQL 필요; 정수의 4–8바이트 대비 16바이트 |
+| 복합 자연 키 | 비즈니스 데이터에서 파생된 ID(국가 + 코드 등) | 넓은 키는 조인과 외래 키를 느리게 함; 비즈니스 데이터가 바뀌면 위험 |
+
+새 프로젝트를 시작하는 대부분의 팀에게는: 내부 테이블에는 `BIGINT AUTO_INCREMENT`, 공개 ID가 있거나 시스템 간에 병합될 수 있는 데이터가 있는 테이블에는 `UUID_V7()`을 쓰는 네이티브 `UUID`입니다.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### UUID_V7과 UUID_V4 중 언제 무엇을 사용해야 하나요? {#when-should-i-use-uuid_v7-vs-uuid_v4}
+
+쓰기가 많은 테이블의 기본 키에는 `UUID_V7()`을 사용하세요. 상위 비트에 타임스탬프를 포함하므로 새 UUID는 항상 기존 것 뒤에 정렬됩니다 — 이것이 InnoDB가 삽입 시 인덱스 페이지를 분할하지 않게 합니다. `UUID_V4()`는 순서 의미가 없는 무작위 ID가 필요할 때만(예: 일회용 토큰) 사용하세요.
+
+#### UUID를 DEFAULT 표현식으로 사용할 수 있나요? {#can-i-use-uuid-as-a-default-expression}
+
+MySQL 자체는 `UUID()`, `RAND()`, `NOW()` 같은 비결정론적 함수를 `DEFAULT` 표현식에 허용합니다. 진짜 제한은 VillageSQL 고유의 것입니다: 비결정론적으로 등록된 확장 함수 — `UUID_V7()` 같은 — 는 `DEFAULT` 표현식에서 차단되지만, `UUID_V3()`/`UUID_V5()` 같은 결정론적 함수는 허용됩니다. 그러나 그 허용은 여기서 기본 키에 유용하지 않습니다: `UUID_V3()`/`UUID_V5()`는 `DEFAULT` 표현식에서 고정된 인수를 받으므로(`DEFAULT`는 다른 열을 읽을 수 없음), 모든 행이 동일한 UUID를 받습니다 — 두 번째 `INSERT`가 기본 키에서 첫 번째와 충돌합니다. 대신 각 `INSERT` 문에서 `UUID_V7()`을 생성하세요.
+
+#### 외래 키에도 UUID를 사용해야 하나요? {#should-i-use-uuid-for-foreign-keys-too}
+
+예, 하지만 저장 비용을 알아 두세요: UUID 외래 키는 참조하는 테이블에서 행당 16바이트로, 정수의 4–8바이트와 비교됩니다. 수백만 행과 여러 UUID 외래 키가 있는 테이블에서는 이것이 쌓입니다. 순수한 내부 참조에는 `AUTO_INCREMENT` + 정수 외래 키가 더 가볍습니다.
+
+#### UUID_V3과 UUID_V5의 차이는 무엇인가요? {#whats-the-difference-between-uuid_v3-and-uuid_v5}
+
+둘 다 네임스페이스와 이름에서 결정론적 UUID를 생성합니다 — 같은 입력은 항상 같은 출력을 만듭니다. v3은 MD5를, v5는 SHA-1을 사용합니다. SHA-1이 조금 더 강하므로 새 코드에는 v5를 선호하세요. v3을 사용하는 시스템이 생성한 ID와 맞춰야 할 때만 v3을 사용하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.UUID_V7 does not exist` | `INSTALL EXTENSION vsql_uuid`를 실행 |
+| `DEFAULT (UUID_V7())`이 거부됨 | MySQL은 비결정론적 기본값을 허용하지 않음 — 각 INSERT에서 UUID를 생성 |
+| UUID 기본 키가 예상보다 느림 | `UUID_V4()`가 아니라 `UUID_V7()`을 사용하고 있는지 확인. 무작위 UUID는 B-트리 페이지 분할을 일으킴. |
+| `Extension vsql_uuid is already installed` | 이미 설치됨 — 조치 불필요 |
+| UUID FK 조인이 `ERROR 3219: Unable to implicitly cast a non-custom type during compare with a custom type in =`로 실패 | 양쪽 모두 네이티브 `UUID` 타입이어야 함. `UUID` 열을 `CHAR(36)`/`VARCHAR` UUID 문자열과 조인하면 조용히 불일치하는 대신 이 오류가 발생 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 UUID](/ko/guides/uuids) — MySQL의 UUID 버전과 저장에 대한 심층 설명
+- [InnoDB가 데이터를 저장하는 방식](/ko/guides/innodb-storage) — 기본 키 선택이 물리적 저장 배치에 영향을 주는 이유
+- [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes) — 기본 키는 항상 클러스터형 B-트리 인덱스
+- [MySQL의 페이지네이션: 키셋 대 OFFSET](/ko/guides/pagination) — 키는 페이지네이션 커서 역할도 함

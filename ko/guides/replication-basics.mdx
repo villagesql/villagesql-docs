@@ -1,0 +1,212 @@
+---
+title: "MySQL 복제 기초"
+sidebarTitle: "복제 구성하기"
+description: "MySQL 복제의 동작 방식: 소스와 복제본 구성, 바이너리 로그 기반 복제, GTID 복제, 복제 지연, SHOW REPLICA STATUS로 모니터링, 흔한 복제 문제입니다."
+keywords: "mysql replication, mysql replica setup, mysql gtid replication, mysql replication lag, mysql show replica status, mysql source replica, mysql binlog replication, mysql replication tutorial"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 복제는 한 서버(소스)의 변경을 하나 이상의 서버(복제본)로 복사합니다. 소스는 모든 변경을 바이너리 로그에 쓰고, 각 복제본은 그 로그를 읽어 변경을 재생합니다. 복제는 읽기 확장, 고가용성, 지리적 분산의 기반입니다.
+
+## 복제의 동작 방식 {#how-replication-works}
+
+1. 소스가 트랜잭션을 커밋하고 바이너리 로그에 씁니다.
+2. 복제본의 I/O 스레드가 소스에 연결해 새 binlog 이벤트를 읽고 로컬 릴레이 로그에 씁니다.
+3. 복제본의 SQL 스레드가 릴레이 로그에서 읽어 각 이벤트를 실행합니다.
+
+이것은 기본적으로 비동기입니다 — 소스는 복제본이 수신을 확인하기를 기다리지 않습니다. 복제본은 소스보다 뒤처질 수 있습니다.
+
+## 복제본 구성하기 {#setting-up-a-replica}
+
+**소스에서** — `my.cnf`에서 바이너리 로깅을 활성화하고 고유한 서버 ID를 설정합니다:
+
+```ini
+[mysqld]
+server_id = 1
+log_bin = /var/log/mysql/mysql-bin
+binlog_format = ROW
+```
+
+복제 사용자를 만듭니다:
+
+```sql
+CREATE USER 'repl'@'%' IDENTIFIED BY 'repl_password';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+```
+
+`--source-data`와 함께 mysqldump로 일관된 스냅샷을 찍습니다:
+
+```bash
+mysqldump --single-transaction --source-data=1 --all-databases \
+  -u root -p > source_snapshot.sql
+```
+
+**복제본에서** — 다른 서버 ID를 설정합니다:
+
+```ini
+[mysqld]
+server_id = 2
+```
+
+스냅샷을 복원하고 복제를 시작합니다:
+
+```bash
+mysql -u root -p < source_snapshot.sql
+```
+
+```sql
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = '192.168.1.10',
+    SOURCE_USER = 'repl',
+    SOURCE_PASSWORD = 'repl_password',
+    SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;
+```
+
+`SOURCE_AUTO_POSITION = 1`은 GTID 기반 복제를 활성화합니다. GTID를 사용하지 않는다면 대신 `SOURCE_LOG_FILE`과 `SOURCE_LOG_POS`를 지정하세요(값은 스냅샷 파일 헤더에 있습니다).
+
+## GTID 복제 {#gtid-replication}
+
+전역 트랜잭션 식별자(GTID)는 커밋된 모든 트랜잭션에 고유한 ID를 부여합니다. 장애 조치와 복제본 구성을 더 단순하게 만듭니다 — binlog 파일 이름과 위치를 추적하는 대신, MySQL은 각 서버가 어떤 트랜잭션을 적용했는지 추적합니다.
+
+소스와 복제본 양쪽에서 GTID를 활성화합니다:
+
+```ini
+[mysqld]
+gtid_mode = ON
+enforce_gtid_consistency = ON
+```
+
+GTID가 활성화되면 `SOURCE_AUTO_POSITION = 1`만 있으면 됩니다 — MySQL이 복제본에 빠진 트랜잭션을 알아내 자동으로 재생합니다.
+
+## 복제 모니터링 {#monitoring-replication}
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+지켜볼 주요 필드:
+
+| 필드 | 의미 |
+|:------|:--------------|
+| `Replica_IO_Running` | `Yes` = I/O 스레드가 소스에 연결되어 읽는 중 |
+| `Replica_SQL_Running` | `Yes` = SQL 스레드가 이벤트를 적용하는 중 |
+| `Seconds_Behind_Source` | 초 단위 복제 지연(0 = 따라잡음) |
+| `Last_SQL_Error` | SQL 스레드를 멈춘 마지막 오류 |
+| `Executed_Gtid_Set` | 이 복제본이 적용한 GTID(GTID 모드) |
+
+복제가 동작하려면 `Replica_IO_Running`과 `Replica_SQL_Running` 둘 다 `Yes`여야 합니다.
+
+## 복제 지연 {#replication-lag}
+
+복제 지연은 복제본의 SQL 스레드가 소스의 쓰기 속도를 따라가지 못할 때 발생합니다. 흔한 원인:
+
+- **적용기 병렬성**: MySQL 8.4는 이미 기본적으로 이벤트를 병렬로 적용합니다 — `replica_parallel_workers`는 4이고 `replica_parallel_type`은 `LOGICAL_CLOCK`입니다. 복제본이 여전히 뒤처지면 워커 수를 올리세요:
+
+```sql
+SET GLOBAL replica_parallel_workers = 4;
+SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+```
+
+- **복제본에서 오래 실행되는 쿼리**: 행을 잠그는 쿼리가 SQL 스레드를 막습니다.
+- **네트워크 지연**: 느린 I/O 스레드 때문에 SQL 스레드가 할 일이 없어집니다.
+- **복제본의 디스크 I/O**: 릴레이 로그나 데이터 파일 동기화가 병목입니다.
+
+## 복제 아키텍처 {#replication-architectures}
+
+기본 구성 — 소스 하나와 하나 이상의 비동기 복제본 — 이 유일한 선택지는 아닙니다. MySQL은 일관성과 가용성의 트레이드오프가 서로 다른 여러 복제 아키텍처를 제공합니다.
+
+| 아키텍처 | 일관성 보장 | 장애 조치 | 쓰기 오버헤드 | 복잡도 |
+|:-------------|:---------------------|:---------|:--------------|:-----------|
+| **비동기 복제**(기본값) | 없음 — 복제본이 임의로 뒤처질 수 있음 | 수동; 일부 트랜잭션이 손실될 수 있음 | 최소 — 소스가 기다리지 않음 | 낮음 |
+| **반동기 복제** | 소스가 커밋하기 전에 최소 한 복제본이 이벤트를 수신 | 수동; 최대 한 트랜잭션 손실 | 각 쓰기에 ~1 RTT 추가 | 낮음–중간 |
+| **그룹 복제** | 커밋 전에 모든 멤버가 합의(다중 프라이머리 또는 단일 프라이머리) | 그룹 안에서 자동 | 더 높음 — 트랜잭션마다 합의 라운드 | 높음 |
+| **InnoDB Cluster** | 그룹 복제와 동일(그 위에 구축) | 클라이언트 장애 조치를 위한 MySQL Router와 함께 자동 | 그룹 복제와 동일 | 높음 |
+
+**각각을 사용할 때:**
+
+- **비동기 복제** — 약간의 지연이 허용되는 읽기 확장과 재해 복구 복제본에 올바른 기본값입니다.
+- **반동기** — 소스 장애에 대한 내구성 보험이 필요하지만 그룹 복제의 운영 복잡도를 감당할 수 없을 때. 쓰기 커밋마다 네트워크 왕복 ~1회를 더합니다.
+- **그룹 복제 / InnoDB Cluster** — 자동 장애 조치가 필요하고 쓰기 지연 증가를 감당할 수 있을 때. InnoDB Cluster는 더 쉬운 관리를 위해 그룹 복제를 MySQL Router와 MySQL Shell로 감쌉니다.
+
+참고: 그룹 복제는 모든 테이블이 InnoDB를 사용하고 기본 키를 가져야 합니다. `group_replication` 플러그인으로 활성화합니다; 설정은 이 가이드의 범위를 벗어납니다.
+
+## 복제본으로 읽기 확장 {#read-scaling-with-replicas}
+
+소스의 부하를 줄이기 위해 읽기가 많은 쿼리를 복제본으로 보내세요:
+
+```sql
+-- Application connects to replica for reads
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Connect to source for writes
+INSERT INTO orders (customer_id, total) VALUES (42, 99.99);
+```
+
+애플리케이션은 복제 지연을 견뎌야 합니다. 복제본에는 몇 밀리초 전에 소스에 삽입된 행이 아직 없을 수 있습니다. 최신 쓰기를 반영해야 하는 읽기는 소스에 연결하세요.
+
+## 복제 대 대안 {#replication-vs-alternatives}
+
+복제는 특정 문제를 잘 해결하고 다른 문제에는 잘못된 도구입니다. 복제를 도입하기 전에 실제로 맞는지 확인하세요.
+
+| 시나리오 | 복제 | 샤딩 | 읽기 복제본만 | 분산 DB(예: Vitess, TiDB) |
+|:---------|:-----------|:---------|:-------------------|:-------------------------------------|
+| 읽기가 많은 워크로드, 쓰기는 한 서버에 들어감 | 적합 | 과함 | 더 단순 — 복제본만 추가 | 과함 |
+| 쓰기량이 한 서버를 초과 | 도움 안 됨 — 모든 복제본이 모든 쓰기를 재생 | 적합 | 도움 안 됨 | 적합 |
+| HA / 자동 장애 조치 | 그룹 복제 또는 InnoDB Cluster 필요 | 직접 도움 안 됨 | 직접 도움 안 됨 | 내장 |
+| 지리적 분산 / 여러 리전에서 낮은 지연 읽기 | 지연 복제본이나 리전별 복제본으로 잘 동작 | 가능하지만 복잡 | 잘 동작 | 일부에 내장 |
+| 특정 시점 복구 | 좋음 — binlog가 PITR을 가능하게 함 | PITR을 복잡하게 만듦 | 좋음 | 다양함 |
+| 스키마가 테넌트/키로 잘 분할됨 | 동작하지만 복제본 쓰기 대역폭 낭비 | 더 적합 | 동작하지만 같은 낭비 | 적합 |
+| 엄격한 자신의 쓰기 읽기 일관성 필요 | 그 읽기에는 소스 사용 | 해당 없음 | 그 읽기에는 소스 사용 | 제품에 따라 다름 |
+
+**짧은 버전:** 한 서버가 모든 쓰기를 처리하고 읽기 확장, HA, 또는 웜 스탠바이(warm standby)가 필요할 때 복제가 올바른 선택입니다. 쓰기 처리량이 병목이라면 복제는 문제를 모든 복제본에 복사합니다 — 샤딩이나 분산 데이터베이스가 근원에서 그것을 해결합니다.
+
+## 복제 중지와 시작 {#stopping-and-starting-replication}
+
+```sql
+STOP REPLICA;           -- stop both threads
+STOP REPLICA IO_THREAD; -- stop only the I/O thread
+STOP REPLICA SQL_THREAD; -- stop only the SQL thread
+
+START REPLICA;
+```
+
+실패하는 이벤트 하나를 건너뛰려면(신중하게 사용하세요 — 이벤트를 건너뛰면 복제본이 소스와 달라집니다):
+
+```sql
+-- GTID mode: inject an empty transaction for the failed GTID
+SET GTID_NEXT = 'source_uuid:N';
+BEGIN; COMMIT;
+SET GTID_NEXT = 'AUTOMATIC';
+START REPLICA;
+```
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 복제는 MySQL 메이저 버전 간에 동작하나요? {#does-replication-work-across-mysql-major-versions}
+
+MySQL은 오래된 소스에서 새로운 복제본으로의 복제를 지원하지만, 그 반대는 지원하지 않습니다. 항상 소스를 업그레이드하기 전에 복제본을 업그레이드하세요.
+
+#### 반동기 복제와 비동기 복제의 차이는 무엇인가요? {#whats-the-difference-between-semi-synchronous-and-asynchronous-replication}
+
+비동기 복제(기본값)에서는 소스가 어떤 복제본의 수신 확인도 기다리지 않고 커밋합니다. 반동기 복제에서는 소스가 클라이언트에 반환하기 전에 최소 한 복제본이 이벤트를 받았다고 확인하기를 기다립니다. 반동기는 약간 더 높은 쓰기 지연을 대가로 소스 장애 시 데이터 손실 위험을 줄입니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `Replica_IO_Running: No` | `Last_IO_Error` 확인 — 보통 연결 또는 인증 실패; SOURCE_HOST, 사용자, 비밀번호, REPLICATION SLAVE 권한을 확인 |
+| `Replica_SQL_Running: No` | `Last_SQL_Error` 확인 — 보통 데이터 충돌; 이벤트를 건너뛸지 근본 원인을 고칠지 결정 |
+| 복제 지연이 커짐 | `replica_parallel_workers`를 기본값 4보다 올림; 복제본에서 적용기를 막는 오래 실행되는 쿼리를 확인 |
+| 복제본에서 `ERROR 1062: Duplicate entry` | 복제본에 소스에 없는 행이 있음 — 복제본에 대한 수동 쓰기를 뜻함; `replica_skip_errors`를 신중하게 사용하거나 재동기화 |
+| 장애 조치 후 GTID 공백 | 새 소스에 이전 소스가 적용한 GTID가 없음 — 장애 조치 중 `SET GTID_PURGED`를 신중하게 사용 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 바이너리 로깅](/ko/guides/binary-logging) — 복제가 소스에서 복제본으로 스트리밍하는 바이너리 로그
+- [MySQL 백업 전략](/ko/guides/backup-strategies) — 내구성을 위해 복제를 보완하는 전략
+- [MySQL의 읽기 복제본](/ko/guides/read-replicas) — 이 가이드가 구성하는 복제본 사용하기

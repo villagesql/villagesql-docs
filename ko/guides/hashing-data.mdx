@@ -1,0 +1,138 @@
+---
+title: "MySQL에서 데이터 해싱"
+sidebarTitle: "데이터 해싱"
+description: "무결성 검사, 중복 제거, 지문 생성을 위해 MySQL에서 데이터를 해싱하는 방법 — VillageSQL의 digest() 함수를 통한 SHA-256과 기타 알고리즘 사용."
+keywords: "mysql sha256 hash, mysql digest function, mysql data integrity hash, mysql checksum column, mysql hash binary, mysql sha2 vs digest"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL에는 `MD5()`, `SHA1()`, `SHA2()`가 내장되어 있습니다. 동작은 하지만 16진수 문자열을 반환합니다 — 기반 데이터가 32바이트인 SHA-256 해시에 64자입니다. 해시를 바이너리로 저장하면 크기가 절반으로 줄고 인덱싱도 더 효율적입니다. VillageSQL의 `vsql_crypto` 확장에 있는 `digest()`는 원시 바이너리를 반환하며, 모든 알고리즘에 대해 하나의 함수를 제공합니다.
+
+## MySQL 기본: 흩어진 함수, 16진수 출력 {#the-mysql-default-scattered-functions-hex-output}
+
+MySQL은 해싱을 위해 세 개의 별도 함수를 제공합니다:
+
+```sql
+SELECT MD5('hello');                 -- 32-char hex string
+SELECT SHA1('hello');                -- 40-char hex string
+SELECT SHA2('hello', 256);          -- 64-char hex string (SHA-256)
+SELECT SHA2('hello', 512);          -- 128-char hex string (SHA-512)
+```
+
+동작은 하지만 저장 공간이 낭비됩니다. 256비트 SHA2는 64자 VARCHAR를 반환하는데, 해시의 각 바이트가 두 개의 16진수 숫자로 인코딩되므로 필요한 바이트의 두 배입니다. 바이너리 출력을 얻으려면 `UNHEX(SHA2('hello', 256))`라고 써야 하는데, 동작은 하지만 일관되게 입력하기에는 번거롭습니다.
+
+`sha224`나 `sha384` 옵션도 없습니다 — MySQL이 노출하는 것으로 제한됩니다.
+
+## 표준 우회 방법: UNHEX + SHA2 {#the-standard-workaround-unhex--sha2}
+
+공간을 덜 차지하는 바이너리 저장을 위해 개발자는 `SHA2()`를 `UNHEX()`로 감쌉니다:
+
+```sql
+CREATE TABLE files (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    path     VARCHAR(500),
+    sha256   BINARY(32)
+);
+
+INSERT INTO files (path, sha256)
+VALUES ('/data/report.pdf', UNHEX(SHA2(LOAD_FILE('/data/report.pdf'), 256)));
+
+-- Find duplicate files by hash
+SELECT sha256, COUNT(*) AS count
+FROM files
+GROUP BY sha256
+HAVING count > 1;
+```
+
+이렇게 하면 저장 공간이 줄어듭니다. 약간 장황하지만 표준 접근 방식이며 SHA-256과 SHA-512에는 잘 동작합니다.
+
+## VillageSQL과 함께: digest() {#with-villagesql-digest}
+
+VillageSQL의 `vsql_crypto` 확장은 `digest(data, algorithm)`을 추가하며, 이 함수는 `VARBINARY` 해시를 직접 반환합니다 — `UNHEX()` 래퍼가 필요 없습니다.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+-- digest() returns VARBINARY — no UNHEX wrapper
+CREATE TABLE files (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    path    VARCHAR(500),
+    sha256  VARBINARY(32)
+);
+
+INSERT INTO files (path, sha256)
+VALUES ('/data/report.pdf', digest(LOAD_FILE('/data/report.pdf'), 'sha256'));
+
+-- Compare hashes for duplicate detection
+SELECT path FROM files
+WHERE sha256 = digest(LOAD_FILE('/data/incoming.pdf'), 'sha256');
+```
+
+로깅이나 표시를 위해 읽을 수 있는 문자열이 필요하면 `HEX()`를 사용하세요:
+
+```sql
+SELECT path, HEX(sha256) AS hash_hex FROM files;
+```
+
+### 지원되는 알고리즘 {#supported-algorithms}
+
+| 알고리즘 | digest() 호출 | 출력 크기 | 사용 시점 |
+|:---|:---|:---|:---|
+| SHA-256 | `digest(data, 'sha256')` | 32바이트 | 범용 무결성 검사 |
+| SHA-512 | `digest(data, 'sha512')` | 64바이트 | 더 높은 충돌 저항성이 필요할 때 |
+| SHA-224 | `digest(data, 'sha224')` | 28바이트 | SHA-2 계열이면서 공간이 제한될 때 |
+| SHA-384 | `digest(data, 'sha384')` | 48바이트 | 256과 512 사이 |
+| SHA-1 | `digest(data, 'sha1')` | 20바이트 | 레거시 호환성 전용 |
+| MD5 | `digest(data, 'md5')` | 16바이트 | 레거시 호환성 전용 |
+
+새 애플리케이션에는 MD5나 SHA-1을 사용하지 마세요 — 둘 다 알려진 충돌 취약점이 있습니다. SHA-256이 대부분의 용도에 실용적인 기본값입니다.
+
+특히 비밀번호 저장에는 `digest()`가 잘못된 도구입니다 — `crypt()`와 `gen_salt()`에 대해서는 [MySQL에서 비밀번호 해싱](/ko/guides/password-hashing)을 참조하세요.
+
+## 각 접근 방식을 사용할 때 {#when-to-use-each-approach}
+
+| 접근 방식 | 사용 시점 |
+|:---|:---|
+| `SHA2(data, 256)` | 16진수 출력만 필요할 때; MySQL 전용 스택 |
+| `UNHEX(SHA2(data, 256))` | 바이너리 저장, VillageSQL 의존성 없음 |
+| `digest(data, 'sha256')` | 알고리즘 유연성을 갖춘 깔끔한 바이너리 출력 |
+
+VillageSQL 기반의 새 프로젝트에는 `digest()`가 더 깔끔한 선택입니다. 기존 MySQL 전용 애플리케이션에는 `UNHEX(SHA2())`도 똑같이 올바릅니다.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### digest()와 SHA2()의 차이는 무엇인가요? {#whats-the-difference-between-digest-and-sha2}
+
+`SHA2('hello', 256)`은 64자 16진수 문자열을 반환합니다. `digest('hello', 'sha256')`은 32바이트 `VARBINARY`를 반환합니다. 둘은 같은 해시를 계산하며, 차이는 인코딩입니다. 바이너리 저장이 더 작고 인덱싱이 더 빠릅니다.
+
+#### digest()로 중복 행을 감지할 수 있나요? {#can-i-use-digest-to-detect-duplicate-rows}
+
+예. `digest(content, 'sha256')`을 인덱스가 있는 열에 저장한 다음 `WHERE sha256 = digest(incoming_content, 'sha256')`으로 조회하세요. 이것은 업로드된 파일의 중복 제거, 변경된 레코드 감지, 콘텐츠 주소 지정 조회 구축에 흔히 쓰이는 패턴입니다.
+
+#### digest()는 비밀번호에 안전한가요? {#is-digest-safe-for-passwords}
+
+아니요. `digest()`는 빠른 해시로, 마이크로초 단위로 계산됩니다. 비밀번호 해싱에는 느리고 반복되는 알고리즘이 필요합니다. 같은 확장의 `crypt()`와 `gen_salt()`를 사용하세요. [MySQL에서 비밀번호 해싱](/ko/guides/password-hashing)을 참조하세요.
+
+#### digest()는 HMAC을 지원하나요? {#does-digest-support-hmac}
+
+아니요 — `digest()`는 키가 없는 일반 해시입니다. 키 기반 인증 코드에는 `hmac()`을 사용하세요. [MySQL의 HMAC 서명](/ko/guides/hmac-mysql)을 참조하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.digest does not exist` | `INSTALL EXTENSION vsql_crypto`를 실행하세요 |
+| `digest()`가 NULL을 반환함 | NULL 입력이거나 실제로 인식되지 않는 알고리즘 이름인지 확인하세요. 대소문자는 문제가 아닙니다 — 이름은 대소문자 구분 없이 일치되므로 `'SHA256'`과 `'sha256'`은 동일한 출력을 반환합니다 |
+| 16진수로 저장된 해시가 두 배 크기로 보임 | 열이 VARBINARY가 아니라 VARCHAR입니다 — SHA-256에는 `VARBINARY(32)`로 바꾸세요 |
+| 동일한 두 문자열의 해시가 다름 | 인코딩과 콜레이션을 확인하세요 — 해시는 대소문자를 구분하며 바이트 단위로 정확합니다 |
+
+## 참고 {#see-also}
+
+- [MySQL에서 비밀번호 해싱](/ko/guides/password-hashing) — 자격 증명을 위해 특별히 설계된 느린 적응형 해싱
+- [MySQL의 HMAC 서명](/ko/guides/hmac-mysql) — 무결성 검증과 웹훅 검증을 위한 키 기반 해싱
+- [MySQL의 대칭 암호화](/ko/guides/symmetric-encryption) — 지문만이 아니라 데이터를 되돌려 받아야 할 때

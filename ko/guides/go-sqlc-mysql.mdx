@@ -1,0 +1,262 @@
+---
+title: "MySQL과 함께 쓰는 Go와 sqlc"
+sidebarTitle: "sqlc와 함께 쓰는 Go"
+description: "sqlc를 사용하여 MySQL과 VillageSQL에 대한 SQL 스키마와 쿼리에서 타입 안전한 Go 코드를 생성하는 방법 — 쿼리 어노테이션, sqlc.yaml 구성, 생성된 코드의 널 허용 열 처리 포함."
+keywords: "sqlc mysql, sqlc golang, go mysql sqlc, sqlc.yaml mysql, sqlc query annotations, go-sql-driver mysql, sqlc generate, type safe sql go, sqlc execlastid"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+sqlc는 SQL에서 직접 Go 구조체와 쿼리 메서드를 생성하므로, 애플리케이션 코드는 런타임에 쿼리를 조립하는 대신 평범한 Go 함수를 호출합니다. 코드와 작성한 SQL 사이에 ORM 계층이 없습니다. 이 가이드는 작은 `posts` 테이블을 만들고, MySQL용으로 sqlc로 코드를 생성한 뒤, 실행 중인 서버에서 실행합니다.
+
+## sqlc 설치 {#installing-sqlc}
+
+Homebrew로 sqlc를 설치하거나, Go 도구로 관리하고 싶다면 `go install`로 설치하세요:
+
+```bash
+brew install sqlc
+```
+
+```bash
+go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
+```
+
+버전을 확인합니다:
+
+```bash
+sqlc version
+```
+
+```
+v1.31.1
+```
+
+## 프로젝트 구성 {#project-layout}
+
+Go 모듈과 세 개의 파일을 만듭니다: 스키마, 쿼리 파일, sqlc 구성 파일.
+
+```bash
+mkdir go-sqlc-mysql && cd go-sqlc-mysql
+go mod init go-sqlc-mysql
+```
+
+`schema.sql`은 sqlc가 타입을 생성할 테이블을 정의합니다. `body`에는 `NOT NULL` 제약이 없으며, 이 점은 나중에 중요해집니다:
+
+```sql
+CREATE TABLE posts (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    title VARCHAR(255) NOT NULL,
+    body TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+);
+```
+
+## 어노테이션이 있는 쿼리 작성 {#writing-annotated-queries}
+
+sqlc는 평범한 SQL 파일을 읽고, 각 문장 위의 `-- name:` 주석을 생성된 Go 메서드로 바꿉니다. 쿼리 이름 뒤의 단어가 반환 형태를 정합니다: 단일 행은 `:one`, 슬라이스는 `:many`, 반환값 없음은 `:exec`, 원시 `sql.Result`는 `:execresult`, 영향받은 행 수는 `:execrows`.
+
+MySQL의 `INSERT` 문은 `RETURNING`을 지원하지 않으므로, 새 행의 ID를 돌려받으려면 전용 어노테이션이 필요합니다. `:execlastid`는 `sql.Result.LastInsertId()`를 대신 호출하여 그 값을 직접 반환합니다:
+
+```sql
+-- name: GetPost :one
+SELECT id, title, body, created_at FROM posts WHERE id = ?;
+
+-- name: ListPosts :many
+SELECT id, title, body, created_at FROM posts ORDER BY id;
+
+-- name: CreatePost :execlastid
+INSERT INTO posts (title, body) VALUES (?, ?);
+```
+
+## sqlc.yaml 구성 {#configuring-sqlcyaml}
+
+`sqlc.yaml`은 sqlc에 스키마와 쿼리 파일의 위치를 알려주고 MySQL 엔진을 설정합니다. 경로는 `sqlc`를 실행하는 디렉토리가 아니라 `sqlc.yaml`의 위치를 기준으로 해석됩니다:
+
+```yaml
+version: "2"
+sql:
+  - schema: "schema.sql"
+    queries: "query.sql"
+    engine: "mysql"
+    gen:
+      go:
+        package: "posts"
+        out: "posts"
+        sql_package: "database/sql"
+        emit_json_tags: true
+```
+
+`package`와 `out`은 생성되는 Go 패키지의 이름과 그것이 기록될 디렉토리를 지정합니다. `sql_package: "database/sql"`은 sqlc에 표준 라이브러리의 `database/sql`에 맞춰 코드를 생성하라고 지시하며, `go-sql-driver/mysql`이 구현하는 것이 바로 이것입니다.
+
+## 코드 생성 {#generating-code}
+
+```bash
+sqlc generate
+```
+
+이 명령은 `posts/`에 세 개의 파일을 생성합니다: `db.go`(`Queries` 구조체와 그 생성자), `models.go`(`Post` 구조체), `query.sql.go`(어노테이션이 있는 쿼리마다 하나의 메서드). 널 허용 열 `body`가 나타나는 곳은 `models.go`입니다:
+
+```go
+type Post struct {
+	ID        uint64         `json:"id"`
+	Title     string         `json:"title"`
+	Body      sql.NullString `json:"body"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+```
+
+## 널 허용 열은 포인터가 아니라 sql.NullString을 생성 {#nullable-columns-generate-sqlnullstring-not-a-pointer}
+
+`body TEXT`에 `NOT NULL` 제약이 없기 때문에, sqlc는 평범한 `string`이나 `*string`이 아니라 `sql.NullString`을 생성했습니다. 같은 규칙이 `INSERT` 문의 매개변수 목록에서 생성된 `CreatePostParams`에도 적용됩니다:
+
+```go
+type CreatePostParams struct {
+	Title string         `json:"title"`
+	Body  sql.NullString `json:"body"`
+}
+```
+
+이것은 모든 삽입에서, 값을 전달할 때조차 `sql.NullString`을 명시적으로 구성해야 한다는 뜻입니다:
+
+```go
+_, err := queries.CreatePost(ctx, posts.CreatePostParams{
+	Title: "Hello VillageSQL",
+	Body:  sql.NullString{String: "First post generated with sqlc.", Valid: true},
+})
+```
+
+본문 없이 행을 삽입하려면 필드를 빈 문자열로 두는 대신 `Valid: false`로 설정하세요. 빈 `sql.NullString{}` 제로 값은 이미 `Valid: false`이므로, `sql.NullString{Valid: false}`라고 명시적으로 쓰는 것과 동일합니다:
+
+```go
+_, err = queries.CreatePost(ctx, posts.CreatePostParams{
+	Title: "No body",
+	Body:  sql.NullString{Valid: false},
+})
+```
+
+널 허용 열을 다시 읽을 때는 `.String`을 신뢰하기 전에 `.Valid`를 확인해야 합니다:
+
+```go
+post, err := queries.GetPost(ctx, id)
+if post.Body.Valid {
+	fmt.Println(post.Body.String)
+}
+```
+
+열이 `NULL`을 허용해야 한다면, 그것을 의도적인 스키마 결정으로 만드세요. `schema.sql`의 `body`에 `NOT NULL`을 추가하고 `sqlc generate`를 다시 실행하면 생성된 필드가 나타나는 모든 곳에서 `sql.NullString`이 평범한 `string`으로 바뀌며, 모든 호출 지점에서 `.Valid` 확인이 사라집니다.
+
+## 연결과 마이그레이션 실행 {#connecting-and-running-migrations}
+
+데이터베이스와, 그 데이터베이스 하나로 범위가 한정된 실제 비밀번호를 가진 애플리케이션 사용자를 만듭니다:
+
+```sql
+CREATE DATABASE sqlc_guide;
+CREATE USER 'sqlc_app'@'127.0.0.1' IDENTIFIED BY 'sqlc_app_pw';
+GRANT ALL PRIVILEGES ON sqlc_guide.* TO 'sqlc_app'@'127.0.0.1';
+```
+
+애플리케이션을 실행하기 전에 `mysql` 클라이언트로 `schema.sql`을 적용합니다:
+
+```bash
+mysql -u root sqlc_guide < schema.sql
+```
+
+드라이버를 추가하고 `parseTime=true`로 TCP를 통해 연결합니다. 이 옵션은 MySQL의 `TIMESTAMP`와 `DATETIME` 열을 `[]byte`가 아니라 Go의 `time.Time`으로 스캔하는 데 필요합니다:
+
+```bash
+go get github.com/go-sql-driver/mysql
+```
+
+```go
+db, err := sql.Open("mysql", "sqlc_app:sqlc_app_pw@tcp(127.0.0.1:3306)/sqlc_guide?parseTime=true")
+if err != nil {
+	log.Fatalf("open: %v", err)
+}
+defer db.Close()
+
+queries := posts.New(db)
+```
+
+## CreatePost는 int64를 반환하고 GetPost는 uint64를 받음 {#createpost-returns-int64-getpost-takes-uint64}
+
+`id BIGINT UNSIGNED`는 sqlc가 열로 생성하는 모든 곳에서 `uint64`로 매핑되며, `GetPost`의 `id` 매개변수도 마찬가지입니다. 그러나 `:execlastid`로 생성된 `CreatePost`는 평범한 `int64`를 반환합니다. 이것은 `sql.Result.LastInsertId()`에서 오는데, 표준 라이브러리는 열의 실제 부호 여부와 관계없이 이것을 `int64`로 정의합니다. 방금 생성된 ID를 `GetPost`에 전달하려면 명시적 변환이 필요합니다:
+
+```go
+id, err := queries.CreatePost(ctx, posts.CreatePostParams{
+	Title: "Hello VillageSQL",
+	Body:  sql.NullString{String: "First post generated with sqlc.", Valid: true},
+})
+
+post, err := queries.GetPost(ctx, uint64(id))
+```
+
+실행 중인 서버에서 전체 프로그램을 처음부터 끝까지 실행하면:
+
+```bash
+go run .
+```
+
+```
+created post id=1
+created post id=2
+fetched post: id=1 title="Hello VillageSQL" body.Valid=true body="First post generated with sqlc." created_at=2026-08-28 12:31:37 +0000 UTC
+total posts: 2
+  id=1 title="Hello VillageSQL" body.Valid=true
+  id=2 title="No body" body.Valid=false
+```
+
+프로그램 자체의 출력과 별개로 데이터베이스에서 직접 확인하면:
+
+```sql
+SELECT id, title, body, created_at FROM posts ORDER BY id;
+```
+
+```
+id	title	body	created_at
+1	Hello VillageSQL	First post generated with sqlc.	2026-08-28 12:31:37
+2	No body	NULL	2026-08-28 12:31:37
+```
+
+## 연결 풀 조정 {#tuning-the-connection-pool}
+
+`database/sql`은 `sql.Open` 아래에서 자체 연결 풀을 관리하며, sqlc가 생성한 `Queries` 구조체는 전달한 `*sql.DB`가 이미 가진 풀을 그대로 사용합니다. MySQL 백엔드에는 특히 두 가지 설정이 중요합니다:
+
+```go
+db.SetMaxOpenConns(10)
+db.SetMaxIdleConns(10)
+db.SetConnMaxLifetime(time.Hour)
+```
+
+`SetConnMaxLifetime`은 MySQL의 `wait_timeout`보다 낮게 설정해야 하며, 이 서버에서 `wait_timeout`의 기본값은 28800초(8시간)입니다. 이 설정이 없으면 MySQL이 서버 쪽에서 이미 닫은 연결이 Go 풀에 유휴 항목으로 남아 있다가, 그 연결에 대한 쿼리가 실패할 때까지 유지됩니다.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### sqlc는 실행 중인 데이터베이스에 대해 동작하나요? {#does-sqlc-run-against-a-live-database}
+
+명시적으로 활성화할 때만 그렇습니다. `sqlc generate`는 `schema.sql`과 `query.sql`을 정적으로 파싱하며 실행 중인 서버가 필요하지 않습니다. `sqlc vet`과 `sqlc push`는 추가 검사를 위해 실제 데이터베이스에 연결할 수 있지만, 이 가이드의 기본 `generate` 워크플로는 연결을 열지 않습니다.
+
+#### query.sql의 쿼리에 구문 오류가 있으면 어떻게 되나요? {#what-happens-if-a-query-in-querysql-has-a-syntax-error}
+
+`sqlc generate`는 아무것도 생성하기 전에 파일과 줄을 지목하는 파싱 오류로 실패합니다. 실패 시 출력 디렉토리에 아무것도 기록되지 않으므로, 깨진 쿼리가 오래되거나 부분적인 생성 코드를 만드는 일은 없습니다.
+
+#### sqlc가 INSERT ... ON DUPLICATE KEY UPDATE 코드를 생성할 수 있나요? {#can-sqlc-generate-code-for-insert--on-duplicate-key-update}
+
+예. sqlc는 이것을 일반 `INSERT` 문으로 파싱합니다. 다른 삽입과 마찬가지로, 결과의 어느 부분이 필요한지에 따라 `:exec`, `:execresult`, `:execrows` 또는 `:execlastid`로 어노테이션을 지정하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `sqlc generate`가 `schema.sql`을 찾을 수 없다고 보고함 | `sqlc.yaml`의 경로는 `sqlc`를 실행한 디렉토리가 아니라 구성 파일 자체의 디렉토리를 기준으로 합니다. 다른 곳에서 실행한다면 `sqlc generate -f /full/path/to/sqlc.yaml`을 사용하세요. |
+| 생성된 코드가 컴파일되지 않음: `undefined: sql.NullString` | 파일의 임포트에 `"database/sql"`을 추가하거나, `sqlc generate`로 다시 생성하세요. 널 허용 열이 있으면 임포트가 자동으로 추가됩니다. |
+| `sql: Scan error ... unsupported Scan, storing driver.Value type []uint8 into type *time.Time` | `sql.Open`에 전달하는 DSN에 `parseTime=true`를 추가하세요. |
+| 삽입된 행의 body가 NULL이 아니라 빈 문자열임 | `Valid: true`가 없는 `sql.NullString{}`은 `NULL`을 올바르게 삽입하며, `Valid`를 설정하지 않은 `sql.NullString{String: ""}`도 `Valid: false`이므로 같은 방식으로 동작합니다. 빈 문자열과 함께 `Valid: true`를 실수로 설정하지 않았는지 확인하세요. 그 경우에는 NULL이 아니라 빈 문자열이 삽입됩니다. |
+
+## 참고 {#see-also}
+
+- [MySQL과 ORM](/ko/guides/mysql-with-orms) — sqlc가 대안이 되는 런타임 쿼리 조립 방식
+- [MySQL의 스키마 마이그레이션](/ko/guides/schema-migrations) — 테이블이 프로덕션에 들어간 뒤 `schema.sql` 변경을 안전하게 버전 관리하기
+- [MySQL 연결 풀링](/ko/guides/connection-pooling) — `database/sql`의 기본값을 넘어서는 풀 크기 조정과 영구 연결

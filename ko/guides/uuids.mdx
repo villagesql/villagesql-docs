@@ -1,0 +1,169 @@
+---
+title: "MySQL의 UUID"
+sidebarTitle: "UUID 사용하기"
+description: "MySQL에서 UUID를 기본 키로 사용하는 방법 — 저장 전략, 성능 트레이드오프, 그리고 UUID 버전 설명입니다."
+keywords: "MySQL UUID primary key, uuid vs auto increment, uuid binary mysql, uuid v7 mysql, mysql uuid performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+자동 증가 정수는 문제가 생기기 전까지는 단순합니다: 행 수를 노출하고, 분산 시스템에서 실패하며, 데이터베이스를 병합하거나 샤딩할 때 깨집니다. UUID는 그 모든 것을 해결하지만, MySQL의 기본 처리 방식은 대규모 삽입을 느리게 만듭니다. 왜 그런 일이 일어나는지, 그리고 어떻게 고치는지 설명합니다.
+
+## MySQL 기본값: CHAR(36)으로 저장하는 UUID() {#the-mysql-default-uuid-as-char36}
+
+MySQL의 내장 `UUID()` 함수는 `550e8400-e29b-41d4-a716-446655440000` 같은 36문자 문자열로 v1 UUID를 반환합니다. 그것을 `CHAR(36)` 열에 저장하면 동작은 하지만 비효율적입니다:
+
+- 같은 데이터에 16바이트 대신 36바이트
+- 문자열 비교는 바이너리 비교보다 느림
+- 랜덤 UUID는 삽입할 때마다 B-트리 페이지 분할을 일으킴(아래에서 더 설명)
+
+```sql
+-- This works but has problems at scale
+CREATE TABLE orders (
+    order_id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+    user_id  INT NOT NULL
+);
+```
+
+## 표준 우회 방법: BINARY(16) {#the-standard-workaround-binary16}
+
+MySQL은 문자열과 간결한 바이너리 형식 사이를 변환하는 `UUID_TO_BIN()`과 `BIN_TO_UUID()`를 제공합니다. `BINARY(16)`을 사용하면 저장 공간이 절반으로 줄고 비교가 빨라집니다:
+
+```sql
+CREATE TABLE orders (
+    order_id BINARY(16) PRIMARY KEY,
+    user_id  INT NOT NULL
+);
+
+-- Store: convert string UUID to binary
+INSERT INTO orders (order_id, user_id)
+VALUES (UUID_TO_BIN(UUID()), 101);
+
+-- Retrieve: convert back to readable format
+SELECT BIN_TO_UUID(order_id), user_id FROM orders;
+```
+
+`UUID_TO_BIN()`은 v1 UUID가 시간순으로 정렬되도록 타임스탬프 비트를 재배열하는 선택적 두 번째 인수(`1`)를 받습니다. 삽입 성능 문제에 대한 부분적인 해결책입니다.
+
+## 남은 문제: 랜덤 삽입이 인덱스를 단편화함 {#the-remaining-problem-random-inserts-fragment-indexes}
+
+MySQL의 InnoDB는 클러스터형 인덱스를 사용합니다. 즉, 행이 기본 키 순서로 물리적으로 저장됩니다. 랜덤 UUID로 행을 삽입하면, InnoDB는 인덱스 중간에서 그 행이 들어갈 자리를 찾아야 하고 공간을 만들기 위해 페이지를 분할해야 할 수도 있습니다. 지속적인 부하 아래에서 이것은 쓰기 증폭과 인덱스 단편화를 일으킵니다.
+
+UUID v7은 식별자의 상위 비트에 Unix 타임스탬프를 넣어 이것을 해결합니다. 새 UUID는 항상 기존 것보다 크므로, 삽입은 항상 인덱스의 가장 오른쪽 리프에 추가됩니다. 분할이 없습니다.
+
+## VillageSQL과 함께: 네이티브 UUID 유형과 모든 버전 {#with-villagesql-native-uuid-type-and-all-versions}
+
+VillageSQL의 `vsql_uuid` 확장은 16바이트 바이너리 저장과 수동 변환이 필요 없는 네이티브 `UUID` 열 유형을 추가하고, UUID v1부터 v7까지의 생성 함수를 더합니다.
+
+```sql
+INSTALL EXTENSION vsql_uuid;
+```
+
+```sql
+-- Native UUID type — no UUID_TO_BIN/BIN_TO_UUID needed
+CREATE TABLE orders (
+    order_id UUID PRIMARY KEY,
+    user_id  INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- UUID_V7 inserts always append to the index — no page splits
+INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 101);
+INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 102);
+
+-- Sorts chronologically by creation order
+SELECT user_id, created_at FROM orders ORDER BY order_id;
+
+-- Inspect the timestamp embedded in a v7 UUID (as datetime or Unix epoch)
+SELECT UUID_TIMESTAMP(order_id), UUID_EPOCH(order_id) FROM orders LIMIT 1;
+```
+
+### UUID 버전 선택하기 {#choosing-a-uuid-version}
+
+| 버전 | 사용 시점 |
+|:---|:---|
+| `UUID_V4()` | 랜덤 ID가 필요하고 삽입 성능은 상관없을 때 |
+| `UUID_V7()` | 새 행, 기본 키, 높은 삽입량 — 권장 기본값 |
+| `UUID_V6()` | 정렬 가능한 출력이 필요한 레거시 v1 시스템 |
+| `UUID_V1()` | v1 형식을 기대하는 시스템과의 호환성 |
+| `UUID_V3()` / `UUID_V5()` | 이름에서 파생한 결정적 ID(v3 = MD5, v5 = SHA-1) |
+
+`UUID_VERSION(uuid)`은 저장된 UUID의 버전 번호를 반환하며, 버전별로 ID를 라우팅할 때 유용합니다. `UUID` 값이나 문자열 리터럴을 받으며, 문자열은 암시적으로 변환됩니다. 하지만 잘못된 문자열은 0이나 NULL을 반환하는 대신 `ERROR 1525`를 일으키므로, 신뢰할 수 없는 텍스트를 걸러내는 도구는 아닙니다. 그 용도로는 아래의 `UUID_IS_VALID()`를 사용하세요. `UUID_COMPARE(uuid1, uuid2)`는 명시적인 순서 로직을 위해 -1, 0, 1을 반환합니다. UUID와 다른 기본 키 접근 방식을 언제 쓸지 더 넓게 보려면, [기본 키 전략 선택하기](/ko/guides/primary-key-strategies)를 보세요.
+
+### 이름 기반 UUID와 RFC 네임스페이스 {#name-based-uuids-and-the-rfc-namespaces}
+
+`UUID_V3()`과 `UUID_V5()`는 네임스페이스와 이름에서 UUID를 파생하므로, 같은 쌍은 항상 같은 UUID를 만듭니다. `UUID_NS_DNS()`, `UUID_NS_URL()`, `UUID_NS_OID()`, `UUID_NS_X500()`은 RFC 9562가 정의하는 4개의 네임스페이스를 반환합니다. 이들은 네임스페이스 매개변수가 받는 텍스트를 반환하므로, 바로 조합할 수 있습니다:
+
+```sql
+SELECT UUID_V5(UUID_NS_DNS(), 'example.com');
+-- cfbff0d1-9375-5685-968c-48ce8b15ae17
+```
+
+`UUID_NIL()`과 `UUID_MAX()`는 같은 RFC가 예약한 모두 0인 UUID와 모두 1인 UUID를 반환하며, 센티널 값으로 사용합니다.
+
+### 데이터베이스 바깥에서 온 UUID 검증하기 {#validating-uuids-from-outside-the-database}
+
+`UUID_IS_VALID(string)`은 문자열이 `UUID` 열에 받아들여질 때 1을, 아닐 때 0을 반환합니다. 무엇을 넘기든 절대 오류를 내지 않으므로, 값이 유형이 지정된 열에 도달하기 전에 걸러낼 수 있습니다:
+
+```sql
+SELECT UUID_IS_VALID('550e8400-e29b-41d4-a716-446655440000');  -- 1
+SELECT UUID_IS_VALID('nope');                                  -- 0
+
+-- Reject malformed IDs at the schema level
+CREATE TABLE staging (
+  raw VARCHAR(40),
+  CHECK (UUID_IS_VALID(raw) = 1)
+);
+```
+
+### 생성 열과 제약 조건에서 UUID 함수 사용하기 {#using-uuid-functions-in-generated-columns-and-constraints}
+
+검사, 검증, 상수 함수는 결정적이며, 이름 기반 생성기 `UUID_V3()`과 `UUID_V5()`도 그렇습니다. 이들 모두 생성 열과 CHECK 제약 조건에 나타날 수 있습니다. 랜덤 및 시간 기반 생성기인 `UUID_V4()`, `UUID_V7()` 등은 호출할 때마다 출력이 바뀌므로 그럴 수 없습니다. 이 덕분에 스키마 수준에서 UUID로부터 저장된 값을 파생하거나 검증할 수 있습니다:
+
+```sql
+CREATE TABLE audit_log (
+  id uuid NOT NULL,
+  ver INT AS (UUID_VERSION(id)) STORED,  -- derive the version into a column
+  CHECK (UUID_VERSION(id) IN (4, 7))     -- accept only v4 or v7 IDs
+);
+```
+
+## UUID 대 자동 증가 {#uuid-vs-auto-increment}
+
+| | AUTO_INCREMENT | UUID(BINARY/네이티브) |
+|:---|:---|:---|
+| **분산 환경에서 안전** | 아니요 — 조정이 필요함 | 예 |
+| **행 수 노출** | 예 | 아니요 |
+| **저장 공간** | 4–8바이트 | 16바이트 |
+| **삽입 성능** | 빠름(항상 추가) | v7은 빠르고, v4는 느림 |
+| **사람이 읽을 수 있음** | 예 | 아니요(바이너리) |
+| **병합에 안전** | 아니요 | 예 |
+
+대부분의 단일 데이터베이스 애플리케이션에서는 `AUTO_INCREMENT`로 충분합니다. 시스템 전체에서 전역적으로 고유한 ID가 필요할 때, 여러 소스의 데이터를 병합할 때, 또는 순차적인 행 수를 노출하고 싶지 않을 때 UUID를 사용하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### UUID_V7을 DEFAULT로 쓸 수 있나요? {#can-i-use-uuid_v7-as-a-default}
+현재는 안 됩니다. MySQL에서 비결정적 함수는 DEFAULT 식에 사용할 수 없습니다. INSERT 문에서 UUID를 생성하세요.
+
+#### 기존 행을 UUID로 채울 수 있나요? {#can-i-backfill-existing-rows-with-uuids}
+예. `UUID` 열을 추가하고, UPDATE에서 `UUID_V7()`로 채운 다음, 기본 키로 만드세요.
+
+#### UUID_V7은 표준인가요? {#is-uuid_v7-a-standard}
+예. RFC 4122를 대체하는 RFC 9562에 정의되어 있습니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.UUID_V7 does not exist` | `INSTALL EXTENSION vsql_uuid` 실행 |
+| `DEFAULT (UUID_V7())` 거부됨 | `DEFAULT`를 제거하고, 각 INSERT에서 `UUID_V7()` 호출 |
+| `Extension 'vsql_uuid' is already installed` | 이미 설치됨. 조치 필요 없음 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 기본 키 전략 선택하기](/ko/guides/primary-key-strategies) — UUID를 AUTO_INCREMENT 및 다른 전략과 비교하기
+- [MySQL의 랜덤 데이터 생성](/ko/guides/random-data-mysql) — UUID v4 뒤에 있는 무작위성
+- [InnoDB가 데이터를 저장하는 방식](/ko/guides/innodb-storage) — 랜덤 UUID 기본 키가 페이지 단편화를 일으키는 이유

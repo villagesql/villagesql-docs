@@ -1,0 +1,85 @@
+---
+title: "MySQL의 utf8mb4: 이모지와 완전한 유니코드 저장하기"
+sidebarTitle: "utf8mb4와 이모지"
+description: "MySQL의 utf8 문자 집합이 이모지를 거부하는 이유, 테이블을 utf8mb4로 안전하게 변환하는 방법, 그리고 예전에 변환을 실패하게 만들던 인덱스 길이 제한입니다."
+keywords: "mysql utf8mb4, mysql emoji, incorrect string value mysql, convert utf8 to utf8mb4, utf8mb4 vs utf8, mysql unicode"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL에서 `utf8`이라는 이름의 문자 집합은 UTF-8이 아닙니다. 이모지 이전 시대에 멈춘, 문자당 3바이트의 부분 집합(`utf8mb3`)이며, 이모지, 많은 CJK 표의 문자, 수학 기호 같은 4바이트 문자는 모두 거기에 저장되지 않습니다. `utf8mb4`가 진짜 UTF-8입니다. MySQL 8.0 이상에서는 새 테이블의 기본값이지만, 더 오래된 버전에서 만들었거나 DDL에 `utf8`을 명시한 테이블은 여전히 이 함정을 안고 있습니다.
+
+## 실패 {#the-failure}
+
+```sql
+CREATE TABLE notes_mb3 (
+  body VARCHAR(100)
+) CHARACTER SET utf8mb3;
+
+INSERT INTO notes_mb3 (body) VALUES ('launch day 🚀');
+```
+
+```text
+ERROR 1366 (HY000): Incorrect string value: '\xF0\x9F\x9A\x80' for column 'body' at row 1
+```
+
+`\xF0\x9F\x9A\x80`은 로켓 이모지의 4바이트입니다. 엄격한 SQL 모드가 꺼져 있으면 이것은 대신 경고로 도착하고, 문제의 문자는 조용히 `?`로 바뀌며 문자열의 나머지는 유지됩니다. 이쪽이 더 나쁩니다: 몇 주 뒤에 데이터를 보고 알게 됩니다.
+
+## 변환할 것 찾기 {#find-what-needs-converting}
+
+어떤 테이블과 열이 아직 3바이트 utf8을 쓰는지 메타데이터에 물어보세요:
+
+```sql
+SELECT table_schema, table_name, column_name, character_set_name
+FROM information_schema.columns
+WHERE character_set_name = 'utf8mb3'
+  AND table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys');
+```
+
+스키마와 테이블의 기본값도 확인하세요. 그렇지 않으면 새 열이 잘못된 상태로 태어납니다:
+
+```sql
+SELECT schema_name, default_character_set_name
+FROM information_schema.schemata;
+```
+
+## 변환 {#convert}
+
+`CONVERT TO CHARACTER SET`은 테이블을 다시 쓰면서 열 정의와 저장된 데이터를 모두 변환합니다:
+
+```sql
+ALTER TABLE notes_mb3 CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+그다음 앞으로 만들 객체가 올바른 문자 집합을 물려받도록 기본값을 고치세요:
+
+```sql
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+큰 테이블에서 이것은 전체 다시 쓰기입니다. 다른 차단형 `ALTER`와 같이 취급하고 평소의 온라인 마이그레이션 도구로 실행하세요. [스키마 마이그레이션](/ko/guides/schema-migrations)을 보세요.
+
+변환 전에 확인할 2가지:
+
+- **인덱스 길이.** `VARCHAR(255)` 고유 인덱스는 utf8mb3에서 765바이트가 필요했지만 utf8mb4에서는 1,020바이트가 필요합니다. 최신 InnoDB 기본값(`DYNAMIC` 행 형식)은 3,072바이트를 허용하므로, 이 문제는 주로 아주 오래된 서버에서 `REDUNDANT`나 `COMPACT` 행 형식으로 넘어온 테이블에서 생깁니다. `ALTER`가 최대 키 길이 오류로 실패하면, 먼저 테이블의 행 형식을 확인하세요.
+- **연결 문자 집합.** 저장은 경로의 절반일 뿐입니다. 클라이언트 연결이 `utf8mb3`으로 협상하면, 열이 담을 수 있더라도 이모지는 전송 중에 죽습니다. 세션이 실제로 무엇을 쓰는지 확인하세요:
+
+```sql
+SHOW VARIABLES LIKE 'character_set_c%';
+```
+
+`character_set_client`와 `character_set_connection`이 둘 다 `utf8mb4`로 읽혀야 합니다. 대부분의 최신 드라이버는 기본적으로 그렇게 하지만, 오래된 JDBC와 PHP 구성은 `utf8`을 고정할 수 있습니다.
+
+## 콜레이션, 간단히 {#collation-briefly}
+
+문자 집합은 바이트가 무엇을 뜻하는지이고, 콜레이션은 바이트를 어떻게 비교하는지입니다. MySQL 8.x의 utf8mb4에서는 `utf8mb4_0900_ai_ci`가 기본값이자 일반적으로 올바른 답입니다: 악센트를 구분하지 않고, 대소문자를 구분하지 않으며, 올바른 유니코드 9.0 순서입니다. 문자열 열로 조인되는 테이블 사이에 콜레이션을 섞으면 변환이 강제되고 인덱스를 건너뛸 수 있으므로, 하나를 골라 어디서나 사용하세요. [문자 집합과 콜레이션](/ko/guides/character-sets)이 비교 규칙을 깊이 다룹니다.
+
+## 함께 보기 {#see-also}
+
+- [문자 집합과 콜레이션](/ko/guides/character-sets) — 이 가이드가 특수한 경우인 더 넓은 문자 집합 모델
+- [스키마 마이그레이션](/ko/guides/schema-migrations) — 프로덕션에서 변환 ALTER를 안전하게 실행하기
+- [데이터 유형 선택하기](/ko/guides/choosing-data-types) — 모든 문자가 4바이트일 수 있을 때의 열 크기 정하기
+- [ORM으로 MySQL 사용하기: Django, Rails, Prisma](/ko/guides/mysql-with-orms) — 이 문자 집합을 사용하는 ORM 연결 설정
+- [MySQL 대소문자 구분](/ko/tutorial/case-sensitivity) — 이 문자 집합에 딸려 오는 콜레이션 읽기

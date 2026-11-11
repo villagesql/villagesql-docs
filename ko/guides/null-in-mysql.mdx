@@ -1,0 +1,203 @@
+---
+title: "MySQL의 NULL"
+sidebarTitle: "NULL 다루기"
+description: "MySQL에서 NULL이 동작하는 방식: 3값 논리, 비교와 집계에서의 흔한 함정, 그리고 인덱스가 NULL 값을 처리하는 방식입니다."
+keywords: "mysql null, mysql ifnull, mysql coalesce, mysql three valued logic, mysql null index, mysql null aggregate, mysql null join"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL에서 NULL은 0, 빈 문자열, 또는 거짓을 뜻하지 않습니다. 알 수 없음을 뜻합니다. 이 구분은 추적하기 어려운 버그를 일으킵니다. 쿼리가 오류 없이 실행되고 조용히 잘못된 결과를 반환하기 때문입니다.
+
+## NULL은 값이 아닙니다 {#null-is-not-a-value}
+
+NULL은 값의 부재를 나타냅니다. NULL을 무엇과 비교하든(다른 NULL과 비교하더라도) 참이나 거짓을 반환하지 않습니다. NULL을 반환합니다.
+
+```sql
+SELECT NULL = NULL;    -- NULL (not 1)
+SELECT NULL != NULL;   -- NULL (not 0)
+SELECT NULL = 0;       -- NULL
+SELECT NULL = '';      -- NULL
+SELECT 1 + NULL;       -- NULL
+SELECT 'hello' || NULL; -- NULL (logical OR with NULL is unknown, not concatenation — see below)
+```
+
+기본적으로 MySQL의 `sql_mode`에는 `PIPES_AS_CONCAT`이 포함되지 않으므로, `||`는 문자열 연결이 아니라 논리 OR입니다. `'hello' || 'world'`는 `'helloworld'`가 아니라 `0`으로 평가됩니다. 이는 `||`가 항상 연결인 PostgreSQL 및 ANSI 표준과 다릅니다. MySQL에서 문자열 연결에는 `CONCAT()`을 사용하세요.
+
+이것이 3값 논리입니다: 참, 거짓, 알 수 없음(NULL). NULL과의 모든 비교는 알 수 없음을 내고, MySQL은 `WHERE` 절에서 이를 거짓으로 취급합니다. 이는 필터링된 열에 NULL이 있는 행이 조용히 제외된다는 뜻입니다.
+
+```sql
+CREATE TABLE users (
+    id       INT PRIMARY KEY AUTO_INCREMENT,
+    email    VARCHAR(255),
+    referrer VARCHAR(255)  -- nullable
+);
+
+INSERT INTO users (email, referrer) VALUES
+    ('a@example.com', 'google'),
+    ('b@example.com', NULL),
+    ('c@example.com', 'twitter');
+
+-- This returns only 1 row — both the 'google' row and the NULL row are excluded
+SELECT * FROM users WHERE referrer != 'google';
+```
+
+NULL 행을 포함하려면 `IS NULL`을 명시적으로 사용하세요:
+
+```sql
+SELECT * FROM users WHERE referrer != 'google' OR referrer IS NULL;
+```
+
+## NULL 검사하기 {#testing-for-null}
+
+항상 `IS NULL`과 `IS NOT NULL`을 사용하고, `= NULL`이나 `!= NULL`은 절대 사용하지 마세요:
+
+```sql
+-- Wrong — always returns no rows
+SELECT * FROM users WHERE referrer = NULL;
+
+-- Correct
+SELECT * FROM users WHERE referrer IS NULL;
+SELECT * FROM users WHERE referrer IS NOT NULL;
+```
+
+MySQL은 두 NULL을 같다고 취급하는 `<=>`(NULL 안전 동등 연산자)도 제공합니다:
+
+```sql
+SELECT NULL <=> NULL;  -- 1 (true)
+SELECT NULL <=> 0;     -- 0 (false)
+```
+
+이것은 NULL과 NULL을 일치시키고 싶은 `WHERE` 절에서 유용합니다. NULL일 수 있는 두 열을 비교하는 쿼리 같은 경우입니다.
+
+## 집계에서의 NULL {#null-in-aggregates}
+
+집계 함수(`COUNT`, `SUM`, `AVG` 등)는 NULL 값을 무시합니다. `COUNT(*)`만 예외입니다.
+
+```sql
+SELECT
+    COUNT(*)        AS total_rows,      -- counts all rows including NULLs
+    COUNT(referrer) AS has_referrer,    -- counts only non-NULL referrer values
+    AVG(referrer)   AS avg_referrer     -- ignores NULLs in the average
+FROM users;
+```
+
+```
+total_rows | has_referrer
+-----------+-------------
+3          | 2
+```
+
+`COUNT(*)`는 3을 반환합니다. `COUNT(referrer)`는 2를 반환합니다. NULL 행이 제외됩니다. 이는 의도된 동작이지만, `COUNT(column)`이 `COUNT(*)`와 같을 것으로 기대하는 개발자를 놀라게 합니다.
+
+## 식에서 NULL 처리하기 {#handling-null-in-expressions}
+
+열이 NULL일 때 기본값으로 대체하려면 `COALESCE`를 사용하세요:
+
+```sql
+-- Returns the first non-NULL value in the list
+SELECT email, COALESCE(referrer, 'direct') AS source FROM users;
+```
+
+```
+email           | source
+----------------+---------
+a@example.com  | google
+b@example.com  | direct
+c@example.com  | twitter
+```
+
+`IFNULL(column, default)`는 인수가 두 개인 경우에 동등합니다:
+
+```sql
+SELECT email, IFNULL(referrer, 'direct') AS source FROM users;
+```
+
+`NULLIF(a, b)`는 `a = b`일 때 NULL을 반환하고, 그렇지 않으면 `a`를 반환합니다. 0으로 나누기를 피하는 데 유용합니다:
+
+```sql
+SELECT total_revenue / NULLIF(order_count, 0) AS avg_order_value FROM stats;
+```
+
+| 함수 | 동작 | 사용 시점 |
+|:---------|:---------|:---------|
+| `COALESCE(a, b, ...)` | 목록에서 첫 번째 비NULL 값을 반환 | 대체 선택지가 여러 개일 때 |
+| `IFNULL(a, b)` | `a`가 NULL이면 `b`, 아니면 `a`를 반환 | 단일 대체값. 인수 두 개에는 `COALESCE`보다 간단한 구문 |
+| `NULLIF(a, b)` | `a = b`이면 NULL, 아니면 `a`를 반환 | 센티널 값 억제(예: 카운트가 0일 때 0으로 나누기 피하기) |
+
+NULL은 JOIN 동작에도 명확하지 않은 방식으로 영향을 줍니다. `LEFT JOIN`은 일치하는 것이 없을 때 오른쪽 열에 NULL을 반환하고, 그 NULL 열을 `WHERE`에서 필터링하면 조용히 `INNER JOIN`으로 바뀝니다. 샘플 데이터베이스로 풀어 본 ON과 WHERE의 구분은 [MySQL LEFT JOIN](/ko/tutorial/left-join)을 참고하세요.
+
+## NULL과 인덱스 {#null-and-indexes}
+
+MySQL 인덱스는 NULL 값을 저장합니다. `WHERE col IS NULL` 쿼리는 `col`의 인덱스를 사용할 수 있습니다. 다만:
+
+- `UNIQUE` 인덱스에서 `NULL` 값은 같다고 간주되지 않습니다. 고유 열은 여러 NULL 값을 담을 수 있습니다
+- 복합 인덱스에서 어느 열 위치의 NULL이든 정상적으로 인덱싱됩니다
+
+```sql
+CREATE TABLE sessions (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT,           -- nullable: anonymous sessions
+    token      VARCHAR(64) NOT NULL UNIQUE,
+    created_at DATETIME NOT NULL,
+    INDEX idx_user (user_id)  -- indexes NULL values too
+);
+
+-- This query can use idx_user
+SELECT * FROM sessions WHERE user_id IS NULL;
+```
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 선택적 텍스트 필드에 NULL과 빈 문자열 중 무엇을 써야 하나요? {#should-i-use-null-or-empty-string-for-optional-text-fields}
+정말로 없는 데이터에는 NULL을 선호하세요. 빈 문자열(`''`)은 "명시적으로 비어 있게 설정됨"을 뜻하며 "제공되지 않음"과 구별됩니다. 둘을 섞으면 불일치가 생깁니다. `WHERE col IS NULL`과 `WHERE col = ''`는 서로 다른 조건입니다. 하나의 관례를 골라 일관되게 적용하세요.
+
+#### `NOT IN`은 왜 NULL과 함께 예상 밖으로 동작하나요? {#why-does-not-in-behave-unexpectedly-with-nulls}
+NULL을 하나라도 반환하는 서브쿼리와 함께 쓴 `NOT IN`은 항상 빈 결과 집합을 반환합니다:
+
+```sql
+-- If any value in category_ids is NULL, this returns no rows
+SELECT * FROM products WHERE category_id NOT IN (SELECT id FROM categories);
+```
+
+서브쿼리가 NULL을 반환할 수 있을 때는 대신 `NOT EXISTS`를 사용하세요:
+
+```sql
+SELECT * FROM products p
+WHERE NOT EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id);
+```
+
+#### `ORDER BY`는 NULL을 정렬하나요? {#does-order-by-sort-nulls}
+예. 기본적으로 MySQL은 오름차순에서 NULL 값을 먼저, 내림차순에서 마지막에 정렬합니다. MySQL은 `NULLS FIRST` / `NULLS LAST` 구문을 지원하지 않습니다(그것은 PostgreSQL입니다). NULL의 위치를 제어하려면 정렬 식을 사용하세요:
+
+```sql
+-- NULLs last in ascending order
+SELECT * FROM users ORDER BY referrer IS NULL, referrer ASC;
+
+-- NULLs first in ascending order (default behavior, but explicit)
+SELECT * FROM users ORDER BY referrer IS NULL DESC, referrer ASC;
+```
+
+`col IS NULL`은 비NULL 값에 대해 0, NULL에 대해 1로 평가되므로, 이것을 오름차순으로 정렬하면 NULL이 끝으로 밀립니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `WHERE col != 'value'`가 NULL 행을 제외함 | 조건에 `OR col IS NULL` 추가 |
+| `COUNT(column)`이 `COUNT(*)`와 일치하지 않음 | 예상된 동작 — `COUNT(column)`은 NULL을 건너뜀. 전체 행 수에는 `COUNT(*)` 사용 |
+| `NOT IN` 서브쿼리가 빈 결과를 반환함 | 서브쿼리가 NULL을 반환함 — 대신 `NOT EXISTS` 사용 |
+| WHERE의 `= NULL`이 아무것도 일치하지 않음 | `IS NULL`로 교체 |
+| UNIQUE 열이 중복 NULL을 허용함 | 예상된 동작 — 고유 인덱스에서 NULL은 같다고 간주되지 않음 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL JOIN 성능과 흔한 실수](/ko/guides/joins) — 조인에서 NULL이 일으키는 잘못된 행 수 버그
+- [MySQL의 CHECK 제약 조건](/ko/guides/check-constraints) — NOT NULL과 다른 열 규칙 강제하기
+- [MySQL의 진짜 불리언](/ko/guides/boolean-columns) — 불리언 집계가 NULL을 다루는 방식
+- [MySQL INNER JOIN](/ko/tutorial/inner-join) — 내부 조인이 NULL을 보여주는 대신 행을 빼는 이유
+- [MySQL 연산자](/ko/tutorial/operators) — NULL과의 비교가 NULL을 반환하는 이유
+- [MySQL IS NULL](/ko/tutorial/is-null) — WHERE 절에서 빠진 값 검사하기
+- [MySQL LEFT JOIN](/ko/tutorial/left-join) — 외부 조인의 NULL이 어디서 오는지

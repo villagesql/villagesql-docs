@@ -1,0 +1,142 @@
+---
+title: "MySQL의 UPSERT"
+sidebarTitle: "UPSERT 사용하기"
+description: "MySQL에서 UPSERT를 하는 방법: INSERT ... ON DUPLICATE KEY UPDATE, REPLACE INTO, INSERT IGNORE, 각각을 언제 써야 하는지, 그리고 알아 둘 AUTO_INCREMENT 부작용입니다."
+keywords: "mysql upsert, mysql replace into, mysql insert ignore, mysql replace vs on duplicate key update, mysql upsert auto_increment, mysql upsert concurrency"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL에는 `UPSERT` 키워드가 없지만, 행을 삽입하거나 충돌을 처리하는 3가지 방법이 있습니다: `INSERT ... ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, `INSERT IGNORE`입니다. 이들은 매우 다르게 동작하므로, 잘못 고르면 데이터가 조용히 손상될 수 있습니다.
+
+## INSERT ... ON DUPLICATE KEY UPDATE {#insert--on-duplicate-key-update}
+
+삽입이 고유 제약 조건(기본 키 또는 고유 인덱스)을 위반할 때, MySQL은 대신 `UPDATE`를 실행합니다:
+
+```sql
+CREATE TABLE page_views (
+    page    VARCHAR(255) PRIMARY KEY,
+    views   INT NOT NULL DEFAULT 0,
+    last_at DATETIME
+);
+
+-- First call: inserts the row
+-- Subsequent calls: increments the counter
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW())
+ON DUPLICATE KEY UPDATE
+    views   = views + 1,
+    last_at = NOW();
+```
+
+(기존 행이 아니라) 삽입하려던 값을 참조하려면, 행 별칭을 사용하세요:
+
+```sql
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW()) AS new
+ON DUPLICATE KEY UPDATE
+    page_views.views   = page_views.views + new.views,
+    page_views.last_at = new.last_at;
+```
+
+오래된 `VALUES(col)` 구문도 동작하지만 사용 중단되었습니다. 대신 행 별칭을 사용하세요:
+
+```sql
+-- Deprecated — use row aliases instead
+ON DUPLICATE KEY UPDATE views = views + VALUES(views)
+```
+
+## REPLACE INTO {#replace-into}
+
+`REPLACE`는 충돌하는 행을 삭제하고 새 행을 삽입합니다. 업서트처럼 보이지만 삭제 + 삽입처럼 동작합니다:
+
+```sql
+REPLACE INTO page_views (page, views, last_at)
+VALUES ('/home', 100, NOW());
+```
+
+이것은 대상 테이블의 `BEFORE DELETE`와 `AFTER DELETE` 트리거를 실행하고, 새 행에 대해 `AUTO_INCREMENT` 카운터를 다시 설정합니다. 삭제가 실제 행 삭제이므로, 참조하는 테이블의 `ON DELETE CASCADE`와 다른 외래 키 동작이 실제로 실행됩니다. `REPLACE`에 나열되지 않은 열은 이전 행의 값이 아니라 기본값을 받습니다.
+
+`REPLACE`는 정말로 이전 행을 완전히 버리고 싶을 때만 사용하세요.
+
+## INSERT IGNORE {#insert-ignore}
+
+`INSERT IGNORE`는 오류를 경고로 낮춥니다. 키 충돌에서는 행을 건너뛰고, 유형 불일치나 잘림에서는 대신 강제 변환된 값을 씁니다:
+
+```sql
+INSERT IGNORE INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW());
+```
+
+`INSERT IGNORE`의 문제는 중복뿐 아니라 *모든* 오류를 억제한다는 것이며, 중복이 아닌 경우는 건너뛴 행보다 더 나쁩니다. `INSERT IGNORE INTO page_views (page, views) VALUES ('/new', 'not_a_number')`는 경고만 내고 `('/new', 0)`을 삽입합니다: 아무 일도 하지 않는 것이 아니라 조용하고 손상된 쓰기입니다. 결과에 정말로 관심이 없을 때만 사용하세요.
+
+## 비교 {#comparison}
+
+| | `ON DUPLICATE KEY UPDATE` | `REPLACE INTO` | `INSERT IGNORE` |
+|:--|:--------------------------|:---------------|:----------------|
+| 충돌 시 | 지정한 열을 업데이트 | 삭제 + 삽입 | 행을 버림 |
+| 기존 값 보존 | 예(무엇을 업데이트할지 직접 제어) | 아니요 — 지정하지 않은 열은 기본값으로 재설정 | 해당 없음(업데이트 없음) |
+| 실행되는 트리거 | UPDATE 트리거 | 대상 테이블의 DELETE + INSERT 트리거 | 충돌 시 트리거 없음 |
+| 외래 키 캐스케이드 | 아니요 | 예 — 내부 DELETE가 실행함 | 아니요 |
+| AUTO_INCREMENT | 충돌 시 증가 | 삽입된 행에 대해 새로 증가 | 증가 없음 |
+| 사용 시점 | 특정 필드를 업데이트해야 할 때 | 행을 완전히 교체하고 싶을 때 | 중복을 조용히 건너뛰고 싶을 때 |
+
+## AUTO_INCREMENT 부작용 {#auto_increment-side-effect}
+
+`ON DUPLICATE KEY UPDATE`는 삽입 경로가 아니라 업데이트 경로를 탈 때도 `AUTO_INCREMENT` 카운터를 증가시킵니다. 시간이 지나면 시퀀스에 간격이 생깁니다. `page_views`는 `page`를 기본 키로 사용하고 `AUTO_INCREMENT` 열이 없으므로, 효과를 보려면 대리 키가 있는 테이블을 사용하세요:
+
+```sql
+CREATE TABLE page_views_by_id (
+    id    INT AUTO_INCREMENT PRIMARY KEY,
+    page  VARCHAR(255) UNIQUE,
+    views INT DEFAULT 0
+);
+INSERT INTO page_views_by_id (page, views) VALUES ('/home', 1);
+INSERT INTO page_views_by_id (page, views) VALUES ('/home', 2) AS new
+    ON DUPLICATE KEY UPDATE views = new.views;  -- updates the existing row
+
+SHOW CREATE TABLE page_views_by_id;  -- AUTO_INCREMENT has advanced anyway
+```
+
+이것은 예상된 동작입니다. 애플리케이션이 간격 없는 시퀀스에 의존한다면, 별도의 카운터 테이블을 사용하거나 애플리케이션에서 시퀀스 생성을 처리하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### ON DUPLICATE KEY UPDATE는 원자적인가요? {#is-on-duplicate-key-update-atomic}
+
+예. 삽입 시도와 업데이트는 하나의 원자적 작업으로 일어납니다. 존재 확인과 삽입 사이의 경쟁 조건을 피하기 위해 트랜잭션으로 감쌀 필요가 없습니다.
+
+#### 여러 고유 인덱스가 충돌하면 어떻게 되나요? {#what-if-multiple-unique-indexes-conflict}
+
+삽입이 동시에 2개 이상의 고유 제약 조건을 위반하면, MySQL은 행 1개만 업데이트하며 어느 행인지는 정의되어 있지 않습니다. INSERT 1개가 여러 고유 인덱스에서 충돌할 수 있는 설계는 피하세요. 스키마에 겹치는 고유 제약 조건이 있다면, 동작을 신중하게 테스트하세요.
+
+#### ON DUPLICATE KEY UPDATE를 다중 행 삽입과 함께 쓸 수 있나요? {#can-i-use-on-duplicate-key-update-with-multi-row-inserts}
+
+예:
+
+```sql
+INSERT INTO page_views (page, views)
+VALUES ('/home', 1), ('/about', 1), ('/contact', 1)
+ON DUPLICATE KEY UPDATE views = views + 1;
+```
+
+충돌하는 각 행이 자체 업데이트를 일으킵니다. 행 별칭을 쓸 때는 다중 행의 경우 `VALUES`를 사용하고 별칭에는 `AS new`를 사용하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `ON DUPLICATE KEY UPDATE`가 실행되지 않음 | 충돌 열은 PRIMARY KEY 또는 UNIQUE 인덱스여야 함. 일반 인덱스로는 실행되지 않음 |
+| `REPLACE`가 지정하지 않은 열을 지움 | 예상된 동작. REPLACE는 삭제 + 삽입이므로, 모든 열을 지정하거나 ON DUPLICATE KEY UPDATE를 사용 |
+| `INSERT IGNORE`가 실제 오류를 숨김 | IGNORE를 제거하고, 오류를 재현하고, 근본 원인을 고치기. IGNORE는 중복뿐 아니라 모든 오류를 가림 |
+| AUTO_INCREMENT 간격이 커짐 | ON DUPLICATE KEY UPDATE의 정상적인 부작용. AUTO_INCREMENT의 간격은 외관상의 문제이며 정확성에 영향을 주지 않음 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 트랜잭션](/ko/guides/transactions) — UPSERT를 트랜잭션으로 감싸야 할 때
+- [MySQL의 교착 상태](/ko/guides/deadlocks) — INSERT ... ON DUPLICATE KEY UPDATE는 동시성 아래에서 교착 상태를 일으킬 수 있음
+- [MySQL의 대량 삽입](/ko/guides/bulk-inserts) — 충돌 처리를 하든 안 하든 많은 행을 빠르게 적재하기
+- [흔한 MySQL 오류와 해결 방법](/ko/guides/common-mysql-errors) — 중복 키 오류와 그 의미
+- [MySQL INSERT ON DUPLICATE KEY UPDATE](/ko/tutorial/upsert) — 예제와 함께 보는 이 문 자체

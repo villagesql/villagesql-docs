@@ -1,0 +1,145 @@
+---
+title: "MySQL 슬로우 쿼리 로그"
+sidebarTitle: "슬로우 쿼리 로그 사용하기"
+description: "최적화가 필요한 쿼리를 찾기 위해 MySQL의 슬로우 쿼리 로그를 활성화하고 사용하는 방법으로, 로그 형식, 주요 필드, mysqldumpslow를 다룹니다."
+keywords: "mysql slow query log, mysql long_query_time, mysql enable slow query log, mysqldumpslow, mysql find slow queries, mysql query optimization"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+슬로우 쿼리 로그는 주의가 필요한 쿼리를 찾기 위한 MySQL의 내장 도구입니다. 설정 가능한 임계값보다 오래 걸리는 모든 쿼리를 잡아내어 로그 파일에 기록합니다. 어떤 쿼리를 최적화해야 할지 모르겠다면 여기서 시작하세요.
+
+## 슬로우 쿼리 로그 활성화하기 {#enabling-the-slow-query-log}
+
+서버를 재시작하지 않고 런타임에 활성화할 수 있습니다:
+
+```sql
+-- Enable the log
+SET GLOBAL slow_query_log = 'ON';
+
+-- Log queries that take longer than 1 second
+SET GLOBAL long_query_time = 1;
+
+-- Check where the log file is being written
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+이 설정은 즉시 적용되지만 서버 재시작 시 초기화됩니다. 영구적으로 만들려면 `my.cnf`나 `my.ini`에 추가하세요:
+
+```ini
+[mysqld]
+slow_query_log = ON
+long_query_time = 1
+slow_query_log_file = /var/log/mysql/slow.log
+```
+
+## 무엇이 기록되나 {#what-gets-logged}
+
+일반적인 항목은 다음과 같습니다:
+
+```
+# Time: 2024-03-15T14:23:01.234567Z
+# User@Host: app_user[app_user] @ localhost []  Id: 142
+# Query_time: 4.521893  Lock_time: 0.000123  Rows_sent: 1  Rows_examined: 847293
+SET timestamp=1710509381;
+SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+가장 중요한 헤더 필드:
+
+| 필드 | 알려 주는 것 |
+|:------|:-----------------|
+| `Query_time` | 총 실행 시간(초) |
+| `Lock_time` | 잠금을 기다리는 데 쓴 시간(실행과 별개) |
+| `Rows_sent` | 클라이언트에 반환된 행 |
+| `Rows_examined` | 결과를 만들기 위해 MySQL이 읽은 행 |
+
+**`Rows_examined` / `Rows_sent` 비율이 핵심 신호입니다.** MySQL이 1행을 돌려보내기 위해 847,293행을 검사했다면, 결과 하나를 찾으려고 테이블 거의 전체를 스캔하고 있는 것입니다. 그것이 인덱스가 필요한 쿼리입니다.
+
+## 인덱스를 사용하지 않는 쿼리 기록하기 {#logging-queries-without-indexes}
+
+오버헤드가 더 낮은 변형: 실행 시간과 관계없이 인덱스를 전혀 사용하지 않는 쿼리만 기록합니다.
+
+```sql
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+```
+
+이것은 명백한 인덱스 누락 문제가 성능 문제가 되기 전에 잡아내는 데 유용합니다. 바쁜 서버에서는 많은 로그 항목을 만들 수 있으므로, `log_throttle_queries_not_using_indexes`와 함께 사용해 속도를 제한하세요:
+
+```sql
+-- Log at most 10 no-index queries per minute
+SET GLOBAL log_throttle_queries_not_using_indexes = 10;
+```
+
+## mysqldumpslow로 로그 분석하기 {#analyzing-the-log-with-mysqldumpslow}
+
+바쁜 서버에서는 슬로우 쿼리 로그가 빠르게 커집니다. `mysqldumpslow`는 비슷한 쿼리를 집계하고 총 시간으로 순위를 매겨, 무엇을 먼저 고칠지 쉽게 찾게 해 줍니다:
+
+```bash
+# Top 10 queries by total execution time
+mysqldumpslow -s t -t 10 /var/log/mysql/slow.log
+
+# Top 10 by average execution time
+mysqldumpslow -s at -t 10 /var/log/mysql/slow.log
+
+# Top 10 queries that examined the most rows
+mysqldumpslow -s r -t 10 /var/log/mysql/slow.log
+```
+
+출력은 리터럴 값을 `N`과 `S`로 바꾸어 쿼리를 구조별로 묶습니다:
+
+```
+Count: 523  Time=4.52s (2364s)  Lock=0.00s (0s)  Rows=1.0 (523), app_user@localhost
+  SELECT * FROM orders WHERE status = 'S' ORDER BY created_at LIMIT N
+```
+
+이 쿼리는 523번 실행되었고, 평균 4.52초, 총 2,364초의 서버 시간을 썼습니다. 거기서 시작하세요.
+
+## 슬로우 쿼리를 EXPLAIN으로 넘기기 {#turning-slow-queries-into-explain}
+
+비용이 큰 쿼리를 찾았다면 `EXPLAIN`을 실행해 실행 계획을 확인하세요:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+`type: ALL`(전체 테이블 스캔)과 `Extra: Using filesort`를 찾으세요. 둘 다 인덱스로 고칠 수 있습니다 — [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes)과 [MySQL에서 EXPLAIN 읽기](/ko/guides/reading-explain)를 참조하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### `long_query_time`을 얼마로 설정해야 하나요? {#what-should-i-set-long_query_time-to}
+`1`초에서 시작하세요. 최악의 쿼리를 해결한 뒤에는 중간 심각도의 문제를 잡기 위해 `0.1`로 낮추세요. 성능이 중요한 애플리케이션에서는 `0.05` 이하가 흔합니다. `0`으로 설정하면 모든 쿼리를 기록합니다 — 특정 작업을 프로파일링하는 데 유용하지만, 프로덕션 모니터링용은 아닙니다.
+
+#### 슬로우 쿼리 로그를 활성화하면 성능에 영향이 있나요? {#does-enabling-the-slow-query-log-affect-performance}
+아주 적습니다. 오버헤드는 기록되는 쿼리당 약간의 I/O입니다. `long_query_time = 1`인 바쁜 프로덕션 서버에서는 정말로 느린 쿼리만 기록되므로 — 일반적인 오버헤드는 무시할 만합니다. 모든 쿼리를 기록하는 것(`long_query_time = 0`)은 측정 가능한 오버헤드가 있으므로 일시적으로만 사용해야 합니다.
+
+#### 파일을 읽는 대신 SQL로 슬로우 로그를 쿼리할 수 있나요? {#can-i-query-the-slow-log-from-sql-instead-of-reading-the-file}
+예, `log_output = TABLE`을 설정했다면 `mysql.slow_log` 테이블을 사용할 수 있습니다 — `performance_schema`에는 슬로우 로그 테이블이 없습니다:
+
+```sql
+SET GLOBAL log_output = 'TABLE';
+SELECT * FROM mysql.slow_log ORDER BY start_time DESC LIMIT 10;
+```
+
+프로덕션에서는 일반적으로 파일 출력이 선호됩니다 — 테이블 방식은 기록되는 모든 쿼리에 쓰기 오버헤드를 더합니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| 로그 파일이 생성되지 않음 | MySQL에 로그 디렉터리 쓰기 권한이 있는지 확인 |
+| 느린 쿼리가 있는데도 항목이 없음 | `SHOW VARIABLES LIKE 'slow_query_log'`로 `slow_query_log = ON`인지 확인 |
+| 로그가 너무 빨리 커짐 | `long_query_time`을 높이거나 `log_throttle_queries_not_using_indexes`를 활성화 |
+| `mysqldumpslow`를 찾을 수 없음 | MySQL과 함께 제공됨 — MySQL bin 디렉터리를 확인(`which mysqldumpslow` 또는 `/usr/bin`에서 찾기) |
+
+슬로우 쿼리 로그와 `mysqldumpslow`는 MySQL의 드롭인 대체품이자 확장 기능을 갖춘 [VillageSQL](https://villagesql.com/install)에서 동일하게 동작합니다.
+
+## 함께 보기 {#see-also}
+
+- [MySQL에서 EXPLAIN 읽기](/ko/guides/reading-explain) — 찾아낸 느린 쿼리 분석하기
+- [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes) — 느린 쿼리의 가장 흔한 해결책
+- [MySQL 연결 풀링](/ko/guides/connection-pooling) — 슬로우 쿼리 로그가 잡지 못하는 또 다른 지연 원인
+- [내 MySQL 쿼리는 왜 느린가요?](/ko/guides/mysql-query-performance) — 로그가 드러낸 쿼리로 무엇을 할지
+- [ORM과 함께 MySQL 사용하기: Django, Rails, Prisma](/ko/guides/mysql-with-orms) — ORM이 생성하는 것 잡아내기

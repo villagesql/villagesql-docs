@@ -1,0 +1,311 @@
+---
+title: "MySQL의 스토어드 프로시저"
+sidebarTitle: "스토어드 프로시저 작성하기"
+description: "MySQL 스토어드 프로시저의 동작 방식: CREATE PROCEDURE 구문, IN/OUT/INOUT 매개변수, 지역 변수, 제어 흐름, 커서, 그리고 스토어드 프로시저가 도움이 되는 때와 해가 되는 때입니다."
+keywords: "mysql stored procedure, mysql create procedure, mysql stored procedure example, mysql procedure parameters, mysql procedure vs function, mysql call procedure, mysql delimiter"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+스토어드 프로시저는 서버에서 실행되는 이름 있는 SQL 블록입니다. 한 번 호출하면 안에 있는 문장을 몇 개든 실행합니다. 코드는 애플리케이션이 아니라 데이터베이스에 있습니다.
+
+## 스토어드 프로시저 만들기 {#creating-a-stored-procedure}
+
+MySQL은 프로시저 본문 안의 `;`가 `CREATE PROCEDURE` 문을 일찍 끝내지 않도록 `DELIMITER`로 문장 종결자를 바꿉니다.
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_active_users()
+BEGIN
+    SELECT id, name, email
+    FROM users
+    WHERE status = 'active'
+    ORDER BY name;
+END$$
+
+DELIMITER ;
+```
+
+`CALL`로 호출하세요:
+
+```sql
+CALL get_active_users();
+```
+
+삭제하세요:
+
+```sql
+DROP PROCEDURE IF EXISTS get_active_users;
+```
+
+정의를 확인하세요:
+
+```sql
+SHOW CREATE PROCEDURE get_active_users\G
+```
+
+## 매개변수 {#parameters}
+
+프로시저는 세 가지 매개변수 모드를 지원합니다:
+
+| 모드 | 방향 | 용도 |
+|:-----|:----------|:---------|
+| `IN` | 호출자 → 프로시저 | 값을 전달 |
+| `OUT` | 프로시저 → 호출자 | 값을 반환 |
+| `INOUT` | 양방향 | 전달하고 수정 |
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_user_count(
+    IN  p_status  VARCHAR(20),
+    OUT p_count   INT
+)
+BEGIN
+    SELECT COUNT(*) INTO p_count
+    FROM users
+    WHERE status = p_status;
+END$$
+
+DELIMITER ;
+```
+
+`OUT` 매개변수에는 사용자 정의 변수를 사용해 호출하세요:
+
+```sql
+CALL get_user_count('active', @count);
+SELECT @count;
+```
+
+## 지역 변수 {#local-variables}
+
+`BEGIN...END` 블록의 맨 위, 다른 어떤 문장보다 앞에서 `DECLARE`로 지역 변수를 선언하세요:
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE transfer_funds(
+    IN p_from_account INT,
+    IN p_to_account   INT,
+    IN p_amount       DECIMAL(10,2)
+)
+BEGIN
+    DECLARE v_balance DECIMAL(10,2);
+
+    SELECT balance INTO v_balance
+    FROM accounts
+    WHERE id = p_from_account;
+
+    IF v_balance < p_amount THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Insufficient funds';
+    END IF;
+
+    UPDATE accounts SET balance = balance - p_amount WHERE id = p_from_account;
+    UPDATE accounts SET balance = balance + p_amount WHERE id = p_to_account;
+END$$
+
+DELIMITER ;
+```
+
+## 제어 흐름 {#control-flow}
+
+MySQL 프로시저는 표준 제어 흐름 구문을 지원합니다:
+
+```sql
+-- IF...ELSEIF...ELSE
+IF v_count > 100 THEN
+    SET v_tier = 'high';
+ELSEIF v_count > 10 THEN
+    SET v_tier = 'medium';
+ELSE
+    SET v_tier = 'low';
+END IF;
+
+-- CASE
+CASE p_status
+    WHEN 'active'   THEN SET v_label = 'Active User';
+    WHEN 'inactive' THEN SET v_label = 'Inactive User';
+    ELSE                 SET v_label = 'Unknown';
+END CASE;
+
+-- WHILE loop
+WHILE v_i <= 10 DO
+    SET v_sum = v_sum + v_i;
+    SET v_i = v_i + 1;
+END WHILE;
+
+-- REPEAT...UNTIL
+REPEAT
+    SET v_i = v_i + 1;
+UNTIL v_i > 10
+END REPEAT;
+```
+
+## 오류 처리 {#error-handling}
+
+`DECLARE ... HANDLER`를 사용해 오류를 잡으세요:
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE safe_insert(IN p_name VARCHAR(100))
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    INSERT INTO items (name) VALUES (p_name);
+    COMMIT;
+END$$
+
+DELIMITER ;
+```
+
+`EXIT HANDLER`는 조건이 발생하면 프로시저를 중단합니다. `CONTINUE HANDLER`는 프로시저가 계속 실행되게 합니다. `RESIGNAL`은 오류를 호출자에게 다시 발생시킵니다.
+
+`SIGNAL`로 직접 오류를 발생시키세요:
+
+```sql
+SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT = 'Custom error message';
+```
+
+`45000`은 "처리되지 않은 사용자 정의 예외"를 뜻하는 SQLSTATE입니다.
+
+## 커서 {#cursors}
+
+커서는 프로시저 안에서 결과 집합을 한 행씩 순회합니다. 로직을 집합 연산으로 표현할 수 없을 때 사용하세요.
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE process_orders()
+BEGIN
+    DECLARE v_done    INT DEFAULT FALSE;
+    DECLARE v_id      INT;
+    DECLARE v_amount  DECIMAL(10,2);
+
+    DECLARE order_cursor CURSOR FOR
+        SELECT id, amount FROM orders WHERE status = 'pending';
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+    OPEN order_cursor;
+
+    read_loop: LOOP
+        FETCH order_cursor INTO v_id, v_amount;
+        IF v_done THEN
+            LEAVE read_loop;
+        END IF;
+        -- process each row
+        UPDATE orders SET status = 'processed' WHERE id = v_id;
+    END LOOP;
+
+    CLOSE order_cursor;
+END$$
+
+DELIMITER ;
+```
+
+`NOT FOUND` 핸들러는 커서의 행이 바닥나면 `v_done`을 설정합니다. 프로시저가 끝나기 전에 항상 커서를 닫으세요.
+
+## 스토어드 프로시저와 함수 비교 {#stored-procedures-vs-functions}
+
+| | 스토어드 프로시저 | 스토어드 함수 |
+|:--|:-----------------|:----------------|
+| 반환 값 | OUT 매개변수나 결과 집합을 통해 | 단일 반환 값 |
+| 호출 구문 | `CALL proc()` | `SELECT func()` — 표현식 안에서 사용 |
+| 트랜잭션 | `START TRANSACTION`, `COMMIT`, `ROLLBACK` 가능 | 트랜잭션 상태를 수정할 수 없음 |
+| 결과 집합 | 여러 결과 집합을 반환할 수 있음 | 결과 집합을 반환할 수 없음 |
+| SQL에서의 사용 | SELECT 표현식에서 사용할 수 없음 | SELECT, WHERE 등에서 사용 가능 |
+
+로직을 SQL 표현식에 포함해야 할 때는 함수를 사용하세요. 그 밖의 모든 것 — 여러 단계의 처리, 조건 로직, 부수 효과 — 에는 프로시저를 사용하세요.
+
+## 스토어드 프로시저를 사용해야 할 때 {#when-to-use-stored-procedures}
+
+스토어드 프로시저는 다음과 같은 경우에 의미가 있습니다:
+- 어떤 애플리케이션이나 사용자가 쿼리를 실행하든 적용되어야 하는 비즈니스 규칙을 강제할 때
+- 여러 단계의 작업(복잡한 배치 작업, 데이터 마이그레이션)에서 왕복을 줄일 때
+- 기반 테이블을 노출하지 않고 사용자에게 특정 작업에 대한 접근을 부여할 때(`GRANT EXECUTE ON PROCEDURE`)
+
+다음과 같은 경우에는 해가 됩니다:
+- 로직이 자주 바뀔 때 — 배포에 ALTER PROCEDURE나 DROP/재생성이 필요함
+- 디버깅이 필요할 때 — 디버거가 없고 SIGNAL 기반 로깅만 있음
+- 이식성이 중요할 때 — 스토어드 프로시저 구문은 MySQL 전용임
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 스토어드 프로시저가 결과 집합을 반환할 수 있나요? {#can-a-stored-procedure-return-a-result-set}
+
+예. 프로시저 안에서 `INTO`를 사용하지 않는 모든 `SELECT`는 결과 집합을 호출자에게 보냅니다:
+
+```sql
+CREATE PROCEDURE get_users()
+BEGIN
+    SELECT id, name FROM users;  -- this result set goes to the caller
+END;
+```
+
+프로시저 하나 안의 여러 `SELECT` 문은 여러 결과 집합을 보냅니다. 대부분의 클라이언트는 이를 처리하지만 일부 ORM은 처리하지 못합니다.
+
+#### 데이터베이스의 모든 스토어드 프로시저를 어떻게 보나요? {#how-do-i-see-all-stored-procedures-in-a-database}
+
+```sql
+SHOW PROCEDURE STATUS WHERE Db = 'mydb';
+-- or
+SELECT routine_name, created, last_altered
+FROM information_schema.routines
+WHERE routine_type = 'PROCEDURE' AND routine_schema = 'mydb';
+```
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| CREATE PROCEDURE에서 `ERROR 1064` | `DELIMITER` 변경 누락 — 본문 안의 `;`가 문장을 일찍 끝냄; `DELIMITER $$ ... $$; DELIMITER ;`로 감싸기 |
+| `ERROR 1172: Result consisted of more than one row` | `SELECT ... INTO`가 여러 행을 반환함 — `LIMIT 1`을 추가하거나 단일 행을 반환하도록 쿼리를 고치기 |
+| CALL 후 `OUT` 매개변수가 NULL | 프로시저가 값을 할당하지 않음 — 모든 코드 경로가 그 매개변수에 대한 `SET`이나 `SELECT INTO`에 도달하는지 확인 |
+| `ERROR 1193: Unknown system variable` | `DECLARE v_var`(지역 변수)가 필요한 곳에 `SET @var`(세션 변수)를 썼거나 그 반대 |
+| 프로시저는 실행되지만 데이터를 반환하지 않음 | 결과 집합 `SELECT`가 추가 계층(중첩 CALL)을 통해 데이터를 보내고 있음 — SELECT를 가장 바깥쪽 프로시저로 옮기기 |
+
+## VillageSQL: 스토어드 프로시저에서의 사용자 정의 확장 타입 {#villagesql-custom-extension-types-in-stored-procedures}
+
+VillageSQL 사용자 정의 확장 타입(예: `COMPLEX`, `UUID`, `TVECTOR`)은 스토어드 프로시저 매개변수 타입과
+`DECLARE` 변수 타입으로 사용할 수 있습니다. 먼저 확장을 설치한 다음,
+프로시저 정의에서 그 타입을 참조하세요:
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE add_impedances(
+    IN  p_a COMPLEX,
+    IN  p_b COMPLEX,
+    OUT p_sum COMPLEX
+)
+BEGIN
+    DECLARE v_result COMPLEX;
+    SET v_result = complex_add(p_a, p_b);
+    SET p_sum = v_result;
+END$$
+
+DELIMITER ;
+```
+
+<Warning>
+  어떤 스토어드 프로시저든 그 확장의 사용자 정의 타입을 사용하는 동안에는 `UNINSTALL EXTENSION`이 실패합니다.
+  확장을 제거하기 전에 프로시저를 삭제하거나 변경하세요. 자세한 내용은
+  [확장 프로그램 제거](/ko/extensions/uninstall)를 참조하세요.
+</Warning>
+
+## 함께 보기 {#see-also}
+
+- [MySQL 트리거](/ko/guides/triggers) — 트리거는 스토어드 프로시저 로직이나 인라인 SQL을 호출합니다
+- [MySQL의 트랜잭션](/ko/guides/transactions) — 스토어드 프로시저는 흔히 작업을 트랜잭션으로 감쌉니다
+- [확장 프로그램 제거](/ko/extensions/uninstall) — 스토어드 프로시저가 확장 타입을 사용할 때의 제한

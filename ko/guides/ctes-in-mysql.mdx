@@ -1,0 +1,187 @@
+---
+title: "MySQL CTE가 파생 테이블보다 나은 경우"
+sidebarTitle: "CTE 성능"
+description: "MySQL 옵티마이저가 CTE를 인라인하는지 구체화하는지, EXPLAIN으로 어떻게 구분하는지, 작성 중인 쿼리에 CTE가 맞지 않는 형태인 경우는 언제인지 설명합니다."
+keywords: "mysql cte performance, mysql cte vs derived table, mysql materialize cte, mysql cte slow, mysql cte optimizer, mysql recursive cte cycles, cte_max_recursion_depth"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+CTE와 파생 테이블은 같은 행을 반환하므로, 둘 사이의 선택은 보통 읽기 쉬움의 문제입니다. 옵티마이저가 둘 중 하나를 구체화하면 더 이상 읽기 쉬움만의 문제가 아니게 되는데, 이는 대부분의 글이 말하는 것보다 더 자주 일어납니다. 이 가이드는 어느 쪽을 얻었는지 구분하는 방법과, CTE가 맞지 않는 형태인 경우를 다룹니다.
+
+구문 자체는 튜토리얼에서 가르칩니다:
+[공통 테이블 표현식](/ko/tutorial/cte), [재귀 CTE](/ko/tutorial/recursive-cte),
+[파생 테이블](/ko/tutorial/derived-tables).
+
+이 페이지의 모든 실행 계획은 Sakila 샘플 데이터베이스에 대해 서버 1대에서 얻은 것입니다. 비용과 행 추정치는 InnoDB의 샘플링된 통계와 `optimizer_switch` 설정에서 나오므로 여러분의 수치는 다를 것입니다. 각 계획의 형태가 그대로 옮겨지는 부분입니다.
+
+## 규칙: 병합 가능한가 아닌가 {#the-rule-mergeable-or-not}
+
+CTE는 외부 쿼리에 접혀 들어가거나 임시 테이블로 먼저 만들어지는데, 어느 쪽이 되는지는 CTE를 몇 번 참조하는지가 아니라 CTE에 무엇이 들어 있는지로 결정됩니다.
+
+본문이 `WHERE`와 `JOIN`이 있는 단순한 `SELECT`인 CTE는 병합되어 계획에서 완전히 사라집니다:
+
+```sql
+EXPLAIN FORMAT=TREE WITH g AS (SELECT film_id, title, rating FROM film WHERE rating = 'G')
+SELECT title FROM g WHERE film_id < 50\G
+```
+
+```text
+-> Filter: ((film.rating = 'G') and (film.film_id < 50))  (cost=10.1 rows=9.8)
+    -> Index range scan on film using PRIMARY over (film_id < 50)  (cost=10.1 rows=49)
+```
+
+CTE 노드가 없고, 외부 조건이 인덱스에 도달했습니다. `GROUP BY`, `DISTINCT`, `LIMIT`, `UNION`, 또는 윈도 함수를 포함하는 CTE는 병합될 수 없습니다. 외부 쿼리의 조건을 그 연산들 앞에 적용하면 결과가 동등하지 않기 때문입니다. 이런 CTE는 구체화됩니다.
+
+아래의 계획들은 그 두 번째 경우를 보여 줍니다. `WITH`라는 단어가 아니라 CTE의 내용에 관한 것으로 읽으세요.
+
+## 어느 쪽을 얻었는지 확인하기 {#check-which-one-you-got}
+
+`EXPLAIN FORMAT=TREE`는 구체화 여부를 그 단어 그대로 말해 줍니다. 기본 `EXPLAIN`은 그렇지 않습니다: 여기의 쿼리들에서 `Extra` 열에는 그 단어가 나타나지 않습니다.
+
+```sql
+EXPLAIN FORMAT=TREE WITH counts AS (SELECT rating, COUNT(*) AS films FROM film GROUP BY rating)
+SELECT rating, films FROM counts WHERE films > 200\G
+```
+
+```text
+-> Table scan on counts  (cost=2.5..2.5 rows=0)
+    -> Materialize CTE counts  (cost=0..0 rows=0)
+        -> Filter: (count(0) > 200)
+            -> Table scan on <temporary>
+                -> Aggregate using temporary table
+                    -> Table scan on film  (cost=103 rows=1000)
+```
+
+CTE를 한 번만 참조했는데도 `Materialize CTE counts`입니다. 그 안의 `GROUP BY`가 이를 강제하며, 서버는 행을 임시 테이블에 쓰고 다시 읽습니다.
+
+**같은 `GROUP BY`를 포함하는 파생 테이블도 같은 계획을 얻습니다.** `FROM (SELECT rating, COUNT(*) ... GROUP BY rating) AS counts`로 작성하면 노드 이름만 빼고 트리가 동일하고 비용도 같습니다. 따라서 단일 참조 쿼리에서 CTE가 파생 테이블보다 나은 점은 없습니다: 두 형태는 읽히는 방식이 다를 뿐, 옵티마이저는 둘을 똑같이 다룹니다.
+
+같은 CTE를 두 번 참조하면 문구가 `if needed`로 바뀌고, 두 번째 참조는 같은 구체화된 결과를 재사용합니다:
+
+```sql
+EXPLAIN FORMAT=TREE WITH counts AS (SELECT rating, COUNT(*) AS films FROM film GROUP BY rating)
+SELECT a.rating, a.films FROM counts AS a JOIN counts AS b ON a.films = b.films\G
+```
+
+```text
+-> Nested loop inner join  (cost=2502 rows=0)
+    -> Table scan on a  (cost=2.5..2.5 rows=0)
+        -> Materialize CTE counts if needed  (cost=0..0 rows=0)
+            -> Table scan on <temporary>
+                -> Aggregate using temporary table
+                    -> Table scan on film  (cost=103 rows=1000)
+    -> Index lookup on b using <auto_key0> (films=a.films)  (cost=0.25..2.5 rows=10)
+        -> Materialize CTE counts if needed (query plan printed elsewhere)  (cost=0..0 rows=0)
+```
+
+여기가 두 형태가 실제로 갈라지는 지점입니다. 비용이 큰 내부 쿼리는 한 번 실행되고 두 참조 모두 그 결과를 읽습니다. 파생 테이블로 작성하면 같은 쿼리가 서브쿼리를 두 번 명시하고 두 번 계산합니다.
+
+## 구체화의 비용 {#what-materializing-costs-you}
+
+구체화된 CTE는 임시 테이블이며, 이는 알아 둘 만한 두 가지를 뜻합니다.
+
+기본 테이블의 인덱스를 포기합니다. 행이 임시 테이블에 들어가면 외부 쿼리는 그 테이블을 스캔합니다. 서버는 위의 조인에서 그랬듯 즉석에서 `auto_key`를 만들 수 있지만, 그것은 실제 테이블에 있던 인덱스가 아닙니다. 외부 조건이 `PRIMARY`에 도달했던 이 페이지 맨 위의 병합된 계획과 비교해 보세요.
+
+푸시다운이 이를 완화합니다. `derived_condition_pushdown`은 기본적으로 켜져 있고 옮길 수 있는 것을 안쪽으로 옮기는데, 이것이 위에서 `Filter: (count(0) > 200)`이 `Materialize` 노드 바깥이 아니라 *안쪽*에 나타나는 이유입니다. 모든 것을 옮길 수는 없으므로, 계획에서 CTE가 결과에 남는 것보다 훨씬 많은 행을 생산하는 것으로 보이면 제한 조건을 직접 CTE 안에 작성하세요.
+
+## CTE가 맞지 않는 형태인 경우 {#when-a-cte-is-the-wrong-shape}
+
+- **짧은 단일 단계.** 파생 테이블은 사용되는 자리에 그대로 둡니다. 한 줄짜리 서브쿼리에 이름을 붙이면 읽는 사람에게 한 번 더 건너뛰게 합니다.
+- **옵티마이저가 푸시다운하지 않은 필터.** 계획에서 CTE가 모든 행을 구체화하고 외부 쿼리가 대부분을 버리는 것으로 보이면 필터를 안쪽에 작성하세요.
+- **인덱스에 대한 행 단위 작업.** 상관 서브쿼리나 조인은 각 조회마다 인덱스를 사용할 수 있습니다. 구체화된 CTE는 이미 그것을 포기했습니다.
+
+쿼리에 이름 붙은 단계가 2개 이상 있을 때, 같은 결과가 두 번 필요할 때, 또는 대안이 어디서 끝나는지 아무도 알 수 없을 만큼 깊이 중첩된 서브쿼리일 때 CTE가 올바른 형태입니다.
+
+둘 중 디버그하기 쉬운 쪽이기도 합니다. CTE 정의는 그 CTE에서 `SELECT`하는 방식으로 단독 실행할 수 있어, 두 번째 단계를 보기 전에 첫 번째 단계가 맞는지 알려 줍니다. `FROM` 절 한가운데에서 파생 테이블을 꺼내어 직접 실행하는 것은 매번 수작업으로 하는 같은 일입니다.
+
+## 실제 계층 구조에 대한 재귀 CTE {#recursive-ctes-on-real-hierarchies}
+
+Sakila에는 계층 구조가 없으므로 이 절은 자체 테이블을 사용합니다. 샘플 데이터 옆에 만들고, 다 사용한 후에는 `DROP TABLE employees;`를 실행하세요:
+
+```sql
+CREATE TABLE employees (
+    id         INT PRIMARY KEY,
+    name       VARCHAR(50) NOT NULL,
+    manager_id INT NULL
+);
+
+INSERT INTO employees VALUES
+    (1,'Ada',NULL), (2,'Brem',1), (3,'Chi',1), (4,'Dov',2), (5,'Eze',4);
+```
+
+시드는 루트를 선택하고, 재귀 멤버는 테이블을 이미 생산된 행과 조인합니다. `depth` 열은 답이자 보호 장치입니다.
+
+```sql
+WITH RECURSIVE org_chart AS (
+    SELECT id, name, manager_id, 0 AS depth
+    FROM employees
+    WHERE manager_id IS NULL
+  UNION ALL
+    SELECT e.id, e.name, e.manager_id, oc.depth + 1
+    FROM employees AS e
+    INNER JOIN org_chart AS oc ON e.manager_id = oc.id
+    WHERE oc.depth < 100
+)
+SELECT depth, name FROM org_chart ORDER BY depth, name;
+```
+
+```text
++-------+------+
+| depth | name |
++-------+------+
+|     0 | Ada  |
+|     1 | Brem |
+|     1 | Chi  |
+|     2 | Dov  |
+|     3 | Eze  |
++-------+------+
+5 rows in set (0.00 sec)
+```
+
+**순환이 실패 모드입니다.** A가 B에게 보고하고 B가 A에게 보고하면 쿼리에서 아무것도 멈추지 않으며, 깊이 제한에 도달할 때까지 실행됩니다:
+
+```text
+ERROR 3636 (HY000): Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.
+```
+
+위 쿼리의 `WHERE oc.depth < 100`이 그것을 막습니다. 무한한 순회를 유한한 순회로 바꾸며, 데이터가 깨끗하든 아니든 동작합니다.
+
+오류 메시지는 `cte_max_recursion_depth`를 올리라고 제안하는데, 이는 재귀가 실제로 종료되고 기본값 1,000보다 많은 반복이 필요할 때만 맞습니다. 정상적인 1,500단계 시리즈도 같은 오류에 부딪히며, 그 경우 `SET SESSION cte_max_recursion_depth = 5000`이 올바른 답입니다. 순환 데이터에서는 틀린 답입니다: 쿼리는 여전히 끝나지 않고, 그저 더 늦게 실패할 뿐입니다.
+
+## 사용 가능 여부와 용어 {#availability-and-terminology}
+
+CTE는 MySQL 8.0에서 도입되었고 8.4와 9.x를 포함한 이후 모든 릴리스에 있습니다. `WITH` 절에 `ERROR 1064`로 답하는 서버는 그 이전 버전입니다. `SELECT VERSION()`으로 확인하세요.
+
+표준은 재귀 CTE의 첫 부분을 **앵커 멤버**, 두 번째 부분을 **재귀 멤버**라고 부릅니다. 튜토리얼은 첫 부분을 시드라고 부르는데 같은 것이며, MySQL 자체의 메시지는 표준 용어를 사용합니다.
+
+## CTE는 INSERT, UPDATE, DELETE에서도 동작합니다 {#ctes-work-in-insert-update-and-delete}
+
+```sql
+WITH stale_orders AS (
+    SELECT id FROM orders WHERE created_at < NOW() - INTERVAL 1 YEAR
+)
+DELETE FROM orders WHERE id IN (SELECT id FROM stale_orders);
+```
+
+CTE가 먼저 평가되므로, 문장이 무언가를 변경하기 전에 CTE가 가리키는 행이 결정됩니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 원인과 해결 방법 |
+|:--------|:---------|
+| CTE가 대체한 서브쿼리보다 느림 | 구체화되었습니다. `EXPLAIN FORMAT=TREE`에서 `Materialize CTE`를 확인하세요. |
+| CTE가 결과에 필요한 것보다 훨씬 많은 행을 읽음 | 외부 필터가 푸시다운되지 않았습니다. CTE 안으로 옮기세요. |
+| `ERROR 1146: Table '<database>.cte_name' doesn't exist` | CTE가 `RECURSIVE` 없이 자신을 참조합니다. `WITH RECURSIVE`로 작성하세요. |
+| 종료되리라 예상한 데이터에서 `ERROR 3636` | 데이터에 순환이 있습니다. 깊이 열과 `WHERE depth < N` 보호 조건을 추가하세요. |
+| 실제로 깊은 시리즈에서 `ERROR 3636` | 세션에 대해 `cte_max_recursion_depth`를 올리세요. |
+| `WITH`에 `ERROR 1064` | 서버가 CTE 지원 이전 버전입니다. `SELECT VERSION()`으로 확인하세요. |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 서브쿼리 대 JOIN](/ko/guides/subqueries-vs-joins) — 이것과 경쟁하는 또 다른 형태
+- [MySQL GROUP BY 성능](/ko/guides/group-by-having) — CTE가 피하도록 도울 수 있는 임시 테이블
+- [MySQL 뷰](/ko/guides/views) — 이름 붙은 쿼리를 스키마 객체로 영구 저장하기
+- [공통 테이블 표현식](/ko/tutorial/cte) — 구문을 먼저 보고 싶다면 튜토리얼

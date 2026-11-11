@@ -1,0 +1,285 @@
+---
+title: "Next.js로 MySQL 사용하기"
+sidebarTitle: "ORM 없는 Next.js"
+description: "원시 mysql2 드라이버로 Next.js App Router 애플리케이션을 MySQL에 연결하기: 연결 풀 싱글턴, Server Component에서의 쿼리, Server Action으로의 쓰기, JSON Route Handler를 중간에 ORM 없이 다룹니다."
+keywords: "nextjs mysql, mysql2 nextjs, next.js server action mysql, next.js route handler mysql, mysql connection pool nextjs, nextjs app router mysql, mysql2 connection pool singleton"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Next.js App Router 애플리케이션은 세 가지 다른 장소에서 MySQL과 대화합니다: Server Component, Server Action, Route Handler입니다. 이 가이드는 원시 `mysql2` 드라이버와 하나의 공유 연결 풀을 사용해 세 곳 모두에서 MySQL에 연결하며, 중간에 ORM을 두지 않습니다. VillageSQL은 MySQL의 드롭인 대체품이므로, 여기의 모든 문장은 수정 없이 그대로 실행됩니다.
+
+## 데이터베이스 설정 {#setting-up-the-database}
+
+root로 연결하는 대신 전용 데이터베이스와 애플리케이션 사용자를 만드세요:
+
+```sql
+CREATE DATABASE nextjs_guide;
+
+CREATE USER 'nextjs_app'@'127.0.0.1' IDENTIFIED BY 'nextjs_dev_pw';
+GRANT ALL PRIVILEGES ON nextjs_guide.* TO 'nextjs_app'@'127.0.0.1';
+```
+
+작업할 테이블을 만드세요:
+
+```sql
+CREATE TABLE notes (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  body VARCHAR(280) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+앱을 스캐폴딩하고 드라이버를 설치하세요:
+
+```bash
+npx create-next-app@latest nextjs-mysql --typescript --app --src-dir
+npm install mysql2
+```
+
+연결 정보는 소스가 아니라 `.env.local`에 저장하세요:
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=nextjs_app
+DB_PASSWORD=nextjs_dev_pw
+DB_NAME=nextjs_guide
+```
+
+## 연결 풀 {#the-connection-pool}
+
+앱에서 MySQL과 대화하는 모든 곳은 하나의 모듈 `src/lib/db.ts`에서 같은 풀을 임포트합니다:
+
+```typescript
+import mysql from "mysql2/promise";
+
+// Next.js dev mode reloads route modules on every file save, but it keeps the
+// Node.js process alive between reloads. A pool created at module scope gets
+// re-created on every reload unless it is cached somewhere that survives the
+// reload. `globalThis` survives; module-level variables do not.
+const globalForPool = globalThis as unknown as {
+  vsqlPool: mysql.Pool | undefined;
+};
+
+export const pool =
+  globalForPool.vsqlPool ??
+  mysql.createPool({
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT ?? 3306),
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPool.vsqlPool = pool;
+}
+```
+
+이것은 핫 리로드에 걸쳐 Prisma나 Drizzle 클라이언트를 캐시할 때 쓰는 것과 같은 패턴을 `mysql2` 풀에 직접 적용한 것입니다. `connectionLimit`, `waitForConnections`, `queueLimit`은 [MySQL 연결 풀링](/ko/guides/connection-pooling)에서 설명합니다. 이 가이드는 풀이 Next.js 프로세스 안에 있을 때 무엇이 달라지는지에 집중합니다.
+
+`globalThis` 캐시는 개발 모드에서 선택 사항이 아닙니다. 이 앱에서 한 테스트가 그 이유를 증명합니다: 캐시를 둔 채로 `npm run dev`를 실행하고 `src/lib/db.ts`를 연속으로 네 번 저장하자, 다음과 같이 확인했을 때 그동안 내내 정확히 하나의 `nextjs_app` 연결만 열려 있었습니다:
+
+```sql
+SELECT COUNT(*) FROM information_schema.processlist WHERE user = 'nextjs_app';
+```
+
+`globalThis` 캐시를 제거하고 새 `next dev` 프로세스에서 같은 네 번의 저장을 반복하자 그 수가 다섯으로 늘었습니다. 각 리로드가 모듈의 최상위를 다시 실행했고, 각 실행은 이전 풀을 닫지 않은 채 `mysql.createPool()`을 다시 호출했습니다. 이것을 보려면 풀 모듈 자체를 편집하세요: 그 모듈을 임포트하기만 하는 페이지를 저장해도 모듈은 다시 실행되지 않습니다. Turbopack이 재컴파일에 걸쳐 바뀌지 않은 모듈을 살려 두기 때문입니다. 프로덕션에서는 이런 일이 일어나지 않습니다. `next build`가 앱을 한 번 컴파일하고 `next start`가 모듈을 다시 로드하지 않고 실행하기 때문입니다. 하지만 이 보호 장치는 프로덕션에서 비용이 없고, 개발 중의 실제로 재현 가능한 연결 누수를 막습니다.
+
+## Server Component에서 쿼리하기 {#querying-from-a-server-component}
+
+`src/app/page.tsx`는 Server Component 안에서 매개변수화된 쿼리로 `notes`를 직접 읽습니다:
+
+```typescript
+import { pool } from "@/lib/db";
+import { addNote } from "./actions";
+import type { RowDataPacket } from "mysql2";
+
+interface Note extends RowDataPacket {
+  id: number;
+  body: string;
+  created_at: Date;
+}
+
+async function getNotes(): Promise<Note[]> {
+  const [rows] = await pool.query<Note[]>(
+    "SELECT id, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
+    [20],
+  );
+  return rows;
+}
+
+export default async function Home() {
+  const notes = await getNotes();
+  // ...renders `notes`, including note.created_at.toISOString()
+}
+```
+
+사용자 입력을 이어 붙이거나 보간해 쿼리 문자열을 만들지 마세요. 위의 `LIMIT ?` 자리 표시자는 문자열 연결이 아니라 `mysql2`가 채우며, 이것이 `20; DROP TABLE notes` 같은 값이 숫자로 파싱되지 못해 실패하는 것 말고는 아무 일도 하지 못하게 막는 장치입니다.
+
+`mysql2`는 MySQL `TIMESTAMP` 열을 문자열이 아니라 JavaScript `Date` 객체로 반환합니다. 위의 `Note` 인터페이스가 `created_at`을 `Date`로 타입 지정하고 있으므로, 이것을 JSX로 직접 렌더링하면(`{note.created_at}`) 앱이 실행되기도 전에 `npm run build`의 타입 검사에서 실패합니다:
+
+```
+error TS2322: Type 'Date' is not assignable to type 'ReactNode'.
+```
+
+그 타입 주석이 없으면 같은 실수가 나중에 더 나쁘게, 빌드 시점 오류 대신 런타임 충돌로 드러납니다: `Error: Objects are not valid as a React child (found: [object Date])`. 어느 쪽이든 해결책은 같습니다: 값을 문자열처럼 다루는 대신, 렌더링하는 자리에서 그 값에 `.toISOString()`(또는 포매팅 라이브러리)을 호출하세요.
+
+`npm run build`로 앱을 빌드하면 이 페이지가 요청 시점 데이터에 의존하지 않음(`cookies()` 없음, `headers()` 없음, 동적으로 표시된 것 없음)을 보여주므로, Next.js는 빌드 시점에 정적 콘텐츠로 사전 렌더링합니다:
+
+```
+Route (app)
+┌ ○ /
+├ ○ /_not-found
+└ ƒ /api/notes
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+```
+
+이는 `getNotes()`의 쿼리가 `next build` 중에 한 번 실행되고, 데이터베이스가 빌드 시점에 연결 가능해야 한다는 뜻입니다. 아래의 Server Action은 모든 요청마다 쿼리를 다시 실행하는 대신, 각 쓰기 뒤에 페이지를 재검증해 페이지 내용을 최신으로 유지합니다.
+
+## Server Action으로 쓰기 {#writing-with-a-server-action}
+
+`src/app/actions.ts`는 같은 풀을 통해 삽입을 수행합니다:
+
+```typescript
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { pool } from "@/lib/db";
+
+export async function addNote(formData: FormData) {
+  const body = formData.get("body");
+
+  if (typeof body !== "string" || body.trim().length === 0) {
+    return;
+  }
+
+  await pool.execute("INSERT INTO notes (body) VALUES (?)", [body.trim()]);
+
+  revalidatePath("/");
+}
+```
+
+홈 페이지의 폼은 이 함수를 `action`으로 직접 전달합니다:
+
+```tsx
+<form action={addNote}>
+  <input type="text" name="body" maxLength={280} required />
+  <button type="submit">Add</button>
+</form>
+```
+
+실제 브라우저에서 이 폼에 "Server Action verified end to end"를 입력하고 Add를 클릭해 제출하자, 전체 페이지 이동 없이 새 행이 삽입되었고, `revalidatePath("/")` 덕분에 그 행이 렌더링된 목록에 즉시 나타났습니다. 그 뒤 데이터베이스에 직접 쿼리해 쓰기를 확인했습니다:
+
+```sql
+SELECT * FROM notes;
+```
+
+```
+id  body                                 created_at
+1   First note, inserted while setting up the guide.   2026-08-28 12:17:51
+2   Server Action verified end to end                  2026-08-28 12:19:37
+```
+
+`revalidatePath("/")`는 이전 섹션의 캐시된 정적 렌더링을 무효화하므로, 다음 요청은 빌드 시점 스냅샷을 제공하는 대신 `getNotes()`를 다시 실행합니다. 이 호출이 없으면 정적 페이지의 데이터 캐시는 새 행을 결코 알아차리지 못합니다.
+
+## JSON Route Handler {#a-json-route-handler}
+
+Server Component와 Server Action은 Next.js 자체가 렌더링하는 페이지를 다룹니다. Route Handler는 ORM 중심 가이드가 보통 건너뛰는 조각입니다. 페이지가 아니라 일반 HTTP API 표면이기 때문입니다: `src/app/api/notes/route.ts`는 모바일 클라이언트, 웹훅, 또는 Next.js 프런트엔드가 아닌 모든 호출자를 위해 `GET` 요청에 JSON으로 응답합니다.
+
+```typescript
+import { NextResponse } from "next/server";
+import { pool } from "@/lib/db";
+import type { RowDataPacket } from "mysql2";
+
+interface Note extends RowDataPacket {
+  id: number;
+  body: string;
+  created_at: Date;
+}
+
+export async function GET() {
+  const [rows] = await pool.query<Note[]>(
+    "SELECT id, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
+    [20],
+  );
+
+  return NextResponse.json({ notes: rows });
+}
+```
+
+빌드된 앱을 `npm run start`(기본 포트 3000)로 실행하고 이 라우트를 요청하면, 자리 표시 데이터가 아니라 `notes`의 실제 행을 반환하며, 위에서 Server Action이 삽입한 행도 포함됩니다:
+
+```bash
+curl http://localhost:3000/api/notes
+```
+
+```json
+{"notes":[{"id":2,"body":"Server Action verified end to end","created_at":"2026-08-28T19:19:37.000Z"},{"id":1,"body":"First note, inserted while setting up the guide.","created_at":"2026-08-28T19:17:51.000Z"}]}
+```
+
+홈 페이지와 달리 이 라우트는 요청 시점 데이터를 간접적으로 읽으므로(빌드 시점이 아니라 호출마다 데이터베이스에 쿼리), 위의 같은 빌드 출력은 이 라우트를 정적을 뜻하는 `○`가 아니라 동적을 뜻하는 `ƒ`로 표시합니다.
+
+## Next.js에서의 연결 풀 크기 {#connection-pool-sizing-in-nextjs}
+
+Route Handler는 들어오는 요청마다 한 번 실행되고, 동시 부하 아래에서는 여러 요청이 동시에 진행 중일 수 있습니다. 풀은 그 요청들이 각각 자기 연결을 여는 대신 제한된 수의 MySQL 연결을 공유하도록 존재합니다.
+
+실행 중인 앱의 `/api/notes`에 동시 요청 20개를 보내고 즉시 서버를 확인하자:
+
+```sql
+SHOW STATUS LIKE 'Threads_connected';
+```
+
+`connectionLimit: 10`으로 설정된 풀에 대해 사용 중인 연결이 4개뿐이었습니다. `Threads_connected`는 이 앱의 연결뿐 아니라 서버의 모든 연결을 세므로, 사용자별 숫자가 필요하면 이 가이드 앞부분의 `information_schema.processlist` 쿼리를 사용하세요. 정확한 숫자는 버스트가 도착하는 시점에 비해 각 쿼리가 얼마나 빨리 완료되느냐에 달려 있으므로, 더 느린 쿼리나 더 바쁜 서버라면 설정된 한도까지 더 높은 수를 보일 것입니다. 어느 쪽이든 확인되는 것은 풀이 20개를 여는 대신 버스트에 걸쳐 연결을 대기열에 넣고 재사용한다는 점입니다. `connectionLimit`을 높이면 나머지가 풀의 내부 대기열(`queueLimit`으로 제한되거나, `queueLimit`이 `0`이면 무제한)에서 기다리기 전에 몇 개의 요청이 병렬로 쿼리를 실행할 수 있는지가 늘어납니다. 앱이 받을 수 있는 요청 수는 바뀌지 않고, 동시에 MySQL에 대해 쿼리 중일 수 있는 수만 바뀝니다.
+
+Next.js에 특정한 두 가지가 실제로 이 숫자에 영향을 줍니다:
+
+- **모든 서버 프로세스가 자기 풀을 가집니다.** 여러 인스턴스(여러 `next start` 프로세스, 또는 여러 서버리스 함수 인스턴스)를 실행하는 Next.js 배포는 `connectionLimit`에 실행 중인 인스턴스 수를 곱합니다. `connectionLimit`만이 아니라 `connectionLimit`과 MySQL의 `max_connections`를 함께 정하세요.
+- **개발 모드는 단일 프로세스 안에서 풀을 늘릴 수 있습니다.** 위의 연결 풀 섹션에서 보았듯이, 풀이 `globalThis`에 캐시되지 않은 경우입니다. 프로덕션 빌드에서는 일어나지 않지만, 개발 중에 확인할 가치가 있습니다. 증상(MySQL이 앱에 필요한 것보다 훨씬 많은 열린 연결을 보고함)이 프로덕션의 크기 문제와 똑같아 보이기 때문입니다.
+
+## 대신 ORM 선택하기 {#choosing-an-orm-instead}
+
+이 가이드는 `mysql2`를 직접 사용합니다. 원시 연결 풀은 그 위에 무엇이 놓이든 모든 Next.js와 MySQL 통합이 공유하는 조각이기 때문입니다. 애플리케이션이 생성된 타입, 마이그레이션, 또는 쿼리 빌더의 이점을 얻을 수 있다면, MySQL 특정 설정은 [Next.js와 Prisma로 MySQL 사용하기](/ko/guides/mysql-with-prisma)나 [Next.js와 Drizzle로 MySQL 사용하기](/ko/guides/mysql-with-drizzle)를, 일반적으로 ORM 전반에서 중요한 설정은 [ORM으로 MySQL 사용하기](/ko/guides/mysql-with-orms)를 참고하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### `note.created_at`을 렌더링하면 왜 그냥 텍스트로 출력되지 않고 실패하나요? {#why-does-rendering-notecreated_at-fail-instead-of-just-printing-as-text}
+
+`mysql2`는 MySQL `TIMESTAMP`나 `DATETIME` 열을 JavaScript `Date` 객체로 디코딩하는데, TypeScript의 `ReactNode` 타입도 React 자체도 이를 JSX로 직접 렌더링할 수 없습니다. 열이 `Date`로 타입 지정되어 있으면 `npm run build`가 타입 검사 시점에 `{note.created_at}`을 `error TS2322: Type 'Date' is not assignable to type 'ReactNode'`로 잡아냅니다. 그 타입이 없으면 같은 실수가 대신 런타임에 도달해 `Error: Objects are not valid as a React child (found: [object Date])`를 던집니다. 렌더링하기 전에 값에 `.toISOString()`, `.toLocaleString()`, 또는 포매팅 라이브러리를 호출하세요.
+
+#### 사용자가 몇 명뿐일 것으로 예상해도 연결 풀이 필요한가요? {#do-i-need-a-connection-pool-if-i-only-expect-a-few-users}
+
+예. 트래픽이 적어도 Next.js는 여러 요청을 동시에 실행할 수 있고(Route Handler도 호출하는 페이지 로드, 브라우저 탭 두 개, 사이트를 크롤링하는 봇), 각 MySQL 연결은 서버의 실제 스레드입니다. 작은 `connectionLimit`을 가진 풀(작은 앱에는 10이 합리적인 기본값)은 유휴 상태에서는 비용이 없고, 동시 요청의 버스트가 각각 연결을 하나씩 여는 것을 막습니다.
+
+#### Route Handler에서 Server Action을 호출하거나, 그 반대로 할 수 있나요? {#can-i-call-a-server-action-from-a-route-handler-or-the-other-way-around}
+
+Route Handler는 Server Action이 호출하는 것과 같은 함수를 호출할 수 있습니다. 둘 다 풀을 사용하는 비동기 함수일 뿐이기 때문입니다. 다른 것은 호출 규약입니다: Server Action은 `<form action>`이나 React의 `useActionState`가 호출하고, Route Handler는 HTTP 요청이 호출합니다. 한쪽이 다른 쪽을 직접 호출하게 하는 대신, 데이터베이스 로직을 일반 함수로 공유하고 양쪽에서 그 함수를 호출하세요.
+
+#### 홈 페이지는 정적인데 API 라우트는 왜 아닌가요? {#why-is-the-home-page-static-but-the-api-route-is-not}
+
+Next.js는 라우트가 요청 시점 데이터를 읽는지에 따라 라우트별로 이를 결정합니다. 이 가이드의 `src/app/page.tsx`는 `cookies()`나 `headers()` 같은 런타임 API를 호출하지 않으므로, `next build`가 한 번 사전 렌더링하고 `revalidatePath`가 무효화할 때까지 그 스냅샷을 제공합니다. 이 가이드의 Route Handler에는 그런 캐싱이 적용되지 않으므로 모든 요청마다 데이터베이스에 쿼리합니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `error TS2322: Type 'Date' is not assignable to type 'ReactNode'`(빌드) 또는 `Error: Objects are not valid as a React child (found: [object Date])`(런타임, 타입이 없을 때) | `TIMESTAMP`나 `DATETIME` 열이 `Date` 객체로 돌아왔습니다. 렌더링하기 전에 `.toISOString()`을 호출하거나 포매팅하세요. |
+| `next dev` 중에 MySQL 연결 수가 계속 증가함 | 풀이 `globalThis`에 캐시되지 않아 핫 리로드마다 새 풀이 만들어집니다. 이 가이드에 나온 `globalForPool` 보호 장치를 추가하세요. |
+| Server Action은 실행되는데 페이지에 새 데이터가 전혀 나타나지 않음 | 변경된 데이터를 읽는 경로에 `revalidatePath`(또는 `revalidateTag`)를 추가하세요. 없으면 정적으로 렌더링된 페이지는 빌드 시점 스냅샷을 계속 제공합니다. |
+| Route Handler나 Server Action에서 `Error: connect ECONNREFUSED 127.0.0.1:3306`(포트는 다를 수 있음) | Next.js를 실행하는 프로세스에서 MySQL 서버에 연결할 수 없습니다. 서버가 실행 중인지, `.env.local`이 올바른 호스트와 포트를 가리키는지 확인하세요. |
+| 부하 아래에서 연결이 너무 많음 | MySQL의 `max_connections`를 높이거나, 프로세스별 `connectionLimit`을 낮추거나, 실행 중인 Next.js 인스턴스 수를 줄이세요. [연결 풀링](/ko/guides/connection-pooling)을 참고하세요. |
+
+## 함께 보기 {#see-also}
+
+- [Next.js와 Prisma로 MySQL 사용하기](/ko/guides/mysql-with-prisma) — 원시 드라이버 대신 Prisma 위에 만든 같은 앱
+- [Next.js와 Drizzle로 MySQL 사용하기](/ko/guides/mysql-with-drizzle) — 원시 드라이버 대신 Drizzle 위에 만든 같은 앱
+- [MySQL 연결 풀링](/ko/guides/connection-pooling) — 프레임워크와 무관하게 `connectionLimit`, `waitForConnections`, `queueLimit`이 동작하는 방식
+- [ORM으로 MySQL 사용하기](/ko/guides/mysql-with-orms) — 애플리케이션과 MySQL 사이에 ORM이 있을 때 중요한 설정

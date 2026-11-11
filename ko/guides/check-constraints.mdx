@@ -1,0 +1,151 @@
+---
+title: "MySQL의 CHECK 제약 조건"
+sidebarTitle: "CHECK 제약 조건 사용하기"
+description: "MySQL CHECK 제약 조건의 동작 방식: 구문, 적용 동작, 이름 있는 제약 조건, 제약 조건 비활성화, 그리고 CHECK가 트리거 및 애플리케이션 수준 검증과 비교되는 방식."
+keywords: "mysql check constraint, mysql check constraint example, mysql add check constraint, mysql constraint validation, mysql 8 check constraint, mysql create table check, mysql enforce data rules"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL은 `CHECK` 제약 조건을 적용합니다. 이전 버전에서는 구문은 받아들였지만 조용히 무시했습니다 — PostgreSQL에서 마이그레이션하는 많은 개발자를 놀라게 한 동작입니다.
+
+## CHECK 제약 조건 정의 {#defining-check-constraints}
+
+`CHECK` 제약 조건은 컬럼과 함께 인라인으로 추가하거나 테이블 수준 제약 조건으로 추가합니다:
+
+```sql
+CREATE TABLE products (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    name     VARCHAR(100) NOT NULL,
+    price    DECIMAL(10,2) NOT NULL,
+    quantity INT NOT NULL,
+
+    -- Inline constraints
+    CONSTRAINT chk_price    CHECK (price > 0),
+    CONSTRAINT chk_quantity CHECK (quantity >= 0)
+);
+```
+
+또는 컬럼 정의와 함께 인라인으로:
+
+```sql
+CREATE TABLE orders (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    status     VARCHAR(20) CHECK (status IN ('pending', 'shipped', 'delivered', 'cancelled')),
+    discount   DECIMAL(5,2) CHECK (discount BETWEEN 0 AND 100)
+);
+```
+
+검사 표현식이 여러 컬럼에 걸칠 때는 테이블 수준 제약 조건이 필요합니다:
+
+```sql
+CREATE TABLE shipments (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    shipped_at   DATE,
+    delivered_at DATE,
+    CONSTRAINT chk_dates CHECK (delivered_at IS NULL OR delivered_at >= shipped_at)
+);
+```
+
+## 적용 {#enforcement}
+
+MySQL은 `INSERT`와 `UPDATE`에서 `CHECK` 제약 조건을 적용합니다. 위반 시 `ERROR 3819 (HY000): Check constraint 'name' is violated.`를 반환합니다:
+
+```sql
+INSERT INTO products (name, price, quantity) VALUES ('Widget', -5.00, 10);
+-- ERROR 3819 (HY000): Check constraint 'chk_price' is violated.
+```
+
+오류 메시지에 제약 조건 이름이 포함되므로, 제약 조건에 이름을 붙이는 것은 추가로 입력할 만한 가치가 있습니다.
+
+`CHECK` 제약 조건은 `DELETE`에서는 평가되지 **않습니다**. 또한 제약 조건 자체가 기존 테이블에 추가될 때 다시 평가되지도 않습니다 — 제약 조건을 위반하는 기존 데이터가 있는 테이블에 제약 조건을 추가하면 즉시 실패합니다.
+
+## 제약 조건 추가와 제거 {#adding-and-removing-constraints}
+
+기존 테이블에 제약 조건을 추가합니다:
+
+```sql
+ALTER TABLE products
+ADD CONSTRAINT chk_name_length CHECK (CHAR_LENGTH(name) >= 2);
+```
+
+이름 있는 제약 조건을 삭제합니다:
+
+```sql
+ALTER TABLE products DROP CHECK chk_price;
+-- or the SQL standard syntax:
+ALTER TABLE products DROP CONSTRAINT chk_price;
+```
+
+테이블의 모든 제약 조건을 나열합니다:
+
+```sql
+SELECT cc.constraint_name, cc.check_clause
+FROM information_schema.check_constraints cc
+JOIN information_schema.table_constraints tc
+    ON tc.constraint_schema = cc.constraint_schema
+   AND tc.constraint_name   = cc.constraint_name
+WHERE cc.constraint_schema = DATABASE()
+  AND tc.table_name = 'products';
+```
+
+## 적용 비활성화 {#disabling-enforcement}
+
+특정 제약 조건을 삭제하지 않고 비활성화합니다:
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price NOT ENFORCED;
+```
+
+다시 활성화합니다:
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price ENFORCED;
+```
+
+`NOT ENFORCED`는 검증을 일시적으로 우회해야 하는 데이터 마이그레이션 중에 유용합니다. 마이그레이션이 완료되면 적용을 다시 활성화하세요.
+
+## CHECK 대 트리거 대 애플리케이션 검증 {#check-vs-triggers-vs-application-validation}
+
+| | CHECK 제약 조건 | 트리거 | 애플리케이션 코드 |
+|:--|:----------------|:--------|:-----------------|
+| 적용 주체 | MySQL(항상) | MySQL(항상) | 애플리케이션(앱이 실행될 때만) |
+| 성능 | 매우 낮은 오버헤드 | 행당 실행 오버헤드 | 왕복 비용 |
+| 오류 가시성 | 제약 조건 이름이 포함된 SQL 오류 | 오류를 드러내려면 SIGNAL 필요 | 애플리케이션 정의 |
+| 컬럼 간 검사 | 예 | 예 | 예 |
+| 테이블 간 검사 | 아니요 | 예(다른 테이블 쿼리 가능) | 예 |
+| 복잡성 | 단순한 표현식만 | 임의의 SQL 로직 | 임의의 코드 |
+
+단순하고 자체 완결적인 규칙에는 `CHECK`를 사용하세요: 유효 범위, 허용 값, 음이 아닌 숫자, 날짜 순서. 규칙이 다른 테이블의 쿼리를 필요로 할 때는 트리거를 사용하세요. 외부 상태와 관련된 규칙(속도 제한, 가용성 검사)에는 애플리케이션 검증을 사용하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### CHECK 제약 조건은 모든 스토리지 엔진에서 동작하나요? {#do-check-constraints-work-on-all-storage-engines}
+
+예. 일부 MySQL 기능과 달리 `CHECK` 제약 조건은 InnoDB, MyISAM, 기타 스토리지 엔진에서 동작합니다. 다만 MyISAM 테이블은 구문적으로 유효한 제약 조건을 정의할 수 있지만 이 스토리지 엔진에는 롤백이 없으므로, MyISAM에서 제약 조건 실패는 부분적인 데이터를 남길 수 있습니다. InnoDB는 완전한 롤백으로 위반을 깔끔하게 처리합니다.
+
+#### CHECK 제약 조건이 다른 테이블을 참조할 수 있나요? {#can-check-constraints-reference-other-tables}
+
+아니요. `CHECK` 표현식은 현재 테이블의 현재 행으로 제한됩니다. 서브쿼리, 저장 함수, 다른 테이블 참조는 `CHECK` 표현식에서 허용되지 않습니다. 테이블 간 검증에는 트리거를 사용하세요.
+
+#### CHECK 제약 조건은 항상 MySQL에 있었나요? {#were-check-constraints-always-in-mysql}
+
+이전 MySQL 버전에서도 구문은 받아들였지만 제약 조건은 조용히 무시되었습니다. 이전 스키마에서 마이그레이션하는 경우, 기존 `CHECK` 절이 유효하고 적용하려는 규칙을 담고 있는지 확인하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `ERROR 3819: Check constraint violated` | INSERT 또는 UPDATE 값이 제약 조건을 통과하지 못함 — 오류의 제약 조건 이름을 확인하여 어떤 규칙이 위반되었는지 식별 |
+| `ALTER TABLE ADD CONSTRAINT`가 즉시 실패함 | 테이블의 기존 행이 제약 조건을 위반함 — 먼저 데이터를 수정하거나 마이그레이션 중 `NOT ENFORCED` 사용 |
+| CHECK 제약 조건이 정의되었지만 적용되지 않음 | CHECK 제약 조건 적용이 도입되기 전의 오래된 MySQL 버전을 실행 중 — 업그레이드하거나 트리거 사용 |
+| 제약 조건을 삭제할 수 없음 | `DROP CHECK` 또는 `DROP CONSTRAINT`에 (컬럼 이름이 아닌) 제약 조건 이름 사용 |
+| 제약 조건 이름을 알 수 없음 | `information_schema.check_constraints`를 쿼리하여 테이블의 제약 조건 이름 찾기 |
+
+## 참고 {#see-also}
+
+- [MySQL의 정규화](/ko/guides/normalization) — CHECK 제약 조건이 보완하는 스키마 설계
+- [MySQL 트리거](/ko/guides/triggers) — 복잡한 검증을 위한 CHECK 제약 조건의 대안
+- [MySQL의 NULL](/ko/guides/null-in-mysql) — CHECK 제약 조건과 NULL은 분명하지 않은 방식으로 상호 작용합니다

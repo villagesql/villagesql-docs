@@ -1,0 +1,181 @@
+---
+title: "외부 API 데이터로 행 보강하기"
+sidebarTitle: "REST API 보강"
+description: "VillageSQL의 vsql_http 확장을 사용해 외부 REST API의 실시간 데이터를 MySQL 쿼리 결과로 가져오는 방법입니다."
+keywords: "mysql rest api, mysql api enrichment, mysql http query, mysql external data, vsql_http enrichment"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+어떤 데이터는 데이터베이스 안에 있지 않습니다 — 환율, 배송 상태, 지리 위치 조회, 서드파티 제품 상세 정보. 표준 접근 방식은 애플리케이션 코드에서 가져와 테이블에 캐시하거나 애플리케이션 계층에서 쿼리 결과와 꿰매 붙이는 것입니다. VillageSQL의 `vsql_http` 확장을 사용하면 그 데이터를 쿼리에서 직접 가져오거나 UPDATE 한 번으로 열에 저장할 수 있습니다.
+
+## 설정 {#setup}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+## 패턴 1: 보강 결과를 열에 저장 {#pattern-1-store-enrichment-in-a-column}
+
+가장 흔한 용도: 외부 API에서 가져온 데이터로 열을 채우는 것입니다. 행마다 API를 호출하는 UPDATE를 실행하고, 결과를 저장한 뒤, 저장된 열을 쿼리합니다.
+
+이 예제는 각 주문의 배송 상태를 가져옵니다:
+
+```sql
+ALTER TABLE orders ADD COLUMN shipping_status VARCHAR(100);
+
+UPDATE orders
+SET shipping_status = JSON_VALUE(
+  JSON_UNQUOTE(JSON_EXTRACT(
+    CONVERT(
+      vsql_http.http_get(
+        CONCAT('https://api.shipping.com/track/', tracking_number)
+      ) USING utf8mb4
+    ),
+    '$.content'
+  )),
+  '$.status'
+)
+WHERE tracking_number IS NOT NULL
+  AND shipping_status IS NULL
+LIMIT 50;
+```
+
+`shipping_status IS NULL`인 행이 남지 않을 때까지 애플리케이션에서 이것을 반복 실행하세요. API 속도 제한 안에 머물도록 배치로 처리하세요.
+
+채우고 나면 쿼리는 저장된 열을 읽습니다 — 쿼리마다 API 호출이 없습니다:
+
+```sql
+SELECT id, customer_id, shipping_status
+FROM orders
+WHERE shipping_status = 'delivered'
+ORDER BY updated_at DESC;
+```
+
+## 패턴 2: 쿼리 안에서 실시간 조회 {#pattern-2-live-lookup-in-a-query}
+
+캐시하기에는 너무 빨리 바뀌는 데이터 — 환율, 실시간 가격 — 에는 SELECT 안에서 API를 인라인으로 호출할 수 있습니다. 결과의 모든 행이 요청을 일으키므로 결과 집합을 작게 유지하세요.
+
+```sql
+-- Fetch the current USD/EUR exchange rate and apply it to each row
+SET @rate_resp = CONVERT(
+  vsql_http.http_get('https://api.exchangerate.example.com/latest?base=USD')
+  USING utf8mb4
+);
+SET @rate_body = JSON_UNQUOTE(JSON_EXTRACT(@rate_resp, '$.content'));
+SET @eur_rate = CAST(JSON_VALUE(@rate_body, '$.rates.EUR') AS DECIMAL(10,6));
+
+SELECT
+  id,
+  amount_usd,
+  ROUND(amount_usd * @eur_rate, 2) AS amount_eur
+FROM invoices
+WHERE currency = 'USD'
+LIMIT 100;
+```
+
+공유 값을 변수로 한 번 가져온 뒤 쿼리에서 그 변수를 사용하세요 — 행마다 정말로 다른 API 호출이 필요한 경우가 아니라면 SELECT 표현식 안에서 `http_get()`을 호출하지 마세요.
+
+## 패턴 3: 조건부 보강 {#pattern-3-conditional-enrichment}
+
+API를 호출하기 전에 WHERE로 필터링하여 실제로 필요한 행에 대해서만 가져오세요:
+
+```sql
+-- Only enrich rows missing geocoordinates
+UPDATE locations
+SET
+  lat = CAST(JSON_VALUE(
+    JSON_UNQUOTE(JSON_EXTRACT(
+      CONVERT(
+        vsql_http.http_get(
+          CONCAT('https://api.geocode.example.com/json?address=',
+                 vsql_http.url_encode(address))
+        ) USING utf8mb4
+      ),
+      '$.content'
+    )),
+    '$.lat'
+  ) AS DECIMAL(10,7)),
+  lng = CAST(JSON_VALUE(
+    JSON_UNQUOTE(JSON_EXTRACT(
+      CONVERT(
+        vsql_http.http_get(
+          CONCAT('https://api.geocode.example.com/json?address=',
+                 vsql_http.url_encode(address))
+        ) USING utf8mb4
+      ),
+      '$.content'
+    )),
+    '$.lng'
+  ) AS DECIMAL(10,7))
+WHERE lat IS NULL
+  AND address IS NOT NULL
+LIMIT 25;
+```
+
+주소를 감싸는 `url_encode()`에 주목하세요 — 사용자 데이터를 URL에 넣기 전에 항상 인코딩하세요.
+
+## API 오류 처리 {#handling-api-errors}
+
+모든 `vsql_http` 함수는 연결 실패 시 curl의 오류 메시지를 담은 경고와 함께 NULL을 반환합니다. 내용을 사용하기 전에 상태 코드를 확인하세요:
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_get('https://api.example.com/data/123') USING utf8mb4
+);
+
+SELECT
+  CASE
+    WHEN @resp IS NULL          THEN 'connection_failed'
+    WHEN JSON_VALUE(@resp, '$.status') = '200' THEN
+      JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content'))
+    WHEN JSON_VALUE(@resp, '$.status') = '404' THEN 'not_found'
+    ELSE CONCAT('error_', JSON_VALUE(@resp, '$.status'))
+  END AS result;
+```
+
+대량 UPDATE 루프에서는 NULL 또는 200이 아닌 응답을 받은 행의 열 값이 NULL로 남으므로, UPDATE를 다시 실행해 실패한 행을 재시도할 수 있습니다.
+
+## 성능 고려 사항 {#performance-considerations}
+
+**각 HTTP 호출은 동기식이며 쿼리를 막습니다.** 각각 200ms API를 호출하는 50행 배치는 최소 10초가 걸립니다. `max_execution_time`은 `SELECT` 문만 제한합니다 — 여기에는 효과가 없습니다. 이 `UPDATE`의 실행 시간에 상한을 두려면, 미리 `SELECT CONNECTION_ID()`로 연결 ID를 얻어 두고, 너무 오래 실행되면 다른 세션에서 `KILL QUERY <id>`를 실행하세요:
+
+```sql
+UPDATE orders
+SET shipping_status = JSON_VALUE(
+  JSON_UNQUOTE(JSON_EXTRACT(
+    CONVERT(vsql_http.http_get(
+      CONCAT('https://api.shipping.com/track/', tracking_number)
+    ) USING utf8mb4),
+    '$.content'
+  )),
+  '$.status'
+)
+WHERE shipping_status IS NULL
+LIMIT 50;
+```
+
+실시간 쿼리보다 결과 저장을 선호하세요 — 값이 열에 들어가고 나면 이후 쿼리는 네트워크를 건드리지 않습니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| UPDATE가 너무 오래 실행됨 | `LIMIT`을 줄임; `max_execution_time`은 `UPDATE`에 적용되지 않으므로 대신 다른 세션에서 `KILL QUERY <connection_id>`를 사용 |
+| 모든 행에 NULL을 반환 | 서버 호스트에서 API에 도달할 수 없음; `SHOW WARNINGS`로 curl의 오류 메시지를 확인하고 네트워크 접근을 검증 |
+| JSON 추출이 NULL을 반환 | `content`는 중첩 객체가 아니라 JSON으로 인코딩된 문자열이므로, 한 단계 `'$.content.field'` 경로는 절대 해석되지 않음. 먼저 따옴표를 벗기고 — `JSON_UNQUOTE(JSON_EXTRACT(resp, '$.content'))` — 그 결과에서 필드를 추출. 응답 크기와 무관함 |
+| URL 매개변수가 올바르게 인코딩되지 않음 | 값을 `vsql_http.url_encode()`로 감쌈 |
+| API의 속도 제한 오류 | 배치당 LIMIT을 줄임; 배치 사이에 `SELECT SLEEP(1)`을 추가 |
+
+## 다음 단계 {#next-steps}
+
+- [SQL에서 HTTP 요청 보내기](/ko/guides/http-requests-in-mysql) — 전체 함수 참조와 응답 파싱
+- [트리거에서 웹훅 보내기](/ko/guides/http-webhooks) — 데이터를 가져오는 대신 변경을 밖으로 밀어내기
+
+## 함께 보기 {#see-also}
+
+- [SQL에서 HTTP 요청 보내기](/ko/guides/http-requests-in-mysql) — API 호출에 사용하는 HTTP 함수
+- [MySQL의 JSON](/ko/guides/json-in-mysql) — API가 반환하는 JSON 응답 파싱하기
+- [테이블을 REST API로 제공하기](/ko/guides/rest-api-from-tables) — 자신의 테이블을 HTTP로 공개하기

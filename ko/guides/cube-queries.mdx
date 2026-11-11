@@ -1,0 +1,122 @@
+---
+title: "MySQL의 다차원 범위 쿼리"
+sidebarTitle: "다차원 쿼리"
+description: "VillageSQL의 vsql_cube 확장을 사용하여 MySQL에서 다차원 데이터를 저장하고 쿼리하는 방법 — 여러 숫자 속성에 걸친 포함, 겹침, 최근접 이웃 검색을 다룹니다."
+keywords: "mysql multi-dimensional range query, mysql geometric type, mysql cube extension, mysql nearest neighbor, mysql n-dimensional search, vsql_cube"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  이 가이드는 VillageSQL 0.0.4 이상이 필요합니다.
+</Note>
+
+MySQL에는 n차원 공간의 점이나 영역을 표현하는 내장 방법이 없습니다. 여러 숫자 열에 AND 조건을 연결할 수는 있지만, 그것은 포함 여부만 처리합니다 — 거리 쿼리로 확장되지 않고, 행의 속성들을 하나의 기하학적 값으로 다룰 수도 없습니다. VillageSQL의 `vsql_cube` 확장은 두 종류의 쿼리를 모두 자연스럽게 만드는 `cube` 사용자 정의 유형을 추가합니다.
+
+## 문제 {#the-problem}
+
+각 상품에 가격, 평균 평점, 리뷰 수가 있는 상품 카탈로그가 있다고 합시다. 구매자는 가격 $50–$200, 평점 3.5 이상, 리뷰 50개 이상인 상품을 원합니다. 이는 세 가지 조건의 AND입니다:
+
+```sql
+-- Works for containment, but doesn't generalize
+SELECT name FROM products
+WHERE price BETWEEN 50 AND 200
+  AND rating BETWEEN 3.5 AND 5.0
+  AND reviews BETWEEN 50 AND 1000;
+```
+
+AND 연결은 일치하는 항목을 찾습니다. 하지만 주어진 상품과 가장 유사한 상품 5개 — 가격, 평점, 리뷰 수가 동시에 가장 가까운 상품 — 를 원한다면 자연스러운 SQL 답이 없습니다. 후보를 애플리케이션 코드로 가져와 거기서 거리를 계산해야 합니다.
+
+## VillageSQL과 함께: cube 유형 {#with-villagesql-the-cube-type}
+
+```sql
+INSTALL EXTENSION vsql_cube;
+```
+
+`cube` 유형은 n차원 공간의 점이나 상자를 저장합니다. 점은 위치이고, 상자는 두 모서리 좌표로 정의되는 영역입니다. 둘 다 일반 열에 들어갑니다.
+
+```sql
+CREATE TABLE products (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255),
+    attrs `cube`(3)
+);
+```
+
+`cube`는 MySQL 예약어이므로 DDL에서 백틱으로 감싸세요. 차원 매개변수(`3`)는 필수입니다 — 숫자 없는 `cube`만으로는 지원되지 않습니다.
+
+### 데이터 삽입 {#inserting-data}
+
+좌표 문자열을 직접 삽입하고 열 자체의 변환이 이를 파싱하게 하세요. `cube_point_nd()`로 감싸지 마세요: 그 함수는 매개변수화되지 않은 `cube`를 반환하며, 이는 차원이 매개변수화된 `cube(3)` 열로 암시적으로 변환될 수 없습니다(`ERROR 3219`).
+
+```sql
+INSERT INTO products (name, attrs) VALUES
+    ('Budget Widget',   '29.99,4.1,320'),
+    ('Standard Widget', '79.99,4.4,1250'),
+    ('Premium Widget',  '149.99,4.7,890'),
+    ('Discount Widget', '19.99,3.2,45'),
+    ('Pro Widget',      '199.99,4.8,2100');
+```
+
+여기서 좌표는 `(price, rating, review_count)`입니다 — 상품당 점 하나입니다.
+
+### cube_contains를 사용한 범위 쿼리 {#range-queries-with-cube_contains}
+
+검색 영역을 상자로 정의하세요. `cube_box_nd()`는 아래쪽 모서리의 좌표 다음에 위쪽 모서리의 좌표를 받으므로, 3차원 상자는 숫자 6개를 받습니다.
+
+```sql
+-- Products: $50–$200, rating 3.5–5.0, 50–2000 reviews
+SET @region = cube_box_nd(50.0, 3.5, 50, 200.0, 5.0, 2000);
+
+SELECT name FROM products
+WHERE cube_contains(@region, attrs);
+```
+
+`cube_contains(@region, attrs)`는 상품의 점이 상자 안에 들어갈 때 1을 반환합니다 — 세 AND 조건을 한꺼번에 적용한 것과 같지만, 거리 쿼리와 조합할 수도 있습니다.
+
+### cube_distance를 사용한 최근접 이웃 {#nearest-neighbor-with-cube_distance}
+
+주어진 상품과 가장 유사한 상품을 찾으려면 속성 공간에서 유클리드 거리를 측정하세요:
+
+```sql
+-- 3 products most similar to Standard Widget (79.99, 4.4, 1250)
+SET @target = cube_point_nd(79.99, 4.4, 1250);
+
+SELECT name,
+       ROUND(cube_distance(attrs, @target), 2) AS distance
+FROM products
+WHERE name != 'Standard Widget'
+ORDER BY cube_distance(attrs, @target)
+LIMIT 3;
+```
+
+스케일에 대한 참고: 가격은 수백 단위, 평점은 0–5, 리뷰 수는 수천 단위일 수 있습니다. 원시 유클리드 거리는 리뷰 수에 지배됩니다. 균형 잡힌 유사도 점수를 원한다면 삽입 전에 세 차원을 모두 공통 스케일(예: 0–1)로 정규화하세요.
+
+### 겹침 확인 {#checking-overlap}
+
+`cube_overlaps()`는 두 상자가 공간을 조금이라도 공유하면 1을 반환합니다 — 상품이 여러 프로모션 구간 중 하나에라도 해당하는지 확인할 때 유용합니다:
+
+```sql
+SET @promo_a = cube_box_nd(0.0, 4.5, 500, 100.0, 5.0, 9999);
+SET @promo_b = cube_box_nd(100.0, 4.0, 100, 300.0, 5.0, 9999);
+
+SELECT name FROM products
+WHERE cube_overlaps(@promo_a, attrs) OR cube_overlaps(@promo_b, attrs);
+```
+
+## 문제 해결 {#troubleshooting}
+
+| 오류 | 해결 방법 |
+|---|---|
+| `ERROR: Function 'cube_point_nd' does not exist` | `INSTALL EXTENSION vsql_cube`를 실행 |
+| 열 유형 `cube`가 인식되지 않음 | VillageSQL 0.0.4 이상을 실행 중인지 확인 |
+| 열 선언이 거부됨 | DDL에서 `cube`를 백틱으로 감싸기: `` `cube`(N) `` |
+| 거리 결과가 이상해 보임 | 좌표를 정규화 — 원시 유클리드 거리는 스케일이 가장 큰 차원에 치우침 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL에서 벡터 임베딩 생성하기](/ko/guides/vector-embeddings) — 다차원 유사도에 대한 또 다른 접근으로서 AI가 생성한 벡터
+- [MySQL에서 전문 검색을 구현하는 방법](/ko/guides/full-text-search) — 텍스트 데이터를 위한 대안으로서 키워드 기반 검색
+- [데이터에 맞는 열 유형을 고르는 방법](/ko/guides/choosing-data-types) — cube와 표준 열 유형 중 무엇을 선택할지

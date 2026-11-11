@@ -1,0 +1,249 @@
+---
+title: "MySQL 보안 강화"
+sidebarTitle: "MySQL 강화하기"
+description: "MySQL 서버를 안전하게 만드는 방법: mysql_secure_installation 실행, 익명 사용자 제거, root 접근 제한, 비밀번호 정책 적용, 권한 감사, SSL/TLS 활성화, 공격 표면 축소입니다."
+keywords: "mysql security, mysql hardening, mysql secure installation, mysql ssl tls, mysql password policy, mysql root security, mysql user privileges audit, mysql security best practices"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+기본 MySQL 설치는 보안보다 설치 편의성을 우선합니다. 프로덕션 서버를 강화한다는 것은 개발자 노트북에서는 합리적이었지만 서버가 애플리케이션이나 네트워크에서 접근 가능할 때는 부적절한 기본값을 제거하는 것을 뜻합니다.
+
+## 배포 환경별 강화 {#hardening-by-deployment-context}
+
+모든 강화 단계가 같은 위험/마찰 트레이드오프를 갖는 것은 아닙니다. 이 표를 사용해 우선순위를 정하세요:
+
+| 단계 | 인터넷 노출 프로덕션 | 내부/사설 네트워크 | 개발 / 스테이징 |
+|:-----|:--------------------------|:------------------------|:--------------|
+| `mysql_secure_installation` 실행 | 필수 | 필수 | 권장 |
+| 익명 사용자 제거 | 필수 | 필수 | 권장 |
+| root를 localhost로 제한 | 필수 | 필수 | 권장 |
+| test 데이터베이스 제거 | 필수 | 필수 | 선택 |
+| `validate_password` 컴포넌트 | 필수 | 필수 | 선택 — 빠른 반복을 방해할 수 있음 |
+| 비밀번호 만료 정책 | 필수 | 권장 | 생략 |
+| 최소 권한 앱 계정 | 필수 | 필수 | 권장 |
+| 권한 부여 시 호스트 제한(`'%'` 금지) | 필수 | 필수 | 선택 |
+| 계정에 `REQUIRE SSL` | 필수 | 권장 | 생략 |
+| 사용자 정의 CA 서명 TLS 인증서 | 필수 | 선택 — 자체 서명 허용 | 생략 |
+| `bind-address`를 내부 IP로 | 필수 | 권장 | 선택 |
+| `local_infile` 비활성화 | 필수 | 권장 | 선택 |
+| `skip_name_resolve` | 권장 | 권장 | 선택 |
+| 사용하지 않는 계정 잠금 또는 삭제 | 필수 | 필수 | 선택 |
+
+**인터넷 노출**은 로드 밸런서 뒤에 있더라도 포트 3306에 사설 네트워크 밖에서 접근할 수 있다는 뜻입니다. 모든 "필수" 행을 예외 없이 적용하세요.
+
+**내부/사설 네트워크**는 VPC, 사설 서브넷, 사무실 네트워크 안에서만 접근할 수 있는 서버를 말합니다. 일부 완화 조치(CA 서명 인증서, 모든 계정에 SSL 강제)는 미미한 이득에 비해 운영 부담을 더합니다 — 하지만 강력한 비밀번호, 최소 권한, bind-address 제한은 여전히 타협할 수 없습니다.
+
+**개발/스테이징** 머신은 자격 증명 유출의 가장 흔한 원인입니다. 비밀번호 복잡성을 생략하거나 `'%'` 호스트 권한을 그대로 두는 것은 인스턴스에 노트북이나 CI 환경 밖에서 접근할 수 없을 때만 허용됩니다. 스테이징이 프로덕션 데이터와 네트워크를 공유한다면 최소한 내부/사설로 취급하세요.
+
+## mysql_secure_installation {#mysql_secure_installation}
+
+로컬 개발 머신이 아닌 모든 서버에서는 MySQL을 설치한 직후 이것을 실행하세요:
+
+```bash
+mysql_secure_installation
+```
+
+가장 중요한 강화 단계를 안내합니다:
+
+- root 비밀번호 설정(아직 설정하지 않았다면)
+- 익명 사용자 제거
+- 원격 root 로그인 금지
+- test 데이터베이스 제거
+- 권한 테이블 다시 로드
+
+이 네 단계가 새 설치에서 가장 흔한 공격 표면을 제거합니다.
+
+## root 계정 제한 {#root-account-restrictions}
+
+root는 `localhost`에서만 연결해야 합니다. 이를 확인하고 강제하세요:
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = 'root';
+-- Should show only 'localhost', '127.0.0.1', '::1'
+```
+
+root에 `'%'` 호스트 항목이 있으면 제거하세요:
+
+```sql
+DROP USER 'root'@'%';
+```
+
+원격 관리에는 root를 원격으로 사용하는 대신 호스트 접근이 제한된 이름 있는 DBA 계정을 만드세요.
+
+## 익명 사용자와 test 데이터베이스 제거 {#remove-anonymous-users-and-test-database}
+
+```sql
+-- Remove any anonymous accounts
+DELETE FROM mysql.user WHERE user = '';
+FLUSH PRIVILEGES;
+
+-- Remove the test database (readable by anonymous users by default)
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE db = 'test' OR db = 'test\\_%';
+FLUSH PRIVILEGES;
+```
+
+## 비밀번호 정책 {#password-policy}
+
+MySQL 8.0+에는 비밀번호 복잡성 규칙을 강제하는 `validate_password` 컴포넌트가 포함되어 있습니다. 사용하기 전에 설치해야 합니다 — `mysql_secure_installation`이 자동 설치를 제안합니다. 수동으로 설치하려면:
+
+```sql
+INSTALL COMPONENT 'file://component_validate_password';
+```
+
+활성화되었는지 확인하세요:
+
+```sql
+SHOW VARIABLES LIKE 'validate_password%';
+```
+
+최소 요구 사항을 설정하세요:
+
+```sql
+SET GLOBAL validate_password.length = 12;
+SET GLOBAL validate_password.mixed_case_count = 1;
+SET GLOBAL validate_password.number_count = 1;
+SET GLOBAL validate_password.special_char_count = 1;
+SET GLOBAL validate_password.policy = 'MEDIUM';
+```
+
+정책 수준: `LOW`(길이만), `MEDIUM`(길이 + 문자 종류), `STRONG`(+ 사전 검사).
+
+잊힐 수 있는 계정에는 비밀번호 만료를 설정하세요:
+
+```sql
+ALTER USER 'admin'@'localhost' PASSWORD EXPIRE INTERVAL 90 DAY;
+```
+
+## 최소 권한 사용자 계정 {#least-privilege-user-accounts}
+
+애플리케이션 계정은 필요한 최소한의 권한만 가져야 합니다. 전체 GRANT 구문은 [MySQL 사용자 관리](/ko/guides/user-management)를 참조하세요.
+
+흔한 패턴:
+
+```sql
+-- Read-only replica account
+CREATE USER 'app_read'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT ON myapp.* TO 'app_read'@'10.0.1.%';
+
+-- Application write account (no schema changes)
+CREATE USER 'app_write'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT, INSERT, UPDATE, DELETE ON myapp.* TO 'app_write'@'10.0.1.%';
+
+-- Migration account (schema changes allowed, used only by deploy scripts)
+CREATE USER 'app_migrate'@'localhost' IDENTIFIED BY 'strong_password';
+GRANT ALL PRIVILEGES ON myapp.* TO 'app_migrate'@'localhost';
+```
+
+호스트를 가능한 한 엄격하게 제한하세요 — `'%'`가 아니라 서브넷 표기나 특정 IP를 사용하세요.
+
+## 기존 권한 감사 {#auditing-existing-privileges}
+
+모든 계정과 그 권한을 검토하세요:
+
+```sql
+-- List all user accounts
+SELECT user, host, account_locked, password_expired
+FROM mysql.user
+ORDER BY user, host;
+
+-- Check for overly broad grants
+SELECT user, host, Select_priv, Insert_priv, Update_priv, Delete_priv,
+       Super_priv, Grant_priv
+FROM mysql.user
+WHERE host = '%' OR Super_priv = 'Y';
+```
+
+활발히 사용하지 않는 계정은 제거하거나 잠그세요:
+
+```sql
+ALTER USER 'old_account'@'%' ACCOUNT LOCK;
+-- Or drop entirely:
+DROP USER 'old_account'@'%';
+```
+
+## SSL/TLS 연결 {#ssltls-connections}
+
+MySQL 8.0은 기본적으로 SSL/TLS를 활성화하고 시작 시 인증서를 자동 생성합니다. 활성화되었는지 확인하세요:
+
+```sql
+SHOW VARIABLES LIKE '%ssl%';
+-- ssl_ca, ssl_cert, ssl_key should show file paths
+-- have_ssl no longer exists on MySQL 8.4 (ERROR 1193). To confirm TLS is in
+-- use, run SHOW STATUS LIKE 'Ssl_cipher' on an actual TLS connection.
+```
+
+특정 계정에 SSL을 요구하세요:
+
+```sql
+ALTER USER 'app_write'@'%' REQUIRE SSL;
+```
+
+클라이언트 연결이 SSL을 사용하는지 확인하려면:
+
+```sql
+SHOW STATUS LIKE 'Ssl_cipher';
+-- Non-empty value means the current connection is encrypted
+```
+
+프로덕션에서는 자동 생성된 자체 서명 인증서를 신뢰할 수 있는 CA의 인증서로 교체하세요.
+
+## 네트워크 접근 {#network-access}
+
+MySQL이 필요한 인터페이스에서만 수신하도록 제한하세요. `my.cnf`에서:
+
+```ini
+[mysqld]
+bind-address = 127.0.0.1     # local only
+# or
+bind-address = 10.0.1.5      # specific internal IP
+```
+
+MySQL에 네트워크에서 전혀 접근할 수 없어야 한다면(애플리케이션이 같은 호스트에 있는 경우), `127.0.0.1`에 바인딩하고 포트 3306을 외부에 절대 노출하지 마세요. 방화벽 규칙은 두 번째 방어 계층이지, bind address 제한의 대체물이 아닙니다.
+
+## 위험한 기능 비활성화 {#disabling-risky-features}
+
+애플리케이션이 사용하지 않는 기능을 끄세요:
+
+```sql
+-- Prevent MySQL from reading/writing files on the server filesystem
+-- (prevents SQL injection attacks that use LOAD DATA INFILE to read /etc/passwd)
+SET GLOBAL local_infile = 0;
+```
+
+`my.cnf`에서:
+
+```ini
+[mysqld]
+local_infile = 0
+skip_name_resolve = 1       # don't do reverse DNS lookups; use IPs in grants
+```
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 기본 MySQL 8.4 설치는 안전한가요? {#is-the-default-mysql-84-install-secure}
+
+이전 MySQL 기본값보다는 낫지만, 여전히 프로덕션용으로 강화되어 있지는 않습니다. MySQL 8.4는 무작위 root 비밀번호를 생성하고 기본적으로 SSL을 활성화합니다. 그래도 여전히 다음이 필요합니다: root 비밀번호가 강력한지 확인, 익명 사용자 제거, 호스트 접근 제한, `validate_password` 컴포넌트 설정.
+
+#### MySQL을 root로 실행해야 하나요? {#should-i-run-mysql-as-root}
+
+절대 안 됩니다. MySQL은 전용 저권한 시스템 사용자(일반적으로 `mysql`)로 실행해야 합니다. 서버 프로세스를 root로 실행하면 MySQL 취약점 공격이 전체 시스템 장악으로 이어질 수 있습니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `ERROR 1045: Access denied for user 'root'@'%'` | root 원격 로그인이 올바르게 차단됨 — 특정 호스트 접근 권한을 가진 이름 있는 관리자 사용자를 만들기 |
+| `REQUIRE SSL` 추가 후 애플리케이션이 연결하지 못함 | 클라이언트가 SSL 플래그를 사용해야 함: `--ssl-mode=REQUIRED`; 서버 인증서가 유효한지 확인 |
+| `validate_password`가 비밀번호를 거부 | 현재 정책을 확인: `SHOW VARIABLES LIKE 'validate_password%'`; 비밀번호가 모든 요구 사항을 충족하는지 확인 |
+| 새 설치에서 root 비밀번호를 찾을 수 없음 | MySQL 8.0은 첫 시작 시 임시 root 비밀번호를 오류 로그에 기록함 — `SELECT @@GLOBAL.log_error;`로 로그 경로를 찾은 다음 `grep 'temporary password' <path>` |
+| DELETE 후에도 호스트 `'%'` 권한이 여전히 보임 | `mysql.user`를 직접 수정한 뒤에는 `FLUSH PRIVILEGES`를 실행 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 사용자 관리](/ko/guides/user-management) — 사용자 생성과 최소 권한 부여
+- [MySQL의 비밀번호 해싱](/ko/guides/password-hashing) — MySQL에 저장된 애플리케이션 수준 자격 증명 보호
+- [MySQL의 JWT 인증](/ko/guides/jwt-authentication) — 자격 증명 발급과 교체를 ID 공급자로 옮기기

@@ -1,0 +1,99 @@
+---
+title: "흔한 MySQL 오류와 해결 방법"
+sidebarTitle: "흔한 오류"
+description: "누구나 마주치는 MySQL 오류 해석하기: 접근 거부(1045), 연결 불가(2002), ONLY_FULL_GROUP_BY(1055), 구문 오류(1064), 중복 키(1062)."
+keywords: "mysql error 1045 access denied, mysql error 2002 can't connect, only_full_group_by error, mysql error 1055, mysql error 1064, mysql duplicate entry 1062"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+다섯 가지 오류가 대부분의 MySQL 지원 질문을 차지합니다. 아래 각 오류는 서버가 출력하는 그대로 표시되며, 실제 의미와 해결 방법을 함께 설명합니다. 모두 VillageSQL에서 동일하게 동작합니다.
+
+## ERROR 2002: 소켓을 통해 연결할 수 없음 {#error-2002-cant-connect-through-socket}
+
+```text
+ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/tmp/nosuch.sock' (2)
+```
+
+클라이언트가 서버에 전혀 도달하지 못했습니다. 이것은 인증 문제가 아니라 연결 문제입니다: 서버가 실행 중이 아니거나, 클라이언트가 잘못된 위치를 찾고 있습니다. `(2)`는 errno 2, "no such file"입니다.
+
+- 서버가 실행 중인지 확인하세요: `pgrep mysqld` 또는 서비스 관리자.
+- `mysql -h localhost`는 Unix 소켓을 사용합니다. 서버가 다른 소켓 경로에서 수신 대기한다면 경로를 전달하세요: `mysql -S /path/to/mysql.sock`.
+- 소켓 대신 TCP를 강제하려면 `-h localhost`가 아니라 `-h 127.0.0.1`을 사용하세요.
+
+## ERROR 1045: 접근 거부 {#error-1045-access-denied}
+
+```text
+ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)
+```
+
+2002의 반대입니다: 서버에 도달했고, 서버가 자격 증명을 거부했습니다. 메시지를 정확히 읽으세요. 세 가지 사실을 알려 줍니다:
+
+- 서버가 여러분이라고 인식한 **사용자**.
+- 여러분이 연결해 온 **호스트**. MySQL 계정은 `user@host` 쌍입니다: `'app'@'localhost'`와 `'app'@'%'`는 서로 다른 비밀번호와 권한을 가진 서로 다른 계정입니다.
+- **`using password: YES/NO`** — 비밀번호가 전송되었는지 여부. `NO`는 클라이언트가 읽은 환경이나 구성 파일에서 비밀번호를 찾지 못했다는 뜻인 경우가 많습니다.
+
+해당 호스트에 어떤 계정이 존재하는지 확인하고(관리자로 `SELECT user, host FROM mysql.user;`) `ALTER USER`로 비밀번호를 재설정하여 해결하세요. [사용자 관리](/ko/guides/user-management)를 참조하세요.
+
+## ERROR 1055: ONLY_FULL_GROUP_BY {#error-1055-only_full_group_by}
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'myapp.orders.total' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+이 오류를 낸 쿼리:
+
+```sql
+SELECT customer_id, total
+FROM orders
+GROUP BY customer_id;
+```
+
+각 그룹에는 하나의 `customer_id`가 있지만 `total` 값은 여러 개이며, 쿼리는 어떤 것을 원하는지 전혀 말하지 않습니다. 이전 MySQL 버전은 임의로 하나를 골랐습니다. 5.7부터 기본 `ONLY_FULL_GROUP_BY` 모드가 이를 오류로 만들며, 처음부터 잘못되었던 쿼리로부터 여러분을 보호하고 있는 것입니다. 세 가지 진짜 해결 방법:
+
+```sql
+-- Say what you meant with an aggregate
+SELECT customer_id, SUM(total) FROM orders GROUP BY customer_id;
+
+-- Or group by every selected column
+SELECT customer_id, total FROM orders GROUP BY customer_id, total;
+
+-- Or, if any value from the group is genuinely fine, say so explicitly
+SELECT customer_id, ANY_VALUE(total) FROM orders GROUP BY customer_id;
+```
+
+`sql_mode`에서 `ONLY_FULL_GROUP_BY`를 비활성화하는 것도 동작하지만 잘못된 답입니다: 오류를 다시 조용히 임의적인 결과로 되돌립니다. `ANY_VALUE()`가 약속하는 것과 약속하지 않는 것은 [MySQL GROUP BY 성능](/ko/guides/group-by-having)을 참조하세요.
+
+## ERROR 1064: 구문 오류 {#error-1064-syntax-error}
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'SELEC 1' at line 1
+```
+
+인용된 조각은 파서가 받아들일 수 없었던 첫 번째 토큰에서 시작하므로, 실제 실수는 인용 시작 지점이나 그 직전에 있습니다. 흔한 원인: 키워드 오타, 컬럼 목록의 쉼표 누락, 백틱 없이 식별자로 사용된 예약어, 또는 문의 절반을 문자열로 만들어 버린 짝 없는 따옴표.
+
+## ERROR 1062: 중복 항목 {#error-1062-duplicate-entry}
+
+```text
+ERROR 1062 (23000): Duplicate entry '1' for key 'orders.PRIMARY'
+```
+
+고유 제약 조건이 제 역할을 했습니다. 메시지가 값과 인덱스를 알려 주므로 진단은 끝났습니다. 결정할 것은 그 삽입이 무엇을 의미해야 하는가입니다:
+
+- 행이 두 번 존재해서는 안 됨: 중복 키를 만드는 생성기를 수정하세요.
+- 삽입이 대신 기존 행을 업데이트해야 함: `INSERT ... ON DUPLICATE KEY UPDATE`를 사용하세요. [업서트](/ko/guides/upsert)를 참조하세요.
+- 삽입을 조용히 건너뛰어야 함: `INSERT IGNORE`. 다른 오류도 함께 숨기므로 아껴서 사용하세요.
+
+## 모든 MySQL 오류 읽는 법 {#reading-any-mysql-error}
+
+`ERROR <number> (<SQLSTATE>): <message>` 패턴은 세 가지 신호를 담고 있습니다. 번호는 MySQL 고유이며 최고의 검색 키입니다. SQLSTATE 클래스는 이식 가능합니다: `28000`은 인증, `42000`은 쿼리 문제, `23000`은 제약 조건 위반, `HY000`은 일반 범주입니다. 클라이언트 측 오류(2002 같은 2xxx)는 서버에 도달하지 못한 것이고, 서버 측 오류(1xxx)는 연결이 동작한다는 뜻입니다.
+
+## 참고 {#see-also}
+
+- [사용자 관리](/ko/guides/user-management) — 접근 거부 오류 뒤에 있는 계정 모델
+- [MySQL GROUP BY 성능](/ko/guides/group-by-having) — ONLY_FULL_GROUP_BY, 그리고 비활성화가 잘못된 해결책인 이유
+- [MySQL GROUP BY](/ko/tutorial/group-by) — 절 작성에 관한 튜토리얼 레슨
+- [업서트](/ko/guides/upsert) — 중복 키 오류를 업데이트로 바꾸기
+- [MySQL 튜토리얼용 서버 설치](/ko/tutorial/install-mysql) — 연결 오류와 이를 재현하는 명령

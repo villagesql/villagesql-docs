@@ -1,0 +1,180 @@
+---
+title: "AI로 MySQL에서 텍스트 분류하기"
+sidebarTitle: "텍스트 분류하기"
+description: "VillageSQL의 ai_prompt() 함수를 사용해서 MySQL에서 텍스트를 분류하는 방법 — SQL을 떠나지 않고 행에 범주, 의도, 또는 주제 레이블 붙이기입니다."
+keywords: "mysql text classification, mysql ai classify, mysql label rows ai, mysql spam detection sql, mysql topic classification, mysql ai_prompt classification"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+텍스트 분류 — 내용에 따라 행을 범주에 배정하는 것 — 는 보통 데이터를 Python 스크립트로 내보내고, AI 모델을 호출하고, 결과를 다시 가져오는 것을 뜻합니다. VillageSQL의 `ai_prompt()`를 사용하면 분류를 SQL 안에서 직접 할 수 있어서, 로직을 데이터 가까이에 두고 내보내기/가져오기 왕복을 없앱니다.
+
+## 문제: SQL 밖에서의 분류 {#the-problem-classification-outside-sql}
+
+VillageSQL이 없을 때의 일반적인 워크플로:
+
+```python
+rows = db.query("SELECT id, body FROM support_tickets WHERE category IS NULL")
+for row in rows:
+    category = llm.classify(row["body"], labels=["billing", "technical", "shipping", "other"])
+    db.execute("UPDATE support_tickets SET category = ? WHERE id = ?", category, row["id"])
+```
+
+이 방식은 동작하지만, 분류 로직이 애플리케이션 코드에 있습니다. 마이그레이션, 백필, 일회성 재레이블링 모두 SQL 쿼리가 아니라 스크립트를 실행해야 합니다.
+
+## VillageSQL과 함께: 분류기로서의 ai_prompt() {#with-villagesql-ai_prompt-as-a-classifier}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+신뢰할 수 있는 분류의 핵심은 꽉 짜인 프롬프트입니다: 정확한 범주를 나열하고, 모델에게 그중 하나만 반환하라고 말하고, 선택적으로 예를 하나 줍니다.
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE support_tickets ADD COLUMN category VARCHAR(20);
+
+-- max_execution_time only bounds SELECT statements in MySQL/VillageSQL —
+-- it has no effect on INSERT/UPDATE/DELETE, including this UPDATE. To
+-- bound how long a batch UPDATE can run, use KILL QUERY against the
+-- connection's own id from a timer, not a session variable set beforehand.
+
+UPDATE support_tickets
+SET category = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Classify this support ticket into exactly one of these categories: ',
+        'billing, technical, shipping, other. ',
+        'Reply with the category name only, lowercase, no punctuation.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE category IS NULL
+LIMIT 100;
+```
+
+### 분류 출력 검증하기 {#validating-classification-output}
+
+모델은 가끔 예상 밖의 출력을 반환합니다. 결과를 있는 그대로 저장하고 따로 검증하세요:
+
+```sql
+-- Check what labels the model returned
+SELECT DISTINCT category, COUNT(*) AS cnt
+FROM support_tickets
+GROUP BY category
+ORDER BY cnt DESC;
+
+-- Fix off-label results
+UPDATE support_tickets
+SET category = 'other'
+WHERE category NOT IN ('billing', 'technical', 'shipping', 'other');
+```
+
+### 다중 레이블 분류 {#multi-label-classification}
+
+행이 둘 이상의 범주에 속할 수 있을 때는 JSON 배열을 요청하고 `JSON` 열에 저장하세요:
+
+```sql
+ALTER TABLE articles ADD COLUMN topics JSON;
+
+UPDATE articles
+SET topics = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Return a JSON array of topics that apply to this article. ',
+        'Choose from: ["technology", "business", "health", "science", "politics"]. ',
+        'Return only the JSON array, no other text.\n\n',
+        'Article: ', content
+    )
+)
+WHERE topics IS NULL
+LIMIT 50;
+
+-- Query rows tagged with a specific topic
+SELECT title FROM articles
+WHERE JSON_CONTAINS(topics, '"technology"');
+```
+
+### 신뢰도 점수 만들기 {#building-a-confidence-score}
+
+모델에게 레이블과 신뢰도 수준을 모두 담은 구조화된 JSON을 반환하라고 요청하세요:
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_result JSON;
+
+UPDATE reviews
+SET ai_result = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Classify this review. Return JSON with keys "label" (positive/negative/neutral) ',
+        'and "confidence" (high/medium/low). Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE ai_result IS NULL
+LIMIT 100;
+
+-- Query by label and confidence
+SELECT review_text,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) AS label,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) AS confidence
+FROM reviews
+WHERE JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) = 'negative'
+  AND JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) = 'high';
+```
+
+## 효과적인 프롬프트 패턴 {#prompt-patterns-that-work}
+
+| 목표 | 프롬프트 패턴 |
+|:---|:---|
+| 단일 레이블 | "Classify as X, Y, or Z. Reply with one word only." |
+| 신뢰도 점수 | `{"label": "X", "confidence": "high/medium/low"}` |
+| 다중 레이블 | "Return a JSON array of applicable labels from [X, Y, Z]." |
+| 이진 결정 | "Does this text contain X? Reply yes or no." |
+
+더 높은 정확도를 위해 모델에게 고를 범주를 더 적게 주세요. 빠르고 저렴한 모델에서는 옵션이 5–6개를 넘으면 신뢰성이 떨어집니다.
+
+설정과 공급자 옵션은 [MySQL을 AI API에 연결하기](/ko/guides/ai-api-setup)를 보세요. 더 넓은 ai_prompt() 사용 패턴은 [MySQL 쿼리에서 AI 모델 실행하기](/ko/guides/ai-prompts-in-mysql)를 보세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### AI 분류는 학습된 모델과 비교해 얼마나 정확한가요? {#how-accurate-is-ai-classification-compared-to-a-trained-model}
+
+Claude Haiku 같은 유능한 모델은 학습 데이터 없이도 단순한 분류 작업에서 높은 정확도를 냅니다. 미묘한 구분이 있는 도메인 특화 범주에서는 프롬프트에 예를 제공하거나 더 큰 모델을 사용해야 할 수 있습니다.
+
+#### 트리거를 사용해서 행이 삽입될 때 분류할 수 있나요? {#can-i-classify-rows-as-theyre-inserted-using-a-trigger}
+
+예, 하지만 주의하세요 — 모든 INSERT에서 `ai_prompt()`를 호출하는 트리거는 모든 쓰기를 5–30초 걸리게 만듭니다. 주기적인 배치 작업에서 분류하고, 레이블이 준비되기까지 짧은 지연을 받아들이는 편이 낫습니다.
+
+#### 모델이 NULL을 반환하는 행은 어떻게 처리하나요? {#how-do-i-handle-rows-where-the-model-returns-null}
+
+`ai_prompt()`는 API 호출이 실패하면 NULL을 반환합니다. 배치 루프에서, 일시적인 실패에 대한 재시도 로직과 함께 NULL이 남지 않을 때까지 UPDATE를 계속 실행하세요.
+
+#### 분류에는 어떤 모델을 써야 하나요? {#what-model-should-i-use-for-classification}
+
+`claude-haiku-4-5`나 `gpt-4o-mini`로 시작하세요 — 둘 다 빠르고 저렴합니다. 정확도가 받아들일 수 없는 수준일 때만 더 유능한 모델로 올라가세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | `INSTALL EXTENSION vsql_ai`를 실행 |
+| NULL을 반환 | API 키와 `max_execution_time`을 확인; 모델 이름을 확인 |
+| 허용된 집합 밖의 레이블 | 예상 밖의 값을 정규화하는 UPDATE 후속 쿼리를 추가 |
+| 구조화된 출력에서 JSON 파싱 오류 | 프롬프트에 "Return only valid JSON, no other text"를 추가 |
+| 낮은 정확도 | 프롬프트에 예를 2–3개 추가; 더 유능한 모델을 시도 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 쿼리에서 AI 모델 실행하기](/ko/guides/ai-prompts-in-mysql) — 분류에 사용하는 ai_prompt() 함수
+- [MySQL 데이터의 감정 분석](/ko/guides/sentiment-analysis) — 관련된 텍스트 분석 작업
+- [MySQL의 AI 요약](/ko/guides/ai-summarization) — 저장된 텍스트에 ai_prompt()를 적용하는 또 다른 예

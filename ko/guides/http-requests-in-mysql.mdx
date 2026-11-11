@@ -1,0 +1,176 @@
+---
+title: "SQL에서 HTTP 요청 보내기"
+sidebarTitle: "HTTP 요청"
+description: "VillageSQL의 vsql_http 확장을 사용하여 MySQL 쿼리에서 외부 HTTP API를 직접 호출하는 방법 — GET, POST, JSON 응답 파싱."
+keywords: "mysql http request, mysql call api, mysql http_get, mysql http_post, mysql rest api, vsql_http"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL에는 네트워크 요청을 보내는 내장 방법이 없습니다. HTTP API를 호출하려면 데이터베이스에서 데이터를 꺼내고, 애플리케이션 코드에서 요청을 보내고, 결과를 다시 밀어 넣어야 합니다. VillageSQL의 `vsql_http` 확장은 `http_get()`, `http_post()`와 전체 HTTP 메서드를 SQL에 직접 추가하므로, 데이터가 있는 바로 그곳에서 외부 API를 호출할 수 있습니다.
+
+## 문제: 모든 API 호출마다 데이터베이스를 떠남 {#the-problem-leaving-the-database-for-every-api-call}
+
+VillageSQL이 없을 때의 일반적인 패턴:
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, tracking_number FROM shipments WHERE status IS NULL")
+
+# Call a shipping API for each row
+for row in rows:
+    resp = requests.get(f"https://api.shipping.com/track/{row['tracking_number']}")
+    status = resp.json()["status"]
+    db.execute("UPDATE shipments SET status = ? WHERE id = ?", status, row["id"])
+```
+
+이 방법은 동작하지만 모든 행이 세 번의 왕복입니다: SELECT, API 호출, UPDATE. 보강 로직이 데이터가 있는 스키마가 아니라 애플리케이션 코드에 있습니다.
+
+## VillageSQL과 함께: SQL에서 HTTP {#with-villagesql-http-from-sql}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+`http_get(url)`은 GET 요청을 보내고 전체 응답을 담은 JSON 문자열을 반환합니다.
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_get('https://httpbin.org/get') USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status')       AS status,
+  JSON_VALUE(@resp, '$.content_type') AS content_type,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+`vsql_http`의 모든 함수는 같은 JSON 형태를 반환합니다:
+
+| 필드 | 설명 |
+|:---|:---|
+| `status` | JSON 숫자로 된 HTTP 상태 코드(`200`, `404` 등) |
+| `content_type` | `Content-Type` 응답 헤더의 값 |
+| `headers` | 모든 응답 헤더에 대한 `[name, value]` 쌍의 배열 |
+| `content` | 응답 본문 |
+
+### 문자 집합 변환 {#the-charset-conversion}
+
+VillageSQL 0.0.6 이하에서는 VEF STRING 함수가 binary 문자 집합을 반환합니다. 결과를 `JSON_VALUE`나 `JSON_EXTRACT`에 전달하기 전에 `CONVERT(... USING utf8mb4)`로 감싸세요:
+
+```sql
+-- On 0.0.6 and earlier, this throws an error — JSON_VALUE rejects binary charset
+-- ERROR 3144: Cannot create a JSON value from a string with CHARACTER SET 'binary'
+SELECT JSON_VALUE(vsql_http.http_get('https://httpbin.org/get'), '$.status');
+
+-- This works on every version
+SELECT JSON_VALUE(
+  CONVERT(vsql_http.http_get('https://httpbin.org/get') USING utf8mb4),
+  '$.status'
+);
+```
+
+VillageSQL 0.0.7 이상은 올바른 문자 집합을 직접 반환하므로 거기서는 `CONVERT`가 더 이상 필요하지 않습니다 — 하지만 유지해도 해롭지 않으며, 아래의 모든 예제는 0.0.6 이하와의 호환성을 위해 여전히 사용합니다. 캐스트를 반복하지 않으려면 `CONVERT`로 변수에 한 번 할당하고 그 변수를 재사용하세요.
+
+## POST 요청 {#post-requests}
+
+`http_post(url, content_type, body)`는 본문이 있는 POST를 보냅니다:
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_post(
+    'https://httpbin.org/post',
+    'application/json',
+    '{"name": "widget", "qty": 3}'
+  ) USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status') AS status,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+## 사용자 정의 헤더와 기타 메서드 {#custom-headers-and-other-methods}
+
+`http_request(method, url, headers_json, body, content_type, options_json)`는 사용자 정의 헤더와 함께 모든 메서드를 처리합니다:
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_request(
+    'GET',
+    'https://api.example.com/secure',
+    '{"Authorization": "Bearer mytoken", "Accept": "application/json"}',
+    NULL,
+    NULL,
+    NULL
+  ) USING utf8mb4
+);
+```
+
+`headers_json` 인자는 키가 헤더 이름이고 값이 헤더 값인 JSON 객체입니다.
+
+### 사용 가능한 모든 함수 {#all-available-functions}
+
+| 함수 | 설명 |
+|:---|:---|
+| `http_get(url)` | GET 요청 |
+| `http_post(url, content_type, body)` | 본문이 있는 POST |
+| `http_put(url, content_type, body)` | 본문이 있는 PUT |
+| `http_delete(url)` | DELETE 요청 |
+| `http_patch(url, content_type, body)` | 본문이 있는 PATCH |
+| `http_request(method, url, headers_json, body, content_type, options_json)` | 모든 메서드, 사용자 정의 헤더, 옵션 |
+| `url_encode(text)` | 문자열을 퍼센트 인코딩 |
+| `url_decode(text)` | 퍼센트 인코딩된 문자열을 디코딩 |
+
+모든 함수는 NULL 입력에 NULL을 반환합니다. 연결 실패(연결 거부, DNS 실패, 타임아웃) 시 HTTP 함수는 마찬가지로 NULL을 반환하고 curl의 오류 메시지를 담은 경고를 발생시킵니다 — 요청이 사라진 것처럼 보이면 `SHOW WARNINGS`로 확인하세요.
+
+## URL 인코딩 {#url-encoding}
+
+`url_encode()`와 `url_decode()`는 쿼리 매개변수의 퍼센트 인코딩을 처리합니다:
+
+```sql
+SELECT vsql_http.url_encode('hello world & more');
+-- → hello%20world%20%26%20more
+
+-- Build a URL with encoded parameters
+SET @q = vsql_http.url_encode('SELECT * FROM users');
+SET @url = CONCAT('https://api.example.com/search?q=', @q);
+SET @resp = CONVERT(vsql_http.http_get(@url) USING utf8mb4);
+```
+
+## 알려진 제한 사항 {#known-limitations}
+
+**256KB 응답 상한** — 256KB보다 큰 응답은 잘립니다. 이것은 SQL 쿼리에서 쓰이는 일반적인 API 페이로드를 충분히 다루지만, 큰 파일 다운로드에는 적합하지 않습니다. 이 상한으로 잘린 응답은 더 이상 유효한 JSON이 아닙니다: `JSON_EXTRACT`/`JSON_UNQUOTE`는 이에 대해 `ERROR 3141`을 발생시키고, `JSON_VALUE`는 기본 `NULL ON ERROR` 동작에 따라 오류 대신 `Warning 3141`과 함께 NULL을 반환합니다.
+
+**`JSON_VALUE` 크기 제한** — `JSON_VALUE`는 추출된 값이 MySQL의 내부 크기 제한을 초과하면 NULL을 반환합니다. 큰 응답 본문에는 대신 `JSON_UNQUOTE(JSON_EXTRACT(...))`를 사용하세요:
+
+```sql
+-- Use JSON_UNQUOTE + JSON_EXTRACT for large content fields
+SELECT JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+**동기 실행** — 모든 HTTP 호출은 완료되거나 타임아웃될 때까지 블로킹됩니다. `max_execution_time`은 블로킹 중인 `vsql_http` 호출을 제한하거나 중단하지 않습니다 — 느리거나 도달할 수 없는 엔드포인트는 그와 관계없이 자체 연결/읽기 타임아웃 동안 문장을 붙잡습니다. `http_get`/`http_post`/`http_put`/`http_delete`/`http_patch`는 옵션을 받지 않습니다. `http_request(method, url, headers_json, body, content_type, options_json)`만 `options_json` 인자에 초 단위 `{"timeout": N}`으로 타임아웃을 받습니다(기본값 30). 타임아웃을 줄여야 할 때는 축약 함수 대신 `http_request`를 사용하세요([HTTP 웹훅](/ko/guides/http-webhooks) 참조).
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.http_get does not exist` | `INSTALL EXTENSION vsql_http`를 실행하세요 |
+| NULL을 반환함 | 연결 실패 또는 NULL 입력 — `SHOW WARNINGS`로 curl의 오류 메시지를 확인하고, URL을 검증하고, 서버 호스트에서의 네트워크 접근을 확인하세요 |
+| `JSON_VALUE`가 NULL을 반환함 | 응답 본문이 너무 큼 — `JSON_UNQUOTE(JSON_EXTRACT(...))`를 사용하세요 |
+| JSON 파싱이 깨짐 | `CONVERT(... USING utf8mb4)`를 빠뜨림 — 함수 호출을 감싸세요 |
+| 쿼리가 타임아웃됨 | 요청 자체에 `{"timeout": N}` 옵션을 설정하세요 — `max_execution_time`은 블로킹 중인 `vsql_http` 호출에 영향을 주지 않습니다 |
+
+## 다음 단계 {#next-steps}
+
+- [API 데이터로 행 보강하기](/ko/guides/rest-api-enrichment) — 실시간 외부 데이터를 쿼리 결과로 가져오기
+- [트리거에서 웹훅 보내기](/ko/guides/http-webhooks) — 행 변경을 외부 서비스로 자동으로 밀어 보내기
+
+## 참고 {#see-also}
+
+- [외부 API 데이터로 행 보강하기](/ko/guides/rest-api-enrichment) — HTTP 기반 데이터 보강의 실용적 패턴
+- [트리거에서 웹훅 보내기](/ko/guides/http-webhooks) — 트리거에서의 이벤트 기반 HTTP 호출
+- [MySQL의 JSON](/ko/guides/json-in-mysql) — HTTP 요청이 반환하는 JSON 응답 파싱
+- [테이블을 REST API로 제공하기](/ko/guides/rest-api-from-tables) — 요청을 보내는 대신 HTTP에 응답하는 같은 서버

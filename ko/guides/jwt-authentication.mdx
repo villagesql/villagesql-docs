@@ -1,0 +1,192 @@
+---
+title: "JWT로 MySQL 사용자를 인증하는 방법"
+sidebarTitle: "JWT 인증"
+description: "VillageSQL의 vsql_oauth2 확장을 사용해 MySQL 계정이 JSON Web Token으로 로그인하게 하는 방법 — 서명 키, 클레임 매핑, 역할 부여, 그리고 거부된 토큰이 잘못된 비밀번호처럼 보이는 이유입니다."
+keywords: "mysql jwt authentication, mysql oauth login, mysql oidc, jwks mysql, mysql token login, vsql_oauth2"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  이 가이드는 프리뷰 기능을 사용합니다. 서버를
+  `--vsql_allow_preview_extensions=ON`으로 시작하세요. 그렇지 않으면 `INSTALL EXTENSION`이 거부됩니다.
+</Note>
+
+ID 제공자가 이미 있으면 데이터베이스 비밀번호는 관리하기 번거롭습니다. 비밀번호는 별도로 발급되고, 별도로 교체되며, 비밀번호를 받은 사람보다 오래 남습니다. VillageSQL의 `vsql_oauth2` 확장은 대신 계정이 JSON Web Token으로 로그인하게 합니다: 제공자가 토큰을 발급하고, 서버가 서명과 만료를 검증하며, 토큰 안의 클레임이 계정을 지정합니다.
+
+## 서명 키 설정하기 {#set-up-a-signing-key}
+
+확장은 서명을 JWKS 엔드포인트에서 가져온 키로 검증하거나(실제 제공자와 함께 쓰는 방식), 직접 붙여 넣은 공개 키 하나로 검증합니다. 정적 키가 전체 경로가 동작하는 것을 보는 가장 빠른 방법이므로, 이 가이드는 거기서 시작합니다.
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt_private.pem
+openssl rsa -pubout -in jwt_private.pem -out jwt_public.pem
+```
+
+```sql
+INSTALL EXTENSION vsql_oauth2;
+
+SET GLOBAL vsql_oauth2.public_key = '-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----';
+SET GLOBAL vsql_oauth2.username_claim = 'sub';
+```
+
+`username_claim`은 계정 이름을 담은 클레임을 지정합니다. 기본값은 `sub`이며, 아래 예제 토큰이 사용하는 값입니다.
+
+실제 제공자와 함께라면 대신 `jwks_url`을 설정합니다. 확장은 키를 가져오고, `jwks_refresh_interval`의 간격으로 다시 가져오며, 토큰이 캐시에 없는 키 ID를 지정하면 즉시 다시 가져옵니다. `issuer`와 `audience`도 설정해서, 다른 시스템을 위해 발급된 토큰이 여기서 받아들여지지 않게 하세요.
+
+## 계정 만들기 {#create-the-account}
+
+계정은 일반적인 MySQL 계정이며, 생성 시 확장으로 인증하는 계정으로 지정됩니다. 계정은 자체 권한을 가집니다:
+
+```sql
+CREATE USER 'analyst'@'%' IDENTIFIED WITH vsql_oauth2;
+GRANT SELECT ON shop.* TO 'analyst'@'%';
+```
+
+설정할 비밀번호도, 교체할 비밀번호도 없습니다.
+
+세션은 연결한 계정이 아니라 토큰이 지정하는 계정으로 실행됩니다. 그 이름은 `username_claim`의 클레임에서 오며, 기본값은 `sub`입니다. 그 클레임이 `analyst`라고 말하는 동안에는 위의 문장으로 충분합니다. 제공자가 거기에 다른 것, 예를 들어 이메일 주소를 넣는다면, 그 계정도 만들고 연결하는 계정이 그것으로 프록시하게 하세요:
+
+```sql
+CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
+CREATE USER 'alice@example.com';
+GRANT SELECT ON shop.* TO 'alice@example.com';
+GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
+```
+
+아무도 `alice@example.com`으로 직접 로그인하지 않으므로, 그 계정에는 자체 비밀번호가 필요하지 않습니다. `validate_password`를 실행하는 서버는 비밀번호 없는 계정 생성을 거부하며 `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`로 응답합니다. 그것이 적용되는 곳에서는 아무도 갖고 있지 않은 비밀번호나 로그인을 전혀 허용하지 않는 인증 플러그인을 계정에 부여하세요.
+
+프록시 권한이 없으면 로그인은 `ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing proxy privilege.`로 거부됩니다.
+
+## 로그인하기 {#log-in}
+
+토큰은 보통 비밀번호가 가는 자리로 이동하며, 내장 `mysql_clear_password` 플러그인을 통해 전달됩니다. 클라이언트는 이 플러그인을 명시적으로 켜야 합니다:
+
+```bash
+MYSQL_PWD="$TOKEN" mysql -h 127.0.0.1 -u analyst --enable-cleartext-plugin
+```
+
+토큰을 `--password=`로 전달하면 프로세스 목록에 노출되므로, 토큰은 대신 환경 변수로 전달합니다.
+
+세션 안에서 `CURRENT_USER()`는 데이터베이스 계정이고 `@@external_user`는 토큰이 담고 있던 ID를 유지하는데, 감사 추적에서 원하는 것이 바로 이것입니다:
+
+```sql
+SELECT CURRENT_USER() AS logged_in_as, @@external_user AS token_identity;
+```
+
+```
++--------------+----------------+
+| logged_in_as | token_identity |
++--------------+----------------+
+| analyst@%    | analyst        |
++--------------+----------------+
+```
+
+<Warning>
+  `mysql_clear_password`는 프로토콜 수준에서 토큰을 평문으로 보냅니다. 이 방식으로
+  인증하는 모든 연결에 TLS를 사용하세요. 그렇지 않으면 경로상의 무엇이든 토큰을
+  읽을 수 있고 만료될 때까지 재사용할 수 있습니다.
+</Warning>
+
+## 토큰에서 역할 매핑하기 {#mapping-roles-from-the-token}
+
+계정은 토큰에서 권한을 가져올 수도 있습니다. 확장이 역할을 담은 클레임을 보도록 지정하고, 권한 부여를 켜세요:
+
+```sql
+SET GLOBAL vsql_oauth2.roles_claim = 'roles';
+SET GLOBAL vsql_oauth2.auto_grant = ON;
+```
+
+역할 하나와 자체 권한이 없는 계정 하나를 만드세요:
+
+```sql
+CREATE ROLE 'shop_reader';
+GRANT SELECT ON shop.* TO 'shop_reader';
+
+CREATE USER 'dana'@'%' IDENTIFIED WITH vsql_oauth2;
+```
+
+`"roles": ["shop_reader"]`를 담은 토큰은 그 역할이 활성화된 상태로 로그인합니다:
+
+```sql
+SELECT CURRENT_USER() AS account, CURRENT_ROLE() AS roles_now;
+```
+
+```
++---------+-------------------+
+| account | roles_now         |
++---------+-------------------+
+| dana@%  | `shop_reader`@`%` |
++---------+-------------------+
+```
+
+`roles_filter`는 어떤 역할 이름을 고려할지 좁히고, `roles_transform_pattern`과 `roles_transform_replacement`는 그룹 이름이 역할 이름처럼 보이지 않는 제공자를 위해 제공자의 이름을 데이터베이스 역할 이름으로 다시 씁니다.
+
+<Warning>
+  `auto_grant`는 실제 권한을 기록하며, 그 권한은 로그인보다 오래 남습니다. 위의 로그인
+  뒤에 권한은 서버 안에 있습니다:
+
+```sql
+SELECT FROM_USER AS role_granted, TO_USER AS to_account
+FROM mysql.role_edges WHERE TO_USER = 'dana';
+```
+
+```
++--------------+------------+
+| role_granted | to_account |
++--------------+------------+
+| shop_reader  | dana       |
++--------------+------------+
+```
+
+  나중에 `auto_grant`를 꺼도 그것을 되돌리지 않습니다. 한 번 본 토큰 하나가 누군가
+  역할을 회수할 때까지 그 계정을 넓힙니다. 켜기 전에 `roles_filter`의 범위를
+  정하고, 그 클레임을 제공자가 설정하도록 신뢰해야 하는 것으로 취급하세요.
+</Warning>
+
+`auto_grant`가 꺼져 있으면 같은 토큰으로 로그인은 되지만 역할은 부여되지 않고 건너뛰며, `CURRENT_ROLE()`은 `NONE`입니다. 건너뛴 각 역할은 오류 로그에 기록됩니다: `VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`. `auto_create`는 계정에 대해 같은 방식으로 동작하여, 서버가 본 적 없는 주체의 첫 로그인 시 계정을 만듭니다. 둘 다 기본적으로 꺼져 있으며, 둘 다 이 서버에 대한 권한을 제공자에게 넘깁니다.
+
+## 거부된 토큰은 잘못된 비밀번호처럼 보입니다 {#a-rejected-token-looks-like-a-wrong-password}
+
+모든 실패는 하나의 오류를 만들고, 그것은 평범한 오류입니다:
+
+```
+ERROR 1045 (28000): Access denied for user 'analyst'@'localhost' (using password: NO)
+```
+
+만료된 토큰, 잘못된 키로 서명된 토큰, 실수로 입력한 일반 비밀번호 모두 `using password: NO`를 포함해 정확히 그것을 만듭니다 — 토큰이 전송되었으므로 이것은 오해를 부릅니다. `log_error_verbosity=3`에서도 서버 오류 로그에 구별되는 것이 나타나지 않습니다.
+
+그러니 오류가 아니라 토큰에서부터 디버그하세요. 토큰을 디코드하고 이 순서로 네 가지를 확인하세요:
+
+1. **`exp`**가 미래입니다. 제공자와 서버 사이의 시계 차이가 여기에 영향을 줍니다.
+2. **서명 키가 일치합니다.** 토큰의 `kid`가 JWKS 문서가 여전히 게시하는 것인지 확인하세요. 문서가 더 이상 담고 있지 않은 키는 위조된 토큰과 똑같이 보입니다.
+3. **`iss`와 `aud`**가 설정한 값과 일치합니다(설정했다면).
+4. **`username_claim`의 클레임이 존재하는 계정을 지정합니다.** 계정이 쓰인 그대로의 철자여야 합니다.
+
+페이로드를 디코드하는 데는 셸 외에 다른 도구가 필요하지 않습니다:
+
+```bash
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null
+```
+
+## 문제 해결 {#troubleshooting}
+
+| 증상 | 해결 방법 |
+|---|---|
+| 설치 시 `ERROR 3219 ... requires preview capabilities` | 서버를 `--vsql_allow_preview_extensions=ON`으로 시작 |
+| 모든 시도에서 `Access denied` | 위의 네 가지 확인을 차례로 진행. 메시지는 모든 원인에 대해 같음 |
+| 클라이언트가 토큰을 전혀 보내지 않음 | `--enable-cleartext-plugin`을 전달. 다른 클라이언트에는 `mysql_clear_password`를 위한 자체 옵션이 있음 |
+| 로그인이 되다가 한꺼번에 멈춤 | 제공자가 키를 교체함. `jwks_url`에 접근할 수 있는지, 그리고 토큰의 `kid`가 그것이 반환하는 문서에 나타나는지 확인 |
+| 아무도 부여하지 않은 권한을 계정이 가짐 | `auto_grant`가 토큰 클레임에서 권한을 부여함. `mysql.role_edges`를 확인하고 회수 |
+| 확장을 다시 설치한 뒤 설정이 사라짐 | `UNINSTALL EXTENSION`은 유지된 설정을 삭제함. 다시 적용 |
+
+## 함께 보기 {#see-also}
+
+- [vsql_oauth2](/ko/extensions/vsql-oauth2) — 확장이 추가하는 모든 설정이 있는 확장의 참조 페이지
+- [MySQL 사용자 관리](/ko/guides/user-management) — 토큰으로 인증하는 계정에 여전히 필요한 권한
+- [MySQL 보안 강화](/ko/guides/security-hardening) — TLS와 나머지 연결 표면
+- [HMAC으로 데이터 서명하기](/ko/guides/hmac-mysql) — 로그인이 아니라 SQL 안에서 서명 검증하기

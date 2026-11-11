@@ -1,0 +1,159 @@
+---
+title: "MySQL의 EXPLAIN 읽기"
+sidebarTitle: "EXPLAIN 읽기"
+description: "MySQL EXPLAIN 출력을 읽는 방법: 각 열의 의미, 전체 테이블 스캔을 찾아내는 방법, 느린 쿼리를 고치기 위해 EXPLAIN을 사용하는 방법입니다."
+keywords: "mysql explain output, mysql explain type, mysql explain rows, mysql explain key, mysql query plan, mysql optimize query, mysql explain analyze"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+쿼리가 느릴 때 첫 번째 행동은 `EXPLAIN`입니다. MySQL이 쿼리를 어떻게 실행할 계획인지 정확히 보여줍니다 — 어떤 인덱스를 사용하는지, 몇 행을 스캔할 것으로 예상하는지, 어디서 비싼 작업을 하는지. 읽을 수 있게 되면 거의 모든 느린 쿼리를 고칠 수 있습니다.
+
+## EXPLAIN 실행하기 {#running-explain}
+
+아무 `SELECT` 앞에 `EXPLAIN`을 붙이세요:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+MySQL은 쿼리의 테이블마다 한 행을 반환합니다. 조인에서는 여러 행을 받습니다 — 관련된 테이블마다 하나씩.
+
+## 중요한 열 {#the-columns-that-matter}
+
+전체 `EXPLAIN` 행은 다음과 같습니다:
+
+```
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |   100.00 | NULL        |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+```
+
+대부분의 열은 가끔 중요합니다. 다음 열들은 거의 항상 중요합니다:
+
+### `type` — MySQL이 테이블을 스캔하는 방식 {#type--how-mysql-scans-the-table}
+
+가장 중요한 열입니다. 접근 방법을 알려주며, 가장 빠른 것부터 가장 느린 것 순으로:
+
+| type | 의미 | 보게 되는 경우 |
+|:-----|:--------|:----------------|
+| `const` | 기본 키 또는 고유 인덱스로 단일 행 | `WHERE id = 5` |
+| `eq_ref` | 이전 테이블의 행마다 한 행 | 기본 키에 대한 JOIN |
+| `ref` | 비고유 인덱스에서 여러 행 | `WHERE user_id = 42` |
+| `range` | 인덱스 범위 스캔 | `BETWEEN`, `>`, `<`, `IN` |
+| `index` | 전체 인덱스 스캔 | 인덱스를 왼쪽에서 오른쪽으로 스캔 |
+| `ALL` | 전체 테이블 스캔 | 사용할 수 있는 인덱스 없음 |
+
+**`ALL`이 고쳐야 할 것입니다.** MySQL이 테이블의 모든 행을 읽고 있다는 뜻입니다. 백만 행짜리 테이블에서는 쿼리 실행마다 백만 번의 읽기입니다.
+
+### `key` — MySQL이 선택한 인덱스 {#key--which-index-mysql-chose}
+
+`NULL`은 인덱스를 사용하지 않았다는 뜻입니다. `possible_keys`에 인덱스가 나열되어 있는데 `key`가 `NULL`이면, MySQL이 전체 스캔이 더 싸다고 판단한 것입니다 — 보통 테이블이 작거나 쿼리의 선택도가 충분하지 않기 때문입니다.
+
+### `rows` — 검사할 것으로 추정되는 행 수 {#rows--estimated-rows-examined}
+
+보장이 아니라 추정치입니다. MySQL은 통계를 사용해 이 숫자를 만듭니다. `rows: 1`인 쿼리는 빠르고, 프로덕션 테이블에서 `rows: 5000000`은 문제입니다.
+
+### `Extra` — 추가 실행 세부 정보 {#extra--additional-execution-details}
+
+`Extra` 열에는 중요한 플래그가 들어 있습니다:
+
+| Extra 값 | 의미 |
+|:------------|:--------|
+| `Using index` | 커버링 인덱스 — 행 조회 불필요(빠름) |
+| `Using where` | MySQL이 행을 읽은 뒤 필터링 |
+| `Using filesort` | 정렬에 인덱스를 사용할 수 없음 — 추가 정렬 단계 |
+| `Using temporary` | MySQL이 임시 테이블을 만듦(큰 집합에서 비쌈) |
+| `Using index condition` | 인덱스 조건 푸시다운 — 스토리지 계층에서 필터링 |
+
+큰 테이블에서 `Using filesort`와 `Using temporary`가 함께 나오면 위험 신호입니다.
+
+## 실습 예제 {#a-worked-example}
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- No indexes yet
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key  | rows    | Extra                          |
+|------|------|---------|--------------------------------|
+| ALL  | NULL | 1000000 | Using where; Using filesort    |
+```
+
+두 가지 문제: 전체 테이블 스캔(`ALL`)과 filesort입니다. 복합 인덱스로 둘 다 고치세요(인덱스 설계 원칙은 [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes)을 보세요):
+
+```sql
+CREATE INDEX idx_status_created ON orders (status, created_at);
+
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key                | rows | Extra |
+|------|--------------------|------|-------|
+| ref  | idx_status_created | 4200 | NULL  |
+```
+
+`rows`가 1,000,000에서 4,200으로 떨어졌습니다. `type`은 이제 `ref` — `status`에 대한 동등 조회입니다. 인덱스가 이미 각 `status` 값 안에서 행을 `created_at` 순으로 정렬하기 때문에 filesort가 사라졌습니다.
+
+## EXPLAIN ANALYZE {#explain-analyze}
+
+`EXPLAIN ANALYZE`는 쿼리를 실제로 실행하고 추정치와 함께 실제 시간을 반환합니다:
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
+-> Index lookup on orders using idx_user_id (user_id=42)
+   (cost=4.50 rows=12) (actual time=0.045..0.112 rows=11 loops=1)
+```
+
+`cost`와 `rows`는 옵티마이저의 추정치입니다. `actual time`과 `actual rows`는 실제로 일어난 일입니다. 추정 행 수와 실제 행 수 사이의 큰 차이는 오래된 통계를 뜻합니다 — `ANALYZE TABLE orders`를 실행해 갱신하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### EXPLAIN과 커버링 인덱스의 관계는 무엇인가요? {#whats-the-relationship-between-explain-and-covering-indexes}
+`Extra: Using index`는 MySQL이 커버링 인덱스를 사용하고 있다는 뜻입니다 — 테이블 행을 읽지 않고 인덱스만으로 쿼리에 답할 수 있습니다. 읽기가 많은 테이블에서 가장 효과가 큰 최적화 중 하나입니다. 설계 방법은 [MySQL의 커버링 인덱스](/ko/guides/covering-indexes)를 보세요.
+
+#### 내 쿼리에 `type: index`가 나옵니다 — 괜찮은가요? {#my-query-has-type-index--is-that-okay}
+별로 그렇지 않습니다. `type: index`는 MySQL이 (테이블 대신) 전체 인덱스를 스캔했다는 뜻으로, `ALL`보다 빠르지만 여전히 전체 스캔입니다. 쿼리가 모든 행을 필요로 하지만 인덱스에서 그것을 충족할 수 있을 때 나타납니다. 큰 테이블에서 이것을 만난다면, 커버링 인덱스나 `WHERE` 절로 스캔 범위를 좁힐 수 있는지 확인하세요.
+
+#### MySQL은 왜 내가 만든 인덱스를 무시하나요? {#why-does-mysql-ignore-the-index-i-created}
+옵티마이저는 통계를 바탕으로 인덱스를 선택합니다. 테이블이 작으면 MySQL은 전체 스캔이 더 싸다고 판단할 수 있습니다. 통계가 오래되었으면 인덱스의 선택도를 과소평가할 수 있습니다. `ANALYZE TABLE`을 실행해 통계를 새로 고친 뒤 `EXPLAIN`을 다시 확인하세요.
+
+#### INSERT, UPDATE, DELETE에 EXPLAIN을 사용할 수 있나요? {#can-i-use-explain-on-insert-update-and-delete}
+예 — MySQL 8.0 이상에서 `EXPLAIN`은 모든 DML 문에 동작합니다. 출력은 수정될 행에 대한 접근 방법을 보여주며, UPDATE나 DELETE가 느릴 때 유용합니다.
+
+어떤 쿼리를 먼저 EXPLAIN할지 찾아야 한다면, [MySQL 슬로우 쿼리 로그](/ko/guides/slow-query-log)가 서버에서 가장 느린 쿼리를 수집하고 총 시간순으로 순위를 매깁니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| 큰 테이블에서 `type: ALL` | 필터링되는 열에 인덱스를 추가 |
+| `Extra: Using filesort` | `WHERE`와 `ORDER BY` 열을 모두 포함하는 인덱스를 추가 |
+| `Extra: Using temporary` | 인덱스가 없는 열에 대한 `GROUP BY`를 피하도록 쿼리를 다시 쓰거나, 인덱스를 추가 |
+| 인덱스가 있는데도 `key: NULL` | `ANALYZE TABLE`을 실행해 통계를 갱신; 인덱스가 쿼리의 열 순서와 일치하는지 확인 |
+| 추정 `rows`가 실제와 크게 다름 | `ANALYZE TABLE`을 실행해 통계를 새로 고침 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes) — EXPLAIN이 보고하는 B-트리 구조
+- [MySQL의 커버링 인덱스](/ko/guides/covering-indexes) — Extra의 `Using index`가 뜻하는 것과 거기에 도달하는 방법
+- [MySQL 슬로우 쿼리 로그](/ko/guides/slow-query-log) — EXPLAIN을 실행할 가치가 있는 쿼리 찾기
+- [내 MySQL 쿼리는 왜 느린가요?](/ko/guides/mysql-query-performance) — EXPLAIN이 입력이 되는 튜닝 워크플로
+- [MySQL의 페이지네이션: 키셋 대 OFFSET](/ko/guides/pagination) — 키셋 페이지네이션이 스캔 대신 탐색하는지 확인하기
+- [MySQL LIMIT](/ko/tutorial/limit) — 튜토리얼에서 설명하는 실행 계획 행 하나

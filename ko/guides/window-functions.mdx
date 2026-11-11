@@ -1,0 +1,190 @@
+---
+title: "MySQL 8.4의 윈도우 함수"
+sidebarTitle: "윈도우 함수 사용하기"
+description: "MySQL 8.4 윈도우 함수의 동작 방식: ROW_NUMBER, RANK, LAG, LEAD, 누적 합계, 그리고 GROUP BY 집계와 다른 점입니다."
+keywords: "mysql window functions, mysql row_number, mysql rank, mysql over clause, mysql partition by, mysql lag lead, mysql running total, mysql 8.4 analytics"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+윈도우 함수는 현재 행과 관련된 행의 집합에 걸쳐 값을 계산합니다. `GROUP BY`처럼 그 행들을 하나의 출력 행으로 합치지 않습니다. 예전에는 서브쿼리나 애플리케이션 계층의 처리가 필요했던 분석 쿼리를 가능하게 합니다.
+
+## 윈도우 함수가 GROUP BY와 다른 점 {#how-window-functions-differ-from-group-by}
+
+```sql
+-- GROUP BY: collapses rows — you lose the individual order details
+SELECT customer_id, SUM(amount) AS total
+FROM orders
+GROUP BY customer_id;
+
+-- Window function: adds a column without collapsing rows
+SELECT
+    id,
+    customer_id,
+    amount,
+    SUM(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM orders;
+```
+
+두 번째 쿼리는 주문당 행 1개를 반환하고, 각 행은 그 고객의 합계도 함께 보여줍니다. `GROUP BY`는 이것을 할 수 없습니다. 개별 행을 제거하기 때문입니다.
+
+## OVER 절 {#the-over-clause}
+
+모든 윈도우 함수는 윈도우, 즉 계산할 행의 집합을 정의하는 `OVER` 절을 사용합니다.
+
+```sql
+function() OVER (
+    PARTITION BY col    -- divide rows into groups (optional)
+    ORDER BY col        -- define row order within the window (required for ranking/offset functions)
+    ROWS BETWEEN ...    -- define the frame (optional)
+)
+```
+
+빈 `OVER()`는 윈도우가 결과 집합 전체라는 뜻입니다.
+
+## 순위 함수 {#ranking-functions}
+
+```sql
+SELECT
+    name,
+    score,
+    ROW_NUMBER() OVER (ORDER BY score DESC) AS row_num,
+    RANK()       OVER (ORDER BY score DESC) AS `rank`,
+    DENSE_RANK() OVER (ORDER BY score DESC) AS `dense_rank`
+FROM leaderboard;
+```
+
+| 함수 | 동점일 때의 동작 |
+|:---------|:-----------------|
+| `ROW_NUMBER()` | 고유한 순차 번호 — 동점도 다른 번호를 받음(임의의 순서) |
+| `RANK()` | 동점 행은 순위를 공유; 다음 순위는 건너뜀(1, 1, 3) |
+| `DENSE_RANK()` | 동점 행은 순위를 공유; 다음 순위는 건너뛰지 않음(1, 1, 2) |
+
+출력 예:
+
+```
+name   | score | row_num | rank | dense_rank
+-------+-------+---------+------+-----------
+Alice  |   100 |       1 |    1 |          1
+Bob    |    95 |       2 |    2 |          2
+Carol  |    95 |       3 |    2 |          2
+Dave   |    90 |       4 |    4 |          3
+```
+
+## PARTITION BY: 그룹별 순위 {#partition-by-per-group-rankings}
+
+결과 집합 전체가 아니라 그룹 안에서 순위를 매기려면 `PARTITION BY`를 추가하세요:
+
+```sql
+-- Rank orders within each customer, newest first
+SELECT
+    customer_id,
+    id AS order_id,
+    created_at,
+    ROW_NUMBER() OVER (
+        PARTITION BY customer_id
+        ORDER BY created_at DESC
+    ) AS order_rank
+FROM orders;
+```
+
+각 고객의 가장 최근 주문을 얻으려면:
+
+```sql
+SELECT customer_id, order_id, created_at
+FROM (
+    SELECT
+        customer_id,
+        id AS order_id,
+        created_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY created_at DESC
+        ) AS rn
+    FROM orders
+) ranked
+WHERE rn = 1;
+```
+
+## LAG와 LEAD: 인접한 행에 접근하기 {#lag-and-lead-accessing-adjacent-rows}
+
+`LAG`는 이전 행에, `LEAD`는 다음 행에 접근합니다. 셀프 조인 없이 말입니다.
+
+```sql
+SELECT
+    date,
+    revenue,
+    LAG(revenue)  OVER (ORDER BY date) AS prev_day_revenue,
+    LEAD(revenue) OVER (ORDER BY date) AS next_day_revenue,
+    revenue - LAG(revenue) OVER (ORDER BY date) AS day_over_day_change
+FROM daily_revenue
+ORDER BY date;
+```
+
+두 함수 모두 선택적 오프셋(기본값 1)과 인접한 행이 없을 때 쓸 기본값을 받습니다:
+
+```sql
+LAG(revenue, 1, 0) OVER (ORDER BY date)  -- use 0 when there's no previous row
+```
+
+## 누적 합계와 이동 평균 {#running-totals-and-moving-averages}
+
+프레임, 즉 계산에 포함할 행의 부분 집합을 정의하려면 `ROWS BETWEEN`을 사용하세요.
+
+```sql
+SELECT
+    date,
+    amount,
+    -- Running total (all rows from start to current)
+    SUM(amount) OVER (ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+    -- 7-day moving average
+    AVG(amount) OVER (ORDER BY date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving_avg_7d
+FROM daily_sales;
+```
+
+흔한 프레임 지정:
+
+| 프레임 | 의미 |
+|:------|:--------|
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | 첫 행부터 현재 행까지(누적 합계) |
+| `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` | 현재 행과 앞의 6개 행(7행 윈도우) |
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` | 파티션 전체 |
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### WHERE 절에서 윈도우 함수 결과로 필터링할 수 있나요? {#can-i-filter-on-a-window-function-result-in-a-where-clause}
+
+아니요. 윈도우 함수는 `WHERE` 뒤에 평가됩니다. 윈도우 함수 결과로 필터링하려면, 쿼리를 서브쿼리나 CTE로 감싸세요:
+
+```sql
+SELECT * FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+    FROM orders
+) t
+WHERE rn = 1;
+```
+
+#### 프레임 절에서 ROWS와 RANGE의 차이는 무엇인가요? {#whats-the-difference-between-rows-and-range-in-the-frame-clause}
+
+`ROWS`는 물리적인 행을 셉니다. `RANGE`는 같은 `ORDER BY` 값을 가진 행을 함께 묶습니다. 대부분의 용도(누적 합계, 이동 평균)에서는 `ROWS`가 예상한 동작을 줍니다. `RANGE`는 정렬 열에 같은 값이 있을 때 놀라운 결과를 낼 수 있습니다.
+
+#### 윈도우 함수는 인덱스와 함께 동작하나요? {#do-window-functions-work-with-indexes}
+
+윈도우 함수는 윈도우 계산 자체에는 인덱스를 사용하지 않지만, 쿼리는 처리할 행을 줄이기 위해 `WHERE` 절에 여전히 인덱스를 사용할 수 있습니다. 복잡한 윈도우 쿼리는 실행 계획을 이해하기 위해 [MySQL의 EXPLAIN 읽기](/ko/guides/reading-explain)가 도움이 됩니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| 윈도우 함수 구문에서 `ERROR 1064` | 윈도우 함수 지원 이전의 오래된 MySQL 버전을 실행 중. `SELECT VERSION()`으로 확인 |
+| WHERE 절의 윈도우 함수 결과가 실패 | 필터를 외부 쿼리나 CTE로 옮기기. WHERE는 윈도우 함수를 참조할 수 없음 |
+| `RANK()`가 예상치 못하게 번호를 건너뜀 | 예상된 동작. 간격을 원하지 않으면 `DENSE_RANK()`를 사용 |
+| 윈도우 함수 쿼리가 느림 | 정렬 속도를 높이도록 `PARTITION BY`와 `ORDER BY` 열에 인덱스 추가 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL CTE가 파생 테이블보다 나은 경우](/ko/guides/ctes-in-mysql) — 다단계 분석을 위해 윈도우 함수와 흔히 함께 쓰임
+- [MySQL GROUP BY 성능](/ko/guides/group-by-having) — 행을 하나로 합치는 종류의 집계와 그 비용
+- [MySQL GROUP BY](/ko/tutorial/group-by) — 이 절 자체에 대한 튜토리얼 레슨

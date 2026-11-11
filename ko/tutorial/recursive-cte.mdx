@@ -1,0 +1,114 @@
+---
+title: "MySQL 재귀 CTE"
+sidebarTitle: "재귀 CTE"
+description: "MySQL 재귀 CTE가 자신의 출력에서 행을 만드는 방식, 모든 재귀 CTE에 필요한 2개의 부분, 그리고 폭주하는 쿼리를 ERROR 3636으로 멈추는 깊이 제한입니다."
+keywords: "mysql recursive cte, mysql with recursive, mysql hierarchical query, mysql generate series, mysql error 3636, mysql anchor member"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+일반 CTE는 테이블을 읽습니다. 재귀 CTE는 자기 자신을 읽으므로, 각 라운드의 행이 다음 라운드를 만듭니다. SQL이 계층 구조를 따라가거나 수열을 생성하는 방법이 이것이고, 둘 다 일반 `SELECT`로는 할 수 없습니다.
+
+시작하기 전에 `mysql -u root -p sakila`로 클라이언트를 여세요.
+
+## 재귀 CTE의 동작 방식 {#how-a-recursive-cte-works}
+
+```sql
+WITH RECURSIVE CTE_NAME AS (
+  SELECT SEED_VALUE AS COLUMN_NAME
+  UNION ALL
+  SELECT NEXT_EXPRESSION FROM CTE_NAME WHERE STOP_CONDITION
+)
+SELECT COLUMN_NAME FROM CTE_NAME;
+```
+
+`CTE_NAME`을 결과의 이름으로, `COLUMN_NAME`을 그것이 만드는 열로, `SEED_VALUE`를 시작 값으로, `NEXT_EXPRESSION`을 이전 행에서 다음 행을 만드는 식으로, `STOP_CONDITION`을 결국 거짓이 되는 검사로 바꾸세요.
+
+재귀 CTE에는 `UNION ALL`로 이어진 2종류의 부분이 있습니다:
+
+- **시드(seed)**: 앵커 멤버라고도 부르며, CTE를 어디서도 언급하지 않고 시작 행을 만듭니다.
+- **재귀 멤버**: CTE 자체에서 선택합니다.
+
+대부분은 각각 정확히 1개씩 가지며, 아래 형태가 그것입니다. MySQL은 어느 쪽이든 1개보다 많은 것을 허용하고, `UNION ALL` 대신 `UNION`도 허용하는데, 이 경우 각 라운드에서 중복을 제거합니다. 둘 다 흔하지 않지만, 만났을 때 알아볼 수 있어야 합니다.
+
+서버는 시드를 실행한 다음, 이전 라운드가 만든 결과에 대해 재귀 부분을 반복해서 실행하다가, 어떤 라운드가 행을 하나도 만들지 않으면 멈춥니다. 재귀 부분의 `WHERE`가 결국 그렇게 만드는 것입니다.
+
+키워드는 `WITH RECURSIVE`이고, CTE가 아니라 `WITH`에 붙습니다.
+
+## 5까지 세기 {#counting-to-5}
+
+```sql
+WITH RECURSIVE numbers AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM numbers WHERE n < 5
+)
+SELECT n FROM numbers;
+```
+
+```text
++------+
+| n    |
++------+
+|    1 |
+|    2 |
+|    3 |
+...
++------+
+5 rows in set (0.00 sec)
+```
+
+시드가 행 1을 만듭니다. 재귀 부분은 그 행을 받아 2를 만들고, 다시 2를 받아 3을 만들며, 5에 도달하면 `WHERE n < 5`가 다음 행을 만들지 않으므로 멈춥니다.
+
+이런 수열은 보기보다 유용합니다. 실제 데이터와 조인하면 범위 안의 모든 날짜에 대해 행을 하나씩 주는데, 아무 일도 없었던 날도 포함되며, 데이터만 조회하는 쿼리로는 이것을 만들 수 없습니다.
+
+## 정지 조건을 빼먹으면 {#leaving-out-the-stop-condition}
+
+`WHERE`를 빼면 재귀 부분은 항상 또 다른 행을 만듭니다.
+
+```sql
+WITH RECURSIVE numbers AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM numbers
+)
+SELECT n FROM numbers;
+```
+
+```text
+ERROR 3636 (HY000): Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.
+```
+
+서버는 영원히 실행하지 않고 멈춥니다. 그 제한은 설정입니다:
+
+```sql
+SELECT @@cte_max_recursion_depth AS max_depth;
+```
+
+```text
++-----------+
+| max_depth |
++-----------+
+|      1000 |
++-----------+
+1 row in set (0.01 sec)
+```
+
+메시지의 횟수는 설정보다 1 큰데, 제한을 넘은 라운드가 서버가 멈추기 전에 집계되기 때문입니다.
+
+`ERROR 3636`은 먼저 정지 조건이 없거나 잘못되었다는 뜻으로 읽으세요. `SET SESSION cte_max_recursion_depth = 5000;`으로 제한을 올리는 것은 기본값보다 많은 라운드가 정말로 필요할 때만 옳습니다. 쿼리가 결코 멈추지 않을 것이었다면 잘못인데, 실패하는 데 더 오래 걸릴 뿐 어차피 실패하기 때문입니다. 이 설정은 변수이므로, 위의 1,000은 MySQL의 고정된 속성이 아니라 이 서버의 값입니다.
+
+## 요약 {#summary}
+
+- CTE가 자기 자신을 읽을 때 `WITH RECURSIVE`를 쓰세요.
+- 시드 부분과 재귀 멤버를 `UNION ALL`로 이어서 작성하세요.
+- 정지 조건은 재귀 부분의 `WHERE`에 두세요.
+- 설정에 손대기 전에 `ERROR 3636`을 폭주하는 재귀로 읽으세요.
+
+## 함께 보기 {#see-also}
+
+- [공통 테이블 표현식](/ko/tutorial/cte) — 재귀가 아닌 종류
+- [UNION](/ko/tutorial/union) — 2개의 부분을 잇는 연산자
+- [MySQL CTE가 파생 테이블보다 나은 경우](/ko/guides/ctes-in-mysql) — 옵티마이저가 처리하는 방식

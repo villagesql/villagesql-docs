@@ -1,0 +1,184 @@
+---
+title: "MySQL 트리거"
+sidebarTitle: "트리거 작성하기"
+description: "MySQL 트리거가 동작하는 방식: CREATE TRIGGER 구문, BEFORE 대 AFTER, NEW와 OLD 행 참조, 이벤트당 여러 트리거, 그리고 트리거가 유지 보수성에 도움이 되는 경우와 해가 되는 경우입니다."
+keywords: "mysql triggers, mysql create trigger, mysql before after trigger, mysql trigger example, mysql NEW OLD trigger, mysql trigger insert update delete, mysql audit trigger"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+트리거는 행이 삽입, 갱신, 또는 삭제될 때 자동으로 실행되는 SQL입니다. MySQL은 데이터 변경 전이나 후에 트리거를 실행하며, 쓰이고 있는 행 값에 접근할 수 있게 해 줍니다.
+
+## 트리거 만들기 {#creating-a-trigger}
+
+```sql
+CREATE TRIGGER trigger_name
+    {BEFORE | AFTER} {INSERT | UPDATE | DELETE}
+    ON table_name
+    FOR EACH ROW
+BEGIN
+    -- trigger body
+END;
+```
+
+실용적인 예 — 모든 가격 변경을 기록하기:
+
+```sql
+CREATE TABLE price_history (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    product_id  INT,
+    old_price   DECIMAL(10,2),
+    new_price   DECIMAL(10,2),
+    changed_at  DATETIME DEFAULT NOW()
+);
+
+DELIMITER $$
+
+CREATE TRIGGER log_price_change
+    AFTER UPDATE ON products
+    FOR EACH ROW
+BEGIN
+    IF OLD.price <> NEW.price THEN
+        INSERT INTO price_history (product_id, old_price, new_price)
+        VALUES (NEW.id, OLD.price, NEW.price);
+    END IF;
+END$$
+
+DELIMITER ;
+```
+
+트리거 삭제하기:
+
+```sql
+DROP TRIGGER IF EXISTS log_price_change;
+```
+
+현재 데이터베이스의 모든 트리거 나열하기:
+
+```sql
+SHOW TRIGGERS\G
+-- or
+SELECT trigger_name, event_manipulation, event_object_table, action_timing
+FROM information_schema.triggers
+WHERE trigger_schema = DATABASE();
+```
+
+## BEFORE 대 AFTER {#before-vs-after}
+
+| | BEFORE 트리거 | AFTER 트리거 |
+|:--|:--------------|:-------------|
+| 실행 시점 | 행이 쓰이기 전 | 행이 쓰인 후 |
+| `NEW` 값 수정 가능 | 예 — 변경이 행에 적용됨 | 아니요 — 행이 이미 쓰임 |
+| `OLD` 값 참조 가능 | 예 (UPDATE/DELETE) | 예 (UPDATE/DELETE) |
+| 용도 | 검증, 기본값 설정, 데이터 정규화 | 감사 로깅, 다른 테이블로 연쇄 반영, 알림 |
+
+`BEFORE INSERT` 트리거는 기본값을 설정하거나 잘못된 데이터를 거부할 수 있습니다. `AFTER INSERT` 트리거는 삽입이 성공한 뒤 감사 레코드를 쓸 수 있습니다.
+
+## NEW와 OLD 참조 {#new-and-old-references}
+
+| 트리거 유형 | `NEW` | `OLD` |
+|:-------------|:------|:------|
+| `INSERT` | 새 행의 값 | 사용할 수 없음 |
+| `UPDATE` | 갱신 후의 새 값 | 갱신 전의 원래 값 |
+| `DELETE` | 사용할 수 없음 | 삭제된 행의 값 |
+
+쓰이는 내용을 바꾸려면 `BEFORE` 트리거에서 `NEW` 값을 수정하세요:
+
+```sql
+CREATE TRIGGER normalize_email
+    BEFORE INSERT ON users
+    FOR EACH ROW
+BEGIN
+    SET NEW.email = LOWER(TRIM(NEW.email));
+END;
+```
+
+## 이벤트당 여러 트리거 {#multiple-triggers-per-event}
+
+MySQL은 같은 테이블과 이벤트에 여러 트리거를 지원합니다. `FOLLOWS`와 `PRECEDES` 키워드가 실행 순서를 제어합니다:
+
+```sql
+CREATE TRIGGER audit_insert
+    AFTER INSERT ON orders
+    FOR EACH ROW
+    FOLLOWS another_trigger
+BEGIN
+    INSERT INTO audit_log (action, table_name, row_id, happened_at)
+    VALUES ('INSERT', 'orders', NEW.id, NOW());
+END;
+```
+
+`FOLLOWS`/`PRECEDES`가 없으면 MySQL은 생성 시각에 따라 실행 순서를 배정합니다.
+
+## 트리거에서 오류 발생시키기 {#raising-errors-in-triggers}
+
+작업을 중단하고 호출자에게 오류를 반환하려면 `SIGNAL`을 사용하세요:
+
+```sql
+CREATE TRIGGER enforce_minimum_price
+    BEFORE INSERT ON products
+    FOR EACH ROW
+BEGIN
+    IF NEW.price < 0.01 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Price must be at least $0.01';
+    END IF;
+END;
+```
+
+`BEFORE` 트리거가 오류를 시그널하면 삽입/갱신/삭제는 중단됩니다 — 아무것도 쓰이지 않습니다.
+
+## 트리거의 제약 {#trigger-limitations}
+
+MySQL 트리거에는 알아 둘 만한 몇 가지 제약이 있습니다:
+- 트리거는 결과 집합을 반환하는 스토어드 프로시저를 호출할 수 없습니다
+- 트리거는 `COMMIT`, `ROLLBACK`, `SAVEPOINT`를 직접 사용할 수 없습니다 (둘러싼 트랜잭션에 참여합니다)
+- 트리거는 자신이 정의된 테이블을 참조할 수 없습니다 (대부분의 맥락에서 같은 테이블에 대한 직접 쿼리를 통한 재귀적 트리거 호출은 불가능합니다)
+- `AFTER` 트리거는 `NEW` 값을 수정할 수 없습니다 — 행이 이미 쓰였습니다
+- MySQL은 문 수준 트리거를 지원하지 않습니다 (모든 트리거는 `FOR EACH ROW`입니다)
+
+## 트리거를 사용해야 할 때 {#when-to-use-triggers}
+
+트리거는 다음에 잘 맞습니다:
+- 감사 로깅 — 애플리케이션과 관계없이 누가 무엇을 언제 바꿨는지 기록하기
+- CHECK 제약 조건으로 표현할 수 없는 복잡한 제약 강제하기
+- 파생 데이터를 동기화 상태로 유지하기 (비정규화된 요약 열, 감사 타임스탬프)
+
+다음 경우에는 트리거를 피하세요:
+- 로직이 복잡해서 디버깅하려면 숨겨진 부작용을 추적해야 할 때
+- 성능이 중요할 때 — 모든 트리거는 영향을 받는 모든 문에서 행마다 실행됩니다
+- 트리거가 그 존재를 모르는 애플리케이션 개발자를 놀라게 하는 방식으로 데이터를 수정할 때
+
+숨겨진 트리거는 "이 행이 왜 바뀌었지?"라는 혼란의 흔한 원인입니다. 트리거가 있다면 데이터베이스 안에서만이 아니라 애플리케이션 수준에서 눈에 잘 띄게 문서화하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### LOAD DATA INFILE 중에도 트리거가 실행되나요? {#do-triggers-fire-during-load-data-infile}
+
+예. `LOAD DATA INFILE`이 로드하는 각 행에 대해 `INSERT` 트리거가 실행됩니다. 트리거가 상당한 작업을 한다면, LOAD DATA를 통한 대량 로드는 먼저 스테이징 테이블에 로드한 다음 INSERT...SELECT로 복사하는 것보다 훨씬 느립니다 (INSERT...SELECT도 트리거를 실행하지만, `SET @disable_trigger = TRUE`와 트리거 안의 조건 검사로 일시적으로 끌 수 있습니다).
+
+#### 트리거가 스토어드 프로시저를 호출할 수 있나요? {#can-triggers-call-stored-procedures}
+
+예, 예외 하나가 있습니다: 호출되는 프로시저는 결과 집합(`INTO`가 없는 `SELECT`)을 반환할 수 없습니다. 반환하면 MySQL은 오류를 반환합니다. 트리거에서 호출되는 프로시저는 `OUT` 매개변수와 `SELECT...INTO`를 사용할 수 있습니다.
+
+#### REPLACE INTO에서도 트리거가 실행되나요? {#do-triggers-fire-on-replace-into}
+
+`REPLACE`는 충돌이 있으면 DELETE + INSERT로 실행됩니다. 충돌 시 대상 테이블에서 4개 모두 다음 순서로 실행됩니다: `BEFORE INSERT`(중복 키 검사), 그다음 충돌하는 행에 대한 `BEFORE DELETE`와 `AFTER DELETE`, 그다음 `AFTER INSERT`. 이 삭제는 실제 행 삭제이므로, 참조하는 테이블의 `ON DELETE CASCADE` 규칙도 실제로 실행됩니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| 트리거가 실행되지 않음 | 트리거가 존재하는지 확인: `SHOW TRIGGERS LIKE 'table_name'` — 이벤트(INSERT/UPDATE/DELETE)와 시점(BEFORE/AFTER)이 예상과 일치하는지도 확인 |
+| `ERROR 1442: Can't update table in stored function/trigger` | 트리거는 대부분의 맥락에서 자신이 정의된 테이블을 직접 INSERT/UPDATE/DELETE할 수 없음 — 다른 테이블에 쓰거나 DML 뒤에 호출하는 스토어드 프로시저를 사용 |
+| AFTER 트리거의 변경이 저장되지 않음 | `AFTER` 트리거는 `NEW`를 수정할 수 없음 — 쓰이는 행을 바꿔야 하면 `BEFORE`로 전환 |
+| 트리거가 대량 삽입을 느리게 함 | 트리거는 행마다 실행됨 — 대량 로드에는 트리거를 일시적으로 끄거나 스테이징 테이블에 로드하는 것을 고려 |
+| 트리거의 `SIGNAL`이 앱에 전달되지 않음 | 일부 드라이버는 트리거의 오류를 삼킴 — `SHOW WARNINGS`를 확인하고 드라이버의 오류 처리 설정을 확인 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 스토어드 프로시저](/ko/guides/stored-procedures) — 트리거가 호출할 수 있는 로직
+- [트리거에서 웹훅 보내기](/ko/guides/http-webhooks) — 트리거 본문에서의 HTTP 호출
+- [MySQL의 CHECK 제약 조건](/ko/guides/check-constraints) — 트리거로 자주 구현하는 검증 규칙의 더 단순한 대안

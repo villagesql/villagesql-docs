@@ -1,0 +1,249 @@
+---
+title: "MySQL에 진짜 불리언을 저장하는 방법"
+sidebarTitle: "불리언 컬럼"
+description: "VillageSQL의 vsql_boolean 확장으로 MySQL에 true와 false를 저장하는 방법 — TINYINT(1)이 5와 -1을 받아들이는 이유, 그리고 STRICTBOOL이 이를 거부하는 방법."
+keywords: "mysql boolean, mysql tinyint 1 boolean, mysql bool column, mysql true false column, strictbool, vsql_boolean"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL에는 불리언 유형이 없습니다. `BOOL`과 `BOOLEAN`은 `TINYINT(1)`의 다른 표기이며, 한 바이트에 들어가는 모든 숫자를 저장합니다. 이 컬럼은 `0`과 `1`만큼이나 쉽게 `5`와 `-1`을 담고, 들어간 그대로 돌려줍니다. VillageSQL의 `vsql_boolean` 확장은 두 값만 담고 나머지는 모두 거부하는 `STRICTBOOL` 컬럼 유형을 추가합니다.
+
+## TINYINT(1)이 문제가 되는 이유 {#why-tinyint1-bites}
+
+MySQL이 제공하는 컬럼에 네 행을 삽입한 모습입니다:
+
+```sql
+CREATE TABLE accounts_tinyint (id INT PRIMARY KEY, active BOOL);
+
+INSERT INTO accounts_tinyint VALUES (1, TRUE), (2, FALSE), (3, 5), (4, -1);
+
+SELECT id, active FROM accounts_tinyint;
+```
+
+```
++----+--------+
+| id | active |
++----+--------+
+|  1 |      1 |
+|  2 |      0 |
+|  3 |      5 |
+|  4 |     -1 |
++----+--------+
+```
+
+아무것도 거부하지 않았습니다. 이제 같은 질문을 두 가지 방식으로 던져 보세요:
+
+```sql
+SELECT COUNT(*) AS rows_that_are_truthy FROM accounts_tinyint WHERE active;
+SELECT COUNT(*) AS matches_equals_true  FROM accounts_tinyint WHERE active = TRUE;
+```
+
+```
++----------------------+
+| rows_that_are_truthy |
++----------------------+
+|                    3 |
++----------------------+
++---------------------+
+| matches_equals_true |
++---------------------+
+|                   1 |
++---------------------+
+```
+
+세 행이 참으로 평가되고, 한 행이 `TRUE`와 같습니다. 두 쿼리 모두 올바르게 보이지만 결과가 다릅니다. `TRUE`는 리터럴 `1`이고 `WHERE active`는 0이 아닌 모든 값을 검사하기 때문입니다. `5`를 담은 행은 한 쿼리에서는 활성이고 다른 쿼리에서는 비활성입니다. 스키마의 어떤 것도 `5`가 기록되는 것을 막지 않았으므로, 이 불일치는 나중에 숫자가 맞지 않는 보고서에서 발견됩니다.
+
+## STRICTBOOL 컬럼 {#the-strictbool-column}
+
+```sql
+INSTALL EXTENSION vsql_boolean;
+```
+
+```sql
+CREATE TABLE accounts (
+    id     INT PRIMARY KEY,
+    email  VARCHAR(64),
+    active STRICTBOOL NOT NULL DEFAULT 'false'
+);
+```
+
+이 컬럼은 문자열 `'true'`/`'false'`, `'t'`/`'f'`, `'yes'`/`'no'`, `'on'`/`'off'`, `'1'`/`'0'`을 대소문자 구분 없이 받아들입니다. 문자열로 전달하세요. 따옴표 없는 숫자는 거부됩니다. 어떤 표기로 넣든 `true` 또는 `false`가 돌아옵니다:
+
+```sql
+INSERT INTO accounts (id, email, active) VALUES
+    (1, 'ana@example.com',  'true'),
+    (2, 'ben@example.com',  'no'),
+    (3, 'cleo@example.com', 'on'),
+    (4, 'dev@example.com',  '0');
+
+INSERT INTO accounts (id, email) VALUES (5, 'eve@example.com');
+
+SELECT id, email, active FROM accounts;
+```
+
+```
++----+------------------+--------+
+| id | email            | active |
++----+------------------+--------+
+|  1 | ana@example.com  | true   |
+|  2 | ben@example.com  | false  |
+|  3 | cleo@example.com | true   |
+|  4 | dev@example.com  | false  |
+|  5 | eve@example.com  | false  |
++----+------------------+--------+
+```
+
+5번 행은 값을 제공하지 않아 컬럼 기본값을 받았습니다. 허용된 표기 밖의 모든 값은 마땅한 자리인 삽입 시점에 거부됩니다:
+
+```sql
+INSERT INTO accounts (id, email, active) VALUES (6, 'f@example.com', 'maybe');
+```
+
+```
+ERROR 1366 (HY000): Incorrect STRICTBOOL value: 'maybe' for column 'active' at row 1
+```
+
+값을 썼던 방식 그대로 필터링하세요:
+
+```sql
+SELECT email FROM accounts WHERE active = 'true';
+```
+
+```
++------------------+
+| email            |
++------------------+
+| ana@example.com  |
+| cleo@example.com |
++------------------+
+```
+
+## 집계 {#counting}
+
+이 유형에는 두 가지 집계 함수가 함께 제공됩니다. `boolean_sum`은 true인 행을 세고, `boolean_avg`는 그 비율을 제공합니다:
+
+```sql
+SELECT boolean_sum(active) AS active_accounts,
+       ROUND(boolean_avg(active), 2) AS active_share,
+       COUNT(*) AS total
+FROM accounts;
+```
+
+```
++-----------------+--------------+-------+
+| active_accounts | active_share | total |
++-----------------+--------------+-------+
+|               2 |          0.4 |     5 |
++-----------------+--------------+-------+
+```
+
+두 집계 함수 모두 NULL을 무시하므로, 비율은 응답한 행에 대해 계산됩니다:
+
+```sql
+CREATE TABLE survey (id INT PRIMARY KEY, agreed STRICTBOOL);
+INSERT INTO survey VALUES (1, 'true'), (2, 'false'), (3, NULL);
+
+SELECT boolean_sum(agreed) AS yes,
+       ROUND(boolean_avg(agreed), 2) AS share,
+       COUNT(*) AS rows_total
+FROM survey;
+```
+
+```
++------+-------+------------+
+| yes  | share | rows_total |
++------+-------+------------+
+|    1 |   0.5 |          3 |
++------+-------+------------+
+```
+
+세 행 중 두 응답에서 '예' 하나는 0.5의 비율입니다. NULL을 false로 세고 싶다면, 집계 함수가 그렇게 가정하기를 기대하지 말고 쿼리에서 명시하세요.
+
+## 인덱싱 {#indexing}
+
+`STRICTBOOL` 컬럼은 다른 컬럼과 마찬가지로 인덱싱됩니다:
+
+```sql
+CREATE INDEX idx_active ON accounts (active);
+```
+
+인덱스가 제 몫을 하는지는 늘 그렇듯 따져 볼 문제입니다. 두 값만 가진 컬럼은 그중 하나가 드물 때만 선택도가 있습니다. 예를 들어 거의 아무것도 잠기지 않는 계정 테이블의 `locked` 플래그가 그렇습니다.
+
+## 기존 컬럼 마이그레이션 {#migrating-an-existing-column}
+
+`TINYINT` 컬럼을 제자리에서 변환할 수는 없습니다. 서버가 거부합니다:
+
+```sql
+ALTER TABLE accounts_tinyint MODIFY active STRICTBOOL;
+```
+
+```
+ERROR 3219 (HY000): Cannot convert column 'active' to custom type 'STRICTBOOL'
+```
+
+대신 두 번째 컬럼을 추가하고 채우세요:
+
+```sql
+ALTER TABLE accounts_tinyint ADD COLUMN active_bool STRICTBOOL NOT NULL DEFAULT 'false';
+
+UPDATE accounts_tinyint SET active_bool = 'true'  WHERE active <> 0;
+UPDATE accounts_tinyint SET active_bool = 'false' WHERE active = 0;
+
+SELECT id, active, active_bool FROM accounts_tinyint;
+```
+
+```
++----+--------+-------------+
+| id | active | active_bool |
++----+--------+-------------+
+|  1 |      1 | true        |
+|  2 |      0 | false       |
+|  3 |      5 | true        |
+|  4 |     -1 | true        |
++----+--------+-------------+
+```
+
+위 두 문은 각각 리터럴을 할당합니다. 값을 계산하는 문은 거부됩니다. `STRICTBOOL` 컬럼은 문자열 표현식을 받지 않기 때문입니다:
+
+```sql
+UPDATE accounts_tinyint SET active_bool = IF(active <> 0, 'true', 'false');
+```
+
+```
+ERROR 3219 (HY000): Incorrect STRICTBOOL value: cannot implicitly cast string expression. Use explicit conversion for column 'active_bool' at row 1
+```
+
+오류가 요구하는 명시적 변환은 이 유형의 자체 함수이므로, 한 문으로도 처리할 수 있습니다:
+
+```sql
+UPDATE accounts_tinyint SET active_bool = STRICTBOOL::from_string(IF(active <> 0, 'true', 'false'));
+```
+
+마이그레이션은 `5`와 `-1` 행이 무엇을 의미했는지 결정할 시점이기도 합니다. 위에서는 0이 아닌 모든 값이 `true`가 되었으며, 이는 `WHERE active`가 말했을 결과입니다. 시스템의 어떤 보고서가 대신 `active = 1`을 사용했다면 그 보고서는 다른 결과를 냈고, 지금이 그것을 알게 되는 때입니다.
+
+새 컬럼이 올바르면 이전 컬럼을 삭제하고 이름을 바꾸세요:
+
+```sql
+ALTER TABLE accounts_tinyint DROP COLUMN active;
+ALTER TABLE accounts_tinyint RENAME COLUMN active_bool TO active;
+```
+
+## 문제 해결 {#troubleshooting}
+
+| 오류 | 해결 방법 |
+|---|---|
+| `Incorrect STRICTBOOL value: '<value>'` | 값이 허용된 표기 중 하나가 아닙니다. 따옴표로 묶은 `'true'`/`'false'`, `'t'`/`'f'`, `'yes'`/`'no'`, `'on'`/`'off'`, 또는 `'1'`/`'0'`을 사용하세요 |
+| `Incorrect STRICTBOOL value: cannot implicitly cast string expression` | 우변이 계산된 값입니다. `STRICTBOOL::from_string(...)`으로 감싸거나, 결과마다 리터럴을 할당하세요 |
+| `Cannot convert column '<col>' to custom type 'STRICTBOOL'` | `ALTER ... MODIFY`로는 이 유형에 도달할 수 없습니다. 새 컬럼을 추가하고 채우세요 |
+| `FUNCTION <db>.boolean_sum does not exist` | `INSTALL EXTENSION vsql_boolean` 실행 |
+| `NOT NULL` 컬럼이 해당 컬럼을 생략한 삽입을 거부함 | 위 예시처럼 컬럼에 명시적인 `DEFAULT`를 지정하세요 |
+
+## 참고 {#see-also}
+
+- [vsql_boolean](/ko/extensions/vsql-boolean) — 이 확장이 추가하는 모든 함수가 있는 참조 페이지
+- [데이터 유형 선택하기](/ko/guides/choosing-data-types) — 더 좁은 컬럼이 제 몫을 하는 경우
+- [MySQL의 NULL](/ko/guides/null-in-mysql) — 불리언 집계 함수가 건너뛰는 것
+- [MySQL의 CHECK 제약 조건](/ko/guides/check-constraints) — 잘못된 값을 거부하는 또 다른 방법

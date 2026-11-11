@@ -1,0 +1,170 @@
+---
+title: "MySQL의 전문 검색"
+sidebarTitle: "전문 검색 사용하기"
+description: "MySQL 전문 검색의 동작 방식: FULLTEXT 인덱스, MATCH...AGAINST 구문, 자연어 모드 대 불리언 모드 대 쿼리 확장, 그리고 전문 검색과 LIKE 중 무엇을 사용할지 설명합니다."
+keywords: "mysql full-text search, mysql fulltext index, mysql match against, mysql boolean mode search, mysql natural language search, mysql full text search example, mysql search text"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL의 `LIKE '%keyword%'`는 작은 테이블에서는 동작하지만 인덱스를 사용할 수 없습니다 — 모든 행이 스캔됩니다. 전문 검색은 텍스트 열을 검색하기 위한 인덱스 기반의 순위화된 대안을 제공합니다.
+
+## FULLTEXT 인덱스 만들기 {#creating-a-fulltext-index}
+
+`FULLTEXT` 인덱스는 `InnoDB`(기본 스토리지 엔진)와 `MyISAM` 테이블의 `CHAR`, `VARCHAR`, `TEXT` 열에서 동작합니다.
+
+```sql
+CREATE TABLE articles (
+    id    INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(200),
+    body  TEXT,
+    FULLTEXT idx_ft (title, body)
+);
+```
+
+기존 테이블에 `FULLTEXT` 인덱스를 추가합니다:
+
+```sql
+ALTER TABLE articles ADD FULLTEXT INDEX idx_ft (title, body);
+```
+
+하나의 `FULLTEXT` 인덱스가 여러 열에 걸칠 수 있습니다. 그 인덱스에 대한 쿼리는 인덱싱된 모든 열을 동시에 검색합니다.
+
+## MATCH...AGAINST로 쿼리하기 {#querying-with-matchagainst}
+
+전문 쿼리는 `MATCH(columns) AGAINST(expression)` 구문을 사용합니다. `MATCH` 열 목록은 `FULLTEXT` 인덱스의 열과 정확히 일치해야 합니다.
+
+```sql
+SELECT id, title,
+       MATCH(title, body) AGAINST('database performance') AS relevance
+FROM articles
+WHERE MATCH(title, body) AGAINST('database performance');
+```
+
+`MATCH...AGAINST`가 `WHERE` 절에 나타나면 MySQL은 관련성 내림차순으로 행을 반환합니다. `AGAINST` 표현식은 관련성 점수를 반환합니다 — 0은 일치하지 않음을 뜻합니다.
+
+## 검색 모드 {#search-modes}
+
+MySQL은 세 가지 검색 모드를 지원합니다:
+
+| 모드 | 구문 | 동작 |
+|:-----|:-------|:---------|
+| 자연어(기본값) | `AGAINST('phrase')` 또는 `AGAINST('phrase' IN NATURAL LANGUAGE MODE)` | 관련성으로 결과 순위화; 흔한 단어는 무시됨 |
+| 불리언 모드 | `AGAINST('phrase' IN BOOLEAN MODE)` | 연산자(`+`, `-`, `*`, `""`) 지원; 관련성 점수는 사용 가능하지만 자동이 아님 — 순위화하려면 `ORDER BY MATCH...AGAINST`를 추가 |
+| 쿼리 확장 | `AGAINST('phrase' WITH QUERY EXPANSION)` | 2단계: 먼저 일치 항목을 찾은 다음, 그 결과에서 얻은 관련 용어로 확장 |
+
+### 자연어 모드 {#natural-language-mode}
+
+기본값입니다. MySQL은 극히 흔한 단어를 사실상 무시하는 가중치 체계를 사용합니다 — 거의 모든 행에 나타나는 용어는 관련성 점수에 거의 기여하지 않습니다. 흔한 영어 불용어(`the`, `is`, `at`)는 바로 걸러집니다. 명시적인 `ORDER BY`가 없으면 결과는 관련성 내림차순으로 반환됩니다.
+
+```sql
+-- Returns rows matching 'index' or 'query', ranked by relevance
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('index query');
+```
+
+### 불리언 모드 {#boolean-mode}
+
+불리언 모드는 정밀한 제어를 위한 연산자를 지원합니다:
+
+```sql
+-- Must contain 'index', must not contain 'slow', 'performance' is optional
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('+index -slow performance' IN BOOLEAN MODE);
+```
+
+일반적인 불리언 연산자:
+
+| 연산자 | 의미 | 예시 |
+|:---------|:--------|:--------|
+| `+` | 단어가 반드시 있어야 함 | `+index` |
+| `-` | 단어가 없어야 함 | `-slow` |
+| `*` | 접두사 와일드카드 | `perform*` |
+| `""` | 구문 일치 | `"query optimizer"` |
+| `>` `<` | 관련성 증가/감소 | `>fast <slow` |
+| `()` | 그룹화 | `+(index query) -slow` |
+
+InnoDB 테이블은 `MATCH()` 표현식의 모든 열에 `FULLTEXT` 인덱스가 있어야 합니다 — 없으면 InnoDB의 불리언 모드 쿼리는 오류를 반환합니다. (MyISAM은 FULLTEXT 인덱스 없이도 불리언 모드를 허용하지만 모든 행을 스캔합니다.)
+
+### 쿼리 확장 {#query-expansion}
+
+2단계 검색입니다. MySQL은 초기 쿼리를 실행하고, 상위 일치 항목을 가져와 거기서 추가 용어를 추출한 다음, 그 용어를 추가하여 검색을 다시 실행합니다.
+
+```sql
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('database' WITH QUERY EXPANSION);
+```
+
+사용자가 단일 용어나 모호한 용어로 검색할 때 유용합니다. 첫 단계의 상위 일치 항목이 주제에서 벗어나 있으면 놀라운 결과를 반환할 수 있습니다.
+
+## 전문 검색 대 LIKE {#full-text-search-vs-like}
+
+| | FULLTEXT + MATCH...AGAINST | LIKE '%keyword%' |
+|:--|:--------------------------|:-----------------|
+| 인덱스 사용 | 예 — 큰 테이블에서 빠름 | 아니요 — 전체 스캔 |
+| 관련성 순위화 | 예(자연어 모드) | 아니요 |
+| 부분 단어 일치 | `*` 연산자로 | 예(LIKE '%word%') |
+| 여러 열 | 인덱스당 MATCH 하나 | OR 조건 필요 |
+| FULLTEXT 인덱스 필요 | 예(InnoDB는 필수; MyISAM은 없어도 스캔) | 아니요 |
+| 최소 단어 길이 | 예(`innodb_ft_min_token_size` = 3) | 없음 |
+| 짧은 단어(2자) | 기본적으로 걸러짐 | 일치함 |
+
+작은 테이블에서의 단순한 패턴 일치, 접두사 검색(인덱스가 있는 `LIKE 'prefix%'`), 또는 임의의 패턴 일치가 필요할 때는 `LIKE`를 사용하세요. 텍스트 열에서 단어나 구문을 검색하고 관련성 순위화나 대규모에서의 더 나은 성능이 필요할 때는 전문 검색을 사용하세요.
+
+## 최소 단어 길이 {#minimum-word-length}
+
+InnoDB의 기본 최소 토큰 크기는 3자입니다(`innodb_ft_min_token_size`). 3자보다 짧은 단어는 인덱싱되지 않습니다. 2자 단어를 위해서는 최솟값을 낮추세요:
+
+```sql
+-- In my.cnf / my.ini
+[mysqld]
+innodb_ft_min_token_size = 2
+```
+
+`innodb_ft_min_token_size`는 동적 변수가 아닙니다 — 적용하려면 서버 재시작이 필요합니다. 재시작 후 모든 `FULLTEXT` 인덱스를 다시 빌드하세요:
+
+```sql
+OPTIMIZE TABLE articles;
+```
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 단어가 테이블에 있는데도 MATCH...AGAINST가 행을 반환하지 않는 이유는 무엇인가요? {#why-does-my-matchagainst-return-no-rows-even-though-the-word-is-in-the-table}
+
+흔한 이유 세 가지: (1) 단어가 `innodb_ft_min_token_size`(기본값 3)보다 짧습니다. (2) 단어가 불용어 목록에 있습니다. (3) MyISAM 테이블에서 단어가 행의 50% 이상에 나타납니다 — MyISAM의 자연어 모드는 그런 단어를 너무 흔해서 쓸모없는 것으로 취급합니다. InnoDB에는 이런 제한이 없습니다. MyISAM의 50% 임계값을 우회하려면 불리언 모드를 사용하세요.
+
+#### 전문 검색을 WHERE 조건과 함께 사용할 수 있나요? {#can-i-use-full-text-search-with-where-conditions}
+
+예. `MATCH...AGAINST`를 다른 `WHERE` 조건과 평소처럼 결합하세요:
+
+```sql
+SELECT title FROM articles
+WHERE status = 'published'
+  AND MATCH(title, body) AGAINST('performance' IN BOOLEAN MODE);
+```
+
+MySQL은 전문 검색 부분에 `FULLTEXT` 인덱스를 사용하고 다른 인덱싱된 열에 대해서는 별도로 필터링할 수 있습니다.
+
+#### MySQL 전문 검색은 여러 언어를 지원하나요? {#does-mysql-full-text-search-support-multiple-languages}
+
+MySQL에는 여러 언어의 내장 불용어 목록이 있습니다. 프로덕션의 다국어 검색에는 보통 `innodb_ft_enable_stopword = OFF`를 구성하고 `innodb_ft_server_stopword_table`로 자체 불용어 테이블을 제공하거나, 외부 검색 엔진(Elasticsearch, MeiliSearch)을 사용해야 합니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `ERROR 1214: The used table type doesn't support FULLTEXT indexes` | InnoDB와 MyISAM만 FULLTEXT를 지원함 — `SHOW CREATE TABLE`에서 스토리지 엔진을 확인 |
+| `MATCH` 열 목록 불일치 오류 | `MATCH(...)`의 열은 FULLTEXT 인덱스에 나열된 열과 같은 순서로 정확히 일치해야 함 |
+| 흔한 단어가 결과를 반환하지 않음 | 단어가 불용어 목록에 있거나, MyISAM 테이블에서 행의 50% 이상에 나타날 수 있음 — 불리언 모드를 시도: `AGAINST('word' IN BOOLEAN MODE)` |
+| 짧은 단어를 찾지 못함 | 단어가 `innodb_ft_min_token_size`(기본값 3) 미만임 — 설정을 낮추고, MySQL을 재시작한 다음, `OPTIMIZE TABLE`을 실행하여 인덱스를 다시 빌드 |
+| `INSERT` 후 결과가 나타나지 않음 | InnoDB가 FULLTEXT 갱신을 버퍼링함 — `SET GLOBAL innodb_optimize_fulltext_only=1; OPTIMIZE TABLE articles;`를 실행하여 플러시 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes) — FULLTEXT는 B-트리와 나란한 특수 인덱스 유형입니다
+- [MySQL의 JSON](/ko/guides/json-in-mysql) — 구조화된 데이터와 함께 JSON 텍스트 필드 검색하기
+- [다차원 범위 쿼리](/ko/guides/cube-queries) — 텍스트 검색이 맞지 않을 때 여러 숫자 차원에 걸친 검색
+- [MySQL LIKE](/ko/tutorial/like) — 전문 인덱스가 대규모에서 대체하는 패턴 연산자
+- [MySQL REGEXP](/ko/tutorial/regexp) — 모든 행을 읽는 패턴 일치

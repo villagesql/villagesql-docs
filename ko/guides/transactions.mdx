@@ -1,0 +1,147 @@
+---
+title: "MySQL의 트랜잭션"
+sidebarTitle: "트랜잭션 사용하기"
+description: "MySQL 트랜잭션이 동작하는 방식: COMMIT, ROLLBACK, 격리 수준, 그리고 데이터를 일관되게 유지하기 위해 트랜잭션을 사용하는 방법입니다."
+keywords: "mysql transactions, mysql isolation level, mysql repeatable read, mysql read committed, mysql transaction locking, mysql transaction isolation levels"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+트랜잭션은 여러 SQL 문을 하나의 작업 단위로 묶습니다. 전부 성공하거나, 전부 실패합니다. 트랜잭션이 없으면 여러 단계로 된 작업 — 결제, 이체, 주문 — 의 중간에서 실패했을 때 데이터가 깨진 중간 상태로 남을 수 있습니다.
+
+## 기본: BEGIN, COMMIT, ROLLBACK {#the-basics-begin-commit-rollback}
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- debit Alice
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- credit Bob
+
+COMMIT;  -- both changes are saved
+```
+
+두 갱신 사이에서 무언가 잘못되면:
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+
+-- error occurs here, or you decide to cancel
+
+ROLLBACK;  -- neither change is saved — balance unchanged
+```
+
+`ROLLBACK`은 `START TRANSACTION` 시점까지 모든 것을 되돌립니다. 데이터베이스는 트랜잭션이 시작되기 전의 상태로 남습니다.
+
+`BEGIN`과 `START TRANSACTION`은 같습니다. 둘 다 새 트랜잭션을 시작합니다.
+
+## 자동 커밋 {#autocommit}
+
+기본적으로 MySQL은 자동 커밋 모드로 실행됩니다 — 각 문이 자기만의 트랜잭션이고, 즉시 커밋됩니다. 그래서 `DELETE FROM orders WHERE id = 5`가 명시적인 `COMMIT` 없이 바로 적용됩니다.
+
+`START TRANSACTION`을 호출하면 그 트랜잭션이 끝날 때까지 자동 커밋이 일시적으로 중단됩니다.
+
+```sql
+-- Check current autocommit setting
+SHOW VARIABLES LIKE 'autocommit';
+
+-- Disable autocommit for the session
+SET autocommit = 0;
+
+-- Now every statement is part of a transaction until you COMMIT or ROLLBACK
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+```
+
+자동 커밋을 끄면 모든 작업 뒤에 명시적으로 `COMMIT`이나 `ROLLBACK`을 해야 합니다. 커밋하지 않고 연결을 끊으면 MySQL은 열려 있는 트랜잭션을 롤백합니다.
+
+## 격리 수준 {#isolation-levels}
+
+여러 트랜잭션이 동시에 실행될 때, 격리 수준은 각 트랜잭션이 다른 트랜잭션에서 무엇을 볼 수 있는지 제어합니다. MySQL의 기본값은 `REPEATABLE READ`입니다.
+
+| 수준 | 더티 리드 | 반복 불가능한 읽기 | 팬텀 리드 |
+|:------|:------------|:---------------------|:--------------|
+| `READ UNCOMMITTED` | 가능 | 가능 | 가능 |
+| `READ COMMITTED` | 방지됨 | 가능 | 가능 |
+| `REPEATABLE READ` | 방지됨 | 방지됨 | 방지됨* |
+| `SERIALIZABLE` | 방지됨 | 방지됨 | 방지됨 |
+
+*InnoDB의 REPEATABLE READ는 갭 락으로 팬텀 리드를 방지하는데, 이것은 SQL 표준이 요구하는 것보다 엄격합니다.
+
+**READ COMMITTED**는 처리량을 우선하는 애플리케이션에서 흔한 선택입니다. 더티 리드(다른 트랜잭션의 커밋되지 않은 데이터를 보는 것)는 방지하지만, 반복 불가능한 읽기(한 트랜잭션 안에서 같은 행을 두 번 읽을 때, 그 사이에 다른 트랜잭션이 커밋했다면 다른 값이 반환될 수 있는 것)는 허용합니다.
+
+```sql
+-- Set isolation level for the current session
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- Or for the next transaction only
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+-- ...
+```
+
+## 세이브포인트 {#savepoints}
+
+세이브포인트를 사용하면 트랜잭션 전체를 포기하지 않고 일부만 롤백할 수 있습니다:
+
+```sql
+START TRANSACTION;
+
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+SAVEPOINT after_order;
+
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 42);
+
+-- something went wrong with the item — roll back just this part
+ROLLBACK TO SAVEPOINT after_order;
+
+-- the order is still there; we can retry the item insert
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 43);
+
+COMMIT;
+```
+
+## 트랜잭션이 다루지 않는 것 {#what-transactions-dont-cover}
+
+모든 MySQL 문을 롤백할 수 있는 것은 아닙니다. DDL 문(`CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`)은 암시적 커밋을 일으킵니다 — MySQL은 이 문들을 실행하기 전에 열려 있는 트랜잭션을 커밋하고, DDL 자체는 롤백할 수 없습니다.
+
+```sql
+START TRANSACTION;
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+
+DROP TABLE temp_data;  -- implicit commit happens here — the INSERT is committed
+
+ROLLBACK;  -- nothing to roll back; everything was already committed
+```
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 트랜잭션이 끝내 커밋되지 않으면 어떻게 되나요? {#what-happens-if-a-transaction-is-never-committed}
+커밋하지 않고 연결을 닫으면 MySQL은 열려 있는 트랜잭션을 자동으로 롤백합니다. 서버가 충돌하면 InnoDB의 리두 로그가 시작 시 커밋된 트랜잭션을 복구하고 커밋되지 않은 트랜잭션을 롤백합니다.
+
+#### MyISAM에서 트랜잭션을 사용할 수 있나요? {#can-i-use-transactions-with-myisam}
+아니요. 트랜잭션에는 트랜잭션을 지원하는 스토리지 엔진이 필요합니다. InnoDB(MySQL의 기본 엔진)는 트랜잭션을 완전히 지원합니다. MyISAM은 지원하지 않습니다 — MyISAM 테이블에 대한 문은 즉시 적용되고 롤백할 수 없습니다.
+
+#### 트랜잭션을 얼마나 오래 열어 둘 수 있나요? {#how-long-can-a-transaction-stay-open}
+기술적으로는 필요한 만큼 오래 열어 둘 수 있지만, 오래 실행되는 트랜잭션은 락을 잡고 언두 로그 공간을 소비해서 다른 트랜잭션에 성능 문제를 일으킵니다. `innodb_lock_wait_timeout` 변수(기본값: 50초)는 트랜잭션이 오류를 반환하기 전에 락을 얼마나 오래 기다릴지 제어합니다. 트랜잭션을 짧게 유지하고 작업이 끝나는 즉시 커밋하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| 변경 사항이 저장되지 않음 | 자동 커밋이 꺼져 있는지 확인 — `COMMIT`을 명시적으로 호출해야 할 수 있음 |
+| `ROLLBACK`이 효과가 없음 | DDL 문(`CREATE`, `ALTER`, `DROP`)이 트랜잭션 중간에 암시적 커밋을 일으킴 |
+| 트랜잭션이 다른 쿼리를 막음 | 오래 실행되는 트랜잭션이 락을 잡고 있음 — 즉시 커밋하거나 롤백; 락 정보는 `SHOW ENGINE INNODB STATUS`로 확인 |
+| `ERROR 1205: Lock wait timeout exceeded` | 다른 트랜잭션이 충돌하는 락을 잡고 있음; 막고 있는 트랜잭션이 끝난 뒤 재시도 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 외래 키](/ko/guides/foreign-keys) — 외래 키 검사는 트랜잭션 작업의 일부입니다
+- [MySQL의 데드락](/ko/guides/deadlocks) — 두 트랜잭션이 서로를 막을 때 일어나는 일
+- [MySQL의 UPSERT](/ko/guides/upsert) — 트랜잭션 안의 INSERT ... ON DUPLICATE KEY UPDATE
+- [MySQL의 대량 삽입](/ko/guides/bulk-inserts) — 속도를 위해 쓰기를 트랜잭션으로 묶기
+- [MySQL COMMIT과 ROLLBACK](/ko/tutorial/transactions) — 실습 예제와 함께 보는 START TRANSACTION, COMMIT, ROLLBACK

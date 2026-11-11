@@ -1,0 +1,133 @@
+---
+title: "MySQL의 커버링 인덱스"
+sidebarTitle: "커버링 인덱스 사용하기"
+description: "MySQL에서 커버링 인덱스란 무엇인지, 행 조회를 어떻게 없애는지, 가장 중요한 쿼리를 위해 어떻게 설계하는지 설명합니다."
+keywords: "mysql covering index, mysql using index, mysql index only scan, mysql composite index performance, mysql explain using index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+커버링 인덱스는 쿼리에 필요한 모든 열을 포함하는 인덱스입니다. 먼저 인덱스의 기본 동작 방식을 이해하면 도움이 됩니다 — [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes)은 여기에도 적용되는 B-트리 구조, 키 길이, 선택도 규칙을 다룹니다. MySQL이 실제 테이블 행을 건드리지 않고 인덱스만으로 쿼리에 답할 수 있을 때, 이를 인덱스 전용 스캔이라고 합니다. 큰 테이블에서는 이것이 단일 쿼리에 적용할 수 있는 가장 큰 최적화 중 하나입니다.
+
+## 행 조회의 동작 방식(그리고 비용이 큰 이유) {#how-row-lookups-work-and-why-theyre-expensive}
+
+일반적인 인덱스 조회는 두 단계입니다:
+
+1. MySQL이 인덱스를 검색하여 어떤 행이 일치하는지 찾습니다
+2. 일치하는 각 행에 대해 MySQL이 테이블에서 전체 행을 가져옵니다("행 조회" 또는 "테이블 복귀 조회")
+
+2단계가 비용이 큰 부분입니다. InnoDB의 클러스터형 인덱스는 테이블 데이터가 기본 키 순서로 물리적으로 정렬되어 있음을 뜻합니다. 보조 인덱스로 행을 조회하면 기본 키 값이 흩어져 있어 각 행 조회가 서로 다른 디스크 페이지에 대한 무작위 I/O가 될 가능성이 높습니다. 규모가 커지면 이 무작위 읽기가 쿼리 시간을 지배합니다.
+
+커버링 인덱스는 2단계를 완전히 없앱니다.
+
+## EXPLAIN에서 커버링 인덱스 식별하기 {#identifying-a-covering-index-in-explain}
+
+`EXPLAIN`은 커버링 인덱스가 사용 중일 때 알려줍니다: `Extra: Using index`를 찾으세요. EXPLAIN 출력에 아직 익숙하지 않다면 [MySQL에서 EXPLAIN 읽기](/ko/guides/reading-explain)가 모든 핵심 열을 다룹니다.
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+CREATE INDEX idx_user_status_created ON orders (user_id, status, created_at);
+
+-- All three columns in the SELECT are in the index
+EXPLAIN SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------------+
+| type  | key                       | rows | Extra       |
++-------+---------------------------+------+-------------+
+| ref   | idx_user_status_created   |   12 | Using index |
++-------+---------------------------+------+-------------+
+```
+
+`Using index` — MySQL이 인덱스만 읽었습니다. 행 조회가 없습니다.
+
+이제 인덱스에 없는 열을 추가해 보세요:
+
+```sql
+-- order_total is not in the index
+EXPLAIN SELECT user_id, status, created_at, order_total FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------+
+| type  | key                       | rows | Extra |
++-------+---------------------------+------+-------+
+| ref   | idx_user_status_created   |   12 | NULL  |
++-------+---------------------------+------+-------+
+```
+
+이제 `Extra`가 비어 있습니다 — MySQL은 인덱스로 행을 찾은 다음 `order_total`을 얻기 위해 전체 행을 가져옵니다. 행 조회가 돌아왔습니다.
+
+## 커버링 인덱스 설계하기 {#designing-a-covering-index}
+
+목표는 쿼리가 건드리는 모든 열 — `WHERE`, `ORDER BY`, `GROUP BY`, `SELECT` 목록에 있는 열 — 을 포함하는 것입니다. 열 순서는 `WHERE`와 `ORDER BY` 필터링에 대해 여전히 최좌측 접두사 규칙을 따릅니다:
+
+```sql
+-- Query pattern:
+SELECT status, created_at FROM orders
+WHERE user_id = 42
+ORDER BY created_at;
+
+-- Covering index: equality column first, then sort column, then SELECT columns
+CREATE INDEX idx_covering ON orders (user_id, created_at, status);
+```
+
+- `user_id`가 첫 번째 — 동등 필터
+- `created_at`이 두 번째 — 정렬 열(인덱스가 이미 정렬되어 있어 filesort 없음)
+- `status`가 마지막 — `SELECT`에만 있고 필터링이나 정렬에는 없음
+
+`SELECT` 열은 어떤 행이 찾아지는지나 어떤 순서인지에 영향을 주지 않기 때문에 마지막에 옵니다 — 그저 따라가는 것뿐입니다.
+
+## 커버링 인덱스가 가치 있는 경우 {#when-covering-indexes-are-worth-it}
+
+| 시나리오 | 가치 있는가? |
+|:---------|:----------|
+| 큰 테이블에 대한 트래픽이 많은 쿼리 | 예 |
+| 좁은 `SELECT` 목록(열 몇 개) | 예 |
+| 읽기 위주 워크로드 | 예 |
+| 작은 테이블 | 아니요 — 어차피 행 조회가 빠름 |
+| `SELECT *` 쿼리 | 아니요 — 테이블 전체를 인덱싱하지 않고는 모든 열을 커버할 수 없음 |
+| 쓰기 위주 테이블 | 평가 필요 — 모든 `INSERT`/`UPDATE`/`DELETE`가 인덱스를 갱신함 |
+
+```sql
+-- Not a candidate: SELECT * means no index can cover this
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Good candidate: narrow SELECT, high-traffic query
+SELECT id, status FROM orders WHERE user_id = 42 AND created_at > '2024-01-01';
+```
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 커버링 인덱스가 `SELECT *`에 도움이 되나요? {#does-a-covering-index-help-with-select-}
+아니요. 인덱스는 `SELECT` 목록의 모든 열을 포함할 때만 쿼리를 커버할 수 있습니다. `SELECT *`는 모든 열을 선택하므로 모든 열을 인덱싱해야 하는데, 그 시점에는 사실상 테이블을 인덱스로 복제한 것이어서 유용하지 않습니다.
+
+#### 커버링 인덱스가 그래도 `SELECT *` 쿼리 속도를 높일 수 있나요? {#can-a-covering-index-still-speed-up-select--queries}
+예, 부분적으로는 그렇습니다. MySQL이 행 조회를 해야 하더라도 인덱스가 가져올 행의 범위를 좁혀 줍니다. 개선은 `WHERE` 필터링에서 오는 것이지 행 조회를 없애는 데서 오는 것이 아닙니다.
+
+#### 커버링 인덱스가 도움이 될지 어떻게 알 수 있나요? {#how-do-i-know-if-a-covering-index-would-help}
+`EXPLAIN`을 실행하고 `Extra`를 확인하세요. `Using index condition`이 보이거나 아무것도 없고(`Using index` 없음) `rows`가 크다면 커버링 인덱스가 도움이 될 수 있습니다. `EXPLAIN ANALYZE`는 실제 행 수와 추정 행 수를 보여 주므로 옵티마이저의 선택을 확인하는 데 유용합니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `Extra`에 `Using index` 대신 아무것도 표시되지 않음 | `SELECT`의 열 하나가 인덱스에 없음 — 추가하거나 쿼리에서 제거 |
+| `Using index` 대신 `Extra: Using index condition` | 인덱스가 필터링에는 사용되지만 완전히 커버하지는 않음 — 나머지 `SELECT` 열을 추가 |
+| 인덱스가 있지만 `key`가 `NULL` | `ANALYZE TABLE`을 실행하여 통계를 새로 고침; 쿼리의 `WHERE`가 최좌측 인덱스 열을 사용하는지 확인 |
+| 커버링 인덱스가 쓰기를 느리게 함 | 예상되는 트레이드오프 — 워크로드에서 읽기 이점이 쓰기 비용보다 큰지 평가 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes) — 커버링 인덱스의 바탕이 되는 B-트리 기초
+- [MySQL에서 EXPLAIN 읽기](/ko/guides/reading-explain) — EXPLAIN 출력에서 `Using index`를 확인하는 방법
+- [InnoDB의 데이터 저장 방식](/ko/guides/innodb-storage) — 행 조회의 비용이 큰 이유와 커버링이 이를 피하는 이유
