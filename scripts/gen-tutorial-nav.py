@@ -25,9 +25,10 @@ why it is there:
    page is its first entry, so the heading looks like every other group
    heading in the tab.
 
-3. The group goes into the English navigation only. Nothing under tutorial/
-   is translated, for the same reason nothing under guides/ is. VERSIONING.md
-   is the operative statement of that rule.
+3. The group goes into the English navigation only. scripts/build-translated-
+   menus.py copies it into each translated menu, keeping the lessons that
+   have a translated file. The contents list on a translated tutorial/index.mdx
+   is not generated, so a change to the lesson order is made there by hand.
 """
 
 import glob

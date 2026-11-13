@@ -37,8 +37,9 @@ exists, the shared page marks it with a `**MySQL 9.7:**` note, as the managing
 page does for the Docker image name. Links to Oracle's MySQL manual point at
 the 8.4 edition.
 
-Translated pages cover the shared extension and SDK pages and the stable
-server pages. The Guides, the Tutorial, and the dev pages are English only.
+Translated pages cover the shared pages, the Guides and the Tutorial
+included, and the stable server pages. The dev pages are English only. A
+page with no translation in a language is left out of that language's menu.
 
 The `manifest.json.schema.json` files stay at their old paths
 (`mysql-8.4/stable/`, `mysql-8.4/0.0.6/`, and so on), because extension
@@ -93,8 +94,8 @@ A new page is translated in full.
   must match English, in the same order, with the same headings, front-matter
   keys, and link targets.
 - **Links:** in a translated page, a link to a translated page carries the
-  language prefix, such as `](/ja/extensions/install)`. A link to an
-  English-only page, such as a guide, keeps its `/en/` address.
+  language prefix, such as `](/ja/extensions/install)`. A link to a
+  page with no translation, such as a dev page, keeps its `/en/` address.
 - **Headings that links point at** get the English slug as a custom id, such
   as `## 見出し {#english-slug}`, so English anchors keep working.
 - **Mechanical check:**
