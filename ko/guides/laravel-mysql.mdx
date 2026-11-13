@@ -1,0 +1,267 @@
+---
+title: "Laravel 12와 MySQL"
+sidebarTitle: "Laravel과 Eloquent"
+description: "MySQL을 대상으로 Laravel 12 설정하기: .env 연결 블록, 마이그레이션 실행, Eloquent 모델, $fillable을 사용한 대량 할당 보호, 그리고 라이브 데이터베이스에 대한 쓰기 검증입니다."
+keywords: "laravel mysql, laravel 12 mysql, laravel eloquent mysql, laravel migrate mysql, laravel .env database, laravel fillable, laravel database connection, villagesql laravel"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+새 Laravel 12 프로젝트는 `.env`의 활성 `DB_CONNECTION` 줄 바로 아래에 주석 처리된 MySQL 연결 블록이 기본으로 들어 있으며, 모든 MySQL 클라이언트가 기대하는 것과 같은 호스트, 포트, 데이터베이스, 사용자 이름, 비밀번호 형태를 사용합니다. 주석을 해제하고 실제 값을 채우는 것이 통합의 전부입니다. 이 가이드는 그 설정을 처음부터 끝까지 안내합니다: 연결하기, 마이그레이션 실행하기, 그리고 Eloquent를 통해 읽고 쓰기입니다.
+
+## 프로젝트 만들기 {#creating-the-project}
+
+```bash
+composer create-project laravel/laravel laravel-mysql "12.*"
+```
+
+이 명령은 Laravel 12와 그 의존성을 설치하고, 애플리케이션 키를 생성하며, 기본 SQLite 데이터베이스를 만들어서 앱이 설정 없이 즉시 실행되게 합니다. 버전을 확인하세요:
+
+```bash
+php artisan --version
+```
+
+```
+Laravel Framework 12.68.0
+```
+
+Laravel 12에는 PHP 8.2 이상이 필요합니다. PHP가 아직 설치되지 않은 macOS에서는 `brew install php composer`가 둘 다 설치합니다. Homebrew의 PHP 8.5 빌드에는 `pdo_mysql`과 `mysqli`가 기본으로 포함되어 있으므로, MySQL을 위한 추가 확장 설정이 필요하지 않습니다.
+
+## 데이터베이스와 사용자 만들기 {#creating-the-database-and-user}
+
+애플리케이션을 `root`로 향하게 하지 말고, 전용 데이터베이스와 범위가 제한된 사용자를 만드세요:
+
+```sql
+CREATE DATABASE laravel_guide;
+CREATE USER 'laravel_app'@'127.0.0.1' IDENTIFIED BY 'your-password';
+GRANT ALL PRIVILEGES ON laravel_guide.* TO 'laravel_app'@'127.0.0.1';
+```
+
+## 연결 구성하기 {#configuring-the-connection}
+
+`.env`를 열고 `DB_CONNECTION`을 `sqlite`에서 `mysql`로 바꾼 다음, 연결 세부 정보를 채우세요:
+
+```bash
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=laravel_guide
+DB_USERNAME=laravel_app
+DB_PASSWORD=your-password
+```
+
+Laravel은 여기서 TCP로 `127.0.0.1`에 연결하는데, 위의 `CREATE USER` 문이 권한을 부여한 것과 같은 호스트입니다. VillageSQL은 MySQL의 드롭인 대체품이므로, `config/database.php`나 `.env` 키에서 바뀌는 것은 없습니다.
+
+`config/database.php`는 `mysql` 연결에 기본으로 `'strict' => true`를 설정합니다. 이것은 세션을 MySQL의 표준 strict SQL 모드로 둡니다:
+
+```sql
+SELECT @@sql_mode;
+```
+
+```
+ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+그 모드 집합은 VillageSQL에서 변경 없이 실행됩니다. 호환성을 위해 비활성화하거나 우회해야 할 strict 모드 플래그는 없습니다.
+
+## 마이그레이션 실행하기 {#running-migrations}
+
+Laravel의 기본 마이그레이션은 `users`, `cache`, `jobs` 테이블을 만듭니다. 구성된 연결을 대상으로 실행하세요:
+
+```bash
+php artisan migrate:fresh
+```
+
+```
+INFO  Preparing database.
+
+Creating migration table ....................................... 2.76ms DONE
+
+INFO  Running migrations.
+
+0001_01_01_000000_create_users_table ........................... 8.69ms DONE
+0001_01_01_000001_create_cache_table ........................... 4.42ms DONE
+0001_01_01_000002_create_jobs_table ............................ 6.31ms DONE
+```
+
+`posts` 테이블을 위한 자체 마이그레이션과 함께 모델을 생성하세요:
+
+```bash
+php artisan make:model Post -m
+```
+
+```
+INFO  Model [app/Models/Post.php] created successfully.
+
+INFO  Migration [database/migrations/..._create_posts_table.php] created successfully.
+```
+
+생성된 마이그레이션에 `title`과 `body` 열을 추가하세요:
+
+```php
+Schema::create('posts', function (Blueprint $table) {
+    $table->id();
+    $table->string('title');
+    $table->text('body');
+    $table->timestamps();
+});
+```
+
+실행한 다음, 서버에서 직접 테이블의 형태를 확인하세요:
+
+```bash
+php artisan migrate
+```
+
+```sql
+DESCRIBE posts;
+```
+
+```
+Field       Type              Null  Key  Default  Extra
+id          bigint unsigned   NO    PRI  NULL     auto_increment
+title       varchar(255)      NO         NULL
+body        text              NO         NULL
+created_at  timestamp         YES        NULL
+updated_at  timestamp         YES        NULL
+```
+
+## Eloquent와 대량 할당 보호 {#eloquent-and-mass-assignment-protection}
+
+Laravel의 Eloquent 모델은 필드가 `$fillable`에 나열되지 않는 한 기본적으로 대량 할당을 차단합니다:
+
+```php
+class Post extends Model
+{
+    protected $fillable = ['title', 'body'];
+}
+```
+
+`id`, `created_at`, `updated_at`은 의도적으로 제외되어 있습니다. `create()`에 `id`를 전달해도 오류가 나지 않고 값을 덮어쓰지도 않습니다. Eloquent는 `$fillable`에 없는 키를 조용히 버립니다:
+
+```php
+$post = Post::create(['title' => 'Tinker test', 'body' => 'via fillable', 'id' => 999]);
+echo $post->id;
+```
+
+```
+1
+```
+
+행은 `999`가 아니라 다음 자동 증가 값을 받았습니다. 이것은 `store()` 메서드가 요청 본문을 직접 받을 때 중요합니다: `$fillable`이 열의 범위를 정하지 않으면, 클라이언트가 `id`나 타임스탬프 필드를 전달해서 그대로 받아들여지게 할 수 있습니다. `$fillable`은 모델을 보호하고, 요청 검증은 들어오는 데이터의 형태를 검사하는 별개의 관심사입니다.
+
+## 라우트와 컨트롤러 {#routes-and-a-controller}
+
+Laravel 12의 기본 뼈대는 라우팅을 최소한으로 유지합니다: `routes/web.php`가 라우트를 담고, `bootstrap/app.php`가 옛 `Http/Kernel.php` 파일 없이 미들웨어와 예외 처리를 연결합니다. 컨트롤러를 생성하세요:
+
+```bash
+php artisan make:controller PostController
+```
+
+```php
+class PostController extends Controller
+{
+    public function index(): JsonResponse
+    {
+        return response()->json(Post::latest()->get());
+    }
+
+    public function store(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'body' => 'required|string',
+        ]);
+
+        $post = Post::create($validated);
+
+        return response()->json($post, 201);
+    }
+}
+```
+
+라우트를 등록하세요:
+
+```php
+use App\Http\Controllers\PostController;
+
+Route::get('/posts', [PostController::class, 'index']);
+Route::post('/posts', [PostController::class, 'store']);
+```
+
+`routes/web.php`는 Laravel의 세션 기반 CSRF 미들웨어 뒤에서 실행되는데, 요청에 CSRF 토큰이 없으므로 평범한 `curl -X POST`를 `419 Page Expired`로 거부합니다. 브라우저를 향한 폼 라우트에서는 이것이 정상입니다. 실제 폼은 숨겨진 필드로 토큰을 전송합니다. 폼이나 토큰 없이 직접 호출되도록 만든 라우트는 `bootstrap/app.php`에서 제외하세요:
+
+```php
+->withMiddleware(function (Middleware $middleware): void {
+    $middleware->validateCsrfTokens(except: [
+        'posts',
+    ]);
+})
+```
+
+## 처음부터 끝까지 검증하기 {#verifying-end-to-end}
+
+내장 서버를 시작하고 두 라우트를 모두 실행해 보세요. 테이블에는 위의 `$fillable` 데모에서 만든 행이 이미 있으므로, 인덱스 라우트가 그것을 반환합니다:
+
+```bash
+php artisan serve --port=8123
+```
+
+```bash
+curl -s http://127.0.0.1:8123/posts
+```
+
+```json
+[{"id":1,"title":"Tinker test","body":"via fillable","created_at":"2026-08-28T19:49:05.000000Z","updated_at":"2026-08-28T19:49:05.000000Z"}]
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8123/posts -d "title=Hello VillageSQL" -d "body=First post from curl"
+```
+
+```json
+{"title":"Hello VillageSQL","body":"First post from curl","updated_at":"2026-08-28T19:49:21.000000Z","created_at":"2026-08-28T19:49:21.000000Z","id":2}
+```
+
+JSON 응답만 믿지 말고, 데이터베이스를 직접 쿼리해서 두 행이 모두 들어갔는지 확인하세요:
+
+```sql
+SELECT * FROM laravel_guide.posts;
+```
+
+```
+id  title              body                    created_at           updated_at
+1   Tinker test        via fillable            2026-08-28 19:49:05  2026-08-28 19:49:05
+2   Hello VillageSQL   First post from curl    2026-08-28 19:49:21  2026-08-28 19:49:21
+```
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### Laravel은 왜 MySQL 대신 SQLite를 기본으로 하나요? {#why-does-laravel-default-to-sqlite-instead-of-mysql}
+
+최근 Laravel 버전은 `php artisan serve`가 설정 없이 즉시 동작하도록 새 프로젝트의 기본값을 SQLite로 둡니다. `.env` 파일은 여전히 활성 `DB_CONNECTION` 줄 바로 아래에 MySQL 연결 키를 주석 처리된 채로 담고 있습니다. MySQL로 전환하는 것은 새 설정 섹션이 아니라, 주석을 해제하고 다섯 개의 값을 채우는 문제입니다.
+
+#### Eloquent가 VillageSQL과 동작하려면 특별한 설정이 필요한가요? {#does-eloquent-need-any-special-configuration-to-work-with-villagesql}
+
+아니요. VillageSQL은 MySQL의 드롭인 대체품이고 같은 와이어 프로토콜을 사용하므로, Laravel의 `mysql` 드라이버, strict SQL 모드 설정, 쿼리 문법 모두 변경 없이 동작합니다.
+
+#### `$fillable`과 요청 검증의 차이는 무엇인가요? {#whats-the-difference-between-fillable-and-request-validation}
+
+`$request->validate()`는 들어오는 요청에서 어떤 필드를 받아들일지 결정하고 잘못된 형식의 입력을 422 응답으로 거부합니다. 모델의 `$fillable`은 `create()`나 `fill()`에 전달한 필드 중 어떤 것이 실제로 데이터베이스에 기록되는지 결정합니다. `$request->validate()`만 사용하면 다른 곳의 컨트롤러가 `Post::create($request->all())`을 호출할 경우 모델이 여전히 대량 할당에 열려 있습니다. `$fillable`은 어느 컨트롤러가 호출하든 모델을 보호합니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| POST 요청에 `419 Page Expired` | 라우트가 CSRF 미들웨어 뒤에서 실행됨. `@csrf`가 있는 실제 폼을 제출하거나, 직접 호출되도록 만든 라우트라면 `bootstrap/app.php`에서 `validateCsrfTokens(except: [...])`로 제외. |
+| `SQLSTATE[HY000] [2002] Connection refused` | `.env`의 `DB_PORT`가 VillageSQL이 실제로 수신 대기하는 포트와 일치하지 않음. 서버가 시작된 포트를 확인. |
+| `SQLSTATE[HY000] [1045] Access denied for user '<user>'@'localhost' (using password: YES)` | `DB_USERNAME`이나 `DB_PASSWORD`가 틀렸거나, 사용자에게 `DB_DATABASE`에 닿는 권한이 없음. `DB_HOST`가 `127.0.0.1`이어도 오류는 `'localhost'`라고 말할 수 있음: MySQL은 `skip_name_resolve`가 켜져 있지 않으면 역방향 DNS로 연결 IP를 해석하고, 일치한 호스트 이름을 보고함. 오류가 실제로 지정하는 호스트에 대해 권한이 만들어졌는지 확인. 그 호스트는 `DB_HOST`의 값이 아닐 수 있음. |
+| `create()`에 전달한 필드가 저장되지 않음 | 모델의 `$fillable` 배열에 나열되지 않음. `$fillable`이 비어 있지 않으면 Eloquent는 예외를 던지지 않고 필드를 조용히 버림. `$fillable`에 추가하거나, 의도적으로 보호를 우회하는 것이라면 `forceFill()`을 사용. |
+
+## 함께 보기 {#see-also}
+
+- [ORM과 함께 MySQL 사용하기: Django, Rails, Prisma](/ko/guides/mysql-with-orms) — ORM에 구애받지 않는 관점에서 본 같은 연결 수준 설정과 N+1 패턴
+- [MySQL의 스키마 마이그레이션](/ko/guides/schema-migrations) — Laravel의 마이그레이션 파일이 `ALTER TABLE` 이면에서 테이블에 하는 일
+- [MySQL 연결 풀링](/ko/guides/connection-pooling) — 실제 트래픽 아래의 Laravel 앱을 위한 영구 연결 구성

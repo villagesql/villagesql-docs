@@ -1,0 +1,190 @@
+---
+title: "MySQL의 교착 상태"
+sidebarTitle: "교착 상태 피하기"
+description: "MySQL 교착 상태가 발생하는 방식, InnoDB가 이를 감지하고 해결하는 방식, 교착 상태 로그를 읽는 방법, 애플리케이션에서 교착 상태를 예방하는 패턴입니다."
+keywords: "mysql deadlock, mysql innodb deadlock, mysql deadlock error 1213, mysql deadlock detection, mysql show engine innodb status, mysql deadlock prevention, mysql lock wait timeout"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+교착 상태는 두 트랜잭션이 서로 상대방에게 필요한 잠금을 보유하여 어느 쪽도 진행할 수 없을 때 발생합니다. InnoDB는 이를 자동으로 감지하고 트랜잭션 하나 — "희생자" — 를 `ERROR 1213: Deadlock found when trying to get lock; try restarting transaction`과 함께 종료합니다.
+
+## 교착 상태가 발생하는 방식 {#how-deadlocks-happen}
+
+전형적인 패턴: 두 트랜잭션이 행을 반대 순서로 잠급니다.
+
+```sql
+-- Transaction A: locks row 1, then tries to lock row 2
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- locks row 1
+-- (Transaction B runs here and locks row 2)
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- waits for B's lock on row 2
+
+-- Transaction B: locks row 2, then tries to lock row 1
+BEGIN;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- locks row 2
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- waits for A's lock on row 1
+-- Deadlock: A waits for B, B waits for A
+```
+
+InnoDB의 교착 상태 감지기가 순환을 찾아내고, 잠근 자원이 더 적은(또는 더 적은 작업을 수행한) 트랜잭션을 롤백합니다.
+
+## 교착 상태 로그 읽기 {#reading-the-deadlock-log}
+
+가장 최근의 교착 상태는 InnoDB 상태 출력에서 항상 볼 수 있습니다:
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+```
+
+`LATEST DETECTED DEADLOCK` 절을 찾으세요. 두 트랜잭션, 각각이 보유한 잠금, 기다리던 잠금, 어느 트랜잭션이 롤백되었는지를 보여 줍니다.
+
+```
+------------------------
+LATEST DETECTED DEADLOCK
+------------------------
+*** (1) TRANSACTION:
+TRANSACTION 12345, ACTIVE 0 sec starting index read
+MySQL thread id 10, query: UPDATE accounts SET balance = balance + 100 WHERE id = 2
+*** (1) HOLDS THE LOCK(S):
+RECORD LOCKS space id 87 page no 3 n bits 72 index PRIMARY of table accounts trx id 12345 lock_mode X locks rec but not gap
+Record lock, heap no 3 PHYSICAL RECORD: ...
+
+*** (2) TRANSACTION:
+TRANSACTION 12346, ACTIVE 0 sec starting index read
+MySQL thread id 11, query: UPDATE accounts SET balance = balance - 100 WHERE id = 1
+*** (2) HOLDS THE LOCK(S): ...
+*** (2) WAITING FOR THIS LOCK TO BE GRANTED: ...
+*** WE ROLL BACK TRANSACTION (1)
+```
+
+추출해야 할 핵심 사항:
+- 어떤 두 쿼리가 충돌하는지
+- 어떤 테이블과 인덱스가 관련되어 있는지
+- 어느 트랜잭션이 희생자(롤백됨)였는지
+
+## 교착 상태 예방 패턴 {#deadlock-prevention-patterns}
+
+### 일관된 순서로 행 잠그기 {#lock-rows-in-consistent-order}
+
+위의 교착 상태는 A가 행 1 다음 행 2를 잠그고, B가 행 2 다음 행 1을 잠그기 때문에 발생합니다. 두 트랜잭션이 항상 ID 오름차순으로 잠그면 순환이 형성될 수 없습니다:
+
+```sql
+-- Both transactions lock in order: lower ID first
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- lower ID first
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- then higher ID
+COMMIT;
+```
+
+애플리케이션 코드를 제어할 수 있다면, 여러 행을 건드리는 작업에 일관된 잠금 순서를 강제하세요.
+
+### 트랜잭션을 짧게 유지하기 {#keep-transactions-short}
+
+긴 트랜잭션은 잠금을 더 오래 보유하여 충돌이 생길 시간을 더 줍니다. 트랜잭션 안에서는 최소한의 작업만 하세요:
+
+```sql
+-- Fetch data outside the transaction, compute, then write in one short transaction
+BEGIN;
+UPDATE orders SET status = 'shipped', shipped_at = NOW() WHERE id = ?;
+COMMIT;
+-- Don't: read+compute+write all inside one long-running transaction
+```
+
+### SELECT ... FOR UPDATE로 미리 잠그기 {#use-select--for-update-to-pre-lock}
+
+트랜잭션이 행을 갱신할 예정이라면, UPDATE에서 잠금 충돌을 발견하기보다 SELECT에서 잠그세요:
+
+```sql
+BEGIN;
+SELECT * FROM orders WHERE id = 42 FOR UPDATE;  -- acquires write lock now
+-- ... application logic ...
+UPDATE orders SET status = 'processed' WHERE id = 42;
+COMMIT;
+```
+
+이것이 교착 상태를 없애지는 않지만, 잠금 순서를 명시적이고 예측 가능하게 만듭니다.
+
+### 교착 상태 시 재시도 {#retry-on-deadlock}
+
+교착 상태는 동시성 시스템에서 예상되는 일입니다. 올바른 애플리케이션 대응은 `ERROR 1213`을 잡아 트랜잭션 전체를 재시도하는 것입니다:
+
+```python
+MAX_RETRIES = 3
+for attempt in range(MAX_RETRIES):
+    try:
+        with connection.transaction():
+            do_work()
+        break
+    except DeadlockError:
+        if attempt == MAX_RETRIES - 1:
+            raise
+        time.sleep(0.1 * (attempt + 1))  # brief backoff
+```
+
+개별 문장을 재시도하지 마세요 — InnoDB가 이미 롤백했으므로 트랜잭션 전체를 처음부터 재시도하세요.
+
+## 갭 잠금과 넥스트 키 잠금 {#gap-locks-and-next-key-locks}
+
+InnoDB는 기본 `REPEATABLE READ` 격리 수준에서 팬텀 읽기를 막기 위해 갭 잠금과 넥스트 키 잠금을 사용합니다. 이 더 넓은 잠금은 교착 상태 가능성을 높입니다.
+
+```sql
+-- Locking a non-existent id doesn't just lock a gap -- it locks up to
+-- the next existing row too (a gap lock, not a plain row lock).
+-- Locking an id that DOES exist takes only a record lock, no gap.
+SELECT * FROM orders WHERE id = 6 FOR UPDATE;
+
+-- Switching to READ COMMITTED reduces gap locking
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+`READ COMMITTED`는 행 잠금만 사용하므로(갭 잠금 없음) 교착 상태 빈도가 줄어듭니다. 트레이드오프는 팬텀 읽기를 허용한다는 것입니다. 대부분의 OLTP 워크로드에서 교착 상태에 민감한 작업에는 `READ COMMITTED`가 합리적인 선택입니다.
+
+## 잠금 대기 타임아웃 {#lock-wait-timeout}
+
+모든 잠금 충돌이 교착 상태는 아닙니다. 트랜잭션 B가 단순히 A의 잠금을 기다리고 A가 느리다면, B는 `innodb_lock_wait_timeout`초(기본값: 50) 후에 타임아웃됩니다. 오류는 `ERROR 1205: Lock wait timeout exceeded`입니다.
+
+```sql
+SHOW VARIABLES LIKE 'innodb_lock_wait_timeout';
+-- 50 seconds by default
+
+SET SESSION innodb_lock_wait_timeout = 10;
+```
+
+타임아웃은 교착 상태가 아닙니다 — InnoDB는 차단하는 트랜잭션을 롤백하지 않았고, 기다리던 트랜잭션만 롤백했습니다.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 현재 모든 잠금과 누가 기다리는지 어떻게 보나요? {#how-do-i-see-all-current-locks-and-whos-waiting}
+
+```sql
+SELECT * FROM performance_schema.data_locks\G
+SELECT * FROM performance_schema.data_lock_waits\G
+```
+
+`data_locks`는 현재 보유되거나 요청된 모든 잠금을 보여 줍니다. `data_lock_waits`는 어떤 스레드가 어떤 스레드를 차단하는지 보여 줍니다.
+
+#### InnoDB는 항상 교착 상태를 즉시 감지하나요? {#does-innodb-always-detect-deadlocks-immediately}
+
+InnoDB의 교착 상태 감지기는 잠금 충돌이 발생할 때 동기적으로 실행됩니다. 감지는 거의 즉각적입니다. `innodb_deadlock_detect = OFF`로 비활성화하고 `innodb_lock_wait_timeout`에만 의존할 수 있으며, 일부 고동시성 워크로드가 성능을 위해 그렇게 하지만 드문 일입니다.
+
+#### 모든 교착 상태를 예방할 수 있나요? {#can-i-prevent-all-deadlocks}
+
+아니요. 교착 상태는 잠금을 사용하는 동시 트랜잭션의 근본적인 속성입니다. 일관된 잠금 순서와 짧은 트랜잭션으로 빈도를 줄일 수 있으며, 항상 교착 상태에 대한 재시도 로직을 작성해야 합니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `ERROR 1213: Deadlock found` | 트랜잭션을 재시도; `SHOW ENGINE INNODB STATUS`에서 잠금 충돌 패턴을 조사 |
+| `ERROR 1205: Lock wait timeout exceeded` | 어떤 트랜잭션이 잠금을 너무 오래 보유 중; `performance_schema.data_lock_waits`에서 차단하는 쿼리를 찾기 |
+| UPDATE가 아니라 INSERT에서 교착 상태 | 인덱스 범위에 대한 갭 잠금 충돌일 가능성이 높음; `READ COMMITTED` 격리를 시도하거나 일관된 순서로 행을 삽입 |
+| 같은 교착 상태 패턴이 반복됨 | 애플리케이션의 잠금 순서가 일관되지 않음 — 두 코드 경로를 찾아 정해진 순서를 강제 |
+| `SHOW ENGINE INNODB STATUS`에 교착 상태가 표시되지 않음 | 상태는 가장 최근의 교착 상태만 유지함; 오류 로그에 영구적인 교착 상태 로깅을 활성화: `SET GLOBAL innodb_print_all_deadlocks = ON` |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 트랜잭션](/ko/guides/transactions) — 교착 상태를 가능하게 하는 트랜잭션 모델
+- [InnoDB의 데이터 저장 방식](/ko/guides/innodb-storage) — InnoDB 행 수준 잠금이 내부에서 동작하는 방식

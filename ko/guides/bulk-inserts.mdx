@@ -1,0 +1,167 @@
+---
+title: "MySQL의 대량 삽입"
+sidebarTitle: "대량으로 삽입하기"
+description: "MySQL에 대량의 데이터를 효율적으로 삽입하는 방법: 다중 행 INSERT, LOAD DATA INFILE, INSERT...SELECT, 키 비활성화, 성능을 위한 트랜잭션 배치 처리."
+keywords: "mysql bulk insert, mysql load data infile, mysql batch insert, mysql fast insert, mysql import csv, mysql bulk load performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+행을 하나씩 삽입하는 것은 대량 가져오기를 느리게 만드는 가장 빠른 방법입니다. MySQL은 각 단일 행 `INSERT`를 완전한 트랜잭션 커밋으로 처리합니다 — 파싱, 계획, 실행, fsync. 규모가 커지면 행당 오버헤드가 지배적이 됩니다. 이를 피하는 방법은 다음과 같습니다.
+
+## 다중 행 INSERT {#multi-row-insert}
+
+가장 간단한 최적화: 여러 행을 하나의 문으로 묶습니다.
+
+```sql
+-- Slow: one round trip and one transaction per row
+INSERT INTO products (name, price) VALUES ('Widget A', 9.99);
+INSERT INTO products (name, price) VALUES ('Widget B', 14.99);
+INSERT INTO products (name, price) VALUES ('Widget C', 19.99);
+
+-- Fast: one round trip, one transaction for all three
+INSERT INTO products (name, price) VALUES
+    ('Widget A',  9.99),
+    ('Widget B', 14.99),
+    ('Widget C', 19.99);
+```
+
+배치 크기가 중요합니다. 문당 수백에서 수천 행이 보통 최적입니다 — 더 큰 배치는 메모리 압박을 높이고 트랜잭션 지속 시간을 늘립니다. 워크로드에 맞는 최적점을 찾으려면 벤치마크하세요. 배치당 500–2000행이 일반적인 시작점입니다.
+
+## 트랜잭션 배치 처리 {#transaction-batching}
+
+많은 INSERT를 하나의 트랜잭션으로 감싸면 문마다 발생하는 커밋 오버헤드를 피할 수 있습니다:
+
+```sql
+START TRANSACTION;
+INSERT INTO products (name, price) VALUES ('Widget A',  9.99);
+INSERT INTO products (name, price) VALUES ('Widget B', 14.99);
+-- ... hundreds more ...
+INSERT INTO products (name, price) VALUES ('Widget Z', 99.99);
+COMMIT;
+```
+
+명시적 트랜잭션이 없으면 각 INSERT는 자동 커밋됩니다. 자동 커밋은 각 행이 개별적으로 디스크에 플러시된다는 뜻입니다. 500개의 삽입을 하나의 트랜잭션으로 감싸면 플러시는 한 번만 일어납니다.
+
+이를 다중 행 INSERT와 결합하세요: 문당 500–1000행 단위로 행을 묶고, 각 배치를 트랜잭션으로 감쌉니다.
+
+## LOAD DATA INFILE {#load-data-infile}
+
+큰 CSV 가져오기에는 `LOAD DATA INFILE`이 가장 빠른 MySQL 네이티브 옵션입니다 — 행마다 SQL 파싱을 거치지 않으므로 배치 INSERT보다 훨씬 빠릅니다.
+
+```sql
+LOAD DATA INFILE '/var/lib/mysql-files/products.csv'
+INTO TABLE products
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES  -- skip header row
+(name, price, category);
+```
+
+파일은 MySQL 서버 프로세스가 읽을 수 있어야 합니다. 기본적으로 파일 경로는 `secure_file_priv`로 지정된 디렉토리로 제한됩니다:
+
+```sql
+SHOW VARIABLES LIKE 'secure_file_priv';
+```
+
+서버가 아닌 클라이언트 머신에서 파일을 로드하려면:
+
+```sql
+LOAD DATA LOCAL INFILE '/path/on/client/products.csv'
+INTO TABLE products
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n';
+```
+
+`LOCAL INFILE`은 서버에서 `local_infile = ON`이 설정되어 있어야 하고, 클라이언트에서 `--local-infile` 플래그가 활성화되어 있어야 합니다.
+
+## INSERT ... SELECT {#insert--select}
+
+테이블 간 데이터 복사(ETL 패턴, 스테이징 테이블)에는 `INSERT...SELECT`가 행을 애플리케이션으로 읽어 들여 다시 삽입하는 것보다 빠릅니다:
+
+```sql
+-- Load staging table, validate, then move to production
+INSERT INTO products (name, price, category)
+SELECT name, price, category
+FROM products_staging
+WHERE price > 0 AND name IS NOT NULL;
+```
+
+## 대량 로드 중 인덱스 비활성화 {#disabling-indexes-during-bulk-load}
+
+MyISAM 테이블에서는 대량 삽입 중 비고유 인덱스 업데이트를 비활성화하면 속도가 크게 빨라집니다:
+
+```sql
+ALTER TABLE products DISABLE KEYS;
+-- ... bulk INSERT ...
+ALTER TABLE products ENABLE KEYS;  -- rebuilds indexes in one pass
+```
+
+InnoDB에서는 같은 효과가 없습니다. 대신 InnoDB는 보조 인덱스 업데이트에 "체인지 버퍼"를 자동으로 사용합니다. InnoDB 대량 로드 성능을 최대화하려면:
+
+```sql
+-- Temporarily increase the buffer pool if possible
+SET GLOBAL innodb_buffer_pool_size = 4 * 1024 * 1024 * 1024;  -- 4GB example
+
+-- Disable foreign key checks
+SET foreign_key_checks = 0;
+-- ... bulk load ...
+SET foreign_key_checks = 1;
+
+-- Disable unique checks for known-clean data
+SET unique_checks = 0;
+-- ... bulk load ...
+SET unique_checks = 1;
+```
+
+로드가 끝나면 즉시 다시 활성화하세요. 실제로 중복이 있는 데이터에서 `unique_checks`를 비활성화하면 손상된 인덱스가 만들어집니다.
+
+## 성능 비교 {#performance-comparison}
+
+| 방법 | 상대 속도 | 적합한 용도 |
+|:-------|:--------------|:---------|
+| 단일 행 INSERT(자동 커밋) | 가장 느림 | 소량, 대화형 |
+| 단일 행 INSERT(트랜잭션으로 배치) | 2–5배 빠름 | 중간 규모 |
+| 다중 행 INSERT | 5–20배 빠름 | 대부분의 대량 로드 |
+| LOAD DATA INFILE | 가장 빠름(단일 행보다 10–100배 빠른 경우가 많음) | 큰 CSV 가져오기 |
+| INSERT...SELECT | 빠름(서버 측 복사) | 테이블 간 복사 |
+
+정확한 수치는 행 크기, 인덱스, 하드웨어, 구성에 따라 크게 달라집니다. 각자의 경우를 벤치마크하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 각 INSERT 배치는 얼마나 커야 하나요? {#how-large-should-each-insert-batch-be}
+
+500–1000행에서 시작하여 벤치마크하세요. 더 큰 배치는 커밋당 오버헤드를 줄이지만 메모리 사용량과 트랜잭션 지속 시간(잠금을 더 오래 유지)을 늘립니다. 배치가 실패하면 배치 전체가 롤백됩니다 — 더 작은 배치는 롤백 작업이 적다는 뜻입니다. 대부분의 애플리케이션에서 최적 배치 크기는 500에서 5000행 사이입니다.
+
+#### LOAD DATA INFILE을 ON DUPLICATE KEY UPDATE와 함께 사용할 수 있나요? {#can-i-use-load-data-infile-with-on-duplicate-key-update}
+
+`LOAD DATA`는 중복 처리를 위해 `REPLACE` 또는 `IGNORE`를 지원하지만 `ON DUPLICATE KEY UPDATE`는 지원하지 않습니다. 대량 로드 중 업서트 동작이 필요하다면 스테이징 테이블에 로드한 다음, 스테이징 테이블에서 대상 테이블로 `INSERT...SELECT...ON DUPLICATE KEY UPDATE`를 사용하세요.
+
+#### 대량 삽입은 트리거를 우회하나요? {#does-bulk-inserting-bypass-triggers}
+
+아니요. 트리거는 `LOAD DATA INFILE`과 `INSERT...SELECT`로 로드된 행을 포함하여 영향을 받는 모든 행에 대해 실행됩니다. 트리거가 많은 작업을 수행한다면 대량 로드가 그에 비례하여 느려집니다. 순수한 데이터 마이그레이션에서는 트리거를 일시적으로 비활성화하는 것이 좋을 수 있습니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `ERROR 1290: The MySQL server is running with the --secure-file-priv option` | `SHOW VARIABLES LIKE 'secure_file_priv'`에 표시된 디렉토리로 파일을 옮기거나 `LOAD DATA LOCAL INFILE` 사용 |
+| `ERROR 3948: Loading local data is disabled` | 서버에서 `SET GLOBAL local_infile = 1`, 클라이언트에서 `--local-infile=1`로 활성화 |
+| 배치 처리 후에도 대량 삽입이 여전히 느림 | `autocommit`이 ON인지 확인 — 각 문이 개별적으로 커밋됨; 명시적인 `BEGIN...COMMIT` 블록으로 감싸기 |
+| `unique_checks` 비활성화 후 깨끗한 것으로 알려진 데이터에서 중복 키 오류 | `unique_checks = 0`은 로드 중 고유성을 검증하지 않으며 중복이 있으면 인덱스를 손상시킴 — 항상 먼저 검증하세요 |
+| `LOAD DATA`가 행을 잘못 파싱함 | `FIELDS TERMINATED BY`, `ENCLOSED BY`, `LINES TERMINATED BY`가 실제 파일 형식과 일치하는지 확인; 로드 후 `SHOW WARNINGS` 사용 |
+
+이 로딩 기법들은 MySQL의 드롭인 대체품이자 확장 기능을 갖춘 [VillageSQL](https://villagesql.com/install)에서도 변경 없이 동작합니다.
+
+## 참고 {#see-also}
+
+- [MySQL의 트랜잭션](/ko/guides/transactions) — 안전과 속도를 위해 대량 삽입을 트랜잭션으로 배치 처리하기
+- [MySQL의 스키마 마이그레이션](/ko/guides/schema-migrations) — 대량 삽입은 데이터 마이그레이션 작업의 일부인 경우가 많습니다
+- [MySQL의 UPSERT](/ko/guides/upsert) — 로드 중 중복 키 처리하기
+- [MySQL 여러 행 삽입](/ko/tutorial/insert-multiple-rows) — 다중 행 문 자체
+- [MySQL INSERT SELECT](/ko/tutorial/insert-select) — 쿼리가 반환하는 행 복사하기

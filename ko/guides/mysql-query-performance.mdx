@@ -1,0 +1,187 @@
+---
+title: "내 MySQL 쿼리는 왜 느릴까?"
+sidebarTitle: "쿼리 성능"
+description: "EXPLAIN, 슬로 쿼리 로그, 그리고 가장 흔한 원인(누락된 인덱스, 잘못된 인덱스 선택, N+1 패턴)을 이용해 느린 MySQL 쿼리를 진단하고 고치는 방법입니다."
+keywords: "mysql slow query, mysql query optimization, mysql explain, mysql missing index, mysql performance tuning, mysql query slow"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+느린 쿼리는 거의 항상 몇 가지 흔한 원인으로 귀결됩니다: 누락된 인덱스, 잘못된 인덱스, 인덱스 사용을 막는 방식으로 작성된 쿼리, 인덱스된 열에 적용된 함수, N+1 패턴, 또는 동시에 실행되는 다른 쿼리와의 경합입니다. 대부분은 두 가지 명령으로 진단할 수 있습니다: `EXPLAIN`과 슬로 쿼리 로그입니다. 거기서 시작하세요.
+
+## 1단계: EXPLAIN 읽기 {#step-1-read-explain}
+
+조사하려는 쿼리 앞에 `EXPLAIN`을 붙여 실행하세요:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE customer_id = 42;
+```
+
+다음과 같은 출력을 얻습니다:
+
+```
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 843201 |    10.00 | Using where |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+```
+
+다섯 개의 열이 진단 작업의 대부분을 합니다:
+
+**`possible_keys`** — MySQL이 이 쿼리에 대해 고려한 인덱스입니다. `NULL`은 `WHERE` 절의 열에 관련 인덱스가 없다는 뜻입니다.
+
+**`key`** — MySQL이 실제로 선택한 인덱스입니다. `possible_keys`에 후보가 나열되었는데 `key`가 `NULL`이면, MySQL은 전체 테이블 스캔이 더 저렴하다고 판단한 것입니다. 보통 통계가 오래되었거나, 테이블이 충분히 작아서 옵티마이저가 인덱스를 건너뛰었다는 신호입니다.
+
+**`type`** — MySQL이 사용한 접근 방식입니다. 가장 중요한 열입니다. `ALL`은 전체 테이블 스캔을 뜻합니다: MySQL이 일치하는 행을 찾기 위해 모든 행을 읽었습니다. 800,000행짜리 테이블이라면, 1행을 반환할지도 모르는 쿼리를 위해 800,000번의 행 읽기가 일어난 것입니다. `ref`나 `eq_ref`는 MySQL이 인덱스 조회를 사용했다는 뜻이며, 이것이 여러분이 원하는 것입니다.
+
+**`key`** — MySQL이 어떤 인덱스를 선택했는지입니다. `NULL`은 인덱스가 사용되지 않았다는 뜻입니다(위의 `possible_keys` 참고).
+
+**`rows`** — MySQL이 검사할 행 수에 대한 추정치입니다. 반환될 것으로 기대하는 행 수에 비해 높은 숫자는 무언가 잘못되었다는 신호입니다.
+
+**`Extra`** — 보충 정보입니다. `Using filesort`는 어떤 인덱스도 `ORDER BY`를 커버하지 않아서 MySQL이 결과 집합을 메모리나 디스크에서 정렬해야 했다는 뜻입니다. `Using temporary`는 MySQL이 임시 테이블을 만들었다는 뜻이며, 특정 `GROUP BY`와 `DISTINCT` 쿼리에서 발생합니다. 둘 다 큰 테이블에서는 경고 신호입니다.
+
+추정치를 읽었다면, `EXPLAIN ANALYZE`를 사용해 실행 시점에 실제로 무슨 일이 일어났는지 확인하세요:
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 42;
+```
+
+`EXPLAIN ANALYZE`는 쿼리를 실행하고 추정치와 나란히 실제 행 수와 소요 시간을 보고합니다. 추정치가 800,000행이고 실제도 800,000행이면, 추정이 맞았고 스캔은 실재합니다. 실제가 훨씬 낮다면, 옵티마이저가 오래된 통계를 근거로 잘못된 선택을 했을 수 있습니다.
+
+## 2단계: 가장 흔한 원인 {#step-2-the-most-common-causes}
+
+### 누락된 인덱스 {#missing-index}
+
+위 예시의 쿼리는 `customer_id`에 인덱스가 없기 때문에 `orders` 테이블 전체를 스캔합니다. 해결책은 간단합니다:
+
+```sql
+ALTER TABLE orders ADD INDEX idx_customer_id (customer_id);
+```
+
+인덱스를 추가한 뒤 `EXPLAIN`을 다시 실행하세요. `type` 열이 `ALL`에서 `ref`로 바뀌고, `key`에 새 인덱스 이름이 표시되어야 합니다.
+
+### 잘못된 인덱스 {#wrong-index}
+
+MySQL은 때때로 최선이 아닌 인덱스를 선택합니다. `EXPLAIN`은 어느 것을 선택했는지 알려줍니다. 다른 인덱스가 더 나은지 시험하려면 `FORCE INDEX`를 사용하세요:
+
+```sql
+EXPLAIN SELECT * FROM orders FORCE INDEX (idx_created_at) WHERE customer_id = 42;
+```
+
+강제한 인덱스가 더 낮은 `rows` 추정치를 내면, 원래 인덱스의 통계가 오래된 것은 아닌지 검토하세요. `ANALYZE TABLE orders`가 통계를 다시 계산합니다. MySQL이 계속 잘못된 인덱스를 선택한다면, 더 이상 유용하지 않은 인덱스가 있을 수도 있습니다. 그 인덱스를 삭제하면 고려 대상에서 제외됩니다.
+
+### 선행 열 문제 {#leading-column-problem}
+
+`(customer_id, status, created_at)`에 대한 복합 인덱스는 쿼리가 `customer_id`로 필터링하거나 `customer_id`와 `status`를 함께 필터링할 때 효율적입니다. 쿼리가 `status`만으로 또는 `created_at`만으로 필터링하면 효율적으로 사용할 수 없습니다. 인덱스가 `customer_id`를 기준으로 먼저 정렬되어 있기 때문입니다.
+
+```sql
+-- Uses the composite index efficiently
+SELECT * FROM orders WHERE customer_id = 42 AND status = 'pending';
+
+-- Can't use the composite index — status isn't the leading column
+SELECT * FROM orders WHERE status = 'pending';
+```
+
+`status`만으로 필터링해야 한다면 `status`에 별도의 인덱스를 추가하세요.
+
+### SELECT * {#select-}
+
+필요한 열만 지정하는 것은 좋은 스타일에 그치지 않습니다. 성능에 영향을 줍니다. MySQL이 쿼리를 인덱스만으로 완전히 처리할 수 있을 때(커버링 인덱스), 실제 테이블 행은 전혀 건드리지 않습니다. `SELECT *`는 그것을 깨뜨립니다: 인덱스에 없는 열을 가져오기 위해 일치하는 각 행을 테이블에서 조회하도록 MySQL을 강제합니다.
+
+```sql
+-- May require a table row lookup for each match
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Can use a covering index on (customer_id, status, total)
+SELECT status, total FROM orders WHERE customer_id = 42;
+```
+
+### 인덱스된 열에 함수 적용 {#functions-on-indexed-columns}
+
+인덱스된 열을 함수로 감싸면 보통 인덱스 사용이 막힙니다. MySQL은 "`YEAR()`가 2024를 반환하는 `created_at`을 가진 행은 어느 것인가"라는 질문에 B-tree 인덱스로 답할 수 없습니다. 인덱스는 계산된 연도가 아니라 원시 타임스탬프를 저장하기 때문입니다.
+
+```sql
+-- Can't use an index on created_at
+WHERE YEAR(created_at) = 2024
+
+-- Can use an index on created_at
+WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31 23:59:59'
+```
+
+같은 문제가 `LOWER()`, `DATE()`, 열에 대한 산술 연산, 그리고 비교 전에 값을 변환하는 모든 것에 적용됩니다.
+
+### N+1 쿼리 {#n1-queries}
+
+때로는 문제가 느린 쿼리 하나가 아니라 빠른 쿼리 수백 개입니다. 흔한 패턴: 주문 목록을 가져온 뒤, 각 주문마다 고객 이름을 얻기 위해 별도의 쿼리를 실행합니다. 주문이 200개면 쿼리는 201개입니다. 각각은 빠르지만, 합치면 몇 초가 더해집니다.
+
+해결책은 `JOIN`으로 한 쿼리에서 데이터를 가져오는 것입니다:
+
+```sql
+SELECT o.id, o.total, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE o.created_at > '2024-01-01';
+```
+
+## 3단계: 슬로 쿼리 로그 활성화 {#step-3-enable-the-slow-query-log}
+
+한 번 설정하고 계속 실행되게 두세요. 시간 임계값을 넘는 쿼리를 백그라운드에서 포착해, 존재하는지도 몰랐던 문제를 드러냅니다. 런타임에 활성화하세요:
+
+```sql
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 1;  -- log queries taking more than 1 second
+```
+
+로그 파일이 어디에 기록되는지 확인하세요:
+
+```sql
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+로그를 요약하고 어떤 쿼리가 가장 자주 나타나거나 총 시간을 가장 많이 차지하는지 보려면 `mysqldumpslow`를 사용하세요:
+
+```bash
+mysqldumpslow -s t /path/to/slow-query.log
+```
+
+`long_query_time`을 0.1이나 0.5로 낮추면 개별적으로는 빠르지만 많은 호출에 걸쳐 누적되는 쿼리를 잡을 수 있습니다.
+
+## 4단계: SHOW PROCESSLIST 확인 {#step-4-check-show-processlist}
+
+무언가가 지금 느릴 때 사용하세요. 너무 오래 실행 중인 쿼리나, 바로 지금 멈춰 있는 애플리케이션이 그런 경우입니다. `SHOW PROCESSLIST`는 모든 활성 연결과 각 쿼리가 얼마나 오래 실행되고 있는지 보여줍니다:
+
+```sql
+SHOW PROCESSLIST;
+```
+
+`Waiting for table metadata lock`이나 `Waiting for lock` 상태에 멈춘 쿼리는 잘못된 계획 때문에 느린 것이 아닙니다. 잠금을 쥐고 있는 다른 쿼리에 막힌 것입니다. 잠금 경합에 대한 자세한 내용은 다음을 확인하세요:
+
+```sql
+SHOW ENGINE INNODB STATUS;
+```
+
+`TRANSACTIONS` 섹션은 어떤 트랜잭션이 대기 중이고 어떤 트랜잭션이 잠금을 쥐고 있는지 보여줍니다.
+
+## 빠른 참조 {#quick-reference}
+
+| 증상 | 가능성 높은 원인 | 해결 방법 |
+|:--------|:------------|:----|
+| `EXPLAIN`에 `type: ALL`이 표시됨 | 누락된 인덱스 | `WHERE` 열에 인덱스 추가 |
+| `Extra: Using filesort` | `ORDER BY`를 위한 인덱스 없음 | 정렬 열을 커버하는 인덱스 추가 |
+| `Extra: Using temporary` | 복잡한 `GROUP BY` 또는 `DISTINCT` | 쿼리 검토 또는 인덱스 추가 |
+| 작은 테이블에서는 빠르고 큰 테이블에서는 느린 쿼리 | 전체 테이블 스캔 | 인덱스 추가 |
+| 빠른 쿼리가 많이 누적됨 | N+1 패턴 | `JOIN`으로 다시 작성 |
+| 쿼리가 가끔만 느림 | 잠금 경합 | `SHOW PROCESSLIST`와 `INNODB STATUS` 확인 |
+
+이 페이지의 모든 진단은 MySQL의 드롭인 대체품이자 확장 기능을 갖춘 [VillageSQL](https://villagesql.com/install)에서 동작하므로, 튜닝 워크플로를 다시 배우지 않고 도입할 수 있습니다.
+
+## 함께 보기 {#see-also}
+
+- [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes) — 인덱스 선택과 B-tree 구조 뒤의 사고 모델
+- [커버링 인덱스](/ko/guides/covering-indexes) — 인덱스를 벗어나지 않는 쿼리를 작성하는 방법
+- [EXPLAIN 출력 읽기](/ko/guides/reading-explain) — EXPLAIN 계획의 모든 열을 더 깊이 살펴보기
+- [슬로 쿼리 로그 사용하기](/ko/guides/slow-query-log) — 설정, 로테이션, `mysqldumpslow`를 이용한 분석
+- [MySQL CROSS JOIN](/ko/tutorial/cross-join) — 의도치 않은 크로스 조인과 그것이 얼마나 커지는지

@@ -1,0 +1,189 @@
+---
+title: "MySQL 인덱스의 동작 방식"
+sidebarTitle: "인덱스 사용하기"
+description: "MySQL 인덱스 실용 가이드: B-tree 인덱스의 동작 방식, MySQL이 인덱스를 사용하는 시점, 복합 인덱스 열 순서, 커버링 인덱스, 그리고 흔한 실수입니다."
+keywords: "mysql index explained, mysql how indexes work, mysql b-tree index, mysql composite index, mysql covering index, mysql explain index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+인덱스는 MySQL에서 가장 영향력 있는 성능 도구이며 — 가장 흔히 오해받는 도구이기도 합니다. 개발자들은 쿼리가 느릴 때 인덱스를 추가하고, 디스크 공간이 부족할 때 제거하며, 인덱스가 왜 도움이 되거나 해가 되는지 모르는 경우가 많습니다. 이 가이드는 추측 대신 좋은 결정을 내릴 수 있도록 그 메커니즘을 설명합니다.
+
+## 멘탈 모델 {#the-mental-model}
+
+800페이지짜리 책을 생각해 보세요. "TCP/IP"가 언급된 모든 곳을 찾으려면 모든 페이지를 읽을 수 있습니다 — 그것이 전체 테이블 스캔입니다. 아니면 책 뒤의 색인을 확인해서 "TCP/IP — 42, 107, 391페이지"를 찾아 그 페이지로 바로 갈 수 있습니다. 데이터베이스 인덱스가 하는 일이 그것입니다.
+
+MySQL의 기본 인덱스 구조는 **B-tree**(균형 트리)입니다. 값을 정렬된 상태로 유지하여 빠른 조회(이진 탐색), 범위 스캔(`BETWEEN`, `>`, `<`), 정렬된 출력(`ORDER BY`)을 가능하게 합니다 — 모두 전체 테이블을 읽지 않고 말입니다.
+
+## MySQL이 인덱스를 사용하는 방식 {#how-mysql-uses-an-index}
+
+쿼리를 실행하면 MySQL의 옵티마이저는 인덱스가 읽어야 할 행을 좁힐 수 있는지 확인합니다. 쿼리가 인덱스된 열로 필터링하거나 정렬할 때 인덱스를 사용합니다.
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- Without an index, this scans every row
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Add an index on user_id
+CREATE INDEX idx_user_id ON orders (user_id);
+
+-- Now MySQL jumps directly to user_id = 42 rows
+SELECT * FROM orders WHERE user_id = 42;
+```
+
+### EXPLAIN: MySQL이 실제로 하는 일 보기 {#explain-see-what-mysql-is-actually-doing}
+
+`EXPLAIN`은 MySQL이 쿼리를 어떻게 실행할 계획인지 보여줍니다. `key` 열은 어떤 인덱스를 사용했는지(없으면 NULL) 알려주고, `rows`는 검사해야 했던 행 수를 추정합니다.
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+| id | select_type | table  | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra          |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+|  1 | SIMPLE      | orders | NULL       | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |   100.00 | NULL           |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+```
+
+`type: ref`는 MySQL이 인덱스 조회를 사용했다는 뜻입니다. `type: ALL`은 전체 테이블 스캔을 뜻합니다 — 보통 피하려고 하는 것입니다.
+
+## 복합 인덱스: 열 순서가 중요합니다 {#composite-indexes-column-order-matters}
+
+복합 인덱스는 여러 열을 포함합니다. 열 순서가 인덱스를 언제 사용할 수 있는지 결정합니다.
+
+```sql
+-- Index on (user_id, status)
+CREATE INDEX idx_user_status ON orders (user_id, status);
+```
+
+MySQL은 이 인덱스를 다음에 사용할 수 있습니다:
+- `WHERE user_id = 42` — 예, 가장 왼쪽 열
+- `WHERE user_id = 42 AND status = 'shipped'` — 예, 두 열 모두
+- `WHERE status = 'shipped'` — **아니요**, 가장 왼쪽 열을 건너뜀
+
+규칙: MySQL은 복합 인덱스를 왼쪽부터 사용합니다. 쿼리가 이득을 보려면 선행 열을 포함해야 합니다.
+
+이것은 `(user_id, status)`와 `(status, user_id)`가 서로 다른 용도를 가진 서로 다른 인덱스라는 뜻입니다. 가장 흔한 쿼리 패턴을 중심으로 복합 인덱스를 설계하세요.
+
+## 커버링 인덱스: 인덱스만으로 쿼리 처리하기 {#covering-indexes-serving-queries-from-the-index-alone}
+
+커버링 인덱스는 쿼리에 필요한 모든 열을 포함합니다. MySQL은 실제 행 데이터를 읽지 않고 인덱스만으로 쿼리에 완전히 답할 수 있습니다 — 큰 테이블에서 상당한 속도 향상입니다.
+
+```sql
+-- Query only needs user_id, status, created_at
+SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+
+-- A covering index for this query
+CREATE INDEX idx_covering ON orders (user_id, status, created_at);
+```
+
+MySQL이 커버링 인덱스를 사용하면 `EXPLAIN`은 `Extra: Using index`를 보여줍니다. 행 조회가 필요하지 않습니다.
+
+## 인덱스를 추가하지 말아야 할 때 {#when-not-to-add-an-index}
+
+인덱스가 많다고 항상 좋은 것은 아닙니다. 모든 인덱스에는 비용이 듭니다:
+
+- **쓰기 오버헤드** — 모든 INSERT, UPDATE, DELETE가 테이블의 모든 인덱스를 갱신해야 함
+- **저장 공간** — 쓰기가 많은 데이터에서는 인덱스가 테이블 자체만큼 커질 수 있음
+- **옵티마이저 복잡성** — 인덱스가 너무 많으면 옵티마이저가 가끔 잘못된 것을 고름
+
+인덱스가 가장 도움이 되는 때:
+- 열의 카디널리티가 높을 때(서로 다른 값이 많을 때) — `user_id`, `email`, `order_id`
+- 쿼리가 테이블의 작은 부분만 필터링할 때
+
+인덱스가 가장 도움이 되지 않는 때:
+- 낮은 카디널리티 — 가능한 값이 3개인 `status`, 불리언 `is_active`
+- 전체 스캔이 어차피 빠를 만큼 테이블이 작을 때
+- 열에 쓰기가 많고 거의 쿼리되지 않을 때
+
+```sql
+-- Probably not worth indexing: 'active' and 'inactive' split the table ~50/50
+CREATE INDEX idx_active ON users (is_active);  -- likely unused by optimizer
+
+-- Worth indexing: email is unique, commonly queried
+CREATE INDEX idx_email ON users (email);
+```
+
+## 기본 키는 항상 인덱스입니다 {#primary-key-is-always-an-index}
+
+InnoDB 테이블은 기본 키를 중심으로 구성됩니다 — 기본 키는 별도의 인덱스가 아니라 행의 물리적 저장 순서입니다. 이것은 다음을 뜻합니다:
+
+- 기본 키 조회는 가능한 가장 빠른 쿼리입니다
+- 기본 키 값이 순차적이면 행이 물리적으로 인접합니다
+- 무작위 기본 키(UUID v4 같은)는 삽입 시 단편화를 일으킵니다 — [MySQL의 UUID](/ko/guides/uuids)를 보세요
+
+## 흔한 인덱스 실수 {#common-index-mistakes}
+
+**인덱스된 열에 함수 사용하기** — 열을 함수로 감싸면 MySQL은 인덱스를 사용할 수 없습니다:
+
+```sql
+-- Index on created_at exists, but this skips it
+SELECT * FROM orders WHERE YEAR(created_at) = 2024;
+
+-- Use a range instead — index is used
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31';
+```
+
+**LIKE의 선행 와일드카드** — 패턴이 `%`로 시작하면 인덱스가 도움이 되지 않습니다:
+
+```sql
+-- Can't use index
+SELECT * FROM users WHERE email LIKE '%@example.com';
+
+-- Can use index (no leading wildcard)
+SELECT * FROM users WHERE email LIKE 'alice%';
+```
+
+**서로 다른 열에 걸친 OR** — MySQL의 옵티마이저는 `OR` 조건을 처리하기 위해 여러 단일 열 인덱스를 병합할 수 있을 때도 있지만, 신뢰할 수 없습니다. 큰 테이블에서는 `UNION`이 더 예측 가능합니다:
+
+```sql
+-- Index merge may or may not kick in depending on table size and selectivity
+SELECT * FROM orders WHERE user_id = 42 OR status = 'urgent';
+
+-- UNION gives the optimizer a cleaner path
+SELECT * FROM orders WHERE user_id = 42
+UNION
+SELECT * FROM orders WHERE status = 'urgent';
+```
+
+## 누락된 인덱스 찾기 {#finding-missing-indexes}
+
+슬로우 쿼리 로그는 시간 임계값을 넘는 쿼리를 기록합니다 — 무엇에 인덱스를 만들지 찾는 좋은 출발점입니다:
+
+```sql
+-- Enable slow query log (in MySQL config or at runtime)
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 1;  -- log queries over 1 second
+```
+
+그다음 느린 쿼리에 `EXPLAIN`을 실행하세요. `type: ALL`과 수백만 단위의 `rows`를 찾으세요.
+
+## 요약 {#summary}
+
+- B-tree 인덱스는 빠른 조회와 범위 스캔을 위해 값을 정렬된 상태로 유지합니다
+- MySQL은 쿼리가 선행 인덱스 열로 필터링하거나 정렬할 때 인덱스를 사용합니다
+- 복합 인덱스의 열 순서가 중요합니다 — 가장 흔한 쿼리를 중심으로 설계하세요
+- 커버링 인덱스가 가장 빠릅니다 — 쿼리가 인덱스만으로 완전히 답해집니다
+- 인덱스는 쓰기에 비용이 듭니다. 읽기 이득이 정당화하는 곳에만 추가하세요
+- 열을 함수로 감싸면 그 인덱스를 비활성화한 것입니다 — 대신 범위 조건을 사용하세요
+
+인덱스는 MySQL의 드롭인 대체품이자 확장 기능을 갖춘 [VillageSQL](https://villagesql.com/install)에서 동일하게 동작하므로, 이 전략 가이드는 변경 없이 적용됩니다.
+
+## 함께 보기 {#see-also}
+
+- [MySQL에서 EXPLAIN 읽기](/ko/guides/reading-explain) — 인덱스가 사용되고 있는지 확인하고 MySQL이 왜 그것을 고르는지 이해하기
+- [MySQL의 커버링 인덱스](/ko/guides/covering-indexes) — 행 조회 없이 쿼리에 답하는 인덱스
+- [MySQL 슬로우 쿼리 로그](/ko/guides/slow-query-log) — 어떤 쿼리에 먼저 인덱스가 필요한지 찾기
+- [MySQL INFORMATION_SCHEMA](/ko/guides/information-schema) — 쿼리로 인덱스 메타데이터와 사용되지 않는 인덱스 찾기
+- [내 MySQL 쿼리는 왜 느릴까?](/ko/guides/mysql-query-performance) — 인덱스가 속한 더 넓은 튜닝 워크플로
+- [MySQL의 페이지네이션: 키셋 대 OFFSET](/ko/guides/pagination) — 큰 테이블을 인덱스 기반으로 페이지네이션하는 방법

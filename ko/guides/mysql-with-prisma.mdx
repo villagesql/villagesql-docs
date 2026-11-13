@@ -1,0 +1,229 @@
+---
+title: "Next.js와 Prisma로 MySQL 사용하기"
+sidebarTitle: "Next.js와 Prisma"
+description: "Prisma 7과 MySQL 위에 Next.js App Router 애플리케이션을 처음부터 끝까지 만들기: 스키마, 마이그레이션, Prisma 7이 이제 요구하는 드라이버 어댑터, 그리고 동작하는 읽기/쓰기 페이지입니다. 이 가이드의 모든 명령은 VillageSQL에서 수정 없이 실행됩니다."
+keywords: "nextjs prisma mysql, prisma driver adapter mysql, prisma 7 mysql, prisma migrate mysql, prisma server action, villagesql prisma"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Prisma는 가장 널리 쓰이는 TypeScript ORM 중 하나이고, Next.js의 App Router는 새 프로젝트가 데이터베이스에 도달하는 흔한 방식입니다. 이 가이드는 Prisma 7을 통해 MySQL의 행을 나열하고 생성하는 작은 Next.js 앱을 만들며, 예전 Prisma 튜토리얼 이후 바뀐 부분을 다룹니다: 연결 URL이 스키마 파일 밖으로 옮겨졌고, 드라이버 어댑터는 더 이상 선택 사항이 아닙니다. VillageSQL은 MySQL의 드롭인 대체품이므로, 여기의 모든 명령은 수정 없이 그대로 동작합니다.
+
+## 데이터베이스 만들기 {#create-the-database}
+
+Prisma에는 두 개의 데이터베이스가 필요합니다: 앱이 사용하는 데이터베이스와, 마이그레이션을 계산하기 위해 내부적으로 사용하는 두 번째 "섀도" 데이터베이스입니다. 둘 다 만들고, 각각에 권한을 가진 전용 사용자를 만드세요:
+
+```sql
+CREATE DATABASE prisma_guide CHARACTER SET utf8mb4;
+CREATE DATABASE prisma_guide_shadow CHARACTER SET utf8mb4;
+CREATE USER 'prisma_app'@'127.0.0.1' IDENTIFIED BY 'change-me';
+GRANT ALL PRIVILEGES ON prisma_guide.* TO 'prisma_app'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON prisma_guide_shadow.* TO 'prisma_app'@'127.0.0.1';
+```
+
+섀도 데이터베이스는 존재하기만 하면 됩니다. Prisma가 그 안에 테이블을 자동으로 만들고 삭제합니다. Prisma가 스스로 섀도 데이터베이스를 만들 수 있도록 `*.*`에 더 넓은 `CREATE`/`DROP` 권한을 부여하는 대신, 미리 만들어 두고 앱 사용자에게 그 데이터베이스 하나에 대한 권한만 부여하면, 비밀번호가 유출되었을 때의 피해 범위가 서버 전체가 아니라 데이터베이스 두 개로 유지됩니다.
+
+## 앱 스캐폴딩 {#scaffold-the-app}
+
+```bash
+npx create-next-app@latest my-app --typescript --app --src-dir
+cd my-app
+npm install prisma@7 @prisma/client@7
+```
+
+메이저 버전을 고정하세요. 이 글을 쓰는 시점에 npm의 `prisma` `latest` 태그는 8.0 릴리스 후보를 가리킵니다: 시험해 보기에는 괜찮지만, 계속 동작해야 하는 가이드에는 잘못된 기본값입니다.
+
+## Prisma 초기화 {#initialize-prisma}
+
+```bash
+npx prisma init --datasource-provider mysql --no-skills
+```
+
+`prisma init`은 기본적으로 Claude Code, Cursor, Windsurf 에이전트 스킬을 저장소에 스캐폴딩하는 설치 후 단계를 실행합니다(`.claude/`, `.windsurf/`, `.agents/`와 `skills-lock.json`). `--no-skills`는 이를 건너뜁니다. Prisma와 함께 AI 코딩 에이전트를 사용한다면 정말 유용한 기능이지만, 이 가이드의 범위에는 들어가지 않습니다.
+
+이 명령은 `prisma/schema.prisma`, `.env` 파일, 그리고 `prisma7.config.ts`(Prisma 7에서는 설정 파일 이름에 버전 접미사가 붙습니다)를 만듭니다. 연결 문자열을 설정하세요:
+
+```bash .env
+DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide"
+SHADOW_DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide_shadow"
+```
+
+예전 Prisma 튜토리얼은 데이터 소스 URL을 `schema.prisma`에 직접 넣었습니다. Prisma 7부터 섀도 데이터베이스 URL을 포함한 연결 URL은 스키마 파일이 아니라 `prisma7.config.ts`에 있습니다:
+
+```ts prisma7.config.ts
+import "dotenv/config";
+import { defineConfig } from "prisma/config";
+
+export default defineConfig({
+  schema: "prisma/schema.prisma",
+  migrations: { path: "prisma/migrations" },
+  datasource: {
+    url: process.env["DATABASE_URL"],
+    shadowDatabaseUrl: process.env["SHADOW_DATABASE_URL"],
+  },
+});
+```
+
+`schema.prisma`는 `prisma init`이 만든 `generator` 블록을 유지하고, 이제 데이터 소스에는 연결 URL 없이 provider만 선언합니다:
+
+```prisma prisma/schema.prisma
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String   @db.VarChar(255)
+  body      String   @db.Text
+  createdAt DateTime @default(now())
+}
+```
+
+## 마이그레이션 실행 {#run-the-migration}
+
+```bash
+npx prisma migrate dev --name init
+```
+
+이 명령은 스키마를 적용하고, `prisma/migrations/<timestamp>_init/migration.sql`을 생성하고, `prisma generate`를 대신 호출합니다. 테이블이 존재하는지 확인하세요:
+
+```sql
+SHOW TABLES FROM prisma_guide;
+-- _prisma_migrations, Post
+```
+
+## 드라이버 어댑터로 연결 {#connect-with-a-driver-adapter}
+
+Prisma 7의 생성된 클라이언트는 더 이상 스스로 연결하지 않습니다: 인수 없는 `new PrismaClient()`는 이제 타입 검사에 실패합니다. 데이터베이스마다 하나씩 있는 드라이버 어댑터 패키지를 전달합니다:
+
+```bash
+npm install @prisma/adapter-mariadb mariadb
+```
+
+`@prisma/adapter-mariadb`는 MariaDB와 MySQL 모두를 위한 어댑터입니다: 와이어 프로토콜이 공유되므로, 일반 MySQL에서 동작하는 것과 같은 방식으로 VillageSQL에서도 동작합니다. Next.js의 개발 모드 핫 리로드가 파일을 저장할 때마다 새 연결 풀을 열지 않도록 싱글턴을 설정하세요:
+
+```ts src/lib/prisma.ts
+import { PrismaClient } from "@/generated/prisma/client";
+import { PrismaMariaDb } from "@prisma/adapter-mariadb";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+const adapter = new PrismaMariaDb(process.env.DATABASE_URL!);
+
+export const prisma = globalForPrisma.prisma ?? new PrismaClient({ adapter });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+### 새 계정의 첫 연결 {#the-first-connection-to-a-new-account}
+
+MySQL 8과 VillageSQL은 `caching_sha2_password` 플러그인으로 계정을 만듭니다. 특정 계정이 처음 인증할 때 클라이언트는 RSA 키 교환을 완료해야 합니다. 그 뒤로는 서버가 결과를 캐시하고, 이후 연결은 그 단계를 건너뛰는 더 빠른 경로를 탑니다. `@prisma/adapter-mariadb`는 암호화되지 않은 연결에서 그 교환을 거부하므로, 이 계정을 한 번도 인증한 적이 없는 서버에서는 빌드가 실패합니다:
+
+```
+Database error. Code: `45028`. Message: `pool timeout: failed to retrieve a connection
+from pool after 10000ms (pool connections: active=0 idle=0 limit=10)`
+```
+
+그 메시지의 어디에도 인증이 언급되지 않고, `active=0 idle=0`은 서버에 연결할 수 없는 것처럼 읽히게 만듭니다. 기저의 드라이버 오류가 더 구체적입니다:
+
+```
+RSA public key is not available client side. Either set option `cachingRsaPublicKey`
+to indicate public key path, or allow public key retrieval with option
+`allowPublicKeyRetrieval`
+```
+
+로컬 개발에서는 연결 URL에 옵션을 추가하세요:
+
+```bash .env
+DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide?allowPublicKeyRetrieval=true"
+```
+
+암호화되지 않은 연결로 키를 가져오면 그 첫 핸드셰이크를 가로챌 수 있는 누구에게나 비밀번호가 노출되므로, 로컬 서버가 아닌 모든 것에 대해서는 이 옵션 대신 TLS를 사용하세요.
+
+이것은 [FastAPI 가이드](/ko/guides/fastapi-sqlalchemy-mysql)가 `asyncmy`에 대해 문서화한 것과 같은 함정이며, 같은 이유로 간헐적입니다: `mysql` CLI를 포함해 어떤 클라이언트든 그 계정의 전체 인증을 한 번 완료하면, `FLUSH PRIVILEGES`나 서버 재시작으로 캐시가 비워질 때까지 캐시된 결과가 문제를 숨깁니다.
+
+생성된 클라이언트의 임포트 경로에는 두 가지 특이점이 있습니다. `index.ts`가 없으므로 `@/generated/prisma`(디렉터리)가 아니라 `@/generated/prisma/client`(파일)를 임포트합니다. 그리고 그 파일의 모든 내보내기는 `@ts-nocheck`로 지정되어 있습니다. 읽으라고 있는 것이 아니라 임포트하라고 있는 생성 코드이기 때문입니다.
+
+## Server Component에서 읽기와 쓰기 {#read-and-write-from-a-server-component}
+
+```tsx src/app/page.tsx
+import { prisma } from "@/lib/prisma";
+import { revalidatePath } from "next/cache";
+
+async function createPost(formData: FormData) {
+  "use server";
+  const title = formData.get("title") as string;
+  const body = formData.get("body") as string;
+  await prisma.post.create({ data: { title, body } });
+  revalidatePath("/");
+}
+
+export default async function Home() {
+  const posts = await prisma.post.findMany({ orderBy: { createdAt: "desc" } });
+
+  return (
+    <main>
+      <form action={createPost}>
+        <input name="title" placeholder="Title" required />
+        <textarea name="body" placeholder="Body" required />
+        <button type="submit">Create post</button>
+      </form>
+      <ul>
+        {posts.map((post) => (
+          <li key={post.id}>
+            <strong>{post.title}</strong>
+            <p>{post.body}</p>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+`prisma.post.findMany()`는 Server Component로 실행되므로, 목록은 클라이언트 측 페치 없이 데이터가 이미 HTML에 담긴 채로 렌더링됩니다. 폼은 Server Action(`"use server"`)으로 전송되고, 이 액션은 같은 Prisma 클라이언트를 통해 쓰기를 수행한 뒤 `revalidatePath("/")`를 호출해 클라이언트 측 새로 고침 없이 새 게시물이 나타나게 합니다.
+
+이 시점에서 `npm run build`를 실행하면 실제로 데이터베이스에 쿼리합니다: 홈 페이지가 동적 API를 사용하지 않으므로 Next.js는 빌드 시점에 정적 콘텐츠로 사전 렌더링하고, 이는 `findMany()`가 요청 시점뿐 아니라 빌드 중에도 실행된다는 뜻입니다. `npm run build` 중에 데이터베이스에 연결할 수 없으면 빌드는 거기서 실패하므로, 이 앱의 CI 파이프라인은 런타임뿐 아니라 빌드 시점에도 연결 가능한 데이터베이스가 필요합니다.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 프로덕션에도 섀도 데이터베이스가 필요한가요? {#do-i-need-the-shadow-database-in-production}
+
+아니요. `prisma migrate dev`는 개발 중에 스키마 드리프트를 감지하기 위해 섀도 데이터베이스를 사용합니다. 프로덕션에서는 `prisma migrate deploy`를 사용하세요. 이 명령은 섀도 데이터베이스를 전혀 건드리지 않고 기존 마이그레이션 파일을 적용합니다.
+
+#### 독립 스크립트가 왜 "Cannot read properties of undefined (reading 'prepareCacheLength')"로 실패하나요? {#why-does-my-standalone-script-fail-with-cannot-read-properties-of-undefined-reading-preparecachelength}
+
+그 스크립트의 환경에서 `process.env.DATABASE_URL`이 `undefined`입니다. Next.js는 `next dev`와 `next build`를 위해 `.env`를 자동으로 로드하지만, 일반 `node`나 `tsx` 스크립트는 그렇지 않습니다. 스크립트 맨 위에 `import "dotenv/config"`를 추가하세요.
+
+#### `@prisma/adapter-pg`의 MySQL 대응물을 대신 쓸 수 있나요? {#can-i-use-prismaadapter-pgs-mysql-equivalent-instead}
+
+MySQL 전용 어댑터 이름은 없습니다. `@prisma/adapter-mariadb`가 Prisma가 MariaDB와 MySQL 모두를 위해 제공하는 어댑터이며, VillageSQL도 포함합니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `Error: P3014` / "User was denied access on the database `prisma_migrate_shadow_db_...`" | 앱 사용자가 데이터베이스를 만들 수 없습니다. 전용 섀도 데이터베이스를 미리 만들고 권한을 부여하거나, 트레이드오프를 받아들인다면 더 넓은 `CREATE`/`DROP` 권한을 부여하세요. |
+| `error: The datasource property 'shadowDatabaseUrl' is no longer supported in schema files` | 연결 URL이 인라인으로 들어 있는 Prisma 5/6 스타일의 `schema.prisma`를 사용하고 있습니다. `url`과 `shadowDatabaseUrl`을 모두 `prisma7.config.ts`의 `datasource` 블록으로 옮기세요. |
+| `active=0 idle=0`과 함께 `pool timeout: failed to retrieve a connection from pool` | 이 서버에서 그 계정이 `caching_sha2_password` 전체 인증을 한 번도 완료하지 않았고, 어댑터는 암호화되지 않은 RSA 교환을 하지 않습니다. 로컬 개발에서는 `DATABASE_URL`에 `?allowPublicKeyRetrieval=true`를 추가하거나, TLS로 연결하세요. |
+| `new PrismaClient()`에서 `Expected 1 arguments, but got 0` | Prisma 7은 드라이버 어댑터를 요구합니다. `@prisma/adapter-mariadb`를 설치하고 `new PrismaClient({ adapter })`를 전달하세요. |
+| `info You don't have any generators defined in your schema.prisma, so nothing will be generated.` | `schema.prisma`에 `generator client` 블록이 없습니다. 다시 추가하세요. (파일을 줄이다가 실수로라도) 삭제하면 `prisma generate`가 아무것도 만들지 않습니다. |
+| `Module not found: Can't resolve '@/generated/prisma'` | 대신 `@/generated/prisma/client`를 임포트하세요. 생성된 출력에는 `index.ts` 배럴 파일이 없습니다. |
+
+## 함께 보기 {#see-also}
+
+- [Next.js와 Drizzle로 MySQL 사용하기](/ko/guides/mysql-with-drizzle) — Prisma 대신 더 가볍고 SQL 우선인 ORM 위에 만든 같은 앱
+- [Next.js로 MySQL 사용하기](/ko/guides/nextjs-mysql) — ORM 없이 연결 설정, Server Action, Route Handler 패턴
+- [ORM으로 MySQL 사용하기](/ko/guides/mysql-with-orms) — Prisma뿐 아니라 모든 ORM에서 중요한 설정
+- [연결 풀링](/ko/guides/connection-pooling) — 드라이버 어댑터의 풀 크기가 프로세스 수와 어떻게 상호작용하는지

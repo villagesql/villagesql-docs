@@ -1,0 +1,158 @@
+---
+title: "MySQL 대소문자 구분"
+sidebarTitle: "대소문자 구분"
+description: "MySQL 문자열 비교가 대소문자를 무시하는 이유, 그것을 결정하는 콜레이션을 읽는 방법, 그리고 대신 대소문자를 구분하는 일치를 요청하는 방법입니다."
+keywords: "mysql case sensitive, mysql case insensitive query, mysql collation case sensitive, mysql where case sensitive, mysql collate, mysql table name case sensitivity"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 문자열 비교는 따로 요청하지 않는 한 대소문자를 무시합니다. 이것은 사람들을 한 번 놀라게 하고 나중에 발목을 잡기 때문에, 무엇이 그것을 결정하는지와 쿼리 하나에서 그것을 바꾸는 방법을 알아 둘 만합니다.
+
+시작하기 전에 `mysql -u root -p sakila`로 클라이언트를 여세요.
+
+## 대소문자 구분의 동작 방식 {#how-case-sensitivity-works}
+
+쿼리 안의 어떤 것도 그것을 결정하지 않습니다. 콜레이션이 결정하고, 모든 텍스트 열은 콜레이션을 하나씩 가지고 있습니다. 문자 집합은 열이 어떤 문자를 담을 수 있는지 말하고, 콜레이션은 그것들을 어떻게 비교할지 말합니다. 비교 하나에 대해 콜레이션을 덮어쓰려면 `COLLATE`를 사용합니다:
+
+```sql
+SELECT COLUMN_LIST
+FROM TABLE_NAME
+WHERE COLUMN_NAME COLLATE COLLATION_NAME = 'SEARCH_TEXT';
+```
+
+`COLLATION_NAME`을 비교에 사용할 콜레이션으로, `SEARCH_TEXT`를 일치시킬 값으로 바꾸세요.
+
+## 예제 {#examples}
+
+### 1) 대소문자만 다른 2개의 문자열은 같습니다 {#1-2-strings-that-differ-only-in-case-are-equal}
+
+```sql
+SELECT 'ABC' = 'abc' AS same;
+```
+
+```text
++------+
+| same |
++------+
+|    1 |
++------+
+1 row in set (0.00 sec)
+```
+
+### 2) 열에 대해서도 같습니다 {#2-the-same-holds-against-a-column}
+
+소문자 검색어가 대문자 제목을 찾습니다.
+
+```sql
+SELECT title FROM film WHERE title = 'academy dinosaur';
+```
+
+```text
++------------------+
+| title            |
++------------------+
+| ACADEMY DINOSAUR |
++------------------+
+1 row in set (0.00 sec)
+```
+
+### 3) 열의 콜레이션 읽기 {#3-read-the-columns-collation}
+
+```sql
+SELECT COLUMN_NAME, DATA_TYPE, COLLATION_NAME
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'sakila' AND TABLE_NAME = 'film' AND COLUMN_NAME = 'title';
+```
+
+```text
++-------------+-----------+--------------------+
+| COLUMN_NAME | DATA_TYPE | COLLATION_NAME     |
++-------------+-----------+--------------------+
+| title       | varchar   | utf8mb4_0900_ai_ci |
++-------------+-----------+--------------------+
+1 row in set (0.01 sec)
+```
+
+콜레이션 이름은 끝에서부터 읽으세요. `ci`는 대소문자를 구분하지 않는다는 뜻이고, 그래서 예제 2가 일치했습니다. `ai`는 악센트를 구분하지 않는다는 뜻이고, 별도의 역할을 합니다: 이 콜레이션에서 `'e' = 'é'`는 참이고, `utf8mb4_0900_as_cs`에서는 거짓입니다.
+
+| 끝부분 | 비교 |
+|---|---|
+| `_ci` | 대소문자를 무시 |
+| `_cs` | 대소문자를 구분 |
+| `_ai` | 악센트를 무시 |
+| `_as` | 악센트를 구분 |
+| `_bin` | 저장된 값을 직접 비교해서 둘 다 구분 |
+
+이 표는 여러분 자신의 열의 콜레이션 이름이 뜻하는 바이기도 합니다. 위의 쿼리를 어떤 테이블과 열에 대해서든 실행해서 어떤 규칙 아래에서 작업하고 있는지 확인하세요.
+
+### 4) 대소문자를 구분하는 비교 요청하기 {#4-ask-for-a-case-sensitive-comparison}
+
+```sql
+SELECT 'ABC' = 'abc' COLLATE utf8mb4_0900_as_cs AS case_sensitive,
+       'ABC' = 'abc' COLLATE utf8mb4_0900_ai_ci AS case_insensitive;
+```
+
+```text
++----------------+------------------+
+| case_sensitive | case_insensitive |
++----------------+------------------+
+|              0 |                1 |
++----------------+------------------+
+1 row in set (0.00 sec)
+```
+
+열에 대해서도 같은 방식으로 동작합니다.
+
+```sql
+SELECT title FROM film WHERE title COLLATE utf8mb4_0900_as_cs = 'academy dinosaur';
+```
+
+```text
+Empty set (0.00 sec)
+```
+
+## 열에 대한 COLLATE는 인덱스 조회를 포기합니다 {#collate-on-a-column-gives-up-the-index-lookup}
+
+열의 인덱스는 그 열 자신의 콜레이션으로 만들어지므로, 다른 콜레이션으로 하는 비교는 일치하는 값을 찾는 데 그 인덱스를 사용할 수 없습니다. 위 쿼리에 대한 `EXPLAIN`은 조회가 아니라 1,000개 행 전체의 스캔을 보고합니다. 1,000편의 영화에서는 비용이 들지 않지만, 큰 테이블에서는 큰 비용이 듭니다. 모든 쿼리에서 대소문자를 구분하는 일치가 필요하다면, [문자 집합과 콜레이션](/ko/guides/character-sets) 가이드가 대신 열을 그렇게 저장하는 방법을 다룹니다.
+
+## 기본값은 어디에서 오는가 {#where-the-default-comes-from}
+
+콜레이션 없이 만든 데이터베이스는 서버의 것을, 테이블은 데이터베이스의 것을, 열은 테이블의 것을 물려받습니다. 그래서 이력 어디에도 콜레이션을 지정하지 않은 열은 서버 설정 때문에 대소문자를 구분하지 않고 비교하고 있는 것입니다. 이름 앞의 `@@`는 서버 설정을 읽으며, 이 한 쌍이 어느 것을 물려받았는지 알려 줍니다:
+
+```sql
+SELECT @@collation_server AS server_collation, @@character_set_server AS server_charset;
+```
+
+서버는 시작될 때 주어진 값으로 답하므로, 그 결과를 MySQL에 관한 사실이 아니라 여러분 자신의 설치에 관한 사실로 취급하세요.
+
+## 식별자는 다른 규칙을 따릅니다 {#identifiers-follow-a-different-rule}
+
+열 이름은 절대 대소문자를 구분하지 않습니다. 데이터베이스와 테이블 이름은 별개의 문제이며, `lower_case_table_names`가 결정합니다:
+
+| 값 | 데이터베이스와 테이블 이름 |
+|---|---|
+| `0` | 쓴 그대로 저장하고 대소문자를 구분해서 비교 |
+| `1` | 소문자로 저장하고 대소문자를 구분하지 않고 비교 |
+| `2` | 쓴 그대로 저장하고 대소문자를 구분하지 않고 비교 |
+
+`SELECT @@lower_case_table_names;`를 실행해서 현재 상태를 확인하세요. 세션에서 바꿀 수는 없습니다: `SET GLOBAL lower_case_table_names=1`은 `ERROR 1238 (HY000): Variable 'lower_case_table_names' is a read only variable`로 답합니다. 이것은 서버가 처음 설정된 방식에 묶인 시작 설정이므로, 그 답을 현재 사용 중인 서버의 속성으로 취급하세요.
+
+실용적인 조언은 그 답에 좌우되지 않습니다. 모든 데이터베이스와 테이블 이름을 한 가지 대소문자로 쓰고 어디에서나 그 표기를 사용하세요. 그러면 같은 SQL을 2대의 서버 사이에서 옮겨도, 동작하던 쿼리가 존재하지 않는 테이블에 대한 오류인 `ERROR 1146 (42S02)`로 바뀌지 않습니다.
+
+## 요약 {#summary}
+
+- 흔한 콜레이션은 `_ci`로 끝나므로, 문자열 비교가 대소문자를 무시한다고 예상하세요.
+- 열의 콜레이션은 `INFORMATION_SCHEMA.COLUMNS`에서 읽으세요.
+- 콜레이션 이름은 끝에서부터 읽으세요: `_ci`와 `_ai`는 무시, `_cs`, `_as`, `_bin`은 구분.
+- 일회성으로 대소문자를 구분하는 비교에는 `COLLATE`를 사용하고, 인덱스 조회를 포기한다는 점을 받아들이세요.
+- `lower_case_table_names`가 무엇이라고 하든, 모든 데이터베이스와 테이블 이름에 한 가지 표기를 유지하세요.
+
+## 함께 보기 {#see-also}
+
+- [LIKE](/ko/tutorial/like) — 이것이 처음 나타나는 곳
+- [REGEXP](/ko/tutorial/regexp) — 같은 규칙, 다른 덮어쓰기 방법
+- [MySQL의 문자 집합과 콜레이션](/ko/guides/character-sets) — 열에 맞는 것을 고르기
+- [MySQL에서 utf8mb4 사용하기](/ko/guides/utf8mb4) — 흔한 콜레이션 뒤에 있는 문자 집합

@@ -1,0 +1,146 @@
+---
+title: "MySQL 뷰"
+sidebarTitle: "뷰 만들기"
+description: "MySQL 뷰의 동작 방식: 뷰 만들기와 쿼리하기, 업데이트 가능한 뷰, WITH CHECK OPTION, 뷰 알고리즘(MERGE 대 TEMPTABLE), 그리고 뷰가 도움이 되는 경우와 해가 되는 경우입니다."
+keywords: "mysql views, mysql create view, mysql updatable view, mysql view with check option, mysql view algorithm, mysql view vs table, mysql view performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+뷰는 데이터베이스에 저장된 이름 있는 쿼리입니다. 뷰를 쿼리하는 것은 테이블을 쿼리하는 것과 똑같아 보이지만, 뷰의 SELECT는 쿼리 시점에 실행됩니다. 따로 저장된 데이터는 없습니다.
+
+## 뷰 만들기와 쿼리하기 {#creating-and-querying-views}
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Query it like a table
+SELECT * FROM active_customers WHERE email LIKE '%@example.com';
+```
+
+기반이 되는 정의를 보려면:
+
+```sql
+SHOW CREATE VIEW active_customers\G
+```
+
+뷰를 수정하려면 `CREATE OR REPLACE VIEW`를 사용하세요:
+
+```sql
+CREATE OR REPLACE VIEW active_customers AS
+SELECT id, name, email, created_at
+FROM customers
+WHERE status = 'active';
+```
+
+뷰를 삭제하려면:
+
+```sql
+DROP VIEW active_customers;
+```
+
+## 업데이트 가능한 뷰 {#updatable-views}
+
+일부 뷰는 뷰를 통한 `INSERT`, `UPDATE`, `DELETE`를 지원합니다. 뷰가 기반 테이블 1개에 깔끔하게 대응하면 업데이트 가능합니다:
+
+- 값을 쓰는 모든 열이 기반 테이블 1개에 속함. JOIN 위의 뷰도 이 규칙 아래에서는 여전히 업데이트 가능하지만, 그것을 통한 `INSERT`는 조용히 테이블 1개만 건드리고 다른 테이블에는 행을 전혀 삽입하지 않음. 다만 `INSERT` 1개에서 두 기반 테이블의 열을 모두 쓰는 것은 조용하지 않음. `ERROR 1393: Can not modify more than one base table through a join view`를 일으킴
+- `DISTINCT` 없음
+- 집계 함수(`SUM`, `COUNT` 등) 없음
+- `GROUP BY`나 `HAVING` 없음
+- `WHERE` 절에 같은 테이블을 참조하는 서브쿼리 없음
+- `UNION` 없음
+
+```sql
+-- This view is updatable
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Update through the view
+UPDATE active_customers SET email = 'new@example.com' WHERE id = 42;
+```
+
+MySQL은 기반 `customers` 테이블을 업데이트합니다. 뷰가 행을 필터링하면, 뷰를 통해 보이지 않게 되는 값으로 행을 `UPDATE`할 수 있습니다. 행은 기본 테이블에 여전히 존재하지만 뷰에서는 사라집니다.
+
+## WITH CHECK OPTION {#with-check-option}
+
+`WITH CHECK OPTION`은 뷰를 통한 삽입과 업데이트 중 행을 뷰에서 보이지 않게 만드는 것을 막습니다:
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email, status
+FROM customers
+WHERE status = 'active'
+WITH CHECK OPTION;
+
+-- Fails: setting status = 'inactive' would hide the row from the view
+UPDATE active_customers SET status = 'inactive' WHERE id = 42;
+-- ERROR 1369: CHECK OPTION failed 'mydb.active_customers'
+```
+
+뷰가 의미 있는 데이터 부분 집합을 나타내고, 뷰를 통한 삽입과 업데이트가 그 부분 집합 안에 머물도록 보장하고 싶을 때 `WITH CHECK OPTION`을 사용하세요.
+
+## 뷰 알고리즘 {#view-algorithms}
+
+MySQL은 2가지 알고리즘 중 하나로 뷰를 실행합니다:
+
+| 알고리즘 | 동작 | MySQL이 선택하는 경우 |
+|:----------|:---------|:----------------------|
+| `MERGE` | 뷰의 SELECT를 인라인하도록 외부 쿼리를 다시 씀 — 임시 테이블 없음 | 집계, DISTINCT, GROUP BY, UNION이 없는 단순한 뷰 |
+| `TEMPTABLE` | 뷰를 먼저 임시 테이블로 구체화한 다음 외부 쿼리를 실행 | 집계, DISTINCT, GROUP BY, UNION이 있는 뷰 |
+
+`TEMPTABLE`은 외부 쿼리가 실행되기 전에 뷰 결과 전체가 계산된다는 뜻입니다. 옵티마이저는 외부 쿼리의 `WHERE` 조건을 뷰 안으로 밀어 넣을 수 없습니다. `TEMPTABLE` 뷰에서 필터링이 효율적으로 동작하려면, 필터가 뷰 자체의 정의 안에 있어야 합니다.
+
+놀라운 일을 피하려면 알고리즘을 명시적으로 지정하세요:
+
+```sql
+CREATE ALGORITHM=MERGE VIEW active_customers AS
+SELECT id, name, email FROM customers WHERE status = 'active';
+```
+
+요청한 알고리즘을 MySQL이 만족시킬 수 없으면 Warning 1354를 내고 뷰를 `ALGORITHM=UNDEFINED`로 저장합니다. `SHOW CREATE VIEW`가 보고하는 것은 `TEMPTABLE`이 아니라 그것입니다. 그러면 옵티마이저는 그런 뷰를 실행 시점에 구체화합니다.
+
+## 뷰에는 인덱스가 없습니다 {#views-are-not-indexed}
+
+뷰에는 자체 인덱스가 없습니다. `MERGE` 뷰에 대한 쿼리는 기반 테이블의 인덱스를 사용할 수 있습니다. `TEMPTABLE` 뷰에 대한 쿼리는 그럴 수 없습니다. 임시 테이블에는 인덱스가 없습니다.
+
+자주 쿼리하는 뷰 결과에 인덱스가 필요하다면, 선택지는 다음과 같습니다:
+- 뷰가 `MERGE` 알고리즘을 쓰도록 하고 기반 테이블의 열에 인덱스 만들기
+- 뷰를 잡이나 트리거로 채워지는 실제 테이블로 대체하기
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 뷰는 언제 써야 하나요? {#when-should-i-use-a-view}
+
+뷰는 접근 제어(사용자에게 열이나 행의 부분 집합만 노출), 여러 쿼리가 쓰는 복잡한 조인의 단순화, 기반 스키마가 바뀔 수 있을 때 안정적인 인터페이스 제공에 잘 맞습니다. 뷰는 성능 도구가 아닙니다. 데이터를 캐시하거나 저장하지 않습니다.
+
+#### 뷰를 조인할 수 있나요? {#can-i-join-views}
+
+예. `MERGE` 뷰 2개를 조인하는 것은 사실상 기반 쿼리 2개를 조인하는 것입니다. MySQL이 전체를 다시 씁니다. `TEMPTABLE` 뷰의 조인은 각 뷰가 먼저 독립적으로 구체화되므로 더 느립니다. 복잡한 조인에서는 [공통 테이블 식](/ko/tutorial/cte)이 실행에 대해 더 많은 제어를 주는 경우가 많습니다.
+
+#### 기반 테이블이 바뀌면 뷰가 자동으로 업데이트되나요? {#do-views-update-automatically-when-the-underlying-table-changes}
+
+뷰 정의는 SQL 텍스트로 저장됩니다. 기본 테이블에 열을 추가해도, 뷰에서 `SELECT *`는 그 열을 포함하지 않습니다. `CREATE OR REPLACE VIEW`가 필요합니다. 뷰가 참조하는 열의 이름을 바꾸거나 삭제하면, 뷰는 무효가 되고 다시 만들 때까지 뷰에 대한 쿼리는 오류를 냅니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `ERROR 1369: CHECK OPTION failed` | 업데이트가 행을 뷰에서 숨기게 됨. 뷰의 WHERE 조건을 확인 |
+| 기본 테이블에 인덱스가 있는데도 뷰 쿼리가 느림 | 뷰가 TEMPTABLE 알고리즘을 쓰고 있을 수 있음. `EXPLAIN`에서 "DERIVED"를 확인; 구조를 바꾸거나 CTE로 전환 |
+| 뷰를 통한 `UPDATE`가 잘못된 행을 업데이트 | JOIN이나 집계 때문에 뷰가 업데이트 불가능함. 기본 테이블을 직접 업데이트 |
+| `ERROR 1356: View references invalid table` | 기반 테이블의 이름이 바뀌었거나 삭제됨. 뷰를 다시 만들기 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 정규화](/ko/guides/normalization) — 뷰는 정규화된 스키마에 대한 쿼리를 단순화할 수 있음
+- [MySQL JOIN 성능과 흔한 실수](/ko/guides/joins) — 뷰는 종종 조인 로직을 캡슐화함
+- [MySQL 조인의 동작 방식](/ko/tutorial/joins) — 뷰 정의가 사용하는 조인 구문
+- [MySQL의 서브쿼리 대 JOIN](/ko/guides/subqueries-vs-joins) — 뷰가 감싸는 쿼리 형태
+- [MySQL의 소프트 삭제](/ko/guides/soft-deletes) — 살아 있는 행만 보여주는 뷰 뒤에 삭제된 행 숨기기

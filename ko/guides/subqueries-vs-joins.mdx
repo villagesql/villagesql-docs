@@ -1,0 +1,152 @@
+---
+title: "MySQL의 서브쿼리 대 JOIN"
+sidebarTitle: "서브쿼리와 JOIN 비교하기"
+description: "MySQL에서 서브쿼리와 JOIN 중 무엇을 쓸지: 상관 서브쿼리와 비상관 서브쿼리, EXISTS 대 IN, 성능 차이, 그리고 MySQL 옵티마이저가 각각을 처리하는 방식입니다."
+keywords: "mysql subquery vs join, mysql subquery performance, mysql semi join, mysql rewrite subquery as join, mysql subquery optimizer, mysql join or subquery faster"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+서브쿼리와 JOIN은 종종 같은 결과를 만듭니다. 둘 중 무엇을 고르느냐는 가독성, NULL에 대한 정확성, 그리고 — 어떤 경우에는 — 성능에 영향을 줍니다.
+
+## 서브쿼리의 종류 {#types-of-subqueries}
+
+**비상관 서브쿼리**는 한 번 실행되고 그 결과를 외부 쿼리가 사용합니다:
+
+```sql
+-- Runs once: find all orders over the average amount
+SELECT id, amount
+FROM orders
+WHERE amount > (SELECT AVG(amount) FROM orders);
+```
+
+**상관 서브쿼리**는 외부 쿼리의 열을 참조하므로 행마다 한 번씩 실행됩니다:
+
+```sql
+-- Runs once per customer: find customers who have at least one order over $500
+SELECT c.name
+FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+```
+
+상관 서브쿼리는 큰 테이블에서 느릴 수 있습니다 — 서브쿼리가 외부 쿼리의 모든 행에 대해 실행됩니다. MySQL이 어떻게 실행하는지 보려면 `EXPLAIN`을 확인하세요.
+
+## IN 대 EXISTS 대 JOIN {#in-vs-exists-vs-join}
+
+이 3가지 패턴은 종종 같은 문제를 해결합니다:
+
+```sql
+-- IN subquery
+SELECT name FROM customers
+WHERE id IN (SELECT customer_id FROM orders WHERE amount > 500);
+
+-- EXISTS
+SELECT name FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+
+-- JOIN (with DISTINCT to avoid duplicates)
+SELECT DISTINCT c.name
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 500;
+```
+
+| 방식 | 사용할 때 |
+|:---------|:------------|
+| `IN (subquery)` | 서브쿼리가 작고 고정된 목록을 반환할 때; 단순한 경우에 읽기 쉬움 |
+| `EXISTS` | 존재 여부만 확인할 때; 첫 번째 일치에서 멈춤; NULL에 안전함 |
+| `JOIN` | 두 테이블의 열이 모두 필요할 때; MySQL 옵티마이저에 더 많은 유연성이 있음 |
+
+MySQL 옵티마이저는 `IN (subquery)`를 내부적으로 세미 조인으로 다시 쓰는 경우가 많으므로, 성능 차이는 무시할 만한 경우가 잦습니다. 서브쿼리 결과 집합이 크면 `EXISTS`나 `JOIN`이 더 안정적입니다.
+
+## NOT IN의 NULL 문제 {#the-null-problem-with-not-in}
+
+`NOT IN`은 서브쿼리가 NULL을 하나라도 반환하면 예상 밖으로 동작합니다:
+
+```sql
+-- This returns zero rows if ANY customer_id in orders is NULL
+SELECT name FROM customers
+WHERE id NOT IN (SELECT customer_id FROM orders);
+```
+
+`orders.customer_id`에 NULL 행이 하나라도 있으면 `NOT IN` 전체가 빈 결과를 반환합니다. 이것은 올바른 SQL 동작입니다 — `NULL`은 알 수 없는 값이므로, `NOT IN (NULL, 1, 2)`는 모든 비교에서 UNKNOWN입니다. 대신 `NOT EXISTS`를 사용하세요:
+
+```sql
+-- Safe: returns customers with no orders, even if some order rows have NULL customer_id
+SELECT name FROM customers c
+WHERE NOT EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id
+);
+```
+
+MySQL의 NULL 동작에 대한 자세한 내용은 [MySQL의 NULL](/ko/guides/null-in-mysql)을 보세요.
+
+## FROM의 서브쿼리(파생 테이블) {#subqueries-in-from-derived-tables}
+
+`FROM` 절의 서브쿼리는 파생 테이블을 만듭니다:
+
+```sql
+SELECT dept, avg_salary
+FROM (
+    SELECT department AS dept, AVG(salary) AS avg_salary
+    FROM employees
+    GROUP BY department
+) dept_stats
+WHERE avg_salary > 80000;
+```
+
+이 패턴에는 보통 CTE가 더 명확합니다 — 로직이 인라인으로 중첩되지 않고 맨 위에서 이름을 갖고 정의됩니다. [MySQL CTE가 파생 테이블보다 나을 때](/ko/guides/ctes-in-mysql)를 보세요.
+
+## 성능 고려 사항 {#performance-considerations}
+
+MySQL 옵티마이저는 많은 서브쿼리 패턴을 다시 씁니다. 직접 최적화하기 전에:
+
+1. 서브쿼리 버전과 JOIN 버전 모두에 `EXPLAIN`을 실행해서 MySQL이 실제로 무엇을 실행하는지 확인하세요
+2. 조인/상관 열에 인덱스가 있는지 확인하세요 — 보통 그것이 병목입니다
+3. `EXPLAIN`이 실행 계획에서 큰 차이를 보일 때만 다시 쓰세요
+
+| 패턴 | 주의할 점 |
+|:--------|:----------|
+| SELECT 안의 상관 서브쿼리 | 행마다 실행됨 — 큰 테이블에서 O(n²)이 될 수 있음 |
+| 큰 결과 집합을 반환하는 `IN (subquery)` | 보통 세미 조인 재작성으로 최적화됨; `EXPLAIN`을 확인 |
+| NULL이 있을 수 있는 `NOT IN` | 잘못된 결과 — `NOT EXISTS`를 사용 |
+| FROM의 파생 테이블 | 옵티마이저가 병합할 수도, 안 할 수도 있음; `EXPLAIN`을 확인 |
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### JOIN은 항상 서브쿼리보다 빠른가요? {#is-join-always-faster-than-a-subquery}
+
+꼭 그렇지는 않습니다. MySQL 8.0의 옵티마이저는 많은 경우 `IN (subquery)`를 세미 조인으로 다시 써서 명시적 JOIN과 같은 실행 계획을 만듭니다. 한 형태가 항상 더 빠르다고 가정하지 말고 `EXPLAIN`으로 측정하세요.
+
+#### IN 대신 EXISTS를 언제 사용해야 하나요? {#when-should-i-use-exists-instead-of-in}
+
+일치하는 데이터가 무엇인지가 아니라 일치가 존재하는지만 중요할 때, 서브쿼리가 NULL을 반환할 수 있을 때, 또는 서브쿼리가 큰 결과 집합을 반환할 때 `EXISTS`를 사용하세요. `EXISTS`는 첫 번째 일치에서 단락 평가하고, `IN`은 전체 목록을 만들어야 합니다.
+
+#### 세미 조인이 무엇인가요? {#whats-a-semi-join}
+
+세미 조인은 오른쪽에 일치하는 행이 하나 이상 있는 왼쪽 테이블의 행을 반환하되, 여러 일치에 대해 왼쪽 테이블 행을 중복해서 만들지 않습니다. MySQL 옵티마이저는 `IN (subquery)`와 `EXISTS`를 효율적으로 실행하기 위해 내부적으로 세미 조인을 사용합니다. SQL에서 세미 조인을 직접 쓸 수는 없지만, `EXISTS`와 `IN (subquery)` 모두 옵티마이저가 세미 조인을 고려하게 만듭니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `NOT IN`이 예상 밖으로 빈 결과를 반환 | 서브쿼리 결과에 NULL이 있음 — `NOT EXISTS`로 바꾸기 |
+| 상관 서브쿼리가 매우 느림 | 상관 열에 인덱스를 추가; JOIN으로 다시 쓰는 것을 고려 |
+| 같은 쿼리가 IN 서브쿼리보다 JOIN으로 더 빠름 | 옵티마이저가 IN 서브쿼리를 다시 쓰지 않을 수 있음 — JOIN으로 다시 써 보기 |
+| 파생 테이블 쿼리가 느림 | MySQL이 파생 테이블을 구체화했는지 확인 — CTE나 JOIN으로 다시 써 보기. `SQL_NO_CACHE`에 기대지 마세요: 그것이 제어하던 쿼리 캐시는 MySQL 8.0에서 제거되었으므로, 이 힌트는 사용 중단 경고만 발생시킴 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL JOIN 성능과 흔한 실수](/ko/guides/joins) — 이 비교에서 조인 쪽을 느리게 만드는 것
+- [MySQL CTE가 파생 테이블보다 나을 때](/ko/guides/ctes-in-mysql) — 깊이 중첩된 서브쿼리의 더 깔끔한 대안
+- [MySQL 서브쿼리](/ko/tutorial/subqueries)와 [상관 서브쿼리](/ko/tutorial/correlated-subqueries) — 서브쿼리 작성법에 대한 튜토리얼 수업
+- [MySQL EXISTS](/ko/tutorial/exists) — 행을 결코 곱하지 않는 형태

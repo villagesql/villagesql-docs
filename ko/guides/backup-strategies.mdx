@@ -1,0 +1,204 @@
+---
+title: "MySQL 백업 전략"
+sidebarTitle: "백업 계획하기"
+description: "MySQL 데이터베이스를 백업하는 방법: 논리 백업을 위한 mysqldump, MySQL Shell의 덤프 유틸리티, 바이너리 로그 기반 특정 시점 복구, 프로덕션 시스템을 위한 백업 모범 사례."
+keywords: "mysql backup, mysqldump, mysql backup strategy, mysql point in time recovery, mysql backup restore, mysql dump database, mysql incremental backup, mysql backup best practices, mysql backup automation, mysql backup compression, mysql point in time recovery binlog, mysqlpump, mysql shell dump, percona xtrabackup"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 백업 전략은 두 부분으로 이루어집니다: 데이터의 일관된 스냅샷을 만드는 것(전체 백업)과 그 스냅샷 이후에 이루어진 변경 사항을 재생하는 방법을 갖추는 것(특정 시점 복구)입니다. 적합한 도구는 데이터베이스 크기, 허용 가능한 복구 시간, 그리고 감수할 수 있는 데이터 손실량에 따라 달라집니다.
+
+## mysqldump — 논리 백업 {#mysqldump--logical-backups}
+
+`mysqldump`는 데이터를 SQL 문으로 내보냅니다. 가장 이식성이 높은 형식이며 모든 크기의 데이터베이스에서 동작하지만, 큰 데이터 세트에서는 바이너리 백업보다 복원이 느립니다.
+
+**단일 데이터베이스 백업:**
+
+```bash
+mysqldump -u root -p myapp > myapp_backup.sql
+```
+
+**모든 데이터베이스 백업:**
+
+```bash
+mysqldump -u root -p --all-databases > all_databases.sql
+```
+
+**InnoDB에 권장되는 플래그:**
+
+```bash
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --routines \
+  --triggers \
+  --events \
+  -u root -p myapp > myapp_backup.sql
+```
+
+| 플래그 | 목적 |
+|:-----|:--------|
+| `--single-transaction` | 테이블 잠금 없이 일관된 스냅샷 생성(InnoDB 전용) |
+| `--source-data=2` | binlog 위치를 주석으로 기록 — PITR에 필수 |
+| `--routines` | 저장 프로시저와 함수 포함 |
+| `--triggers` | 트리거 포함(기본 활성화이지만 명시하면 명확함) |
+| `--events` | 예약된 이벤트 포함 |
+
+`--single-transaction` 없이 실행하면 mysqldump는 `LOCK TABLES`로 테이블을 잠그며, 덤프가 진행되는 동안 쓰기가 차단됩니다.
+
+**덤프에서 복원:**
+
+```bash
+mysql -u root -p myapp < myapp_backup.sql
+```
+
+모든 데이터베이스를 복원하려면: `mysql -u root -p < all_databases.sql`
+
+## 바이너리 로그를 이용한 특정 시점 복구 {#point-in-time-recovery-with-binary-logs}
+
+전체 백업은 마지막 백업 시점까지만 보호합니다. 바이너리 로깅을 사용하면 백업 이후에 이루어진 모든 변경 사항을 재생할 수 있습니다.
+
+**요구 사항:**
+- 바이너리 로깅 활성화(`log_bin = ON`)
+- 백업 시 `--source-data=2` 사용(시작 binlog 위치 기록)
+
+**워크플로:**
+
+1. 전체 백업 복원:
+```bash
+mysql -u root -p < myapp_backup.sql
+```
+
+2. 덤프 파일에서 binlog 시작 위치 찾기:
+```bash
+head -50 myapp_backup.sql | grep "SOURCE_LOG_FILE"
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='mysql-bin.000003', SOURCE_LOG_POS=154;
+```
+
+3. 되돌리려는 이벤트 직전 시점까지 바이너리 로그 재생:
+```bash
+mysqlbinlog \
+  --start-position=154 \
+  --stop-datetime="2024-06-15 11:59:00" \
+  mysql-bin.000003 mysql-bin.000004 | mysql -u root -p
+```
+
+mysqlbinlog 옵션의 자세한 내용은 [MySQL 바이너리 로깅](/ko/guides/binary-logging)을 참조하세요.
+
+## MySQL Shell 덤프 유틸리티 {#mysql-shell-dump-utilities}
+
+MySQL Shell(`mysqlsh`)은 `mysqldump`보다 빠른 덤프 및 로드 유틸리티를 제공합니다. 병렬 스레드를 사용하고 압축된 출력을 생성하므로 큰 데이터베이스에 실용적입니다.
+
+```bash
+# Dump a single schema
+mysqlsh root@localhost -- util dump-schemas '["myapp"]' --outputUrl=/backups/myapp
+
+# Load it back
+mysqlsh root@localhost -- util load-dump /backups/myapp
+```
+
+MySQL Shell 덤프 유틸리티는 기본적으로 출력을 압축하며(zstd), 덤프와 로드 모두 여러 CPU 코어에서 병렬화할 수 있습니다. 몇 GB보다 큰 데이터베이스에서는 `mysqldump` 대비 속도 차이가 상당합니다.
+
+## 백업 방법 비교 {#backup-methods-compared}
+
+| 방법 | 백업 크기 | 백업 속도 | 복원 속도 | 일관성 | MySQL 호환성 |
+|:-------|:-----------|:-------------|:-------------|:------------|:-------------------|
+| `mysqldump` | 큼(일반 SQL) | 느림 | 느림(SQL 재실행) | 일관된 스냅샷(`--single-transaction`) | 모든 MySQL 버전 |
+| `mysqlpump` | 큼(일반 SQL) | 더 빠름(병렬 덤프) | 느림(SQL 재실행) | 테이블 단위 일관성만 | 8.4에서 제거됨 — 바이너리가 배포되지 않음 |
+| MySQL Shell 덤프 | 작음(zstd 압축) | 빠름(병렬, 압축) | 빠름(병렬 로드) | 일관된 스냅샷 | MySQL 8.0+ |
+| Percona XtraBackup | 큼(물리적 복사) | 빠름(핫 복사, InnoDB 인식) | 매우 빠름(파일 복사) | 완전한 InnoDB 일관성 | 같은 메이저 버전 |
+| 콜드 파일 복사 | 큼(물리적 복사) | 빠름 | 매우 빠름(파일 복사) | 서버가 중지된 경우에만 일관됨 | 같은 MySQL 버전 |
+
+`mysqldump`는 여전히 이식성과 단순함을 위한 기본 선택입니다. 큰 데이터베이스에서는 MySQL Shell 덤프가 사실상 `mysqlpump`를 대체했습니다 — 더 빠르고, 더 작은 파일을 생성하며, MySQL 8.0+를 지원합니다. `mysqlpump`는 MySQL 8.4에서 제거되었습니다 — 바이너리가 빌드에 전혀 포함되지 않으므로, 이를 호출하는 모든 스크립트는 바로 실패합니다.
+
+복원 시간이 중요한 약 50GB 이상의 프로덕션 데이터베이스에서는 Percona XtraBackup 또는 MySQL Shell 덤프가 실용적인 선택입니다.
+
+### 각 방법을 사용할 시기 {#when-to-use-each-method}
+
+| 방법 | 사용할 때 | 피해야 할 때 |
+|:-------|:---------|:-----------|
+| `mysqldump` | 이식성이 필요한 경우; MySQL 버전 간 마이그레이션; 데이터베이스가 약 10GB 미만인 경우; 사람이 읽을 수 있는 백업을 원하는 경우 | 데이터베이스가 크고 복원 시간이 중요한 경우; 1분 미만의 백업 윈도가 필요한 경우 |
+| MySQL Shell 덤프 | 데이터베이스가 큰 경우(10GB 이상); 압축과 함께 병렬 로드를 원하는 경우 | MySQL Shell이 설치되지 않았거나 허용되지 않는 경우 |
+| `mysqlpump` | (MySQL 8.4에서 제거됨 — 바이너리가 배포되지 않음. 대신 MySQL Shell 덤프를 사용하세요.) | — |
+| Percona XtraBackup | 매우 큰 InnoDB 데이터베이스; 성능 영향을 최소화한 핫 물리 백업이 필요한 경우; 복원 속도가 중요한 경우 | 혼합 스토리지 엔진(MyISAM); 서드파티 도구를 설치할 수 없는 경우; 복잡성이 정당화되지 않는 작은 데이터베이스 |
+| 콜드 파일 복사 | 개발/테스트 환경; 오프라인 서버; 위험한 마이그레이션 전 빠른 스냅샷 | 다운타임을 허용할 수 없는 프로덕션 서버; 서버가 계속 가동되어야 하는 모든 상황 |
+
+## 백업 예약하기 {#scheduling-backups}
+
+야간 덤프를 실행하는 cron 작업이 가장 일반적인 프로덕션 설정입니다:
+
+```bash
+# /etc/cron.d/mysql-backup
+0 2 * * * mysql_user /usr/local/bin/mysql-backup.sh
+```
+
+```bash
+#!/bin/bash
+# mysql-backup.sh
+DATE=$(date +%Y-%m-%d)
+BACKUP_DIR=/backups/mysql
+
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --all-databases \
+  -u backup_user -p"$MYSQL_BACKUP_PASSWORD" \
+  | gzip > "$BACKUP_DIR/all_databases_$DATE.sql.gz"
+
+# Keep 14 days of backups
+find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
+```
+
+백업 사용자에게는 `SELECT`, `LOCK TABLES`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `RELOAD`, `PROCESS` 권한만 필요합니다 — `ALL PRIVILEGES`는 필요하지 않습니다. `PROCESS`가 없어도 `mysqldump`는 완료되지만, 테이블스페이스 메타데이터를 덤프하려고 시도하면서 실행할 때마다 "Access denied ... PROCESS privilege" 오류를 stderr에 출력합니다.
+
+## 백업 검증하기 {#verifying-backups}
+
+테스트하지 않은 백업은 백업이 아닙니다. 정기적으로 검증하세요:
+
+```bash
+# Test restore to a separate instance
+mysql -u root -p --host=test-server < all_databases.sql
+
+# Quick sanity check — verify row counts
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+```
+
+최소 월 1회 자동화된 복원 테스트를 수행하면 손상, 권한 문제, 디스크 공간 문제를 실제로 문제가 되기 전에 발견할 수 있습니다.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### `--single-transaction`은 모든 스토리지 엔진에서 동작하나요? {#does---single-transaction-work-with-all-storage-engines}
+
+아니요. `--single-transaction`은 일관된 읽기 스냅샷을 사용하며, 이는 InnoDB만 지원합니다. 같은 데이터베이스의 MyISAM 테이블은 덤프 중에 여전히 `LOCK TABLES`로 잠깁니다. 엔진이 혼합되어 있다면 `--single-transaction`만으로는 완전히 일관된 덤프에 충분하지 않습니다.
+
+#### 백업을 얼마나 오래 보관해야 하나요? {#how-long-should-i-retain-backups}
+
+최소한: 일일 백업 7–14일, 주간 백업 4주, 월간 백업 1년. 보관 기간은 규제 요구 사항과 얼마나 먼 과거로 복구해야 할 수 있는지에 따라 달라집니다. 바이너리 로그는 가장 오래된 보관 백업과 현재 사이의 간격을 메울 만큼 충분히 오래 보관해야 합니다.
+
+#### 데이터 디렉토리를 복사하는 것이 유효한 백업인가요? {#is-copying-the-data-directory-a-valid-backup}
+
+서버를 먼저 종료한 경우에만 유효합니다(콜드 복사). 실행 중인 MySQL 서버는 직접 복사하기에 안전하지 않은 방식으로 데이터 파일을 기록하므로, 손상된 백업을 얻게 됩니다. 서버를 중지하지 않는 핫 백업에는 MySQL Shell의 덤프 유틸리티 또는 Percona XtraBackup을 사용하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `mysqldump`가 큰 테이블에서 멈춤 | 테이블 전체를 메모리에 버퍼링하는 대신 행을 하나씩 스트리밍하도록 `--quick` 추가 |
+| 복원이 `ERROR 1824: Failed to open the referenced table`(또는 행에서 `ERROR 1452`)로 실패함 | `mysqldump`는 기본적으로 출력을 `SET FOREIGN_KEY_CHECKS=0`으로 감싸므로, 전체 덤프를 그대로 복원하면 이 문제가 발생하지 않습니다. 직접 편집했거나 부분적인 덤프(일부 테이블만 추출했거나 FK 검사 줄을 제거한 경우)를 복원할 때 나타납니다 — 이 경우 맨 위에 `SET FOREIGN_KEY_CHECKS=0;`을 추가하세요 |
+| 덤프 파일이 너무 큼 | 압축 사용: `mysqldump ... \| gzip > backup.sql.gz`; 복원은 `zcat backup.sql.gz \| mysql ...` |
+| 특정 시점 복구에서 변경 사항이 누락됨 | 바이너리 로그 파일에 간격이 있음 — 범위 내 모든 로그 파일이 순서대로 재생되었는지 확인 |
+| 백업 사용자가 트리거를 덤프할 수 없음 | `TRIGGER` 권한 부여: `GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |
+
+백업 스크립트는 [VillageSQL](https://villagesql.com/install)로 전환해도 그대로 동작합니다. VillageSQL은 MySQL의 드롭인 대체품이므로, 이 가이드의 mysqldump 명령, 바이너리 로그 설정, 복원 런북이 그대로 동작합니다.
+
+## 참고 {#see-also}
+
+- [MySQL 바이너리 로깅](/ko/guides/binary-logging) — 바이너리 로그가 특정 시점 복구를 가능하게 합니다
+- [MySQL 복제 기초](/ko/guides/replication-basics) — 복제는 같은 바이너리 로그 인프라에 의존합니다
+- [Docker에서 MySQL](/ko/guides/mysql-on-docker) — 컨테이너화된 MySQL의 백업과 볼륨
+- [MySQL에서 업그레이드하기](/ko/guides/upgrade) — VillageSQL로의 업그레이드가 시작되는 백업 만들기
+- [지원 종료 후 MySQL 8.0에서 8.4로 업그레이드하기](/ko/guides/mysql-80-eol-upgrade) — 이 백업이 보호하는 8.0에서 8.4로의 업그레이드

@@ -1,0 +1,178 @@
+---
+title: "MySQL 쿼리에서 AI 모델 실행하기"
+sidebarTitle: "AI 프롬프트 실행하기"
+description: "VillageSQL의 ai_prompt() 함수를 사용하여 MySQL 쿼리에서 AI 언어 모델을 직접 호출하는 방법 — 행 보강, 데이터 분류, 텍스트 일괄 처리."
+keywords: "mysql ai prompt, mysql call ai model, mysql ai_prompt function, mysql llm query, mysql anthropic openai, mysql ai text generation"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL에는 AI 모델을 호출하는 방법이 없습니다. SQL로 데이터를 처리한 다음, AI 단계를 위해 애플리케이션 코드로 옮기고, 결과를 다시 가져와야 합니다. VillageSQL의 `vsql_ai` 확장은 `ai_prompt()`를 추가합니다 — 쿼리에서 AI 모델을 직접 호출하는 함수이므로, 보강, 분류, 생성이 데이터가 이미 있는 곳에서 이루어질 수 있습니다.
+
+## 문제: SQL과 AI 사이의 컨텍스트 전환 {#the-problem-context-switching-between-sql-and-ai}
+
+VillageSQL 없이 사용하는 일반적인 패턴:
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, review_text FROM reviews WHERE ai_label IS NULL")
+
+# Call AI for each row
+for row in rows:
+    label = openai.chat(model="gpt-4o-mini", prompt=row["review_text"])
+    db.execute("UPDATE reviews SET ai_label = ? WHERE id = ?", label, row["id"])
+```
+
+이 방식은 동작하지만 행마다 세 번의 왕복이 필요합니다: SELECT, AI 호출, UPDATE. 큰 테이블에서는 조정 오버헤드가 누적되고, 보강 로직은 데이터가 있는 스키마가 아니라 애플리케이션 코드에 존재하게 됩니다.
+
+## VillageSQL 사용: SQL에서 ai_prompt() {#with-villagesql-ai_prompt-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+`ai_prompt(provider, model, api_key, prompt)`는 API를 호출하고 응답을 문자열로 반환합니다. 스칼라 함수를 사용할 수 있는 모든 곳에서 사용하세요.
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+-- Enrich a single row
+SELECT review_text,
+       ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+                 CONCAT('Classify this review as positive, negative, or neutral: ', review_text)
+       ) AS sentiment
+FROM reviews
+WHERE id = 1;
+```
+
+### 행을 대량으로 업데이트하기 {#updating-rows-in-bulk}
+
+가장 일반적인 용도: 기존 행 전체에 보강 컬럼을 백필하기.
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_label VARCHAR(50);
+
+SET @key = 'sk-ant-your-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE reviews
+SET ai_label = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT('Classify as positive, negative, or neutral. Reply with one word only: ', review_text)
+)
+WHERE ai_label IS NULL
+LIMIT 100;  -- Process in batches to stay within rate limits
+```
+
+NULL 행이 더 이상 남지 않을 때까지 애플리케이션에서 루프로 UPDATE를 실행하세요.
+
+### WHERE에서 프롬프트 결과 사용하기 {#using-prompt-results-in-where}
+
+AI 출력으로 필터링할 수 있지만, 스캔하는 모든 행에 대해 모델을 호출합니다:
+
+```sql
+-- Flag reviews that need human review
+SELECT id, review_text FROM reviews
+WHERE ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+    CONCAT('Does this review mention a refund request? Reply yes or no: ', review_text)
+) = 'yes'
+LIMIT 20;
+```
+
+성능을 위해서는 WHERE 절에서 `ai_prompt()`를 호출하는 대신 저장된 컬럼을 업데이트하고 그 컬럼을 쿼리하는 방식을 권장합니다.
+
+### 여러 컬럼으로 프롬프트 구성하기 {#building-prompts-from-multiple-columns}
+
+모델에 전체 컨텍스트를 제공하려면 컬럼을 프롬프트에 연결하세요:
+
+```sql
+UPDATE support_tickets
+SET ai_summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Summarize this support ticket in one sentence.\n',
+        'Subject: ', subject, '\n',
+        'Body: ', body
+    )
+)
+WHERE ai_summary IS NULL
+LIMIT 50;
+```
+
+## 성능과 속도 제한 {#performance-and-rate-limits}
+
+각 `ai_prompt()` 호출은 독립적인 HTTPS 요청입니다. 대량 작업의 경우:
+
+- **UPDATE에서 LIMIT 사용** — AI 호출은 각각 5–30초가 걸리므로, 100행에 대한 배치 `UPDATE`는 몇 분이 걸립니다. 공급자 속도 제한을 지키려면 50–100행 단위로 배치 처리하세요. `max_execution_time`은 `SELECT`만 제한하며 여기서는 아무 효과가 없습니다 — 실행 중인 `UPDATE`를 중단하려면 다른 세션에서 `KILL QUERY <connection_id>`를 사용하세요.
+- **결과 저장** — 결과를 저장하지 않고 SELECT에서 `ai_prompt()`를 호출하지 마세요. 반복되는 SELECT는 매번 API 호출을 다시 실행합니다.
+
+```sql
+-- Batch loop pattern (run repeatedly until done)
+UPDATE reviews
+SET ai_label = ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+    CONCAT('Label as positive, negative, or neutral. One word: ', review_text))
+WHERE ai_label IS NULL
+LIMIT 100;
+
+-- Check progress
+SELECT COUNT(*) AS remaining FROM reviews WHERE ai_label IS NULL;
+```
+
+## 모델 선택 {#choosing-a-model}
+
+| 모델 | 속도 | 비용 | 사용 시기 |
+|:---|:---|:---|:---|
+| `claude-haiku-4-5` | 빠름 | 낮음 | 대량 분류, 단순 레이블링 |
+| `claude-sonnet-5` | 중간 | 중간 | 복잡한 추론, 세밀한 출력 |
+| `claude-opus-5` | 느림 | 높음 | 권장 기본값 — 에이전트 및 엔터프라이즈 작업 |
+| `claude-fable-5` | 느림 | 높음 | 가장 뛰어난 성능 — 까다로운 추론, 장기 작업 |
+| `gpt-4o-mini` | 빠름 | 낮음 | OpenAI 생태계, 단순 작업 |
+| `gemini-2.5-flash` | 빠름 | 낮음 | Google 생태계, 균형 잡힌 작업 |
+
+분류와 레이블링 작업에는 허용 가능한 정확도를 내는 가장 빠르고 저렴한 모델을 사용하세요. 처리량보다 출력 품질이 더 중요한 작업에만 더 뛰어난 모델을 사용하세요.
+
+설정과 공급자 구성은 [MySQL을 AI API에 연결하기](/ko/guides/ai-api-setup)를 참조하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### DEFAULT 표현식에서 ai_prompt()를 사용할 수 있나요? {#can-i-use-ai_prompt-in-a-default-expression}
+
+아니요 — MySQL에서는 비결정적 함수(`ai_prompt()`가 여기에 해당)를 DEFAULT 표현식이나 생성 컬럼에 사용할 수 없습니다.
+
+#### 저장 프로시저에서 ai_prompt()를 사용할 수 있나요? {#can-i-use-ai_prompt-in-a-stored-procedure}
+
+예. 저장 프로시저, 트리거, 함수 모두 동일한 타임아웃 제약 아래에서 `ai_prompt()`를 호출할 수 있습니다. 트리거에는 주의하세요 — 모든 INSERT마다 AI를 호출하면 모든 쓰기가 느려집니다.
+
+#### 응답 형식은 어떻게 제어하나요? {#how-do-i-control-the-response-format}
+
+프롬프트로 제어합니다. "Reply with one word: positive, negative, or neutral"은 분류에 예측 가능한 출력을 줍니다. "Return valid JSON with keys: category, confidence"는 구조화된 출력을 줍니다. 지시가 구체적이면 모델은 지시를 안정적으로 따릅니다.
+
+#### ai_prompt()는 실패 시 재시도하나요? {#does-ai_prompt-retry-on-failure}
+
+아니요. API 호출이 실패하면 NULL을 반환합니다. 애플리케이션의 배치 루프에 재시도 로직을 구현하기 전에 `SHOW WARNINGS`를 실행하여 원인을 확인하세요 — `vsql_ai`는 실제 실패 원인을 담은 `Warning 3200`을 발생시킵니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | `INSTALL EXTENSION vsql_ai` 실행 |
+| NULL을 반환함 | 잘못된 API 키, 속도 제한 도달, 또는 타임아웃 — `max_execution_time` 확인 |
+| 응답이 문장 중간에 끊김 | `SHOW WARNINGS` 실행 — "Prompt response truncated to fit the result buffer" 경고는 답변이 결과에 들어가지 않았다는 뜻이므로, 모델에 더 짧은 답변을 요청하세요 |
+| UPDATE가 너무 오래 실행됨 | 더 작은 `LIMIT` 배치 사용; `max_execution_time`은 `UPDATE`에 적용되지 않으므로 대신 다른 세션에서 `KILL QUERY <connection_id>` 사용 |
+| 모델이 예상치 못한 형식을 반환함 | 프롬프트를 더 엄격하게: 정확한 출력 형식을 지정하고 예시를 제공 |
+| 속도 제한 오류 | 배치 크기 축소; UPDATE 배치 사이에 `SELECT SLEEP(1);` 추가, 또는 애플리케이션 루프에 sleep 추가 |
+
+## 참고 {#see-also}
+
+- [MySQL을 AI API에 연결하기](/ko/guides/ai-api-setup) — 먼저 vsql_ai 확장 설치 및 구성하기
+- [MySQL에서 AI 요약하기](/ko/guides/ai-summarization) — ai_prompt()로 긴 텍스트 요약하기
+- [AI로 MySQL에서 텍스트 분류하기](/ko/guides/text-classification) — ai_prompt()를 사용하여 범주별로 행에 레이블 지정하기
+- [MySQL 데이터의 감정 분석](/ko/guides/sentiment-analysis) — 텍스트의 어조와 감정 점수 매기기

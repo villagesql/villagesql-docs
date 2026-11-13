@@ -1,0 +1,195 @@
+---
+title: "MySQL 문자 집합과 콜레이션"
+sidebarTitle: "문자 집합 선택하기"
+description: "MySQL 문자 집합과 콜레이션의 동작 방식: utf8mb4와 utf8 비교, 콜레이션 선택, 데이터베이스와 컬럼 수준에서 문자 집합 설정, 정렬 동작, 문자 집합 문제 해결."
+keywords: "mysql character set, mysql collation, mysql utf8mb4, mysql utf8 vs utf8mb4, mysql charset, mysql unicode, mysql collation comparison, mysql set charset, mysql character encoding"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL의 문자 집합은 문자열이 저장되는 방식(어떤 바이트가 어떤 문자를 나타내는지)을 제어합니다. 콜레이션은 문자열이 비교되고 정렬되는 방식을 제어합니다. 처음부터 이를 올바르게 설정하면 나중에 고치기 어려운 손상된 데이터와 잘못된 정렬을 피할 수 있습니다.
+
+## utf8mb4 — 올바른 기본값 {#utf8mb4--the-right-default}
+
+항상 `utf8mb4`를 사용하세요. MySQL의 `utf8`(`mb4`가 없는)은 4바이트 유니코드 문자를 저장할 수 없는 3바이트 인코딩입니다 — 여기에는 이모지, 많은 한자, 다양한 기호가 포함됩니다. `utf8mb4`는 완전한 UTF-8 인코딩입니다.
+
+```sql
+-- Verify your database is using utf8mb4
+SHOW CREATE DATABASE myapp;
+-- Should show: DEFAULT CHARACTER SET utf8mb4
+```
+
+`utf8`을 사용하는 레거시 데이터베이스를 쓰고 있다면, `utf8mb4`로 마이그레이션하려면 데이터베이스, 테이블, 컬럼을 변환해야 합니다.
+
+### 문자 집합 빠른 참조 {#character-set-quick-reference}
+
+| 문자 집합 | 사용할 때 | 피해야 할 때 | 잘못 선택했을 때의 마이그레이션 비용 |
+|:-------------|:---------|:-----------|:------------------------|
+| `utf8mb4` | 모든 새 스키마 — 이모지와 현대 CJK를 포함한 모든 유니코드 처리 | 새 작업에서는 피할 이유가 없음 | 해당 없음 — 올바른 기본값 |
+| `utf8`(레거시 3바이트) | 사용하지 말 것 — 유지할 유일한 이유는 마이그레이션 윈도를 잡을 수 없는 경우 | 이모지, 보충 CJK 문자, 또는 모든 4바이트 유니코드 저장 | 중간 — `ALTER TABLE … CONVERT TO CHARACTER SET utf8mb4`; 영향을 받는 모든 테이블 재구축 |
+| `latin1` | 레거시 스키마의 단일 바이트 서유럽 텍스트; ASCII 전용 데이터에서 `utf8mb4`보다 약간 작은 저장 공간 | 사용자 생성 콘텐츠, 다국어 데이터, 웹과 관련된 모든 것 | 높음 — 바이너리 안전 변환이 자동으로 되지 않음; latin1 범위 밖의 데이터는 조용히 손상됨 |
+| `binary` / `BLOB` | 원시 바이트 — 파일 내용, 암호화 해시, 패킹된 바이너리 형식 | 검색, 정렬, 표시할 텍스트 | 낮음 — `BINARY` 컬럼에는 문자 집합 의미가 없음; 텍스트 문자 집합으로 변환하려면 애플리케이션 수준 디코딩 필요 |
+
+비용 열은 문자 집합 자체의 성능 비용이 아니라 나중에 잘못된 선택을 고치는 데 필요한 작업에 관한 것입니다. `latin1`이 함정입니다: 오류 없이 모든 바이트 값을 받아들이므로 잘못된 데이터가 조용히 들어오고, 표시하거나 변환하려 할 때에야 드러납니다.
+
+## 콜레이션 {#collations}
+
+콜레이션은 정렬 순서와 비교 동작을 결정합니다. 일반적인 선택:
+
+| 콜레이션 | 정렬 동작 | 대소문자 구분 | 악센트 구분 |
+|:----------|:-------------|:--------------|:----------------|
+| `utf8mb4_general_ci` | 근사 유니코드 순서 | 아니요 | 아니요 |
+| `utf8mb4_unicode_ci` | 완전한 유니코드 알고리즘 | 아니요 | 아니요 |
+| `utf8mb4_0900_ai_ci` | 유니코드 9.0, 가장 정확 | 아니요 | 아니요 |
+| `utf8mb4_bin` | 바이너리(바이트 단위) | 예 | 예 |
+| `utf8mb4_0900_as_cs` | 유니코드 9.0 | 예 | 예 |
+
+`utf8mb4_0900_ai_ci`는 기본 콜레이션이며 가장 좋은 범용 선택입니다. 유니코드를 올바르게 처리하고, 대소문자를 구분하지 않으며(`ci`), 악센트를 구분하지 않습니다(`ai`). 정확한 바이트 일치가 필요할 때만 `utf8mb4_bin`을 사용하세요.
+
+`ci` = 대소문자 구분 안 함, `cs` = 대소문자 구분, `ai` = 악센트 구분 안 함, `as` = 악센트 구분.
+
+## 문자 집합 설정 {#setting-character-sets}
+
+**데이터베이스 생성 시:**
+```sql
+CREATE DATABASE myapp
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_0900_ai_ci;
+```
+
+**테이블 생성 시:**
+```sql
+CREATE TABLE users (
+    id   INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+**컬럼 수준(테이블 기본값 재정의):**
+```sql
+CREATE TABLE products (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(100),
+    description TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+);
+```
+
+컬럼 수준 문자 집합은 테이블의 나머지 부분은 대소문자를 구분하지 않으면서 한 컬럼만 대소문자를 구분하는 일치가 필요할 때 유용합니다.
+
+**컬럼의 문자 집합 변경:**
+```sql
+ALTER TABLE users
+MODIFY name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+**테이블 전체 변환:**
+```sql
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+`CONVERT TO`는 한 문장으로 모든 컬럼을 변경합니다. 테이블을 재구축하므로 테이블 크기에 비례하는 시간이 걸립니다.
+
+## 문자 집합 확인 {#checking-character-sets}
+
+```sql
+-- Database level
+SHOW CREATE DATABASE myapp;
+
+-- Table and column level
+SHOW CREATE TABLE users;
+
+-- Connection level
+SHOW VARIABLES LIKE 'character_set%';
+SHOW VARIABLES LIKE 'collation%';
+```
+
+`SHOW CREATE TABLE` 출력에서 문자 집합이 표시되지 않는 컬럼은 테이블 기본값을 상속하고 있는 것입니다.
+
+## 연결 문자 집합 {#connection-character-set}
+
+연결 문자 집합은 MySQL이 클라이언트로부터 기대하고 문자열 리터럴에 사용하는 인코딩을 제어합니다. 항상 명시적으로 설정하세요:
+
+```sql
+SET NAMES utf8mb4;
+-- equivalent to:
+SET character_set_client = utf8mb4;
+SET character_set_results = utf8mb4;
+SET character_set_connection = utf8mb4;
+```
+
+대부분의 드라이버는 연결 문자열에서 문자 집합을 설정하면 이를 자동으로 수행합니다. 연결은 기본적으로 `utf8mb4`이므로 명시적인 재정의가 필요한 경우는 드뭅니다.
+
+## 콜레이션이 쿼리에 미치는 영향 {#collation-effects-on-queries}
+
+콜레이션은 `WHERE`, `ORDER BY`, 고유성에 영향을 줍니다:
+
+```sql
+-- utf8mb4_0900_ai_ci: these three are equal
+SELECT * FROM users WHERE name = 'alice';  -- matches Alice, ALICE, alice
+
+-- utf8mb4_bin: exact match only
+SELECT * FROM users WHERE name COLLATE utf8mb4_bin = 'alice';  -- only 'alice'
+```
+
+컬럼의 기본값과 다른 콜레이션으로 정렬하려면:
+
+```sql
+SELECT name FROM users ORDER BY name COLLATE utf8mb4_unicode_ci;
+```
+
+## utf8에서 utf8mb4로 변환하기 {#converting-from-utf8-to-utf8mb4}
+
+레거시 데이터베이스가 `utf8`(3바이트)을 사용한다면 변환하세요:
+
+```sql
+-- Convert one table
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+-- Update the database default
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+새 연결의 기본값을 `utf8mb4`로 만들기 위해 서버 구성도 업데이트하세요:
+
+```ini
+[mysqld]
+character_set_server = utf8mb4
+collation_server = utf8mb4_0900_ai_ci
+
+[client]
+default-character-set = utf8mb4
+```
+
+큰 테이블의 변환은 시간이 걸리고 테이블을 재구축합니다. 유지 보수 윈도 중에 예약하거나 온라인 스키마 변경 도구를 사용하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### MySQL의 `utf8`은 왜 이모지를 지원하지 않나요? {#why-does-utf8-in-mysql-not-support-emoji}
+
+MySQL의 `utf8`은 4바이트 유니코드 확장보다 앞선 비표준 3바이트 UTF-8 부분 집합입니다. 이모지(와 다른 많은 현대 유니코드 문자)는 4바이트가 필요합니다. `utf8mb4`가 UTF-8의 올바른 완전한 구현입니다. 이전 `utf8` 별칭은 하위 호환성을 위해서만 존재합니다 — 새 스키마에는 절대 사용하지 마세요.
+
+#### 콜레이션 변경이 기존 데이터에 영향을 주나요? {#does-changing-collation-affect-existing-data}
+
+콜레이션 변경은 저장된 바이트를 변경하지 않습니다. 그 바이트가 비교되고 정렬되는 방식을 변경합니다. 다만 고유 인덱스는 콜레이션을 사용하여 적용되므로, `_bin`에서 `_ci`로 변경하면 먼저 해결해야 하는 충돌(`Alice`와 `alice`가 같아짐)이 드러날 수 있습니다.
+
+#### 어떤 콜레이션을 사용해야 하나요? {#which-collation-should-i-use}
+
+대부분의 사용 사례에는 `utf8mb4_0900_ai_ci` — 기본 콜레이션이며 유니코드를 잘 처리합니다. 정확한 바이트 일치가 필요할 때만 `utf8mb4_bin`을 사용하세요. 새 프로젝트에서는 `utf8mb4_general_ci`를 피하세요 — `_0900_ai_ci`보다 오래되었고 일부 유니코드 경계 사례를 잘못 처리합니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| 이모지가 `????`로 저장됨 | 컬럼 또는 연결이 `utf8`(3바이트)을 사용 중 — `utf8mb4`로 변환 |
+| `Incorrect string value` 오류 | 컬럼의 문자 집합이 인코딩할 수 없는 문자를 삽입 중 — 컬럼을 `utf8mb4`로 변환 |
+| 정렬 순서가 잘못됨 | 콜레이션 불일치 — `SHOW CREATE TABLE`을 확인하고 `ORDER BY`에 명시적인 `COLLATE` 설정 |
+| 대소문자 구분 비교가 동작하지 않음 | 컬럼이 `_ci` 콜레이션을 사용 — WHERE 절에서 `COLLATE utf8mb4_bin`을 사용하거나 컬럼의 콜레이션 변경 |
+| `Illegal mix of collations` 오류 | 다른 콜레이션을 가진 컬럼이나 리터럴을 비교 중 — `COLLATE`를 추가하여 일치시키거나 컬럼 변환 |
+
+## 참고 {#see-also}
+
+- [MySQL 문자열 함수](/ko/guides/string-functions) — 동작이 콜레이션에 따라 달라지는 문자열 함수
+- [MySQL의 utf8mb4: 이모지와 완전한 유니코드 저장하기](/ko/guides/utf8mb4) — utf8 대 utf8mb4 함정과 이모지 저장
+- [MySQL 대소문자 구분](/ko/tutorial/case-sensitivity) — 콜레이션이 비교에서 결정하는 것

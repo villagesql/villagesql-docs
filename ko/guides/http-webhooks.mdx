@@ -1,0 +1,164 @@
+---
+title: "트리거에서 웹훅 보내기"
+sidebarTitle: "HTTP 웹훅"
+description: "VillageSQL의 vsql_http 확장을 사용하여 MySQL 트리거에서 HTTP 웹훅을 보내는 방법 — INSERT, UPDATE, DELETE 시 행 변경을 외부 서비스로 자동으로 푸시하기."
+keywords: "mysql webhook trigger, mysql http trigger, mysql after insert webhook, mysql push notification, vsql_http trigger"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+외부 시스템을 데이터베이스와 동기화하려면 보통 폴링이 필요합니다 — 외부 서비스가 주기적으로 여러분의 API에 변경 사항을 조회하거나, 애플리케이션 코드가 모든 쓰기 후에 이벤트를 발행합니다. VillageSQL의 `vsql_http` 확장을 사용하면 트리거가 HTTP 요청을 직접 보낼 수 있으므로, 애플리케이션 계층의 이벤트 발행 없이도 행이 바뀌는 순간 외부 시스템에 알림이 갑니다.
+
+## 설정 {#setup}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+## 기본 웹훅 트리거 {#basic-webhook-trigger}
+
+웹훅 엔드포인트에 페이로드를 POST하는 `AFTER INSERT` 트리거:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',     'order.created',
+    'id',        NEW.id,
+    'customer',  NEW.customer_id,
+    'total',     NEW.total,
+    'status',    NEW.status
+  );
+  SET @ignored = vsql_http.http_post(
+    'https://hooks.example.com/orders',
+    'application/json',
+    @payload
+  );
+END$$
+DELIMITER ;
+```
+
+결과는 `@ignored`에 할당됩니다 — 트리거는 응답을 사용하지 않지만, 할당이 "result not used" 경고를 억제합니다. NULL은 연결이 실패했다는 뜻이며, 어느 쪽이든 트리거는 완료되고 INSERT는 진행됩니다.
+
+## 타임아웃 제어 {#controlling-timeouts}
+
+기본적으로 `vsql_http`는 30초 타임아웃을 사용합니다. 느리거나 사용할 수 없는 웹훅 엔드포인트는 그 시간 동안 쓰기를 블로킹합니다. 더 짧은 기한을 설정하려면 옵션 JSON과 함께 `http_request()`를 사용하세요:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',    'order.created',
+    'id',       NEW.id,
+    'customer', NEW.customer_id,
+    'total',    NEW.total
+  );
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    NULL,
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+3초 타임아웃은 웹훅 지연이 쓰기를 붙잡을 수 있는 시간에 상한을 둡니다. 요청은 완료되거나 포기합니다 — INSERT는 롤백되지 않습니다.
+
+## UPDATE와 DELETE 트리거 {#update-and-delete-triggers}
+
+같은 패턴이 갱신과 삭제에도 동작합니다. 이전 값을 포함하려면 `OLD`를 사용하세요:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_update
+  AFTER UPDATE ON orders
+  FOR EACH ROW
+BEGIN
+  IF NEW.status != OLD.status THEN
+    SET @payload = JSON_OBJECT(
+      'event',      'order.status_changed',
+      'id',         NEW.id,
+      'old_status', OLD.status,
+      'new_status', NEW.status
+    );
+    SET @ignored = vsql_http.http_request(
+      'POST',
+      'https://hooks.example.com/orders',
+      NULL,
+      @payload,
+      'application/json',
+      '{"timeout": 3}'
+    );
+  END IF;
+END$$
+DELIMITER ;
+```
+
+`IF NEW.status != OLD.status` 가드는 상태를 바꾸지 않는 UPDATE 문에서 웹훅이 호출되는 것을 막아, 웹훅 양을 의미 있는 변경에 비례하게 유지합니다.
+
+## 인증 {#authentication}
+
+API 키나 베어러 토큰은 `http_request()`의 `headers_json` 인자로 전달하세요:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT('id', NEW.id, 'total', NEW.total);
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    '{"Authorization": "Bearer your-webhook-secret"}',
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+비밀은 트리거 본문에 하드코딩하는 대신 구성 테이블에 저장하고 트리거 시점에 변수로 가져오세요.
+
+## 중요한 주의 사항 {#important-caveats}
+
+**트리거는 동기적입니다.** HTTP 호출은 완료되거나 타임아웃될 때까지 블로킹됩니다. 느리거나 다운된 웹훅 엔드포인트는 그 테이블에 대한 모든 쓰기를 붙잡습니다. 항상 짧은 타임아웃(2–5초)을 설정하고, 엔드포인트가 즉시 응답하도록 설계하세요(작업을 큐에 넣고, 인라인으로 처리하지 마세요).
+
+**실패는 기본적으로 조용합니다.** HTTP 호출이 NULL을 반환하면(연결 실패) 트리거는 오류를 발생시키지 않고 쓰기는 성공합니다 — 경고가 curl의 오류 메시지를 담지만, 트리거 안의 어떤 것도 그것을 검사하지 않습니다. 2xx가 아닌 응답도 조용히 반환됩니다 — `http_post()`는 상태 코드와 관계없이 JSON을 반환하며, 트리거는 그것을 검사하지 않습니다. 신뢰할 수 있는 전달이 중요하다면 대신 트랜잭션 아웃박스 패턴을 사용하세요: 같은 트랜잭션에서 이벤트를 `outbox` 테이블에 쓴 다음, 별도의 프로세스로 전달합니다.
+
+**트리거는 행마다 한 번 실행됩니다.** `FOR EACH ROW`는 대량 `UPDATE orders SET status = 'shipped'`가 1000행에 영향을 주면 1000번의 웹훅 호출을 보낸다는 뜻입니다. 이것은 엔드포인트에 과부하를 주고 연결 한도를 소진할 수 있습니다. 대량 작업에는 트리거를 억제하거나 아웃박스 패턴을 사용하세요.
+
+**재시도 로직이 없습니다.** 실패한 요청은 실패한 채로 남습니다. 재시도와 데드 레터 처리는 트리거가 아니라 수신 시스템이나 아웃박스 프로세스에 구축하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| 쓰기가 느려짐 | 웹훅 엔드포인트가 느림 — `http_request()` 옵션에 짧은 타임아웃을 설정하세요 |
+| 생성 시 트리거 본문 오류 | `CREATE TRIGGER` 전에 `DELIMITER $$`가 설정되어 있는지 확인하세요 |
+| 웹훅이 수신되지 않음 | NULL 반환은 연결 실패를 뜻합니다 — `SHOW WARNINGS`로 curl의 오류 메시지를 확인하고, 서버 호스트에서의 네트워크 접근을 검증하세요 |
+| 대량 UPDATE 시 웹훅 호출이 너무 많음 | `IF NEW.col != OLD.col`로 가드하거나 배치 작업에는 트리거를 억제하세요 |
+
+## 다음 단계 {#next-steps}
+
+- [SQL에서 HTTP 요청 보내기](/ko/guides/http-requests-in-mysql) — 응답 파싱을 포함한 전체 함수 참조
+- [API 데이터로 행 보강하기](/ko/guides/rest-api-enrichment) — 외부 데이터를 테이블로 가져오기
+- [MySQL의 트리거](/ko/guides/triggers) — 일반적인 트리거 패턴과 BEFORE 대 AFTER 의미론
+
+## 참고 {#see-also}
+
+- [SQL에서 HTTP 요청 보내기](/ko/guides/http-requests-in-mysql) — 웹훅 트리거에 쓰이는 vsql_http 함수
+- [MySQL 트리거](/ko/guides/triggers) — 웹훅을 호출하는 트리거 메커니즘
+- [MySQL의 HMAC 서명](/ko/guides/hmac-mysql) — 수신자 검증을 위한 웹훅 페이로드 서명

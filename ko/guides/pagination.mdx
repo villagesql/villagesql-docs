@@ -1,0 +1,97 @@
+---
+title: "MySQL의 페이지네이션: 키셋과 OFFSET"
+sidebarTitle: "결과 페이지 나누기"
+description: "OFFSET 페이지네이션이 깊은 페이지에서 느려지는 이유와, 키셋(커서) 페이지네이션이 10,000번째 페이지를 1번째 페이지만큼 빠르게 유지하는 방법입니다."
+keywords: "mysql pagination, keyset pagination, cursor pagination mysql, limit offset slow, mysql offset performance, seek method"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`LIMIT 20 OFFSET 200000`은 200,020행을 읽고 그중 200,000행을 버립니다. 버그가 아닙니다. OFFSET의 뜻이 그것입니다. 서버는 임의의 정렬에서 200,001번째 행으로 건너뛸 방법이 없으므로 거기까지 걸어갑니다. 1페이지는 빠르고, 10,000페이지는 느리며, 느려짐은 페이지 깊이에 선형으로 커집니다. 키셋 페이지네이션은 맨 위에서부터 세는 대신 마지막 페이지가 끝난 자리를 기억해 이를 해결합니다.
+
+## OFFSET 페이지네이션: 괜찮다가 어느 순간 괜찮지 않게 된다 {#offset-pagination-fine-until-it-isnt}
+
+익숙한 패턴:
+
+```sql
+SELECT id, title, created_at
+FROM articles
+ORDER BY id
+LIMIT 20 OFFSET 40;   -- page 3
+```
+
+얕은 페이징에는 괜찮습니다: 관리자 화면, 사람이 20페이지 너머로는 결코 스크롤하지 않을 결과 집합이 그렇습니다. 문제는 깊은 곳에서 나타납니다:
+
+- **비용이 페이지 번호에 따라 커집니다.** `OFFSET 200000`은 무엇이든 반환하기 전에 200,000개의 인덱스 항목을 스캔하고 버립니다.
+- **요청 사이에 행이 이동합니다.** 사용자가 페이지를 넘기는 동안 행이 삽입되면 페이지 경계가 움직이고, 사용자는 중복을 보거나 행을 놓칩니다.
+
+## 키셋 페이지네이션: 멈춘 자리 기억하기 {#keyset-pagination-remember-where-you-stopped}
+
+행을 세는 대신 클라이언트가 마지막으로 본 값으로 필터링하세요:
+
+```sql
+-- First page
+SELECT id, title, created_at
+FROM articles
+ORDER BY id
+LIMIT 20;
+
+-- Next page: the client sends back the last id it received (say, 20)
+SELECT id, title, created_at
+FROM articles
+WHERE id > 20
+ORDER BY id
+LIMIT 20;
+```
+
+`WHERE id > 20` 절은 서버가 인덱스 안으로 직접 탐색해 페이지가 아무리 깊어도 정확히 20행만 읽게 합니다. 10,000페이지의 비용은 1페이지와 같습니다. 경계가 위치가 아니라 값이므로, 삽입된 행이 페이지 경계를 이동시킬 수 없습니다.
+
+트레이드오프: 키셋 페이지네이션은 다음과 이전을 제공하지만 "47페이지로 건너뛰기"는 제공하지 않습니다. 무한 스크롤과 API에서는 보통 그것이 어차피 원하던 인터페이스입니다.
+
+## 키가 아닌 것으로 정렬하기 {#sorting-by-something-other-than-the-key}
+
+실제 목록은 `id`로 정렬하는 경우가 드뭅니다. 고유하지 않은 열로 정렬하면 타이브레이커가 필요합니다. 그렇지 않으면 같은 값을 가진 행이 페이지에 걸쳐 건너뛰어지거나 반복됩니다. 클라이언트는 마지막으로 본 행의 두 값을 모두 돌려보내고, 쿼리는 둘 다로 비교합니다:
+
+```sql
+-- Sorted by created_at, with id as the tiebreaker
+SELECT id, title, created_at
+FROM articles
+WHERE created_at > '2026-08-01 12:00:00'
+   OR (created_at = '2026-08-01 12:00:00' AND id > 143)
+ORDER BY created_at, id
+LIMIT 20;
+```
+
+SQL에는 더 짧은 행 생성자 표기 `WHERE (created_at, id) > ('2026-08-01 12:00:00', 143)`도 있습니다. 같은 행을 반환하지만, MySQL의 옵티마이저는 이를 인덱스 범위 탐색으로 변환하지 않습니다: `EXPLAIN`은 행 생성자에 대해 전체 스캔(쿼리가 인덱스로 커버되는지에 따라 `type: ALL` 또는 `type: index`)을, 위의 풀어 쓴 형태에 대해 탐색(`type: range`)을 보여줍니다. 풀어 쓴 형태를 사용하세요.
+
+어느 쪽이든 인덱스는 ORDER BY와 일치해야 합니다:
+
+```sql
+CREATE INDEX idx_articles_created_id ON articles (created_at, id);
+```
+
+`EXPLAIN`으로 계획을 확인하세요: 그 인덱스에 `type: range`가 나오고 filesort가 없어야 합니다. 무엇을 살펴야 하는지는 [EXPLAIN 읽기](/ko/guides/reading-explain)를 참고하세요.
+
+## 전체 개수가 필요한가요? {#do-you-need-a-total-count}
+
+큰 필터링된 집합에 대한 `SELECT COUNT(*)`는 페이지 쿼리 자체보다 비용이 더 클 수 있습니다. 키셋 페이지네이션 위에 만든 인터페이스는 보통 정확한 개수를 버리고 "더 보기" 기능을 택합니다. 제품에 정말로 개수가 필요하다면, 요청마다 세는 대신 캐시하거나 요약 테이블에서 유지하세요.
+
+## 무엇을 쓸 것인가 {#which-one-to-use}
+
+| 상황 | 사용 |
+|---|---|
+| 관리자 테이블, 수백 행 | OFFSET, 더 간단함 |
+| 사용자가 사이를 오갈 수 있는 번호 매긴 페이지 링크 | OFFSET, 키셋은 임의 페이지로 건너뛸 수 없음 |
+| API 결과 페이지네이션 | 키셋, 불투명한 커서 반환 |
+| 무한 스크롤 | 키셋 |
+| 약 10만 행을 넘어 커질 수 있는 모든 목록 | 키셋 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 인덱스](/ko/guides/mysql-indexes) — 키셋 페이지네이션이 의존하는 인덱스 설계
+- [EXPLAIN 읽기](/ko/guides/reading-explain) — 스캔 대신 탐색임을 확인하기
+- [기본 키 전략](/ko/guides/primary-key-strategies) — 정렬 가능한 키(UUIDv7 같은)는 좋은 커서가 됩니다
+- [MySQL LIMIT](/ko/tutorial/limit) — LIMIT과 OFFSET에 대한 튜토리얼 레슨
+- [MySQL ORDER BY](/ko/tutorial/order-by) — 페이징이 의존하는 정렬

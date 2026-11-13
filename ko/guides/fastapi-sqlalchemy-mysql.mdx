@@ -1,0 +1,350 @@
+---
+title: "MySQL과 함께하는 FastAPI와 SQLAlchemy 2.0"
+sidebarTitle: "SQLAlchemy와 함께하는 FastAPI"
+description: "SQLAlchemy 2.0의 타입 ORM, 비동기 드라이버, Alembic 마이그레이션으로 MySQL 위에 비동기 FastAPI 앱을 구축하는 방법 — greenlet 의존성과 그 밖의 실제 설정 함정을 포함합니다."
+keywords: "fastapi mysql, sqlalchemy 2.0 async, fastapi sqlalchemy, asyncmy, aiomysql, alembic async migration, sqlalchemy mapped_column, fastapi depends session, villagesql fastapi"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+FastAPI의 비동기 요청 처리는 그 아래의 데이터베이스 호출도 비동기일 때만 효과가 있습니다. SQLAlchemy 2.0은 타입 ORM 스타일과 비동기 엔진으로 이를 지원하지만, 둘을 MySQL에 연결하는 데는 처음에 틀리기 쉬운 설정 단계가 몇 가지 있습니다.
+
+## 비동기 드라이버 선택하기 {#choosing-an-async-driver}
+
+SQLAlchemy 2.0은 두 가지 비동기 MySQL 드라이버인 `asyncmy`와 `aiomysql`을 위한 방언을 제공합니다. 어느 쪽도 다른 쪽보다 공식 권장으로 문서화되어 있지 않습니다. `asyncmy`는 Cython으로 작성된 컴파일된 드라이버로 현재 Python 버전용으로 미리 빌드된 휠을 제공하며, 이 가이드에서 사용하는 이유입니다:
+
+```bash
+pip install "sqlalchemy[asyncio]" asyncmy cryptography
+```
+
+`sqlalchemy[asyncio]` 대신 그냥 `sqlalchemy`를 설치하는 것이 첫 번째 실제 함정입니다. SQLAlchemy의 비동기 ORM 계층은 `greenlet` 라이브러리로 비동기 코드와 동기 코드를 잇는데, 이는 기본 패키지의 의존성이 아닙니다. `[asyncio]` 추가 항목을 건너뛰면 비동기 엔진을 처음 건드릴 때 다음 오류가 발생합니다:
+
+```
+ValueError: the greenlet library is required to use this function. No module named 'greenlet'
+```
+
+해결 방법은 `pip install greenlet`이거나, 더 좋게는 항상 `[asyncio]` 추가 항목과 함께 SQLAlchemy를 설치하여 자동으로 가져오게 하는 것입니다.
+
+두 번째 함정은 `cryptography`입니다. MySQL 8과 VillageSQL은 새 계정에 기본적으로 `caching_sha2_password` 인증 플러그인을 사용하는데, 이 플러그인은 특정 계정이 특정 클라이언트 라이브러리에서 처음 인증할 때 비밀번호를 보내기 위해 RSA 키 교환이 필요합니다. `asyncmy`는 RSA 구현을 번들하지 않으므로, 이 전체 핸드셰이크를 해야 하는 연결은 다음과 같이 실패합니다:
+
+```
+RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods
+```
+
+계정이 (`mysql` CLI를 포함한 어떤 클라이언트에서든) 전체 인증을 한 번 완료하면 서버가 결과를 캐시하고 이후 연결은 RSA 단계를 건너뛰는 더 빠른 경로를 사용합니다. 이것이 이 오류가 가장 최근에 그 계정에 무엇이 연결했는지에 따라 나타났다 사라졌다 하는 것처럼 보이는 이유입니다. `cryptography`를 미리 설치하면 그 캐시에 대한 의존성이 완전히 없어지며, 이것이 확실한 해결 방법입니다.
+
+## 데이터베이스와 사용자 만들기 {#creating-the-database-and-user}
+
+root로 연결하기보다 전용 데이터베이스와 애플리케이션 사용자를 만드세요:
+
+```sql
+CREATE DATABASE IF NOT EXISTS fastapi_guide CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS 'fastapi_app'@'127.0.0.1' IDENTIFIED BY 'fastapi_pw_123!';
+GRANT ALL PRIVILEGES ON fastapi_guide.* TO 'fastapi_app'@'127.0.0.1';
+```
+
+사용자는 `localhost`가 아니라 `127.0.0.1`로 범위가 지정됩니다. 이 가이드의 연결 문자열은 TCP로 `127.0.0.1`에 연결하므로 권한 부여가 그 호스트와 일치해야 합니다. Unix 소켓 연결은 계정의 IP 기반 권한 부여와 관계없이 `localhost`에 대조됩니다.
+
+## 프로젝트 레이아웃 {#project-layout}
+
+```
+fastapi-sqlalchemy-mysql/
+├── alembic/
+│   ├── env.py
+│   └── versions/
+├── alembic.ini
+├── app/
+│   ├── __init__.py
+│   ├── database.py
+│   ├── models.py
+│   ├── schemas.py
+│   └── main.py
+└── requirements.txt
+```
+
+`requirements.txt`:
+
+```
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]>=2.0
+asyncmy
+cryptography
+alembic
+pydantic
+```
+
+## 비동기 엔진과 세션 {#the-async-engine-and-session}
+
+`app/database.py`는 비동기 엔진, 세션 팩토리, 모든 모델이 사용하는 선언적 베이스를 만듭니다:
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+DATABASE_URL = "mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide"
+
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+
+`expire_on_commit=False`는 FastAPI에서 중요합니다. 기본값 `expire_on_commit=True`에서는 커밋된 객체의 모든 속성이 오래된 것으로 표시되고, 그 속성을 다음에 읽을 때 새로 고치기 위해 새 `SELECT`가 발행됩니다. `await` 바깥에서 촉발되면 그 새로 고침은 다음과 같이 실패합니다:
+
+```
+sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() here. Was IO attempted in an unexpected place?
+```
+
+그리고 세션이 완전히 닫힌 후에는 같은 속성 읽기가 대신 다음과 같이 실패합니다:
+
+```
+sqlalchemy.orm.exc.DetachedInstanceError: Instance <Post at 0x...> is not bound to a Session; attribute refresh operation cannot proceed
+```
+
+`expire_on_commit=False`는 이미 로드된 값을 커밋 후에도 객체에서 사용할 수 있게 유지하여 둘 다 피합니다.
+
+`get_session()`은 제너레이터 함수이므로, FastAPI의 `Depends()`가 요청이 성공하든 예외를 발생시키든 요청이 끝난 후 세션을 자동으로 닫을 수 있습니다.
+
+## 모델 {#the-model}
+
+`app/models.py`는 레거시 `Column` 전용 스타일 대신 SQLAlchemy 2.0의 타입 선언적 스타일인 `Mapped`와 `mapped_column`을 사용하여 `Post` 테이블을 정의합니다:
+
+```python
+import datetime
+
+from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database import Base
+
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+```
+
+`server_default=func.now()`는 타임스탬프 기본값을 MySQL 자체로 넘기므로, 애플리케이션 바깥에서 삽입된 행에도 올바르게 설정됩니다.
+
+## Alembic 설정하기 {#setting-up-alembic}
+
+비동기 엔진에 맞게 이미 연결된 `env.py`를 생성하는 비동기 템플릿으로 Alembic을 초기화합니다:
+
+```bash
+alembic init -t async alembic
+```
+
+이 명령은 프로젝트 디렉토리 안에서 실행하세요. Alembic은 `init`에 주어진 경로와 관계없이 `alembic.ini`를 현재 작업 디렉토리에 쓰며, `alembic/` 스크립트 폴더 자체는 주어진 경로에 만들어집니다. 잘못된 디렉토리에서 실행하면 예상치 못한 곳에 `alembic.ini`가 남습니다.
+
+`alembic.ini`가 실제 데이터베이스를 가리키게 합니다:
+
+```ini
+sqlalchemy.url = mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide
+```
+
+그런 다음 autogenerate가 모델을 볼 수 있도록 `alembic/env.py`를 편집하여 모델을 가져옵니다:
+
+```python
+from app.database import Base
+from app.models import Post  # noqa: F401  (registers Post on Base.metadata)
+
+target_metadata = Base.metadata
+```
+
+마이그레이션을 생성하고 실행합니다:
+
+```bash
+alembic revision --autogenerate -m "create posts table"
+alembic upgrade head
+```
+
+autogenerate 단계가 새 테이블을 감지하고 마이그레이션을 작성했습니다:
+
+```
+INFO  [alembic.autogenerate.compare.tables] Detected added table 'posts'
+Generating alembic/versions/4f5ba2a8774a_create_posts_table.py ...  done
+```
+
+VillageSQL에 적용하는 데 성공했습니다:
+
+```
+INFO  [alembic.runtime.migration] Running upgrade  -> 4f5ba2a8774a, create posts table
+```
+
+실제 서버에서 직접 확인합니다:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SHOW TABLES;"
+```
+
+```
+Tables_in_fastapi_guide
+alembic_version
+posts
+```
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "DESCRIBE posts;"
+```
+
+```
+Field       Type          Null    Key     Default    Extra
+id          int           NO      PRI     NULL       auto_increment
+title       varchar(200)  NO              NULL
+body        text          NO              NULL
+created_at  datetime      NO              now()      DEFAULT_GENERATED
+```
+
+## Pydantic 스키마 {#the-pydantic-schemas}
+
+`app/schemas.py`는 ORM 모델과 별도로 요청과 응답의 형태를 정의합니다:
+
+```python
+import datetime
+
+from pydantic import BaseModel, ConfigDict
+
+
+class PostCreate(BaseModel):
+    title: str
+    body: str
+
+
+class PostRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    body: str
+    created_at: datetime.datetime
+```
+
+`from_attributes=True`는 `PostRead`가 딕셔너리 대신 `Post` ORM 인스턴스에서 직접 응답을 만들 수 있게 합니다.
+
+## FastAPI 라우트 {#the-fastapi-routes}
+
+`app/main.py`는 `Depends()`를 통해 각 라우트에 세션을 연결하므로, 모든 요청이 하나의 전역 연결을 공유하는 대신 자체 세션을 받습니다:
+
+```python
+from fastapi import Depends, FastAPI
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_session
+from app.models import Post
+from app.schemas import PostCreate, PostRead
+
+app = FastAPI(title="FastAPI + SQLAlchemy 2.0 + VillageSQL")
+
+
+@app.get("/posts", response_model=list[PostRead])
+async def list_posts(session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Post).order_by(Post.id))
+    return result.scalars().all()
+
+
+@app.post("/posts", response_model=PostRead, status_code=201)
+async def create_post(payload: PostCreate, session: AsyncSession = Depends(get_session)):
+    post = Post(title=payload.title, body=payload.body)
+    session.add(post)
+    await session.commit()
+    await session.refresh(post)
+    return post
+```
+
+요청 간에 공유되는 전역 세션은 동시 부하에서 결국 같은 연결에 쿼리가 뒤섞여 순서 없이 도달하는 결과를 낳습니다. `Depends()`를 통해 요청마다 만들어지는 세션은 각 요청이 자체 세션과 풀에서 체크아웃한 자체 연결을 받으므로 그 문제를 피합니다.
+
+## 실행 및 확인 {#running-and-verifying}
+
+앱을 시작합니다:
+
+```bash
+uvicorn app.main:app --host 127.0.0.1 --port 8010
+```
+
+빈 테이블은 빈 목록을 반환합니다:
+
+```bash
+curl -s http://127.0.0.1:8010/posts
+```
+
+```json
+[]
+```
+
+게시물 만들기:
+
+```bash
+curl -s -X POST http://127.0.0.1:8010/posts \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Hello VillageSQL", "body": "First post via FastAPI + SQLAlchemy 2.0"}'
+```
+
+```json
+{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}
+```
+
+HTTP 201 상태와 함께 반환됩니다. 다시 목록을 조회하면 새 행이 보입니다:
+
+```json
+[{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}]
+```
+
+데이터베이스를 직접 쿼리하면 API 응답뿐 아니라 쓰기가 실제로 반영되었음을 확인할 수 있습니다:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SELECT * FROM posts;"
+```
+
+```
+id  title             body                                       created_at
+1   Hello VillageSQL  First post via FastAPI + SQLAlchemy 2.0     2026-08-28 12:04:36
+```
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 비동기 엔진에는 왜 동기 엔진과 다른 연결 문자열이 필요한가요? {#why-does-the-async-engine-need-a-different-connection-string-than-a-sync-one}
+
+연결 문자열의 드라이버 이름은 SQLAlchemy에 어떤 DBAPI를 로드할지 알려 줍니다. 동기 설정은 `mysql+pymysql://`이나 `mysql+mysqldb://`를 사용하고, 비동기 설정에는 `asyncio` 위에 구축된 드라이버가 필요하므로 문자열은 대신 `mysql+asyncmy://`를 사용합니다. `create_async_engine`에 동기 드라이버 이름을 사용하면 즉시 실패하는데, 그 드라이버에는 SQLAlchemy가 호출할 비동기 인터페이스가 없기 때문입니다.
+
+#### `expire_on_commit=False`가 필요한가요? {#do-i-need-expire_on_commitfalse}
+
+꼭 필요하지는 않지만, 생략하면 커밋된 객체의 모든 속성 접근이 다시 로드하기 위해 새 데이터베이스 왕복을 촉발하며, 그 왕복은 활성 비동기 컨텍스트 안에서 일어날 때만 동작합니다. 속성이 정확히 어디서 읽히는지에 따라 `MissingGreenlet`으로, 또는 세션이 닫힌 후에는 `DetachedInstanceError`로 나타납니다. 웹 애플리케이션에 더 안전한 기본값은 `expire_on_commit=False`입니다.
+
+#### Alembic의 동기 autogenerate 워크플로를 계속 사용할 수 있나요? {#can-i-still-use-alembics-synchronous-autogenerate-workflow}
+
+예. 비동기 템플릿의 `env.py`도 일반 명령줄에서 `revision --autogenerate`와 `upgrade`를 실행합니다. 비동기 부분은 `env.py`가 스키마를 조사하고 수정하기 위해 자체 연결을 여는 방식에만 영향을 줍니다. Alembic CLI 명령 자체는 아무것도 바뀌지 않습니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `ValueError: the greenlet library is required to use this function` | 그냥 `sqlalchemy` 대신 `sqlalchemy[asyncio]`를 설치하거나, 직접 `pip install greenlet` |
+| `RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods` | `pip install cryptography`를 실행; `asyncmy`는 MySQL의 기본 `caching_sha2_password` 인증의 RSA 단계에 이것이 필요함 |
+| `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` | ORM 속성이 `await`된 호출 바깥에서 읽힘, 보통 세션이 커밋 시 객체를 만료시켰기 때문; 세션 팩토리에 `expire_on_commit=False`를 설정 |
+| `sqlalchemy.orm.exc.DetachedInstanceError` | 속성을 읽기 전에 객체의 세션이 이미 닫힘; `expire_on_commit=False`를 유지하거나, 요청이 끝나기 전에 필요한 모든 속성을 읽기 |
+| `alembic init -t async <path>` 후 `alembic.ini`가 잘못된 디렉토리에 나타남 | 프로젝트 디렉토리 안에서 `alembic init`을 실행; ini 파일은 경로 인수가 아니라 현재 작업 디렉토리를 따름 |
+| `alembic revision --autogenerate`가 빈 마이그레이션을 생성 | `alembic/env.py`의 `target_metadata`가 여전히 `None`이거나, 모델을 가져오지 않아 `Base.metadata`에 등록되지 않음 |
+| `Access denied for user 'fastapi_app'@'127.0.0.1'` | 사용자가 `localhost` 같은 다른 호스트용으로 만들어짐; 이 가이드의 연결 문자열은 TCP로 `127.0.0.1`에 연결하므로 권한 부여가 그 호스트와 일치해야 함 |
+| FastAPI 응답에 모델에 있는 필드가 빠짐 | `PostRead`가 딕셔너리 대신 ORM 객체에서 읽으려면 `model_config = ConfigDict(from_attributes=True)`가 필요함 |
+
+## 함께 보기 {#see-also}
+
+- [ORM과 함께 MySQL 사용하기: Django, Rails, Prisma](/ko/guides/mysql-with-orms) — 같은 문자 집합과 엄격 모드 구성이 SQLAlchemy에도 적용됩니다
+- [MySQL 연결 풀링](/ko/guides/connection-pooling) — 동시 FastAPI 요청 하에서 비동기 엔진의 풀 크기 조정

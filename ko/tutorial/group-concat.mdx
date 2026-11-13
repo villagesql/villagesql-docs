@@ -1,0 +1,134 @@
+---
+title: "MySQL GROUP_CONCAT"
+sidebarTitle: "GROUP_CONCAT"
+description: "GROUP_CONCAT가 MySQL 그룹의 값들을 1개의 문자열로 이어 붙이는 방법, 그 값들을 정렬하고 구분하는 방법, 그리고 경고만 내고 잘라 버리는 바이트 제한입니다."
+keywords: "mysql group_concat, group_concat mysql, mysql concatenate rows, mysql group_concat separator, mysql group_concat order by, group_concat_max_len"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`COUNT`는 그룹에 행이 몇 개인지 알려 줍니다. `GROUP_CONCAT`는 그 값들을 1개의 문자열로 이어 붙여서 그것들이 무엇이었는지 알려 줍니다. 상세 내용을 숫자로 줄이는 대신 유지하는 집계 함수입니다.
+
+시작하기 전에 `mysql -u root -p sakila`로 클라이언트를 여세요.
+
+## GROUP_CONCAT의 동작 방식 {#how-group_concat-works}
+
+```sql
+SELECT GROUPING_COLUMN,
+       GROUP_CONCAT(COLUMN_NAME ORDER BY COLUMN_NAME SEPARATOR 'SEPARATOR_TEXT')
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN;
+```
+
+`GROUPING_COLUMN`을 그룹을 정의하는 열로, `TABLE_NAME`을 테이블로, `COLUMN_NAME`을 이어 붙일 열로, `SEPARATOR_TEXT`를 값 사이에 들어갈 것으로 바꾸세요. `ORDER BY`와 `SEPARATOR`는 둘 다 선택 사항이고, 바깥의 쿼리가 아니라 괄호 안에 들어갑니다.
+
+`SEPARATOR`가 없으면 값은 공백 없는 쉼표로 이어집니다. `ORDER BY`가 없으면 특정한 순서 없이 나옵니다.
+
+## 예제 {#examples}
+
+### 1) 각 그룹의 값 이어 붙이기 {#1-join-the-values-in-each-group}
+
+```sql
+SELECT rating, GROUP_CONCAT(title ORDER BY title SEPARATOR ', ') AS titles
+FROM film
+WHERE length = 185
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+--------------------------------------------------+
+| rating | titles                                           |
++--------+--------------------------------------------------+
+| G      | CONTROL ANTHEM, DARN FORRESTER, MUSCLE BRIGHT    |
+| PG     | WORST BANGER                                     |
+| PG-13  | CHICAGO NORTH, GANGS PRIDE, POND SEATTLE         |
+| R      | HOME PITY, SOLDIERS EVOLUTION, SWEET BROTHERHOOD |
++--------+--------------------------------------------------+
+4 rows in set (0.00 sec)
+```
+
+5개가 아니라 4개의 행인데, 185분짜리 `NC-17` 영화가 없어서 `WHERE`가 그룹화 전에 그 행들을 제거했기 때문입니다. 남은 행이 없는 그룹은 나타나지 않습니다.
+
+### 2) 반복 제거하기 {#2-drop-the-repeats}
+
+괄호 안의 `DISTINCT`는 각 그룹 안의 중복 값을 제거합니다.
+
+```sql
+SELECT rating, GROUP_CONCAT(DISTINCT rental_rate ORDER BY rental_rate) AS rates
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+----------------+
+| rating | rates          |
++--------+----------------+
+| G      | 0.99,2.99,4.99 |
+| PG     | 0.99,2.99,4.99 |
+| PG-13  | 0.99,2.99,4.99 |
+| R      | 0.99,2.99,4.99 |
+| NC-17  | 0.99,2.99,4.99 |
++--------+----------------+
+5 rows in set (0.00 sec)
+```
+
+`DISTINCT`가 없으면 각 문자열은 그룹의 영화마다 요금 1개씩, 178개에서 223개 사이를 담게 되고, 가장 긴 2개는 다음 절에서 다루는 제한에 부딪힙니다. 이것은 기본 구분자이기도 합니다: 쉼표 하나뿐, 그 밖에는 아무것도 없습니다.
+
+## 결과는 group_concat_max_len 바이트에서 잘립니다 {#the-result-is-cut-off-at-group_concat_max_len-bytes}
+
+이것이 함정입니다. 서버는 너무 길어진 `GROUP_CONCAT` 결과를 자르고, 오류를 내지 않습니다. 제한은 설정이므로, 아래의 숫자는 MySQL의 속성이 아니라 이 서버의 것이며, 문자가 아니라 바이트를 셉니다.
+
+```sql
+SELECT LENGTH(GROUP_CONCAT(title)) AS bytes FROM film;
+```
+
+```text
++-------+
+| bytes |
++-------+
+|  1024 |
++-------+
+1 row in set, 1 warning (0.00 sec)
+```
+
+정확히 1,024인데, 그것만으로도 의심스럽습니다: 실제 합계가 딱 떨어지는 숫자에 떨어지는 일은 드뭅니다. 설정과 대조해 확인하세요.
+
+```sql
+SELECT @@group_concat_max_len AS max_len;
+```
+
+```text
++---------+
+| max_len |
++---------+
+|    1024 |
++---------+
+1 row in set (0.00 sec)
+```
+
+첫 번째 쿼리의 출력 하단이 경고 1개를 보고했고, `SHOW WARNINGS`가 무엇을 잃었는지 말해 줍니다: `Warning 1260 Row 65 was cut by GROUP_CONCAT()`. 문자열은 1,000개 중 64개의 온전한 제목을 담고 65번째의 중간에서 멈춥니다.
+
+`GROUP_CONCAT` 뒤에 직접 `SHOW WARNINGS`를 실행해서 같은 메시지를 확인하세요.
+
+`SET SESSION group_concat_max_len = 100000;`은 연결의 나머지 동안 제한을 높이고, 다시 연결하면 원래대로 돌아갑니다. 제한이 바이트를 세기 때문에, ASCII 밖의 텍스트는 숫자가 시사하는 것보다 빨리 잘립니다: `utf8mb4`에서 문자 하나는 최대 4바이트를 차지할 수 있습니다.
+
+길이가 `group_concat_max_len`과 정확히 같은 결과는 확인하기 전까지 잘린 것으로 취급하고, 출력 하단의 경고 개수를 살피세요.
+
+## 요약 {#summary}
+
+- 그룹의 값들을 1개의 문자열로 이어 붙이려면 `GROUP_CONCAT`를 사용하세요.
+- `ORDER BY`, `SEPARATOR`, `DISTINCT`는 괄호 안에 넣으세요.
+- 구분자를 지정하지 않으면 공백 없는 쉼표가 쓰인다고 예상하세요.
+- `group_concat_max_len` 바이트에서 오류가 아니라 경고와 함께 잘린다고 예상하세요.
+- 길이가 제한과 정확히 같으면 언제나 잘림을 의심하세요.
+
+## 함께 보기 {#see-also}
+
+- [집계 함수](/ko/tutorial/aggregate-functions) — 숫자를 반환하는 집계 함수들
+- [GROUP BY](/ko/tutorial/group-by) — `GROUP_CONCAT`가 이어 붙이는 그룹 만들기
+- [MySQL 문자열 함수](/ko/guides/string-functions) — 그 뒤에 문자열 모양 바꾸기
+- [MySQL GROUP BY 성능](/ko/guides/group-by-having) — 대규모에서 이 문자열을 만드는 데 드는 비용

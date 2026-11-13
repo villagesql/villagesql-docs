@@ -1,0 +1,156 @@
+---
+title: "MySQL의 타임스탬프와 시간대"
+sidebarTitle: "시간대 다루기"
+description: "MySQL이 DATETIME과 TIMESTAMP를 다루는 방식, 시간대 저장과 변환, 그리고 애플리케이션이 여러 시간대에 걸쳐 있을 때 흔한 버그를 피하는 방법입니다."
+keywords: "mysql timestamp timezone, mysql datetime vs timestamp, mysql utc, mysql time_zone, mysql convert timezone, mysql current_timestamp, mysql daylight saving"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+시간대 버그는 디버깅하기 가장 어려운 버그에 속합니다 — 서버 위치에 따라 나타났다 사라지고, 개발 환경과 프로덕션에서 다르게 보이며, 종종 일광 절약 시간 전환 뒤에야 드러납니다. 근본 원인은 거의 항상 MySQL이 시간을 저장하는 방식과 애플리케이션이 시간을 읽기를 기대하는 방식의 불일치입니다.
+
+## DATETIME 대 TIMESTAMP {#datetime-vs-timestamp}
+
+이 두 타입은 비슷해 보이지만 결정적인 순간 — 조회 — 에 다르게 동작합니다.
+
+| 타입 | 저장 공간 | 범위 | 시간대 동작 |
+|:-----|:--------|:------|:-------------------|
+| `DATETIME` | 8바이트 | 1000-01-01부터 9999-12-31까지 | 변환 없음 — 리터럴 값을 저장하고 반환 |
+| `TIMESTAMP` | 4바이트 | 1970-01-01부터 2038-01-19까지 | UTC로 저장; 조회 시 세션 `time_zone`으로 변환 |
+
+`TIMESTAMP`는 값을 자동으로 변환합니다:
+- **INSERT/UPDATE** 시: 저장을 위해 세션 `time_zone`에서 UTC로 변환
+- **SELECT** 시: 표시를 위해 UTC에서 다시 세션 `time_zone`으로 변환
+
+`DATETIME`은 아무 변환도 하지 않습니다. 써넣은 값이 그대로 돌아옵니다.
+
+`'America/New_York'` 같은 이름 있는 시간대는 시간대 테이블이 로드되어 있어야 합니다(아래 [이름 있는 시간대](#named-time-zones)를 보세요) — 새로 초기화한 서버에는 그 테이블이 없습니다. 아래 예를 실행하기 전에 `SELECT COUNT(*) FROM mysql.time_zone_name;`으로 확인하세요; `0`이면 먼저 로드하거나 `'-05:00'` 같은 숫자 오프셋으로 대체하세요.
+
+```sql
+SET time_zone = 'America/New_York';
+
+CREATE TABLE events (
+    ts  TIMESTAMP,
+    dt  DATETIME
+);
+
+INSERT INTO events VALUES ('2024-03-15 12:00:00', '2024-03-15 12:00:00');
+
+-- Switch to a different timezone and re-read
+SET time_zone = 'America/Los_Angeles';
+SELECT ts, dt FROM events;
+-- ts: 2024-03-15 09:00:00  (converted: UTC-8 vs UTC-5 = 3 hours earlier)
+-- dt: 2024-03-15 12:00:00  (unchanged)
+```
+
+## 2038년 문제 {#the-2038-problem}
+
+`TIMESTAMP`는 32비트 Unix 타임스탬프로 저장됩니다. `2038-01-19 03:14:07 UTC` 이후의 날짜는 표현할 수 없습니다. 미래 날짜를 저장하는 모든 애플리케이션 — 예약, 구독, 예정된 이벤트 — 은 이 한계에 부딪히지 않도록 `DATETIME`을 사용해야 합니다.
+
+```sql
+-- This will fail or behave unexpectedly near or after 2038
+expiry_date TIMESTAMP   -- wrong
+
+-- Use DATETIME for dates beyond 2038
+expiry_date DATETIME    -- correct
+```
+
+## 서버 시간대와 세션 시간대 {#server-and-session-time-zones}
+
+MySQL에는 서로 독립적인 2개의 시간대 설정이 있습니다:
+
+```sql
+-- Server's global time zone (set at startup or in my.cnf)
+SELECT @@global.time_zone;
+
+-- Session time zone (can differ per connection)
+SELECT @@session.time_zone;
+```
+
+`time_zone`이 `SYSTEM`으로 보이면 MySQL은 운영 체제의 시간대를 사용하고 있습니다. 이것은 OS가 바뀔 때까지(서버 이전, DST 전환) 동작합니다 — 그다음에는 타임스탬프가 어긋납니다.
+
+**모범 사례**: 서버를 명시적으로 UTC로 설정하고, 표시 변환은 애플리케이션에서 처리하세요.
+
+```ini
+# my.cnf
+[mysqld]
+default-time-zone = '+00:00'
+```
+
+또는 런타임에:
+```sql
+SET GLOBAL time_zone = '+00:00';
+SET SESSION time_zone = '+00:00';
+```
+
+## 이름 있는 시간대 {#named-time-zones}
+
+`'+00:00'`과 `'UTC'`는 둘 다 유효하지만, `'America/New_York'` 같은 이름 있는 시간대는 시간대 테이블이 로드되어 있어야 합니다. `CONVERT_TZ()`가 NULL을 반환하거나 이름 있는 시간대가 실패하면 테이블이 없는 것입니다.
+
+```sql
+-- Check if named timezone tables are loaded
+SELECT COUNT(*) FROM mysql.time_zone_name;
+
+-- Load them (run from the OS shell)
+-- mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql
+```
+
+```sql
+-- Convert between time zones
+SELECT CONVERT_TZ('2024-03-15 12:00:00', 'America/New_York', 'UTC');
+-- Returns: 2024-03-15 16:00:00  (March 15 is EDT = UTC-4, so noon EDT = 16:00 UTC)
+```
+
+## AUTO_UPDATE 열 {#auto_update-columns}
+
+`TIMESTAMP` 열은 삽입과 갱신 시 자동 채우기를 지원합니다:
+
+```sql
+CREATE TABLE posts (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    title      VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+세션 시간대가 UTC이면 `CURRENT_TIMESTAMP`는 UTC로 평가되므로, 누가 어느 시간대에서 연결하든 `created_at`과 `updated_at`은 일관되게 저장됩니다.
+
+`DATETIME`과 `NOW()`로도 같은 일을 할 수 있습니다:
+
+```sql
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+```
+
+`NOW()`는 세션 시간대의 현재 날짜와 시간을 반환합니다 — 세션을 UTC로 통일해야 하는 또 하나의 이유입니다.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 타임스탬프를 DATETIME에 UTC로 저장해야 하나요, TIMESTAMP를 써야 하나요? {#should-i-store-timestamps-as-utc-in-datetime-or-use-timestamp}
+
+날짜가 2038년 상한 안에 머문다면 `TIMESTAMP`가 더 깔끔합니다 — UTC 변환을 자동으로 처리합니다. 2038년 이후의 미래 날짜나 1970년 이전의 과거 날짜를 저장해야 하는 애플리케이션에서는 `DATETIME`을 사용하고, 삽입 전에 항상 UTC로 변환해서 애플리케이션 계층에서 UTC를 강제하세요.
+
+#### 서버 이전 후 타임스탬프가 어긋나는 이유는 무엇인가요? {#why-do-timestamps-shift-after-a-server-migration}
+
+이전 서버는 한 OS 시간대를 가리키는 `time_zone = SYSTEM`을 사용했고, 새 서버는 다른 시간대(또는 UTC)를 가리킵니다. UTC로 저장된 `TIMESTAMP` 값은 두 시간대 모두에서 올바르게 표시되지만, UTC가 아니라 시스템 시간대를 가정하고 저장된 값이 있다면 어긋납니다. 이전하기 전에 두 서버 모두에서 `SELECT @@global.time_zone`으로 점검하세요.
+
+#### 시간 부분 없이 날짜만 저장하려면 어떻게 하나요? {#how-do-i-store-just-a-date-with-no-time-component}
+
+`DATE`를 사용하세요. 3바이트로 저장되고, 시각이나 시간대의 모호함이 없습니다. `WHERE date_col = '2024-03-15'` 같은 연산은 세션 시간대와 관계없이 모호하지 않습니다.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| 배포 후 타임스탬프가 몇 시간씩 어긋남 | 환경 간에 세션 또는 서버 `time_zone`이 다름 — UTC로 통일 |
+| `CONVERT_TZ()`가 NULL을 반환 | 이름 있는 시간대 테이블이 로드되지 않음 — `mysql_tzinfo_to_sql`을 실행 |
+| 2038년 이후의 날짜가 저장되지 않음 | `TIMESTAMP` 대신 `DATETIME`을 사용 |
+| DST 변경 후 `TIMESTAMP`가 잘못된 시간을 보여줌 | OS DST 의존을 피하려면 `SYSTEM` 대신 `time_zone = '+00:00'`을 설정 |
+| `updated_at`이 자동으로 갱신되지 않음 | 열에 `ON UPDATE CURRENT_TIMESTAMP` 절이 필요함 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL 날짜와 시간 함수](/ko/guides/date-time-functions) — DATETIME과 TIMESTAMP 값을 다루는 함수

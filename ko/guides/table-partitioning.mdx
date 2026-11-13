@@ -1,0 +1,190 @@
+---
+title: "MySQL의 테이블 파티셔닝"
+sidebarTitle: "테이블 파티셔닝하기"
+description: "MySQL 테이블 파티셔닝이 동작하는 방식: RANGE, LIST, HASH, KEY 파티셔닝 유형, 파티션 프루닝, 파티셔닝이 성능을 개선하는 경우, 그리고 흔한 함정입니다."
+keywords: "mysql table partitioning, mysql partition by range, mysql partition pruning, mysql partitioning example, mysql range partition, mysql list partition, mysql partition performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+파티셔닝은 하나의 논리적 테이블을 여러 물리적 세그먼트로 나눕니다. MySQL은 파티셔닝 표현식에 따라 행을 파티션으로 보내고, 파티션 키로 필터링하는 쿼리는 파티션을 통째로 건너뛸 수 있습니다 — 이 최적화를 파티션 프루닝이라고 합니다. 파티셔닝에는 InnoDB 또는 NDB 스토리지 엔진이 필요합니다.
+
+## 파티셔닝이 도움이 될 때 {#when-partitioning-helps}
+
+파티션 프루닝은 다음 경우에 실질적인 이득을 줍니다:
+- 테이블이 버퍼 풀에 들어가기에 너무 크고, 쿼리가 일관되게 파티션 키로 필터링할 때
+- 오래된 데이터를 정기적으로 삭제할 때 — `ALTER TABLE t DROP PARTITION p_old`는 느린 DELETE와 달리 즉시 끝납니다
+
+파티셔닝은 다음 경우에는 도움이 되지 않습니다:
+- 쿼리가 파티션 키로 필터링하지 않을 때 (모든 파티션을 스캔해야 함)
+- 테이블이 메모리에 충분히 들어갈 때
+- 제대로 된 인덱싱을 대신하려 할 때 — 파티셔닝하지 않은 테이블의 좋은 인덱스가, 맞는 인덱스가 없는 파티셔닝된 테이블보다 나은 경우가 많습니다
+
+## RANGE 파티셔닝 {#range-partitioning}
+
+파티션 키가 어떤 범위에 속하는지에 따라 행이 파티션에 배정됩니다. 가장 흔한 사용 사례는 날짜 기반 보관입니다.
+
+```sql
+CREATE TABLE orders (
+    id          INT NOT NULL,
+    customer_id INT,
+    amount      DECIMAL(10,2),
+    created_at  DATE NOT NULL
+)
+PARTITION BY RANGE COLUMNS (created_at) (
+    PARTITION p2022 VALUES LESS THAN ('2023-01-01'),
+    PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+    PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+정의된 어떤 범위에도 맞지 않는 행을 받기 위해 항상 `MAXVALUE` 파티션을 포함하세요. 그것이 없으면 정의된 범위 밖의 삽입은 오류로 실패합니다.
+
+새 파티션 추가하기:
+
+```sql
+-- Only works if the last partition is not MAXVALUE
+ALTER TABLE orders ADD PARTITION (
+    PARTITION p2025 VALUES LESS THAN ('2026-01-01')
+);
+
+-- If MAXVALUE exists, reorganize it:
+ALTER TABLE orders REORGANIZE PARTITION p_future INTO (
+    PARTITION p2025 VALUES LESS THAN ('2026-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+오래된 데이터를 즉시 삭제하기:
+
+```sql
+ALTER TABLE orders DROP PARTITION p2022;
+```
+
+## LIST 파티셔닝 {#list-partitioning}
+
+파티션 키의 정확한 값에 따라 행이 배정됩니다.
+
+```sql
+CREATE TABLE customers (
+    id     INT NOT NULL,
+    name   VARCHAR(100),
+    region VARCHAR(20) NOT NULL
+)
+PARTITION BY LIST COLUMNS (region) (
+    PARTITION p_north VALUES IN ('WA', 'OR', 'ID', 'MT'),
+    PARTITION p_south VALUES IN ('CA', 'NV', 'AZ', 'NM'),
+    PARTITION p_east  VALUES IN ('NY', 'NJ', 'CT', 'MA')
+);
+```
+
+어떤 파티션에도 나열되지 않은 region 값을 삽입하면 실패합니다. 문자열 열에는 `LIST COLUMNS`를 사용하세요 — `LIST`만으로는 정수 표현식만 지원합니다.
+
+## HASH와 KEY 파티셔닝 {#hash-and-key-partitioning}
+
+`HASH`와 `KEY`는 고정된 수의 파티션에 행을 고르게 분배합니다. 값에 의한 파티션 프루닝은 지원하지 않지만, 행을 여러 파티션에 분산시켜 동시 쓰기 처리량을 높일 수 있습니다.
+
+```sql
+-- HASH: you define the expression
+CREATE TABLE sessions (
+    id         INT NOT NULL,
+    user_id    INT NOT NULL,
+    data       TEXT
+)
+PARTITION BY HASH (user_id)
+PARTITIONS 8;
+
+-- KEY: MySQL uses the primary key automatically
+CREATE TABLE logs (
+    id         BIGINT AUTO_INCREMENT,
+    message    TEXT,
+    PRIMARY KEY (id)
+)
+PARTITION BY KEY ()
+PARTITIONS 4;
+```
+
+## 파티션 프루닝 {#partition-pruning}
+
+프루닝은 `WHERE` 절이 파티션 표현식을 직접 필터링할 때만 동작합니다. `RANGE COLUMNS (created_at)`에서는 `created_at`으로 필터링하면 올바르게 프루닝됩니다:
+
+```sql
+-- Pruned: MySQL scans only p2024
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31';
+
+-- NOT pruned: wrapping the column in YEAR() defeats pruning
+-- MySQL can't map YEAR(created_at) = 2024 back to the RANGE COLUMNS expression
+SELECT * FROM orders WHERE YEAR(created_at) = 2024;
+```
+
+프루닝을 확인하려면 `EXPLAIN`을 실행하고 `partitions` 열을 보세요:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE created_at = '2024-06-15'\G
+```
+
+`partitions`에 파티션 이름이 하나 또는 몇 개만 보이면 프루닝이 동작하는 것입니다. 모든 파티션이 보이면 필터가 적용되지 않는 것입니다.
+
+## 파티셔닝 제약 {#partitioning-constraints}
+
+- **모든 고유 키(기본 키 포함)는 파티셔닝 표현식의 모든 열을 포함해야 합니다.** `created_at`으로 파티셔닝하려면 모든 고유 키에 `created_at`이 있어야 합니다 — 독립된 `PRIMARY KEY (id)`가 있는 테이블에는 먼저 `PRIMARY KEY (id, created_at)`으로 바꾸지 않는 한 파티션을 추가할 수 없습니다.
+- MySQL의 파티셔닝된 테이블에서는 `FOREIGN KEY` 제약 조건이 지원되지 않습니다.
+- 테이블 하나는 최대 8192개의 파티션을 가질 수 있습니다 (MySQL 8.0 이상).
+
+## 파티셔닝 대 인덱싱 {#partitioning-vs-indexing}
+
+| | 파티셔닝 | 인덱싱 |
+|:--|:------------|:---------|
+| 가장 적합한 용도 | 범위 기반 데이터 프루닝, 보관 데이터 삭제 | 포인트 조회, 임의 열의 범위 스캔 |
+| 스키마 변경 필요 | 예 | 예 (ALTER TABLE ADD INDEX) |
+| 모든 쿼리를 빠르게 함 | 파티션 키로 필터링하는 쿼리만 | 인덱스된 열을 사용하는 모든 쿼리 |
+| 오래된 데이터 삭제 | 즉시 (`DROP PARTITION`) | DELETE + 인덱스 유지 관리 필요 |
+| 외래 키 | 지원하지 않음 | 지원함 |
+
+인덱싱부터 시작하세요. 큰 테이블에서 입증된 성능 문제가 있고 쿼리 패턴에 맞는 명확한 파티션 키가 있을 때만 파티셔닝을 추가하세요.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 기존 테이블을 파티셔닝할 수 있나요? {#can-i-partition-an-existing-table}
+
+예, `ALTER TABLE`로 할 수 있습니다:
+
+```sql
+ALTER TABLE orders
+PARTITION BY RANGE COLUMNS (created_at) (
+    PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+    PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+이 작업은 테이블을 다시 쓰므로, 큰 테이블에서는 상당한 시간과 디스크 공간이 들 수 있습니다.
+
+#### 행이 어느 파티션에 있는지 어떻게 확인하나요? {#how-do-i-check-which-partition-a-row-is-in}
+
+```sql
+SELECT PARTITION_NAME, TABLE_ROWS
+FROM information_schema.partitions
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'orders';
+```
+
+특정 행이 어느 파티션으로 갈지 보려면, 그 행과 일치하는 WHERE 절과 함께 `EXPLAIN PARTITIONS`를 사용하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:--------|:---------|
+| `ERROR 1526: Table has no partition for value` | RANGE 또는 LIST에 일치하는 파티션이 없음 — RANGE에는 `MAXVALUE` 파티션을 추가하고, LIST에는 빠진 값을 처리 |
+| `ERROR 1503: A PRIMARY KEY must include all columns in the table's partitioning function` | 파티션 키 열을 기본 키 정의에 추가 |
+| 파티션 프루닝이 일어나지 않음 | `EXPLAIN`의 partitions 열을 확인; WHERE 절이 파티션 열을 함수로 감싸지 않고 직접 사용하는지 확인 |
+| `ALTER TABLE DROP PARTITION`이 오류를 반환 | 테이블이 RANGE 또는 LIST로 파티셔닝되어 있어야 함 — HASH와 KEY 파티션은 개별적으로 삭제할 수 없음 |
+| 파티셔닝 후 성능이 더 나빠짐 | 쿼리가 프루닝되지 않을 수 있음 — EXPLAIN으로 확인하고, WHERE에 쓰는 열에 대한 인덱스가 각 파티션에 있는지 확인 |
+
+## 함께 보기 {#see-also}
+
+- [InnoDB가 데이터를 저장하는 방식](/ko/guides/innodb-storage) — 파티셔닝이 동작하는 스토리지 엔진
+- [MySQL 인덱스의 동작 방식](/ko/guides/mysql-indexes) — 파티션 안의 인덱스와 파티션 프루닝
+- [MySQL의 스키마 마이그레이션](/ko/guides/schema-migrations) — 기존 테이블에 파티셔닝을 추가하거나 바꾸는 방법

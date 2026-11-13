@@ -1,0 +1,141 @@
+---
+title: "MySQL에서 열 암호화하기"
+sidebarTitle: "열 암호화하기"
+description: "MySQL에서 민감한 열 데이터를 암호화하는 방법 — MySQL의 AES_ENCRYPT가 안전하지 않은 기본 모드를 사용하는 이유와 VillageSQL의 encrypt()가 이를 자동으로 해결하는 방식입니다."
+keywords: "mysql encrypt column, mysql AES_ENCRYPT secure, mysql column encryption, mysql encrypt PII, mysql aes cbc iv, mysql encrypt decrypt data"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL에는 `AES_ENCRYPT()`가 내장되어 있습니다. 문제는 기본 모드인 `aes-128-ecb`가 안전하지 않다는 것입니다. ECB 암호화는 결정적입니다: 같은 키로 같은 평문을 암호화하면 항상 같은 암호문이 나옵니다. 암호화된 열을 보는 공격자는 키를 전혀 모르고도 반복되는 값을 알아챌 수 있습니다. VillageSQL의 `encrypt()`는 무작위 IV와 함께 CBC 모드를 자동으로 사용하므로, 동일한 입력도 매번 다른 출력을 생성합니다.
+
+## MySQL의 기본값: ECB 모드 {#the-mysql-default-ecb-mode}
+
+MySQL의 `AES_ENCRYPT(data, key)`는 기본적으로 `aes-128-ecb`(`block_encryption_mode`)를 사용합니다. ECB — Electronic Codebook — 는 무작위성 없이 각 블록을 독립적으로 암호화합니다. 같은 값을 가진 두 행은 같은 암호문을 생성합니다:
+
+```sql
+-- These two rows will have identical encrypted values
+INSERT INTO users (email, ssn_enc)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'secretkey')),
+       ('bob@example.com',   AES_ENCRYPT('123-45-6789', 'secretkey'));
+
+-- An attacker can see that Alice and Bob have the same SSN
+-- without knowing the key or the plaintext
+SELECT HEX(ssn_enc) FROM users;
+```
+
+MySQL 8.0에서는 `block_encryption_mode`를 CBC를 사용하도록 변경할 수 있지만, 그러면 IV를 직접 관리해야 합니다: 생성하고, 암호문과 함께 저장하고, 매번 `AES_DECRYPT()`에 다시 전달해야 합니다.
+
+## 표준 우회 방법: AES-CBC와 수동 IV {#the-standard-workaround-manual-iv-with-aes-cbc}
+
+MySQL에서 CBC 모드를 올바르게 사용하려면 IV를 명시적으로 저장하고 전달해야 합니다:
+
+```sql
+SET @@block_encryption_mode = 'aes-256-cbc';
+
+-- Must generate and store IV alongside ciphertext
+SET @iv = RANDOM_BYTES(16);
+INSERT INTO users (email, ssn_enc, ssn_iv)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'key', @iv), @iv);
+
+-- Must retrieve IV to decrypt
+SELECT AES_DECRYPT(ssn_enc, 'key', ssn_iv) AS ssn
+FROM users WHERE email = 'alice@example.com';
+```
+
+이는 올바르지만 장황합니다 — 모든 테이블에 추가 IV 열이 필요하고, 암호화된 데이터를 건드리는 모든 쿼리가 IV를 전달해야 합니다.
+
+## VillageSQL과 함께: 자동 IV 관리 {#with-villagesql-automatic-iv-management}
+
+VillageSQL의 `vsql_crypto` 확장은 IV를 자동으로 처리하는 `encrypt()`와 `decrypt()`를 추가합니다. IV는 호출마다 새로 생성되어 저장 값의 암호문 앞에 붙습니다. `decrypt()`는 신경 쓸 필요 없이 이를 추출합니다.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+CREATE TABLE users (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    email   VARCHAR(255),
+    ssn_enc VARBINARY(255)   -- IV + ciphertext stored together
+);
+
+SET @key = 'my-32-byte-key-for-aes-256-here!';  -- 32 bytes → AES-256
+
+-- Same plaintext encrypts to different ciphertext every time
+INSERT INTO users (email, ssn_enc) VALUES
+    ('alice@example.com', encrypt('123-45-6789', @key, 'aes-256')),
+    ('bob@example.com',   encrypt('123-45-6789', @key, 'aes-256'));
+
+-- Decrypt in a SELECT
+SELECT email, decrypt(ssn_enc, @key, 'aes-256') AS ssn FROM users;
+```
+
+IV 열도, 쿼리의 IV 매개변수도 없습니다. 같은 SSN을 가진 두 행이 다른 암호문을 생성합니다 — 패턴 누출이 없습니다.
+
+### 키 크기 {#key-sizes}
+
+| 암호 유형 | 키 길이 | 사용 시기 |
+|:---|:---|:---|
+| `'aes'` 또는 `'aes-128'` | 16바이트 | 민감도가 낮은 데이터, 성능에 민감한 워크로드 |
+| `'aes-192'` | 24바이트 | 중간 수준의 보안 |
+| `'aes-256'` | 32바이트 | PII, 금융 데이터, 규제 대상 전부 — 권장 기본값 |
+
+암호가 요구하는 것보다 짧은 키는 `ERROR 3200: VDF error in function 'encrypt': key too short for <cipher>: need N bytes, got M`을 발생시킵니다 — 0으로 채워지지 않습니다. 더 긴 키는 조용히 잘립니다. 정확히 16, 24, 또는 32바이트를 사용하세요.
+
+### 저장할 내용 {#what-to-store}
+
+`VARBINARY` 열은 암호문 앞에 붙은 IV(16바이트)를 담습니다. PKCS7 패딩은 평문 길이가 이미 16의 정확한 배수일 때 항상 AES 블록 하나(16바이트)를 통째로 추가합니다 — 패딩이 0바이트인 경우는 없습니다. 따라서 안전한 공식은 평문 길이 + 총 32바이트(IV 16바이트, 패딩 최대 16바이트)입니다. 여유를 두고 열 크기를 정하세요:
+
+```sql
+-- For strings up to ~200 chars: VARBINARY(255) is sufficient
+-- For longer text: VARBINARY(500) or BLOB
+ssn_enc   VARBINARY(64),    -- SSNs, short codes
+addr_enc  VARBINARY(512),   -- Addresses, longer strings
+notes_enc BLOB              -- Free-form text
+```
+
+## 이것이 다루지 않는 것 {#what-this-doesnt-cover}
+
+SQL의 열 수준 암호화는 데이터베이스 접근 권한은 있지만 키는 없는 사람으로부터 저장된 데이터를 보호합니다. 다음으로부터는 보호하지 않습니다:
+
+- 키를 보유하고 복호화된 데이터를 쿼리하는 애플리케이션 코드 — 앱을 침해한 공격자는 둘 다 얻습니다
+- 암호화된 열에 대해 필터링하거나 정렬하는 쿼리(복호화 없이는 `WHERE ssn = ?`를 할 수 없습니다)
+
+검색 가능한 암호화나 봉투 키 관리(모든 데이터를 다시 암호화하지 않고 키를 교체)에는 애플리케이션 계층의 추가 인프라가 필요합니다.
+
+## 자주 묻는 질문 {#frequently-asked-questions}
+
+#### 암호화 키는 어디에 저장해야 하나요? {#where-should-i-store-the-encryption-key}
+
+데이터베이스에는 저장하지 마세요. 키는 시크릿 관리자(AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager)나 환경 변수에 두고 애플리케이션이 런타임에 로드해야 합니다. 자신이 암호화하는 데이터베이스와 같은 곳에 저장된 키는 아무런 보호도 제공하지 않습니다.
+
+#### 암호화된 열에서 검색할 수 있나요? {#can-i-search-on-encrypted-columns}
+
+직접적으로는 안 됩니다. 일치 항목을 찾기 위해 모든 행을 복호화하는 것은 전체 테이블 스캔입니다. 일반적인 패턴: 동등 조회를 위해 암호화된 열 옆에 값의 결정적 해시를 저장하거나(SSN 조회를 위한 `sha256(ssn)`), 애플리케이션 계층에서 복호화하여 암호화된 검색 인덱스를 구축합니다.
+
+#### 키를 잃어버리면 어떻게 되나요? {#what-happens-if-i-lose-the-key}
+
+데이터는 복구할 수 없습니다. 키를 데이터베이스와 별도로 백업하세요. 모든 것을 다시 암호화하지 않고 마스터 키를 교체할 수 있도록, 데이터 키를 마스터 키로 감싸는 봉투 암호화를 고려하세요.
+
+#### DEFAULT 표현식으로 열을 암호화할 수 있나요? {#can-i-encrypt-a-column-with-a-default-expression}
+
+현재는 안 됩니다. 비결정적 함수(무작위 IV 때문에 `encrypt()`가 그렇습니다)는 DEFAULT 표현식에 사용할 수 없습니다. 각 INSERT에서 암호화된 값을 생성하세요.
+
+## 문제 해결 {#troubleshooting}
+
+| 문제 | 해결 방법 |
+|:---|:---|
+| `FUNCTION <database>.encrypt does not exist` | `INSTALL EXTENSION vsql_crypto`를 실행 |
+| `decrypt()`가 NULL을 반환 | 암호문이 손상되었거나, 키가 틀렸거나, 잘못된 암호 유형을 지정함 |
+| 같은 평문에 대해 암호화된 값이 동일함 | ECB 모드의 MySQL `AES_ENCRYPT`를 사용 중 — `encrypt()`로 전환 |
+| 열이 암호문에 비해 너무 작음 | VARBINARY 크기에 32바이트를 추가(IV 16바이트 + 패딩 최대 16바이트) |
+| 키 길이가 잘못됨 | AES-128은 16바이트, AES-192는 24바이트, AES-256은 32바이트 필요 — `LENGTH(@key)`를 확인 |
+
+## 함께 보기 {#see-also}
+
+- [MySQL의 대칭 암호화](/ko/guides/symmetric-encryption) — 이것의 바탕이 되는 암호화 알고리즘과 키 관리
+- [MySQL의 비밀번호 해싱](/ko/guides/password-hashing) — 자격 증명에는 암호화보다 해싱이 낫습니다
+- [MySQL에서 데이터 해싱하기](/ko/guides/hashing-data) — 복호화가 필요 없을 때의 단방향 지문

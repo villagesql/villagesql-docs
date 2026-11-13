@@ -1,0 +1,184 @@
+---
+title: "C++ 확장 작성하기"
+sidebarTitle: "C++ 확장 작성하기"
+description: "C++로 VillageSQL 확장을 작성하는 방법 — C++를 선택해야 하는 경우, CMake 설정, 타입 래퍼, 빌드, 테스트를 다룹니다."
+keywords: "villagesql extension c++, vef sdk, vdf c++, custom sql function c++, vsql extension template"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+VillageSQL 확장은 서버가 런타임에 로드하는 공유 라이브러리입니다. VEF SDK는 타입이 지정된 C++ 래퍼를 제공하므로 원시 FFI를 건드리지 않고 확장 함수를 작성할 수 있습니다. 이 가이드는 최소한의 확장을 처음부터 빌드하는 과정을 안내합니다.
+
+## C++를 선택해야 하는 경우 {#when-to-choose-c}
+
+다음과 같은 경우 C++가 올바른 선택입니다:
+
+- 팀에 이미 C++ 코드베이스가 있고 확장을 같은 언어로 유지하고 싶을 때
+- 정밀한 바이너리 레이아웃을 가진 사용자 정의 유형이 필요할 때(C++ 유형 빌더가 가장 완전한 API입니다)
+- SQL 함수로 노출하고 싶은 기존 C++ 라이브러리를 다루고 있을 때
+
+Rust를 선호하고 C++ 요구 사항이 없다면 [Rust 확장 작성하기](/ko/guides/rust-extensions)를 참조하세요.
+
+## 사전 요구 사항 {#prerequisites}
+
+확장 코드를 작성하기 전에 VillageSQL 빌드가 필요합니다 — 확장은 서버의 SDK 헤더와 빌드 트리에 링크됩니다.
+
+다음도 필요합니다:
+
+- **C++17 컴파일러** — GCC 8+, Clang 8+, 또는 MSVC 2019+
+- **CMake 3.18+** — 확장 템플릿은 CMake를 사용합니다
+
+아직 서버를 빌드하지 않았다면 먼저 [소스에서 빌드](/ko/8.4/stable/source) 가이드를 따르세요.
+
+## CMake 설정 {#cmake-setup}
+
+가장 빠르게 시작하는 방법은 [vsql-extension-template](https://github.com/villagesql/vsql-extension-template)을 사용하는 것입니다. 포크하거나 복제하세요:
+
+```bash
+git clone https://github.com/villagesql/vsql-extension-template my-extension
+cd my-extension
+```
+
+템플릿의 `CMakeLists.txt`가 VEF 빌드 설정을 대신 처리합니다 — CMake를 처음부터 작성하기보다 템플릿을 복사하여 수정하세요. `-DVillageSQL_BUILD_DIR`로 빌드 디렉토리를 구성합니다:
+
+```bash
+mkdir build && cd build
+cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+make
+```
+
+`-DVillageSQL_BUILD_DIR`은 CMake에 VillageSQL 빌드가 어디 있는지 알려 주어 SDK 헤더를 찾을 수 있게 합니다. 이렇게 하면 빌드 출력에 `.veb` 파일이 생성됩니다. 전체 CMake 설정은 [확장 만들기](/ko/extensions/build/create)와 [vsql-extension-template](https://github.com/villagesql/vsql-extension-template)을 참조하세요.
+
+## C++로 작성한 최소 VDF {#a-minimal-vdf-in-c}
+
+VEF SDK 헤더를 포함하고 빌더 API를 사용하여 함수를 등록합니다. 다음은 문자열 반전 함수를 구현하는 완전한 확장입니다:
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+void my_reverse_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();   // std::string_view
+    auto buf = out.buffer();   // Span<char>
+
+    if (sv.size() > buf.size()) {
+        out.error("my_reverse: input exceeds buffer size");
+        return;
+    }
+
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = sv[sv.size() - 1 - i];
+    }
+    out.set_length(sv.size());
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&my_reverse_impl>("my_reverse")
+            .returns(STRING)
+            .param(STRING)
+            .build())
+)
+```
+
+주목할 점 몇 가지:
+
+- `<villagesql/extension.h>`(이전 V1 헤더)가 아니라 `<villagesql/vsql.h>`를 포함하세요
+- 타입이 지정된 인수 래퍼(`StringArg`, `IntArg`, `RealArg`)는 null을 확인하고 타입이 지정된 값을 노출합니다 — 원시 포인터 연산이 없습니다
+- `out.set_null()`, `out.warning(msg)`, `out.error(msg)`가 성공이 아닌 세 가지 반환입니다
+- `VEF_GENERATE_ENTRY_POINTS`는 원시 구조체가 아니라 `make_extension()` 빌더를 받습니다
+
+정수나 실수를 반환하는 함수의 경우:
+
+```cpp
+void count_vowels_impl(StringArg input, IntResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    long long count = 0;
+    for (char c : input.value()) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    out.set(count);
+}
+```
+
+함수를 결정적(같은 입력은 항상 같은 출력을 생성)으로 선언하려면 빌더 체인에 `.deterministic()`을 추가하세요:
+
+```cpp
+.func(make_func<&my_reverse_impl>("my_reverse")
+    .returns(STRING)
+    .param(STRING)
+    .deterministic()
+    .build())
+```
+
+결정적 함수는 생성 열과 함수 인덱스에서 사용할 수 있습니다. 실제로 결정적일 때만 `.deterministic()`을 추가하세요.
+
+## 빌드 {#building}
+
+위의 CMake 설정 절에서 cmake 구성 단계를 마친 후 빌드하고 설치합니다:
+
+```bash
+make
+make install
+```
+
+`make install`은 `.veb` 파일을 VillageSQL 확장 디렉토리로 복사합니다.
+
+## 설치 및 테스트 {#installing-and-testing}
+
+VillageSQL에 연결하여 확장을 설치합니다:
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+로드되었는지 확인합니다:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+함수를 호출합니다:
+
+```sql
+SELECT my_reverse('Hello, World!');
+-- → !dlroW ,olleH
+```
+
+자동화된 테스트를 위해 `mysql-test/t/`에 MySQL Test Framework 스위트를 작성합니다:
+
+```sql
+-- mysql-test/t/basic.test
+INSTALL EXTENSION my_extension;
+SELECT my_reverse('abc');
+SELECT my_reverse('');
+SELECT my_reverse(NULL);
+UNINSTALL EXTENSION my_extension;
+```
+
+예상 결과를 생성하고 실행합니다:
+
+```bash
+cd /path/to/villagesql/build/mysql-test
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test --record
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test
+```
+
+## 함께 보기 {#see-also}
+
+- [확장 만들기](/ko/extensions/build/create) — 전체 C++ SDK 참조: 타입 래퍼, 사용자 정의 유형, 집계, 시스템 변수
+- [확장 API 참조](/ko/sdk/cpp/extension-api-reference) — VDF 계약, null 처리, 버퍼 크기 산정, 오류 의미론
+- [Rust 확장 작성하기](/ko/guides/rust-extensions) — 같은 작업을 위한 Rust 경로
