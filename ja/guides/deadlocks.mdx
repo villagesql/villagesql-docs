@@ -1,0 +1,190 @@
+---
+title: "MySQL のデッドロック"
+sidebarTitle: "デッドロックの回避"
+description: "MySQL のデッドロックが起こる仕組み、InnoDB がそれを検出して解決する方法、デッドロックログの読み方、およびアプリケーションでデッドロックを防ぐパターン。"
+keywords: "mysql deadlock, mysql innodb deadlock, mysql deadlock error 1213, mysql deadlock detection, mysql show engine innodb status, mysql deadlock prevention, mysql lock wait timeout"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+デッドロックは、2 つのトランザクションがそれぞれ相手の必要とするロックを保持し、どちらも先に進めないときに起こります。InnoDB はこれを自動的に検出し、一方のトランザクション（「犠牲者」）を `ERROR 1213: Deadlock found when trying to get lock; try restarting transaction` で強制終了します。
+
+## デッドロックが起こる仕組み {#how-deadlocks-happen}
+
+典型的なパターン: 2 つのトランザクションが逆の順序で行をロックします。
+
+```sql
+-- Transaction A: locks row 1, then tries to lock row 2
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- locks row 1
+-- (Transaction B runs here and locks row 2)
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- waits for B's lock on row 2
+
+-- Transaction B: locks row 2, then tries to lock row 1
+BEGIN;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- locks row 2
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- waits for A's lock on row 1
+-- Deadlock: A waits for B, B waits for A
+```
+
+InnoDB のデッドロック検出器がこの循環を見つけ、ロックしているリソースが少ないほう（または行った作業が少ないほう）のトランザクションをロールバックします。
+
+## デッドロックログの読み方 {#reading-the-deadlock-log}
+
+最新のデッドロックは、常に InnoDB のステータス出力で確認できます。
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+```
+
+`LATEST DETECTED DEADLOCK` セクションを探してください。両方のトランザクション、それぞれが保持していたロック、待っていたロック、およびどちらのトランザクションがロールバックされたかが示されます。
+
+```
+------------------------
+LATEST DETECTED DEADLOCK
+------------------------
+*** (1) TRANSACTION:
+TRANSACTION 12345, ACTIVE 0 sec starting index read
+MySQL thread id 10, query: UPDATE accounts SET balance = balance + 100 WHERE id = 2
+*** (1) HOLDS THE LOCK(S):
+RECORD LOCKS space id 87 page no 3 n bits 72 index PRIMARY of table accounts trx id 12345 lock_mode X locks rec but not gap
+Record lock, heap no 3 PHYSICAL RECORD: ...
+
+*** (2) TRANSACTION:
+TRANSACTION 12346, ACTIVE 0 sec starting index read
+MySQL thread id 11, query: UPDATE accounts SET balance = balance - 100 WHERE id = 1
+*** (2) HOLDS THE LOCK(S): ...
+*** (2) WAITING FOR THIS LOCK TO BE GRANTED: ...
+*** WE ROLL BACK TRANSACTION (1)
+```
+
+読み取るべき重要な点:
+- どの 2 つのクエリが競合しているか
+- どのテーブルとインデックスが関係しているか
+- どちらのトランザクションが犠牲者（ロールバックされた側）か
+
+## デッドロック防止のパターン {#deadlock-prevention-patterns}
+
+### 一貫した順序で行をロックする {#lock-rows-in-consistent-order}
+
+上のデッドロックは、A が行 1 の次に行 2 をロックし、B が行 2 の次に行 1 をロックするために起こります。両方のトランザクションが常に ID の昇順でロックすれば、循環は形成されません。
+
+```sql
+-- Both transactions lock in order: lower ID first
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- lower ID first
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- then higher ID
+COMMIT;
+```
+
+アプリケーションコードを制御できる場合は、複数の行に触れる操作に対して一貫したロック順序を強制してください。
+
+### トランザクションを短く保つ {#keep-transactions-short}
+
+長いトランザクションはロックを長く保持するため、競合が発生する時間が増えます。トランザクションの中では最小限の作業だけを行ってください。
+
+```sql
+-- Fetch data outside the transaction, compute, then write in one short transaction
+BEGIN;
+UPDATE orders SET status = 'shipped', shipped_at = NOW() WHERE id = ?;
+COMMIT;
+-- Don't: read+compute+write all inside one long-running transaction
+```
+
+### SELECT ... FOR UPDATE で事前にロックする {#use-select--for-update-to-pre-lock}
+
+トランザクションが行を更新する予定なら、UPDATE でロックの衝突に気づくのではなく、SELECT の時点でロックします。
+
+```sql
+BEGIN;
+SELECT * FROM orders WHERE id = 42 FOR UPDATE;  -- acquires write lock now
+-- ... application logic ...
+UPDATE orders SET status = 'processed' WHERE id = 42;
+COMMIT;
+```
+
+これでデッドロックがなくなるわけではありませんが、ロックの順序が明示的で予測可能になります。
+
+### デッドロック時に再試行する {#retry-on-deadlock}
+
+デッドロックは並行システムでは想定されるものです。アプリケーションの正しい対応は、`ERROR 1213` を捕捉してトランザクション全体を再試行することです。
+
+```python
+MAX_RETRIES = 3
+for attempt in range(MAX_RETRIES):
+    try:
+        with connection.transaction():
+            do_work()
+        break
+    except DeadlockError:
+        if attempt == MAX_RETRIES - 1:
+            raise
+        time.sleep(0.1 * (attempt + 1))  # brief backoff
+```
+
+個々のステートメントを再試行しないでください。InnoDB はすでにトランザクションをロールバックしているため、トランザクション全体を最初から再試行します。
+
+## ギャップロックとネクストキーロック {#gap-locks-and-next-key-locks}
+
+InnoDB は、デフォルトの `REPEATABLE READ` 分離レベルでファントムリードを防ぐために、ギャップロックとネクストキーロックを使います。これらの広いロックは、デッドロックの可能性を高めます。
+
+```sql
+-- Locking a non-existent id doesn't just lock a gap -- it locks up to
+-- the next existing row too (a gap lock, not a plain row lock).
+-- Locking an id that DOES exist takes only a record lock, no gap.
+SELECT * FROM orders WHERE id = 6 FOR UPDATE;
+
+-- Switching to READ COMMITTED reduces gap locking
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+`READ COMMITTED` は行ロックのみを使い（ギャップロックなし）、デッドロックの頻度を減らします。トレードオフは、ファントムリードを許すことです。ほとんどの OLTP ワークロードでは、デッドロックの影響を受けやすい操作に対して `READ COMMITTED` は妥当な選択です。
+
+## ロック待ちのタイムアウト {#lock-wait-timeout}
+
+すべてのロック競合がデッドロックというわけではありません。トランザクション B が単に A のロックを待っていて A が遅い場合、B は `innodb_lock_wait_timeout` 秒（デフォルト: 50）後にタイムアウトします。エラーは `ERROR 1205: Lock wait timeout exceeded` です。
+
+```sql
+SHOW VARIABLES LIKE 'innodb_lock_wait_timeout';
+-- 50 seconds by default
+
+SET SESSION innodb_lock_wait_timeout = 10;
+```
+
+タイムアウトはデッドロックではありません。InnoDB はブロックしている側のトランザクションをロールバックせず、待っている側だけをロールバックしました。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 現在のすべてのロックと、誰が待っているかを見るにはどうすればよいですか? {#how-do-i-see-all-current-locks-and-whos-waiting}
+
+```sql
+SELECT * FROM performance_schema.data_locks\G
+SELECT * FROM performance_schema.data_lock_waits\G
+```
+
+`data_locks` は、現在保持または要求されているすべてのロックを示します。`data_lock_waits` は、どのスレッドがどのスレッドをブロックしているかを示します。
+
+#### InnoDB は常にデッドロックを即座に検出しますか? {#does-innodb-always-detect-deadlocks-immediately}
+
+InnoDB のデッドロック検出器は、ロックの競合が発生したときに同期的に実行されます。検出はほぼ瞬時です。`innodb_deadlock_detect = OFF` で無効にして `innodb_lock_wait_timeout` だけに頼ることもでき、一部の高並行ワークロードはパフォーマンスのためにそうしますが、一般的ではありません。
+
+#### すべてのデッドロックを防げますか? {#can-i-prevent-all-deadlocks}
+
+いいえ。デッドロックは、ロックを行う並行トランザクションの根本的な性質です。一貫したロック順序と短いトランザクションで頻度を減らすことはでき、デッドロックに対する再試行ロジックは常に書くべきです。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 1213: Deadlock found` | トランザクションを再試行し、`SHOW ENGINE INNODB STATUS` でロック競合のパターンを調べます |
+| `ERROR 1205: Lock wait timeout exceeded` | あるトランザクションがロックを長く保持しすぎています。`performance_schema.data_lock_waits` でブロックしているクエリを見つけます |
+| UPDATE ではなく INSERT でデッドロックが起こる | インデックス範囲でのギャップロックの競合の可能性が高いです。`READ COMMITTED` 分離レベルを試すか、一貫した順序で行を挿入します |
+| 同じデッドロックのパターンが繰り返される | アプリケーションのロック順序が一貫していません。2 つのコードパスを見つけ、正規の順序を強制します |
+| `SHOW ENGINE INNODB STATUS` にデッドロックが表示されない | ステータスは最新のデッドロックしか保持しません。エラーログへの永続的なデッドロックのログ記録を有効にします: `SET GLOBAL innodb_print_all_deadlocks = ON` |
+
+## 関連項目 {#see-also}
+
+- [MySQL のトランザクション](/ja/guides/transactions) — デッドロックを可能にするトランザクションモデル
+- [InnoDB がデータを格納する仕組み](/ja/guides/innodb-storage) — InnoDB の行レベルロックが内部でどう機能するか

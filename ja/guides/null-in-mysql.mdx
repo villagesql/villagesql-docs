@@ -1,0 +1,203 @@
+---
+title: "MySQL の NULL"
+sidebarTitle: "NULL の扱い"
+description: "MySQL での NULL の仕組み: 三値論理、比較と集計でよくある落とし穴、そしてインデックスが NULL 値をどう扱うか。"
+keywords: "mysql null, mysql ifnull, mysql coalesce, mysql three valued logic, mysql null index, mysql null aggregate, mysql null join"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL の NULL は、ゼロでも空文字列でも false でもありません。不明を意味します。この区別は追跡しにくいバグを引き起こします。クエリはエラーなしで実行され、黙って誤った結果を返すからです。
+
+## NULL は値ではない {#null-is-not-a-value}
+
+NULL は値の不在を表します。NULL を何かと比較しても、別の NULL との比較であっても、true も false も返りません。NULL が返ります。
+
+```sql
+SELECT NULL = NULL;    -- NULL (not 1)
+SELECT NULL != NULL;   -- NULL (not 0)
+SELECT NULL = 0;       -- NULL
+SELECT NULL = '';      -- NULL
+SELECT 1 + NULL;       -- NULL
+SELECT 'hello' || NULL; -- NULL (logical OR with NULL is unknown, not concatenation — see below)
+```
+
+デフォルトでは MySQL の `sql_mode` に `PIPES_AS_CONCAT` が含まれないため、`||` は文字列の連結ではなく論理 OR です。`'hello' || 'world'` は `'helloworld'` ではなく `0` に評価されます。これは PostgreSQL や ANSI 標準とは異なり、そちらでは `||` は常に連結です。MySQL で文字列を連結するには `CONCAT()` を使ってください。
+
+これが三値論理です。true、false、そして不明 (NULL) です。NULL との比較はすべて不明を生み、MySQL は `WHERE` 句でこれを false として扱います。つまり、フィルタされる列に NULL を持つ行は黙って除外されます。
+
+```sql
+CREATE TABLE users (
+    id       INT PRIMARY KEY AUTO_INCREMENT,
+    email    VARCHAR(255),
+    referrer VARCHAR(255)  -- nullable
+);
+
+INSERT INTO users (email, referrer) VALUES
+    ('a@example.com', 'google'),
+    ('b@example.com', NULL),
+    ('c@example.com', 'twitter');
+
+-- This returns only 1 row — both the 'google' row and the NULL row are excluded
+SELECT * FROM users WHERE referrer != 'google';
+```
+
+NULL の行を含めるには、`IS NULL` を明示的に使います。
+
+```sql
+SELECT * FROM users WHERE referrer != 'google' OR referrer IS NULL;
+```
+
+## NULL の判定 {#testing-for-null}
+
+常に `IS NULL` と `IS NOT NULL` を使い、`= NULL` や `!= NULL` は決して使わないでください。
+
+```sql
+-- Wrong — always returns no rows
+SELECT * FROM users WHERE referrer = NULL;
+
+-- Correct
+SELECT * FROM users WHERE referrer IS NULL;
+SELECT * FROM users WHERE referrer IS NOT NULL;
+```
+
+MySQL には、2 つの NULL を等しいものとして扱う `<=>` (NULL 安全な等価演算子) もあります。
+
+```sql
+SELECT NULL <=> NULL;  -- 1 (true)
+SELECT NULL <=> 0;     -- 0 (false)
+```
+
+これは、NULL どうしを一致させたい `WHERE` 句、たとえば NULL になり得る 2 つの列を比較するクエリで役立ちます。
+
+## 集計における NULL {#null-in-aggregates}
+
+集計関数 (`COUNT`、`SUM`、`AVG` など) は NULL 値を無視します。例外は `COUNT(*)` です。
+
+```sql
+SELECT
+    COUNT(*)        AS total_rows,      -- counts all rows including NULLs
+    COUNT(referrer) AS has_referrer,    -- counts only non-NULL referrer values
+    AVG(referrer)   AS avg_referrer     -- ignores NULLs in the average
+FROM users;
+```
+
+```
+total_rows | has_referrer
+-----------+-------------
+3          | 2
+```
+
+`COUNT(*)` は 3 を返します。`COUNT(referrer)` は 2 を返します。NULL の行が除外されるためです。これは意図された動作ですが、`COUNT(column)` が `COUNT(*)` と等しいと期待する開発者を驚かせます。
+
+## 式における NULL の処理 {#handling-null-in-expressions}
+
+列が NULL のときにデフォルト値で置き換えるには、`COALESCE` を使います。
+
+```sql
+-- Returns the first non-NULL value in the list
+SELECT email, COALESCE(referrer, 'direct') AS source FROM users;
+```
+
+```
+email           | source
+----------------+---------
+a@example.com  | google
+b@example.com  | direct
+c@example.com  | twitter
+```
+
+`IFNULL(column, default)` は、引数が 2 つの場合には同等です。
+
+```sql
+SELECT email, IFNULL(referrer, 'direct') AS source FROM users;
+```
+
+`NULLIF(a, b)` は `a = b` のときに NULL を返し、それ以外では `a` を返します。ゼロ除算を避けるのに役立ちます。
+
+```sql
+SELECT total_revenue / NULLIF(order_count, 0) AS avg_order_value FROM stats;
+```
+
+| 関数 | 動作 | 使う場面 |
+|:---------|:---------|:---------|
+| `COALESCE(a, b, ...)` | リスト内の最初の非 NULL 値を返す | 複数のフォールバックの選択肢がある |
+| `IFNULL(a, b)` | `a` が NULL なら `b`、それ以外は `a` を返す | 単一のフォールバック値。引数が 2 つなら `COALESCE` より簡潔な構文 |
+| `NULLIF(a, b)` | `a = b` なら NULL、それ以外は `a` を返す | センチネル値を抑制する (例: count が 0 のときのゼロ除算を避ける) |
+
+NULL は JOIN の動作にも分かりにくい形で影響します。`LEFT JOIN` は一致が存在しないとき右側の列に NULL を返し、その NULL 列を `WHERE` でフィルタすると、黙って `INNER JOIN` に変わります。サンプルデータベースを使って ON と WHERE の違いを順に追った [MySQL の LEFT JOIN](/ja/tutorial/left-join) を参照してください。
+
+## NULL とインデックス {#null-and-indexes}
+
+MySQL のインデックスは NULL 値を格納します。`WHERE col IS NULL` のクエリは `col` のインデックスを使えます。ただし次の点に注意してください。
+
+- `UNIQUE` インデックスでは `NULL` 値は等しいとみなされません。一意列は複数の NULL 値を含むことができます
+- 複合インデックスでは、どの列位置の NULL も通常どおりインデックスされます
+
+```sql
+CREATE TABLE sessions (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT,           -- nullable: anonymous sessions
+    token      VARCHAR(64) NOT NULL UNIQUE,
+    created_at DATETIME NOT NULL,
+    INDEX idx_user (user_id)  -- indexes NULL values too
+);
+
+-- This query can use idx_user
+SELECT * FROM sessions WHERE user_id IS NULL;
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 省略可能なテキストフィールドには NULL と空文字列のどちらを使うべきですか？ {#should-i-use-null-or-empty-string-for-optional-text-fields}
+本当に存在しないデータには NULL を優先してください。空文字列 (`''`) は「明示的に空に設定された」ことを意味し、「提供されていない」とは異なります。両者を混ぜると不整合が生じます。`WHERE col IS NULL` と `WHERE col = ''` は異なる条件です。1 つの規約を選び、一貫して適用してください。
+
+#### なぜ `NOT IN` は NULL があると予期しない動作をするのですか？ {#why-does-not-in-behave-unexpectedly-with-nulls}
+NULL を 1 つでも返すサブクエリを伴う `NOT IN` は、常に空の結果セットを返します。
+
+```sql
+-- If any value in category_ids is NULL, this returns no rows
+SELECT * FROM products WHERE category_id NOT IN (SELECT id FROM categories);
+```
+
+サブクエリが NULL を返す可能性があるときは、代わりに `NOT EXISTS` を使ってください。
+
+```sql
+SELECT * FROM products p
+WHERE NOT EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id);
+```
+
+#### `ORDER BY` は NULL をソートしますか？ {#does-order-by-sort-nulls}
+はい。デフォルトでは、MySQL は昇順で NULL 値を最初に、降順で最後にソートします。MySQL は `NULLS FIRST` / `NULLS LAST` 構文をサポートしていません (それは PostgreSQL です)。NULL の位置を制御するには、ソート式を使います。
+
+```sql
+-- NULLs last in ascending order
+SELECT * FROM users ORDER BY referrer IS NULL, referrer ASC;
+
+-- NULLs first in ascending order (default behavior, but explicit)
+SELECT * FROM users ORDER BY referrer IS NULL DESC, referrer ASC;
+```
+
+`col IS NULL` は非 NULL 値に対して 0、NULL に対して 1 に評価されるため、これで昇順にソートすると NULL が末尾に押しやられます。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `WHERE col != 'value'` が NULL の行を除外する | 条件に `OR col IS NULL` を追加する |
+| `COUNT(column)` が `COUNT(*)` と一致しない | 想定どおり — `COUNT(column)` は NULL を飛ばす。総行数には `COUNT(*)` を使う |
+| `NOT IN` サブクエリが空の結果を返す | サブクエリが NULL を返している — 代わりに `NOT EXISTS` を使う |
+| WHERE 内の `= NULL` が何にも一致しない | `IS NULL` に置き換える |
+| UNIQUE 列が重複した NULL を許す | 想定どおりの動作 — 一意インデックスでは NULL は等しいとみなされない |
+
+## 関連項目 {#see-also}
+
+- [MySQL の JOIN のパフォーマンスとよくある間違い](/ja/guides/joins) — 結合で NULL が引き起こす行数の誤りのバグ
+- [MySQL の CHECK 制約](/ja/guides/check-constraints) — NOT NULL やその他の列ルールを強制する
+- [MySQL の本物のブール値](/ja/guides/boolean-columns) — ブール集計が NULL をどう扱うか
+- [MySQL の INNER JOIN](/ja/tutorial/inner-join) — 内部結合が NULL を表示する代わりに行を落とす理由
+- [MySQL の演算子](/ja/tutorial/operators) — NULL との比較が NULL を返す理由
+- [MySQL の IS NULL](/ja/tutorial/is-null) — WHERE 句で欠けている値を判定する
+- [MySQL の LEFT JOIN](/ja/tutorial/left-join) — 外部結合の NULL がどこから来るか

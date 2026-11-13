@@ -1,0 +1,173 @@
+---
+title: "MariaDB から MySQL への移行"
+sidebarTitle: "MariaDB からの移行"
+description: "MariaDB データベースを MySQL に移行する方法: JSON 列、シーケンス、INET6、および外部キー制約名など、実際にロードを失敗させるスキーマとダンプの違い。"
+keywords: "mariadb to mysql migration, migrate mariadb to mysql, mariadb vs mysql differences, mariadb dump mysql, mariadb json vs mysql json, mariadb sequence mysql, mysqldump mariadb"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MariaDB と MySQL は同じワイヤプロトコルと、SQL 構文の大部分を共有しています。そのため、移行は見かけ上は単純です。ダンプして、ロードするだけです。実際には、MariaDB 固有の型、オブジェクト、およびダンプの動作のいくつかが、プレーンなロードを途中で止めます。そのうちの 1 つは、エラーをまったく出さずに列の格納型を変えてしまいます。このガイドでは、MariaDB 12.3.3 から取得して MySQL にロードした実際のダンプに基づき、実際に何が壊れ、どう修正するかを説明します。
+
+## データ型とデフォルトの違い {#data-type-and-default-differences}
+
+| MariaDB の機能 | MySQL での状況 | 注記 |
+|:-----------------|:-----------------|:------|
+| `JSON` 列型 | MariaDB 側では `CHECK (json_valid(...))` 制約付きの `LONGTEXT` | MariaDB の `JSON` はネイティブな型ではなくエイリアスです。MariaDB で `SHOW CREATE TABLE` を実行すると、実際の列は `longtext ... CHECK (json_valid(...))` と表示されます。MySQL にはネイティブな `JSON` 型がありますが、MariaDB でこのように作成された列は、ダンプが列定義をそのまま持つため、MySQL には `JSON` ではなく `LONGTEXT` としてロードされます。 |
+| `INET6` 列型 | 未対応 | MySQL と VillageSQL には `INET6` 型がありません。`INET6` 列を持つテーブルのロードは即座に失敗します。値を `VARCHAR(45)` として格納するか、INET 拡張機能を使います。 |
+| `SEQUENCE` オブジェクトと `NEXTVAL()` | 未対応 | MariaDB の `CREATE SEQUENCE` と `NEXTVAL()` の列デフォルトには、MySQL の同等物がありません。代わりに `AUTO_INCREMENT` を使います。 |
+| `INSERT ... RETURNING` | 未対応 | MariaDB は `INSERT` の `RETURNING` を受け入れますが、MySQL は受け入れません。代わりに挿入後に `SELECT LAST_INSERT_ID()` を使います。 |
+| デフォルトの照合順序 | `utf8mb4_general_ci`（MariaDB 12.3.3）と `utf8mb4_0900_ai_ci`（MySQL 8.4 および VillageSQL） | 両方のサーバーで `SHOW VARIABLES LIKE 'collation_server'` を実行して確認しました。`mysqldump` は照合順序を `CREATE TABLE` に明示的に書き込むため、ダンプされたテーブルは作成時の照合順序を保持します。デフォルトが影響するのは、照合順序を指定せずに移行先で新規に作成するテーブルだけです。 |
+| `SHOW CREATE TABLE` の整数の表示幅 | 廃止 | MariaDB は `int(11)` や `bigint(20)` と表示します。MySQL 8.4 と VillageSQL は、`int` や `bigint` とだけ表示します。これは見た目の違いで、格納されたデータには影響しませんが、MariaDB と MySQL の `SHOW CREATE TABLE` の差分は、テーブルが変更された証拠にはならないということです。 |
+
+## MariaDB 固有のスキーマオブジェクトがロードを失敗させる {#mariadb-only-schema-objects-break-the-load}
+
+`CREATE SEQUENCE` を使うスキーマは、MySQL にロードすると、どのテーブルも作成される前に即座に失敗します。`mysqldump` はシーケンスの定義をテーブルより先に書き込むためです。シーケンスを含む未修正のダンプをロードすると次のようになります。`at line N` の値はステートメントがダンプ内のどこにあるかを示すもので、ここに示す数値とは一致しません。
+
+```
+ERROR 1064 (42000) at line 23: You have an error in your SQL syntax; check the manual
+that corresponds to your MySQL server version for the right syntax to use near
+'SEQUENCE IF EXISTS `invoice_seq`' at line 1
+```
+
+ダンプから `DROP SEQUENCE` / `CREATE SEQUENCE` / `DO SETVAL(...)` のブロックを削除し、`DEFAULT nextval(...)` と書かれた列のデフォルトを、プレーンな `AUTO_INCREMENT` 列またはアプリケーションが割り当てる値に置き換えます。
+
+`INET6` 型の列も、同じロードの後の方で、ローダーがその列を宣言するテーブルに到達した時点で同じように失敗します。これは、このガイドの中で、どのサーバーにロードするかによって文言が変わる唯一のエラーです。VillageSQL は型の名前を示します。その文法はその位置でカスタム型名を受け入れるため、解決できなかった型を報告するからです。
+
+```
+ERROR 1064 (42000) at line 26: Expected a type or a custom type instead of "inet6"
+near 'inet6 DEFAULT NULL, `created_at` timestamp NULL DEFAULT current_timestamp(), '
+at line 5
+```
+
+標準の MySQL 8.4 は、同じステートメントを代わりに一般的な構文エラーで拒否します。
+
+```
+ERROR 1064 (42000) at line 26: You have an error in your SQL syntax; check the manual
+that corresponds to your MySQL server version for the right syntax to use
+near 'inet6 DEFAULT NULL, `created_at` timestamp NULL DEFAULT current_timestamp(), '
+at line 5
+```
+
+どちらも `ERROR 1064` で、どちらも問題の行を示すため、修正はどちらでも同じです。ロードの前に列の型を `VARCHAR(45)`（テキスト形式の IPv6 アドレスに十分な長さ）に変更するか、移行先に拡張機能がインストールされていれば、それが提供する INET 型に変更します。
+
+## 外部キー制約名がテーブル間で衝突する {#foreign-key-constraint-names-collide-across-tables}
+
+MariaDB の `mysqldump` は、名前のない外部キー制約に、テーブルごとに `1` から始まるプレーンな整数の名前を自動で付けます。同じスキーマ内の 2 つのテーブルが、どちらも文字どおり `1` という名前の制約を持つことがあります。
+
+```sql
+CREATE TABLE `order_items` (
+  ...
+  CONSTRAINT `1` FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`),
+  CONSTRAINT `2` FOREIGN KEY (`product_id`) REFERENCES `products` (`id`)
+) ENGINE=InnoDB ...;
+
+CREATE TABLE `orders` (
+  ...
+  CONSTRAINT `1` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)
+) ENGINE=InnoDB ...;
+```
+
+MySQL は、外部キー制約名がテーブル内だけでなく、スキーマ全体で一意であることを要求します。2 つ目の `CONSTRAINT `1`` のロードは次のエラーで失敗します。
+
+```
+ERROR 1826 (HY000) at line 96: Duplicate foreign key constraint name '1'
+```
+
+これは、元のテーブルが MariaDB の自動命名に頼っていた（`CREATE TABLE` で `CONSTRAINT name` を指定していなかった）場合にだけ起こります。ロードの前に、衝突する各制約を一意な名前、たとえば `order_items_ibfk_1` と `orders_ibfk_1` に変更します。
+
+## JSON 列はエラーなしに、別の型としてロードされる {#the-json-column-loads-without-error-as-a-different-type}
+
+上の 3 つの問題とは異なり、`JSON` 列はエラーも警告もなく MySQL にロードされます。MariaDB の `JSON` 列について、ダンプされた `CREATE TABLE` は次のようになります。
+
+```sql
+CREATE TABLE `products` (
+  ...
+  `attributes` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+    DEFAULT NULL CHECK (json_valid(`attributes`))
+) ENGINE=InnoDB ...;
+```
+
+MySQL は `CHECK` 制約と `JSON_VALID()` 関数をサポートしているため、このステートメントは書かれたとおりに実行されます。MySQL 側では、列は MySQL のネイティブな `JSON` 型ではなく、`CHECK` 制約付きの `LONGTEXT` になります。`JSON_EXTRACT()` と `JSON_LENGTH()` で読み戻すと、元のデータと同一の結果が得られるため、何も失われません。しかし、列の宣言された型は、新規の MySQL スキーマが使うものとは異なります。移行先でネイティブな `JSON` 型が必要なら、ロード後に列を変更します。
+
+```sql
+ALTER TABLE products MODIFY attributes JSON;
+```
+
+これは、元の `CHECK (json_valid(...))` 制約を列に付けたまま残します。ダンプはその制約に名前を付けていないため、`CREATE TABLE` の実行時にサーバーが `products_chk_1` のような名前を付けました。`ALTER` の前からすでに存在しています。MySQL は型レベルですでに無効な JSON を拒否するため、ネイティブな `JSON` 列では無害ですが、LONGTEXT の定義から残った不要な制約です。クリーンなスキーマにしたい場合は削除します。
+
+```sql
+ALTER TABLE products DROP CHECK products_chk_1;
+```
+
+## 認証の違い {#authentication-differences}
+
+MariaDB と MySQL のクライアントは同じワイヤプロトコルを話し、一方から他方へのプレーンなパスワード認証による接続は動作します。引き継がれないのは、アカウントの定義そのものです。`mysqldump` はデフォルトでは `mysql.user` テーブルをダンプしないため、アカウントと権限は移行先で手作業で再作成する必要があり、そのための構文は異なります。
+
+パスワード付きで作成された MariaDB のアカウントは、次のように表示されます。
+
+```sql
+-- MariaDB
+SHOW CREATE USER 'appuser'@'%';
+-- CREATE USER `appuser`@`%` IDENTIFIED BY PASSWORD '*E6867A710B62E46C7948C1936692C0E9EAB160C5'
+```
+
+デフォルトの `caching_sha2_password` プラグインを使う MySQL または VillageSQL では、同じステートメントは代わりに次のように表示されます。
+
+```sql
+-- MySQL / VillageSQL
+SHOW CREATE USER 'appuser'@'%';
+-- CREATE USER `appuser`@`%` IDENTIFIED WITH 'caching_sha2_password' AS '...'
+--   REQUIRE NONE PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK ...
+```
+
+MariaDB の `SHOW CREATE USER` ステートメントを MySQL にコピーしないでください。移行先で `CREATE USER ... IDENTIFIED BY '<password>'` によってアカウントを新規に作成し、サーバー自身のデフォルトプラグインを選ばせてから、`GRANT` ステートメントを再発行します。
+
+セットアップしたばかりの MariaDB インストール（たとえば新規の Homebrew インストール）に対して移行をテストしていて、パスワードが正しいのに、パスワード付きの名前付きアカウントが「Access denied」で拒否される場合は、まず匿名アカウントを確認します。
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = '';
+```
+
+セキュリティ設定を行っていない MariaDB インストールでは、`''@'localhost'` と `''@'<hostname>'` が残っていることがあります。ホストの一致はユーザー名の一致より優先されるため、`localhost` に解決される接続は、名前付きアカウントより先に匿名アカウントに一致し、匿名アカウントはパスワードを期待しないため拒否されます。これは MariaDB 側のインストールの問題で、データとともに MySQL に引き継がれるものではありませんが、匿名アカウントを削除するまでは、移行元でのテストを混乱させることがあります。
+
+## 移行の進め方 {#migration-approach}
+
+1. **スキーマとデータをダンプします。** `mysqldump` を使います（MariaDB ホストでは通常 MariaDB 独自の `mariadb-dump` へのシンボリックリンクです。`mysqldump --version` を実行してどちらかを確認します）。
+2. **ロードを試みる前に、ダンプから `CREATE SEQUENCE`、`INET6`、および `RETURNING` を検索します。** この 3 つはいずれも、ロードがすでに途中まで進むまで有用なエラーを出しません。
+3. **まずスクラッチ用のデータベースにロードを試みます。** `CREATE SEQUENCE` または `INET6` の失敗は、そのステートメントでスクリプト全体を中止します。そのため、ファイル内で先に定義されたテーブルはすでにロードされ、後に定義されたテーブルはロードされていません。半分ロードされたデータベースにパッチを当てるのではなく、ダンプを修正して新規のデータベースに再ロードします。
+4. **移行元のスキーマが名前のない外部キーに頼っていた場合は、外部キー制約名の衝突を確認します。** `grep -o 'CONSTRAINT \`[0-9]*\`' dump.sql` で見つかります。
+5. **アカウントと権限を手作業で再作成します。** `mysqldump` にはそれらが含まれず、`CREATE USER` / `SHOW CREATE USER` の構文は 2 つのサーバーで異なります。
+6. **行数を検証し、JSON 列を抜き取り検査します。** `JSON` 列は黙って `LONGTEXT` としてロードされます。ネイティブな `JSON` 列に変換するかどうかを決める前に、`JSON_EXTRACT()` でデータが往復することを確認します。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 同じバージョン系統の MySQL を移行先とする場合、MariaDB の `mysqldump` ファイルに編集は必要ですか? {#does-a-mariadb-mysqldump-file-need-any-edits-for-a-same-version-family-mysql-target}
+
+スキーマがシーケンス、`INET6`、`RETURNING`、または名前のない外部キーを使っていなければ、同じダンプは多くの場合、変更なしでロードされます。スキーマが「ただのテーブルとデータ」だから成功するだろうと仮定するのではなく、まずスクラッチ用のデータベースに対してロードをテストしてください。
+
+#### ネイティブな MySQL の `JSON` 列は、MariaDB のダンプを通して正しく往復しますか? {#will-a-native-mysql-json-column-round-trip-through-a-mariadb-dump-correctly}
+
+値は正しく往復します。列の型は往復しません。MariaDB は `JSON` 列を `CHECK` 制約付きの `LONGTEXT` としてダンプし、それがそのまま MySQL にロードされます。後で明示的に `ALTER TABLE ... MODIFY` で列を `JSON` にしない限り、そのままです。
+
+#### MySQL クライアントで MariaDB サーバーに、またはその逆に接続できますか? {#can-i-connect-to-a-mariadb-server-with-a-mysql-client-or-the-reverse}
+
+はい、通常のパスワード認証による接続であれば可能です。どちらも同じワイヤプロトコルを使い、一方のライブラリでビルドされたクライアントは、パスワード付きのアカウントが存在しさえすれば、他方のサーバーのアカウントに対して認証できます。両者が分かれるのは、接続ではなく、各サーバーが受け入れる SQL です。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 1064 ... near 'SEQUENCE IF EXISTS ...'` | `CREATE SEQUENCE`/`DROP SEQUENCE`/`DO SETVAL(...)` ステートメントと、`DEFAULT nextval(...)` の列デフォルトを削除し、代わりに `AUTO_INCREMENT` を使います |
+| `inet6` を示す `ERROR 1064`（VillageSQL は `Expected a type or a custom type instead of "inet6"` と言い、標準の MySQL は一般的な構文エラーを出します） | ロードの前に列を `VARCHAR(45)` またはサポートされる INET 型に変更します |
+| `ERROR 1064 ... near 'RETURNING id'` | ステートメントから `RETURNING` を削除し、後で `SELECT LAST_INSERT_ID()` を使います |
+| `ERROR 1826 (HY000) ... Duplicate foreign key constraint name '1'` | ダンプ内の衝突する `CONSTRAINT` 名を、スキーマ全体で一意になるように変更します |
+| `JSON` 列がエラーなしでロードされるが、移行先のスキーマでは `LONGTEXT` と表示される | 想定どおりです。MariaDB の `JSON` は `CHECK` 制約付きの `LONGTEXT` です。移行先でネイティブな型が必要なら `ALTER TABLE ... MODIFY <col> JSON` を実行します |
+| 正しいパスワードを持つはずの名前付きアカウントで「Access denied」 | MariaDB の移行元の `mysql.user` で、接続を横取りしている可能性のある匿名アカウント（`user = ''`）を確認します |
+
+## 関連項目 {#see-also}
+
+- [PostgreSQL から MySQL への移行](/ja/guides/postgres-to-mysql) — 移行元が PostgreSQL の場合の同等のガイド
+- [MySQL のスキーママイグレーション](/ja/guides/schema-migrations) — 移行に必要な DDL 変更の実行

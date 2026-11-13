@@ -1,0 +1,159 @@
+---
+title: "MySQL の EXPLAIN の読み方"
+sidebarTitle: "EXPLAIN の読み方"
+description: "MySQL の EXPLAIN 出力の読み方: 各列の意味、フルテーブルスキャンの見つけ方、および EXPLAIN を使って遅いクエリを修正する方法。"
+keywords: "mysql explain output, mysql explain type, mysql explain rows, mysql explain key, mysql query plan, mysql optimize query, mysql explain analyze"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+クエリが遅いとき、最初にすることは `EXPLAIN` です。MySQL がそのクエリをどう実行する計画なのかを正確に示します。どのインデックスを使うか、何行をスキャンする見込みか、どこで高コストな処理をしているかです。読めるようになれば、ほぼどんな遅いクエリでも修正できます。
+
+## EXPLAIN の実行 {#running-explain}
+
+任意の `SELECT` の前に `EXPLAIN` を付けます。
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+MySQL はクエリ内のテーブルごとに 1 行を返します。結合では複数の行が返され、関係するテーブルごとに 1 行です。
+
+## 重要な列 {#the-columns-that-matter}
+
+完全な `EXPLAIN` の行は次のようになります。
+
+```
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |   100.00 | NULL        |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+```
+
+ほとんどの列は時々重要になります。次の列はほぼ常に重要です。
+
+### `type` — MySQL がテーブルをスキャンする方法 {#type--how-mysql-scans-the-table}
+
+これが最も重要な列です。アクセス方法を示し、速い順に次のとおりです。
+
+| type | 意味 | 見られる場面 |
+|:-----|:--------|:----------------|
+| `const` | 主キーまたは一意インデックスによる単一行 | `WHERE id = 5` |
+| `eq_ref` | 前のテーブルの行ごとに 1 行 | 主キーでの JOIN |
+| `ref` | 非一意インデックスからの複数行 | `WHERE user_id = 42` |
+| `range` | インデックスの範囲スキャン | `BETWEEN`、`>`、`<`、`IN` |
+| `index` | フルインデックススキャン | インデックスを左から右へスキャン |
+| `ALL` | フルテーブルスキャン | 使えるインデックスがない |
+
+**`ALL` が修正すべきものです。** MySQL がテーブルのすべての行を読んでいることを意味します。100 万行のテーブルでは、クエリを実行するたびに 100 万回の読み取りです。
+
+### `key` — MySQL が選んだインデックス {#key--which-index-mysql-chose}
+
+`NULL` はインデックスが使われなかったことを意味します。`possible_keys` にインデックスが列挙されているのに `key` が `NULL` の場合、MySQL はフルスキャンの方が安いと判断しました。通常はテーブルが小さいか、クエリの選択性が十分でないためです。
+
+### `rows` — 検査される行数の見積もり {#rows--estimated-rows-examined}
+
+見積もりであり、保証ではありません。MySQL は統計を使ってこの数値を算出します。`rows: 1` のクエリは速く、本番テーブルでの `rows: 5000000` は問題です。
+
+### `Extra` — 追加の実行詳細 {#extra--additional-execution-details}
+
+`Extra` 列には重要なフラグが入ります。
+
+| Extra の値 | 意味 |
+|:------------|:--------|
+| `Using index` | カバリングインデックス — 行のルックアップが不要（高速） |
+| `Using where` | MySQL が行を読んだ後にフィルタリングする |
+| `Using filesort` | ソートにインデックスを使えない — 追加のソートステップ |
+| `Using temporary` | MySQL が一時テーブルを作成した（大きなセットでは高コスト） |
+| `Using index condition` | インデックスコンディションプッシュダウン — ストレージ層でのフィルタリング |
+
+大きなテーブルで `Using filesort` と `Using temporary` が同時に出るのは危険信号です。
+
+## 実例 {#a-worked-example}
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- No indexes yet
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key  | rows    | Extra                          |
+|------|------|---------|--------------------------------|
+| ALL  | NULL | 1000000 | Using where; Using filesort    |
+```
+
+問題は 2 つです。フルテーブルスキャン（`ALL`）と filesort です。複合インデックスで両方を修正します（インデックス設計の原則は [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes)を参照してください）。
+
+```sql
+CREATE INDEX idx_status_created ON orders (status, created_at);
+
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key                | rows | Extra |
+|------|--------------------|------|-------|
+| ref  | idx_status_created | 4200 | NULL  |
+```
+
+`rows` は 1,000,000 から 4,200 に減りました。`type` は `ref` になり、`status` での等価ルックアップです。インデックスがすでに各 `status` 値の中で行を `created_at` 順に並べているため、filesort は消えました。
+
+## EXPLAIN ANALYZE {#explain-analyze}
+
+`EXPLAIN ANALYZE` は実際にクエリを実行し、見積もりと並べて実際の時間を返します。
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
+-> Index lookup on orders using idx_user_id (user_id=42)
+   (cost=4.50 rows=12) (actual time=0.045..0.112 rows=11 loops=1)
+```
+
+`cost` と `rows` はオプティマイザの見積もりです。`actual time` と `actual rows` は実際に起きたことです。見積もりと実際の行数の差が大きい場合は統計が古いことを意味するため、`ANALYZE TABLE orders` を実行して更新します。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### EXPLAIN とカバリングインデックスの関係は何ですか? {#whats-the-relationship-between-explain-and-covering-indexes}
+`Extra: Using index` は、MySQL がカバリングインデックスを使っていることを意味します。テーブルの行を読まずに、インデックスだけでクエリに完全に応答できます。これは読み取りの多いテーブルで利用できる最も効果の大きい最適化の 1 つです。設計方法は [MySQL のカバリングインデックス](/ja/guides/covering-indexes)を参照してください。
+
+#### クエリに `type: index` が出ます — 問題ありませんか? {#my-query-has-type-index--is-that-okay}
+あまりよくありません。`type: index` は、MySQL が（テーブルではなく）インデックス全体をスキャンしたことを意味します。`ALL` より速いですが、それでもフルスキャンです。クエリがすべての行を必要とするものの、インデックスから満たせる場合に現れます。大きなテーブルでこれに当たる場合は、カバリングインデックスや `WHERE` 句でスキャンを絞り込めないか確認してください。
+
+#### 作成したインデックスを MySQL が無視するのはなぜですか? {#why-does-mysql-ignore-the-index-i-created}
+オプティマイザは統計に基づいてインデックスを選びます。テーブルが小さい場合、MySQL はフルスキャンの方が安いと判断することがあります。統計が古い場合、インデックスの選択性を過小評価することがあります。`ANALYZE TABLE` を実行して統計を更新し、`EXPLAIN` を再確認してください。
+
+#### INSERT、UPDATE、および DELETE に EXPLAIN を使えますか? {#can-i-use-explain-on-insert-update-and-delete}
+はい。MySQL 8.0 以降では、`EXPLAIN` はすべての DML ステートメントで機能します。出力は変更対象の行へのアクセス方法を示すため、UPDATE や DELETE が遅いときに役立ちます。
+
+どのクエリから EXPLAIN すべきかを特定する必要がある場合は、[MySQL のスロークエリログ](/ja/guides/slow-query-log)がサーバー上で最も遅いクエリを記録し、合計時間で順位付けします。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| 大きなテーブルで `type: ALL` | フィルタリングする列にインデックスを追加する |
+| `Extra: Using filesort` | `WHERE` と `ORDER BY` の両方の列をカバーするインデックスを追加する |
+| `Extra: Using temporary` | インデックスのない列での `GROUP BY` を避けるようにクエリを書き換えるか、インデックスを追加する |
+| インデックスが存在するのに `key: NULL` | `ANALYZE TABLE` を実行して統計を更新する。インデックスがクエリの列順と一致するか確認する |
+| 見積もりの `rows` が実際と大きく異なる | `ANALYZE TABLE` を実行して統計を更新する |
+
+## 関連項目 {#see-also}
+
+- [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes) — EXPLAIN が報告している B ツリー構造
+- [MySQL のカバリングインデックス](/ja/guides/covering-indexes) — Extra の `Using index` の意味と、それに到達する方法
+- [MySQL のスロークエリログ](/ja/guides/slow-query-log) — EXPLAIN を実行する価値のあるクエリを見つける
+- [MySQL のクエリが遅いのはなぜ?](/ja/guides/mysql-query-performance) — EXPLAIN がつながるチューニングのワークフロー
+- [MySQL のページネーション: キーセット vs OFFSET](/ja/guides/pagination) — キーセットページネーションがスキャンではなくシークすることの確認
+- [MySQL の LIMIT](/ja/tutorial/limit) — チュートリアルでのプラン行の解説

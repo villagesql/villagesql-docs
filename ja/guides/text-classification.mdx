@@ -1,0 +1,180 @@
+---
+title: "AI で MySQL のテキストを分類する"
+sidebarTitle: "テキストの分類"
+description: "VillageSQL の ai_prompt() 関数を使って MySQL のテキストを分類する方法 — SQL から出ることなく、行にカテゴリ、意図、またはトピックのラベルを付けます。"
+keywords: "mysql text classification, mysql ai classify, mysql label rows ai, mysql spam detection sql, mysql topic classification, mysql ai_prompt classification"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+テキスト分類 — 内容に基づいて行をカテゴリに割り当てること — は、通常、データを Python スクリプトにエクスポートし、AI モデルを呼び出し、結果をインポートし直すことを意味します。VillageSQL の `ai_prompt()` を使うと、分類を SQL の中で直接実行でき、ロジックをデータの近くに置いたまま、エクスポートとインポートの往復をなくせます。
+
+## 問題: SQL の外での分類 {#the-problem-classification-outside-sql}
+
+VillageSQL を使わない場合の典型的なワークフローは次のとおりです。
+
+```python
+rows = db.query("SELECT id, body FROM support_tickets WHERE category IS NULL")
+for row in rows:
+    category = llm.classify(row["body"], labels=["billing", "technical", "shipping", "other"])
+    db.execute("UPDATE support_tickets SET category = ? WHERE id = ?", category, row["id"])
+```
+
+これは動作しますが、分類ロジックはアプリケーションコードの中にあります。マイグレーション、バックフィル、1 回限りの再ラベル付けはどれも、SQL クエリではなくスクリプトの実行を必要とします。
+
+## VillageSQL の場合: 分類器としての ai_prompt() {#with-villagesql-ai_prompt-as-a-classifier}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+信頼できる分類の鍵は、厳密なプロンプトです。正確なカテゴリを列挙し、そのうちの 1 つだけを返すようにモデルに指示し、必要に応じて例を示します。
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE support_tickets ADD COLUMN category VARCHAR(20);
+
+-- max_execution_time only bounds SELECT statements in MySQL/VillageSQL —
+-- it has no effect on INSERT/UPDATE/DELETE, including this UPDATE. To
+-- bound how long a batch UPDATE can run, use KILL QUERY against the
+-- connection's own id from a timer, not a session variable set beforehand.
+
+UPDATE support_tickets
+SET category = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Classify this support ticket into exactly one of these categories: ',
+        'billing, technical, shipping, other. ',
+        'Reply with the category name only, lowercase, no punctuation.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE category IS NULL
+LIMIT 100;
+```
+
+### 分類出力の検証 {#validating-classification-output}
+
+モデルは時折、予期しない出力を返します。結果をそのまま格納し、別途検証します。
+
+```sql
+-- Check what labels the model returned
+SELECT DISTINCT category, COUNT(*) AS cnt
+FROM support_tickets
+GROUP BY category
+ORDER BY cnt DESC;
+
+-- Fix off-label results
+UPDATE support_tickets
+SET category = 'other'
+WHERE category NOT IN ('billing', 'technical', 'shipping', 'other');
+```
+
+### マルチラベル分類 {#multi-label-classification}
+
+1 つの行が複数のカテゴリに属しうる場合は、JSON 配列を要求し、それを `JSON` 列に格納します。
+
+```sql
+ALTER TABLE articles ADD COLUMN topics JSON;
+
+UPDATE articles
+SET topics = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Return a JSON array of topics that apply to this article. ',
+        'Choose from: ["technology", "business", "health", "science", "politics"]. ',
+        'Return only the JSON array, no other text.\n\n',
+        'Article: ', content
+    )
+)
+WHERE topics IS NULL
+LIMIT 50;
+
+-- Query rows tagged with a specific topic
+SELECT title FROM articles
+WHERE JSON_CONTAINS(topics, '"technology"');
+```
+
+### 信頼度スコアの構築 {#building-a-confidence-score}
+
+ラベルと信頼度の両方を持つ構造化された JSON を返すようにモデルに求めます。
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_result JSON;
+
+UPDATE reviews
+SET ai_result = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Classify this review. Return JSON with keys "label" (positive/negative/neutral) ',
+        'and "confidence" (high/medium/low). Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE ai_result IS NULL
+LIMIT 100;
+
+-- Query by label and confidence
+SELECT review_text,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) AS label,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) AS confidence
+FROM reviews
+WHERE JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) = 'negative'
+  AND JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) = 'high';
+```
+
+## 効果的なプロンプトのパターン {#prompt-patterns-that-work}
+
+| 目的 | プロンプトのパターン |
+|:---|:---|
+| 単一ラベル | "Classify as X, Y, or Z. Reply with one word only." |
+| 信頼度スコアリング | `{"label": "X", "confidence": "high/medium/low"}` |
+| マルチラベル | "Return a JSON array of applicable labels from [X, Y, Z]." |
+| 二値判定 | "Does this text contain X? Reply yes or no." |
+
+精度を高めるには、モデルに与える選択肢のカテゴリを少なくします。5〜6 個を超える選択肢は、高速で安価なモデルの信頼性を下げます。
+
+セットアップとプロバイダーの選択肢については、[MySQL を AI API に接続する](/ja/guides/ai-api-setup)を参照してください。ai_prompt() のより広い使用パターンについては、[MySQL のクエリから AI モデルを実行する](/ja/guides/ai-prompts-in-mysql)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### AI による分類は、学習済みモデルと比べてどのくらい正確ですか? {#how-accurate-is-ai-classification-compared-to-a-trained-model}
+
+Claude Haiku のような高性能なモデルは、単純な分類タスクでは学習データなしで高い精度を達成します。微妙な区別があるドメイン固有のカテゴリでは、プロンプトに例を示すか、より大きなモデルを使う必要があるかもしれません。
+
+#### トリガーを使って、挿入時に行を分類できますか? {#can-i-classify-rows-as-theyre-inserted-using-a-trigger}
+
+はい。ただし注意が必要です。INSERT のたびに `ai_prompt()` を呼び出すトリガーを使うと、すべての書き込みに 5〜30 秒かかるようになります。定期的なバッチジョブで分類し、ラベルが利用可能になるまでの短い遅延を受け入れるほうが良いでしょう。
+
+#### モデルが NULL を返した行はどう扱えばよいですか? {#how-do-i-handle-rows-where-the-model-returns-null}
+
+`ai_prompt()` は API 呼び出しが失敗すると NULL を返します。バッチループでは、NULL がなくなるまで UPDATE を実行し続け、一時的な失敗には再試行ロジックを入れます。
+
+#### 分類にはどのモデルを使うべきですか? {#what-model-should-i-use-for-classification}
+
+まず `claude-haiku-4-5` または `gpt-4o-mini` から始めます。どちらも高速で安価です。精度が許容できない場合にのみ、より高性能なモデルに切り替えます。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | `INSTALL EXTENSION vsql_ai` を実行する |
+| NULL が返る | API キーと `max_execution_time` を確認し、モデル名を検証する |
+| 許可されたセット外のラベル | UPDATE の後に、予期しない値を正規化するクエリを追加する |
+| 構造化出力での JSON 解析エラー | プロンプトに "Return only valid JSON, no other text" を追加する |
+| 精度が低い | プロンプトに 2〜3 個の例を追加する。より高性能なモデルを試す |
+
+## 関連項目 {#see-also}
+
+- [MySQL のクエリから AI モデルを実行する](/ja/guides/ai-prompts-in-mysql) — 分類に使う ai_prompt() 関数
+- [MySQL データのセンチメント分析](/ja/guides/sentiment-analysis) — 関連するテキスト分析タスク
+- [MySQL での AI 要約](/ja/guides/ai-summarization) — 格納されたテキストに対する ai_prompt() のもう 1 つの応用

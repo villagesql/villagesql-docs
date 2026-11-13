@@ -1,0 +1,146 @@
+---
+title: "MySQL のビュー"
+sidebarTitle: "ビューの作成"
+description: "MySQL のビューの仕組み: ビューの作成と照会、更新可能なビュー、WITH CHECK OPTION、ビューのアルゴリズム（MERGE と TEMPTABLE）、およびビューが役立つ場合と害になる場合。"
+keywords: "mysql views, mysql create view, mysql updatable view, mysql view with check option, mysql view algorithm, mysql view vs table, mysql view performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ビューは、データベースに格納された名前付きのクエリです。ビューへの問い合わせはテーブルへの問い合わせとまったく同じに見えますが、ビューの SELECT はクエリの実行時に実行されます。別にデータが格納されているわけではありません。
+
+## ビューの作成と照会 {#creating-and-querying-views}
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Query it like a table
+SELECT * FROM active_customers WHERE email LIKE '%@example.com';
+```
+
+基になる定義を確認するには、次を実行します。
+
+```sql
+SHOW CREATE VIEW active_customers\G
+```
+
+ビューを変更するには、`CREATE OR REPLACE VIEW` を使用します。
+
+```sql
+CREATE OR REPLACE VIEW active_customers AS
+SELECT id, name, email, created_at
+FROM customers
+WHERE status = 'active';
+```
+
+ビューを削除するには、次を実行します。
+
+```sql
+DROP VIEW active_customers;
+```
+
+## 更新可能なビュー {#updatable-views}
+
+一部のビューは、ビューを通じた `INSERT`、`UPDATE`、および `DELETE` をサポートします。ビューが単一の基になるテーブルにきれいに対応する場合、そのビューは更新可能です。
+
+- 書き込むすべての列が単一の基になるテーブルに属している。JOIN に対するビューもこのルールのもとでは更新可能ですが、それを通じた `INSERT` は黙って一方のテーブルだけに作用し、もう一方には行をまったく挿入しません。ただし、1 つの `INSERT` で両方の基になるテーブルの列に書き込む場合は黙って行われず、`ERROR 1393: Can not modify more than one base table through a join view` が発生します
+- `DISTINCT` がない
+- 集計関数（`SUM`、`COUNT` など）がない
+- `GROUP BY` や `HAVING` がない
+- `WHERE` 句に同じテーブルを参照するサブクエリがない
+- `UNION` がない
+
+```sql
+-- This view is updatable
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Update through the view
+UPDATE active_customers SET email = 'new@example.com' WHERE id = 42;
+```
+
+MySQL は基になる `customers` テーブルを更新します。ビューが行を絞り込んでいる場合、ビューを通じて見えなくなる値に行を `UPDATE` できます。その行は基のテーブルには存在し続けますが、ビューからは消えます。
+
+## WITH CHECK OPTION {#with-check-option}
+
+`WITH CHECK OPTION` は、ビューを通じて行が見えなくなるような、ビュー経由の挿入と更新を防ぎます。
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email, status
+FROM customers
+WHERE status = 'active'
+WITH CHECK OPTION;
+
+-- Fails: setting status = 'inactive' would hide the row from the view
+UPDATE active_customers SET status = 'inactive' WHERE id = 42;
+-- ERROR 1369: CHECK OPTION failed 'mydb.active_customers'
+```
+
+ビューが意味のあるデータのサブセットを表し、それを通じた挿入と更新がそのサブセット内にとどまることを保証したい場合に、`WITH CHECK OPTION` を使用してください。
+
+## ビューのアルゴリズム {#view-algorithms}
+
+MySQL は、2 つのアルゴリズムのいずれかを使用してビューを実行します。
+
+| アルゴリズム | 動作 | MySQL がこれを選ぶ場合 |
+|:----------|:---------|:----------------------|
+| `MERGE` | 外側のクエリを書き換えてビューの SELECT をインライン化する。一時テーブルなし | 集計、DISTINCT、GROUP BY、UNION のない単純なビュー |
+| `TEMPTABLE` | まずビューを一時テーブルに実体化し、その後で外側のクエリを実行する | 集計、DISTINCT、GROUP BY、UNION のあるビュー |
+
+`TEMPTABLE` は、外側のクエリが実行される前にビューの結果全体が計算されることを意味します。オプティマイザは、外側のクエリの `WHERE` 条件をビューにプッシュダウンすることができません。`TEMPTABLE` ビューで絞り込みを効率的に機能させるには、フィルタがビュー自身の定義の中になければなりません。
+
+不意打ちを避けるには、アルゴリズムを明示的に指定します。
+
+```sql
+CREATE ALGORITHM=MERGE VIEW active_customers AS
+SELECT id, name, email FROM customers WHERE status = 'active';
+```
+
+MySQL が要求されたアルゴリズムを満たせない場合、Warning 1354 を発生させ、ビューを `ALGORITHM=UNDEFINED` として格納します。`SHOW CREATE VIEW` が報告するのはこれであり、`TEMPTABLE` ではありません。オプティマイザはその後、実行時にそうしたビューを実体化します。
+
+## ビューにはインデックスがない {#views-are-not-indexed}
+
+ビューは独自のインデックスを持ちません。`MERGE` ビューに対するクエリは、基になるテーブルのインデックスを使用できます。`TEMPTABLE` ビューに対するクエリは使用できません。一時テーブルにはインデックスがないためです。
+
+頻繁に照会されるビューの結果にインデックスが必要な場合、選択肢は次のとおりです。
+- ビューが `MERGE` アルゴリズムを使用するようにし、基になるテーブルの列にインデックスを作成する
+- ビューを、ジョブやトリガーによってデータが投入される実テーブルに置き換える
+
+## よくある質問 {#frequently-asked-questions}
+
+#### ビューはいつ使うべきですか？
+
+ビューは、アクセス制御（列や行のサブセットをユーザーに公開する）、複数のクエリが使用する複雑な結合の単純化、および基になるスキーマが変わりうる場合に安定したインターフェースを提供することに適しています。ビューはパフォーマンスのための道具ではありません。データをキャッシュしたり格納したりはしません。
+
+#### ビューを結合できますか？
+
+はい。2 つの `MERGE` ビューを結合することは、事実上 2 つの基になるクエリを結合することです。MySQL は全体を書き換えます。`TEMPTABLE` ビューの結合は、各ビューがまず独立して実体化されるため遅くなります。複雑な結合では、[共通テーブル式](/ja/tutorial/cte)のほうが実行をより細かく制御できることがよくあります。
+
+#### 基になるテーブルが変わると、ビューは自動的に更新されますか？
+
+ビューの定義は SQL テキストとして格納されます。基のテーブルに列を追加しても、ビューからの `SELECT *` にはその列は含まれません。`CREATE OR REPLACE VIEW` が必要です。ビューが参照する列の名前を変更したり削除したりすると、ビューは無効になり、再作成するまでそのビューに対するクエリはエラーになります。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 1369: CHECK OPTION failed` | その更新によって行がビューから隠れてしまいます。ビューの WHERE 条件を確認します |
+| 基のテーブルにインデックスがあるのにビューのクエリが遅い | ビューが TEMPTABLE アルゴリズムを使用している可能性があります。`EXPLAIN` で「DERIVED」を確認し、構造を変えるか CTE に切り替えます |
+| ビューを通じた `UPDATE` が誤った行を更新する | JOIN や集計のためにビューが更新可能ではありません。基のテーブルを直接更新します |
+| `ERROR 1356: View references invalid table` | 基になるテーブルの名前が変更されたか削除されています。ビューを再作成します |
+
+## 関連項目 {#see-also}
+
+- [MySQL における正規化](/ja/guides/normalization) — ビューは正規化されたスキーマに対するクエリを単純化できます
+- [MySQL の JOIN のパフォーマンスとよくある間違い](/ja/guides/joins) — ビューはしばしば結合ロジックをカプセル化します
+- [MySQL の結合の仕組み](/ja/tutorial/joins) — ビューの定義が使用する結合の構文
+- [MySQL におけるサブクエリと JOIN の比較](/ja/guides/subqueries-vs-joins) — ビューが包むクエリの形
+- [MySQL のソフトデリート](/ja/guides/soft-deletes) — 削除済みの行を有効行のビューの背後に隠す

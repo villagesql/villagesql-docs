@@ -1,0 +1,285 @@
+---
+title: "Next.js で MySQL を使う"
+sidebarTitle: "ORM なしの Next.js"
+description: "生の mysql2 ドライバーで Next.js App Router アプリケーションを MySQL に接続する: コネクションプールのシングルトン、Server Component からのクエリ、Server Action による書き込み、JSON Route Handler。間に ORM は挟みません。"
+keywords: "nextjs mysql, mysql2 nextjs, next.js server action mysql, next.js route handler mysql, mysql connection pool nextjs, nextjs app router mysql, mysql2 connection pool singleton"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Next.js App Router アプリケーションは、Server Components、Server Actions、Route Handlers という 3 つの異なる場所から MySQL と通信します。このガイドでは、生の `mysql2` ドライバーと 1 つの共有コネクションプールを使い、間に ORM を挟まずに、その 3 つすべてから MySQL に接続します。VillageSQL は MySQL のドロップイン代替なので、ここにあるすべてのステートメントは変更なしで VillageSQL に対して実行できます。
+
+## データベースの準備 {#setting-up-the-database}
+
+root として接続するのではなく、専用のデータベースとアプリケーションユーザーを作成します。
+
+```sql
+CREATE DATABASE nextjs_guide;
+
+CREATE USER 'nextjs_app'@'127.0.0.1' IDENTIFIED BY 'nextjs_dev_pw';
+GRANT ALL PRIVILEGES ON nextjs_guide.* TO 'nextjs_app'@'127.0.0.1';
+```
+
+作業用のテーブルを作成します。
+
+```sql
+CREATE TABLE notes (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  body VARCHAR(280) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+アプリをスキャフォールドし、ドライバーをインストールします。
+
+```bash
+npx create-next-app@latest nextjs-mysql --typescript --app --src-dir
+npm install mysql2
+```
+
+接続情報はソースではなく `.env.local` に保存します。
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=nextjs_app
+DB_PASSWORD=nextjs_dev_pw
+DB_NAME=nextjs_guide
+```
+
+## コネクションプール {#the-connection-pool}
+
+アプリ内で MySQL と通信するすべての場所は、1 つのモジュール `src/lib/db.ts` から同じプールをインポートします。
+
+```typescript
+import mysql from "mysql2/promise";
+
+// Next.js dev mode reloads route modules on every file save, but it keeps the
+// Node.js process alive between reloads. A pool created at module scope gets
+// re-created on every reload unless it is cached somewhere that survives the
+// reload. `globalThis` survives; module-level variables do not.
+const globalForPool = globalThis as unknown as {
+  vsqlPool: mysql.Pool | undefined;
+};
+
+export const pool =
+  globalForPool.vsqlPool ??
+  mysql.createPool({
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT ?? 3306),
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPool.vsqlPool = pool;
+}
+```
+
+これは、Prisma や Drizzle のクライアントをホットリロードをまたいでキャッシュするのに使われるのと同じパターンを、`mysql2` のプールに直接適用したものです。`connectionLimit`、`waitForConnections`、`queueLimit` は [MySQL のコネクションプーリング](/ja/guides/connection-pooling)で説明しています。このガイドは、プールが Next.js プロセスの内部にあるときに何が変わるかに焦点を当てます。
+
+`globalThis` のキャッシュは、開発モードでは任意ではありません。このアプリでのテストがその理由を証明しています。キャッシュを有効にした状態で `npm run dev` を実行し、`src/lib/db.ts` を続けて 4 回保存しても、開いている `nextjs_app` の接続は終始ちょうど 1 つのままでした。次のクエリで確認しました。
+
+```sql
+SELECT COUNT(*) FROM information_schema.processlist WHERE user = 'nextjs_app';
+```
+
+`globalThis` のキャッシュを取り除き、新しい `next dev` プロセスに対して同じ 4 回の保存を繰り返すと、その数は 5 に増えました。リロードのたびにモジュールのトップレベルが再実行され、そのたびに前のプールを閉じることなく `mysql.createPool()` が再び呼ばれました。これを確認するには、プールモジュールそのものを編集してください。それを単にインポートしているだけのページを保存しても再実行されません。Turbopack は再コンパイルをまたいで、変更されていないモジュールを生かしたままにするからです。本番環境ではこれは起きません。`next build` がアプリを一度だけコンパイルし、`next start` がモジュールをリロードせずに実行するからです。しかしこのガードは本番環境では何のコストもかからず、開発中の現実に再現可能な接続リークを防ぎます。
+
+## Server Component からのクエリ {#querying-from-a-server-component}
+
+`src/app/page.tsx` は、Server Component の中で、パラメータ化されたクエリを使って `notes` から直接読み取ります。
+
+```typescript
+import { pool } from "@/lib/db";
+import { addNote } from "./actions";
+import type { RowDataPacket } from "mysql2";
+
+interface Note extends RowDataPacket {
+  id: number;
+  body: string;
+  created_at: Date;
+}
+
+async function getNotes(): Promise<Note[]> {
+  const [rows] = await pool.query<Note[]>(
+    "SELECT id, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
+    [20],
+  );
+  return rows;
+}
+
+export default async function Home() {
+  const notes = await getNotes();
+  // ...renders `notes`, including note.created_at.toISOString()
+}
+```
+
+ユーザー入力を連結したり補間したりしてクエリ文字列を組み立ててはいけません。上の `LIMIT ?` プレースホルダーは文字列の連結ではなく `mysql2` によって埋められます。これが、`20; DROP TABLE notes` のような値が、数値として解析に失敗する以外に何もできない理由です。
+
+`mysql2` は MySQL の `TIMESTAMP` 列を、文字列ではなく JavaScript の `Date` オブジェクトとして返します。上の `Note` インターフェイスが `created_at` を `Date` として型付けしているため、それを JSX として直接レンダリングする (`{note.created_at}`) と、アプリが実行される前に `npm run build` の型チェックで失敗します。
+
+```
+error TS2322: Type 'Date' is not assignable to type 'ReactNode'.
+```
+
+その型注釈がなければ、同じ間違いは後になって、より悪い形で、ビルド時エラーではなくランタイムのクラッシュとして現れます。`Error: Objects are not valid as a React child (found: [object Date])`。どちらにしても修正は同じです。値を文字列として扱うのではなく、レンダリングする場所でその値に `.toISOString()` (またはフォーマット用ライブラリ) を呼び出してください。
+
+`npm run build` でアプリをビルドすると、このページはリクエスト時データへの依存を持たない (`cookies()` も `headers()` もなく、dynamic とマークされたものもない) ため、Next.js はビルド時にそれを静的コンテンツとしてプリレンダリングすることが分かります。
+
+```
+Route (app)
+┌ ○ /
+├ ○ /_not-found
+└ ƒ /api/notes
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+```
+
+つまり `getNotes()` のクエリは `next build` 中に一度だけ実行され、データベースはビルド時に到達可能でなければなりません。後述の Server Action は、リクエストごとにクエリを再実行するのではなく、書き込みのたびにページを再検証することで、ページの内容を最新に保ちます。
+
+## Server Action による書き込み {#writing-with-a-server-action}
+
+`src/app/actions.ts` は同じプールを通じて挿入を実行します。
+
+```typescript
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { pool } from "@/lib/db";
+
+export async function addNote(formData: FormData) {
+  const body = formData.get("body");
+
+  if (typeof body !== "string" || body.trim().length === 0) {
+    return;
+  }
+
+  await pool.execute("INSERT INTO notes (body) VALUES (?)", [body.trim()]);
+
+  revalidatePath("/");
+}
+```
+
+ホームページのフォームは、この関数を `action` として直接渡します。
+
+```tsx
+<form action={addNote}>
+  <input type="text" name="body" maxLength={280} required />
+  <button type="submit">Add</button>
+</form>
+```
+
+実際のブラウザでこのフォームに "Server Action verified end to end" と入力して Add をクリックすると、ページ全体の遷移なしに新しい行が挿入され、`revalidatePath("/")` のおかげで、その行はレンダリングされた一覧にすぐに現れました。その後にデータベースへ直接クエリして書き込みを確認しました。
+
+```sql
+SELECT * FROM notes;
+```
+
+```
+id  body                                 created_at
+1   First note, inserted while setting up the guide.   2026-08-28 12:17:51
+2   Server Action verified end to end                  2026-08-28 12:19:37
+```
+
+`revalidatePath("/")` は前のセクションでキャッシュされた静的レンダリングを無効化するため、次のリクエストはビルド時のスナップショットを配信する代わりに `getNotes()` を再実行します。この呼び出しがなければ、静的ページのデータキャッシュは新しい行に決して気づきません。
+
+## JSON Route Handler {#a-json-route-handler}
+
+Server Components と Server Actions は、Next.js 自身がレンダリングするページをカバーします。Route Handler は、ORM に焦点を当てたガイドがたいてい飛ばす部分です。ページではなく、素の HTTP API サーフェスだからです。`src/app/api/notes/route.ts` は、モバイルクライアント、Webhook、その他 Next.js のフロントエンドではない呼び出し元のために、`GET` リクエストに JSON で応答します。
+
+```typescript
+import { NextResponse } from "next/server";
+import { pool } from "@/lib/db";
+import type { RowDataPacket } from "mysql2";
+
+interface Note extends RowDataPacket {
+  id: number;
+  body: string;
+  created_at: Date;
+}
+
+export async function GET() {
+  const [rows] = await pool.query<Note[]>(
+    "SELECT id, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
+    [20],
+  );
+
+  return NextResponse.json({ notes: rows });
+}
+```
+
+ビルド済みアプリを `npm run start` (デフォルトではポート 3000) で実行してこのルートをリクエストすると、プレースホルダーのデータではなく、上で Server Action が挿入した行を含む `notes` の実際の行が返ります。
+
+```bash
+curl http://localhost:3000/api/notes
+```
+
+```json
+{"notes":[{"id":2,"body":"Server Action verified end to end","created_at":"2026-08-28T19:19:37.000Z"},{"id":1,"body":"First note, inserted while setting up the guide.","created_at":"2026-08-28T19:17:51.000Z"}]}
+```
+
+ホームページとは異なり、このルートは間接的にリクエスト時データを読む (ビルド時ではなく呼び出しのたびにデータベースにクエリする) ため、上の同じビルド出力は、static の `○` ではなく dynamic の `ƒ` でマークしています。
+
+## Next.js でのコネクションプールのサイズ決定 {#connection-pool-sizing-in-nextjs}
+
+Route Handler は受信リクエストごとに 1 回実行され、並行負荷の下では複数のリクエストが同時に処理中になり得ます。プールが存在するのは、各リクエストが自分の接続を開くのではなく、それらのリクエストが上限のある数の MySQL 接続を共有するためです。
+
+実行中のアプリの `/api/notes` に 20 件の並行リクエストを送り、すぐにサーバーを確認すると、
+
+```sql
+SHOW STATUS LIKE 'Threads_connected';
+```
+
+`connectionLimit: 10` で設定されたプールに対して、使用中の接続は 4 つだけでした。`Threads_connected` はこのアプリのものだけでなくサーバー上のすべての接続を数えるため、ユーザーごとの数が必要なときは、このガイドの前のほうにある `information_schema.processlist` のクエリを使ってください。正確な数は、バーストが到着する時点に対して各クエリがどれだけ速く完了するかに依存するため、遅いクエリや混雑したサーバーでは、設定された上限まで、より高い数が表示されます。いずれにせよこれが確認するのは、プールが 20 個の接続を開くのではなく、そのバースト全体で接続をキューイングし再利用していることです。`connectionLimit` を上げると、残りがプールの内部キュー (`queueLimit` で上限が決まり、`queueLimit` が `0` なら無制限) で待つ前に、並行してクエリを実行できるリクエストの数が増えます。アプリが受け付けられるリクエストの数は変わらず、MySQL に対して同時にクエリ実行中でいられる数だけが変わります。
+
+Next.js に固有の 2 つのことが、実際にはこの数に影響します。
+
+- **サーバープロセスごとに独自のプールを持つ。** 複数のインスタンス (複数の `next start` プロセス、または複数のサーバーレス関数インスタンス) を実行する Next.js のデプロイは、実行中のインスタンス数だけ `connectionLimit` を掛け算します。`connectionLimit` だけでなく、`connectionLimit` と MySQL の `max_connections` を一緒にサイズ決定してください。
+- **開発モードは 1 つのプロセス内でプールを増やすことがある。** 上のコネクションプールのセクションで示したとおり、プールが `globalThis` にキャッシュされていない場合です。本番ビルドでは起きませんが、症状 (MySQL がアプリに必要なはずの数をはるかに超える開いた接続を報告する) が本番環境のサイズ決定の問題と見分けがつかないため、開発中に確認する価値があります。
+
+## 代わりに ORM を選ぶ {#choosing-an-orm-instead}
+
+このガイドが `mysql2` を直接使うのは、生のコネクションプールが、その上に何が乗っていようと、すべての Next.js と MySQL の統合が共有する部分だからです。アプリケーションが生成された型、マイグレーション、またはクエリビルダーの恩恵を受けるなら、MySQL 固有の設定については [Next.js と Prisma で MySQL を使う](/ja/guides/mysql-with-prisma)または [Next.js と Drizzle で MySQL を使う](/ja/guides/mysql-with-drizzle)を、ORM 全般で重要な設定については [ORM で MySQL を使う](/ja/guides/mysql-with-orms)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### なぜ `note.created_at` のレンダリングは、テキストとして表示されずに失敗するのですか？ {#why-does-rendering-notecreated_at-fail-instead-of-just-printing-as-text}
+
+`mysql2` は MySQL の `TIMESTAMP` または `DATETIME` 列を JavaScript の `Date` オブジェクトにデコードし、TypeScript の `ReactNode` 型も React 自身も、それを JSX として直接レンダリングできません。列が `Date` として型付けされていれば、`npm run build` は型チェック時に `{note.created_at}` を `error TS2322: Type 'Date' is not assignable to type 'ReactNode'` で捕まえます。その型がなければ、同じ間違いは代わりにランタイムに到達し、`Error: Objects are not valid as a React child (found: [object Date])` を投げます。レンダリングの前に、値に `.toISOString()`、`.toLocaleString()`、またはフォーマット用ライブラリを呼び出してください。
+
+#### 少数のユーザーしか見込まない場合でもコネクションプールは必要ですか？ {#do-i-need-a-connection-pool-if-i-only-expect-a-few-users}
+
+はい。トラフィックが軽くても、Next.js は複数のリクエストを並行して実行することがあり (Route Handler も呼び出すページの読み込み、2 つのブラウザタブ、サイトをクロールするボット)、各 MySQL 接続はサーバー上の実際のスレッドです。小さな `connectionLimit` を持つプール (小さなアプリには 10 が妥当なデフォルトです) は、アイドル時には何のコストもかからず、並行リクエストのバーストがそれぞれ 1 つずつ接続を開くのを防ぎます。
+
+#### Route Handler から Server Action を呼ぶ、またはその逆はできますか？ {#can-i-call-a-server-action-from-a-route-handler-or-the-other-way-around}
+
+Route Handler は Server Action が呼ぶのと同じ関数を呼べます。どちらも、プールを使う単なる非同期関数だからです。異なるのは呼び出し規約です。Server Action は `<form action>` または React の `useActionState` によって起動され、Route Handler は HTTP リクエストによって起動されます。一方がもう一方を直接呼ぶのではなく、データベースのロジックを素の関数に切り出して共有し、両方からそれを呼んでください。
+
+#### なぜホームページは static なのに API ルートはそうではないのですか？ {#why-is-the-home-page-static-but-the-api-route-is-not}
+
+Next.js はこれをルートごとに、そのルートがリクエスト時データを読むかどうかに基づいて決定します。このガイドの `src/app/page.tsx` は `cookies()` や `headers()` のようなランタイム API を呼ばないため、`next build` はそれを一度だけプリレンダリングし、`revalidatePath` が無効化するまでそのスナップショットを配信します。このガイドの Route Handler にはそのようなキャッシュが適用されていないため、リクエストのたびにデータベースにクエリします。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `error TS2322: Type 'Date' is not assignable to type 'ReactNode'` (ビルド時) または `Error: Objects are not valid as a React child (found: [object Date])` (型付けされていない場合、ランタイム時) | `TIMESTAMP` または `DATETIME` 列が `Date` オブジェクトとして返ってきました。レンダリングの前に `.toISOString()` を呼ぶか、フォーマットしてください。 |
+| `next dev` 中に MySQL の接続数が増え続ける | プールが `globalThis` にキャッシュされていないため、ホットリロードのたびに新しいプールが作成されます。このガイドで示した `globalForPool` のガードを追加してください。 |
+| Server Action は実行されるがページに新しいデータが表示されない | 変更されたデータを読むパスに対して `revalidatePath` (または `revalidateTag`) を追加してください。これがないと、静的にレンダリングされたページはビルド時のスナップショットを配信し続けます。 |
+| Route Handler または Server Action からの `Error: connect ECONNREFUSED 127.0.0.1:3306` (ポートは異なる場合あり) | Next.js を実行しているプロセスから MySQL サーバーに到達できません。サーバーが実行中であること、および `.env.local` が正しいホストとポートを指していることを確認してください。 |
+| 負荷時に接続が多すぎる | MySQL の `max_connections` を上げるか、プロセスごとの `connectionLimit` を下げるか、実行中の Next.js インスタンスの数を減らしてください。[コネクションプーリング](/ja/guides/connection-pooling)を参照してください。 |
+
+## 関連項目 {#see-also}
+
+- [Next.js と Prisma で MySQL を使う](/ja/guides/mysql-with-prisma) — 生のドライバーの代わりに Prisma で構築した同じアプリ
+- [Next.js と Drizzle で MySQL を使う](/ja/guides/mysql-with-drizzle) — 生のドライバーの代わりに Drizzle で構築した同じアプリ
+- [MySQL のコネクションプーリング](/ja/guides/connection-pooling) — フレームワークに依存しない、`connectionLimit`、`waitForConnections`、`queueLimit` の仕組み
+- [ORM で MySQL を使う](/ja/guides/mysql-with-orms) — アプリケーションと MySQL の間に ORM があるときに重要な設定

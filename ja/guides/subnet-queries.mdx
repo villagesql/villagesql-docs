@@ -1,0 +1,219 @@
+---
+title: "MySQL でのサブネットによるクエリ"
+sidebarTitle: "サブネットによるクエリ"
+description: "MySQL で IP サブネットによって行をクエリする方法。INET_ATON を使ったビット単位の範囲チェックと、VillageSQL の INET 型およびネットワーク関数を使った、よりすっきりしたサブネットクエリ。"
+keywords: "mysql subnet query, mysql ip range query, mysql cidr query, mysql inet subnet filter, mysql ip in subnet, mysql network address query"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+IP アドレスが特定のサブネットに含まれる行をすべて見つけるには、数値化した IP の値を範囲と比較する必要があります。MySQL の標準的なアプローチは、`INET_ATON()` を使ったビット演算です。VillageSQL の `INET` 型はネットワーク関数を提供し、同じクエリをより読みやすくし、IPv4 と IPv6 の両方で機能させます。
+
+## 標準的なアプローチ: ビット単位の範囲チェック {#the-standard-approach-bitwise-range-checks}
+
+IPv4 の場合、`INET_ATON()` はアドレスを符号なし 32 ビット整数に変換します。サブネットへの所属チェックはビット単位の AND です。`(ip & netmask) == network_address` であれば、その IP はサブネット内にあります。
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INT UNSIGNED,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (INET_ATON('192.168.1.10')),
+    (INET_ATON('192.168.1.50')),
+    (INET_ATON('192.168.2.1')),
+    (INET_ATON('10.0.0.5'));
+
+-- Find all IPs in 192.168.1.0/24
+SELECT INET_NTOA(ip_address) FROM access_log
+WHERE ip_address BETWEEN INET_ATON('192.168.1.0')
+                     AND INET_ATON('192.168.1.255');
+
+-- Or using bitwise AND with the netmask
+SELECT INET_NTOA(ip_address) FROM access_log
+WHERE (ip_address & 0xFFFFFF00) = INET_ATON('192.168.1.0');
+```
+
+どちらも IPv4 では機能します。`BETWEEN` のアプローチは読みやすいです。ビット演算の形式は、サブネットのパラメータが変数である場合に組み合わせやすくなります。
+
+どちらのアプローチも IPv6 では機能しません。`INET_ATON()` は IPv4 しか扱いません。
+
+## VillageSQL の場合: INET 列に対するネットワーク関数 {#with-villagesql-network-functions-on-inet-columns}
+
+VillageSQL の `vsql_network_address` 拡張機能は、「このアドレスはあのサブネットの中にあるか」に直接答える包含述語、つまり `inet_contained_by()`、`inet_contains()`、および `inet_overlaps()` を提供します。加えて、チェックを手で組み立てるための `inet_network()`、`inet_set_masklen()`、および `inet_compare()` も提供します。これらはすべて、IPv4 と IPv6 の両方の `INET` 列で機能します。
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.10')),
+    (inet_from_string('192.168.1.50')),
+    (inet_from_string('192.168.2.1')),
+    (inet_from_string('10.0.0.5')),
+    (inet_from_string('192.168.1.200'));
+```
+
+### サブネットの包含クエリ {#subnet-containment-query}
+
+保存された IP が特定のサブネットに属するかを確認するには、アドレスをサブネットのプレフィックス長でマスクし、その結果を対象のネットワークと比較します。
+
+```sql
+-- All IPs in 192.168.1.0/24
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip_address, 24)))
+    = '192.168.1.0/24';
+```
+
+サブネットを変数から受け取るパラメータ化した形式は次のとおりです。
+
+```sql
+SET @subnet     = '192.168.1.0/24';
+SET @prefix_len = inet_masklen(inet_from_string(@subnet));
+SET @network    = cidr_to_string(cidr_from_string(@subnet));
+
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip_address, @prefix_len)))
+    = @network;
+```
+
+### 包含述語 {#containment-predicates}
+
+この拡張機能は、PostgreSQL の 5 つの包含述語を関数として提供します。これらは
+2 つの `INET` 値を受け取り、`1`、`0`、または `NULL` を返します。
+
+| 関数 | PostgreSQL の演算子 | 真になる条件 |
+|:---|:---|:---|
+| `inet_contained_by(a, b)` | `a << b` | `a` が `b` の中にあり、`b` がより広いネットワークである |
+| `inet_contained_by_or_equals(a, b)` | `a <<= b` | `a` が `b` の中にある、または 2 つのネットワークが等しい |
+| `inet_contains(a, b)` | `a >> b` | `a` がより広いネットワークであり、`b` がその中にある |
+| `inet_contains_or_equals(a, b)` | `a >>= b` | `b` が `a` の中にある、または 2 つのネットワークが等しい |
+| `inet_overlaps(a, b)` | `a && b` | いずれかのネットワークがもう一方を含む、または両者が等しい |
+
+上のサブネットクエリは、1 回の呼び出しになります。
+
+```sql
+-- All IPs in 192.168.1.0/24
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE inet_contained_by(ip_address, inet_from_string('192.168.1.0/24'));
+```
+
+比較されるのは各値のネットワーク部分だけで、2 つのプレフィックス長のうち短いほうまでが対象です。
+そのため `192.168.1.5/24` と `192.168.1.9/24` は同じネットワークであり、厳密な形式はこれらに対して
+`0` を返し、`_or_equals` の形式は `1` を返します。
+ファミリーの異なる 2 つのアドレスが一致することはありません。IPv4 の値を IPv6 の値と比較すると、
+エラーを発生させるのではなく `0` を返します。これは PostgreSQL と同じです。
+
+両方の引数は `INET` でなければなりません。`CIDR` 値は強制変換されません。
+
+```text
+ERROR 3219 (HY000): Cannot initialize function 'inet_contains': argument 1 type mismatch (expected vsql_network_address.INET, got vsql_network_address.CIDR)
+```
+
+上の例のように、代わりにサブネットに `inet_from_string()` を使ってください。これらの
+関数は `vsql_network_address` 0.0.5 で追加されました。
+
+### inet_compare による範囲ベースの包含 {#range-based-containment-with-inet_compare}
+
+行ごとにネットワークを再計算しない代替手段です。ブロードキャストアドレスが分かっている場合に便利です。
+
+```sql
+-- IPs in 192.168.1.0/24: from .0 to .255
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE inet_compare(ip_address, inet_from_string('192.168.1.0'))   >= 0
+  AND inet_compare(ip_address, inet_from_string('192.168.1.255')) <= 0;
+```
+
+### IPv6 のサブネットクエリ(同じパターン) {#ipv6-subnet-queries-same-pattern}
+
+同じ `inet_network()` のアプローチが、何も変更せずに IPv6 でも機能します。
+
+```sql
+CREATE TABLE ipv6_log (id INT, ip INET);
+INSERT INTO ipv6_log VALUES
+    (1, inet_from_string('2001:db8::1')),
+    (2, inet_from_string('2001:db8::100')),
+    (3, inet_from_string('2001:db9::1'));
+
+-- Find all IPs in 2001:db8::/32
+SET @v6_prefix = 32;
+SET @v6_network = '2001:0db8:0000:0000:0000:0000:0000:0000/32';
+
+SELECT inet_to_string(ip) FROM ipv6_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip, @v6_prefix)))
+    = @v6_network;
+```
+
+### ネットワークテーブルのパターン {#networks-table-pattern}
+
+よくある用途です。許可された CIDR を持つ `networks` テーブルがあり、受信した IP がそのいずれかに含まれるかを確認します。
+
+```sql
+CREATE TABLE networks (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    network CIDR,
+    label   VARCHAR(100)
+);
+
+INSERT INTO networks (network, label) VALUES
+    (cidr_from_string('192.168.1.0/24'), 'office-lan'),
+    (cidr_from_string('10.0.0.0/8'),     'vpn-range'),
+    (cidr_from_string('172.16.0.0/12'),  'docker-range');
+
+-- Is an incoming IP in any authorized network?
+-- inet_masklen() takes INET, not CIDR — convert via string to get the prefix length
+SELECT label FROM networks
+WHERE cidr_to_string(inet_network(inet_set_masklen(
+    inet_from_string('192.168.1.42'),
+    inet_masklen(inet_from_string(cidr_to_string(network)))
+))) = cidr_to_string(network);
+```
+
+## 標準と VillageSQL の比較 {#standard-vs-villagesql}
+
+| アプローチ | IPv6 | 読みやすさ | 手計算が不要 |
+|:---|:---|:---|:---|
+| `BETWEEN INET_ATON()` | なし | 中 | ブロードキャストの手計算が必要 |
+| `INET_ATON()` とのビット単位 AND | なし | 低 | ネットマスクの手計算が必要 |
+| `inet_network()` + `inet_set_masklen()` | あり | 高 | 関数が計算を処理する |
+| `inet_contained_by()` | あり | 高 | 1 回の呼び出し、手計算なし |
+
+## よくある質問 {#frequently-asked-questions}
+
+#### VillageSQL には PostgreSQL の `<<` 包含演算子がありますか? {#does-villagesql-have-postgresqls-containment-operator}
+
+その動作は、演算子ではなく関数として存在します。`<<` には `inet_contained_by()`、`>>` には `inet_contains()`、`<<=` と `>>=` には `_or_equals` の各バリアント、`&&` には `inet_overlaps()` です。[包含述語](#containment-predicates)を参照してください。
+
+#### サブネットクエリはインデックスを使いますか? {#does-the-subnet-query-use-the-index}
+
+`cidr_to_string(inet_network(inet_set_masklen(...)))` のパターンはインデックススキャンを使いません。すべての行に対してネットワークアドレスを再計算します。大きなテーブルでは、`inet_compare` の範囲アプローチのほうがインデックスを活用しやすくなります。クエリを `ip_address` 列に対する範囲として表現するためです。
+
+#### サブネットを保存して、同時に包含をクエリできますか? {#can-i-store-subnets-and-query-containment-at-the-same-time}
+
+はい。ホストアドレスとサブネットの両方を `INET` 列に保存し、`inet_contained_by(host_ip, subnet)` で比較します。サブネットが `CIDR` 列にある場合は、先に変換してください。包含述語は両側に `INET` を取り、`CIDR` を強制変換しません。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.inet_network does not exist` | `INSTALL EXTENSION vsql_network_address` を実行します |
+| サブネットクエリが行を返さない | `@network` が展開された CIDR 文字列と一致するか確認します。IPv6 の CIDR は展開表記を使います |
+| 範囲クエリにサブネット外のアドレスが含まれる | ブロードキャストアドレスを確認します。/24 の範囲は `.0` から `.255` です |
+| IPv4 と IPv6 が混在する列で誤った結果が返る | IPv4 アドレスと IPv6 アドレスは重なりません。クエリはファミリーごとに正しい結果を返します |
+
+## 関連項目 {#see-also}
+
+- [MySQL での IP アドレスの保存](/ja/guides/storing-ip-addresses) — サブネットクエリで使う INET 型
+- [MySQL での IPv6 の保存](/ja/guides/ipv6-storage) — INET を使えばサブネットクエリは IPv6 でも同じように機能する
+- [MySQL での IP による位置情報の検索](/ja/guides/ip-geolocation) — サブネットを超えて IP データをさらに活用する

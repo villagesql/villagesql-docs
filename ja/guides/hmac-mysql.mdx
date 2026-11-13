@@ -1,0 +1,158 @@
+---
+title: "MySQL での HMAC 署名"
+sidebarTitle: "HMAC 署名の作成"
+description: "VillageSQL の hmac() 関数を使って MySQL で HMAC 署名を計算および検証する方法。Webhook の検証、データの整合性、および改ざん検出のために使います。"
+keywords: "mysql hmac, mysql hmac sha256, mysql data integrity signature, mysql webhook verification, mysql tamper detection, mysql hmac function"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ハッシュはデータがどのようなものかを教えてくれます。HMAC は、そのデータが秘密鍵を知っている誰かから来たことを教えてくれます。この違いは、行が改ざんされていないこと、Webhook のペイロードが本物であること、またはトークンが偽造ではなく自分のシステムで生成されたことを検証するときに重要です。MySQL には組み込みの HMAC 関数がなく、標準的な答えはアプリケーションコードで計算することです。VillageSQL の `hmac()` を使うと、SQL の中でそれができます。
+
+## 問題: 組み込みの HMAC がない {#the-problem-no-built-in-hmac}
+
+MySQL にはハッシュ化のための `SHA2()` と `MD5()` がありますが、鍵を受け取るものはありません。HMAC（ハッシュベースのメッセージ認証コード）は、共有の秘密を使って認証コードを生成します。鍵を持たない人には再現できないため、ただのハッシュとは根本的に異なります。
+
+典型的な手法は、データベースに書き込む前にアプリケーションで HMAC を計算することです。
+
+```python
+# Python: compute HMAC in app code before writing
+import hmac, hashlib
+sig = hmac.new(b'secret_key', row_data.encode(), hashlib.sha256).hexdigest()
+db.execute("INSERT INTO audit_log (data, signature) VALUES (?, ?)", (row_data, sig))
+```
+
+これは動作しますが、すべての書き込み経路、つまりすべての言語、サービス、および一括ローダーが署名ロジックを複製しなければならないことを意味します。アプリケーションを迂回するマイグレーションスクリプトは、署名のない行を書き込みます。
+
+## VillageSQL の場合: SQL での hmac() {#with-villagesql-hmac-in-sql}
+
+VillageSQL の `vsql_crypto` 拡張機能は `hmac(data, key, algorithm)` を追加します。この関数は、完全に MySQL の中で計算された `VARBINARY` の認証コードを返します。
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+### トリガーで行に署名する {#signing-rows-in-a-trigger}
+
+どのアプリケーション経路が行を作成したかにかかわらず、書き込み時にすべての行に署名するには、トリガーを使います。
+
+```sql
+CREATE TABLE audit_log (
+    id        INT AUTO_INCREMENT PRIMARY KEY,
+    event     VARCHAR(255),
+    payload   TEXT,
+    signature VARBINARY(32),   -- 32 bytes for HMAC-SHA256
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Sign every insert automatically
+DELIMITER $$
+CREATE TRIGGER sign_audit_log
+BEFORE INSERT ON audit_log
+FOR EACH ROW
+BEGIN
+    SET NEW.signature = hmac(
+        CONCAT(NEW.event, '|', COALESCE(NEW.payload, '')),
+        'your-hmac-secret-key',
+        'sha256'
+    );
+END$$
+DELIMITER ;
+```
+
+```sql
+INSERT INTO audit_log (event, payload)
+VALUES ('user.login', '{"user_id": 42, "ip": "10.0.1.5"}');
+
+-- Verify a row hasn't been tampered with
+SELECT
+    event,
+    payload,
+    signature = hmac(
+        CONCAT(event, '|', COALESCE(payload, '')),
+        'your-hmac-secret-key',
+        'sha256'
+    ) AS valid
+FROM audit_log;
+```
+
+### Webhook ペイロードの検証 {#verifying-webhook-payloads}
+
+アプリケーションが受信した Webhook ペイロードを保存する場合、処理の前に SQL の中で直接署名を検証できます。
+
+```sql
+-- Webhook arrives with header X-Signature: <hex>
+-- Store the raw payload and verify before processing
+SELECT
+    payload,
+    HEX(hmac(payload, 'webhook-secret', 'sha256')) AS expected_sig,
+    incoming_sig = HEX(hmac(payload, 'webhook-secret', 'sha256')) AS valid
+FROM webhook_queue
+WHERE id = 1;
+```
+
+### サポートされるアルゴリズム {#supported-algorithms}
+
+| アルゴリズム | 呼び出し | 使用する場面 |
+|:---|:---|:---|
+| HMAC-SHA256 | `hmac(data, key, 'sha256')` | 汎用。推奨されるデフォルト |
+| HMAC-SHA512 | `hmac(data, key, 'sha512')` | より高いセキュリティマージンが必要な場合 |
+| HMAC-SHA1 | `hmac(data, key, 'sha1')` | レガシーシステムとの互換性のみ |
+| HMAC-MD5 | `hmac(data, key, 'md5')` | レガシーシステムとの互換性のみ |
+
+新しいコードでは HMAC-SHA256 を使ってください。HMAC の構成は元になるハッシュの衝突脆弱性を引き継がないため、HMAC-SHA1 はただの SHA-1 のようには破られていません。しかし SHA-1 は非推奨であり、規制当局はレガシーとして扱います。新しいコードでは使わないでください。
+
+## HMAC とただのハッシュの比較 {#hmac-vs-plain-hash}
+
+| | ただのハッシュ（`digest()`） | HMAC（`hmac()`） |
+|:---|:---|:---|
+| **鍵を受け取る** | いいえ | はい |
+| **鍵なしで偽造できる** | はい。誰でも同じデータをハッシュ化できます | いいえ |
+| **用途** | チェックサム、重複排除、フィンガープリント | 認証、改ざん検出、署名 |
+| **検証できる人** | 誰でも | 鍵の保持者のみ |
+
+保護するデータが公開されている場合、ただのハッシュは何も証明しません。データが秘密を知っている誰かによって生成されたことを証明する必要がある場合は、HMAC を使います。鍵なしのハッシュ化については、[MySQL でのデータのハッシュ化](/ja/guides/hashing-data)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### HMAC 鍵をトリガーに保存するのは安全ですか？ {#is-storing-the-hmac-key-in-the-trigger-safe}
+
+いいえ。鍵はトリガー定義にハードコードされ、`SHOW CREATE TRIGGER` の権限を持つ誰にでも見えます。本番環境では、安全な設定経路から鍵を取得するか、接続時にアプリケーションが設定するセッション変数として渡してください。鍵は認証情報として扱います。
+
+#### HMAC を使って、クエリ結果が転送中に改変されていないことを検証できますか？ {#can-i-use-hmac-to-verify-query-results-havent-been-altered-in-transit}
+
+HMAC は不正な変更から保護しますが、盗聴からは保護しません。転送中の保護には、MySQL 接続に TLS を使ってください。HMAC は、データがデータベースに到達した後の改ざんを検出するのに役立ちます。
+
+#### HMAC 鍵をローテーションするにはどうすればよいですか？ {#how-do-i-rotate-the-hmac-key}
+
+切り替える前に、既存のすべての行に新しい鍵で再署名します。
+
+```sql
+UPDATE audit_log
+SET signature = hmac(
+    CONCAT(event, '|', COALESCE(payload, '')),
+    'new-hmac-key',
+    'sha256'
+);
+-- Then update the key in your application/trigger
+```
+
+#### hmac() は同じ入力に対して同じ出力を返しますか？ {#does-hmac-return-the-same-output-for-the-same-inputs}
+
+はい。HMAC は決定的です。同じデータ、同じ鍵、同じアルゴリズムは常に同じ結果を生成します。これが検証を成り立たせています。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.hmac does not exist` | `INSTALL EXTENSION vsql_crypto` を実行します |
+| `hmac()` が NULL を返す | データ引数または鍵引数の NULL、あるいはサポートされないアルゴリズム名を確認します |
+| 検証が常に 0 を返す | データ文字列が署名時のものとバイト単位で同一か確認します。空白、エンコーディング、および NULL の扱いがすべて影響します |
+| 署名列が NULL で埋まる | トリガーは実行されていますが、鍵またはデータが NULL です。NULL 許容フィールドを `COALESCE` で包みます |
+
+## 関連項目 {#see-also}
+
+- [MySQL でのデータのハッシュ化](/ja/guides/hashing-data) — フィンガープリントと重複排除のための鍵なしハッシュ化
+- [トリガーからの Webhook の送信](/ja/guides/http-webhooks) — HMAC は Webhook ペイロードに署名する標準的な方法

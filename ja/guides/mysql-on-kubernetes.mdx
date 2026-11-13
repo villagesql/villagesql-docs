@@ -1,0 +1,62 @@
+---
+title: "Kubernetes 上での MySQL の実行"
+sidebarTitle: "Kubernetes 上の MySQL"
+description: "Kubernetes で MySQL を実行するために必要なこと: StatefulSet とオペレーターの比較、ストレージの決定、およびマネージドデータベースのほうが良い答えになる場合についての率直な見方。"
+keywords: "mysql kubernetes, mysql statefulset, mysql operator kubernetes, mysql k8s persistent volume, run database on kubernetes"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Kubernetes はステートレスなワークロードのために作られ、MySQL はその正反対です。そこで MySQL を実行することは十分に可能で、広く行われています。ただし、Kubernetes はデータベースの難しい部分を何一つ自動的には解決してくれません。このガイドでは、3 段階の取り組み方、重要なストレージの決定、およびまったく行うべきでない場合を扱います。
+
+## 3 つの入り口 {#three-ways-in}
+
+**単一インスタンスの StatefulSet。** PersistentVolumeClaim を持つ 1 つの MySQL ポッドです。ノード障害時に数分の停止が許容される開発環境、CI、および社内ツールに適した形です。ボリュームを持つ 1 つの Docker コンテナの Kubernetes 版にほぼ相当し、[Docker ガイド](/ja/guides/mysql-on-docker)が、そのまま引き継がれる MySQL 側の設定を扱っています。
+
+マニフェストに現れる、人がつまずく要点は次のとおりです。
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+spec:
+  replicas: 1            # one writer; MySQL doesn't scale writes by replica count
+  volumeClaimTemplates:  # storage that survives the pod
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+```
+
+ポッドのメモリの request と limit を同じ値に設定し、その中で `innodb_buffer_pool_size` のサイズを決めます（limit の 50 から 70 パーセント）。メモリ制限を超えた MySQL ポッドは書き込みの途中で OOM で強制終了されます。Docker と同じ故障モードで、同じ修正です。
+
+**オペレーター。** 本番の形をしたものには、手作りの StatefulSet ではなくオペレーターを使ってください。Oracle の MySQL Operator、Percona のもの、またはシャーディング規模なら Vitess です。オペレーターは、レプリカのプロビジョニング、フェイルオーバーの調整、バックアップの連携といったランブックを、コントローラーとして組み込みます。その代償は、独自のアップグレード周期と故障モードを持つ新しい依存関係で、それをインシデントの最中ではなく、その前に理解しておく必要があります。
+
+**クラスターの隣のマネージドデータベース。** アプリケーションを Kubernetes で実行し、RDS、Cloud SQL、またはその他のマネージド MySQL に向けます。これは小さなチームにとってのデフォルトの答えです。バックアップ、フェイルオーバー、およびパッチ適用は他の誰かが担い、クラスターはステートレスなままです。
+
+## ストレージこそが重要な決定 {#storage-is-the-decision-that-matters}
+
+- **常に PVC を使い、`emptyDir` は決して使わない。** `emptyDir` ボリュームはポッドとともに消え、MySQL のポッドはあなたとは無関係の理由で再スケジュールされます。
+- **ネットワークブロックストレージ（EBS、PD、および同等品）に裏付けられたストレージクラスを優先する。** `ReadWriteOnce` はまさにデータベースが求めるものです。ネットワークファイルシステム（NFS 形式の `ReadWriteMany`）は、まさにデータベースが求めないものです。
+- **ローカル NVMe はより速く、よりリスクが高い。** ローカルボリュームはポッドをノードに固定します。レプリケーションでカバーしない限り、ノードの喪失はデータの喪失です。ローカルストレージは、オペレーターが管理するレプリカセットとだけ組み合わせてください。
+- **決定する前に IOPS をベンチマークする。** 大手クラウドのデフォルトのストレージクラスは、IOPS ではなく容量に合わせてプロビジョニングされていることが多く、ラップトップでは問題なかったデータベースが、プロビジョニング不足のボリュームでは這うように遅くなります。
+
+## 自滅しないプローブ {#probes-without-foot-guns}
+
+クエリを実行する liveness プローブは、一時的に遅いだけの正常なサーバー（コールドなバッファプール、長い DDL）を強制終了することがあり、リカバリの途中で Kubernetes が MySQL を再起動すると、リカバリはさらに長くかかります。liveness は最小限（プロセスが TCP を受け付けているか）に保ち、本当のヘルスチェック（`mysqladmin ping`、レプリカの遅延）は、トラフィックのルーティングにだけ影響する readiness プローブに置いてください。
+
+## 行うべきでない場合 {#when-not-to-do-this}
+
+データベースが製品の唯一の信頼できる情報源である場合、両方のシステムを知るオンコール担当者がチームにいない場合、または許容できるコストでクラウドにマネージドの選択肢がある場合は、Kubernetes 上の MySQL をやめてください。率直な計算はこうです。Kubernetes は、運用上の失敗から最も回復しにくいまさにそのコンポーネントに、運用上の負担を加えます。
+
+VillageSQL は MySQL が動く場所ならどこでも動き、`villagesql/server` イメージは上のどのマニフェストでも `mysql` のドロップイン代替です。同じデータディレクトリの配置、同じポート、同じクライアントです。
+
+## 関連項目 {#see-also}
+
+- [Docker 上の MySQL](/ja/guides/mysql-on-docker) — Kubernetes が土台とするコンテナの基礎
+- [レプリケーションの基本](/ja/guides/replication-basics) — オペレーターが自動化してくれるもの
+- [バックアップ戦略](/ja/guides/backup-strategies) — バックアップは依然として必要。PVC のスナップショットはバックアップポリシーではない

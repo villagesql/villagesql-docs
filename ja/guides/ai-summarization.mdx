@@ -1,0 +1,167 @@
+---
+title: "MySQL での AI 要約"
+sidebarTitle: "AI による要約"
+description: "VillageSQL の ai_prompt() を使って MySQL に保存された長いテキストを要約する方法: サポートチケット、記事、およびドキュメントの要約を SQL の中で直接生成する。"
+keywords: "mysql ai summarization, mysql summarize text sql, mysql ai_prompt summarize, mysql text summary column, mysql document summary, mysql support ticket summary"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+要約は、長いテキストを要点を押さえた短い版に変換します。サポートチケット、顧客のフィードバック、記事、およびログエントリはいずれも、内容を素早く確認できる短い要約フィールドがあると役立ちます。MySQL には要約関数がありません。VillageSQL の `ai_prompt()` がそれを追加します。
+
+## VillageSQL の場合: SQL の中の要約 {#with-villagesql-summaries-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+要約のプロンプトでは、望む長さと残すべき内容を指定します。
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE support_tickets ADD COLUMN summary VARCHAR(500);
+
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE support_tickets
+SET summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Summarize this support ticket in one sentence. ',
+        'Include the main issue and any resolution mentioned.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE summary IS NULL
+LIMIT 100;
+```
+
+要約は他の列と同じようにクエリできます。読み取り時に AI 呼び出しは発生しません。
+
+```sql
+-- Recent tickets with AI summaries for quick triage
+SELECT id, created_at, summary
+FROM support_tickets
+WHERE created_at > NOW() - INTERVAL 24 HOUR
+ORDER BY created_at DESC;
+```
+
+### 構造化された要約 {#structured-summaries}
+
+特定のフィールドを抽出する必要がある用途では、JSON 出力を求めます。
+
+```sql
+ALTER TABLE support_tickets ADD COLUMN ai_extract JSON;
+
+UPDATE support_tickets
+SET ai_extract = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Extract key information from this support ticket. ',
+        'Return JSON with keys: issue (string), urgency (low/medium/high), ',
+        'product_mentioned (string or null), resolution_needed (boolean). ',
+        'Return only valid JSON.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE ai_extract IS NULL
+LIMIT 100;
+
+-- Triage: high-urgency tickets with no resolution
+SELECT id, body,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.issue')) AS issue,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.product_mentioned')) AS product
+FROM support_tickets
+WHERE JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.urgency')) = 'high'
+ORDER BY created_at DESC;
+```
+
+### 複数列の内容を要約する {#summarizing-multi-column-content}
+
+複数のフィールドを結合して、より豊富なコンテキストをモデルに与えます。
+
+```sql
+UPDATE articles
+SET summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Write a two-sentence summary of this article for a preview card.\n\n',
+        'Title: ', title, '\n',
+        'Author: ', author_name, '\n',
+        'Body: ', LEFT(body, 3000)   -- trim very long bodies
+    )
+)
+WHERE summary IS NULL
+LIMIT 50;
+```
+
+`LEFT(body, 3000)` は、過度に長いテキストをモデルに送ることを防ぎます。ほとんどの AI モデルにはトークンの上限があります。非常に長いドキュメントでは、最初の数千文字を要約するか、内容をチャンクに分割してください。
+
+## 長さとスタイルの制御 {#length-and-style-control}
+
+プロンプトの言い回しが出力の長さとトーンを制御します。
+
+| 目的 | プロンプトの言い回し |
+|:---|:---|
+| 1 文 | "Summarize in one sentence." |
+| ツイートの長さ | "Summarize in 280 characters or fewer." |
+| エグゼクティブサマリー | "Write a 2–3 sentence executive summary." |
+| 箇条書き | "Summarize as 3 bullet points." |
+| アクション指向 | "What does this ticket ask us to do? One sentence." |
+
+UI のプレビューで使う要約では、あふれを防ぐために文字数の上限を指定してください。
+
+## モデルの選択 {#model-selection}
+
+要約は一般に、より高速で安価なモデルで十分にこなせます。一括要約には `claude-haiku-4-5` または `gpt-4o-mini` を使ってください。次の場合は `claude-sonnet-5` に切り替えます。
+
+- 元のテキストが長く複雑である
+- ニュアンスのあるフィールドを含む構造化 JSON 抽出が必要である
+- 抽出した事実の正確さがコストより重要である
+
+セットアップとプロバイダーの選択肢については、[MySQL を AI API に接続する](/ja/guides/ai-api-setup)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 元のテキストはどのくらいの長さまで扱えますか? {#how-long-can-the-source-text-be}
+
+実用的な上限は 1 回の呼び出しあたり数千語です。AI モデルにはトークンの上限があります（現在のモデルでは通常 100K〜200K トークン）が、非常に長い入力はコストが高く、時間もかかります。約 5000 語を超えるドキュメントでは、最初のセクションを要約するか、チャンクに分割して各チャンクを要約してください。
+
+#### 要約を全文検索インデックスで使えますか? {#can-i-use-summaries-in-a-full-text-search-index}
+
+はい。要約列にデータを入れた後、その列に FULLTEXT インデックスを追加します。要約は短くキーワード密度が高いため、生の内容よりも全文検索の対象として優れていることがよくあります。
+
+#### 同じドキュメントからは常に同じ要約が生成されますか? {#will-the-same-document-always-produce-the-same-summary}
+
+いいえ。AI モデルは確率的です。同じプロンプトでも、呼び出しごとにわずかに異なる出力が生成されることがあります。一貫性が重要な場合は、要約を一度生成して保存し、読み取りのたびに再生成しないでください。
+
+#### すでに要約済みの行はどう扱いますか? {#how-do-i-summarize-rows-that-have-already-been-summarized}
+
+元の内容が変わらない限り、再要約しないでください。`WHERE summary IS NULL` を使って、新規または更新された行だけを処理します。変更を追跡する必要がある場合は、`summary_updated_at` 列を追加し、内容の最終更新タイムスタンプと比較してください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | `INSTALL EXTENSION vsql_ai` を実行します |
+| NULL が返る | `SHOW WARNINGS` を実行して実際の原因を確認し、その後 API キー、`max_execution_time`、およびモデル名を確認します |
+| 要約が長すぎる、または短すぎる | プロンプトを厳密にします。文字数または文数の上限を指定します |
+| モデルが要約せずに元のテキストを繰り返す | プロンプトに「Do not copy sentences from the original」を追加します |
+| 構造化 JSON 抽出でキーが欠けている | プロンプトに「If a field is not mentioned, use null」を追加します |
+
+## 関連項目 {#see-also}
+
+- [MySQL のクエリから AI モデルを実行する](/ja/guides/ai-prompts-in-mysql) — このガイドの基礎となる ai_prompt() 関数
+- [MySQL データのセンチメント分析](/ja/guides/sentiment-analysis) — ai_prompt() を使った別のテキスト分析パターン
+- [MySQL で AI を使ってテキストを分類する](/ja/guides/text-classification) — 同じ手法でテキストを分類する

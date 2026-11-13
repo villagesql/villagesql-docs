@@ -1,0 +1,209 @@
+---
+title: "MySQL での IP による位置情報の検索"
+sidebarTitle: "IP 位置情報の検索"
+description: "MySQL で IP 位置情報の検索を行う方法。MaxMind GeoLite2 または API ベースのデータソースのインポート、国と地域のための IP 範囲の問い合わせ、精度のトレードオフ、および IPv4/IPv6 を統合した検索のための VillageSQL の INET 型の使用を扱います。"
+keywords: "mysql ip geolocation, mysql geoip database, mysql maxmind, mysql ip country lookup, mysql ip range query, mysql geolite2, ip geolocation accuracy mysql, mysql ip lookup without plugin, mysql ipv6 geolocation, ip-api mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL での IP 位置情報は、IP 範囲を場所に対応付けるデータベースをインポートし、範囲チェックで問い合わせることで動作します。標準的な手法は IP 範囲を整数として保存し、`BETWEEN` を使います。VillageSQL の `INET` 型はスキーマをより表現豊かにし、IPv4 と IPv6 を同じテーブルで扱います。
+
+## IP 位置情報の仕組み {#how-ip-geolocation-works}
+
+IP を国に対応付ける MySQL の関数はありません。位置情報は検索の問題です。IP 範囲のテーブルがあり、各行が「X から Y までのアドレスは国 Z にある」と示していて、受信した IP を含む範囲を見つけます。
+
+MaxMind GeoLite2 のような無料のデータベースは、これらの範囲を MySQL にインポートできる CSV ファイルとして提供しています。
+
+## 標準的な手法: 整数の範囲 {#the-standard-approach-integer-ranges}
+
+MaxMind GeoLite2（および同様のデータベース）は、`network` を CIDR 文字列として、各範囲の開始/終了を整数として提供しています。整数の手法はコンパクトで、インデックスに適しています。
+
+```sql
+CREATE TABLE geoip_ranges (
+    start_ip   INT UNSIGNED NOT NULL,
+    end_ip     INT UNSIGNED NOT NULL,
+    country    CHAR(2),
+    INDEX idx_start (start_ip),
+    INDEX idx_end   (end_ip)
+);
+
+-- Import from GeoLite2-Country-Blocks-IPv4.csv after converting to int ranges
+-- Then query:
+SELECT country FROM geoip_ranges
+WHERE INET_ATON('203.0.113.45') BETWEEN start_ip AND end_ip
+LIMIT 1;
+```
+
+これは高速です。`start_ip` のインデックスが効率的な範囲スキャンを可能にします。制限は、IPv4 でしか動作しないことです。IPv6 には別のテーブル（`VARBINARY(16)` の範囲を持つ）が必要です。
+
+## VillageSQL の場合: INET による IPv4/IPv6 の統合 {#with-villagesql-unified-ipv4ipv6-with-inet}
+
+VillageSQL の `INET` 型は、IPv4 と IPv6 の両方のアドレスを自然な順序で保存するため、両方のファミリーに 1 つのテーブルを使えます。範囲チェックでは `inet_compare()` が `BETWEEN` の役割を果たします。
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE geoip_ranges (
+    start_ip   INET NOT NULL,
+    end_ip     INET NOT NULL,
+    country    CHAR(2),
+    region     VARCHAR(100),
+    INDEX idx_start (start_ip)
+);
+
+-- Import IPv4 ranges
+INSERT INTO geoip_ranges (start_ip, end_ip, country) VALUES
+    (inet_from_string('203.0.113.0'), inet_from_string('203.0.113.255'), 'US'),
+    (inet_from_string('198.51.100.0'), inet_from_string('198.51.100.255'), 'DE');
+
+-- Import IPv6 ranges in the same table
+INSERT INTO geoip_ranges (start_ip, end_ip, country) VALUES
+    (inet_from_string('2001:db8::'), inet_from_string('2001:db8::ffff'), 'US');
+
+-- Look up a country for an IPv4 address
+SELECT country, region FROM geoip_ranges
+WHERE inet_compare(inet_from_string('203.0.113.45'), start_ip) >= 0
+  AND inet_compare(inet_from_string('203.0.113.45'), end_ip)   <= 0
+LIMIT 1;
+
+-- Same query works for IPv6
+SELECT country FROM geoip_ranges
+WHERE inet_compare(inet_from_string('2001:db8::42'), start_ip) >= 0
+  AND inet_compare(inet_from_string('2001:db8::42'), end_ip)   <= 0
+LIMIT 1;
+```
+
+### CIDR ネットワークで保存する（代替スキーマ） {#storing-by-cidr-network-alternative-schema}
+
+GeoIP データが開始/終了のペアではなく CIDR ブロックを提供している場合は、ネットワーク列に `CIDR` を使い、サブネットのクエリで包含を解決します。
+
+```sql
+CREATE TABLE geoip_cidrs (
+    network    CIDR NOT NULL,
+    country    CHAR(2),
+    INDEX idx_network (network)
+);
+
+INSERT INTO geoip_cidrs (network, country) VALUES
+    (cidr_from_string('203.0.113.0/24'), 'US'),
+    (cidr_from_string('198.51.100.0/24'), 'DE');
+
+-- Look up by subnet match
+SELECT country FROM geoip_cidrs
+WHERE cidr_to_string(inet_network(inet_set_masklen(
+    inet_from_string('203.0.113.45'),
+    inet_masklen(inet_from_string(cidr_to_string(network)))
+))) = cidr_to_string(network)
+LIMIT 1;
+```
+
+## 手法の選択 {#choosing-an-approach}
+
+| 手法 | IPv6 | スキーマ | パフォーマンス |
+|:---|:---|:---|:---|
+| `INT UNSIGNED` の範囲 + `BETWEEN` | いいえ（別テーブル） | IPv4/IPv6 の 2 つの別テーブル | 高速。整数インデックスの範囲スキャン |
+| `INET` の範囲 + `inet_compare` | はい（統合） | 両方に 1 つのテーブル | 良好。`start_ip` にインデックス |
+| `CIDR` ネットワーク + サブネット一致 | はい（統合） | 1 つのテーブル | 低速。行ごとのネットワーク計算 |
+
+IPv4 のみで最大のクエリ速度が必要なら、`INT UNSIGNED` + `BETWEEN` の手法に勝つのは困難です。IPv4 と IPv6 の両方を 1 つのテーブルで扱う必要があるスキーマでは、`INET` と `inet_compare` のほうが簡潔で、2 つの並行するテーブルを維持せずに済みます。
+
+## 位置情報データソースの比較 {#comparing-geolocation-data-sources}
+
+クエリのスキーマは決定の半分に過ぎません。データソースが精度、鮮度、およびコストを決めます。一般的な選択肢の比較は次のとおりです。
+
+| データソース | 国の精度 | 都市の精度 | レイテンシ | コスト | MySQL との統合 |
+|:---|:---|:---|:---|:---|:---|
+| MaxMind GeoLite2（無料） | 約 98% | 約 80% | プロセス内（SQL または `.mmdb`） | 無料。登録が必要 | CSV をインポート。毎週更新 |
+| MaxMind GeoIP2（有料） | 約 99.8% | 約 85〜90% | プロセス内 | 月 $20 から | GeoLite2 と同じインポート手順 |
+| ip-api.com（無料枠） | 約 99% | 約 83% | HTTP、約 30〜100 ms | 無料（45 リクエスト/分）。有料で制限解除 | アプリケーション層の HTTP 呼び出し。結果を MySQL に保存 |
+| ip-api.com（pro） | 約 99% | 約 83% | HTTP、約 30〜100 ms | 月 $15 から | 同じ。HTTPS + レート制限なし |
+| ipinfo.io | 約 99% | 約 85% | HTTP、約 30〜100 ms | 無料（5 万リクエスト/月）。それ以上は有料枠 | アプリケーション層。結果を MySQL にキャッシュ可能 |
+
+**国レベルの精度**の数値はプロバイダーの自己申告であり、地域によって異なります。アジア太平洋とラテンアメリカのカバレッジは、すべてのソースで北米とヨーロッパより低い傾向があります。
+
+**どれを選ぶか:** MaxMind GeoLite2 が標準的な出発点です。無料で、一度インポートするフラットファイルとして提供され、検索は外部依存なしに完全に MySQL の中で実行されます。本番環境で都市レベルの精度が必要なら、GeoIP2 Precision がアップグレードの道です。API ベースのソース（ip-api.com、ipinfo.io）は少量の利用には便利ですが、すべての検索に HTTP のレイテンシとレート制限への依存を加えます。
+
+## 各手法を使う場面 {#when-to-use-each-approach}
+
+| シナリオ | 推奨される手法 |
+|:---|:---|
+| 保存済みアクセスログのバッチ分析 | MySQL 内の GeoLite2。SQL で直接結合 |
+| すべての HTTP リクエストでのリアルタイム検索（大量） | アプリケーションコードでの MaxMind `.mmdb` リーダー。SQL の往復なし |
+| 少量の拡充（&lt;45 リクエスト/分）、DB へのインポートの手間なし | HTTP 経由の ip-api.com 無料枠 |
+| IPv4 のみ、最大のクエリ速度 | GeoLite2 を使った `INT UNSIGNED` + `BETWEEN` |
+| IPv4 + IPv6 を 1 つのテーブルに | GeoLite2 を使った VillageSQL の `INET` + `inet_compare` |
+| 都市、ASN、または ISP のデータが必要 | GeoIP2 Precision（有料）または ipinfo.io |
+| 隔離された環境、外部 API 呼び出しなし | MaxMind GeoLite2（ローカルにインポート） |
+| セットアップなしのプロトタイピング/テスト | ip-api.com 無料枠 |
+
+## GeoLite2 データのインポート {#importing-geolite2-data}
+
+MaxMind GeoLite2（無料、登録が必要）は CSV ファイルを提供しています。範囲ベースのスキーマの場合は次のとおりです。
+
+```sql
+-- After downloading GeoLite2-Country-Blocks-IPv4.csv
+-- Convert the network column to start/end ranges and load:
+LOAD DATA INFILE '/path/to/ipv4_ranges.csv'
+INTO TABLE geoip_ranges
+FIELDS TERMINATED BY ',' ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS
+(@start_ip_str, @end_ip_str, country)
+SET start_ip = inet_from_string(@start_ip_str),
+    end_ip   = inet_from_string(@end_ip_str);
+```
+
+MaxMind はバイナリの `.mmdb` 形式と、Python、Node.js、Go などの言語向けの公式クライアントライブラリも提供しており、大量の検索を行うシナリオでは SQL の検索より高速です。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 位置情報は MySQL とアプリケーションコードのどちらで行うべきですか？ {#should-i-do-geolocation-in-mysql-or-in-application-code}
+
+大量の検索（すべての HTTP リクエスト）では、MaxMind の `.mmdb` リーダーライブラリを使ったアプリケーション層の位置情報のほうが高速です。メモリ内の二分探索で、SQL の往復がありません。SQL ベースの位置情報は、バッチ分析、レポートのクエリ、およびすでに MySQL で実行されているデータパイプラインに向いています。
+
+#### GeoIP データベースを最新に保つにはどうすればよいですか？ {#how-do-i-keep-the-geoip-database-current}
+
+MaxMind は GeoLite2 を毎週更新します。定期的なダウンロードと、位置情報テーブルの `TRUNCATE` + 再読み込みをスクリプト化してください。あるいは、MaxMind の mmdbinspect か更新スクリプトを使って差分更新を適用します。
+
+#### MySQL での IP 位置情報はどのくらい正確ですか？ {#how-accurate-is-ip-geolocation-in-mysql}
+
+精度は MySQL のスキーマではなく、データソースだけで決まります。国レベルでは、MaxMind GeoLite2（無料）は IPv4 アドレスのおよそ 98% で正確です。都市レベルでは約 80% に下がります。より高い精度には、MaxMind の有料製品 GeoIP2 Precision が国で約 99.8%、都市で約 85〜90% に達します。完璧なデータベースはありません。精度は通常、モバイルネットワーク、VPN、および一部のアジア太平洋の範囲で低くなります。MySQL のクエリ手法は精度に影響しません。インポートしたデータが示すとおりの結果が得られます。
+
+#### MySQL はプラグインや外部 API なしで IP 位置情報を検索できますか？ {#can-mysql-look-up-ip-geolocation-without-a-plugin-or-external-api}
+
+はい。標準的な手法、つまりこのガイドが扱う手法は、GeoIP データベース（MaxMind GeoLite2 など）を整数の範囲として通常の MySQL テーブルにインポートします。検索はただの SQL の `BETWEEN` クエリです。プラグインも、外部 API も、クエリ時のネットワーク呼び出しもありません。唯一の依存は、MaxMind のフラットな CSV ファイルをインポートし、定期的に更新することです。VillageSQL の `vsql_network_address` 拡張機能は、より簡潔な IPv4/IPv6 の扱いのために `INET` 型を追加しますが、基本的な手法には必須ではありません。
+
+#### 位置情報とアクセスログを 1 つのクエリで結合できますか？ {#can-i-join-geolocation-with-my-access-logs-in-one-query}
+
+はい。それが GeoIP データを MySQL に置く主な理由の 1 つです。
+
+```sql
+SELECT
+    g.country,
+    COUNT(*) AS request_count
+FROM access_log a
+JOIN geoip_ranges g
+  ON inet_compare(a.ip_address, g.start_ip) >= 0
+ AND inet_compare(a.ip_address, g.end_ip)   <= 0
+GROUP BY g.country
+ORDER BY request_count DESC;
+```
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.inet_from_string does not exist` | `INSTALL EXTENSION vsql_network_address` を実行します |
+| 検索が結果を返さない | そのブロックの IP 範囲がインポートされているか確認します。`SELECT COUNT(*) FROM geoip_ranges` を試します |
+| 検索が間違った国を返す | GeoIP データベースにはカバレッジの隙間があります。MaxMind のウェブ検索ツールと照合します |
+| `LOAD DATA INFILE` が失敗する | `secure_file_priv` の設定を確認します。あるいは、アプリケーション側のバッチ挿入を使います |
+
+## 関連項目 {#see-also}
+
+- [MySQL での IP アドレスの保存](/ja/guides/storing-ip-addresses) — 位置情報のクエリの前の効率的な IP の保存
+- [MySQL でのサブネットによる問い合わせ](/ja/guides/subnet-queries) — 位置情報の基礎となる範囲ベースの IP 検索

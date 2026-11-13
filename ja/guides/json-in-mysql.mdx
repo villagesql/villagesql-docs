@@ -1,0 +1,154 @@
+---
+title: "MySQL の JSON"
+sidebarTitle: "JSON データの格納"
+description: "MySQL で JSON データを格納、クエリ、インデックス化する方法: JSON 列型、パス式、JSON 関数、および生成列で JSON フィールドにインデックスを作成する方法。"
+keywords: "mysql json, mysql json column, mysql json_extract, mysql json path, mysql json functions, mysql json index, mysql json generated column"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL のネイティブな `JSON` 列型は、挿入時に JSON を検証し、効率的にアクセスできるようバイナリ形式で格納し、ドキュメント全体を解析せずに個々のフィールドを読み書きするための一連の関数を提供します。
+
+## JSON の格納 {#storing-json}
+
+```sql
+CREATE TABLE products (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    name       VARCHAR(100) NOT NULL,
+    attributes JSON
+);
+
+INSERT INTO products (name, attributes) VALUES (
+    'Laptop',
+    '{"brand": "Acme", "ram_gb": 16, "tags": ["portable", "pro"]}'
+);
+```
+
+MySQL は挿入時に JSON を検証します。不正な形式の JSON を挿入するとエラーになります。
+
+## JSON フィールドの読み取り {#reading-json-fields}
+
+`JSON_EXTRACT(column, path)` または短縮形の `->` を使います。
+
+```sql
+-- These are equivalent
+SELECT JSON_EXTRACT(attributes, '$.brand') FROM products;
+SELECT attributes -> '$.brand' FROM products;
+```
+
+どちらも JSON 値を返します。つまり、引用符付きの文字列 `"Acme"` です。引用符のないプレーンな文字列を得るには、`->>`（`JSON_UNQUOTE(JSON_EXTRACT(...))` の短縮形）を使います。
+
+```sql
+SELECT attributes ->> '$.brand' FROM products;  -- returns: Acme
+```
+
+パス構文:
+- `$.key` — オブジェクトのフィールドにアクセスします
+- `$.array[0]` — インデックスで配列要素にアクセスします
+- `$.array[*]` — 配列のすべての要素
+- `$.**` — 再帰ワイルドカード（任意の深さのすべての値）
+
+## JSON フィールドでのフィルタリング {#filtering-on-json-fields}
+
+```sql
+-- Find all 16GB RAM products
+SELECT name FROM products
+WHERE attributes ->> '$.ram_gb' = '16';
+
+-- Check if a key exists
+SELECT name FROM products
+WHERE JSON_EXTRACT(attributes, '$.brand') IS NOT NULL;
+
+-- Check if an array contains a value
+SELECT name FROM products
+WHERE JSON_CONTAINS(attributes -> '$.tags', '"portable"');
+```
+
+`->>` は文字列を返すため、明示的にキャストしない限り、（`16` ではなく）`'16'` と比較するのが正しい書き方です。キャストする場合は `CAST(attributes ->> '$.ram_gb' AS UNSIGNED)` とします。
+
+## JSON の変更 {#modifying-json}
+
+```sql
+-- Add or update a field
+UPDATE products
+SET attributes = JSON_SET(attributes, '$.color', 'silver')
+WHERE id = 1;
+
+-- Remove a field
+UPDATE products
+SET attributes = JSON_REMOVE(attributes, '$.tags')
+WHERE id = 1;
+
+-- Insert only if the key doesn't exist
+UPDATE products
+SET attributes = JSON_INSERT(attributes, '$.warranty_years', 2)
+WHERE id = 1;
+```
+
+主な関数:
+
+| 関数 | 動作 |
+|:---------|:---------|
+| `JSON_SET(doc, path, val)` | 値を設定します。挿入または置換 |
+| `JSON_INSERT(doc, path, val)` | パスが存在しない場合のみ挿入します |
+| `JSON_REPLACE(doc, path, val)` | パスが存在する場合のみ置換します |
+| `JSON_REMOVE(doc, path)` | パスにある値を削除します |
+
+## JSON フィールドのインデックス化 {#indexing-json-fields}
+
+JSON 列そのものに直接インデックスを作成することはできません。特定の JSON フィールドにインデックスを作成するには、生成列を作り、その列にインデックスを作成します。
+
+```sql
+ALTER TABLE products
+    ADD COLUMN brand VARCHAR(100) GENERATED ALWAYS AS (attributes ->> '$.brand') VIRTUAL;
+
+CREATE INDEX idx_brand ON products (brand);
+```
+
+これで `WHERE attributes ->> '$.brand' = 'Acme'` は `idx_brand` を使えます。MySQL は、生成列の式がクエリ条件と一致することを認識します。
+
+この点は[MySQL のデータ型の選択](/ja/guides/choosing-data-types)でより詳しく説明しています。インデックスが必要になるほど頻繁に JSON フィールドをクエリする場合には、これが推奨されるパターンです。
+
+## JSON と正規化された列の比較 {#json-vs-normalized-columns}
+
+| | JSON 列 | 正規化された列 |
+|:--|:------------|:-------------------|
+| スキーマの柔軟性 | 任意の構造、マイグレーション不要 | 固定構造、マイグレーションが必要 |
+| インデックス作成 | 生成列経由のみ | どの列にも直接作成可能 |
+| クエリの複雑さ | パス式、JSON 関数 | 標準 SQL |
+| 結合 | JSON のキーでは不可 | 完全な JOIN サポート |
+| ストレージ | 大きい（バイナリ JSON のオーバーヘッド） | よりコンパクト |
+| データの整合性 | 列レベルの制約なし | `NOT NULL`、`DEFAULT`、外部キー |
+
+構造が本当に可変である場合（ユーザーが設定できる属性、イベントのメタデータ、サードパーティ API のペイロード）には JSON を使います。構造が固定されていて、フィールドに対してフィルタリング、結合、または集計を行う必要がある場合は、正規化された列を使います。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 包含クエリのために JSON 配列にインデックスを作成できますか? {#can-i-index-a-json-array-for-containment-queries}
+
+標準のインデックスでは直接作成できません。`JSON_CONTAINS` クエリでは、配列を別の子テーブルに抽出する（正規化する）か、配列を平坦化した生成列に全文インデックスを使わない限り、唯一の選択肢はフルテーブルスキャンです。高スループットの包含クエリには、正規化のほうが良い道です。
+
+#### `->` と `->>` の違いは何ですか? {#whats-the-difference-between---and--}
+
+`->` は JSON 値を返します（文字列は前後の引用符を含みます）。`->>` は引用符を外した文字列を返します。表示、連結、およびテキストを利用するあらゆる用途には、`->>` が適しています。ただし、等価比較は `->` でも動作します。MySQL はもう一方のオペランドを先に JSON に変換するため、`attributes -> '$.brand' = 'Acme'` は一致します。
+
+#### JSON を格納するとパフォーマンスが低下しますか? {#does-storing-json-hurt-performance}
+
+大きな JSON ドキュメントから 1 つのフィールドを読み取るには、バイナリ構造の解析が必要です。これはテキストの解析より速いものの、ネイティブな列の読み取りより遅くなります。頻繁にアクセスするフィールドについては、生成列とインデックスのパターンによって、読み取りのパフォーマンスがネイティブな列と同等になります。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| 挿入時に `ERROR 3140: Invalid JSON` | JSON の構文を修正します。MySQL は挿入時に検証します |
+| `WHERE attributes -> '$.key' = 'value'` が行を返さない | 引用符は原因ではありません。この比較は JSON を認識し、一致します。パスそのものと、値が数値ではなく JSON 文字列であることを確認します |
+| JSON フィールドのクエリがインデックスを使わない | パス式に対する生成列を追加し、その列にインデックスを作成します |
+| ネストした配列に対する `JSON_CONTAINS` が一致しない | パスと引用符を確認します。`JSON_CONTAINS` 内の文字列値は引用符付きの JSON でなければなりません: `'value'` ではなく `'"value"'` |
+
+## 関連項目 {#see-also}
+
+- [MySQL のデータ型の選択](/ja/guides/choosing-data-types) — JSON と正規化された列の使い分け
+- [MySQL の生成列](/ja/guides/generated-columns) — 仮想生成列で JSON フィールドにインデックスを作成する
+- [SQL からの HTTP リクエストの送信](/ja/guides/http-requests-in-mysql) — HTTP API のレスポンスから JSON を解析する

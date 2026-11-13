@@ -1,0 +1,115 @@
+---
+title: "InnoDB がデータを保存する仕組み"
+sidebarTitle: "InnoDB を理解する"
+description: "MySQL の InnoDB ストレージエンジンがディスク上でデータを構成する仕組み: クラスタ化インデックス、ページ、バッファプール、およびそれらがクエリのパフォーマンスに意味すること。"
+keywords: "mysql innodb storage, mysql clustered index, mysql buffer pool, innodb page size, mysql innodb architecture, mysql row format, innodb tablespace"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+InnoDB は MySQL のデフォルトのストレージエンジンです。InnoDB がデータを保存する仕組みを理解すると、一部のクエリが速く、他のクエリが速くない理由が分かります。特に、主キーの選択が重要な理由、範囲スキャンがランダムな検索に勝る理由、および大きなテーブルのインデックスが書き込みのパフォーマンスを損なうことがある理由です。
+
+## ページ: 保存の単位 {#pages-the-unit-of-storage}
+
+InnoDB はすべてをページに保存します。ページはデフォルトで 16KB の固定サイズの塊です。ページは、InnoDB がディスクから読み、ディスクに書く最小の単位です。1 行を読むとき、InnoDB はその行を含む 16KB のページ全体を読み込みます。
+
+これには実際的な影響があります。
+- 連続した行を読むクエリ（範囲スキャン、順序付けられたデータのフルテーブルスキャン）は、各ページを 1 回読み込み、そこから多くの行を処理します
+- ランダムな行を読むクエリ（大きなテーブルに対するセカンダリインデックス経由）は、行ごとに新しいページを読み込み、それぞれが別のディスク読み取りになる可能性があります
+
+## クラスタ化インデックス {#the-clustered-index}
+
+InnoDB はテーブルの行を**クラスタ化インデックス**に保存します。これは、葉ノードが実際の行データを含み、主キーで物理的にソートされた B ツリーです。別々の「テーブルファイル」と「主キーのインデックスファイル」はなく、両者は同じ構造です。
+
+```sql
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    created_at  DATETIME NOT NULL
+);
+```
+
+このテーブルの行は、ディスク上に `id` 順で物理的に保存されます。`WHERE id BETWEEN 1000 AND 2000` のようなクエリは、連続した範囲のページを読むため高速です。`id = 1`、次に `id = 500000`、次に `id = 250` の行を取得するクエリは、物理的に離れた 3 つのページを読みます。
+
+**主キーを定義しない場合**、InnoDB は隠れた 6 バイトの行 ID を作り、それをクラスタ化インデックスのキーとして使います。これは最適化の機会を無駄にします。
+
+## セカンダリインデックス {#secondary-indexes}
+
+すべてのセカンダリインデックスは別の B ツリーです。葉ノードは行全体を保存せず、インデックス付きの列の値と主キーを保存します。セカンダリインデックスに含まれない列を取得するために、InnoDB は**行の検索**を行います。セカンダリインデックスの葉から主キーを取り出し、クラスタ化インデックスから行全体を取得します。
+
+```sql
+CREATE INDEX idx_customer ON orders (customer_id);
+
+-- This query uses idx_customer, then does a row lookup for each match
+SELECT amount FROM orders WHERE customer_id = 42;
+```
+
+この 2 段階の処理が、カバリングインデックスが重要である理由です。セカンダリインデックスがクエリに必要なすべての列を含んでいれば、行の検索は省略されます。[MySQL のカバリングインデックス](/ja/guides/covering-indexes)を参照してください。
+
+行の検索のコストは、大きな主キーが高くつく理由でもあります。主キーが INT（4 バイト）ではなく UUID 文字列（36 バイト）の場合、すべてのセカンダリインデックスはエントリごとに 4 バイトではなく 36 バイトを保存し、行の検索はより深い B ツリーをたどります。
+
+## バッファプール {#the-buffer-pool}
+
+InnoDB はページをメモリ内の**バッファプール**にキャッシュします。ディスクから読まれたページはバッファプールに読み込まれ、メモリが他の用途に必要になるまでそこに残ります。同じページのその後の読み取りは RAM から提供されます。
+
+```sql
+-- Check buffer pool size
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+
+-- Check hit rate (should be > 99% on a healthy server)
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+-- Innodb_buffer_pool_reads: pages read from disk
+-- Innodb_buffer_pool_read_requests: total page read requests
+-- Hit rate = 1 - (reads / read_requests)
+```
+
+専用のデータベースサーバーでは、`innodb_buffer_pool_size` を利用できる RAM の 70〜80% に設定します。これは読み取りの多いワークロードで最も効果の大きい設定変更です。ワーキングセットのより多くがメモリに収まるほど、ディスクの読み取りは減ります。
+
+## 行フォーマット {#row-formats}
+
+InnoDB は 4 つの行フォーマットをサポートしています。デフォルトは `DYNAMIC` です。
+
+| フォーマット | 可変長の列 | オーバーフロー前のインライン保存 | 備考 |
+|:-------|:------------------------|:--------------------------------|:------|
+| `REDUNDANT` | インラインまたはページ外に保存 | 約 8KB | レガシーフォーマット |
+| `COMPACT` | インラインまたはページ外に保存 | 約 8KB | 古いフォーマット |
+| `DYNAMIC` | 大きい場合はページ外に保存 | 約 8KB | デフォルト。TEXT/BLOB に適する |
+| `COMPRESSED` | 圧縮してページ外に保存 | 約 8KB | ディスク使用量を減らす。CPU のオーバーヘッドが増える |
+
+約 8KB という数字は、デフォルトの 16KB ページのおよそ半分であり、InnoDB が可変長の列データをページ外に移す境界です。そのため、大きな `VARCHAR`/`TEXT`/`BLOB` 列が少数ある行は、上限に当たることなくそれをはるかに超えて大きくなれます。しかし、ページ外に移らずインラインに保存される列、たとえば多数の固定幅の `CHAR` 列は、InnoDB 自身の行サイズ制限に対して引き続きすべて数えられ、それに当たると `ERROR 1118 (42000): Row size too large (> 8126). Changing some columns to TEXT or BLOB may help.` が発生します。MySQL の別の、より高い行サイズ制限は BLOB/TEXT のオーバーフローページを除いて 65,535 バイトで、`ROW_FORMAT` にかかわらず適用されます。どちらの制限も実在し、どの列が大きく、それがページ外に移れるかによって、どちらに先に当たるかは変わります。
+
+`DYNAMIC` フォーマットで `VARCHAR`、`TEXT`、または `BLOB` 列がページをオーバーフローすると、値全体がオーバーフローページに保存され、メインの行には 20 バイトのポインタだけが残ります。`COMPACT` は代わりに先頭の 768 バイトをインラインに保存します。`DYNAMIC` の方式は、長い値があるときにメインの行を小さく保つため、ページあたりに収まる行が増え、B ツリーはより浅いままになります。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 主キーの選択がパフォーマンスにこれほど影響するのはなぜですか？ {#why-does-primary-key-choice-affect-performance-so-much}
+
+クラスタ化インデックスが行を主キーで物理的に並べるためです。ランダムな位置への挿入（UUID の主キーなど）は**ページ分割**を引き起こします。InnoDB は順序を維持するために、満杯のページを分割してデータを移動しなければなりません。連続した主キー（AUTO_INCREMENT、UUID v7）は末尾に挿入され、分割を避けます。ページ分割はテーブルスペースを断片化し、時間とともに書き込みと読み取りの両方を遅くします。
+
+#### バッファプールが小さすぎるとどうなりますか？ {#what-happens-when-the-buffer-pool-is-too-small}
+
+InnoDB はディスクからページを頻繁に読まなければなりません。`Innodb_buffer_pool_reads` が増え続けるのが見えます。サーバーは I/O に縛られ、RAM からならマイクロ秒で済むクエリがディスクからだとミリ秒かかります。読み取りの多いワークロードでは、ワーキングセットを保持できるバッファプールは、ほぼどのインデックスの最適化よりも価値があります。
+
+#### InnoDB と MyISAM の違いは何ですか？ {#whats-the-difference-between-innodb-and-myisam}
+
+InnoDB はトランザクション、外部キー、行レベルのロック、およびクラッシュリカバリをサポートしています。MyISAM はこれらのどれもサポートしていません。特定の読み取り専用の一括ワークロードでは速いですが、ほとんどのアプリケーションには不向きです。InnoDB は MySQL のデフォルトです。特別な理由がない限り、InnoDB を使ってください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| 大きなテーブルで範囲スキャンが遅い | バッファプールのヒット率を確認します。`innodb_buffer_pool_size` の増加を検討します |
+| 挿入が時間とともに遅くなる | 主キーは連続していますか？ `SHOW ENGINE INNODB STATUS` でページ分割を確認します |
+| RAM が十分なのにディスク I/O が高い | バッファプールがワーキングセットに対して小さすぎる可能性があります。増やします |
+| 大きなテーブルで読み取りのほとんどがフルテキスト | 大きなテキストをメインページから外すために、`DYNAMIC` 行フォーマットを検討します |
+
+VillageSQL は同じ InnoDB エンジンを同梱しているため、このページのすべての設定はそのまま適用されます。[VillageSQL をインストール](https://villagesql.com/install)すると、InnoDB をそのままに、カスタムの型、関数、およびインデックスのための拡張機能フレームワークが手に入ります。
+
+## 関連項目 {#see-also}
+
+- [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes) — B ツリーインデックスが InnoDB のページ内でどのように配置されるか
+- [MySQL のカバリングインデックス](/ja/guides/covering-indexes) — インデックス内にとどまることで高コストなページ読み取りを避けられる理由
+- [MySQL のテーブルパーティショニング](/ja/guides/table-partitioning) — 複数の InnoDB セグメントにデータを分割する

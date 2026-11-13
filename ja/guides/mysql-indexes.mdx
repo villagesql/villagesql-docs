@@ -1,0 +1,189 @@
+---
+title: "MySQL のインデックスの仕組み"
+sidebarTitle: "インデックスの使用"
+description: "MySQL のインデックスの実践ガイド: B-tree インデックスの仕組み、MySQL がインデックスを使う条件、複合インデックスの列の順序、カバリングインデックス、およびよくある間違い。"
+keywords: "mysql index explained, mysql how indexes work, mysql b-tree index, mysql composite index, mysql covering index, mysql explain index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+インデックスは、MySQL で最も効果の大きいパフォーマンスツールであり、最もよく誤解されるものでもあります。開発者はクエリが遅いとインデックスを追加し、ディスク容量が足りないと削除しますが、それがなぜ役立ち、なぜ害になるのかを理解していないことが少なくありません。このガイドでは、推測ではなく正しい判断ができるように、その仕組みを説明します。
+
+## メンタルモデル {#the-mental-model}
+
+800 ページの本を考えてみてください。「TCP/IP」の記述をすべて見つけるには、すべてのページを読むこともできます。これがフルテーブルスキャンです。あるいは巻末の索引を調べ、「TCP/IP — 42、107、391 ページ」を見つけて、そのページに直接向かうこともできます。データベースのインデックスがしているのはこれです。
+
+MySQL のデフォルトのインデックス構造は **B-tree**（平衡木）です。値をソートされた状態で保持するため、高速な検索（二分探索）、範囲スキャン（`BETWEEN`、`>`、`<`）、およびソート済みの出力（`ORDER BY`）が可能になります。いずれもテーブル全体を読むことなく行えます。
+
+## MySQL がインデックスを使う仕組み {#how-mysql-uses-an-index}
+
+クエリを実行すると、MySQL のオプティマイザは、インデックスによって、読む必要のある行を絞り込めるかどうかを確認します。クエリがインデックス付きの列でフィルタリングまたはソートする場合に、インデックスを使います。
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- Without an index, this scans every row
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Add an index on user_id
+CREATE INDEX idx_user_id ON orders (user_id);
+
+-- Now MySQL jumps directly to user_id = 42 rows
+SELECT * FROM orders WHERE user_id = 42;
+```
+
+### EXPLAIN: MySQL が実際に何をしているかを見る {#explain-see-what-mysql-is-actually-doing}
+
+`EXPLAIN` は、MySQL がクエリをどう実行する予定かを示します。`key` 列は使われたインデックス（なければ NULL）を示し、`rows` は調べる必要があった行数の見積もりを示します。
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+| id | select_type | table  | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra          |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+|  1 | SIMPLE      | orders | NULL       | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |   100.00 | NULL           |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+```
+
+`type: ref` は、MySQL がインデックス検索を使ったことを意味します。`type: ALL` はフルテーブルスキャンを意味し、通常は避けたいものです。
+
+## 複合インデックス: 列の順序が重要 {#composite-indexes-column-order-matters}
+
+複合インデックスは複数の列をカバーします。列の順序が、インデックスをいつ使えるかを決めます。
+
+```sql
+-- Index on (user_id, status)
+CREATE INDEX idx_user_status ON orders (user_id, status);
+```
+
+MySQL はこのインデックスを次の場合に使えます。
+- `WHERE user_id = 42` — 使えます。先頭の列です
+- `WHERE user_id = 42 AND status = 'shipped'` — 使えます。両方の列です
+- `WHERE status = 'shipped'` — **使えません**。先頭の列を飛ばしています
+
+ルールはこうです。MySQL は複合インデックスを左から使います。恩恵を受けるには、クエリが先頭の列を含んでいる必要があります。
+
+つまり、`(user_id, status)` と `(status, user_id)` は、用途の異なる別のインデックスです。複合インデックスは、最もよく使うクエリパターンに合わせて設計してください。
+
+## カバリングインデックス: インデックスだけでクエリに応える {#covering-indexes-serving-queries-from-the-index-alone}
+
+カバリングインデックスは、クエリが必要とするすべての列を含みます。MySQL は実際の行データを読まずに、インデックスだけでクエリに完全に応えられます。大きなテーブルでは大幅な高速化になります。
+
+```sql
+-- Query only needs user_id, status, created_at
+SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+
+-- A covering index for this query
+CREATE INDEX idx_covering ON orders (user_id, status, created_at);
+```
+
+MySQL がカバリングインデックスを使うと、`EXPLAIN` は `Extra: Using index` を示します。行の検索は不要です。
+
+## インデックスを追加すべきでない場合 {#when-not-to-add-an-index}
+
+インデックスは多ければ良いというものではありません。すべてのインデックスにはコストがかかります。
+
+- **書き込みのオーバーヘッド** — すべての INSERT、UPDATE、および DELETE が、テーブル上のすべてのインデックスを更新しなければなりません
+- **ストレージ** — 書き込みの多いデータでは、インデックスがテーブル自体と同じ大きさになることがあります
+- **オプティマイザの複雑さ** — インデックスが多すぎると、オプティマイザが誤ったものを選ぶことがあります
+
+インデックスが最も役立つのは次の場合です。
+- 列のカーディナリティが高い（異なる値が多い） — `user_id`、`email`、`order_id`
+- クエリがテーブルのごく一部の行に絞り込む
+
+インデックスの効果が最も小さいのは次の場合です。
+- カーディナリティが低い — 3 つの値しか取らない `status`、真偽値の `is_active`
+- テーブルが小さく、どのみちフルスキャンが速い
+- 列への書き込みが多く、クエリされることがまれ
+
+```sql
+-- Probably not worth indexing: 'active' and 'inactive' split the table ~50/50
+CREATE INDEX idx_active ON users (is_active);  -- likely unused by optimizer
+
+-- Worth indexing: email is unique, commonly queried
+CREATE INDEX idx_email ON users (email);
+```
+
+## 主キーは常にインデックス {#primary-key-is-always-an-index}
+
+InnoDB のテーブルは主キーを中心に構成されています。主キーは別のインデックスではなく、行の物理的な格納順序そのものです。これは次のことを意味します。
+
+- 主キーによる検索は、可能な限り最速のクエリです
+- 主キーの値が連続していれば、行は物理的に隣接します
+- ランダムな主キー（UUID v4 など）は、挿入時に断片化を引き起こします。[MySQL の UUID](/ja/guides/uuids)を参照してください
+
+## よくあるインデックスの間違い {#common-index-mistakes}
+
+**インデックス付きの列に関数を使う** — 列を関数で包むと、MySQL はインデックスを使えません。
+
+```sql
+-- Index on created_at exists, but this skips it
+SELECT * FROM orders WHERE YEAR(created_at) = 2024;
+
+-- Use a range instead — index is used
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31';
+```
+
+**LIKE の先頭のワイルドカード** — パターンが `%` で始まると、インデックスは役に立ちません。
+
+```sql
+-- Can't use index
+SELECT * FROM users WHERE email LIKE '%@example.com';
+
+-- Can use index (no leading wildcard)
+SELECT * FROM users WHERE email LIKE 'alice%';
+```
+
+**異なる列にまたがる OR** — MySQL のオプティマイザは、`OR` 条件を処理するために複数の単一列インデックスをマージできることがありますが、これは当てになりません。大きなテーブルでは、`UNION` のほうが予測しやすい動作をします。
+
+```sql
+-- Index merge may or may not kick in depending on table size and selectivity
+SELECT * FROM orders WHERE user_id = 42 OR status = 'urgent';
+
+-- UNION gives the optimizer a cleaner path
+SELECT * FROM orders WHERE user_id = 42
+UNION
+SELECT * FROM orders WHERE status = 'urgent';
+```
+
+## 不足しているインデックスを見つける {#finding-missing-indexes}
+
+スロークエリログは、時間のしきい値を超えたクエリを記録します。何にインデックスを作るべきかを見つける良い出発点です。
+
+```sql
+-- Enable slow query log (in MySQL config or at runtime)
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 1;  -- log queries over 1 second
+```
+
+次に、遅いクエリに対して `EXPLAIN` を実行します。`type: ALL` と、数百万単位の `rows` を探してください。
+
+## まとめ {#summary}
+
+- B-tree インデックスは、高速な検索と範囲スキャンのために値をソートされた状態で保持します
+- クエリが先頭のインデックス付き列でフィルタリングまたはソートするとき、MySQL はインデックスを使います
+- 複合インデックスの列の順序は重要です。最もよく使うクエリに合わせて設計してください
+- カバリングインデックスは最速です。クエリはインデックスだけで完全に応えられます
+- インデックスは書き込みにコストがかかります。読み取りの利点がそれに見合う場所にだけ追加してください
+- 列を関数で包むと、そのインデックスは無効になります。代わりに範囲条件を使ってください
+
+インデックスは、拡張機能を備えた MySQL のドロップイン代替である [VillageSQL](https://villagesql.com/install) でもまったく同じように動作するため、この戦略ガイドはそのまま適用できます。
+
+## 関連項目 {#see-also}
+
+- [MySQL の EXPLAIN の読み方](/ja/guides/reading-explain) — インデックスが使われていることを検証し、MySQL がそれを選ぶ理由を理解する
+- [MySQL のカバリングインデックス](/ja/guides/covering-indexes) — 行の検索をまったく行わずにクエリに応えるインデックス
+- [MySQL のスロークエリログ](/ja/guides/slow-query-log) — どのクエリに先にインデックスが必要かを見つける
+- [MySQL の INFORMATION_SCHEMA](/ja/guides/information-schema) — クエリでインデックスのメタデータと未使用のインデックスを見つける
+- [MySQL のクエリが遅いのはなぜ?](/ja/guides/mysql-query-performance) — インデックスが属する、より広いチューニングのワークフロー
+- [MySQL のページネーション: キーセットと OFFSET の比較](/ja/guides/pagination) — 大きなテーブルをインデックス主導でページネーションする方法

@@ -1,0 +1,230 @@
+---
+title: "MySQL でのダウンタイムなしのスキーマ変更"
+sidebarTitle: "ダウンタイムなしのスキーマ変更"
+description: "読み取りや書き込みをブロックせずに稼働中の MySQL テーブルに ALTER TABLE を実行する方法、オンライン DDL が役に立たない場合、そして gh-ost がその隙間をどう埋めるか。"
+keywords: "mysql zero downtime, mysql online ddl, alter table lock none, algorithm inplace, algorithm instant, gh-ost, mysql alter table blocking, mysql schema change production"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+稼働中のトラフィックがあるテーブルに `ALTER TABLE` を実行するとき、1 つの疑問が生じます。このステートメントは、実行中にアプリケーションをブロックするのか? このガイドはそれを、実際のテーブルで、並行する接続にずっと観察させながら直接測定します。[MySQL のスキーマ移行](/ja/guides/schema-migrations)は、マイグレーションファイルの整理とバージョン管理の方法を扱います。このガイドは、そのマイグレーションファイルの 1 つが稼働中のテーブルに対して実行されている間に、そのテーブルで実際に何が起きるかを扱います。
+
+## テストのセットアップ {#test-setup}
+
+このガイドのすべての数値は同じテーブルから得たものです。ローカルの VillageSQL サーバー上の、3,276,802 行(168.7 MB のデータ)をロードした `orders` テーブルです。
+
+```sql
+CREATE TABLE orders (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  amount_cents INT NOT NULL,
+  created_at DATETIME NOT NULL
+) ENGINE=InnoDB;
+```
+
+行は数値テーブルのクロス結合で生成し、その後、自分自身からの `INSERT ... SELECT` で数回倍にして数百万行に到達させました。正確なサイズは以下の結論には影響しませんが、テーブル全体の再構築がコンマ数秒より長くかかる程度にテーブルが大きい必要があります。そうでなければ、それと並行して実行されるものを何も観察できません。
+
+## オンラインの ALTER はトラフィックをブロックしない {#an-online-alter-does-not-block-traffic}
+
+上の 327 万行のテーブルに `ALGORITHM=INPLACE, LOCK=NONE` でセカンダリインデックスを追加します。
+
+```sql
+ALTER TABLE orders ADD INDEX idx_customer_id (customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+これは最初から最後まで 1.003 秒かかりました。実行中、2 つ目の接続での `SHOW PROCESSLIST` は、それを本物の進行中の操作として示しました。
+
+```
+Id   User  Host       db        Command  Time  State           Info
+325  root  localhost  zdt_demo  Query    0     altering table  ALTER TABLE orders ADD INDEX idx_customer_id (customer_id), ALGORITHM=INPLACE, LOCK=NONE
+```
+
+`information_schema.INNODB_TRX` は、同じテーブルに対する別の `ADD INDEX` から、同じステートメントを実行中のトランザクションとして示します。
+
+```
+trx_id: 6472
+trx_state: RUNNING
+trx_query: ALTER TABLE orders ADD INDEX idx_status (status), ALGORITHM=INPLACE, LOCK=NONE
+```
+
+上の `ALTER` がまだ `altering table` 状態にある間に開いて実行した 3 つ目の接続から、同じテーブルに対する `INSERT` と `SELECT` はどちらもすぐに完了しました。
+
+```sql
+INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
+VALUES (999999, 'pending', 500, NOW(), 0, 0);
+-- 0.009s
+SELECT COUNT(*) FROM orders WHERE status='paid';
+-- 0.271s
+```
+
+どちらのステートメントも `ALTER` の完了を待ちませんでした。これこそが `LOCK=NONE` の要点です。テーブルの再構築は、並行する変更を取り込む InnoDB のオンライン DDL ログを使ってバックグラウンドで行われ、テーブルに対する DML は、再構築が追いついて入れ替わるまで、元のデータ構造に対して進みます。
+
+## ALGORITHM=INSTANT と ALGORITHM=INPLACE {#algorithminstant-vs-algorithminplace}
+
+すべてのオンライン操作が同じコストというわけではありません。`ALGORITHM=INSTANT` でテーブルの末尾に列を追加すると、テーブルのメタデータが変わるだけです。1 行も読み取らず、書き換えません。
+
+```sql
+ALTER TABLE orders ADD COLUMN priority TINYINT NOT NULL DEFAULT 0, ALGORITHM=INSTANT;
+-- 0.011s
+```
+
+同じ形の変更、つまりデフォルト値付きの列の追加を、代わりに `ALGORITHM=INPLACE` で強制すると次のようになります。
+
+```sql
+ALTER TABLE orders ADD COLUMN priority2 TINYINT NOT NULL DEFAULT 0, ALGORITHM=INPLACE, LOCK=NONE;
+-- 0.244s
+```
+
+この 327 万行のテーブルでは、機能的に同じ列の追加に対して、`INSTANT` は `INPLACE` のおよそ 20 倍速くなりました。`INPLACE` はテーブルのデータディクショナリのエントリに触れ、並行する DML と調整する必要があります。`INSTANT` はどちらもしません。その差はテーブルサイズとともに広がります。`INSTANT` は行数に関係なく一定のままですが、`INPLACE` はそれに比例します。
+
+`INSTANT` はすべての操作に使えるわけではありません。`BLOB`/`TEXT` のデフォルト値を持つ列の追加や、既存の列の型の変更は、`INPLACE` または `COPY` にフォールバックします。テーブルの途中を含む任意の位置への列の追加も `INSTANT` を使います(MySQL 8.0.29 以降)。
+
+## オンライン DDL が役に立たない場合: 列の型変更 {#when-online-ddl-cannot-help-a-column-type-change}
+
+すべての `ALTER TABLE` がロックを避けられるわけではありません。列のデータ型を変更するには、MySQL がすべての行を書き換える必要があり、`INPLACE` にはそれができません。
+
+```sql
+ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+```
+ERROR 1846 (0A000) at line 2: ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.
+```
+
+同じ変更に `ALGORITHM=INSTANT` を要求しても、別の理由で同じように失敗します。
+
+```
+ERROR 1846 (0A000) at line 2: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table to change column type. Try ALGORITHM=COPY/INPLACE.
+```
+
+このステートメントに対して MySQL が受け入れる唯一のアルゴリズムは `COPY` で、これはテーブル全体を再構築し、その間、排他ロックを取得します。同じテーブルに対してそれを実行し、再構築中に 2 つ目の接続から行を挿入すると、違いが直接示されます。
+
+```sql
+ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=COPY;
+-- 6.776s
+```
+
+`ALTER` の開始から 0.3 秒後に発行した並行する `INSERT` は、`ALTER` がほぼ終わるまで返ってきませんでした。
+
+```sql
+INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
+VALUES (1, 'pending', 1, NOW(), 0, 0);
+-- 6.466s
+```
+
+この間の `SHOW PROCESSLIST` は、`ALTER` を `copy to tmp table` 状態で、ブロックされた `INSERT` をその横に `Waiting for table metadata lock` 状態で示しました。この状態が診断の手がかりです。詰まっているステートメントを名指しし、それが遅く実行されているのではなくロックの後ろで待っていることを教えてくれます。この同じステートメントに `LOCK=NONE` を付けて早期に失敗させてみることこそが、本番テーブルに対して実行する前に、それが書き換えにかかる時間だけ書き込み側をブロックすることを知る方法です。
+
+## 外部キーとオンライン DDL {#foreign-keys-and-online-ddl}
+
+外部キーは、`ALGORITHM` と `LOCK` とは無関係の制限を追加します。`FOREIGN KEY (order_id) REFERENCES orders(id)` を持つ子テーブル `order_items` では、通常の `ADD COLUMN` は外部キーがあっても `ALGORITHM=INSTANT` でミリ秒単位で完了します。しかし、2 つの操作はアルゴリズムに関係なく完全に失敗します。
+
+外部キーが依存する親の主キーを削除する場合です。
+
+```sql
+ALTER TABLE orders DROP PRIMARY KEY, ADD PRIMARY KEY (id, customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+```
+ERROR 1553 (HY000) at line 2: Cannot drop index 'PRIMARY': needed in a foreign key constraint
+```
+
+参照先の親の列とは独立に、子の列の型を変更する場合です。
+
+```sql
+ALTER TABLE order_items MODIFY COLUMN order_id INT NOT NULL, ALGORITHM=COPY;
+```
+
+```
+ERROR 3780 (HY000) at line 2: Referencing column 'order_id' and referenced column 'id' in foreign key constraint 'fk_order' are incompatible.
+```
+
+どちらのエラーも、MySQL がアルゴリズムを選ぶ前の、解析と検証の時点で発生します。マイグレーションが外部キーに関わる列を変更する必要があるなら、同じマイグレーションの一部として外部キーを削除して再作成し、親と子の列の型をすべてのステップで両側で互換に保つ必要があります。
+
+## オンライン DDL が安全に行えない変更のための gh-ost {#gh-ost-for-changes-online-ddl-cannot-do-safely}
+
+上の `MODIFY COLUMN ... ALGORITHM=COPY` のケースが、オンライン DDL が役に立たないケースです。全行の書き換えが必要ですが、稼働中のテーブルでその間ずっとロックを保持したくはありません。`gh-ost` は、新しいスキーマを持つテーブルのコピー(「ゴースト」テーブル)を作り、既存の行をバックグラウンドでそこにコピーしながら、トリガーを使う代わりにバイナリログをストリーミングして、コピー中に元のテーブルに行われたすべての書き込みを再生することで、これを処理します。最後に短いアトミックなリネームでカットオーバーします。
+
+`gh-ost` は、別のテーブルが外部キーで参照しているテーブルの移行を拒否します。前のセクションの `order_items` テーブルは `FOREIGN KEY (order_id) REFERENCES orders(id)` を持っており、その制約を残したまま `orders` に対して `gh-ost` を実行すると、`FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out` ですぐに失敗します。他のテーブルが参照しているテーブルに対して `gh-ost` を実行する前に、その外部キーを先に削除してください(または `--discard-foreign-keys` を渡します。これは外部キーを代わりに削除し、再作成はしません)。
+
+これをインストールし、`order_items` の外部キーを削除した状態で、まさにこの種の変更のために、同じ 3,276,802 行のテーブルに対して実行しました。
+
+```bash
+# macOS
+brew install gh-ost
+
+# Linux (Debian/Ubuntu)
+curl -LO https://github.com/github/gh-ost/releases/latest/download/gh-ost.amd64.deb
+sudo dpkg -i gh-ost.amd64.deb
+```
+
+```bash
+gh-ost \
+  --user=root --password= \
+  --host=127.0.0.1 --port=3306 \
+  --database=zdt_demo --table=orders \
+  --alter="MODIFY COLUMN customer_id BIGINT NOT NULL" \
+  --allow-on-master \
+  --initially-drop-ghost-table \
+  --exact-rowcount \
+  --chunk-size=2000 \
+  --default-retries=5 \
+  --execute
+```
+
+実際のパスワードを使う場合は、コマンドラインの `--password` ではなく `-conf` ファイルで渡してください。コマンドラインのパスワードは、ホスト上の他のどのユーザーからも `ps` で見え、シェルの履歴にも残ります。
+
+`--execute` なしでは、`gh-ost` はドライランモードで動作します。接続し、binlog をストリーミングし、ゴーストテーブルに使うであろう `CREATE TABLE` ステートメントを出力しますが、変更は行いません。`--execute` を付けると、進捗を出力しながら、完全な移行を 13.112 秒で実行しました。
+
+```
+Copy: 596000/3276802 18.2%; Applied: 0; Backlog: 1/1000; Time: 3s(total), 3s(copy); ...; ETA: 8s
+Copy: 1762000/3276802 53.8%; Applied: 0; Backlog: 0/1000; Time: 7s(total), 7s(copy); ...; ETA: 5s
+Copy: 3276802/3276802 100.0%; Applied: 0; Backlog: 0/1000; Time: 12s(total), 12s(copy); ...; ETA: due
+```
+
+同じ移行の 2 回目の実行の開始 3 秒後、稼働中の `orders` テーブルに対する並行する `INSERT` は 0.007 秒で返り、`gh-ost` 自身の進捗行が、その書き込みを拾って再生したことを確認しました(`Applied: 1`)。
+
+```
+Copy: 1812000/3276803 55.3%; Applied: 1; Backlog: 1/1000; Time: 7s(total), 7s(copy); ...
+```
+
+カットオーバー後、`SHOW CREATE TABLE orders` は `customer_id` を `bigint` として示し、行数は正確に一致し(3,276,803、元の行数に移行中に挿入した 1 行を足したもの)、移行の途中で挿入した行は正しい値で存在していました。`gh-ost` は元のテーブルを削除するのではなく `_orders_del` にリネームしたので、移行前のテーブルは、カットオーバーを確認した後で比較したり手動で削除したりするためにまだ残っています。
+
+これは、`binlog_format=ROW` と `log_bin=ON` がすでに設定されたスタンドアロンのサーバーに対して実行しました。`gh-ost` は変更をストリーミングするためにこれらを必要とし、ステートメントベースのレプリケーションでは動作しません。また、テーブルに主キーまたは一意キーがあることも必要です。どちらもよくあるデフォルトなので、ここでは追加の設定は不要でしたが、確認していないテーブルに対して `gh-ost` に頼る前に、両方を確認してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### ALTER TABLE がテーブルをブロックするかどうかを事前に知るにはどうすればよいですか? {#how-do-i-know-in-advance-whether-an-alter-table-will-block-my-table}
+
+実行する前に、ステートメントに `ALGORITHM=INPLACE, LOCK=NONE`(または `LOCK=NONE` だけ)を追加します。MySQL がブロックせずに変更できるなら、それは実行されます。できないなら、実行してブロックする代わりに、すぐにエラーを返します。どちらにしても、推測したりソースコードを読んだりせずに確定的な答えが得られます。
+
+#### 列の型変更で ALGORITHM=INSTANT が失敗したのはなぜですか? {#why-did-algorithminstant-fail-for-a-column-type-change}
+
+`INSTANT` は、MySQL が変更をメタデータの更新だけで表現できる場合にのみ機能します。列の保存型を変更するということは、既存のすべての行のディスク上の表現が新しい型にとって誤りになるということで、行の読み取りと書き換えが必要になります。これは `INSTANT` を除外し、特に型変更については `INPLACE` も除外します。`COPY` だけがそれを行えます。
+
+#### gh-ost にはレプリケーションの設定が必要ですか? {#does-gh-ost-need-replication-set-up}
+
+いいえ。移行対象のサーバーのバイナリログを読み取ります。これは、`binlog_format=ROW` のサーバーならレプリカの有無に関係なく生成しているものです。`gh-ost` はレプリカに対して実行してマスター上でカットオーバーすることもサポートしており、非常に大きい、または非常にホットなテーブルにはそちらのほうが安全なパターンですが、それはデプロイ上の選択であって、そもそも動作させるための要件ではありません。
+
+#### gh-ost の完了後、古いテーブルはどうなりますか? {#what-happens-to-the-old-table-after-gh-ost-finishes}
+
+デフォルトでは、`gh-ost` は元のテーブルを削除する代わりに、サフィックス(上で記録した実行では `_del`)を付けてリネームします。それは、自分で削除するまで、使われないままスキーマに残ります。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `ERROR 1846: ALGORITHM=INPLACE is not supported` | その操作には完全な書き換えが必要。メンテナンスウィンドウで `ALGORITHM=COPY` を使うか、稼働中のテーブルでは `gh-ost`/`pt-online-schema-change` を使う。 |
+| `ERROR 1846: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table...` | その変更はメタデータだけでは済まない。まず `ALGORITHM=INPLACE, LOCK=NONE` を試し、それも失敗したら `COPY` にフォールバックする。 |
+| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | 参照している外部キーを先に削除し、インデックスを変更し、その後で外部キーを再作成する。 |
+| `ERROR 3780: Referencing column ... and referenced column ... are incompatible` | 外部キーの子と親の列は型の互換性を保つ必要がある。両側を一緒に変更するか、移行の間だけ外部キーを削除する。 |
+| `COPY` アルゴリズムの `ALTER` が終わりの見えないまま書き込み側を止めている | `SHOW PROCESSLIST` でその状態を、`information_schema.INNODB_TRX` で実行時間を確認する。待ちきれないなら、kill して `gh-ost` に切り替える。 |
+| `gh-ost` が起動を拒否する | `binlog_format=ROW` であることと、対象テーブルに主キーまたは一意キーがあることを確認する。どちらも必須。 |
+
+## 関連項目 {#see-also}
+
+- [MySQL のスキーマ移行](/ja/guides/schema-migrations) — このガイドが実行する `ALTER TABLE` ステートメントを生むマイグレーションファイルの整理とバージョン管理
+- [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes) — オンラインの `ADD INDEX` で MySQL が構築するインデックスが、その後のクエリパフォーマンスにどう影響するか
+- [MySQL の EXPLAIN 出力の読み方](/ja/guides/reading-explain) — 移行の完了後、新しく追加したインデックスが実際に使われていることを確認する

@@ -1,0 +1,222 @@
+---
+title: "MySQL の INSERT ON DUPLICATE KEY UPDATE"
+sidebarTitle: "アップサート"
+description: "INSERT ... ON DUPLICATE KEY UPDATE が行を書き込むか既にある行を変更する仕組み、2 rows affected と報告する理由、および今日書くべきエイリアス形式。"
+keywords: "mysql insert on duplicate key update, mysql on duplicate key update, mysql insert or update, insert or update mysql, mysql duplicate key update alias, mysql values function deprecated"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+{/* verify-db: sakila_practice */}
+{/* verify-reset */}
+
+行があるかどうか分からないことがあります。`INSERT ... ON DUPLICATE KEY UPDATE`
+は、行がなければ書き込み、あれば変更します。1 つの文で、事前の確認なしにです。
+これは、あらゆる「この設定を保存する」と、増やす前に作成しなければならない
+あらゆるカウンターの背後にある文です。
+
+これらの例は、[INSERT](/ja/tutorial/insert) の `sakila_practice` データベースを
+使います。始める前にそこにあるセットアップのブロックをもう一度実行し、次に
+`mysql -u root -p sakila_practice` でクライアントを開いてください。
+
+## 仕組み {#how-it-works}
+
+```sql
+INSERT INTO TABLE_NAME (COLUMN_LIST) VALUES (VALUE_LIST) AS ROW_ALIAS
+ON DUPLICATE KEY UPDATE COLUMN_NAME = ROW_ALIAS.COLUMN_NAME;
+```
+
+`TABLE_NAME` をテーブルに、`COLUMN_LIST` と `VALUE_LIST` を通常の挿入と同じ
+列と値に、`ROW_ALIAS` を提示する行の名前に、`COLUMN_NAME` を行が既にあるときに
+変更する列に置き換えます。
+
+`ON DUPLICATE KEY UPDATE` 句は、挿入が `PRIMARY KEY` または `UNIQUE` インデックス
+に違反する場合にだけ実行されます。エイリアスは挿入しようとした行の名前なので、
+`ROW_ALIAS.COLUMN_NAME` は提示した値であり、修飾なしの列名は既に保存されて
+いる値です。
+
+## 例 {#examples}
+
+### 1) これが避ける衝突 {#1-the-collision-this-avoids}
+
+`rating_count` は `rating` を主キーとして持ちます。行を書き込みます。
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 178);
+```
+
+```text
+Query OK, 1 row affected (0.00 sec)
+```
+
+新しい件数でもう一度書き込むと、挿入は失敗します。
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 999);
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'G' for key 'rating_count.PRIMARY'
+```
+
+### 2) 挿入するか、邪魔になっているものを更新する {#2-insert-or-update-what-is-in-the-way}
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 179) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 2 rows affected (0.00 sec)
+```
+
+```sql
+SELECT * FROM rating_count;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   179 |
++--------+-------+
+1 row in set (0.00 sec)
+```
+
+保存されている行は 1 つなのに、文は `2 rows affected` と言います。この数は、
+文がどちらの分岐を取ったかを伝える方法です。行を挿入したら 1、行を更新したら
+2、更新が値を既に正しいと判断したら 0 です。
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 179) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 0 rows affected (0.00 sec)
+```
+
+行は見つかり、既に 179 を保持していたため、書き込むものはありませんでした。
+影響を受けた行数を、テーブル内の行数として読んではいけません。
+
+### 3) 存在しない行に対する同じ文 {#3-the-same-statement-on-a-row-that-is-not-there}
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('R', 195) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 1 row affected (0.00 sec)
+```
+
+```sql
+SELECT * FROM rating_count ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   179 |
+| R      |   195 |
++--------+-------+
+2 rows in set (0.00 sec)
+```
+
+`1 row affected` は挿入の分岐です。文について変わったのは値だけで、それが
+この文の要点です。呼び出し側は行があるかどうかを知る必要がありません。
+
+## 集計全体を更新する {#refreshing-a-whole-summary}
+
+行はクエリから来ることもでき、それが集計テーブルを 1 つの文で最新にする方法
+です。そこではエイリアス形式は許可されません。
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT rating, COUNT(*) FROM sakila.film GROUP BY rating
+AS new ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'AS new ON DUPLICATE KEY UPDATE films = new.films' at line 3
+```
+
+代わりに、クエリを[派生テーブル](/ja/tutorial/derived-tables)で包んでクエリ
+自体にエイリアスを与え、提示する値をそこから読みます。
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT r, c FROM (SELECT rating AS r, COUNT(*) AS c FROM sakila.film GROUP BY rating) AS new
+ON DUPLICATE KEY UPDATE films = new.c;
+```
+
+```text
+Query OK, 5 rows affected (0.01 sec)
+Records: 5  Duplicates: 1  Warnings: 0
+```
+
+```sql
+SELECT * FROM rating_count ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| NC-17  |   210 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+`Duplicates: 1` は `G` の行で、179 として保存されていたものが今は 178 です。
+3 つの新しいレーティングが、影響を受けた 5 行のうち 3 行を占め、その 1 つの
+更新が残りの 2 行を占めます。`R` は既に 195 を保持していたため、まったく
+数えられていません。
+
+## 古いコードはエイリアスの代わりに VALUES() を使う {#older-code-uses-values-instead-of-an-alias}
+
+古い文は、提示された値をエイリアスの代わりに `VALUES(films)` で読みます。
+その形式はまだ動作しますが、警告を出します。
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 178)
+ON DUPLICATE KEY UPDATE films = VALUES(films);
+SHOW WARNINGS\G
+```
+
+```text
+Query OK, 0 rows affected, 1 warning (0.00 sec)
+
+*************************** 1. row ***************************
+  Level: Warning
+   Code: 1287
+Message: 'VALUES function' is deprecated and will be removed in a future release. Please use an alias (INSERT INTO ... VALUES (...) AS alias) and replace VALUES(col) in the ON DUPLICATE KEY UPDATE clause with alias.col instead
+1 row in set (0.00 sec)
+```
+
+`\G` はセミコロンと同じように文を終え、1 行に 1 列ずつ表示します。これは、
+表には幅が広すぎるメッセージを読む方法です。新しい文はエイリアスで書き、以前に
+書かれたコードでは `VALUES()` に出会うと考えてください。
+
+## まとめ {#summary}
+
+- 行があるかもしれないしないかもしれないときは `INSERT ... ON DUPLICATE KEY UPDATE` を使います。
+- この句は `PRIMARY KEY` または `UNIQUE` の衝突のときにだけ実行されると考えてください。
+- 影響を受けた行数は、挿入なら 1、更新なら 2、変更なしなら 0 として読みます。
+- 提示する行に `AS alias` で名前を付け、その値を `alias.column` として読みます。
+- 行が `SELECT` から来るときは、クエリを派生テーブルで包みます。
+- `VALUES(col)` をエイリアス形式に置き換えます。それが警告 1287 の求めるものです。
+
+## 関連項目 {#see-also}
+
+- [INSERT](/ja/tutorial/insert) — 基本の形と `ERROR 1062`
+- [INSERT SELECT](/ja/tutorial/insert-select) — クエリからの行
+- [UPDATE](/ja/tutorial/update) — あると分かっている行の変更
+- [MySQL の UPSERT](/ja/guides/upsert) — REPLACE、INSERT IGNORE、およびどれを使うか

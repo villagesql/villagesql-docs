@@ -1,0 +1,85 @@
+---
+title: "MySQL の utf8mb4: 絵文字と完全な Unicode の保存"
+sidebarTitle: "utf8mb4 と絵文字"
+description: "MySQL の utf8 文字セットが絵文字を拒否する理由、テーブルを utf8mb4 に安全に変換する方法、そしてかつて変換を失敗させていたインデックス長の制限。"
+keywords: "mysql utf8mb4, mysql emoji, incorrect string value mysql, convert utf8 to utf8mb4, utf8mb4 vs utf8, mysql unicode"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL の `utf8` という名前の文字セットは UTF-8 ではありません。それは絵文字以前の時代に凍結された 1 文字あたり 3 バイトのサブセット(`utf8mb3`)で、4 バイトの文字 — 絵文字、多くの CJK 表意文字、数学記号 — はどれも保存に失敗します。`utf8mb4` が本物の UTF-8 です。MySQL 8.0 以降では新しいテーブルのデフォルトですが、古いバージョンで作成されたテーブルや、DDL に明示的な `utf8` を持つテーブルには、まだこの罠が残っています。
+
+## 失敗 {#the-failure}
+
+```sql
+CREATE TABLE notes_mb3 (
+  body VARCHAR(100)
+) CHARACTER SET utf8mb3;
+
+INSERT INTO notes_mb3 (body) VALUES ('launch day 🚀');
+```
+
+```text
+ERROR 1366 (HY000): Incorrect string value: '\xF0\x9F\x9A\x80' for column 'body' at row 1
+```
+
+`\xF0\x9F\x9A\x80` はロケットの絵文字の 4 バイトです。厳格な SQL モードがオフの場合、これは代わりに警告として現れ、問題の文字は黙って `?` に置き換えられ、文字列の残りは保持されます。こちらのほうが悪いです。数週間後に、データから気づくことになります。
+
+## 変換が必要なものを見つける {#find-what-needs-converting}
+
+どのテーブルと列がまだ 3 バイトの utf8 を使っているか、メタデータに問い合わせます。
+
+```sql
+SELECT table_schema, table_name, column_name, character_set_name
+FROM information_schema.columns
+WHERE character_set_name = 'utf8mb3'
+  AND table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys');
+```
+
+スキーマとテーブルのデフォルトも確認してください。そうしないと、新しい列が最初から間違った状態で生まれます。
+
+```sql
+SELECT schema_name, default_character_set_name
+FROM information_schema.schemata;
+```
+
+## 変換 {#convert}
+
+`CONVERT TO CHARACTER SET` はテーブルを書き換え、列の定義と保存されたデータの両方を変換します。
+
+```sql
+ALTER TABLE notes_mb3 CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+次に、将来のオブジェクトが正しい文字セットを継承するように、デフォルトを修正します。
+
+```sql
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+大きなテーブルではこれは完全な書き換えです。他のブロックする `ALTER` と同じように扱い、通常のオンラインマイグレーションツールで実行してください。[スキーマ移行](/ja/guides/schema-migrations)を参照してください。
+
+変換の前に確認すべきことが 2 つあります。
+
+- **インデックス長。** `VARCHAR(255)` の一意インデックスは utf8mb3 では 765 バイトを必要としましたが、utf8mb4 では 1,020 バイトです。現代の InnoDB のデフォルト(`DYNAMIC` 行フォーマット)は 3,072 バイトを許可するので、これが主に問題になるのは、非常に古いサーバーから `REDUNDANT` または `COMPACT` 行フォーマットのまま引き継がれたテーブルです。`ALTER` が最大キー長のエラーで失敗する場合は、まずテーブルの行フォーマットを確認してください。
+- **接続の文字セット。** ストレージは経路の半分にすぎません。クライアント接続が `utf8mb3` をネゴシエートすると、列がそれを保持できても、絵文字は転送中に失われます。セッションが実際に何を使っているかを確認してください。
+
+```sql
+SHOW VARIABLES LIKE 'character_set_c%';
+```
+
+`character_set_client` と `character_set_connection` の両方が `utf8mb4` になっているのが望ましい状態です。現代のほとんどのドライバーはデフォルトでそうしますが、古い JDBC や PHP の設定は `utf8` に固定しているかもしれません。
+
+## 照合順序について簡単に {#collation-briefly}
+
+文字セットはバイトが何を意味するか、照合順序はそれらをどう比較するかです。MySQL 8.x の utf8mb4 では、`utf8mb4_0900_ai_ci` がデフォルトであり、一般的に正しい答えです。アクセントを区別せず、大文字と小文字を区別せず、Unicode 9.0 の正しい順序付けを行います。文字列列で結合されるテーブル間で照合順序が混在すると、変換が強制され、インデックスがスキップされることがあるので、1 つを選んでどこでも使ってください。[文字セットと照合順序](/ja/guides/character-sets)が比較ルールを詳しく扱っています。
+
+## 関連項目 {#see-also}
+
+- [文字セットと照合順序](/ja/guides/character-sets) — このガイドがその特殊なケースにあたる、より広い文字セットのモデル
+- [スキーマ移行](/ja/guides/schema-migrations) — 変換の ALTER を本番で安全に実行する
+- [データ型の選択](/ja/guides/choosing-data-types) — すべての文字が 4 バイトになりうるときの列のサイズ決め
+- [ORM で MySQL を使う: Django、Rails、Prisma](/ja/guides/mysql-with-orms) — この文字セットを使う ORM の接続設定
+- [MySQL の大文字と小文字の区別](/ja/tutorial/case-sensitivity) — この文字セットに付いてくる照合順序の読み方

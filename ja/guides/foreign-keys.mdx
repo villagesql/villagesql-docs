@@ -1,0 +1,135 @@
+---
+title: "MySQL の外部キー"
+sidebarTitle: "外部キーの使用"
+description: "MySQL の外部キーの仕組み、定義方法、CASCADE と RESTRICT のオプション、および使用前に理解しておくべきパフォーマンスのトレードオフ。"
+keywords: "mysql foreign key, mysql foreign key constraint, mysql on delete cascade, mysql referential integrity, mysql innodb foreign key, mysql foreign key performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+外部キーは、2 つのテーブル間の関係を強制する制約です。あるテーブルの列の値が別のテーブルに存在することを保証し、参照先の行が削除または更新されたときに何が起こるかを定義します。
+
+## 外部キーの定義 {#defining-a-foreign-key}
+
+```sql
+CREATE TABLE customers (
+    id   INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    CONSTRAINT fk_orders_customer
+        FOREIGN KEY (customer_id) REFERENCES customers (id)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE
+);
+```
+
+制約名（`fk_orders_customer`）は省略可能ですが、付ける価値があります。エラーメッセージに表示され、`ALTER TABLE` 操作が容易になります。
+
+外部キーには InnoDB が必要です。MyISAM は外部キーを黙って無視します。
+
+## 参照アクション {#referential-actions}
+
+`ON DELETE` 句と `ON UPDATE` 句は、参照先の親行が削除または更新されたときに子行に何が起こるかを定義します。
+
+| アクション | DELETE 時 | UPDATE 時 |
+|:-------|:----------|:----------|
+| `RESTRICT` | 子行が存在する場合は削除をブロック | 子行が存在する場合は更新をブロック |
+| `NO ACTION` | `RESTRICT` と同じ（デフォルト） | `RESTRICT` と同じ |
+| `CASCADE` | 子行を自動的に削除 | 子の FK 値を一致するように更新 |
+| `SET NULL` | 子の FK 列を NULL に設定 | 子の FK 列を NULL に設定 |
+
+`SET DEFAULT` は SQL 標準の一部です。InnoDB はこの構文を問題なく受け入れますが、実装していません。実行時には `RESTRICT` とまったく同じように動作します（ERROR 1451）。使用しないでください。名前が示すのとは逆のことを黙って行います。
+
+**DELETE 時の `CASCADE`** は便利ですが危険です。顧客を削除すると、その顧客のすべての注文が自動的に削除されます。エラーも警告もありません。依存する行が親なしでは本当に意味を持たない場合（たとえば、注文のない注文明細行）にのみ使用してください。
+
+**`RESTRICT`** はより安全なデフォルトです。アプリケーションに削除を明示的に処理させるため、意図しないデータ損失を防ぎます。
+
+## 必須のインデックス {#the-required-index}
+
+MySQL は外部キー列にインデックスを必要とします。インデックスが存在しない場合、InnoDB が自動的に作成します。
+
+```sql
+-- InnoDB creates this index automatically for the FK above
+-- But you can create it explicitly for control over the name
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+```
+
+このインデックスが外部キーのチェックを高速にします。インデックスがなければ、すべての INSERT や DELETE でフルテーブルスキャンが必要になります。また、FK 列に対する JOIN クエリも高速化します。そのため、明示的な FK 制約を使用しない場合でも、一対多の関係では常に外部キー列にインデックスを作成すべきです。
+
+## 外部キーチェックの確認と無効化 {#checking-and-disabling-foreign-key-checks}
+
+一括データロードの間、外部キーチェックはすべての挿入を遅くします。一時的に無効にします。
+
+```sql
+SET FOREIGN_KEY_CHECKS = 0;
+
+-- Bulk insert or LOAD DATA here
+
+SET FOREIGN_KEY_CHECKS = 1;
+```
+
+**重要**: チェックを無効にすると、孤立した行を挿入できるようになります。チェックを再度有効にしても、既存のデータが遡って検証されることはありません。チェックを無効にした状態でデータをロードした場合は、チェックを再度有効にする前に、参照整合性を手動で検証してください。
+
+## 既存の外部キーの表示 {#viewing-existing-foreign-keys}
+
+```sql
+-- List all foreign keys in a database
+SELECT
+    TABLE_NAME,
+    CONSTRAINT_NAME,
+    COLUMN_NAME,
+    REFERENCED_TABLE_NAME,
+    REFERENCED_COLUMN_NAME
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
+ORDER BY TABLE_NAME;
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 外部キーはパフォーマンスを低下させますか？
+
+子テーブルへのすべての INSERT は、親テーブルに対するチェック（インデックス検索）を引き起こします。親テーブルからのすべての DELETE は、子行の有無のチェックを引き起こします。高スループットのテーブルでは、これらのチェックが積み重なります。書き込みスループットを優先するチームは、代わりにアプリケーション層で参照整合性を強制することがよくあります。どちらの選択も常に正しいわけではありません。トレードオフは、データベースレベルの安全性と書き込みパフォーマンスの間にあります。
+
+#### 既存のテーブルに外部キーを追加できますか？
+
+はい、`ALTER TABLE` で追加できます。
+
+```sql
+ALTER TABLE orders
+    ADD CONSTRAINT fk_orders_customer
+    FOREIGN KEY (customer_id) REFERENCES customers (id)
+    ON DELETE RESTRICT;
+```
+
+`orders` の既存の行に、`customers` に存在しない `customer_id` 値がある場合、`ALTER TABLE` は失敗します。先にデータを修正してください。
+
+#### MySQL が外部キーのインデックスを自動的に作成するのはなぜですか？
+
+InnoDB は、親行が削除または更新されたときに子行を素早くチェックする必要があります。FK 列にインデックスがなければ、そのチェックには子テーブルのフルテーブルスキャンが必要です。自動作成されるインデックスがこれを防ぎます。先に（意味のある名前で）独自のインデックスを作成しておけば、InnoDB は 2 つ目を作成せずにそれを使用します。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 1452: Cannot add or update a child row` | FK 値が親テーブルに存在しません。先に親行を挿入します |
+| `ERROR 1451: Cannot delete or update a parent row` | 子行が存在し、アクションが `RESTRICT` です。先に子を削除するか、`CASCADE` を使用します |
+| FK の追加時に `ALTER TABLE` が失敗する | 既存のデータに孤立した行があります。LEFT JOIN によるチェックで見つけて修正します |
+| FK 列への INSERT が遅い | FK 列にインデックスがありません。InnoDB が自動作成するはずですが、`SHOW INDEX` で確認します |
+| `SET FOREIGN_KEY_CHECKS = 0` が持続しない | これはセッション変数です。一括ロードの前に同じセッションで再度設定します |
+
+## 関連項目 {#see-also}
+
+- [MySQL における正規化](/ja/guides/normalization) — 外部キーが強制するスキーマ設計
+- [MySQL のトランザクション](/ja/guides/transactions) — 外部キーのチェックはトランザクション内で行われます
+- [MySQL の JOIN のパフォーマンスとよくある間違い](/ja/guides/joins) — 外部キーが定義する関係へのインデックス作成
+- [MySQL のソフトデリート](/ja/guides/soft-deletes) — カスケードがソフトデリートを無視する理由
+- [MySQL の INNER JOIN](/ja/tutorial/inner-join) — これらの関係をまたいで問い合わせるチュートリアルのレッスン
+- [MySQL の結合の仕組み](/ja/tutorial/joins) — そもそもデータが複数のテーブルに分かれている理由

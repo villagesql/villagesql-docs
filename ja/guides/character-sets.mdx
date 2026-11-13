@@ -1,0 +1,195 @@
+---
+title: "MySQL の文字セットと照合順序"
+sidebarTitle: "文字セットの選択"
+description: "MySQL の文字セットと照合順序の仕組み: utf8mb4 と utf8 の違い、照合順序の選択、データベースレベルと列レベルでの文字セットの設定、ソートの動作、および文字セットの問題の修正。"
+keywords: "mysql character set, mysql collation, mysql utf8mb4, mysql utf8 vs utf8mb4, mysql charset, mysql unicode, mysql collation comparison, mysql set charset, mysql character encoding"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL の文字セットは、文字列がどのように格納されるか（どのバイトがどの文字を表すか）を制御します。照合順序は、文字列がどのように比較され、ソートされるかを制御します。最初にこれらを正しく設定しておけば、後から修正するのが大変なデータの破損や誤ったソートを避けられます。
+
+## utf8mb4 — 正しいデフォルト {#utf8mb4--the-right-default}
+
+常に `utf8mb4` を使ってください。MySQL の `utf8`（`mb4` なし）は 3 バイトのエンコーディングで、4 バイトの Unicode 文字を格納できません。これには絵文字、多くの漢字、および各種の記号が含まれます。`utf8mb4` は完全な UTF-8 エンコーディングです。
+
+```sql
+-- Verify your database is using utf8mb4
+SHOW CREATE DATABASE myapp;
+-- Should show: DEFAULT CHARACTER SET utf8mb4
+```
+
+`utf8` を使っているレガシーなデータベースの場合、`utf8mb4` への移行には、データベース、テーブル、および列の変換が必要です。
+
+### 文字セットのクイックリファレンス {#character-set-quick-reference}
+
+| 文字セット | 使う場面 | 避ける場面 | 誤った場合の移行コスト |
+|:-------------|:---------|:-----------|:------------------------|
+| `utf8mb4` | すべての新しいスキーマ — 絵文字と現代の CJK を含むすべての Unicode を扱える | 新しい作業では決して避けない | 該当なし — これが正しいデフォルト |
+| `utf8`（レガシーの 3 バイト） | 決して使わない — 残す唯一の理由は移行ウィンドウを確保できない場合のみ | 絵文字、補助 CJK 文字、またはあらゆる 4 バイト Unicode の格納 | 中 — `ALTER TABLE … CONVERT TO CHARACTER SET utf8mb4`。影響を受けるすべてのテーブルを再構築する |
+| `latin1` | レガシーなスキーマ内の 1 バイトの西ヨーロッパ言語テキスト。ASCII のみのデータでは `utf8mb4` よりわずかに小さいストレージ | ユーザー生成コンテンツ、多言語データ、または Web に関わるすべてのもの | 高 — バイナリセーフな変換は自動では行われない。latin1 の範囲外のデータは静かに破損する |
+| `binary` / `BLOB` | 生のバイト — ファイルの内容、暗号学的ハッシュ、パックされたバイナリ形式 | 検索、ソート、または表示するテキスト | 低 — `BINARY` 列には文字セットのセマンティクスがない。テキストの文字セットへの変換にはアプリケーションレベルのデコードが必要 |
+
+コストの列は、誤った選択を後から修正するのに必要な作業についてであり、文字セット自体のパフォーマンスコストではありません。`latin1` は罠です。どんなバイト値もエラーなく受け入れるため、不正なデータが静かに入り込み、表示または変換しようとしたときに初めて表面化します。
+
+## 照合順序 {#collations}
+
+照合順序は、ソート順と比較の動作を決定します。一般的な選択肢は次のとおりです。
+
+| 照合順序 | ソートの動作 | 大文字小文字を区別 | アクセントを区別 |
+|:----------|:-------------|:--------------|:----------------|
+| `utf8mb4_general_ci` | 近似的な Unicode 順 | いいえ | いいえ |
+| `utf8mb4_unicode_ci` | 完全な Unicode アルゴリズム | いいえ | いいえ |
+| `utf8mb4_0900_ai_ci` | Unicode 9.0、最も正確 | いいえ | いいえ |
+| `utf8mb4_bin` | バイナリ（バイト単位） | はい | はい |
+| `utf8mb4_0900_as_cs` | Unicode 9.0 | はい | はい |
+
+`utf8mb4_0900_ai_ci` はデフォルトの照合順序であり、汎用的には最良の選択です。Unicode を正しく扱い、大文字小文字を区別せず（`ci`）、アクセントも区別しません（`ai`）。`utf8mb4_bin` は、バイト単位の正確な一致が必要な場合にだけ使ってください。
+
+`ci` = 大文字小文字を区別しない、`cs` = 大文字小文字を区別する、`ai` = アクセントを区別しない、`as` = アクセントを区別する。
+
+## 文字セットの設定 {#setting-character-sets}
+
+**データベース作成時:**
+```sql
+CREATE DATABASE myapp
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_0900_ai_ci;
+```
+
+**テーブル作成時:**
+```sql
+CREATE TABLE users (
+    id   INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+**列レベル（テーブルのデフォルトを上書き）:**
+```sql
+CREATE TABLE products (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(100),
+    description TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+);
+```
+
+列レベルの文字セットは、テーブルの他の列が大文字小文字を区別しない一方で、1 つの列だけ大文字小文字を区別する一致が必要な場合に役立ちます。
+
+**列の文字セットを変更する:**
+```sql
+ALTER TABLE users
+MODIFY name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+**テーブル全体を変換する:**
+```sql
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+`CONVERT TO` は 1 つのステートメントですべての列を変更します。テーブルを再構築するため、テーブルのサイズに比例した時間がかかります。
+
+## 文字セットの確認 {#checking-character-sets}
+
+```sql
+-- Database level
+SHOW CREATE DATABASE myapp;
+
+-- Table and column level
+SHOW CREATE TABLE users;
+
+-- Connection level
+SHOW VARIABLES LIKE 'character_set%';
+SHOW VARIABLES LIKE 'collation%';
+```
+
+`SHOW CREATE TABLE` の出力で文字セットが表示されない列は、テーブルのデフォルトを継承しています。
+
+## 接続の文字セット {#connection-character-set}
+
+接続の文字セットは、MySQL がクライアントから期待し、文字列リテラルに使うエンコーディングを制御します。常に明示的に設定してください。
+
+```sql
+SET NAMES utf8mb4;
+-- equivalent to:
+SET character_set_client = utf8mb4;
+SET character_set_results = utf8mb4;
+SET character_set_connection = utf8mb4;
+```
+
+ほとんどのドライバーは、接続文字列で文字セットを設定すると、これを自動的に行います。接続のデフォルトは `utf8mb4` であるため、明示的な上書きが必要になることはまれです。
+
+## 照合順序がクエリに与える影響 {#collation-effects-on-queries}
+
+照合順序は `WHERE`、`ORDER BY`、および一意性に影響します。
+
+```sql
+-- utf8mb4_0900_ai_ci: these three are equal
+SELECT * FROM users WHERE name = 'alice';  -- matches Alice, ALICE, alice
+
+-- utf8mb4_bin: exact match only
+SELECT * FROM users WHERE name COLLATE utf8mb4_bin = 'alice';  -- only 'alice'
+```
+
+列のデフォルトとは異なる照合順序でソートするには、次のようにします。
+
+```sql
+SELECT name FROM users ORDER BY name COLLATE utf8mb4_unicode_ci;
+```
+
+## utf8 から utf8mb4 への変換 {#converting-from-utf8-to-utf8mb4}
+
+レガシーなデータベースが `utf8`（3 バイト）を使っている場合は、変換します。
+
+```sql
+-- Convert one table
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+-- Update the database default
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+新しい接続のデフォルトを `utf8mb4` にするため、サーバーの構成も更新します。
+
+```ini
+[mysqld]
+character_set_server = utf8mb4
+collation_server = utf8mb4_0900_ai_ci
+
+[client]
+default-character-set = utf8mb4
+```
+
+大きなテーブルの変換には時間がかかり、テーブルが再構築されます。メンテナンスウィンドウ中にスケジュールするか、オンラインスキーマ変更ツールを使ってください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### MySQL の `utf8` が絵文字をサポートしないのはなぜですか? {#why-does-utf8-in-mysql-not-support-emoji}
+
+MySQL の `utf8` は、4 バイトの Unicode 拡張より前に作られた、非標準の 3 バイトの UTF-8 サブセットです。絵文字（および他の多くの現代の Unicode 文字）には 4 バイトが必要です。`utf8mb4` が UTF-8 の正しい完全な実装です。古い `utf8` エイリアスは下位互換性のためだけに存在します。新しいスキーマでは決して使わないでください。
+
+#### 照合順序の変更は既存のデータに影響しますか? {#does-changing-collation-affect-existing-data}
+
+照合順序を変更しても、格納されたバイトは変わりません。変わるのは、それらのバイトがどのように比較され、ソートされるかです。ただし、ユニークインデックスは照合順序を使って強制されるため、`_bin` から `_ci` に変更すると、先に解決しなければならない衝突（`Alice` と `alice` が等しくなる）が明らかになることがあります。
+
+#### どの照合順序を使うべきですか? {#which-collation-should-i-use}
+
+ほとんどの用途では `utf8mb4_0900_ai_ci` です。デフォルトの照合順序であり、Unicode をうまく扱います。`utf8mb4_bin` は、バイト単位の正確な一致が必要な場合にだけ使ってください。新しいプロジェクトでは `utf8mb4_general_ci` を避けてください。`_0900_ai_ci` より古く、一部の Unicode のエッジケースを正しく扱えません。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| 絵文字が `????` として格納される | 列または接続が `utf8`（3 バイト）を使っています。`utf8mb4` に変換します |
+| `Incorrect string value` エラー | 列の文字セットでエンコードできない文字を挿入しています。列を `utf8mb4` に変換します |
+| ソート順が正しくない | 照合順序の不一致です。`SHOW CREATE TABLE` を確認し、`ORDER BY` に明示的な `COLLATE` を設定します |
+| 大文字小文字を区別する比較が機能しない | 列が `_ci` の照合順序を使っています。WHERE 句で `COLLATE utf8mb4_bin` を使うか、列の照合順序を変更します |
+| `Illegal mix of collations` エラー | 異なる照合順序を持つ列またはリテラルを比較しています。`COLLATE` を追加して一致させるか、列を変換します |
+
+## 関連項目 {#see-also}
+
+- [MySQL の文字列関数](/ja/guides/string-functions) — 動作が照合順序に依存する文字列関数
+- [MySQL の utf8mb4: 絵文字と完全な Unicode の格納](/ja/guides/utf8mb4) — utf8 と utf8mb4 の罠と絵文字の格納
+- [MySQL の大文字小文字の区別](/ja/tutorial/case-sensitivity) — 照合順序が比較について決めること

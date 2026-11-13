@@ -1,0 +1,156 @@
+---
+title: "MySQL からのアップグレード"
+sidebarTitle: "VillageSQL へのアップグレード"
+description: "アップストリームの MySQL から VillageSQL へアップグレードする手順ガイド。"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+VillageSQL Server は MySQL のドロップイン代替です。サードパーティのプラグインがない単一インスタンスの素の MySQL 8.4 インストールでは、VillageSQL への移行は機能的にマイナーバージョンのアップグレード(例: 8.4.5 から 8.4.6)と同じで、既存のデータは保持されます。非標準のプラグインに依存するものは、先にコピーでテストしてください。
+
+## 前提条件 {#prerequisites}
+
+- **VillageSQL のバイナリ**: VillageSQL のバイナリ(ソースからコンパイルしたもの、またはダウンロードしたもの)を用意してください。
+- **MySQL のバージョン**: VillageSQL は MySQL 8.4 LTS に基づいています。MySQL 8.4 からのアップグレードがサポートされる経路です。
+
+<Warning>
+  **アップグレードを実行する前に、必ずデータをバックアップしてください。**
+  このプロセスは安全になるように設計されていますが、データベースのアップグレードには常にリスクが伴います。
+</Warning>
+
+## ステップ 1: データのバックアップ {#step-1-backup-your-data}
+
+システムファイルやサービスに触れる前に、データベースの完全なバックアップを作成します。
+
+### オプション A: 論理バックアップ(mysqldump) {#option-a-logical-backup-mysqldump}
+すべてのデータベースの SQL ダンプを作成します。これが最も安全で移植性の高い方法です。
+
+```bash
+mysqldump -u root -p --all-databases --events --routines --triggers > full_backup.sql
+```
+
+### オプション B: 物理バックアップ(データディレクトリ) {#option-b-physical-backup-data-directory}
+データセットが大きい場合は、サーバーを停止してデータディレクトリをコピーします。
+
+```bash
+# Stop the server first (see Step 2)
+cp -r /var/lib/mysql /var/lib/mysql-backup
+```
+
+## ステップ 2: MySQL サーバーの停止 {#step-2-stop-the-mysql-server}
+
+データファイルのロックを解放するために、現在実行中の MySQL サーバーインスタンスを停止します。
+
+**Systemd を使う場合(Linux):**
+```bash
+sudo systemctl stop mysql
+# OR
+sudo systemctl stop mysqld
+```
+
+**SysV Init を使う場合:**
+```bash
+sudo service mysql stop
+```
+
+**手動インストールの場合:**
+```bash
+mysqladmin -u root -p shutdown
+```
+
+## ステップ 3: バイナリの置き換え {#step-3-replace-binaries}
+
+アップグレードの中核は、実行可能ファイル(`mysqld`、`mysql` など)をアップストリームの MySQL 版から VillageSQL 版に切り替えることです。
+
+### 方法 A: インストールディレクトリの入れ替え(推奨) {#method-a-swapping-installation-directories-recommended}
+
+MySQL を tarball でインストールした場合(例: `/usr/local/mysql` へ)、最もきれいな方法は、VillageSQL をその隣にインストールしてシンボリックリンクを切り替えることです。
+
+1.  **VillageSQL を展開/インストール**して、新しいディレクトリ(例: `/usr/local/villagesql-8.4`)に置きます。
+2.  **シンボリックリンクを更新**します。
+    ```bash
+    # Remove link to old MySQL
+    sudo unlink /usr/local/mysql
+
+    # Link to VillageSQL
+    sudo ln -s /usr/local/villagesql-8.4 /usr/local/mysql
+    ```
+3.  **権限を確認**します。データベースを実行するユーザー(通常は `mysql`)が新しいバイナリの実行権限を持っていることを確認します。
+
+### 方法 B: バイナリの上書き {#method-b-overwriting-binaries}
+
+VillageSQL をソースからコンパイルし、システムのインストール(例: `/usr/bin` または `/usr/local/bin`)を上書きしたい場合は次のようにします。
+
+```bash
+# Assuming you are in the VillageSQL build directory
+sudo make install
+```
+
+<Note>
+  MySQL をパッケージマネージャー(`apt`、`yum`)でインストールした場合、バイナリを手動で上書きするのは危険です。パッケージマネージャーが更新時にそれらを元に戻してしまう可能性があるからです。`mysql-server` パッケージをアンインストールする(データファイルは残します!)か、利用できるなら `update-alternatives` を使うことをお勧めします。
+</Note>
+
+## ステップ 4: 設定の確認 {#step-4-configuration-check}
+
+設定ファイル(通常は `/etc/my.cnf` または `/etc/mysql/my.cnf`)が既存のデータディレクトリを指していることを確認します。
+
+```ini
+[mysqld]
+datadir=/var/lib/mysql  # Should point to your EXISTING data
+socket=/var/run/mysqld/mysqld.sock
+```
+
+VillageSQL は標準の MySQL 設定オプションを使うので、既存の `my.cnf` は変更なしで動作するはずです。
+
+## ステップ 5: VillageSQL の起動 {#step-5-start-villagesql}
+
+サービスマネージャーを使うか、手動でサーバーを起動します。
+
+**Systemd を使う場合:**
+```bash
+sudo systemctl start mysql
+```
+
+**手動起動:**
+```bash
+/usr/local/mysql/bin/mysqld_safe --user=mysql &
+```
+
+### 自動アップグレード {#automatic-upgrade}
+起動時に、VillageSQL はデータファイルが古いバージョンのものかどうかを自動的に検出し、システムテーブルに必要なアップグレードを実行します。
+
+エラーログ(通常は `/var/log/mysql/error.log` または `datadir` の中)を確認して、アップグレードが正常に完了したことを確認します。次の行を探してください。
+`[System] [MY-013381] [Server] Server upgrade from '...' to '...' completed.`
+
+## ステップ 6: インストールの確認 {#step-6-verify-installation}
+
+サーバーに接続し、VillageSQL が実行されていることを確認します。
+
+```bash
+mysql -u root -p
+```
+
+次のクエリを実行します。
+
+```sql
+SELECT @@version, @@version_comment;
+```
+
+これでデータが無傷であることを確認し、`INSTALL EXTENSION` のような VillageSQL 独自の機能を使い始められます。
+
+## トラブルシューティング {#troubleshooting}
+
+-   **"Data Dictionary Upgrade Failed"**: サーバーが起動を拒否する場合、ダウングレード(例: 8.4 から 8.0)を試みているか、データファイルが破損している可能性があります。エラーログを確認してください。
+-   **権限エラー**: `mysql` OS ユーザーが `datadir` と新しい VillageSQL インストールディレクトリを所有していることを確認してください。
+    ```bash
+    sudo chown -R mysql:mysql /var/lib/mysql
+    ```
+
+## 関連項目 {#see-also}
+
+- [MySQL のスキーマ移行](/ja/guides/schema-migrations) — アップグレード後に安全な DDL 変更を実行する
+- [MySQL のバックアップ戦略](/ja/guides/backup-strategies) — アップグレード前にバックアップする
+- [Docker 上の MySQL](/ja/guides/mysql-on-docker) — 代わりにコンテナで MySQL または VillageSQL を実行する
+- [サポート終了後の MySQL 8.0 から 8.4 へのアップグレード](/ja/guides/mysql-80-eol-upgrade) — まだ 8.0 の場合は、先に 8.4 に上げる

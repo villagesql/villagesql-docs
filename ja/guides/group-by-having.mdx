@@ -1,0 +1,239 @@
+---
+title: "MySQL の GROUP BY のパフォーマンスと大規模なグループ化"
+sidebarTitle: "GROUP BY のパフォーマンス"
+description: "MySQL の GROUP BY が一時テーブルを作る理由、インデックスがそれを取り除く仕組み、同じフィルタを WHERE と HAVING に置いたときのコストの違い、および ANY_VALUE が安全な場合。"
+keywords: "mysql group by performance, mysql group by slow, mysql group by using temporary, mysql group by index, mysql any_value, mysql group by temporary table, mysql tmp_table_size group by"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+テストテーブルではミリ秒で返る `GROUP BY` が、実際のテーブルでは数分かかることが
+あります。クエリの文面は同じです。違いは、サーバーがインデックスをグループ順に
+たどれるか、先に一時テーブルを作らなければならないかにあります。このガイドは
+その違いと、どちらになるかを決める選択について説明します。
+
+句そのものを学んでいる場合は、チュートリアルがサンプルデータベースを使って
+教えています。[集約関数](/ja/tutorial/aggregate-functions)、
+[GROUP BY](/ja/tutorial/group-by)、[HAVING](/ja/tutorial/having)、
+[COUNT DISTINCT](/ja/tutorial/count-distinct)、
+[GROUP_CONCAT](/ja/tutorial/group-concat)、および [WITH ROLLUP](/ja/tutorial/with-rollup) です。
+
+このページのすべてのクエリとプランは、Sakila サンプルデータベースに対する 1 台の
+サーバーから取得したものです。コストと行数の見積もりは InnoDB のサンプリング
+統計と `optimizer_switch` の設定に由来するため、数値は環境によって異なります。
+各プランの形が、そのまま当てはまる部分です。
+
+## インデックスのないグループ化は一時テーブルを作る {#grouping-without-an-index-builds-a-temporary-table}
+
+行をグループ化するには、サーバーは各グループの行を 1 か所に集めなければ
+なりません。グループ化する列にインデックスがない場合、サーバーは一時テーブルを
+作ってそれを行います。
+
+```sql
+EXPLAIN SELECT rating, COUNT(*) FROM film GROUP BY rating\G
+```
+
+```text
+         type: ALL
+possible_keys: NULL
+          key: NULL
+         rows: 1000
+        Extra: Using temporary
+```
+
+`Using temporary` が探すべき行です。1,000 行では何のコストもかかりません。
+このテーブルは収まる間はメモリに保持され、収まらなくなるとディスクに退避
+されます。グループ化したレポートが速くなくなるのはそこです。
+
+そのメモリの上限をどの設定が決めるかは、サーバーが内部一時テーブルに使う
+エンジンによります。何かを変更する前に、自分の設定を確認してください。
+
+```sql
+SELECT @@internal_tmp_mem_storage_engine AS engine,
+       @@temptable_max_ram, @@temptable_max_mmap, @@tmp_table_size;
+```
+
+これらは異なる役割を持ち、`TempTable` ではすべてが適用されます。
+`temptable_max_ram` と `temptable_max_mmap` は、エンジンがすべてのセッションに
+わたって保持できる量の上限です。`tmp_table_size` は個々の内部一時テーブルの
+上限です。1 KB では 1,000 行に対するグループ化クエリで `Created_tmp_disk_tables`
+が 0 から 1 になり、64 MB では同じクエリがメモリ内に収まりました。推測するのでは
+なく、このカウンターを監視してください。
+
+```sql
+SHOW SESSION STATUS LIKE 'Created_tmp_disk_tables';
+```
+
+グループ化する列にインデックスがあると、インデックスがすでにその順序に
+なっているため、この手順は完全になくなります。
+
+```sql
+EXPLAIN SELECT customer_id, COUNT(*) FROM payment GROUP BY customer_id\G
+```
+
+```text
+         type: index
+possible_keys: idx_fk_customer_id
+          key: idx_fk_customer_id
+         rows: 16500
+        Extra: Using index
+```
+
+`Using temporary` も `Using filesort` もありません。サーバーはインデックスを順に
+読み、等しい値の連続ごとに数え、1 行を出力します。`Using index` は、テーブル
+そのものに一度も触れなかったことを意味します。
+
+したがって、遅い `GROUP BY` で最初に確認すべきことは、グループ化した列と同じ
+順序で、その列から始まるインデックスがあるかどうかです。`(a, b)` の複合
+インデックスは `GROUP BY a` と `GROUP BY a, b` に使えます。`GROUP BY b` では、
+サーバーはそれをカバリングインデックスとしてスキャンでき、`type: index` と
+`Using index` として報告されますが、行はグループ順には届かないため、
+`Using temporary` が一緒に戻ってきます。
+
+## WHERE と HAVING はスタイルの選択ではない {#where-and-having-are-not-a-style-choice}
+
+どちらもフィルタを表現できます。しかしコストは異なります。`WHERE` はグループ化の
+前に実行され、`HAVING` はその後に実行されるためです。
+
+グループ化する列そのものに対する条件はどちらの書き方もでき、意味も同じなので、
+公平な比較になります。`WHERE` では、サーバーはまずインデックスの範囲を絞り、
+読んだものだけをグループ化します。
+
+```sql
+EXPLAIN FORMAT=TREE SELECT customer_id, COUNT(*) FROM payment WHERE customer_id <= 100 GROUP BY customer_id\G
+```
+
+```text
+-> Group aggregate: count(0)  (cost=814 rows=599)
+    -> Filter: (payment.customer_id <= 100)  (cost=543 rows=2710)
+        -> Covering index range scan on payment using idx_fk_customer_id over (customer_id <= 100)  (cost=543 rows=2710)
+```
+
+`HAVING` では、同じ制限が届くのが遅すぎて、何も絞り込めません。
+
+```sql
+EXPLAIN FORMAT=TREE SELECT customer_id, COUNT(*) FROM payment GROUP BY customer_id HAVING customer_id <= 100\G
+```
+
+```text
+-> Filter: (payment.customer_id <= 100)  (cost=3324 rows=599)
+    -> Group aggregate: count(0)  (cost=3324 rows=599)
+        -> Covering index scan on payment using idx_fk_customer_id  (cost=1674 rows=16500)
+```
+
+出力される行は同じで、見積もりコストは 4 倍です。`WHERE` 版は見積もりで 2,710 件の
+インデックスエントリを読みます。`HAVING` 版はインデックス全体を読み、その後で
+ほとんどのグループを捨てます。
+
+これらの見積もりは InnoDB のサンプリング統計と `mysql.server_cost` のコスト定数に
+由来するため、数値は環境によって異なります。2 つのプランの形が、そのまま当てはまる
+部分です。
+
+ルールはこうです。行を検査する条件は常に `WHERE` に置きます。`HAVING` は
+グループを検査するものにだけ使います。実際には、集約を含むものすべてです。
+集約を含まない `HAVING` 句は、ほぼ常に置き場所を間違えた `WHERE` 句であり、
+集約を含む `WHERE` は `ERROR 1111 (HY000): Invalid use of group function` に
+なります。
+
+## ONLY_FULL_GROUP_BY と抜け道 {#only_full_group_by-and-the-escape-hatch}
+
+`only_full_group_by` はデフォルトで有効であり、グループ化も集約もされていない列を
+選択するクエリを `ERROR 1055` で拒否します。理由は、そのようなクエリには定義された
+答えがないからです。グループは多くの行を持ち、どれを表示するかを何も指定して
+いません。
+
+`ANY_VALUE()` は、任意の 1 つを受け入れることをサーバーに伝え、クエリは実行
+されます。
+
+```sql
+SELECT rating, ANY_VALUE(title) AS a_title, COUNT(*) AS films
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+ここでは意図的に出力を示していません。どのタイトルが返るかは定義されていない
+ため、このページに印字したどの結果も、再現できない値になるからです。
+
+`ANY_VALUE()` は、列がグループ化列に関数従属しているのにサーバーがそれを証明
+できない場合に使います。これが正当なケースです。グループ内で本当に値が変わる列の
+エラーを黙らせるために使ってはいけません。得られる値は最初のものでも最小のものでも
+なく、頼りにできるものは何もなく、プランが変わると変わることがあります。
+`MIN()` や `MAX()` なら意図を表現でき、コストは同じです。
+
+`only_full_group_by` をグローバルに無効にすると、これらのエラーのすべてが、誰も
+気づかない誤った答えに変わります。これは誤った修正です。
+
+このチェックは、グループ化された**列**の上に組み立てた式を見通すため、
+`SELECT COALESCE(rating, 'unrated') ... GROUP BY rating` は受け入れられます。
+グループ化された**式**の上に組み立てた式は見通しません。
+`DATE_FORMAT(payment_date, '%Y-%m')` でグループ化して
+`COALESCE(DATE_FORMAT(payment_date, '%Y-%m'), 'ALL')` を選択すると、同じ
+`ERROR 1055` が `payment_date` を指して出ます。サーバーは内部の列ではなく 2 つの式を
+比較するためです。これはレポートでよくあるケースであり、回避策は派生テーブルの中で
+グループ化し、その外側で結果を包むことです。
+
+```sql
+SELECT COALESCE(month, 'ALL') AS month, payments
+FROM (SELECT DATE_FORMAT(payment_date, '%Y-%m') AS month, COUNT(*) AS payments
+      FROM payment GROUP BY DATE_FORMAT(payment_date, '%Y-%m')) AS m
+ORDER BY month;
+```
+
+## 一対多の結合を集約する {#aggregating-a-one-to-many-join}
+
+グループ化の前に結合すると行が増えるため、その結果に対する `SUM` は二重に数えます。
+症状は、誰にも説明できない倍率で大きすぎる合計です。
+
+先に結合してから後でグループ化するのではなく、各側をそれぞれのサブクエリで集約し、
+その結果を結合します。
+
+```sql
+SELECT c.last_name, p.payments, r.rentals
+FROM customer AS c
+JOIN (SELECT customer_id, COUNT(*) AS payments FROM payment GROUP BY customer_id) AS p
+  ON p.customer_id = c.customer_id
+JOIN (SELECT customer_id, COUNT(*) AS rentals FROM rental GROUP BY customer_id) AS r
+  ON r.customer_id = c.customer_id
+ORDER BY c.last_name
+LIMIT 5;
+```
+
+各サブクエリの集約は、それが属する行に対して行われます。先に両方のテーブルを
+結合してから後でグループ化すると、支払いがレンタルの数だけ掛け合わされ、両方の
+件数が膨らみます。[MySQL の JOIN のパフォーマンスとよくある間違い](/ja/guides/joins)
+では、この増加そのものを扱っています。
+
+## 行をまとめたくない場合 {#when-you-do-not-want-the-rows-collapsed}
+
+`GROUP BY` は行をグループごとに 1 行に置き換えます。各行の*隣*に集約が欲しい場合、
+ウィンドウ関数は何もまとめずに、そしてたいていは一時テーブルなしでそれを行います。
+
+```sql
+SELECT customer_id, amount, SUM(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM payment;
+```
+
+[MySQL 8.4 のウィンドウ関数](/ja/guides/window-functions)で詳しく説明しています。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 原因と対処 |
+|:--------|:---------|
+| `GROUP BY` が遅い | グループ化列から始まるインデックスがありません。`EXPLAIN` で `Using temporary` を確認します。 |
+| 遅く、ディスクが忙しい | 一時テーブルがメモリの予算を超えて退避しました。まず行を絞り、次に単一テーブルには `tmp_table_size` を、サーバー全体には `temptable_max_ram` を引き上げます。 |
+| `ERROR 1055` | 選択した列がグループ化も集約もされていません。グループ化するか、集約するか、取り除きます。 |
+| `HAVING` のフィルタが遅い | 集約を含んでいないため、`WHERE` に置くべきものです。 |
+| 合計が大きすぎる | 一対多の結合が、グループ化の前に行を増やしました。 |
+| `GROUP_CONCAT` の結果が途中で切れる | `group_concat_max_len` に達しました。これはエラーではなく警告を出します。 |
+| グループが予想外の順序で返る | `GROUP BY` は順序を保証しません。`ORDER BY` を追加します。 |
+
+## 関連項目 {#see-also}
+
+- [MySQL 8.4 のウィンドウ関数](/ja/guides/window-functions) — 行をまとめずに集約する
+- [MySQL の JOIN のパフォーマンスとよくある間違い](/ja/guides/joins) — 一対多の結合が合計を膨らませる理由
+- [MySQL の CTE が派生テーブルに勝つとき](/ja/guides/ctes-in-mysql) — メインクエリの前に事前集約する
+- [よくある MySQL のエラー](/ja/guides/common-mysql-errors) — 文脈の中の ERROR 1055 と ERROR 1111
+- [GROUP BY](/ja/tutorial/group-by) — まず句そのものを学びたい場合のチュートリアル

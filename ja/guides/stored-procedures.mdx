@@ -1,0 +1,311 @@
+---
+title: "MySQL のストアドプロシージャ"
+sidebarTitle: "ストアドプロシージャを書く"
+description: "MySQL のストアドプロシージャの仕組み: CREATE PROCEDURE の構文、IN/OUT/INOUT パラメータ、ローカル変数、制御フロー、カーソル、およびストアドプロシージャが役立つ場合と害になる場合。"
+keywords: "mysql stored procedure, mysql create procedure, mysql stored procedure example, mysql procedure parameters, mysql procedure vs function, mysql call procedure, mysql delimiter"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ストアドプロシージャは、サーバー上で実行される名前付きの SQL ブロックです。一度呼び出すと、その中にあるすべてのステートメントが実行されます。コードはアプリケーションではなくデータベースにあります。
+
+## ストアドプロシージャの作成 {#creating-a-stored-procedure}
+
+MySQL は `DELIMITER` を使ってステートメントの終端文字を変更し、プロシージャ本体の中の `;` が `CREATE PROCEDURE` ステートメントを途中で終わらせないようにします。
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_active_users()
+BEGIN
+    SELECT id, name, email
+    FROM users
+    WHERE status = 'active'
+    ORDER BY name;
+END$$
+
+DELIMITER ;
+```
+
+`CALL` で呼び出します。
+
+```sql
+CALL get_active_users();
+```
+
+削除します。
+
+```sql
+DROP PROCEDURE IF EXISTS get_active_users;
+```
+
+定義を表示します。
+
+```sql
+SHOW CREATE PROCEDURE get_active_users\G
+```
+
+## パラメータ {#parameters}
+
+プロシージャは 3 つのパラメータモードをサポートします。
+
+| モード | 方向 | 用途 |
+|:-----|:----------|:---------|
+| `IN` | 呼び出し元 → プロシージャ | 値を渡す |
+| `OUT` | プロシージャ → 呼び出し元 | 値を返す |
+| `INOUT` | 両方 | 渡して変更する |
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_user_count(
+    IN  p_status  VARCHAR(20),
+    OUT p_count   INT
+)
+BEGIN
+    SELECT COUNT(*) INTO p_count
+    FROM users
+    WHERE status = p_status;
+END$$
+
+DELIMITER ;
+```
+
+`OUT` パラメータにはユーザー定義変数を使って呼び出します。
+
+```sql
+CALL get_user_count('active', @count);
+SELECT @count;
+```
+
+## ローカル変数 {#local-variables}
+
+ローカル変数は、`BEGIN...END` ブロックの先頭で、他のどのステートメントよりも前に `DECLARE` で宣言します。
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE transfer_funds(
+    IN p_from_account INT,
+    IN p_to_account   INT,
+    IN p_amount       DECIMAL(10,2)
+)
+BEGIN
+    DECLARE v_balance DECIMAL(10,2);
+
+    SELECT balance INTO v_balance
+    FROM accounts
+    WHERE id = p_from_account;
+
+    IF v_balance < p_amount THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Insufficient funds';
+    END IF;
+
+    UPDATE accounts SET balance = balance - p_amount WHERE id = p_from_account;
+    UPDATE accounts SET balance = balance + p_amount WHERE id = p_to_account;
+END$$
+
+DELIMITER ;
+```
+
+## 制御フロー {#control-flow}
+
+MySQL のプロシージャは標準的な制御フロー構文をサポートします。
+
+```sql
+-- IF...ELSEIF...ELSE
+IF v_count > 100 THEN
+    SET v_tier = 'high';
+ELSEIF v_count > 10 THEN
+    SET v_tier = 'medium';
+ELSE
+    SET v_tier = 'low';
+END IF;
+
+-- CASE
+CASE p_status
+    WHEN 'active'   THEN SET v_label = 'Active User';
+    WHEN 'inactive' THEN SET v_label = 'Inactive User';
+    ELSE                 SET v_label = 'Unknown';
+END CASE;
+
+-- WHILE loop
+WHILE v_i <= 10 DO
+    SET v_sum = v_sum + v_i;
+    SET v_i = v_i + 1;
+END WHILE;
+
+-- REPEAT...UNTIL
+REPEAT
+    SET v_i = v_i + 1;
+UNTIL v_i > 10
+END REPEAT;
+```
+
+## エラー処理 {#error-handling}
+
+エラーを捕捉するには `DECLARE ... HANDLER` を使います。
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE safe_insert(IN p_name VARCHAR(100))
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    INSERT INTO items (name) VALUES (p_name);
+    COMMIT;
+END$$
+
+DELIMITER ;
+```
+
+`EXIT HANDLER` は、条件が発生するとプロシージャを停止します。`CONTINUE HANDLER` はプロシージャの実行を続行させます。`RESIGNAL` はエラーを呼び出し元に再送出します。
+
+独自のエラーは `SIGNAL` で送出します。
+
+```sql
+SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT = 'Custom error message';
+```
+
+`45000` は「未処理のユーザー定義例外」を表す SQLSTATE です。
+
+## カーソル {#cursors}
+
+カーソルは、プロシージャ内で結果セットを 1 行ずつ反復処理します。ロジックを集合演算として表現できない場合に使います。
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE process_orders()
+BEGIN
+    DECLARE v_done    INT DEFAULT FALSE;
+    DECLARE v_id      INT;
+    DECLARE v_amount  DECIMAL(10,2);
+
+    DECLARE order_cursor CURSOR FOR
+        SELECT id, amount FROM orders WHERE status = 'pending';
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+    OPEN order_cursor;
+
+    read_loop: LOOP
+        FETCH order_cursor INTO v_id, v_amount;
+        IF v_done THEN
+            LEAVE read_loop;
+        END IF;
+        -- process each row
+        UPDATE orders SET status = 'processed' WHERE id = v_id;
+    END LOOP;
+
+    CLOSE order_cursor;
+END$$
+
+DELIMITER ;
+```
+
+`NOT FOUND` ハンドラーは、カーソルの行がなくなると `v_done` を設定します。プロシージャが終了する前に、必ずカーソルを閉じてください。
+
+## ストアドプロシージャとストアドファンクションの比較 {#stored-procedures-vs-functions}
+
+| | ストアドプロシージャ | ストアドファンクション |
+|:--|:-----------------|:----------------|
+| 戻り値 | OUT パラメータまたは結果セットを通じて | 単一の戻り値 |
+| 呼び出し構文 | `CALL proc()` | `SELECT func()` — 式の中で使用 |
+| トランザクション | `START TRANSACTION`、`COMMIT`、`ROLLBACK` が可能 | トランザクションの状態を変更できない |
+| 結果セット | 複数の結果セットを返せる | 結果セットを返せない |
+| SQL での使用 | SELECT の式では使用できない | SELECT、WHERE などで使用できる |
+
+ロジックを SQL の式に埋め込む必要がある場合はファンクションを使います。それ以外のすべて、つまり複数ステップの処理、条件付きロジック、副作用にはプロシージャを使います。
+
+## ストアドプロシージャを使うべき場合 {#when-to-use-stored-procedures}
+
+ストアドプロシージャが適しているのは次の場合です。
+- どのアプリケーションやユーザーがクエリを実行するかに関係なく適用しなければならないビジネスルールを強制する
+- 複数ステップの操作(複雑なバッチジョブ、データ移行)の往復を減らす
+- 基礎となるテーブルを公開せずに、ユーザーに特定の操作へのアクセスを許可する(`GRANT EXECUTE ON PROCEDURE`)
+
+害になるのは次の場合です。
+- ロジックが頻繁に変わる — デプロイに ALTER PROCEDURE または DROP と再作成が必要になる
+- デバッグが必要 — デバッガーはなく、SIGNAL ベースのログ出力のみ
+- 移植性が重要 — ストアドプロシージャの構文は MySQL 固有
+
+## よくある質問 {#frequently-asked-questions}
+
+#### ストアドプロシージャは結果セットを返せますか? {#can-a-stored-procedure-return-a-result-set}
+
+はい。プロシージャ内の `INTO` を使わない `SELECT` は、結果セットを呼び出し元に送ります。
+
+```sql
+CREATE PROCEDURE get_users()
+BEGIN
+    SELECT id, name FROM users;  -- this result set goes to the caller
+END;
+```
+
+1 つのプロシージャ内の複数の `SELECT` ステートメントは、複数の結果セットを送ります。ほとんどのクライアントはこれを処理できますが、一部の ORM は処理できません。
+
+#### データベース内のすべてのストアドプロシージャを確認するには? {#how-do-i-see-all-stored-procedures-in-a-database}
+
+```sql
+SHOW PROCEDURE STATUS WHERE Db = 'mydb';
+-- or
+SELECT routine_name, created, last_altered
+FROM information_schema.routines
+WHERE routine_type = 'PROCEDURE' AND routine_schema = 'mydb';
+```
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| CREATE PROCEDURE で `ERROR 1064` | `DELIMITER` の変更がありません。本体内の `;` がステートメントを途中で終わらせました。`DELIMITER $$ ... $$; DELIMITER ;` で囲みます |
+| `ERROR 1172: Result consisted of more than one row` | `SELECT ... INTO` が複数行を返しました。`LIMIT 1` を追加するか、単一行を返すようにクエリを修正します |
+| CALL の後で `OUT` パラメータが NULL | プロシージャがそれに代入していません。すべてのコードパスがそのパラメータの `SET` または `SELECT INTO` に到達するか確認します |
+| `ERROR 1193: Unknown system variable` | `DECLARE v_var`(ローカル変数)が必要なところで `SET @var`(セッション変数)を使った、またはその逆です |
+| プロシージャは実行されるがデータを返さない | 結果セットの `SELECT` が余分な層(ネストした CALL)を通してデータを送っています。SELECT を最も外側のプロシージャに移します |
+
+## VillageSQL: ストアドプロシージャでのカスタム拡張機能型 {#villagesql-custom-extension-types-in-stored-procedures}
+
+VillageSQL のカスタム拡張機能型(`COMPLEX`、`UUID`、`TVECTOR` など)は、ストアドプロシージャの
+パラメータ型および `DECLARE` 変数の型として使用できます。まず拡張機能をインストールし、
+次にプロシージャ定義でその型を参照します。
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE add_impedances(
+    IN  p_a COMPLEX,
+    IN  p_b COMPLEX,
+    OUT p_sum COMPLEX
+)
+BEGIN
+    DECLARE v_result COMPLEX;
+    SET v_result = complex_add(p_a, p_b);
+    SET p_sum = v_result;
+END$$
+
+DELIMITER ;
+```
+
+<Warning>
+  いずれかのストアドプロシージャがその拡張機能のカスタム型を使用している間、`UNINSTALL EXTENSION` は失敗します。
+  拡張機能をアンインストールする前に、プロシージャを削除または変更してください。詳細は
+  [拡張機能のアンインストール](/ja/extensions/uninstall)を参照してください。
+</Warning>
+
+## 関連項目 {#see-also}
+
+- [MySQL のトリガー](/ja/guides/triggers) — トリガーはストアドプロシージャのロジックまたはインライン SQL を呼び出す
+- [MySQL のトランザクション](/ja/guides/transactions) — ストアドプロシージャは多くの場合、処理をトランザクションで包む
+- [拡張機能のアンインストール](/ja/extensions/uninstall) — ストアドプロシージャが拡張機能の型を使用している場合の制限

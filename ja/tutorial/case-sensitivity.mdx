@@ -1,0 +1,187 @@
+---
+title: "MySQL の大文字と小文字の区別"
+sidebarTitle: "大文字と小文字の区別"
+description: "MySQL の文字列比較が大文字と小文字を無視する理由、それを決める照合順序の読み方、および代わりに大文字と小文字を区別する一致を求める方法。"
+keywords: "mysql case sensitive, mysql case insensitive query, mysql collation case sensitive, mysql where case sensitive, mysql collate, mysql table name case sensitivity"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL の文字列比較は、特に指定しない限り大文字と小文字を無視します。これは
+一度人を驚かせ、後になって足をすくいます。そのため、何がそれを決めるのか、
+1 つのクエリでどう変えるのかを知っておく価値があります。
+
+始める前に `mysql -u root -p sakila` でクライアントを開いてください。
+
+## 大文字と小文字の区別の仕組み {#how-case-sensitivity-works}
+
+クエリの中の何もそれを決めません。決めるのは照合順序であり、すべてのテキスト列が
+1 つ持っています。文字セットは列が保持できる文字を定め、その照合順序は文字を
+どう比較するかを定めます。1 つの比較に限って照合順序を上書きするには `COLLATE`
+を使います。
+
+```sql
+SELECT COLUMN_LIST
+FROM TABLE_NAME
+WHERE COLUMN_NAME COLLATE COLLATION_NAME = 'SEARCH_TEXT';
+```
+
+`COLLATION_NAME` を比較に使わせたい照合順序に、`SEARCH_TEXT` を一致させる値に
+置き換えます。
+
+## 例 {#examples}
+
+### 1) 大文字と小文字だけが異なる 2 つの文字列は等しい {#1-2-strings-that-differ-only-in-case-are-equal}
+
+```sql
+SELECT 'ABC' = 'abc' AS same;
+```
+
+```text
++------+
+| same |
++------+
+|    1 |
++------+
+1 row in set (0.00 sec)
+```
+
+### 2) 列に対しても同じことが成り立つ {#2-the-same-holds-against-a-column}
+
+小文字の検索語が大文字のタイトルを見つけます。
+
+```sql
+SELECT title FROM film WHERE title = 'academy dinosaur';
+```
+
+```text
++------------------+
+| title            |
++------------------+
+| ACADEMY DINOSAUR |
++------------------+
+1 row in set (0.00 sec)
+```
+
+### 3) 列の照合順序を読む {#3-read-the-columns-collation}
+
+```sql
+SELECT COLUMN_NAME, DATA_TYPE, COLLATION_NAME
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'sakila' AND TABLE_NAME = 'film' AND COLUMN_NAME = 'title';
+```
+
+```text
++-------------+-----------+--------------------+
+| COLUMN_NAME | DATA_TYPE | COLLATION_NAME     |
++-------------+-----------+--------------------+
+| title       | varchar   | utf8mb4_0900_ai_ci |
++-------------+-----------+--------------------+
+1 row in set (0.01 sec)
+```
+
+照合順序の名前は末尾から読みます。`ci` は大文字と小文字を区別しない
+(case-insensitive) という意味で、例 2 が一致したのはそのためです。`ai` は
+アクセントを区別しない (accent-insensitive) という意味で、別の働きをします。
+この照合順序では `'e' = 'é'` は真ですが、`utf8mb4_0900_as_cs` では偽です。
+
+| 末尾 | 比較 |
+|---|---|
+| `_ci` | 大文字と小文字を無視する |
+| `_cs` | 大文字と小文字を区別する |
+| `_ai` | アクセントを無視する |
+| `_as` | アクセントを区別する |
+| `_bin` | 保存された値を直接比較して、両方を区別する |
+
+この表は、自分の列の照合順序名の意味でもあります。上のクエリを任意のテーブルと列に
+対して実行すると、どのルールの下で作業しているかが分かります。
+
+### 4) 大文字と小文字を区別する比較を求める {#4-ask-for-a-case-sensitive-comparison}
+
+```sql
+SELECT 'ABC' = 'abc' COLLATE utf8mb4_0900_as_cs AS case_sensitive,
+       'ABC' = 'abc' COLLATE utf8mb4_0900_ai_ci AS case_insensitive;
+```
+
+```text
++----------------+------------------+
+| case_sensitive | case_insensitive |
++----------------+------------------+
+|              0 |                1 |
++----------------+------------------+
+1 row in set (0.00 sec)
+```
+
+列に対しても同じように機能します。
+
+```sql
+SELECT title FROM film WHERE title COLLATE utf8mb4_0900_as_cs = 'academy dinosaur';
+```
+
+```text
+Empty set (0.00 sec)
+```
+
+## 列に対する COLLATE はインデックス検索を手放す {#collate-on-a-column-gives-up-the-index-lookup}
+
+列のインデックスはその列自身の照合順序で作られているため、別の照合順序での
+比較は、一致する値を見つけるのにそれを使えません。上のクエリに対する `EXPLAIN`
+は、検索ではなく 1,000 行すべてのスキャンを報告します。1,000 本の映画では何の
+コストもかかりませんが、大きなテーブルでは大きなコストになります。すべての
+クエリで大文字と小文字を区別する一致が必要な場合は、
+[文字セットと照合順序](/ja/guides/character-sets)のガイドで、代わりに列をそのように
+保存する方法を説明しています。
+
+## デフォルトはどこから来るのか {#where-the-default-comes-from}
+
+照合順序なしで作成されたデータベースはサーバーのものを、テーブルはデータベースの
+ものを、列はテーブルのものを引き継ぎます。したがって、その履歴のどこにも照合
+順序が指定されていない列は、サーバーの設定のせいで大文字と小文字を区別せずに
+比較しています。名前の前の `@@` はサーバーの設定を読み、この 2 つはどれを
+引き継いだかを教えてくれます。
+
+```sql
+SELECT @@collation_server AS server_collation, @@character_set_server AS server_charset;
+```
+
+サーバーは起動時の設定で答えるので、結果は MySQL についてではなく、自分の
+インストール環境についての事実として扱ってください。
+
+## 識別子は別のルールに従う {#identifiers-follow-a-different-rule}
+
+列名は決して大文字と小文字を区別しません。データベース名とテーブル名は別の
+問題で、`lower_case_table_names` が決めます。
+
+| 値 | データベース名とテーブル名 |
+|---|---|
+| `0` | 書かれたとおりに保存され、大文字と小文字を区別して比較される |
+| `1` | 小文字で保存され、大文字と小文字を区別せずに比較される |
+| `2` | 書かれたとおりに保存され、大文字と小文字を区別せずに比較される |
+
+`SELECT @@lower_case_table_names;` を実行すると、自分の状況が分かります。
+セッションからは変更できません。`SET GLOBAL lower_case_table_names=1` は
+`ERROR 1238 (HY000): Variable 'lower_case_table_names' is a read only variable`
+と答えます。これは起動時の設定で、サーバーが最初にどう設定されたかに結び付いて
+いるため、答えは今いるサーバーの性質として扱ってください。
+
+実践的な助言は答えに依存しません。すべてのデータベース名とテーブル名を大文字か
+小文字のどちらかに統一して書き、そのつづりをどこでも使ってください。そうすれば、同じ SQL を 2 つの
+サーバー間で移動しても、動いていたクエリが、存在しないテーブルのエラーである
+`ERROR 1146 (42S02)` になることはありません。
+
+## まとめ {#summary}
+
+- 通常の照合順序は `_ci` で終わるため、文字列比較は大文字と小文字を無視すると考えてください。
+- 列の照合順序は `INFORMATION_SCHEMA.COLUMNS` から読みます。
+- 照合順序の名前は末尾から読みます。`_ci` と `_ai` は無視し、`_cs`、`_as`、および `_bin` は区別します。
+- 一度限りの大文字と小文字を区別する比較には `COLLATE` を使い、インデックス検索を手放すことを受け入れてください。
+- `lower_case_table_names` が何であれ、すべてのデータベース名とテーブル名のつづりを 1 つに保ちます。
+
+## 関連項目 {#see-also}
+
+- [LIKE](/ja/tutorial/like) — これが最初に現れる場所
+- [REGEXP](/ja/tutorial/regexp) — 同じルールと、別の上書き方法
+- [MySQL の文字セットと照合順序](/ja/guides/character-sets) — 列のための照合順序の選び方
+- [MySQL で utf8mb4 を使う](/ja/guides/utf8mb4) — 通常の照合順序の背後にある文字セット

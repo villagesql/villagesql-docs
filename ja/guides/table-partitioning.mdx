@@ -1,0 +1,190 @@
+---
+title: "MySQL のテーブルパーティショニング"
+sidebarTitle: "テーブルのパーティショニング"
+description: "MySQL のテーブルパーティショニングの仕組み: RANGE、LIST、HASH、および KEY の各パーティショニングタイプ、パーティションプルーニング、パーティショニングがパフォーマンスを改善する場合、およびよくある落とし穴。"
+keywords: "mysql table partitioning, mysql partition by range, mysql partition pruning, mysql partitioning example, mysql range partition, mysql list partition, mysql partition performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+パーティショニングは、1 つの論理テーブルを複数の物理セグメントに分割します。MySQL はパーティショニング式に基づいて行をパーティションに振り分け、パーティションキーで絞り込むクエリはパーティション全体をスキップできます。この最適化をパーティションプルーニングと呼びます。パーティショニングには InnoDB または NDB ストレージエンジンが必要です。
+
+## パーティショニングが役立つ場合 {#when-partitioning-helps}
+
+パーティションプルーニングが本当に効果を発揮するのは次の場合です。
+- テーブルがバッファプールに収まらないほど大きく、クエリが一貫してパーティションキーで絞り込む
+- 古いデータを定期的に削除する。`ALTER TABLE t DROP PARTITION p_old` は、遅い DELETE と違って瞬時に完了する
+
+パーティショニングが役に立たないのは次の場合です。
+- クエリがパーティションキーで絞り込まない(すべてのパーティションをスキャンする必要がある)
+- テーブルがメモリに余裕を持って収まる
+- 適切なインデックス作成の代わりにしようとしている。パーティションのないテーブルの良いインデックスは、対応するインデックスのないパーティションテーブルより高速なことが多い
+
+## RANGE パーティショニング {#range-partitioning}
+
+行は、パーティションキーがある範囲に含まれるかどうかに基づいてパーティションに割り当てられます。最も一般的な用途は日付ベースのアーカイブです。
+
+```sql
+CREATE TABLE orders (
+    id          INT NOT NULL,
+    customer_id INT,
+    amount      DECIMAL(10,2),
+    created_at  DATE NOT NULL
+)
+PARTITION BY RANGE COLUMNS (created_at) (
+    PARTITION p2022 VALUES LESS THAN ('2023-01-01'),
+    PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+    PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+定義したどの範囲にも収まらない行を受け止めるために、必ず `MAXVALUE` パーティションを含めてください。これがないと、定義した範囲の外への挿入はエラーで失敗します。
+
+新しいパーティションを追加します。
+
+```sql
+-- Only works if the last partition is not MAXVALUE
+ALTER TABLE orders ADD PARTITION (
+    PARTITION p2025 VALUES LESS THAN ('2026-01-01')
+);
+
+-- If MAXVALUE exists, reorganize it:
+ALTER TABLE orders REORGANIZE PARTITION p_future INTO (
+    PARTITION p2025 VALUES LESS THAN ('2026-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+古いデータを瞬時に削除します。
+
+```sql
+ALTER TABLE orders DROP PARTITION p2022;
+```
+
+## LIST パーティショニング {#list-partitioning}
+
+行は、パーティションキーの正確な値に基づいて割り当てられます。
+
+```sql
+CREATE TABLE customers (
+    id     INT NOT NULL,
+    name   VARCHAR(100),
+    region VARCHAR(20) NOT NULL
+)
+PARTITION BY LIST COLUMNS (region) (
+    PARTITION p_north VALUES IN ('WA', 'OR', 'ID', 'MT'),
+    PARTITION p_south VALUES IN ('CA', 'NV', 'AZ', 'NM'),
+    PARTITION p_east  VALUES IN ('NY', 'NJ', 'CT', 'MA')
+);
+```
+
+どのパーティションにも列挙されていない region での挿入は失敗します。文字列の列には `LIST COLUMNS` を使ってください。`LIST` 単独では整数の式しかサポートしません。
+
+## HASH および KEY パーティショニング {#hash-and-key-partitioning}
+
+`HASH` と `KEY` は、固定数のパーティションに行を均等に分散します。値によるパーティションプルーニングはサポートしませんが、行をパーティション間に分散することで、同時書き込みのスループットを改善できます。
+
+```sql
+-- HASH: you define the expression
+CREATE TABLE sessions (
+    id         INT NOT NULL,
+    user_id    INT NOT NULL,
+    data       TEXT
+)
+PARTITION BY HASH (user_id)
+PARTITIONS 8;
+
+-- KEY: MySQL uses the primary key automatically
+CREATE TABLE logs (
+    id         BIGINT AUTO_INCREMENT,
+    message    TEXT,
+    PRIMARY KEY (id)
+)
+PARTITION BY KEY ()
+PARTITIONS 4;
+```
+
+## パーティションプルーニング {#partition-pruning}
+
+プルーニングは、`WHERE` 句がパーティション式で直接絞り込む場合にのみ働きます。`RANGE COLUMNS (created_at)` では、`created_at` での絞り込みが正しくプルーニングされます。
+
+```sql
+-- Pruned: MySQL scans only p2024
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31';
+
+-- NOT pruned: wrapping the column in YEAR() defeats pruning
+-- MySQL can't map YEAR(created_at) = 2024 back to the RANGE COLUMNS expression
+SELECT * FROM orders WHERE YEAR(created_at) = 2024;
+```
+
+プルーニングを確認するには、`EXPLAIN` を実行して `partitions` 列を調べます。
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE created_at = '2024-06-15'\G
+```
+
+`partitions` に 1 つまたは少数のパーティション名しか表示されなければ、プルーニングは機能しています。すべてのパーティションが表示される場合、絞り込みは適用されていません。
+
+## パーティショニングの制約 {#partitioning-constraints}
+
+- **すべてのユニークキー(主キーを含む)は、パーティショニング式のすべての列を含まなければなりません。** `created_at` でパーティショニングしたい場合、すべてのユニークキーに `created_at` が含まれている必要があります。単独の `PRIMARY KEY (id)` を持つテーブルには、先に `PRIMARY KEY (id, created_at)` に変更しない限りパーティションを追加できません。
+- MySQL では、パーティションテーブルで `FOREIGN KEY` 制約はサポートされません。
+- 1 つのテーブルは最大 8192 のパーティションを持てます(MySQL 8.0 以降)。
+
+## パーティショニングとインデックス作成の比較 {#partitioning-vs-indexing}
+
+| | パーティショニング | インデックス作成 |
+|:--|:------------|:---------|
+| 最適な用途 | 範囲ベースのデータのプルーニング、アーカイブの削除 | ポイント検索、任意の列に対する範囲スキャン |
+| スキーマ変更が必要 | はい | はい(ALTER TABLE ADD INDEX) |
+| 高速化されるクエリ | パーティションキーで絞り込むクエリのみ | インデックス付きの列を使う任意のクエリ |
+| 古いデータの削除 | 瞬時(`DROP PARTITION`) | DELETE とインデックスのメンテナンスが必要 |
+| 外部キー | サポートされない | サポートされる |
+
+インデックス作成から始めてください。パーティショニングを追加するのは、大きなテーブルで実証されたパフォーマンス問題があり、クエリのパターンに合った明確なパーティションキーがある場合だけにしてください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 既存のテーブルをパーティショニングできますか? {#can-i-partition-an-existing-table}
+
+はい。`ALTER TABLE` を使います。
+
+```sql
+ALTER TABLE orders
+PARTITION BY RANGE COLUMNS (created_at) (
+    PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+    PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+これはテーブルを書き換えるため、大きなテーブルではかなりの時間とディスク領域がかかることがあります。
+
+#### 行がどのパーティションにあるかを確認するには? {#how-do-i-check-which-partition-a-row-is-in}
+
+```sql
+SELECT PARTITION_NAME, TABLE_ROWS
+FROM information_schema.partitions
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'orders';
+```
+
+特定の行がどのパーティションに入るかを確認するには、その行に一致する WHERE 句を付けて `EXPLAIN PARTITIONS` を使います。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 1526: Table has no partition for value` | RANGE または LIST に一致するパーティションがありません。RANGE には `MAXVALUE` パーティションを追加し、LIST では不足している値に対処します |
+| `ERROR 1503: A PRIMARY KEY must include all columns in the table's partitioning function` | パーティションキーの列を主キーの定義に追加します |
+| パーティションプルーニングが起きない | `EXPLAIN` の partitions 列を確認します。WHERE 句がパーティション列を関数で包まずに直接使っているか確認します |
+| `ALTER TABLE DROP PARTITION` がエラーを返す | テーブルは RANGE または LIST でパーティショニングされている必要があります。HASH と KEY のパーティションは個別に削除できません |
+| パーティショニング後にパフォーマンスが悪化した | クエリがプルーニングされていない可能性があります。EXPLAIN で確認し、WHERE で使う列に対して各パーティションにインデックスがあるか確認します |
+
+## 関連項目 {#see-also}
+
+- [InnoDB がデータを保存する仕組み](/ja/guides/innodb-storage) — パーティショニングが動作するストレージエンジン
+- [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes) — パーティション内のインデックスとパーティションプルーニング
+- [MySQL のスキーマ移行](/ja/guides/schema-migrations) — 既存のテーブルにパーティショニングを追加または変更する方法

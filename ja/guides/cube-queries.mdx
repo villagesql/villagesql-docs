@@ -1,0 +1,124 @@
+---
+title: "MySQL における多次元の範囲クエリ"
+sidebarTitle: "多次元クエリ"
+description: "VillageSQL の vsql_cube 拡張機能を使って MySQL で多次元データを格納し、クエリする方法: 複数の数値属性にわたる包含、重なり、および最近傍。"
+keywords: "mysql multi-dimensional range query, mysql geometric type, mysql cube extension, mysql nearest neighbor, mysql n-dimensional search, vsql_cube"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  このガイドには VillageSQL 0.0.4 以降が必要です。
+</Note>
+
+MySQL には、n 次元空間の点や領域を表現する組み込みの方法がありません。複数の数値列にわたって AND 条件をつなぐことはできますが、それが扱えるのは包含だけです。距離クエリには対応できず、行の属性を 1 つにまとまった幾何学的な値として扱うこともできません。VillageSQL の `vsql_cube` 拡張機能は `cube` カスタム型を追加し、どちらの種類のクエリも自然に書けるようにします。
+
+## 問題 {#the-problem}
+
+各製品に価格、平均評価、およびレビュー数がある製品カタログがあるとします。購入者は、価格が 50～200 ドル、評価が 3.5 以上、レビューが 50 件以上の製品を求めています。これは 3 条件の AND です。
+
+```sql
+-- Works for containment, but doesn't generalize
+SELECT name FROM products
+WHERE price BETWEEN 50 AND 200
+  AND rating BETWEEN 3.5 AND 5.0
+  AND reviews BETWEEN 50 AND 1000;
+```
+
+AND のつながりは一致を見つけます。しかし、ある製品に最も似た 5 つの製品、つまり価格、評価、およびレビュー数が同時に最も近いものが欲しい場合、SQL に自然な答えはありません。候補をアプリケーションコードに取り出し、そこで距離を計算しなければなりません。
+
+## VillageSQL の場合: cube 型 {#with-villagesql-the-cube-type}
+
+```sql
+INSTALL EXTENSION vsql_cube;
+```
+
+`cube` 型は、n 次元空間の点またはボックスを格納します。点は位置であり、ボックスは 2 つの角の座標で定義される領域です。どちらも通常の列に格納されます。
+
+```sql
+CREATE TABLE products (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255),
+    attrs `cube`(3)
+);
+```
+
+`cube` は MySQL の予約語なので、DDL ではバッククォートで囲みます。次元パラメータ（`3`）は必須です。数値のない素の `cube` はサポートされていません。
+
+### データの挿入 {#inserting-data}
+
+座標の文字列を直接挿入し、列自身の変換に解析させます。`cube_point_nd()` で
+包まないでください。それはパラメータなしの `cube` を返し、次元パラメータ付きの
+`cube(3)` 列に暗黙的にキャストできません（`ERROR 3219`）。
+
+```sql
+INSERT INTO products (name, attrs) VALUES
+    ('Budget Widget',   '29.99,4.1,320'),
+    ('Standard Widget', '79.99,4.4,1250'),
+    ('Premium Widget',  '149.99,4.7,890'),
+    ('Discount Widget', '19.99,3.2,45'),
+    ('Pro Widget',      '199.99,4.8,2100');
+```
+
+ここでの座標は `(price, rating, review_count)` で、製品ごとに 1 つの点です。
+
+### cube_contains による範囲クエリ {#range-queries-with-cube_contains}
+
+検索領域をボックスとして定義します。`cube_box_nd()` は下側の角の座標に続いて上側の角の座標を受け取るため、3 次元のボックスには 6 つの数値を渡します。
+
+```sql
+-- Products: $50–$200, rating 3.5–5.0, 50–2000 reviews
+SET @region = cube_box_nd(50.0, 3.5, 50, 200.0, 5.0, 2000);
+
+SELECT name FROM products
+WHERE cube_contains(@region, attrs);
+```
+
+`cube_contains(@region, attrs)` は、製品の点がボックスの中にあるとき 1 を返します。3 つの AND 条件すべてを一度に書いたものと等価ですが、距離クエリと組み合わせることもできます。
+
+### cube_distance による最近傍 {#nearest-neighbor-with-cube_distance}
+
+ある製品に最も似た製品を見つけるには、属性空間でのユークリッド距離を測ります。
+
+```sql
+-- 3 products most similar to Standard Widget (79.99, 4.4, 1250)
+SET @target = cube_point_nd(79.99, 4.4, 1250);
+
+SELECT name,
+       ROUND(cube_distance(attrs, @target), 2) AS distance
+FROM products
+WHERE name != 'Standard Widget'
+ORDER BY cube_distance(attrs, @target)
+LIMIT 3;
+```
+
+スケーリングについての注意: 価格は数百、評価は 0～5、レビュー数は数千になることがあります。生のユークリッド距離はレビュー数に支配されます。バランスの取れた類似度スコアが欲しい場合は、挿入する前に 3 つの次元すべてを共通のスケール（例: 0～1）に正規化してください。
+
+### 重なりの確認 {#checking-overlap}
+
+`cube_overlaps()` は、2 つのボックスが何らかの空間を共有する場合に 1 を返します。製品がいくつかのプロモーション帯のいずれかに該当するかどうかを確認するのに役立ちます。
+
+```sql
+SET @promo_a = cube_box_nd(0.0, 4.5, 500, 100.0, 5.0, 9999);
+SET @promo_b = cube_box_nd(100.0, 4.0, 100, 300.0, 5.0, 9999);
+
+SELECT name FROM products
+WHERE cube_overlaps(@promo_a, attrs) OR cube_overlaps(@promo_b, attrs);
+```
+
+## トラブルシューティング {#troubleshooting}
+
+| エラー | 対処 |
+|---|---|
+| `ERROR: Function 'cube_point_nd' does not exist` | `INSTALL EXTENSION vsql_cube` を実行します |
+| 列の型 `cube` が認識されない | VillageSQL 0.0.4 以降を実行していることを確認します |
+| 列の宣言が拒否される | DDL で `cube` をバッククォートで囲みます: `` `cube`(N) `` |
+| 距離の結果がおかしく見える | 座標を正規化します。生のユークリッド距離は、スケールの最も大きい次元に偏ります |
+
+## 関連項目 {#see-also}
+
+- [MySQL でのベクトル埋め込みの生成](/ja/guides/vector-embeddings) — 多次元の類似度に対するもう 1 つのアプローチとしての AI 生成ベクトル
+- [MySQL で全文検索を実装する方法](/ja/guides/full-text-search) — テキストデータに対する代替手段としてのキーワードベースの検索
+- [データに適した列の型を選ぶ方法](/ja/guides/choosing-data-types) — cube と標準の列の型のどちらを使うべきか

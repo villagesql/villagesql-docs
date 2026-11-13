@@ -1,0 +1,154 @@
+---
+title: "MySQL の自己結合"
+sidebarTitle: "自己結合"
+description: "MySQL のテーブルを自分自身と結合してその行どうしを比較する方法、クエリに 2 つのエイリアスが必要な理由、およびすべての組が 2 回現れるのを防ぐ条件。"
+keywords: "mysql self join, self join mysql, mysql join table to itself, mysql compare rows same table, mysql not unique table alias"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+自己結合は、同じクエリの中で 1 つのテーブルを 2 回読むため、その行どうしを
+比較できます。組に関する質問に答える方法です。どの行が同じ値を共有するか、
+どの行がどの行より大きいか、といったものです。
+
+始める前に、`mysql -u root -p sakila` でクライアントを開いてください。
+
+## 自己結合の仕組み {#how-a-self-join-works}
+
+```sql
+SELECT FIRST_ALIAS.COLUMN_NAME, SECOND_ALIAS.COLUMN_NAME
+FROM TABLE_NAME AS FIRST_ALIAS
+JOIN TABLE_NAME AS SECOND_ALIAS
+  ON FIRST_ALIAS.COLUMN_NAME = SECOND_ALIAS.COLUMN_NAME;
+```
+
+`TABLE_NAME` をテーブルに、`FIRST_ALIAS` と `SECOND_ALIAS` をそのテーブルの
+2 つの異なる名前に、各 `COLUMN_NAME` を比較する列に置き換えます。
+
+結合に関する他のことは何も変わりません。サーバーは 2 つの側が 1 つのテーブル
+だとは知らず、他のどんなテーブルの組とも同じように扱います。
+
+## エイリアスは省略できない {#the-aliases-are-not-optional}
+
+エイリアスがないと、クエリは 2 つのものを `actor` と呼ぶことになり、それらを
+区別できません。
+
+```sql
+SELECT first_name FROM actor JOIN actor ON actor.last_name = actor.last_name LIMIT 1;
+```
+
+```text
+ERROR 1066 (42000): Not unique table/alias: 'actor'
+```
+
+`ERROR 1066` は、サーバーが各側に名前を必要としていると言っているものです。
+
+## 例 {#examples}
+
+### 1) 値を共有する行 {#1-rows-that-share-a-value}
+
+Sakila の俳優の中には姓を共有する者がいます。これは、そのそれぞれを他の者と
+組にします。
+
+```sql
+SELECT a1.first_name, a1.last_name, a2.first_name AS also_named
+FROM actor AS a1
+JOIN actor AS a2 ON a1.last_name = a2.last_name AND a1.actor_id < a2.actor_id
+ORDER BY a1.last_name, a1.first_name, a2.first_name;
+```
+
+```text
++-------------+-------------+-------------+
+| first_name  | last_name   | also_named  |
++-------------+-------------+-------------+
+| CHRISTIAN   | AKROYD      | DEBBIE      |
+| CHRISTIAN   | AKROYD      | KIRSTEN     |
+| KIRSTEN     | AKROYD      | DEBBIE      |
+| CUBA        | ALLEN       | KIM         |
+| CUBA        | ALLEN       | MERYL       |
+| KIM         | ALLEN       | MERYL       |
+...
++-------------+-------------+-------------+
+108 rows in set (0.00 sec)
+```
+
+AKROYD という俳優が 3 人いて、その間で 3 組ができます。
+
+### 2) 数値で行を比較する {#2-compare-rows-on-a-number}
+
+同じ形が「どの映画がどの映画とちょうど同じ長さか」に答えます。これはカタログ内
+で最も長い映画に絞り込んでいます。
+
+```sql
+SELECT f1.title, f2.title AS same_length, f1.length
+FROM film AS f1
+JOIN film AS f2 ON f1.length = f2.length AND f1.film_id < f2.film_id
+WHERE f1.length = 185
+ORDER BY f1.title, f2.title;
+```
+
+```text
++--------------------+--------------------+--------+
+| title              | same_length        | length |
++--------------------+--------------------+--------+
+| CHICAGO NORTH      | CONTROL ANTHEM     |    185 |
+| CHICAGO NORTH      | DARN FORRESTER     |    185 |
+| CHICAGO NORTH      | GANGS PRIDE        |    185 |
+...
++--------------------+--------------------+--------+
+45 rows in set (0.00 sec)
+```
+
+185 分の映画は 10 本あり、45 は 10 個のものから作れる組の数です。
+
+## 2 番目の条件がしていること {#what-the-second-condition-is-doing}
+
+`a1.actor_id < a2.actor_id` は、各組を 1 回だけ保持し、俳優が自分自身と組に
+なるのを防ぐものです。これを取り除くと、同じクエリが別のことに答えます。
+
+```sql
+SELECT a1.first_name, a1.last_name, a2.first_name AS also_named
+FROM actor AS a1
+JOIN actor AS a2 ON a1.last_name = a2.last_name
+ORDER BY a1.last_name, a1.first_name, a2.first_name;
+```
+
+```text
++-------------+--------------+-------------+
+| first_name  | last_name    | also_named  |
++-------------+--------------+-------------+
+| CHRISTIAN   | AKROYD       | CHRISTIAN   |
+| CHRISTIAN   | AKROYD       | DEBBIE      |
+| CHRISTIAN   | AKROYD       | KIRSTEN     |
+| DEBBIE      | AKROYD       | CHRISTIAN   |
+| DEBBIE      | AKROYD       | DEBBIE      |
+| DEBBIE      | AKROYD       | KIRSTEN     |
+...
++-------------+--------------+-------------+
+416 rows in set (0.00 sec)
+```
+
+108 行ではなく 416 行になり、2 種類の行が紛れ込んでいます。`CHRISTIAN AKROYD`
+が自分自身と組になっています。彼自身の行が `a1.last_name = a2.last_name` を
+満たすためです。そして `CHRISTIAN` と `DEBBIE` の組が現れ、次に `DEBBIE` と
+`CHRISTIAN` の組が現れます。これは同じ組を逆向きに書いたものです。
+
+id を `<` で比較すると、両方が一度に解決します。どの id も自分自身より小さく
+ないため、行が自分自身と一致することを排除し、本物の各組の並びを 1 つだけ
+保持します。自己結合で組を探すときは、常に `<` を使ってください。
+
+## まとめ {#summary}
+
+- 1 つのテーブルの行どうしを比較するには自己結合を使います。
+- テーブルに 2 つのエイリアスを与えます。エイリアスがないと `ERROR 1066` になるためです。
+- 各組を 1 回だけ欲しいときは、2 つのエイリアスの主キーを `<` で比較します。
+- 排除しない限り、行は自分自身と一致すると考えてください。
+
+## 関連項目 {#see-also}
+
+- [テーブルエイリアス](/ja/tutorial/table-aliases) — このクエリが依存する命名
+- [INNER JOIN](/ja/tutorial/inner-join) — 自己結合がその特殊な場合である結合
+- [結合の仕組み](/ja/tutorial/joins) — 他の種類の中でのこの結合の位置
+- [MySQL の JOIN のパフォーマンスとよくある間違い](/ja/guides/joins) — 大きなテーブルで自己結合にかかるコスト

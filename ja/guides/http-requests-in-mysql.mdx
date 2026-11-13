@@ -1,0 +1,179 @@
+---
+title: "SQL からの HTTP リクエストの送信"
+sidebarTitle: "HTTP リクエスト"
+description: "VillageSQL の vsql_http 拡張機能を使って、MySQL のクエリから直接外部の HTTP API を呼び出す方法。GET、POST、および JSON レスポンスの解析を扱います。"
+keywords: "mysql http request, mysql call api, mysql http_get, mysql http_post, mysql rest api, vsql_http"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL にはネットワークリクエストを送る組み込みの手段がありません。HTTP API を呼び出したい場合は、データベースからデータを取り出し、アプリケーションコードでリクエストを送り、結果を書き戻します。VillageSQL の `vsql_http` 拡張機能は、`http_get()`、`http_post()`、およびすべての HTTP メソッドを SQL に直接追加するため、データがある場所から外部 API を呼び出せます。
+
+## 問題: API 呼び出しのたびにデータベースを離れる {#the-problem-leaving-the-database-for-every-api-call}
+
+VillageSQL を使わない典型的なパターンです。
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, tracking_number FROM shipments WHERE status IS NULL")
+
+# Call a shipping API for each row
+for row in rows:
+    resp = requests.get(f"https://api.shipping.com/track/{row['tracking_number']}")
+    status = resp.json()["status"]
+    db.execute("UPDATE shipments SET status = ? WHERE id = ?", status, row["id"])
+```
+
+これは動作しますが、各行が 3 回の往復になります。SELECT、API 呼び出し、UPDATE です。データ拡充のロジックは、データがあるスキーマではなく、アプリケーションコードに置かれます。
+
+## VillageSQL の場合: SQL からの HTTP {#with-villagesql-http-from-sql}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+`http_get(url)` は GET リクエストを送り、レスポンス全体を含む JSON 文字列を返します。
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_get('https://httpbin.org/get') USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status')       AS status,
+  JSON_VALUE(@resp, '$.content_type') AS content_type,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+`vsql_http` のすべての関数は同じ形の JSON を返します。
+
+| フィールド | 説明 |
+|:---|:---|
+| `status` | JSON 数値としての HTTP ステータスコード（`200`、`404` など） |
+| `content_type` | `Content-Type` レスポンスヘッダーの値 |
+| `headers` | すべてのレスポンスヘッダーの `[name, value]` ペアの配列 |
+| `content` | レスポンス本文 |
+
+### 文字セットの変換 {#the-charset-conversion}
+
+VillageSQL 0.0.6 以前では、VEF の STRING 関数はバイナリ文字セットを返します。結果を `JSON_VALUE` や `JSON_EXTRACT` に渡す前に、`CONVERT(... USING utf8mb4)` で包んでください。
+
+```sql
+-- On 0.0.6 and earlier, this throws an error — JSON_VALUE rejects binary charset
+-- ERROR 3144: Cannot create a JSON value from a string with CHARACTER SET 'binary'
+SELECT JSON_VALUE(vsql_http.http_get('https://httpbin.org/get'), '$.status');
+
+-- This works on every version
+SELECT JSON_VALUE(
+  CONVERT(vsql_http.http_get('https://httpbin.org/get') USING utf8mb4),
+  '$.status'
+);
+```
+
+VillageSQL 0.0.7 以降は正しい文字セットを直接返すため、そこでは `CONVERT` はもう必要ありません。しかし残しておいても害はなく、以下のすべての例は 0.0.6 以前との互換性のために引き続き `CONVERT` を使っています。キャストの繰り返しを避けるには、`CONVERT` を付けて一度変数に代入し、その変数を再利用してください。
+
+## POST リクエスト {#post-requests}
+
+`http_post(url, content_type, body)` は本文付きの POST を送ります。
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_post(
+    'https://httpbin.org/post',
+    'application/json',
+    '{"name": "widget", "qty": 3}'
+  ) USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status') AS status,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+## カスタムヘッダーとその他のメソッド {#custom-headers-and-other-methods}
+
+`http_request(method, url, headers_json, body, content_type, options_json)` は、カスタムヘッダー付きの任意のメソッドを扱います。
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_request(
+    'GET',
+    'https://api.example.com/secure',
+    '{"Authorization": "Bearer mytoken", "Accept": "application/json"}',
+    NULL,
+    NULL,
+    NULL
+  ) USING utf8mb4
+);
+```
+
+`headers_json` 引数は、キーがヘッダー名で値がヘッダー値の JSON オブジェクトです。
+
+### 利用できるすべての関数 {#all-available-functions}
+
+| 関数 | 説明 |
+|:---|:---|
+| `http_get(url)` | GET リクエスト |
+| `http_post(url, content_type, body)` | 本文付きの POST |
+| `http_put(url, content_type, body)` | 本文付きの PUT |
+| `http_delete(url)` | DELETE リクエスト |
+| `http_patch(url, content_type, body)` | 本文付きの PATCH |
+| `http_request(method, url, headers_json, body, content_type, options_json)` | 任意のメソッド、カスタムヘッダー、オプション |
+| `url_encode(text)` | 文字列をパーセントエンコードする |
+| `url_decode(text)` | パーセントエンコードされた文字列をデコードする |
+
+すべての関数は NULL の入力に対して NULL を返します。接続の失敗（接続拒否、DNS の失敗、
+タイムアウト）の場合も、HTTP 関数は NULL を返し、curl のエラーメッセージを含む
+警告を出します。リクエストが消えたように見えるときは、`SHOW WARNINGS` で
+確認してください。
+
+## URL エンコード {#url-encoding}
+
+`url_encode()` と `url_decode()` は、クエリパラメータのパーセントエンコードを扱います。
+
+```sql
+SELECT vsql_http.url_encode('hello world & more');
+-- → hello%20world%20%26%20more
+
+-- Build a URL with encoded parameters
+SET @q = vsql_http.url_encode('SELECT * FROM users');
+SET @url = CONCAT('https://api.example.com/search?q=', @q);
+SET @resp = CONVERT(vsql_http.http_get(@url) USING utf8mb4);
+```
+
+## 既知の制限 {#known-limitations}
+
+**256KB のレスポンス上限** — 256KB を超えるレスポンスは切り詰められます。これは SQL クエリで使われる典型的な API ペイロードを十分に扱えますが、大きなファイルのダウンロードには適していません。この上限で切られたレスポンスは有効な JSON ではなくなります。`JSON_EXTRACT`/`JSON_UNQUOTE` はそれに対して `ERROR 3141` を発生させますが、`JSON_VALUE` はデフォルトの `NULL ON ERROR` 動作のもとで、エラーではなく `Warning 3141` とともに NULL を返します。
+
+**`JSON_VALUE` のサイズ制限** — 抽出した値が MySQL の内部サイズ制限を超えると、`JSON_VALUE` は NULL を返します。大きなレスポンス本文には、代わりに `JSON_UNQUOTE(JSON_EXTRACT(...))` を使ってください。
+
+```sql
+-- Use JSON_UNQUOTE + JSON_EXTRACT for large content fields
+SELECT JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+**同期的** — すべての HTTP 呼び出しは、完了するかタイムアウトするまでブロックします。`max_execution_time` は、ブロックしている `vsql_http` の呼び出しを制限も中断もしません。遅い、または到達できないエンドポイントは、それ自身の接続/読み取りタイムアウトの間、ステートメントを保持し続けます。`http_get`/`http_post`/`http_put`/`http_delete`/`http_patch` はオプションを受け取りません。`http_request(method, url, headers_json, body, content_type, options_json)` だけが、`options_json` 引数の中で秒単位の `{"timeout": N}` としてタイムアウトを受け取ります（デフォルトは 30）。短くする必要があるときは、省略形の関数の代わりに `http_request` を使ってください（[HTTP Webhook](/ja/guides/http-webhooks)を参照）。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.http_get does not exist` | `INSTALL EXTENSION vsql_http` を実行します |
+| NULL が返る | 接続の失敗か NULL の入力です。`SHOW WARNINGS` で curl のエラーメッセージを確認し、URL を検証し、サーバーホストからのネットワークアクセスを確認します |
+| `JSON_VALUE` が NULL を返す | レスポンス本文が大きすぎます。`JSON_UNQUOTE(JSON_EXTRACT(...))` を使います |
+| JSON の解析結果が壊れている | `CONVERT(... USING utf8mb4)` を忘れています。関数呼び出しを包みます |
+| クエリがタイムアウトする | リクエスト自体に `{"timeout": N}` オプションを設定します。`max_execution_time` はブロックしている `vsql_http` の呼び出しに効果がありません |
+
+## 次のステップ {#next-steps}
+
+- [API データで行を拡充する](/ja/guides/rest-api-enrichment) — 外部のライブデータをクエリ結果に取り込む
+- [トリガーから Webhook を送信する](/ja/guides/http-webhooks) — 行の変更を外部サービスに自動でプッシュする
+
+## 関連項目 {#see-also}
+
+- [外部 API データで行を拡充する](/ja/guides/rest-api-enrichment) — HTTP ベースのデータ拡充の実践的なパターン
+- [トリガーからの Webhook の送信](/ja/guides/http-webhooks) — トリガーからのイベント駆動の HTTP 呼び出し
+- [MySQL の JSON](/ja/guides/json-in-mysql) — HTTP リクエストが返す JSON レスポンスの解析
+- [テーブルを REST API として公開する](/ja/guides/rest-api-from-tables) — リクエストを送る代わりに HTTP に応答する同じサーバー

@@ -1,0 +1,209 @@
+---
+title: "MySQL の WITH ROLLUP"
+sidebarTitle: "WITH ROLLUP"
+description: "WITH ROLLUP が MySQL の GROUP BY の結果に小計と合計の行を追加する仕組み、それらの行の NULL の意味、および GROUPING がそれらを本物の NULL と見分ける方法。"
+keywords: "mysql with rollup, group by with rollup, mysql subtotal row, mysql grouping function, mysql total row sql, mysql rollup null"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`GROUP BY` はグループごとに 1 行を返し、全体の行は返しません。`WITH ROLLUP` は
+その行を追加し、複数の列でグループ化したときはその間の小計も追加します。2 つ目の
+クエリを実行して自分で数を足し合わせる手間を省きます。
+
+始める前に、`mysql -u root -p sakila` でクライアントを開いてください。
+
+## WITH ROLLUP の仕組み {#how-with-rollup-works}
+
+```sql
+SELECT GROUPING_COLUMN, AGGREGATE_FUNCTION(COLUMN_NAME)
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN WITH ROLLUP;
+```
+
+`GROUPING_COLUMN` をグループを定義する列に、`TABLE_NAME` をテーブルに、
+`AGGREGATE_FUNCTION(COLUMN_NAME)` をグループごとに計算するものに置き換えます。
+`WITH ROLLUP` は `GROUP BY` 句の末尾に置きます。
+
+サーバーは通常のグループを返し、次に、あるグループ化列を脇に置いてその集約が
+全体を対象とする追加の行を返します。脇に置いた列には NULL を入れるので、それで
+それらの行を見分けられます。
+
+## 例 {#examples}
+
+### 1) 合計行を追加する {#1-add-a-total-row}
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
+| NC-17  |   210 |
+| NULL   |  1000 |
++--------+-------+
+6 rows in set (0.00 sec)
+```
+
+5 行ではなく 6 行です。最後の行はレーティングがあるべき場所に NULL があり、
+その件数はテーブル全体です。
+
+### 2) 小計も {#2-subtotals-as-well}
+
+2 つの列でグループ化すると、1 番目の列の値ごとの小計と、次に総合計が得られます。
+
+```sql
+SELECT rating, rental_rate, COUNT(*) AS films
+FROM film
+WHERE length = 185
+GROUP BY rating, rental_rate WITH ROLLUP;
+```
+
+```text
++--------+-------------+-------+
+| rating | rental_rate | films |
++--------+-------------+-------+
+| G      |        2.99 |     1 |
+| G      |        4.99 |     2 |
+| G      |        NULL |     3 |
+| PG     |        2.99 |     1 |
+| PG     |        NULL |     1 |
+| PG-13  |        2.99 |     2 |
+| PG-13  |        4.99 |     1 |
+| PG-13  |        NULL |     3 |
+| R      |        2.99 |     1 |
+| R      |        4.99 |     2 |
+| R      |        NULL |     3 |
+| NULL   |        NULL |    10 |
++--------+-------------+-------+
+12 rows in set (0.00 sec)
+```
+
+行は、どの列が NULL かで読みます。`G / NULL / 3` は、すべての料金にわたる `G`
+の小計です。`NULL / NULL / 10` は総合計で、185 分の映画が 10 本あることと
+一致します。
+
+ロールアップの行は、一番下にまとめられるのではなく、それが要約するグループの
+後に続くため、結果は上から下へレポートとして読めます。
+
+## ロールアップの NULL を本物の NULL と見分ける {#telling-a-rollup-null-from-a-real-one}
+
+ロールアップの行の NULL は「この列のすべての値」を意味します。データ内の NULL
+は「値が記録されていない」を意味します。両者は同じように表示されるため、NULL
+になりうる列では、見ただけでは 2 つを区別できません。
+
+`GROUPING()` がこの問いに直接答えます。その行でその列が脇に置かれたときは 1 を、
+それ以外は 0 を返します。
+
+```sql
+SELECT rating, GROUPING(rating) AS is_total, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++--------+----------+-------+
+| rating | is_total | films |
++--------+----------+-------+
+| G      |        0 |   178 |
+| PG     |        0 |   194 |
+| PG-13  |        0 |   223 |
+| R      |        0 |   195 |
+| NC-17  |        0 |   210 |
+| NULL   |        1 |  1000 |
++--------+----------+-------+
+6 rows in set (0.00 sec)
+```
+
+Sakila では `rating` が NULL になることはないため、ここでは 2 つの問いの答えは
+同じです。実際に NULL を保持する列では、`rating IS NULL` のテストは両方の種類の
+行を捕まえ、`GROUPING(rating) = 1` はロールアップだけを捕まえます。
+
+## ORDER BY は合計を動かし、並び順を変える {#order-by-moves-the-total-and-changes-the-sort}
+
+上の例に `ORDER BY` がないのは意図的です。`WITH ROLLUP` は各ロールアップ行を
+それが要約するグループの直下に置き、並べ替えはその配置を捨ててしまいます。
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| NULL   |  1000 |
+| G      |   178 |
+| NC-17  |   210 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
++--------+-------+
+6 rows in set (0.00 sec)
+```
+
+2 つのことが動きました。総合計が先頭に並び替えられました。NULL はすべての
+実際の値より前に並ぶためです。そして、レーティングが [GROUP BY](/ja/tutorial/group-by)
+が示した `ENUM` の宣言順ではなくアルファベット順で出てきました。ロールアップ
+結果の並べ替えはテキストとして並べ替えるためです。
+
+ですから、どちらが欲しいかを決めてください。グループの下に小計が並ぶレポート
+として読むには `ORDER BY` を付けず、付けるなら、ロールアップの行が並べ替えに
+よって置かれる場所に落ち着くことを受け入れます。
+
+## ロールアップの行にラベルを付ける {#labeling-the-rollup-rows}
+
+NULL の列はレポートに欲しいものではありません。`COALESCE` は NULL でない最初の
+引数を返すため、代わりにそこに言葉を入れます。
+
+```sql
+SELECT COALESCE(rating, 'All ratings') AS label, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++-------------+-------+
+| label       | films |
++-------------+-------+
+| G           |   178 |
+| PG          |   194 |
+| PG-13       |   223 |
+| R           |   195 |
+| NC-17       |   210 |
+| All ratings |  1000 |
++-------------+-------+
+6 rows in set (0.00 sec)
+```
+
+これは読みやすく、ここで安全なのはデータ内の `rating` が NULL になることが
+ないからにすぎません。NULL になりうる列では、`COALESCE` は本物の欠損値に合計の
+ラベルを付けてしまうため、代わりにテストで `GROUPING()` を使ってください。
+
+## まとめ {#summary}
+
+- 小計と合計の行を得るには、`GROUP BY` の末尾に `WITH ROLLUP` を追加します。
+- グループ化列の NULL は「この列のすべての値」として読みます。
+- 複数の列でグループ化すると、先行する各列の値ごとに小計が得られると考えてください。
+- ロールアップの行とデータが NULL の行を見分けるには `GROUPING(column)` を使います。
+- `ORDER BY` はロールアップの行を動かし、`ENUM` をテキストとして並べ替えると考えてください。
+
+## 関連項目 {#see-also}
+
+- [GROUP BY](/ja/tutorial/group-by) — これが合計を追加するグループ
+- [集計関数](/ja/tutorial/aggregate-functions) — 合計されるもの
+- [IS NULL](/ja/tutorial/is-null) — その列の NULL が持ちうるもう 1 つの意味
+- [MySQL の GROUP BY のパフォーマンス](/ja/guides/group-by-having) — 大規模なグループ化のコスト

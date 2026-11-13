@@ -1,0 +1,164 @@
+---
+title: "トリガーからの Webhook の送信"
+sidebarTitle: "HTTP Webhook"
+description: "VillageSQL の vsql_http 拡張機能を使って MySQL のトリガーから HTTP Webhook を送信する方法。INSERT、UPDATE、または DELETE のときに、行の変更を外部サービスに自動でプッシュします。"
+keywords: "mysql webhook trigger, mysql http trigger, mysql after insert webhook, mysql push notification, vsql_http trigger"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+外部システムをデータベースと同期させるには、通常ポーリングが必要です。外部サービスが定期的にあなたの API に変更を問い合わせるか、アプリケーションコードが書き込みのたびにイベントを発行します。VillageSQL の `vsql_http` 拡張機能を使うと、トリガーが HTTP リクエストを直接送れるため、行が変わった瞬間に外部システムへ通知が届き、アプリケーション層でのイベント発行は不要になります。
+
+## セットアップ {#setup}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+## 基本的な Webhook トリガー {#basic-webhook-trigger}
+
+Webhook エンドポイントにペイロードを POST する `AFTER INSERT` トリガーです。
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',     'order.created',
+    'id',        NEW.id,
+    'customer',  NEW.customer_id,
+    'total',     NEW.total,
+    'status',    NEW.status
+  );
+  SET @ignored = vsql_http.http_post(
+    'https://hooks.example.com/orders',
+    'application/json',
+    @payload
+  );
+END$$
+DELIMITER ;
+```
+
+結果は `@ignored` に代入されます。トリガーはレスポンスを使いませんが、代入によって「結果が使われていない」という警告が抑えられます。NULL は接続が失敗したことを意味します。いずれの場合もトリガーは完了し、INSERT は実行されます。
+
+## タイムアウトの制御 {#controlling-timeouts}
+
+デフォルトでは、`vsql_http` は 30 秒のタイムアウトを使います。遅い、または利用できない Webhook エンドポイントは、その間書き込みをブロックします。より厳しい期限を設定するには、オプションを指定する JSON を付けて `http_request()` を使います。
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',    'order.created',
+    'id',       NEW.id,
+    'customer', NEW.customer_id,
+    'total',    NEW.total
+  );
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    NULL,
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+3 秒のタイムアウトは、Webhook の遅延が書き込みを止められる時間に上限を設けます。リクエストは完了するか諦めるかのどちらかで、INSERT はロールバックされません。
+
+## UPDATE と DELETE のトリガー {#update-and-delete-triggers}
+
+同じパターンは更新と削除でも機能します。以前の値を含めるには `OLD` を使います。
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_update
+  AFTER UPDATE ON orders
+  FOR EACH ROW
+BEGIN
+  IF NEW.status != OLD.status THEN
+    SET @payload = JSON_OBJECT(
+      'event',      'order.status_changed',
+      'id',         NEW.id,
+      'old_status', OLD.status,
+      'new_status', NEW.status
+    );
+    SET @ignored = vsql_http.http_request(
+      'POST',
+      'https://hooks.example.com/orders',
+      NULL,
+      @payload,
+      'application/json',
+      '{"timeout": 3}'
+    );
+  END IF;
+END$$
+DELIMITER ;
+```
+
+`IF NEW.status != OLD.status` のガードは、ステータスを変更しない UPDATE ステートメントで Webhook が発火するのを防ぎ、Webhook の量を意味のある変更に比例させます。
+
+## 認証 {#authentication}
+
+API キーやベアラートークンは、`http_request()` の `headers_json` 引数で渡します。
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT('id', NEW.id, 'total', NEW.total);
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    '{"Authorization": "Bearer your-webhook-secret"}',
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+秘密情報はトリガー本体にハードコードするのではなく、設定テーブルに保存し、トリガーの実行時に変数へ取り出してください。
+
+## 重要な注意点 {#important-caveats}
+
+**トリガーは同期的です。** HTTP 呼び出しは、完了するかタイムアウトするまでブロックします。遅い、または停止している Webhook エンドポイントは、そのテーブルへのすべての書き込みを止めます。常に短いタイムアウト（2〜5 秒）を設定し、エンドポイントは即座に応答するように設計してください（処理をインラインで行うのではなく、キューに入れます）。
+
+**失敗してもデフォルトではエラーになりません。** HTTP 呼び出しが NULL を返した場合（接続の失敗）、トリガーはエラーを発生させず、書き込みは成功します。警告には curl のエラーメッセージが含まれますが、トリガーの中でそれを検査するものはありません。2xx 以外のレスポンスもエラーを出さずに返ります。`http_post()` はステータスコードにかかわらず JSON を返し、トリガーはそれを検査しません。確実な配信が重要な場合は、代わりにトランザクショナルアウトボックスパターンを使ってください。同じトランザクションの中で `outbox` テーブルにイベントを書き、別のプロセスで配信します。
+
+**トリガーは行ごとに発火します。** `FOR EACH ROW` は、一括の `UPDATE orders SET status = 'shipped'` が 1000 行に当たると、1000 回の Webhook 呼び出しを送ることを意味します。これはエンドポイントに過負荷をかけ、接続数の上限を使い果たすことがあります。一括操作では、トリガーを抑止するかアウトボックスパターンを使ってください。
+
+**再試行のロジックはありません。** 失敗したリクエストは失敗したままです。再試行とデッドレターの処理は、トリガーではなく、受信側のシステムかアウトボックスのプロセスに組み込んでください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| 書き込みが遅くなる | Webhook エンドポイントが遅いです。`http_request()` のオプションで短いタイムアウトを設定します |
+| 作成時にトリガー本体のエラーが出る | `CREATE TRIGGER` の前に `DELIMITER $$` が設定されているか確認します |
+| Webhook が届かない | NULL の戻り値は接続の失敗を意味します。`SHOW WARNINGS` で curl のエラーメッセージを確認し、サーバーホストからのネットワークアクセスを検証します |
+| 一括 UPDATE で Webhook の呼び出しが多すぎる | `IF NEW.col != OLD.col` でガードするか、バッチ操作ではトリガーを抑止します |
+
+## 次のステップ {#next-steps}
+
+- [SQL から HTTP リクエストを送信する](/ja/guides/http-requests-in-mysql) — レスポンスの解析を含む完全な関数リファレンス
+- [API データで行を拡充する](/ja/guides/rest-api-enrichment) — 外部データをテーブルに取り込む
+- [MySQL のトリガー](/ja/guides/triggers) — 一般的なトリガーのパターンと BEFORE と AFTER の意味
+
+## 関連項目 {#see-also}
+
+- [SQL からの HTTP リクエストの送信](/ja/guides/http-requests-in-mysql) — Webhook トリガーで使う vsql_http の関数
+- [MySQL のトリガー](/ja/guides/triggers) — Webhook を発火させるトリガーの仕組み
+- [MySQL での HMAC 署名](/ja/guides/hmac-mysql) — 受信側の検証のために Webhook ペイロードに署名する

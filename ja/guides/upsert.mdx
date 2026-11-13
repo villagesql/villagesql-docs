@@ -1,0 +1,142 @@
+---
+title: "MySQL の UPSERT"
+sidebarTitle: "UPSERT の使用"
+description: "MySQL で UPSERT を行う方法: INSERT ... ON DUPLICATE KEY UPDATE、REPLACE INTO、INSERT IGNORE、それぞれを使うべき場面、および知っておくべき AUTO_INCREMENT の副作用。"
+keywords: "mysql upsert, mysql replace into, mysql insert ignore, mysql replace vs on duplicate key update, mysql upsert auto_increment, mysql upsert concurrency"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL には `UPSERT` キーワードはありませんが、行を挿入するか競合を処理する方法が 3 つあります。`INSERT ... ON DUPLICATE KEY UPDATE`、`REPLACE INTO`、および `INSERT IGNORE` です。これらの動作は大きく異なり、間違ったものを選ぶと、黙ってデータを破損させることがあります。
+
+## INSERT ... ON DUPLICATE KEY UPDATE {#insert--on-duplicate-key-update}
+
+挿入が一意制約（主キーまたは一意インデックス）に違反する場合、MySQL は代わりに `UPDATE` を実行します。
+
+```sql
+CREATE TABLE page_views (
+    page    VARCHAR(255) PRIMARY KEY,
+    views   INT NOT NULL DEFAULT 0,
+    last_at DATETIME
+);
+
+-- First call: inserts the row
+-- Subsequent calls: increments the counter
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW())
+ON DUPLICATE KEY UPDATE
+    views   = views + 1,
+    last_at = NOW();
+```
+
+（既存の行ではなく）挿入しようとした値を参照するには、行エイリアスを使用します。
+
+```sql
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW()) AS new
+ON DUPLICATE KEY UPDATE
+    page_views.views   = page_views.views + new.views,
+    page_views.last_at = new.last_at;
+```
+
+古い `VALUES(col)` 構文も動作しますが、非推奨です。代わりに行エイリアスを使用してください。
+
+```sql
+-- Deprecated — use row aliases instead
+ON DUPLICATE KEY UPDATE views = views + VALUES(views)
+```
+
+## REPLACE INTO {#replace-into}
+
+`REPLACE` は競合する行を削除し、新しい行を挿入します。UPSERT のように見えますが、削除と挿入のように動作します。
+
+```sql
+REPLACE INTO page_views (page, views, last_at)
+VALUES ('/home', 100, NOW());
+```
+
+これは対象テーブルの `BEFORE DELETE` トリガーと `AFTER DELETE` トリガーを発火させ、新しい行のために `AUTO_INCREMENT` カウンターを進めます。この削除は実際の行の削除であるため、参照しているテーブルの `ON DELETE CASCADE` やその他の外部キーアクションは発火します。`REPLACE` に列挙されていない列は、前の行の値ではなくデフォルト値になります。
+
+`REPLACE` は、古い行を完全に破棄したい場合にのみ使用してください。
+
+## INSERT IGNORE {#insert-ignore}
+
+`INSERT IGNORE` はエラーを警告に格下げします。キーの競合ではその行をスキップし、型の不一致や切り捨てでは代わりに強制変換した値を書き込みます。
+
+```sql
+INSERT IGNORE INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW());
+```
+
+`INSERT IGNORE` の問題は、重複だけでなく*すべて*のエラーを抑制することであり、重複以外のケースはスキップされた行よりも深刻です。`INSERT IGNORE INTO page_views (page, views) VALUES ('/new', 'not_a_number')` は、警告だけを出して `('/new', 0)` を挿入します。何もしないのではなく、黙って破損した書き込みを行うのです。結果が本当にどうでもよい場合にのみ使用してください。
+
+## 比較 {#comparison}
+
+| | `ON DUPLICATE KEY UPDATE` | `REPLACE INTO` | `INSERT IGNORE` |
+|:--|:--------------------------|:---------------|:----------------|
+| 競合時 | 指定した列を更新 | 削除して挿入 | 行を破棄 |
+| 既存の値の保持 | あり（何を更新するかを制御できる） | なし。指定しない列はデフォルトにリセット | 該当なし（更新しない） |
+| 発火するトリガー | UPDATE トリガー | 対象テーブルの DELETE トリガーと INSERT トリガー | 競合時にトリガーなし |
+| 外部キーのカスケード | なし | あり。内部の DELETE が発火させる | なし |
+| AUTO_INCREMENT | 競合時に進む | 挿入された行のために新たに進む | 進まない |
+| 使う場面 | 特定のフィールドを更新する必要がある | 行を完全に置き換えたい | 重複を黙ってスキップしたい |
+
+## AUTO_INCREMENT の副作用 {#auto_increment-side-effect}
+
+`ON DUPLICATE KEY UPDATE` は、挿入ではなく更新の経路を取った場合でも `AUTO_INCREMENT` カウンターを進めます。時間とともに、これが連番の欠番を生みます。`page_views` は `page` を主キーとして使用し、`AUTO_INCREMENT` 列を持たないため、この効果を確認するには代理キーを持つテーブルを使用します。
+
+```sql
+CREATE TABLE page_views_by_id (
+    id    INT AUTO_INCREMENT PRIMARY KEY,
+    page  VARCHAR(255) UNIQUE,
+    views INT DEFAULT 0
+);
+INSERT INTO page_views_by_id (page, views) VALUES ('/home', 1);
+INSERT INTO page_views_by_id (page, views) VALUES ('/home', 2) AS new
+    ON DUPLICATE KEY UPDATE views = new.views;  -- updates the existing row
+
+SHOW CREATE TABLE page_views_by_id;  -- AUTO_INCREMENT has advanced anyway
+```
+
+これは想定された動作です。アプリケーションが欠番のない連番に依存する場合は、別のカウンターテーブルを使用するか、アプリケーション側で連番の生成を処理してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### ON DUPLICATE KEY UPDATE はアトミックですか？
+
+はい。挿入の試行と更新は、1 つのアトミックな操作として行われます。存在確認と挿入の間の競合状態を避けるために、トランザクションで包む必要はありません。
+
+#### 複数の一意インデックスが競合した場合はどうなりますか？
+
+挿入が複数の一意制約に同時に違反する場合、MySQL は 1 行だけを更新します。どの行かは未定義です。1 つの INSERT が複数の一意インデックスで競合しうる設計は避けてください。スキーマに重なり合う一意制約がある場合は、動作を慎重にテストしてください。
+
+#### 複数行の挿入で ON DUPLICATE KEY UPDATE を使用できますか？
+
+はい。
+
+```sql
+INSERT INTO page_views (page, views)
+VALUES ('/home', 1), ('/about', 1), ('/contact', 1)
+ON DUPLICATE KEY UPDATE views = views + 1;
+```
+
+競合する各行が、それぞれ自身の更新を引き起こします。行エイリアスを使う場合は、複数行のケースでも `VALUES` を使い、エイリアスには `AS new` を使います。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ON DUPLICATE KEY UPDATE` が発動しない | 競合する列は PRIMARY KEY または UNIQUE インデックスでなければなりません。通常のインデックスでは発動しません |
+| `REPLACE` が指定しなかった列を消去する | 想定された動作です。REPLACE は削除と挿入です。すべての列を指定するか、ON DUPLICATE KEY UPDATE を使用します |
+| `INSERT IGNORE` が本当のエラーを隠す | IGNORE を外し、エラーを再現して根本原因を修正します。IGNORE は重複だけでなくすべてのエラーを隠します |
+| AUTO_INCREMENT の欠番が大きくなる | ON DUPLICATE KEY UPDATE の通常の副作用です。AUTO_INCREMENT の欠番は見た目だけの問題で、正しさには影響しません |
+
+## 関連項目 {#see-also}
+
+- [MySQL のトランザクション](/ja/guides/transactions) — UPSERT をトランザクションで包むべき場合
+- [MySQL のデッドロック](/ja/guides/deadlocks) — INSERT ... ON DUPLICATE KEY UPDATE は並行実行時にデッドロックを引き起こすことがあります
+- [MySQL の一括挿入](/ja/guides/bulk-inserts) — 競合処理の有無にかかわらず、多数の行を高速にロードする
+- [よくある MySQL エラーとその修正方法](/ja/guides/common-mysql-errors) — 重複キーエラーとその意味
+- [MySQL の INSERT ON DUPLICATE KEY UPDATE](/ja/tutorial/upsert) — このステートメント単体の、実例付きの解説

@@ -1,0 +1,243 @@
+---
+title: "Docker 上の MySQL"
+sidebarTitle: "Docker での実行"
+description: "Docker で MySQL 8.4 または VillageSQL を実行する方法 — 公式イメージのセットアップ、永続的な名前付きボリューム、Docker Compose のマルチサービス構成、コンテナ間のネットワーク、およびネイティブインストールやマネージドクラウドより Docker が適切なデプロイ選択になる場合。"
+keywords: "mysql docker, mysql docker container, mysql docker compose, mysql official image, mysql docker volume, docker run mysql, mysql container environment variables, mysql docker connect, mysql docker network, mysql docker persistent data, villagesql docker, mysql docker compose volume"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+公式の MySQL Docker イメージを使うと、完全に設定された MySQL サーバーをコンテナで実行できます。初期化、ユーザー作成、およびデータディレクトリのセットアップを、環境変数を通して自動で処理します。
+
+## クイックスタート {#quick-start}
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -e MYSQL_DATABASE=myapp \
+  -e MYSQL_USER=appuser \
+  -e MYSQL_PASSWORD=apppass \
+  -p 3306:3306 \
+  -d mysql:8.4
+```
+
+ホストマシンから接続します。
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u appuser -p myapp
+```
+
+または、コンテナ内で接続します。
+
+```bash
+docker exec -it mysql-dev mysql -u root -p
+```
+
+## 環境変数 {#environment-variables}
+
+| 変数 | 必須 | 説明 |
+|:---------|:---------|:------------|
+| `MYSQL_ROOT_PASSWORD` | はい（または `ALLOW_EMPTY_PASSWORD` を使用） | root ユーザーのパスワード |
+| `MYSQL_DATABASE` | いいえ | 起動時に作成するデータベース |
+| `MYSQL_USER` | いいえ | 作成する root 以外のユーザー |
+| `MYSQL_PASSWORD` | いいえ | `MYSQL_USER` のパスワード |
+| `MYSQL_ALLOW_EMPTY_PASSWORD` | いいえ | `yes` に設定すると、空の root パスワードを許可します（開発のみ） |
+| `MYSQL_RANDOM_ROOT_PASSWORD` | いいえ | `yes` に設定すると、ランダムな root パスワードを生成します（stdout に記録） |
+| `MYSQL_ONETIME_PASSWORD` | いいえ | `yes` に設定すると、初回ログイン時にパスワードの変更を要求します |
+
+`MYSQL_USER` と `MYSQL_PASSWORD` は一緒に設定する必要があります。作成されたユーザーは `MYSQL_DATABASE` への完全なアクセス権を受け取ります。
+
+## ボリュームによる永続データ {#persistent-data-with-volumes}
+
+ボリュームがないと、コンテナを削除したときにすべてのデータが失われます。データディレクトリを永続化するには、ボリュームをマウントします。
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v mysql-data:/var/lib/mysql \
+  -p 3306:3306 \
+  -d mysql:8.4
+```
+
+名前付きボリューム（`mysql-data`）は、コンテナの再起動と削除をまたいで永続します。代わりにホストのディレクトリを使うには次のようにします。
+
+```bash
+-v /path/on/host:/var/lib/mysql
+```
+
+データディレクトリは MySQL のデータとログを所有します。実行中の 2 つの MySQL コンテナの間でボリュームを共有しないでください。
+
+## イメージとボリューム戦略の選択 {#choosing-an-image-and-volume-strategy}
+
+| | 公式 `mysql:8.4` | `villagesql/server:latest` |
+|:---|:---|:---|
+| ベース | MySQL 8.4 | MySQL 8.4 追跡フォーク |
+| 拡張機能 | 組み込みなし | VEF フレームワーク。`.veb` バンドルをインストール |
+| ドロップイン代替 | — | はい。同じワイヤプロトコル、同じクライアントツール |
+| イメージの入手先 | Docker Hub | Docker Hub（`villagesql/server`） |
+| 使う場面 | 標準的な MySQL ワークロード | カスタム型、VDF 関数、または VEF 拡張機能が必要 |
+
+| ボリュームの種類 | 永続性 | パフォーマンス | 可搬性 |
+|:---|:---|:---|:---|
+| 名前付きボリューム（`-v mysql-data:/var/lib/mysql`） | `docker rm` 後も残る | Docker が管理。すべてのプラットフォームで良好 | `docker volume` コマンドでバックアップが容易 |
+| バインドマウント（`-v /host/path:/var/lib/mysql`） | コンテナ削除後も残る | macOS/Windows では遅い（ファイルシステムの変換） | ホストから直接アクセス。ファイルの確認が容易 |
+| ボリュームなし（コンテナ層） | `docker rm` で失われる | 最速の書き込み（一時的） | 開発/テストのみ。保持したいデータには決して使わない |
+
+ほとんどのワークロードでは、名前付きボリュームが正しいデフォルトです。バインドマウントは、ホストからデータディレクトリを直接確認または編集する必要があるときに役立ちますが、macOS と Windows ではパフォーマンスのコストが問題になります。
+
+## Docker Compose {#docker-compose}
+
+複数のサービスを持つ開発環境では、Docker Compose が標準的なアプローチです。
+
+```yaml
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: myapp
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppass
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: myapp
+      DB_USER: appuser
+      DB_PASSWORD: apppass
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+```
+
+`healthcheck` と `depends_on: condition: service_healthy` の組み合わせにより、MySQL が単に起動しただけでなく、接続を受け付ける準備ができるまで、アプリケーションコンテナは起動しません。
+
+## カスタム設定 {#custom-configuration}
+
+カスタムの `my.cnf` をマウントして渡します。
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v /path/to/my.cnf:/etc/mysql/conf.d/custom.cnf:ro \
+  -d mysql:8.4
+```
+
+または、コマンド引数でオプションを直接設定します。
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -d mysql:8.4 \
+  --innodb-buffer-pool-size=512M \
+  --max-connections=200
+```
+
+## 初期化スクリプト {#initialization-scripts}
+
+コンテナは、初回起動時（データディレクトリが空のとき）に、`/docker-entrypoint-initdb.d/` に置かれた `.sql` または `.sh` ファイルを実行します。
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v /path/to/init-scripts:/docker-entrypoint-initdb.d:ro \
+  -d mysql:8.4
+```
+
+SQL ファイルは root として実行されます。シェルスクリプトはコンテナ環境で実行されます。これらのスクリプトは最初の初期化時にだけ実行され、その後のコンテナ起動時には実行されません。
+
+## アプリケーションからの接続 {#connecting-from-applications}
+
+Docker Compose のネットワーク内では、コンテナはサービス名で MySQL に接続します。
+
+```
+DB_HOST=db   # service name in docker-compose.yml
+DB_PORT=3306
+```
+
+ホストマシンからは、`127.0.0.1` 経由で接続します（`localhost` ではありません。MySQL のソケットはホストでは使えません）。
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=3306
+```
+
+## Docker で MySQL を実行すべき場合 {#when-to-run-mysql-in-docker}
+
+| シナリオ | Docker | ネイティブインストール | マネージドクラウド（RDS、Cloud SQL） |
+|:---|:---|:---|:---|
+| ローカル開発 | 最適。隔離され、再現可能で、破棄が容易 | 動くが、リセットが難しい | 過剰。コストとネットワーク遅延が増える |
+| CI/CD パイプライン | 最適。実行ごとに新しいインスタンスを起動 | 可能だがプロビジョニングが遅い | 可能。実行ごとにコストが増える |
+| ステージング環境 | 良い。Compose で本番のトポロジーを再現 | ホストが専用なら問題なし | 本番もマネージドなら良い |
+| 本番（単一サーバー） | 名前付きボリュームと適切なバックアップがあれば問題なし | 問題なし。運用がわずかに単純 | マネージドのバックアップ、HA、フェイルオーバーが加わる |
+| 本番（高可用性） | オーケストレーションが必要（Kubernetes、Swarm） | 手動でレプリケーションを構築 | 最適。HA が組み込み |
+| VillageSQL の拡張機能が必要 | `villagesql/server` イメージを使用 | ソースからビルド | マネージドサービスでは利用不可 |
+| コンプライアンス / データの所在 | ポリシーを確認。データはホスト上に残る | 明確。データはホスト上に残る | プロバイダーのリージョン設定次第 |
+
+## 本番での考慮事項 {#production-considerations}
+
+いくつかの注意点を守れば、Docker は本番の MySQL でもうまく動きます。
+
+- **データの永続化**: 名前付きボリュームまたはバインドマウントを使います。MySQL のデータをコンテナ層に置いたままにしないでください。
+- **メモリ制限**: MySQL がホストのメモリを使い果たさないように Docker で `--memory` を設定し、`innodb_buffer_pool_size` をそれに合わせて調整します。
+- **バックアップ**: `mysqldump` はコンテナ内で動きます: `docker exec mysql-dev mysqldump -u root -p myapp > backup.sql`
+- **ログ**: Docker では MySQL のログは stdout/stderr に出ます。`docker logs mysql-dev` を使うか、ロギングドライバーを設定します。
+- **アップグレード**: 新しいイメージタグを pull し、古いコンテナを停止し、同じボリュームで新しいコンテナを起動します。新しいバージョンでの初回起動時に、MySQL のアップグレード処理が自動で実行されます。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### ホストから `mysql -h localhost` で接続できないのはなぜですか? {#why-cant-i-connect-with-mysql--h-localhost-from-the-host}
+
+Linux と macOS では、`localhost` を指定すると MySQL クライアントは Unix ソケット経由で接続しようとしますが、ホストではそのソケットは使えません。`127.0.0.1` を明示的に使ってください: `mysql -h 127.0.0.1 -P 3306`。
+
+#### Docker で MySQL のデータを永続化するにはどうすればよいですか? {#how-do-i-make-mysql-data-persist-in-docker}
+
+コンテナの起動時に名前付きボリュームを `/var/lib/mysql` にマウントします: `-v mysql-data:/var/lib/mysql`。これがないと、すべてのデータはコンテナの書き込み可能な層に保存され、`docker rm` を実行すると失われます。名前付きボリュームはコンテナの削除後も残り、Docker が管理します。`docker volume ls` で一覧にし、`docker volume inspect mysql-data` で保存場所を確認できます。Docker Compose では、トップレベルの `volumes:` キーの下でボリュームを宣言し、サービスの `volumes:` リストでそれを参照します（上の Docker Compose セクションの例がこのパターンを示しています）。
+
+#### Docker Compose のコンテナは MySQL にどう接続しますか? {#how-do-containers-in-docker-compose-connect-to-mysql}
+
+同じ Compose プロジェクト内のコンテナは、デフォルトのネットワークを共有します。アプリケーションコンテナは、サービス名をホスト名として MySQL に接続します。データベースのサービス名が `db` なら、接続文字列は `host=db port=3306` です。コンテナ間でポートを公開する必要はありません。ポートマッピング（`-p 3306:3306`）は、ホストマシンからの接続にだけ必要です。MySQL の準備ができる前にアプリケーションが起動しないように、MySQL サービスの `healthcheck` とともに `depends_on: condition: service_healthy` を使ってください。
+
+#### 実行中のコンテナに対して SQL ファイルを実行するにはどうすればよいですか? {#how-do-i-run-a-sql-file-against-a-running-container}
+
+```bash
+docker exec -i mysql-dev mysql -u root -p myapp < /path/to/script.sql
+# or from within the container:
+docker exec -it mysql-dev mysql -u root -p myapp -e "SOURCE /tmp/script.sql"
+```
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| コンテナが即座に終了する | `docker logs mysql-dev` を確認します。`MYSQL_ROOT_PASSWORD` の不足か、ボリュームの権限の問題です |
+| `ERROR 2002: Can't connect to local MySQL server through socket` | ソケットではなく TCP（`-h 127.0.0.1`）で接続します。Unix ソケットはホストにはありません |
+| MySQL の準備ができる前にアプリケーションが起動する | `healthcheck` を追加し、Compose で `depends_on: condition: service_healthy` を使います |
+| `docker rm` の後にデータが失われた | ボリュームがマウントされていませんでした。`-v mysql-data:/var/lib/mysql` でコンテナを作り直します |
+| 初期化スクリプトが実行されなかった | データディレクトリが空のとき（初回セットアップ）にだけ実行されます。再初期化するには、ボリュームを削除して再起動します |
+
+このページのすべての内容は、`villagesql/server` イメージでも動きます。VillageSQL は拡張機能を備えた MySQL のドロップイン代替であるため、上の compose ファイル、ボリューム、およびヘルスチェックは、イメージ名を 1 か所変えるだけでそのまま使えます。[Docker で試す](https://villagesql.com/install)。
+
+## 関連項目 {#see-also}
+
+- [MySQL のレプリケーションの基本](/ja/guides/replication-basics) — Docker Compose でソース/レプリカのペアを実行する
+- [MySQL のバックアップ戦略](/ja/guides/backup-strategies) — コンテナ化された MySQL のデータボリュームをバックアップする
+- [MySQL からのアップグレード](/ja/guides/upgrade) — コンテナを MySQL から VillageSQL に移す
+- [Kubernetes 上での MySQL の実行](/ja/guides/mysql-on-kubernetes) — コンテナオーケストレーションの次の段階
+- [MySQL チュートリアル用のサーバーのインストール](/ja/tutorial/install-mysql) — SQL を学ぶためのサーバーを用意する

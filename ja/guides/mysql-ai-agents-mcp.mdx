@@ -1,0 +1,396 @@
+---
+title: "MCP で AI エージェントを MySQL に接続する"
+sidebarTitle: "AI エージェントの接続 (MCP)"
+description: "vsql_mcp 拡張機能を使って、Model Context Protocol 経由で VillageSQL データベースを AI エージェントに公開する方法 — インストール、最小権限のデータベースアカウント、ガードレール、および実際のクライアント接続。"
+keywords: "mysql mcp, model context protocol mysql, vsql_mcp, mysql ai agent, claude code mysql, mcp server mysql, ai agent database access, mcp streamable http"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+データベースにクエリする必要のある AI エージェントは、通常、手書きのツールやサイドカープロセスを通してデータベースと会話します。`vsql_mcp` 拡張機能はその層を取り除きます。VillageSQL プロセス自体の内部で Model Context Protocol サーバーを実行するため、あらゆる MCP クライアントがスキーマを発見し、クエリを直接実行できます。
+
+## vsql_mcp の機能 {#what-vsql_mcp-does}
+
+`vsql_mcp` は Rust 製の拡張機能で、サーバープロセス内のバックグラウンドワーカーから、Streamable HTTP トランスポート（仕様リビジョン `2025-06-18`）で MCP を提供します。6 つのツールを公開します: `list_schemas`、`list_tables`、`describe_table`、`query`、`explain`、および `write` です。`write` ツールは有効にした場合にだけ現れ、デフォルトでは無効です。
+
+`vsql_mcp` はプレビュー拡張機能です。VEF のプレビュー機能である `thread_worker`、`sys_var`、`status_var`、および `sql_query` を使うため、サーバーはプレビュー拡張機能を許可して起動する必要があります。
+
+```bash
+mysqld --vsql_allow_preview_extensions=ON ...
+```
+
+インストールの前にフラグを確認します。
+
+```sql
+SHOW VARIABLES LIKE 'vsql_allow_preview_extensions';
+```
+
+```
++--------------------------------+-------+
+| Variable_name                  | Value |
++--------------------------------+-------+
+| vsql_allow_preview_extensions  | ON    |
++--------------------------------+-------+
+```
+
+## サンプルデータの作成 {#creating-sample-data}
+
+このガイドでは、エージェントがクエリできる実在のものとして、専用のデータベースと小さな `posts` テーブルを使います。
+
+```sql
+CREATE DATABASE mcp_guide;
+
+CREATE TABLE mcp_guide.posts (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  title VARCHAR(200) NOT NULL,
+  author VARCHAR(100) NOT NULL,
+  views INT NOT NULL DEFAULT 0
+);
+
+INSERT INTO mcp_guide.posts (title, author, views) VALUES
+  ('Getting started with VillageSQL', 'Adam', 1520),
+  ('Custom types in VEF', 'Priya', 890),
+  ('Why we built the MCP extension', 'Tomas', 430);
+```
+
+## 拡張機能のインストール {#installing-the-extension}
+
+```sql
+INSTALL EXTENSION vsql_mcp;
+```
+
+インストールすると、その設定変数とステータス変数が登録されます。次のセクションで有効にするまで、どのポートでも待ち受けは始まりません。
+
+## 最小権限アカウントの作成 {#creating-a-least-privilege-account}
+
+`vsql_mcp` は、`query`、`write`、`explain`、およびテーブル DDL リソースを含むほとんどのツール呼び出しを、設定したアカウントを使ってサーバーへのループバック接続で実行します。そのアカウントなしでプロセス内で実行されるのは、`list_schemas`、`list_tables`、および `describe_table` だけです。このガイドが使う 1 つのデータベースに範囲を絞った、`SELECT` のみの専用アカウントを作成します。
+
+```sql
+CREATE USER 'mcp_user'@'127.0.0.1' IDENTIFIED BY 'ChangeMe-guide-2026!';
+GRANT SELECT ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+このアカウントの権限が、実際のアクセス境界です。後述する `vsql_mcp` 自身のガードレールは、これらの権限の代わりではなく、その上に重ねて適用されます。
+
+## サーバーの設定と有効化 {#configuring-and-enabling-the-server}
+
+`vsql_mcp` のすべての設定は `SET GLOBAL vsql_mcp.<name>` 変数です。`db_url` を上で作成したアカウントに向け、サーバーを 1 つのスキーマに絞り、ベアラートークンを必須にして、有効にします。
+
+```sql
+SET GLOBAL vsql_mcp.db_url = 'mysql://mcp_user:ChangeMe-guide-2026!@127.0.0.1:3306/mcp_guide';
+SET GLOBAL vsql_mcp.schema = 'mcp_guide';
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'a-long-random-token';
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+```
+
+待ち受けていることを確認します。
+
+```sql
+SHOW STATUS LIKE 'vsql_mcp%';
+```
+
+```
++----------------------------+-------+
+| Variable_name              | Value |
++----------------------------+-------+
+| vsql_mcp.http_port         | 3100  |
+| vsql_mcp.https_port        | 0     |
+| vsql_mcp.rows_returned_total | 0   |
+| vsql_mcp.sessions_active   | 0     |
+| vsql_mcp.tool_calls_total  | 0     |
+| vsql_mcp.tool_errors_total | 0     |
++----------------------------+-------+
+```
+
+`http_port` はデフォルトの `3100` を示しています。サーバーは `http://127.0.0.1:3100/mcp` で待ち受け、`127.0.0.1` にのみバインドします。リモート接続を直接受け付けることはありません。それが必要なら、リバースプロキシの背後に置くのはあなたの責任です。
+
+## サーバーが MCP を話すことの検証 {#verifying-the-server-speaks-mcp}
+
+実際のクライアントを接続する前に、MCP のハンドシェイクで HTTP エンドポイントを直接検証します。ベアラートークンのないリクエストは拒否されます。
+
+```bash
+curl -i -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
+```
+
+```
+HTTP/1.1 401 Unauthorized
+```
+
+トークンがあれば `initialize` は成功し、`Mcp-Session-Id` ヘッダーを返します。
+
+```bash
+curl -i -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
+```
+
+```
+HTTP/1.1 200 OK
+Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606
+
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.7"}}}
+```
+
+この接続での以降のすべてのリクエストには、このセッション ID が必要です。省略すると、黙ってデフォルトになるのではなく、JSON-RPC エラーで失敗します。
+
+```bash
+curl -i -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -d '{"jsonrpc":"2.0","id":99,"method":"tools/list"}'
+```
+
+```
+HTTP/1.1 400 Bad Request
+
+{"error":{"code":-32600,"message":"missing Mcp-Session-Id header"},"id":99,"jsonrpc":"2.0"}
+```
+
+`notifications/initialized` を送ってから、`initialize` のレスポンスから得たセッション ID を使って、利用可能なツールを一覧にします。
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+```
+
+```json
+{"id":2,"jsonrpc":"2.0","result":{"tools":[
+  {"name":"list_schemas","description":"List schemas visible to the extension.","inputSchema":{"properties":{},"type":"object"}},
+  {"name":"list_tables","description":"List tables and views in a schema, with row estimates.","inputSchema":{"properties":{"schema":{"type":"string"}},"type":"object"}},
+  {"name":"describe_table","description":"Columns, types, and keys for a table.","inputSchema":{"properties":{"schema":{"type":"string"},"table":{"type":"string"}},"required":["table"],"type":"object"}},
+  {"name":"query","description":"Run a single read-only SELECT and return JSON rows.","inputSchema":{"properties":{"sql":{"type":"string"}},"required":["sql"],"type":"object"}},
+  {"name":"explain","description":"Return EXPLAIN FORMAT=JSON for a candidate query.","inputSchema":{"properties":{"sql":{"type":"string"}},"required":["sql"],"type":"object"}}
+]}}
+```
+
+一覧にあるのは 6 つではなく 5 つのツールです。`allow_write` がまだ OFF なので `write` はなく、今接続するエージェントは、使えないツールを前提に計画を立てることがありません。
+
+## MCP 経由でのツールの呼び出し {#calling-tools-over-mcp}
+
+`list_tables` は、公開されたスキーマにある 1 つのテーブルを示します。
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_tables","arguments":{"schema":"mcp_guide"}}}'
+```
+
+```json
+{"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"{\"schema\":\"mcp_guide\",\"tables\":[{\"name\":\"posts\",\"row_estimate\":3,\"type\":\"BASE TABLE\"}]}","type":"text"}],"isError":false}}
+```
+
+`query` は `SELECT` を実行し、実際の行を返します。
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT id, title, author, views FROM mcp_guide.posts ORDER BY views DESC"}}}'
+```
+
+```json
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"{\"columns\":[\"id\",\"title\",\"author\",\"views\"],\"row_count\":3,\"rows\":[{\"author\":\"Adam\",\"id\":1,\"title\":\"Getting started with VillageSQL\",\"views\":1520},{\"author\":\"Priya\",\"id\":2,\"title\":\"Custom types in VEF\",\"views\":890},{\"author\":\"Tomas\",\"id\":3,\"title\":\"Why we built the MCP extension\",\"views\":430}],\"truncated\":false}","type":"text"}],"isError":false}}
+```
+
+これは `posts` テーブルの実際のサンプルデータで、直接の SQL 接続ではなく MCP プロトコルを通して返されたものです。
+
+`query` は単一の読み取り専用ステートメントしか受け付けません。それ以外は、データベースに届く前に拒否されます。
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"query","arguments":{"sql":"DELETE FROM mcp_guide.posts"}}}'
+```
+
+```json
+{"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"only a single read-only statement is allowed by the query tool","type":"text"}],"isError":true}}
+```
+
+## 実際のクライアントの接続 {#connecting-a-real-client}
+
+上の手順は、サーバーが生の HTTP クライアントに正しく応答することを証明します。エージェントが実際に使えることを証明するには、サーバーを Claude Code に登録し、セッションの管理を任せます。
+
+```bash
+claude mcp add --transport http vsql http://127.0.0.1:3100/mcp \
+  --header "Authorization: Bearer a-long-random-token"
+```
+
+```
+Added HTTP MCP server vsql with URL: http://127.0.0.1:3100/mcp to local config
+Headers: {
+  "Authorization": "[REDACTED]"
+}
+File modified: /Users/villageadam/.claude.json [project: /path/to/your/project]
+```
+
+`local config` は、サーバーをこの 1 つのプロジェクトに限定します。すべてのプロジェクトで使えるようにするには、代わりに `--scope user` を渡します。`claude mcp list` は接続状態を示します。
+
+```
+vsql: http://127.0.0.1:3100/mcp (HTTP) - ✔ Connected
+```
+
+Claude Code は自身で `initialize` のハンドシェイクを行い、セッションをネゴシエートし、サーバーが MCP で応答することを確認しました。このガイドが `SET GLOBAL` ステートメントで設定し、上で手作業でテストしたのと同じサーバーです。ここからは、`mcp_guide` データベースについてエージェントに質問すると、curl で示したとおりに `list_tables`、`describe_table`、および `query` を経由します。
+
+`vsql_mcp` に stdio トランスポートはありません。サーバーはデータベースプロセス内で動くため、クライアントが起動する子プロセスはありません。stdio しか話せないクライアントや、ベンダーのクラウド経由でプロキシされて `127.0.0.1` に到達できないリモートクライアントには、エンドポイントの前に stdio から HTTP へのブリッジかトンネルが必要です。
+
+## write ツール {#the-write-tool}
+
+`allow_write` はデフォルトで OFF で、オフのまま `write` を呼び出すと、データベースに触れることなく即座に失敗します。
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"write","arguments":{"sql":"UPDATE mcp_guide.posts SET views = 9999 WHERE id = 1"}}}'
+```
+
+```json
+{"id":6,"jsonrpc":"2.0","result":{"content":[{"text":"the write tool is disabled (set vsql_mcp.allow_write = ON)","type":"text"}],"isError":true}}
+```
+
+`allow_write` を ON にすると、ツールは `tools/list` に現れますが、アカウント自身の権限は引き続き適用されます。`mcp_user` がまだ `SELECT` しか持っていないため、同じ呼び出しは今度はデータベース層で失敗します。
+
+```sql
+SET GLOBAL vsql_mcp.allow_write = ON;
+```
+
+```json
+{"id":8,"jsonrpc":"2.0","result":{"content":[{"text":"ERROR 1142 (42000): UPDATE command denied to user 'mcp_user'@'localhost' for table 'posts'","type":"text"}],"isError":true}}
+```
+
+データベースに対する `UPDATE` を付与すると、同じ呼び出しが通り、実際に行が変更されます。
+
+```sql
+GRANT UPDATE ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+```json
+{"id":9,"jsonrpc":"2.0","result":{"content":[{"text":"{\"affected_rows\":1}","type":"text"}],"isError":false}}
+```
+
+```sql
+SELECT id, title, views FROM mcp_guide.posts WHERE id = 1;
+```
+
+```
++----+----------------------------------+-------+
+| id | title                            | views |
++----+----------------------------------+-------+
+|  1 | Getting started with VillageSQL | 9999  |
++----+----------------------------------+-------+
+```
+
+`allow_write` とアカウントの権限は 2 つの別々のゲートで、実際の書き込みには両方が開いている必要があります。`max_rows` が読み取りを制限するような行数の上限は、書き込みにはありません。条件のない `DELETE` は、他のどの設定に関わらずテーブルを空にします。本番データベースへの書き込みアクセスを持つエージェントは、広い書き込みアクセスを持つ他の自律プロセスと同じリスクを伴います。エージェントにとっては筋が通っていてもあなたにとってはそうでない計画に基づいて、人間のレビュー手順が捕まえるより速く行動する可能性があります。`db_url` には、受け入れられる影響範囲に正確に一致する権限を持つアカウントを与え、`allow_write` は、デモで必要だったからと放置するデフォルトではなく、データベースごとに下す決定として扱ってください。
+
+このガイドでは、先に進む前に `allow_write` をオフに戻し、`UPDATE` を取り消します。これは、エージェントが常時アクセスできるデータベースにとって、より安全な通常状態でもあります。
+
+```sql
+REVOKE UPDATE ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+```
+
+## エージェントの到達範囲を絞る {#narrowing-what-an-agent-can-reach}
+
+2 つの設定が、アカウントの権限だけよりもさらにエージェントの到達範囲を絞ります。1 つのアカウントが `vsql_mcp` 以外にも使われている場合に役立ちます。
+
+`max_rows` は、1 回の `query` 呼び出しが返す行数を制限し、結果に `truncated` の印を付けます。
+
+```sql
+SET GLOBAL vsql_mcp.max_rows = 2;
+```
+
+```json
+{"id":10,"jsonrpc":"2.0","result":{"content":[{"text":"{\"columns\":[\"id\",\"title\"],\"row_count\":2,\"rows\":[{\"id\":1,\"title\":\"Getting started with VillageSQL\"},{\"id\":2,\"title\":\"Custom types in VEF\"}],\"truncated\":true}","type":"text"}],"isError":false}}
+```
+
+`allowed_tables` は、ステートメントが触れてよいテーブルを制限します。これは、`EXPLAIN FORMAT=JSON` でステートメントの実行計画を作成することで検査されます。2 つ目のテーブルを追加して、適用されるところを見てみます。
+
+```sql
+CREATE TABLE mcp_guide.secrets (id INT PRIMARY KEY AUTO_INCREMENT, api_key VARCHAR(200) NOT NULL);
+INSERT INTO mcp_guide.secrets (api_key) VALUES ('sk-do-not-expose-this');
+GRANT SELECT ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+同じスキーマに `secrets` があり、`allowed_tables` を `posts` のみに設定した状態では、`posts` は引き続き動き、`secrets` は拒否されます。
+
+```sql
+SET GLOBAL vsql_mcp.allowed_tables = 'posts';
+```
+
+```json
+{"id":12,"jsonrpc":"2.0","result":{"content":[{"text":"table 'secrets' is not in vsql_mcp.allowed_tables","type":"text"}],"isError":true}}
+```
+
+`list_tables` も除外されたテーブルの名前を出さなくなるため、`list_tables` だけを頼りに作業するエージェントは、`secrets` の存在を知ることがありません。
+
+```json
+{"id":13,"jsonrpc":"2.0","result":{"content":[{"text":"{\"schema\":\"mcp_guide\",\"tables\":[{\"name\":\"posts\",\"row_estimate\":3,\"type\":\"BASE TABLE\"}]}","type":"text"}],"isError":false}}
+```
+
+この許可リストの判定は、アカウントの権限から読み取るのではなく、ステートメントの実行計画に含まれるテーブルに基づいて行われます。そのため、ストアド関数の中までは見通せず、`db_url` のアカウントが呼び出せる関数を読み取りツールが呼ぶことも止めません。`allowed_tables` と `max_rows` は、アカウントの権限の上に重ねるガードレールとして扱い、権限そのものを絞ることの代わりにはしないでください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### エージェントはデータベースの認証情報に直接アクセスする必要がありますか? {#does-an-agent-need-direct-access-to-the-database-credentials}
+
+いいえ。エージェントは、`vsql_mcp.bearer_token` に設定したベアラートークンで `vsql_mcp` に対して認証します。`vsql_mcp.db_url` が指定するデータベースアカウントは、拡張機能がツールのクエリを実行するために内部でだけ使われます。エージェントがそのアカウントのパスワードを見ることはありません。
+
+#### 複数のスキーマを公開できますか? {#can-i-expose-more-than-one-schema}
+
+はい。ただし、`vsql_mcp.schema` を空のままにすると、予想以上のものが公開されます。その場合 `list_schemas` は、`mysql`、`sys`、および `performance_schema` を含むサーバー上のすべてのスキーマを返し、`db_url` のアカウントが到達できるものでフィルタリングしません。この一覧は、アカウントの接続経由ではなく、プロセス内で `information_schema.SCHEMATA` に対して実行されるためです。発見の範囲を制限するのは、`vsql_mcp.schema` を 1 つのスキーマに絞ることです。`query` と `write` が実際に読めるものは引き続きアカウントの権限が決めるため、一覧にあるスキーマが必ずしも読めるとは限りません。
+
+#### vsql_mcp は TLS をサポートしていますか? {#does-vsql_mcp-support-tls}
+
+はい。`vsql_mcp.ssl_cert` と `vsql_mcp.ssl_key` の両方に PEM ファイルのパスを設定すると、`vsql_mcp.ssl_port`（デフォルト `3143`）で HTTPS を提供します。どちらか一方を空にすると、ポート設定に関わらず TLS はオフになります。
+
+#### ポートの変更がすぐに反映されないのはなぜですか? {#why-does-changing-the-port-not-take-effect-immediately}
+
+ポートと TLS の設定は、次にサーバーを有効にしたときに反映されます。変更した後、`vsql_mcp.vsql_mcp_enabled` を OFF にしてから ON に切り替えてください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `INSTALL EXTENSION vsql_mcp` がプレビュー機能のエラーで失敗する | サーバーを `--vsql_allow_preview_extensions=ON` で起動するか、`SET PERSIST vsql_allow_preview_extensions = ON` を実行します。これは直ちに反映され、再起動は不要です。 |
+| `SHOW STATUS LIKE 'vsql_mcp.http_port'` が `0` を返す | サーバーが待ち受けていません。`vsql_mcp.vsql_mcp_enabled = ON` を確認し、設定したポートに他の何かがすでにバインドしていないか確認します。 |
+| すべてのリクエストが `401 Unauthorized` を返す | `require_auth` が ON で、リクエストに `Authorization: Bearer <token>` がないか、トークンが `vsql_mcp.bearer_token` と一致しません。 |
+| `tools/call` が `missing Mcp-Session-Id header` 付きの `400` を返す | `initialize` 以降のすべてのリクエストは、`initialize` のレスポンスが返した `Mcp-Session-Id` の値を持つ必要があります。 |
+| `query` または `write` が MySQL の権限エラーで失敗する | `vsql_mcp.db_url` が指定するアカウントに、ステートメントが必要とする権限がありません。`allowed_tables` に追加するだけでなく、そのアカウントに権限を付与してください。 |
+| `write` が `tools/list` にない | `vsql_mcp.allow_write` が OFF です。ツールを有効にするには `ON` に設定します。 |
+| クライアントがまったく接続できない | クライアントが `127.0.0.1` と設定したポートに到達していることを確認します。`vsql_mcp` は他のどのインターフェースにもバインドしません。 |
+
+## 関連項目 {#see-also}
+
+- [MySQL のユーザー管理](/ja/guides/user-management) — `CREATE USER`、`GRANT`、および最小権限のアカウント設計
+- [MySQL のセキュリティ強化](/ja/guides/security-hardening) — 1 つの拡張機能のガードレールを超えた、より広いサーバーの強化
+- [MySQL を AI API に接続する](/ja/guides/ai-api-setup) — 逆方向: `vsql_ai` で MySQL の内部から AI API を呼び出す

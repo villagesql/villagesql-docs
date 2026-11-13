@@ -1,0 +1,147 @@
+---
+title: "MySQL での対称暗号化"
+sidebarTitle: "対称暗号化を使う"
+description: "MySQL での対称暗号化の仕組み。AES の鍵サイズ、CBC モードと ECB モード、MySQL の AES_ENCRYPT の制限、および SQL とアプリケーション層のどちらで暗号化すべきか。"
+keywords: "mysql symmetric encryption, mysql AES encrypt, mysql aes-256, mysql encrypt decrypt, mysql aes cbc ecb, mysql encryption key management"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+対称暗号化は、暗号化と復号に同じ鍵を使います。機密データを保存し、後で元の値を取り出す必要がある場合に適したツールです。一方向であるハッシュ化とは異なります。MySQL には `AES_ENCRYPT()` が組み込まれていますが、デフォルトでは安全でないモードになります。このガイドでは、トレードオフ、MySQL で AES を正しく使う方法、および SQL とアプリケーション層のどちらで暗号化すべきかを扱います。
+
+## MySQL での AES 暗号化の仕組み {#how-aes-encryption-works-in-mysql}
+
+MySQL の `AES_ENCRYPT(data, key)` は、鍵文字列から導出した鍵で 128 ビット AES を使います。デフォルトのモードは ECB(Electronic Codebook)で、16 バイトの各ブロックが独立して暗号化されます。ECB は決定的です。同じ 16 バイトの入力は、常に同じ 16 バイトの出力を生成します。そのため、暗号文にパターンが現れます。
+
+```sql
+-- ECB default: identical inputs → identical outputs
+SELECT HEX(AES_ENCRYPT('same data', 'key')) AS first,
+       HEX(AES_ENCRYPT('same data', 'key')) AS second;
+-- Both columns are identical
+```
+
+CBC モード(Cipher Block Chaining)は、暗号化の前に各ブロックを直前の暗号文と XOR し、最初のブロックにはランダムな初期化ベクトル(IV)を使うことでこれを解決します。同じ平文でも、呼び出しのたびに異なる暗号文が生成されます。
+
+MySQL は CBC をサポートしますが、`block_encryption_mode` を変更し、IV を自分で管理することでオプトインする必要があります。
+
+```sql
+SET @@block_encryption_mode = 'aes-256-cbc';
+SET @iv = RANDOM_BYTES(16);
+
+SET @ciphertext = AES_ENCRYPT('sensitive data', 'my-32-byte-key-here-padded-to-32', @iv);
+SELECT AES_DECRYPT(@ciphertext, 'my-32-byte-key-here-padded-to-32', @iv);
+```
+
+## VillageSQL の場合: 自動的な CBC と IV の処理 {#with-villagesql-automatic-cbc-and-iv-handling}
+
+VillageSQL の `vsql_crypto` 拡張機能は `encrypt()` と `decrypt()` を提供します。これらは、呼び出しごとに生成されるランダムな IV を使った AES-CBC を使います。IV は暗号文の先頭に付加されます。追加の列も、追加のパラメータも不要です。
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+SET @key = 'my-32-byte-key-here-padded-to-32';  -- exactly 32 bytes for AES-256
+
+-- Different ciphertext every call — CBC with random IV
+SELECT HEX(encrypt('same data', @key, 'aes-256')) AS first,
+       HEX(encrypt('same data', @key, 'aes-256')) AS second;
+-- Both columns differ
+
+-- Round-trip
+SET @enc = encrypt('sensitive data', @key, 'aes-256');
+SELECT decrypt(@enc, @key, 'aes-256');
+-- Returns: sensitive data
+```
+
+### AES の鍵サイズ {#aes-key-sizes}
+
+| 暗号 | 鍵長 | セキュリティレベル |
+|:---|:---|:---|
+| `'aes'` または `'aes-128'` | 16 バイト | 128 ビット — ほとんどの用途に十分 |
+| `'aes-192'` | 24 バイト | 192 ビット |
+| `'aes-256'` | 32 バイト | 256 ビット — 規制対象データ(PII、HIPAA、PCI)に使用 |
+
+鍵長は鍵文字列のバイト数で強制されます。暗号が要求するより短い鍵は、ゼロでパディングされるのではなく `ERROR 3200: VDF error in function 'encrypt': key too short for <cipher>: need N bytes, got M` を発生させます。長い鍵は、必要な長さまで黙って切り詰められます。予想外の動作が起きる場合は `LENGTH(@key)` を確認してください。
+
+### 暗号化したデータの保存 {#storing-encrypted-data}
+
+`encrypt()` は `VARBINARY` を返します。保存される値には、暗号文の先頭に付加された 16 バイトの IV が含まれます。それに合わせて列のサイズを決めてください。
+
+```sql
+CREATE TABLE customer_data (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    email    VARCHAR(255),
+    ssn_enc  VARBINARY(64),    -- short strings up to ~32 chars
+    notes_enc BLOB              -- longer text
+);
+
+SET @key = 'my-32-byte-key-here-padded-to-32';
+
+INSERT INTO customer_data (email, ssn_enc)
+VALUES ('alice@example.com', encrypt('123-45-6789', @key, 'aes-256'));
+
+SELECT email, decrypt(ssn_enc, @key, 'aes-256') AS ssn
+FROM customer_data;
+```
+
+## MySQL と VillageSQL の比較 {#mysql-vs-villagesql-comparison}
+
+| | `AES_ENCRYPT()`(MySQL のデフォルト) | `encrypt()`(VillageSQL) |
+|:---|:---|:---|
+| **デフォルトのモード** | ECB(安全でない) | ランダムな IV を使った CBC |
+| **IV の管理** | 手動 — 別に保存する | 自動 — 出力の先頭に付加される |
+| **スキーマへの影響** | CBC には IV の列が必要 | 暗号文と IV で 1 つの列 |
+| **繰り返される平文** | 同じ暗号文(ECB) | 毎回異なる暗号文 |
+| **鍵サイズの制御** | `block_encryption_mode` の設定で | 暗号の種類のパラメータで |
+
+## SQL とアプリケーション層のどちらで暗号化するか {#when-to-encrypt-in-sql-vs-application-layer}
+
+SQL での暗号化は便利ですが、トレードオフがあります。
+
+| | SQL 層の暗号化 | アプリケーション層の暗号化 |
+|:---|:---|:---|
+| **鍵の場所** | クエリやトリガーの中(ログに見えると危険) | SQL の中ではなくシークレットマネージャーの中 |
+| **検索性** | 暗号化された値で絞り込めない | 同じ制限 |
+| **一括操作** | 暗号化は DB の中で行われる | アプリのコードを経由する必要がある |
+| **鍵のローテーション** | SQL ですべてのデータの再暗号化が必要 | アプリで古い鍵で復号し、新しい鍵で再暗号化できる |
+| **監査証跡** | クエリログに平文が露出することがある | 何を記録するかをアプリが制御する |
+
+SQL 層の暗号化は、アプリケーションは信頼できるがデータベースレベルのアクセス(バックアップ、リードレプリカ、漏洩した DB 認証情報)が心配な場合に、保存データを保護するのに役立ちます。アプリケーション層の暗号化は、鍵をより細かく制御でき、SQL のログの近くに平文を置かずに済みます。
+
+列レベルのパターンとスキーマ設計については、[MySQL での列の暗号化](/ja/guides/encrypting-columns)を参照してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### 対称暗号化と非対称暗号化の違いは何ですか? {#whats-the-difference-between-symmetric-and-asymmetric-encryption}
+
+対称暗号化(AES)は、暗号化と復号に同じ鍵を使います。高速で、大量のデータに適しています。非対称暗号化(RSA)は、暗号化に公開鍵、復号に秘密鍵を使います。鍵交換には便利ですが、大量のデータには遅すぎます。機密性の高い列データの保存には、対称の AES が正しい選択です。
+
+#### 暗号化された列を検索できますか? {#can-i-search-on-an-encrypted-column}
+
+直接はできません。暗号化された値で行を見つけるには、すべての行を復号する必要があり、フルテーブルスキャンになります。一般的な回避策は、等価検索のために、平文の鍵付きハッシュ(HMAC)を別のインデックス付きの列に保存することです。これは、2 つの行が同じ値を持つことは漏らしますが、その値が何かは漏らしません。
+
+#### 暗号鍵をローテーションするには? {#how-do-i-rotate-encryption-keys}
+
+すべての行を読み、古い鍵で復号し、新しい鍵で再暗号化し、書き戻します。大きなテーブルではバッチで行ってください。これが SQL 層の暗号化の主な運用コストです。エンベロープ暗号化(データ鍵をマスター鍵で暗号化する)を使えば、データに触れずにマスター鍵をローテーションできます。
+
+#### AES 暗号化は SQL インジェクションから保護しますか? {#does-aes-encryption-protect-against-sql-injection}
+
+いいえ。暗号化は保存された値を保護します。SQL インジェクションは入力検証の問題です。任意の SQL を実行できる攻撃者は、`decrypt()` を直接呼び出せます。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:---|:---|
+| `FUNCTION <database>.encrypt does not exist` | `INSTALL EXTENSION vsql_crypto` を実行します |
+| `decrypt()` が NULL を返す | 鍵が違う、暗号の種類が違う、または暗号文が破損しています |
+| `AES_ENCRYPT` が同じ入力に同じ出力を生成する | ECB モードを使っています。`encrypt()` に切り替えるか、`block_encryption_mode = 'aes-256-cbc'` を設定して IV を手動で管理します |
+| 列が小さすぎる | `VARBINARY` のサイズに 32 バイトを追加します(IV に 16 バイト + AES のブロックパディングに最大 16 バイト) |
+| `key too short for <cipher>` | `LENGTH(@key)` を確認します。少なくとも暗号のサイズ(16、24、または 32 バイト)が必要です。長い鍵は黙って切り詰められるため、予想外の事態を避けるには正確なサイズを使います |
+
+## 関連項目 {#see-also}
+
+- [MySQL での列の暗号化](/ja/guides/encrypting-columns) — vsql_crypto で列レベルの暗号化を適用する
+- [MySQL でのデータのハッシュ化](/ja/guides/hashing-data) — 復号が不要な場合の一方向の操作

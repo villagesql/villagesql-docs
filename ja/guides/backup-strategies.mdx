@@ -1,0 +1,204 @@
+---
+title: "MySQL のバックアップ戦略"
+sidebarTitle: "バックアップの計画"
+description: "MySQL データベースをバックアップする方法: 論理バックアップのための mysqldump、MySQL Shell のダンプユーティリティ、バイナリログを使ったポイントインタイムリカバリ、および本番システムのためのバックアップのベストプラクティス。"
+keywords: "mysql backup, mysqldump, mysql backup strategy, mysql point in time recovery, mysql backup restore, mysql dump database, mysql incremental backup, mysql backup best practices, mysql backup automation, mysql backup compression, mysql point in time recovery binlog, mysqlpump, mysql shell dump, percona xtrabackup"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL のバックアップ戦略には 2 つの部分があります。データの一貫したスナップショットを取ること（フルバックアップ）と、そのスナップショット以降に行われた変更を再生する手段を持つこと（ポイントインタイムリカバリ）です。適切なツールは、データベースのサイズ、許容できる復旧時間、および失っても許容できるデータの量によって決まります。
+
+## mysqldump — 論理バックアップ {#mysqldump--logical-backups}
+
+`mysqldump` はデータを SQL ステートメントとしてエクスポートします。最も移植性の高い形式で、どのサイズのデータベースでも使えますが、大きなデータセットではバイナリバックアップより復元が遅くなります。
+
+**単一のデータベースをバックアップする:**
+
+```bash
+mysqldump -u root -p myapp > myapp_backup.sql
+```
+
+**すべてのデータベースをバックアップする:**
+
+```bash
+mysqldump -u root -p --all-databases > all_databases.sql
+```
+
+**InnoDB で推奨されるフラグ:**
+
+```bash
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --routines \
+  --triggers \
+  --events \
+  -u root -p myapp > myapp_backup.sql
+```
+
+| フラグ | 目的 |
+|:-----|:--------|
+| `--single-transaction` | テーブルをロックせずに一貫したスナップショットを取る（InnoDB のみ） |
+| `--source-data=2` | binlog の位置をコメントとして記録する — PITR に必須 |
+| `--routines` | ストアドプロシージャと関数を含める |
+| `--triggers` | トリガーを含める（デフォルトで有効だが、明示すると分かりやすい） |
+| `--events` | スケジュールされたイベントを含める |
+
+`--single-transaction` がない場合、mysqldump は `LOCK TABLES` でテーブルをロックするため、ダンプの間は書き込みがブロックされます。
+
+**ダンプから復元する:**
+
+```bash
+mysql -u root -p myapp < myapp_backup.sql
+```
+
+すべてのデータベースを復元するには: `mysql -u root -p < all_databases.sql`
+
+## バイナリログを使ったポイントインタイムリカバリ {#point-in-time-recovery-with-binary-logs}
+
+フルバックアップは、最後のバックアップの時点までしか保護してくれません。バイナリログがあれば、バックアップを取った後に行われたすべての変更を再生できます。
+
+**要件:**
+- バイナリログが有効であること（`log_bin = ON`）
+- バックアップ取得時に `--source-data=2` を使っていること（開始時の binlog の位置を記録します）
+
+**ワークフロー:**
+
+1. フルバックアップを復元します。
+```bash
+mysql -u root -p < myapp_backup.sql
+```
+
+2. ダンプファイルから binlog の開始位置を探します。
+```bash
+head -50 myapp_backup.sql | grep "SOURCE_LOG_FILE"
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='mysql-bin.000003', SOURCE_LOG_POS=154;
+```
+
+3. 取り消したいイベントの直前の時点まで、バイナリログを再生します。
+```bash
+mysqlbinlog \
+  --start-position=154 \
+  --stop-datetime="2024-06-15 11:59:00" \
+  mysql-bin.000003 mysql-bin.000004 | mysql -u root -p
+```
+
+mysqlbinlog のオプションの詳細については、[MySQL のバイナリログ](/ja/guides/binary-logging)を参照してください。
+
+## MySQL Shell のダンプユーティリティ {#mysql-shell-dump-utilities}
+
+MySQL Shell（`mysqlsh`）は、`mysqldump` より高速なダンプとロードのユーティリティを提供します。並列スレッドを使い、圧縮された出力を生成するため、大きなデータベースでも実用的です。
+
+```bash
+# Dump a single schema
+mysqlsh root@localhost -- util dump-schemas '["myapp"]' --outputUrl=/backups/myapp
+
+# Load it back
+mysqlsh root@localhost -- util load-dump /backups/myapp
+```
+
+MySQL Shell のダンプユーティリティはデフォルトで出力を圧縮し（zstd）、ダンプとロードの両方を複数の CPU コアで並列化できます。数 GB を超えるデータベースでは、`mysqldump` との速度差は大きくなります。
+
+## バックアップ方法の比較 {#backup-methods-compared}
+
+| 方法 | バックアップサイズ | バックアップ速度 | 復元速度 | 一貫性 | MySQL 互換性 |
+|:-------|:-----------|:-------------|:-------------|:------------|:-------------------|
+| `mysqldump` | 大（プレーン SQL） | 遅い | 遅い（SQL を再実行） | 一貫したスナップショット（`--single-transaction`） | すべての MySQL バージョン |
+| `mysqlpump` | 大（プレーン SQL） | より速い（並列ダンプ） | 遅い（SQL を再実行） | テーブル単位の一貫性のみ | 8.4 で削除 — バイナリは同梱されない |
+| MySQL Shell ダンプ | 小（zstd 圧縮） | 速い（並列、圧縮） | 速い（並列ロード） | 一貫したスナップショット | MySQL 8.0 以降 |
+| Percona XtraBackup | 大（物理コピー） | 速い（ホットコピー、InnoDB 対応） | 非常に速い（ファイルコピー） | InnoDB の完全な一貫性 | 同じメジャーバージョン |
+| コールドファイルコピー | 大（物理コピー） | 速い | 非常に速い（ファイルコピー） | サーバーが停止している場合のみ一貫 | 同じ MySQL バージョン |
+
+`mysqldump` は、移植性とシンプルさの点で今でも定番です。大きなデータベースでは、MySQL Shell ダンプが事実上 `mysqlpump` に取って代わりました。より速く、より小さいファイルを生成し、MySQL 8.0 以降をサポートします。`mysqlpump` は MySQL 8.4 で削除されました。バイナリはビルドにまったく含まれないため、これを呼び出すスクリプトは即座に失敗します。
+
+復元時間が重要な、約 50 GB を超える本番データベースでは、Percona XtraBackup または MySQL Shell ダンプが実用的な選択肢です。
+
+### 各方法を使う場面 {#when-to-use-each-method}
+
+| 方法 | 使う場面 | 避ける場面 |
+|:-------|:---------|:-----------|
+| `mysqldump` | 移植性が必要な場合、MySQL のバージョン間で移行する場合、データベースが約 10 GB 未満の場合、人が読めるバックアップが欲しい場合 | データベースが大きく復元時間が重要な場合、1 分未満のバックアップウィンドウが必要な場合 |
+| MySQL Shell ダンプ | データベースが大きい（10 GB 以上）場合、圧縮付きの並列ロードが欲しい場合 | MySQL Shell がインストールされていない、または許可されていない場合 |
+| `mysqlpump` | （MySQL 8.4 で削除 — バイナリは同梱されません。代わりに MySQL Shell ダンプを使ってください。） | — |
+| Percona XtraBackup | 非常に大きな InnoDB データベースの場合、パフォーマンスへの影響を最小限に抑えたホット物理バックアップが必要な場合、復元速度が重要な場合 | ストレージエンジンが混在している（MyISAM）場合、サードパーティのツールをインストールできない場合、複雑さに見合わない小さなデータベースの場合 |
+| コールドファイルコピー | 開発/テスト環境、オフラインのサーバー、リスクのある移行前の手早いスナップショット | ダウンタイムを許容できない本番サーバー、サーバーを稼働させ続ける必要があるすべての状況 |
+
+## バックアップのスケジュール {#scheduling-backups}
+
+夜間のダンプを実行する cron ジョブは、最も一般的な本番のセットアップです。
+
+```bash
+# /etc/cron.d/mysql-backup
+0 2 * * * mysql_user /usr/local/bin/mysql-backup.sh
+```
+
+```bash
+#!/bin/bash
+# mysql-backup.sh
+DATE=$(date +%Y-%m-%d)
+BACKUP_DIR=/backups/mysql
+
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --all-databases \
+  -u backup_user -p"$MYSQL_BACKUP_PASSWORD" \
+  | gzip > "$BACKUP_DIR/all_databases_$DATE.sql.gz"
+
+# Keep 14 days of backups
+find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
+```
+
+バックアップユーザーに必要な権限は `SELECT`、`LOCK TABLES`、`SHOW VIEW`、`TRIGGER`、`EVENT`、`RELOAD`、および `PROCESS` だけです。`ALL PRIVILEGES` は不要です。`PROCESS` がなくても `mysqldump` は完了しますが、テーブルスペースのメタデータをダンプしようとする際に、実行のたびに「Access denied ... PROCESS privilege」エラーを stderr に出力します。
+
+## バックアップの検証 {#verifying-backups}
+
+テストしていないバックアップはバックアップではありません。定期的に検証してください。
+
+```bash
+# Test restore to a separate instance
+mysql -u root -p --host=test-server < all_databases.sql
+
+# Quick sanity check — verify row counts
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+```
+
+少なくとも月に 1 回の自動復元テストを行えば、破損、権限の問題、およびディスク容量の問題を、問題になる前に発見できます。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### `--single-transaction` はすべてのストレージエンジンで機能しますか? {#does---single-transaction-work-with-all-storage-engines}
+
+いいえ。`--single-transaction` は一貫した読み取りスナップショットを使いますが、これをサポートするのは InnoDB だけです。同じデータベース内の MyISAM テーブルは、それでもダンプの間は `LOCK TABLES` でロックされます。エンジンが混在している場合、`--single-transaction` だけでは完全に一貫したダンプには不十分です。
+
+#### バックアップはどのくらいの期間保持すべきですか? {#how-long-should-i-retain-backups}
+
+最低限、日次バックアップを 7〜14 日、週次バックアップを 4 週間、月次バックアップを 1 年保持します。保持期間は、規制上の要件と、どこまで遡って復旧する必要があるかによって決まります。バイナリログは、保持している最も古いバックアップから現在までの間隔をカバーするのに十分な期間、保持してください。
+
+#### データディレクトリのコピーは有効なバックアップですか? {#is-copying-the-data-directory-a-valid-backup}
+
+先にサーバーを停止した場合（コールドコピー）に限り有効です。実行中の MySQL サーバーは、直接コピーしても安全ではない方法でデータファイルに書き込むため、破損したバックアップになります。サーバーを停止せずにホットバックアップを取るには、MySQL Shell のダンプユーティリティまたは Percona XtraBackup を使ってください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `mysqldump` が大きなテーブルでハングする | `--quick` を追加して、テーブル全体をメモリにバッファするのではなく、行を 1 行ずつストリームします |
+| 復元が `ERROR 1824: Failed to open the referenced table`（または行に対する `ERROR 1452`）で失敗する | `mysqldump` はデフォルトで出力を `SET FOREIGN_KEY_CHECKS=0` で囲むため、フルダンプをそのまま復元する場合はこの問題は起きません。手で編集したダンプや部分的なダンプ（一部のテーブルだけを抽出した、または FK チェックの行を削除した）を復元する場合に発生します。その場合は先頭に `SET FOREIGN_KEY_CHECKS=0;` を追加します |
+| ダンプファイルが大きすぎる | 圧縮を使います: `mysqldump ... \| gzip > backup.sql.gz`。復元は `zcat backup.sql.gz \| mysql ...` で行います |
+| ポイントインタイムリカバリで変更が欠けた | バイナリログファイルに抜けがあります。範囲内のすべてのログファイルが順番どおりに再生されたことを確認します |
+| バックアップユーザーがトリガーをダンプできない | `TRIGGER` 権限を付与します: `GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |
+
+バックアップスクリプトは、[VillageSQL](https://villagesql.com/install) への切り替え後もそのまま動作します。VillageSQL は MySQL のドロップイン代替であるため、このガイドの mysqldump コマンド、バイナリログの設定、および復元の手順書はそのまま機能します。
+
+## 関連項目 {#see-also}
+
+- [MySQL のバイナリログ](/ja/guides/binary-logging) — ポイントインタイムリカバリを支えるバイナリログ
+- [MySQL レプリケーションの基本](/ja/guides/replication-basics) — レプリケーションは同じバイナリログの仕組みに依存する
+- [Docker 上の MySQL](/ja/guides/mysql-on-docker) — コンテナ化された MySQL のバックアップとボリューム
+- [MySQL からのアップグレード](/ja/guides/upgrade) — VillageSQL へのアップグレードの出発点となるバックアップの取得
+- [サポート終了後の MySQL 8.0 から 8.4 へのアップグレード](/ja/guides/mysql-80-eol-upgrade) — これらのバックアップが保護する 8.0 から 8.4 へのアップグレード

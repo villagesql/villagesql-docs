@@ -1,0 +1,187 @@
+---
+title: "MySQL のクエリが遅いのはなぜ?"
+sidebarTitle: "クエリパフォーマンス"
+description: "EXPLAIN、スロークエリログ、および最もよくある原因（インデックスの欠如、誤ったインデックスの選択、N+1 パターン）を使って、遅い MySQL クエリを診断し修正します。"
+keywords: "mysql slow query, mysql query optimization, mysql explain, mysql missing index, mysql performance tuning, mysql query slow"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+遅いクエリは、ほぼ常にいくつかのよくある原因に行き着きます。インデックスの欠如、誤ったインデックス、インデックスの使用を妨げる書き方のクエリ、インデックス付きの列に適用された関数、N+1 パターン、または同時に実行されている他のクエリとの競合です。そのほとんどは、2 つのコマンドで診断できます: `EXPLAIN` とスロークエリログです。そこから始めてください。
+
+## ステップ 1: EXPLAIN を読む {#step-1-read-explain}
+
+調べたいクエリの前に `EXPLAIN` を付けて実行します。
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE customer_id = 42;
+```
+
+次のような出力が得られます。
+
+```
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 843201 |    10.00 | Using where |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+```
+
+診断の仕事の大半は 5 つの列が担います。
+
+**`possible_keys`** — このクエリのために MySQL が検討したインデックスです。`NULL` は、`WHERE` 句の列に関連するインデックスが存在しないことを意味します。
+
+**`key`** — MySQL が実際に選んだインデックスです。`possible_keys` に候補があるのに `key` が `NULL` なら、MySQL はフルテーブルスキャンのほうが安いと判断したということです。通常は、統計が古いか、オプティマイザがインデックスを飛ばすほどテーブルが小さいかのどちらかの兆候です。
+
+**`type`** — MySQL が使ったアクセス方法です。これが最も重要な列です。`ALL` はフルテーブルスキャンを意味します。MySQL は一致する行を見つけるためにすべての行を読みました。800,000 行のテーブルでは、1 行しか返さないかもしれないクエリのために 800,000 回の行の読み取りです。`ref` または `eq_ref` は、MySQL がインデックス検索を使ったことを意味し、これが求めるものです。
+
+**`key`** — MySQL が選んだインデックスです。`NULL` はインデックスが使われなかったことを意味します（上の `possible_keys` を参照）。
+
+**`rows`** — MySQL が調べる行数の見積もりです。返ってくると期待する行数に比べて大きな数値は、何かがおかしい兆候です。
+
+**`Extra`** — 補足情報です。`Using filesort` は、`ORDER BY` をカバーするインデックスがなかったため、MySQL が結果セットをメモリまたはディスク上でソートしなければならなかったことを意味します。`Using temporary` は、MySQL が一時テーブルを作ったことを意味し、特定の `GROUP BY` と `DISTINCT` のクエリで起こります。どちらも大きなテーブルでは警告のサインです。
+
+見積もりを読んだら、`EXPLAIN ANALYZE` を使って、実行時に実際に何が起きたかを確認します。
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 42;
+```
+
+`EXPLAIN ANALYZE` はクエリを実行し、見積もりと並べて実際の行数と時間を報告します。見積もりが 800,000 行で実際も 800,000 行なら、見積もりは正しく、スキャンは実際に起きています。実際の値がはるかに低いなら、オプティマイザは古い統計に基づいて不適切な選択をしたのかもしれません。
+
+## ステップ 2: 最もよくある原因 {#step-2-the-most-common-causes}
+
+### インデックスの欠如 {#missing-index}
+
+上の例のクエリは、`customer_id` にインデックスがないため、`orders` テーブル全体をスキャンします。修正は単純です。
+
+```sql
+ALTER TABLE orders ADD INDEX idx_customer_id (customer_id);
+```
+
+インデックスを追加した後、`EXPLAIN` を再実行します。`type` 列は `ALL` から `ref` に変わり、`key` には新しいインデックス名が表示されるはずです。
+
+### 誤ったインデックス {#wrong-index}
+
+MySQL は、最良ではないインデックスを選ぶことがあります。`EXPLAIN` はどれを選んだかを教えてくれます。別のインデックスのほうが良い結果になるかをテストするには、`FORCE INDEX` を使います。
+
+```sql
+EXPLAIN SELECT * FROM orders FORCE INDEX (idx_created_at) WHERE customer_id = 42;
+```
+
+強制したインデックスのほうが `rows` の見積もりが低いなら、元のインデックスの統計が古くなっていないか検討してください。`ANALYZE TABLE orders` がそれを再計算します。MySQL が一貫して誤ったインデックスを選ぶなら、もう役に立たないインデックスがあるのかもしれません。それを削除すると、検討対象から外れます。
+
+### 先頭列の問題 {#leading-column-problem}
+
+`(customer_id, status, created_at)` の複合インデックスは、クエリが `customer_id` で、または `customer_id` と `status` の両方でフィルタリングするときに効率的です。クエリが `status` だけ、または `created_at` だけでフィルタリングする場合、インデックスはまず `customer_id` でソートされているため、効率的には使えません。
+
+```sql
+-- Uses the composite index efficiently
+SELECT * FROM orders WHERE customer_id = 42 AND status = 'pending';
+
+-- Can't use the composite index — status isn't the leading column
+SELECT * FROM orders WHERE status = 'pending';
+```
+
+`status` だけでフィルタリングする必要があるなら、`status` に別のインデックスを追加します。
+
+### SELECT * {#select-}
+
+必要な列だけを指定することは、単なる良いスタイルではなく、パフォーマンスに影響します。MySQL がインデックス（カバリングインデックス）だけでクエリを完全に満たせるとき、実際のテーブルの行には触れません。`SELECT *` はそれを壊します。インデックスにない列を取得するために、一致する各行をテーブルで検索することを MySQL に強いるからです。
+
+```sql
+-- May require a table row lookup for each match
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Can use a covering index on (customer_id, status, total)
+SELECT status, total FROM orders WHERE customer_id = 42;
+```
+
+### インデックス付きの列に対する関数 {#functions-on-indexed-columns}
+
+インデックス付きの列を関数で包むと、通常はインデックスが使えなくなります。インデックスは計算された年ではなく生のタイムスタンプを格納しているため、MySQL は「`YEAR()` が 2024 を返す `created_at` を持つ行はどれか」という問いに B-tree インデックスで答えられません。
+
+```sql
+-- Can't use an index on created_at
+WHERE YEAR(created_at) = 2024
+
+-- Can use an index on created_at
+WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31 23:59:59'
+```
+
+同じ問題は、`LOWER()`、`DATE()`、列に対する算術演算、および比較の前に値を変換するその他すべてに当てはまります。
+
+### N+1 クエリ {#n1-queries}
+
+問題が 1 つの遅いクエリではなく、何百もの速いクエリであることがあります。よくあるパターンは、注文の一覧を取得し、次に各注文について顧客名を得るために別のクエリを実行するというものです。200 件の注文なら、201 回のクエリです。1 回ずつは速くても、合わせると数秒になります。
+
+修正は、`JOIN` で 1 つのクエリにデータをまとめて取得することです。
+
+```sql
+SELECT o.id, o.total, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE o.created_at > '2024-01-01';
+```
+
+## ステップ 3: スロークエリログを有効にする {#step-3-enable-the-slow-query-log}
+
+一度設定して動かしたままにしてください。時間のしきい値を超えたクエリをバックグラウンドで記録し、存在を知らなかった問題を浮かび上がらせます。実行時に有効にします。
+
+```sql
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 1;  -- log queries taking more than 1 second
+```
+
+ログファイルがどこに書かれているかを確認します。
+
+```sql
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+ログを要約し、どのクエリが最も頻繁に現れるか、または合計時間が最も長いかを見るには、`mysqldumpslow` を使います。
+
+```bash
+mysqldumpslow -s t /path/to/slow-query.log
+```
+
+`long_query_time` を 0.1 または 0.5 に下げると、個々には速いものの、多くの呼び出しで積み重なるクエリを捕まえられます。
+
+## ステップ 4: SHOW PROCESSLIST を確認する {#step-4-check-show-processlist}
+
+何かが今まさに遅いとき、つまり実行時間が長すぎるクエリや、今ハングしているアプリケーションがあるときに使います。`SHOW PROCESSLIST` は、すべてのアクティブな接続と、各クエリがどれだけの時間実行されているかを示します。
+
+```sql
+SHOW PROCESSLIST;
+```
+
+`Waiting for table metadata lock` または `Waiting for lock` の状態で止まっているクエリは、不適切なプランのせいで遅いのではなく、ロックを保持する別のクエリにブロックされています。ロック競合の詳細は、次で確認します。
+
+```sql
+SHOW ENGINE INNODB STATUS;
+```
+
+`TRANSACTIONS` セクションは、どのトランザクションが待っていて、どれがロックを保持しているかを示します。
+
+## クイックリファレンス {#quick-reference}
+
+| 症状 | 考えられる原因 | 修正 |
+|:--------|:------------|:----|
+| `EXPLAIN` が `type: ALL` を示す | インデックスの欠如 | `WHERE` の列にインデックスを追加 |
+| `Extra: Using filesort` | `ORDER BY` 用のインデックスがない | ソート列をカバーするインデックスを追加 |
+| `Extra: Using temporary` | 複雑な `GROUP BY` または `DISTINCT` | クエリを見直すか、インデックスを追加 |
+| 小さなテーブルでは速いクエリが大きなテーブルでは遅い | フルテーブルスキャン | インデックスを追加 |
+| 多数の速いクエリが積み重なる | N+1 パターン | `JOIN` で書き直す |
+| クエリが時々だけ遅い | ロック競合 | `SHOW PROCESSLIST` と `INNODB STATUS` を確認 |
+
+このページのすべての診断は、拡張機能を備えた MySQL のドロップイン代替である [VillageSQL](https://villagesql.com/install) で動くため、チューニングのワークフローを学び直すことなく採用できます。
+
+## 関連項目 {#see-also}
+
+- [MySQL のインデックスの仕組み](/ja/guides/mysql-indexes) — インデックス選択と B-tree 構造の背後にあるメンタルモデル
+- [カバリングインデックス](/ja/guides/covering-indexes) — インデックスから一度も離れないクエリの書き方
+- [EXPLAIN 出力の読み方](/ja/guides/reading-explain) — EXPLAIN プランのすべての列をより深く見る
+- [スロークエリログの使用](/ja/guides/slow-query-log) — 設定、ローテーション、および `mysqldumpslow` による分析
+- [MySQL の CROSS JOIN](/ja/tutorial/cross-join) — 意図しないもの、そしてそれがどれほど大きくなるか

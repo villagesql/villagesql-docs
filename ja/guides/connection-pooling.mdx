@@ -1,0 +1,149 @@
+---
+title: "MySQL のコネクションプーリング"
+sidebarTitle: "接続のプーリング"
+description: "MySQL のコネクションプーリングの仕組み、永続的な接続がパフォーマンスにとって重要な理由、および ProxySQL とアプリケーションレベルのプーラーの構成方法。"
+keywords: "mysql connection pooling, mysql persistent connections, mysql max_connections, proxysql mysql, mysql connection limit, mysql too many connections, mysql pooler"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL の接続を開くには時間がかかります。TCP ハンドシェイク、認証、セッションの初期化です。負荷がかかると、リクエストごとに接続を開いて閉じるアプリケーションは、クエリよりも接続に多くの時間を費やします。コネクションプーリングは、リクエストごとに新しい接続を作るのではなく、既存の接続を再利用します。
+
+## 接続が高コストである理由 {#why-connections-are-expensive}
+
+MySQL の各接続はサーバー上のスレッドです。接続時のコストは次のとおりです。
+
+- TCP/TLS ハンドシェイク
+- 認証（資格情報の確認、権限の解決）
+- セッション変数の初期化
+
+多忙なアプリケーションサーバーでは、このオーバーヘッドは急速に積み上がります。実行に 1ms かかるクエリは、接続のセットアップを含めると合計 10ms かかるかもしれません。
+
+```sql
+-- See how many connections are currently active
+SHOW STATUS LIKE 'Threads_connected';
+
+-- See the server's connection limit
+SHOW VARIABLES LIKE 'max_connections';
+
+-- See peak connections since last restart
+SHOW STATUS LIKE 'Max_used_connections';
+```
+
+## アプリケーションレベルのプーリング {#application-level-pooling}
+
+ほとんどのアプリケーションフレームワークとデータベースドライバーには、組み込みのコネクションプールがあります。これらは開いた接続のプールを維持し、要求に応じてアプリケーションのスレッドに貸し出します。
+
+**Node.js (mysql2):**
+```javascript
+import mysql from 'mysql2/promise';
+
+const pool = mysql.createPool({
+  host: 'localhost',
+  user: 'app',
+  database: 'mydb',
+  waitForConnections: true,
+  connectionLimit: 10,       // max simultaneous connections
+  queueLimit: 0              // unlimited queue (0 = no limit)
+});
+
+// connection is returned to the pool automatically
+const [rows] = await pool.execute('SELECT * FROM orders WHERE id = ?', [42]);
+```
+
+**Python (SQLAlchemy):**
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    'mysql+mysqlconnector://user:pass@localhost/mydb',
+    pool_size=10,        # persistent connections to keep open
+    max_overflow=5,      # extra connections allowed under peak load
+    pool_timeout=30,     # seconds to wait for a connection from the pool
+    pool_recycle=3600    # recycle connections after 1 hour (avoids stale connections)
+)
+```
+
+どのプールでも重要な設定は次のとおりです。
+- **プールサイズ**: 維持する永続的な接続の数
+- **最大オーバーフロー / キュー**: バースト負荷時に許可される追加の接続の数
+- **リサイクル / タイムアウト**: 接続を閉じて開き直すタイミング（MySQL の `wait_timeout` による失効した接続を防ぐ）
+
+## MySQL の wait_timeout と失効した接続 {#mysqls-wait_timeout-and-stale-connections}
+
+MySQL は、`wait_timeout` 秒（デフォルト: 28800 秒 / 8 時間）後にアイドル状態の接続を閉じます。これは非対話的な接続、つまりアプリケーションのプールが使う種類の接続に適用されます。プールがこれより長く接続を保持すると、その接続は失効し、次のクエリが `MySQL server has gone away` で失敗します。
+
+```sql
+-- Check the server's idle connection timeout
+SHOW VARIABLES LIKE 'wait_timeout';
+```
+
+プールの構成で修正します。`pool_recycle`（またはそれに相当するもの）を `wait_timeout` より短い値に設定します。3600 秒（1 時間）が安全なデフォルトです。
+
+## 複数サーバー構成のための ProxySQL {#proxysql-for-multi-server-setups}
+
+アプリケーションレベルのプールは、単一のサーバーではうまく機能します。レプリカや複数のアプリケーションサーバーがある場合は、ProxySQL のような専用のプロキシがアプリケーションと MySQL の間に置かれ、インフラストラクチャのレベルでプーリングを処理します。
+
+ProxySQL の利点は次のとおりです。
+- **クエリルーティング**: 読み取りをレプリカに、書き込みをプライマリに送る
+- **接続の多重化**: 多数のアプリケーション接続が、より少数の MySQL 接続を共有する
+- **フェイルオーバー**: サーバーがダウンした場合にトラフィックを迂回させる
+
+基本的な ProxySQL のセットアップでは、クエリのプレフィックスで読み取りと書き込みをルーティングします。
+
+```sql
+-- In ProxySQL admin interface
+-- Route SELECT queries to read hostgroup (replicas)
+INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup)
+VALUES (1, 1, '^SELECT', 2);
+
+-- All other queries go to write hostgroup (primary)
+INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup)
+VALUES (2, 1, '.*', 1);
+
+LOAD MYSQL QUERY RULES TO RUNTIME;
+SAVE MYSQL QUERY RULES TO DISK;
+```
+
+## max_connections のチューニング {#tuning-max_connections}
+
+`max_connections` はサーバー側の上限を設定します。各接続はメモリを消費します。ベースラインはおよそ 1MB（デフォルトの `thread_stack`）で、それにセッションの他の静的バッファと、クエリ実行中に要求に応じて割り当てられる追加のメモリ（ソートバッファ、読み取りバッファ、一時テーブル）が加わります。重いクエリ負荷の下では、接続あたりのコストは数 MB に達することがあります。`max_connections` を高く設定しすぎるとメモリが無駄になり、低すぎると `ERROR 1040 (08004): Too many connections` が発生します。
+
+```sql
+-- Increase max connections (requires SUPER privilege)
+SET GLOBAL max_connections = 500;
+```
+
+大まかなサイジングの式は `max_connections = (接続に使える RAM) / (接続あたりのメモリ)` です。`Max_used_connections` を監視して実際のピークを把握し、`max_connections` をその 20〜30% 上に設定してください。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### プールの接続数はいくつにすべきですか? {#how-many-connections-should-my-pool-have}
+
+データベースサーバーの CPU コア数から始めて、負荷に基づいて増やしてください。I/O バウンドの度合いが高いワークロードは CPU コア数より多い接続から恩恵を受けられますが、CPU バウンドなワークロードはそうではありません。HikariCP のよく知られた式 `connections = (core_count * 2) + effective_spindle_count` は回転ディスクのために設計されたもので、SSD には当てはまりません。現代のインフラストラクチャでは、ピーク負荷時の `Threads_running` で実際の並行性を測定し、それをベースラインとして使ってください。
+
+#### `Threads_connected` と `Threads_running` の違いは何ですか? {#whats-the-difference-between-threads_connected-and-threads_running}
+
+`Threads_connected` は、プールでアイドル状態のものを含め、開いているすべての接続を数えます。`Threads_running` は、今まさにクエリを実行している接続を数えます。両者の差がアイドル状態の接続数です。`Threads_connected` が大きく `Threads_running` が小さいのは、健全なプールでは正常です。
+
+#### PHP で永続的な接続を使うべきですか? {#should-i-use-persistent-connections-in-php}
+
+避けてください。PHP には再利用した接続をリセットする機能がありません。開いたままのトランザクション、テーブルロック、一時テーブル、および変更されたセッション変数が次のリクエストに引き継がれます。これはデッドロック、データの破損、および再現が難しいバグを引き起こすことがあります。代わりに、適切なコネクションプール（プーリング付きの PDO、または ProxySQL のようなプロキシ）を使ってください。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `ERROR 1040 (08004): Too many connections` | `max_connections` を増やすか、プールサイズを減らすか、ProxySQL を追加します |
+| `MySQL server has gone away` | 失効した接続です。`pool_recycle` を `wait_timeout` より短く設定します |
+| `Threads_connected` が多いのにスループットが低い | プールが大きすぎます。アイドル状態の接続がメモリを消費しています。プールサイズを減らします |
+| 負荷時に接続のレイテンシが急上昇する | プールが小さすぎます。リクエストが接続待ちでキューに入っています。プールサイズを増やすか、プロキシを追加します |
+
+## 関連項目 {#see-also}
+
+- [MySQL のスロークエリログ](/ja/guides/slow-query-log) — クエリのレイテンシと接続のオーバーヘッドを区別する
+- [MySQL レプリケーションの基本](/ja/guides/replication-basics) — プライマリとレプリカにまたがるプーリング
+- [MySQL のリードレプリカ](/ja/guides/read-replicas) — 読み取りと書き込みを分けたときの役割ごとのプーリング
+- [ORM で MySQL を使う: Django、Rails、および Prisma](/ja/guides/mysql-with-orms) — すべての ORM が開くプール

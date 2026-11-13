@@ -1,0 +1,156 @@
+---
+title: "MySQL のタイムスタンプとタイムゾーン"
+sidebarTitle: "タイムゾーンの扱い"
+description: "MySQL が DATETIME と TIMESTAMP をどう扱うか、タイムゾーンの保存と変換、そしてアプリケーションが複数のタイムゾーンにまたがるときによくあるバグを避ける方法。"
+keywords: "mysql timestamp timezone, mysql datetime vs timestamp, mysql utc, mysql time_zone, mysql convert timezone, mysql current_timestamp, mysql daylight saving"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+タイムゾーンのバグはデバッグが最も難しいものの 1 つです。サーバーの場所によって現れたり消えたりし、開発環境と本番環境で違う形で現れ、夏時間の切り替えの後になって初めて表面化することもよくあります。根本原因はほぼ常に、MySQL が時刻を保存する方法と、アプリケーションが想定している読み取り方の不一致です。
+
+## DATETIME と TIMESTAMP {#datetime-vs-timestamp}
+
+この 2 つの型は似て見えますが、肝心の瞬間 — 取得時 — に違う振る舞いをします。
+
+| 型 | ストレージ | 範囲 | タイムゾーンの振る舞い |
+|:-----|:--------|:------|:-------------------|
+| `DATETIME` | 8 バイト | 1000-01-01 から 9999-12-31 | 変換なし — リテラル値をそのまま保存して返す |
+| `TIMESTAMP` | 4 バイト | 1970-01-01 から 2038-01-19 | UTC で保存し、取得時にセッションの `time_zone` に変換する |
+
+`TIMESTAMP` は値を自動的に変換します。
+- **INSERT/UPDATE** 時: セッションの `time_zone` から UTC に変換して保存する
+- **SELECT** 時: UTC からセッションの `time_zone` に戻して表示する
+
+`DATETIME` は変換を行いません。書き込んだ値がそのまま返ってきます。
+
+`'America/New_York'` のような名前付きゾーンは、タイムゾーンテーブルがロードされている必要があります(下の[名前付きタイムゾーン](#named-time-zones)を参照)。初期化したばかりのサーバーにはそれがありません。下の例を実行する前に `SELECT COUNT(*) FROM mysql.time_zone_name;` で確認し、`0` であれば先にロードするか、`'-05:00'` のような数値オフセットに置き換えてください。
+
+```sql
+SET time_zone = 'America/New_York';
+
+CREATE TABLE events (
+    ts  TIMESTAMP,
+    dt  DATETIME
+);
+
+INSERT INTO events VALUES ('2024-03-15 12:00:00', '2024-03-15 12:00:00');
+
+-- Switch to a different timezone and re-read
+SET time_zone = 'America/Los_Angeles';
+SELECT ts, dt FROM events;
+-- ts: 2024-03-15 09:00:00  (converted: UTC-8 vs UTC-5 = 3 hours earlier)
+-- dt: 2024-03-15 12:00:00  (unchanged)
+```
+
+## 2038 年問題 {#the-2038-problem}
+
+`TIMESTAMP` は 32 ビットの Unix タイムスタンプとして保存されます。`2038-01-19 03:14:07 UTC` より後の日付は表現できません。将来の日付を保存するアプリケーション — 予約、サブスクリプション、予定されたイベント — は、この制限に当たらないように `DATETIME` を使うべきです。
+
+```sql
+-- This will fail or behave unexpectedly near or after 2038
+expiry_date TIMESTAMP   -- wrong
+
+-- Use DATETIME for dates beyond 2038
+expiry_date DATETIME    -- correct
+```
+
+## サーバーとセッションのタイムゾーン {#server-and-session-time-zones}
+
+MySQL には独立した 2 つのタイムゾーン設定があります。
+
+```sql
+-- Server's global time zone (set at startup or in my.cnf)
+SELECT @@global.time_zone;
+
+-- Session time zone (can differ per connection)
+SELECT @@session.time_zone;
+```
+
+`time_zone` が `SYSTEM` を示す場合、MySQL はオペレーティングシステムのタイムゾーンを使っています。これは OS が変わる(サーバー移行、夏時間の切り替え)までは動作しますが、変わるとタイムスタンプがずれます。
+
+**ベストプラクティス**: サーバーを明示的に UTC に設定し、表示のための変換はアプリケーションで行います。
+
+```ini
+# my.cnf
+[mysqld]
+default-time-zone = '+00:00'
+```
+
+または実行時に設定します。
+```sql
+SET GLOBAL time_zone = '+00:00';
+SET SESSION time_zone = '+00:00';
+```
+
+## 名前付きタイムゾーン {#named-time-zones}
+
+`'+00:00'` と `'UTC'` はどちらも有効ですが、`'America/New_York'` のような名前付きゾーンはタイムゾーンテーブルがロードされている必要があります。`CONVERT_TZ()` が NULL を返す、または名前付きゾーンが失敗する場合、テーブルがありません。
+
+```sql
+-- Check if named timezone tables are loaded
+SELECT COUNT(*) FROM mysql.time_zone_name;
+
+-- Load them (run from the OS shell)
+-- mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql
+```
+
+```sql
+-- Convert between time zones
+SELECT CONVERT_TZ('2024-03-15 12:00:00', 'America/New_York', 'UTC');
+-- Returns: 2024-03-15 16:00:00  (March 15 is EDT = UTC-4, so noon EDT = 16:00 UTC)
+```
+
+## AUTO_UPDATE 列 {#auto_update-columns}
+
+`TIMESTAMP` 列は、挿入時と更新時の自動設定をサポートします。
+
+```sql
+CREATE TABLE posts (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    title      VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+セッションのタイムゾーンが UTC であれば `CURRENT_TIMESTAMP` は UTC で評価されるので、誰がどのタイムゾーンから接続しても、`created_at` と `updated_at` は一貫して保存されます。
+
+`DATETIME` と `NOW()` でも同じことができます。
+
+```sql
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+```
+
+`NOW()` はセッションのタイムゾーンでの現在の日付と時刻を返します。これも、セッションを UTC に統一する理由の 1 つです。
+
+## よくある質問 {#frequently-asked-questions}
+
+#### タイムスタンプは DATETIME に UTC で保存すべきですか、それとも TIMESTAMP を使うべきですか? {#should-i-store-timestamps-as-utc-in-datetime-or-use-timestamp}
+
+日付が 2038 年の上限内に収まるなら、`TIMESTAMP` のほうがすっきりします。UTC への変換を自動的に処理するからです。2038 年を超える将来の日付や、1970 年より前の過去の日付を保存する必要があるアプリケーションでは、`DATETIME` を使い、挿入前に常に UTC に変換することでアプリケーション層で UTC を強制します。
+
+#### サーバー移行の後にタイムスタンプがずれるのはなぜですか? {#why-do-timestamps-shift-after-a-server-migration}
+
+古いサーバーは `time_zone = SYSTEM` で、ある OS のタイムゾーンを指していました。新しいサーバーは別のタイムゾーン(または UTC)を指しています。UTC で保存された `TIMESTAMP` 値はどちらのタイムゾーンでも正しく表示されますが、UTC ではなくシステムのタイムゾーンを前提に保存された値があれば、それらはずれます。移行の前に、両方のサーバーで `SELECT @@global.time_zone` を実行して確認してください。
+
+#### 時刻の部分を持たない日付だけを保存するにはどうすればよいですか? {#how-do-i-store-just-a-date-with-no-time-component}
+
+`DATE` を使います。3 バイトで保存され、時刻やタイムゾーンのあいまいさがありません。`WHERE date_col = '2024-03-15'` のような操作は、セッションのタイムゾーンに関係なくあいまいさがありません。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| デプロイ後にタイムスタンプが数時間ずれる | セッションまたはサーバーの `time_zone` が環境間で異なる — UTC に統一する |
+| `CONVERT_TZ()` が NULL を返す | 名前付きタイムゾーンテーブルがロードされていない — `mysql_tzinfo_to_sql` を実行する |
+| 2038 年より後の日付を保存できない | `TIMESTAMP` の代わりに `DATETIME` を使う |
+| 夏時間の切り替え後に `TIMESTAMP` が誤った時刻を示す | OS の夏時間への依存を避けるために、`SYSTEM` ではなく `time_zone = '+00:00'` を設定する |
+| `updated_at` が自動的に更新されない | 列に `ON UPDATE CURRENT_TIMESTAMP` 句が必要 |
+
+## 関連項目 {#see-also}
+
+- [MySQL の日付と時刻の関数](/ja/guides/date-time-functions) — DATETIME と TIMESTAMP の値を操作する関数

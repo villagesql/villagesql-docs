@@ -1,0 +1,212 @@
+---
+title: "MySQL レプリケーションの基本"
+sidebarTitle: "レプリケーションの構築"
+description: "MySQL レプリケーションの仕組み: ソースとレプリカの構築、バイナリログベースのレプリケーション、GTID レプリケーション、レプリケーションラグ、SHOW REPLICA STATUS による監視、およびよくあるレプリケーションの問題。"
+keywords: "mysql replication, mysql replica setup, mysql gtid replication, mysql replication lag, mysql show replica status, mysql source replica, mysql binlog replication, mysql replication tutorial"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL レプリケーションは、1 台のサーバー（ソース）から 1 台以上のサーバー（レプリカ）へ変更をコピーします。ソースはすべての変更をバイナリログに書き込み、各レプリカはそのログを読んで変更を再生します。レプリケーションは、読み取りのスケーリング、高可用性、および地理的分散の土台です。
+
+## レプリケーションの仕組み {#how-replication-works}
+
+1. ソースがトランザクションをコミットし、バイナリログに書き込みます。
+2. レプリカの I/O スレッドがソースに接続し、新しい binlog イベントを読み取り、ローカルのリレーログに書き込みます。
+3. レプリカの SQL スレッドがリレーログから読み取り、各イベントを実行します。
+
+これはデフォルトで非同期です。ソースはレプリカが受信を確認するのを待ちません。レプリカはソースより遅れることがあります。
+
+## レプリカの構築 {#setting-up-a-replica}
+
+**ソース側** — `my.cnf` でバイナリログを有効にし、一意のサーバー ID を設定します。
+
+```ini
+[mysqld]
+server_id = 1
+log_bin = /var/log/mysql/mysql-bin
+binlog_format = ROW
+```
+
+レプリケーションユーザーを作成します。
+
+```sql
+CREATE USER 'repl'@'%' IDENTIFIED BY 'repl_password';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+```
+
+`--source-data` を付けた mysqldump で一貫性のあるスナップショットを取得します。
+
+```bash
+mysqldump --single-transaction --source-data=1 --all-databases \
+  -u root -p > source_snapshot.sql
+```
+
+**レプリカ側** — 異なるサーバー ID を設定します。
+
+```ini
+[mysqld]
+server_id = 2
+```
+
+スナップショットを復元し、レプリケーションを開始します。
+
+```bash
+mysql -u root -p < source_snapshot.sql
+```
+
+```sql
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = '192.168.1.10',
+    SOURCE_USER = 'repl',
+    SOURCE_PASSWORD = 'repl_password',
+    SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;
+```
+
+`SOURCE_AUTO_POSITION = 1` は GTID ベースのレプリケーションを有効にします。GTID を使わない場合は、代わりに `SOURCE_LOG_FILE` と `SOURCE_LOG_POS` を指定します（値はスナップショットファイルのヘッダーにあります）。
+
+## GTID レプリケーション {#gtid-replication}
+
+グローバルトランザクション識別子（GTID）は、コミットされたすべてのトランザクションに一意の ID を割り当てます。これによりフェイルオーバーとレプリカの構築が簡単になります。binlog のファイル名と位置を追跡する代わりに、MySQL は各サーバーがどのトランザクションを適用済みかを追跡します。
+
+ソースとレプリカの両方で GTID を有効にします。
+
+```ini
+[mysqld]
+gtid_mode = ON
+enforce_gtid_consistency = ON
+```
+
+GTID が有効なら、必要なのは `SOURCE_AUTO_POSITION = 1` だけです。MySQL はレプリカに欠けているトランザクションを割り出し、自動的に再生します。
+
+## レプリケーションの監視 {#monitoring-replication}
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+注目すべき主なフィールドは次のとおりです。
+
+| フィールド | 意味 |
+|:------|:--------------|
+| `Replica_IO_Running` | `Yes` = I/O スレッドが接続し、ソースから読み取り中 |
+| `Replica_SQL_Running` | `Yes` = SQL スレッドがイベントを適用中 |
+| `Seconds_Behind_Source` | 秒単位のレプリケーションラグ（0 = 追いついている） |
+| `Last_SQL_Error` | SQL スレッドを停止させた最後のエラー |
+| `Executed_Gtid_Set` | このレプリカが適用済みの GTID（GTID モード） |
+
+レプリケーションが機能しているためには、`Replica_IO_Running` と `Replica_SQL_Running` の両方が `Yes` でなければなりません。
+
+## レプリケーションラグ {#replication-lag}
+
+レプリケーションラグは、レプリカの SQL スレッドがソースの書き込み速度に追いつけないときに発生します。よくある原因は次のとおりです。
+
+- **アプライヤの並列度**: MySQL 8.4 はデフォルトですでにイベントを並列に適用します。`replica_parallel_workers` は 4、`replica_parallel_type` は `LOGICAL_CLOCK` です。それでもレプリカが遅れる場合はワーカー数を増やします。
+
+```sql
+SET GLOBAL replica_parallel_workers = 4;
+SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+```
+
+- **レプリカ上の長時間実行クエリ**: 行をロックするクエリは SQL スレッドをブロックします。
+- **ネットワークレイテンシ**: I/O スレッドが遅いと、SQL スレッドの仕事がなくなります。
+- **レプリカのディスク I/O**: リレーログまたはデータファイルの同期がボトルネックです。
+
+## レプリケーションのアーキテクチャ {#replication-architectures}
+
+デフォルトの構成、つまり 1 つのソースと 1 つ以上の非同期レプリカは、唯一の選択肢ではありません。MySQL は、一貫性と可用性のトレードオフが異なるいくつかのレプリケーションアーキテクチャを提供します。
+
+| アーキテクチャ | 一貫性の保証 | フェイルオーバー | 書き込みのオーバーヘッド | 複雑さ |
+|:-------------|:---------------------|:---------|:--------------|:-----------|
+| **非同期レプリケーション**（デフォルト） | なし — レプリカは任意の長さで遅れうる | 手動。一部のトランザクションが失われうる | 最小 — ソースは待たない | 低 |
+| **半同期レプリケーション** | ソースがコミットする前に少なくとも 1 つのレプリカがイベントを受信済み | 手動。失われるのは最大 1 トランザクション | 各書き込みに約 1 RTT が加わる | 低〜中 |
+| **グループレプリケーション** | コミット前に全メンバーが合意（マルチプライマリまたはシングルプライマリ） | グループ内で自動 | 高い — トランザクションごとに合意ラウンド | 高 |
+| **InnoDB Cluster** | グループレプリケーションと同じ（その上に構築） | クライアントのフェイルオーバーに MySQL Router を使って自動 | グループレプリケーションと同じ | 高 |
+
+**それぞれを使う場面:**
+
+- **非同期レプリケーション** — 多少のラグが許容できる、読み取りのスケーリングと災害復旧用レプリカのための正しいデフォルトです。
+- **半同期** — ソース障害に対する耐久性の保険が必要だが、グループレプリケーションの運用上の複雑さは許容できない場合です。書き込みコミットごとに約 1 回のネットワーク往復が加わります。
+- **グループレプリケーション / InnoDB Cluster** — 自動フェイルオーバーが必要で、書き込みレイテンシの増加を許容できる場合です。InnoDB Cluster はグループレプリケーションを MySQL Router と MySQL Shell で包み、管理を容易にします。
+
+注: グループレプリケーションでは、すべてのテーブルが InnoDB を使い、主キーを持つ必要があります。`group_replication` プラグインで有効にします。設定はこのガイドの範囲外です。
+
+## レプリカによる読み取りのスケーリング {#read-scaling-with-replicas}
+
+読み取りの多いクエリをレプリカに向けて、ソースの負荷を減らします。
+
+```sql
+-- Application connects to replica for reads
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Connect to source for writes
+INSERT INTO orders (customer_id, total) VALUES (42, 99.99);
+```
+
+アプリケーションはレプリケーションラグを許容しなければなりません。レプリカには、数ミリ秒前にソースで挿入された行がまだないことがあります。最新の書き込みを反映しなければならない読み取りは、ソースに接続します。
+
+## レプリケーションと代替手段の比較 {#replication-vs-alternatives}
+
+レプリケーションは特定の問題をうまく解決しますが、他の問題には不適切なツールです。手を伸ばす前に、本当に合っているかを確認してください。
+
+| シナリオ | レプリケーション | シャーディング | リードレプリカのみ | 分散 DB（例: Vitess、TiDB） |
+|:---------|:-----------|:---------|:-------------------|:-------------------------------------|
+| 読み取りの多いワークロードで、書き込みは 1 台に収まる | 適している | 過剰 | よりシンプル — レプリカを追加するだけ | 過剰 |
+| 書き込み量が 1 台のサーバーを超える | 役に立たない — すべてのレプリカがすべての書き込みを再生する | 適している | 役に立たない | 適している |
+| HA / 自動フェイルオーバー | グループレプリケーションまたは InnoDB Cluster が必要 | 直接は役に立たない | 直接は役に立たない | 組み込み |
+| 地理的分散 / 複数リージョンでの低レイテンシ読み取り | 遅延レプリカまたはリージョンごとのレプリカでうまく機能する | 可能だが複雑 | うまく機能する | 一部で組み込み |
+| ポイントインタイムリカバリ | 良い — binlog が PITR を可能にする | PITR を複雑にする | 良い | 製品による |
+| スキーマがテナント/キーで高度に分割可能 | 機能するがレプリカの書き込み帯域を浪費する | より適している | 機能するが同じ浪費 | 適している |
+| 厳密な read-your-writes 一貫性が必要 | その読み取りにはソースを使う | 該当なし | その読み取りにはソースを使う | 製品による |
+
+**要約:** 1 台のサーバーがすべての書き込みを処理し、読み取りのスケール、HA、またはウォームスタンバイが必要なとき、レプリケーションは正しい選択です。書き込みスループットがボトルネックなら、レプリケーションはその問題をすべてのレプリカにコピーします。シャーディングまたは分散データベースなら、問題を発生源で解決します。
+
+## レプリケーションの停止と開始 {#stopping-and-starting-replication}
+
+```sql
+STOP REPLICA;           -- stop both threads
+STOP REPLICA IO_THREAD; -- stop only the I/O thread
+STOP REPLICA SQL_THREAD; -- stop only the SQL thread
+
+START REPLICA;
+```
+
+失敗した 1 つのイベントをスキップするには（慎重に使ってください。イベントのスキップはレプリカの乖離を引き起こします）:
+
+```sql
+-- GTID mode: inject an empty transaction for the failed GTID
+SET GTID_NEXT = 'source_uuid:N';
+BEGIN; COMMIT;
+SET GTID_NEXT = 'AUTOMATIC';
+START REPLICA;
+```
+
+## よくある質問 {#frequently-asked-questions}
+
+#### レプリケーションは MySQL のメジャーバージョンをまたいで機能しますか? {#does-replication-work-across-mysql-major-versions}
+
+MySQL は古いソースから新しいレプリカへのレプリケーションをサポートしますが、その逆はサポートしません。常にソースより先にレプリカをアップグレードしてください。
+
+#### 半同期レプリケーションと非同期レプリケーションの違いは何ですか? {#whats-the-difference-between-semi-synchronous-and-asynchronous-replication}
+
+非同期レプリケーション（デフォルト）では、ソースはどのレプリカの受信確認も待たずにコミットします。半同期レプリケーションでは、ソースはクライアントに応答を返す前に、少なくとも 1 つのレプリカがイベントの受信を確認するのを待ちます。半同期は、書き込みレイテンシがわずかに高くなる代わりに、ソース障害時のデータ損失のリスクを減らします。
+
+## トラブルシューティング {#troubleshooting}
+
+| 問題 | 解決策 |
+|:--------|:---------|
+| `Replica_IO_Running: No` | `Last_IO_Error` を確認する — 通常は接続または認証の失敗。SOURCE_HOST、ユーザー、パスワード、および REPLICATION SLAVE の付与を確認する |
+| `Replica_SQL_Running: No` | `Last_SQL_Error` を確認する — 通常はデータの競合。イベントをスキップするか根本原因を修正するかを決める |
+| レプリケーションラグが増え続ける | `replica_parallel_workers` をデフォルトの 4 より増やす。アプライヤをブロックしているレプリカ上の長時間実行クエリを確認する |
+| レプリカで `ERROR 1062: Duplicate entry` | レプリカにソースにない行がある — レプリカへの手動書き込みを示す。`replica_skip_errors` を慎重に使うか、再同期する |
+| フェイルオーバー後の GTID のギャップ | 新しいソースに、古いソースが適用済みだった GTID が欠けている — フェイルオーバー中に `SET GTID_PURGED` を慎重に使う |
+
+## 関連項目 {#see-also}
+
+- [MySQL のバイナリログ](/ja/guides/binary-logging) — レプリケーションがソースからレプリカへストリームするバイナリログ
+- [MySQL のバックアップ戦略](/ja/guides/backup-strategies) — 耐久性のためにレプリケーションを補完する戦略
+- [MySQL のリードレプリカ](/ja/guides/read-replicas) — このガイドで構築したレプリカの使い方
