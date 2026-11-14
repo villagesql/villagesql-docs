@@ -34,10 +34,6 @@ using TypeHashFunc = size_t (*)(vsql::CustomArg in);
 **Changed in 0.0.8-dev.** In an encode function, `out.set_null()` stores SQL `NULL`, and `out.error(msg)` with a non-empty message aborts the statement with that message, whatever the SQL mode. `out.warning(msg)`, or no call, still reports the value as invalid.
 </Info>
 
-<Info>
-**Changed in 0.0.8-dev.** The server converts a string to utf8mb4 before calling encode, because encode parses `from` as text. A string that is already utf8mb4, or that carries the binary charset, reaches encode unchanged. This happens wherever the server turns a string into a value of the type: storing it into a column (`INSERT`, `UPDATE`, `INSERT ... SELECT`, `LOAD DATA`), comparing a string literal against the type or passing one as its value, and binding a prepared-statement parameter. A direct SQL call to the type's `TYPE::from_string()` VDF follows the rule for any VDF's `STRING` parameter: below Protocol 4 its argument arrives exactly as the caller wrote it, and from Protocol 4 the server converts it to utf8mb4.
-</Info>
-
 Omitting a custom hash function falls back to hashing the type's raw stored
 bytes. This is unsafe for a type whose encode function can produce more than
 one binary representation of an equal logical value — the common case is a
@@ -105,6 +101,26 @@ Staying under the cap does not guarantee a column fits. Every other column in
 the table draws on the same 65535-byte row budget, which only `CREATE TABLE` can
 weigh, so a type at or near the cap can still fail there with
 `ER_TOO_BIG_ROWSIZE`. A plain `VARBINARY` of the same width behaves the same way.
+
+<Info>
+**Changed in 0.0.8-dev.** A type may also declare a second encode, from its binary form, alongside the required encode from text — for a fixed-length type or a parameterized one alike:
+
+```cpp
+// Encode: binary -> binary. Same reporting contract as TypeEncodeFunc.
+using TypeEncodeBinaryFunc = void (*)(vsql::Span<const unsigned char> from,
+                                      vsql::CustomResult out);
+```
+
+Register it with `.from_binary<&f>()`; it is callable from SQL as `TYPE::from_binary`, with signature `(BINARY) -> CUSTOM(this type)`. As with `.from_string<&f>()`, a parameterized type's parameters can be inferred from a constant argument. Requires `VEF_PROTOCOL_4`.
+</Info>
+
+<Info>
+**Changed in 0.0.8-dev.** The server converts a string to utf8mb4 before calling encode, because encode parses `from` as text. A string that is already utf8mb4 reaches encode unchanged. A value in the binary charset is different: a `_binary '...'` string, a hex or bit literal (`0x...`, `X'...'`, `b'...'`), a `VARBINARY` column value, a binary-bound prepared-statement parameter, and a VDF argument of the type are all the type's binary form rather than its text. For a type whose extension negotiated VEF Protocol 4 or later, such a value goes to `.from_binary<&f>()` instead of `encode` — or, if the type declares no `from_binary`, is rejected outright (`Type '%s' has no binary form; pass the value as a character string`), an error that `IGNORE` does not downgrade to a warning. A type from an extension built before VEF Protocol 4, which cannot declare `from_binary`, keeps receiving a binary-charset value in its encode from text, as its bytes, the same as before this change. This happens wherever the server turns a value into one of the type: storing it into a column (`INSERT`, `UPDATE`, `INSERT ... SELECT`, `LOAD DATA`), comparing a literal against the type or passing one as its value, and binding a prepared-statement parameter. A direct call to the type's `TYPE::from_string()` VDF follows the rule for any VDF's `STRING` parameter: an extension negotiated below Protocol 4 gets the argument's bytes as written, and from Protocol 4 the server converts it to utf8mb4 first.
+</Info>
+
+<Info>
+**Changed in 0.0.8-dev.** `.to_binary<&f>()` is the inverse of `.from_binary<&f>()`: a decode `(CUSTOM(this type)) -> BINARY`, registered as the SQL-callable `TYPE::to_binary`, also requiring `VEF_PROTOCOL_4`. The server never calls it itself: `CAST(v AS BINARY)`, `CONVERT(v USING binary)`, and `HEX(v)` are all still rejected on a custom-type value. `TYPE::to_binary` and `TYPE::to_string` are how a value explicitly leaves the type, in either form. The binary form it returns reaches clients, so it must be the same on every platform: the type decides the byte order of its multi-byte numbers (TVECTOR uses little-endian floats), whatever the host's own byte order.
+</Info>
 
 ## Intrinsic Default
 
@@ -207,7 +223,11 @@ struct MyTypeParams {
 
 void mytype_encode(vsql::MaybeParams<MyTypeParams> &params,
                    std::string_view from, vsql::CustomResult out) {
-  const MyTypeParams &p = params.value();  // is_known() is false when the server infers the params from a constant string
+  if (!params.is_known()) {
+    // The server is inferring the params: derive them from `from`.
+    params.set(MyTypeParams{.dimension = /* number of values in from */ 0});
+  }
+  const MyTypeParams &p = params.value();
   size_t bytes = (size_t)p.dimension * 4;
   auto buf = out.buffer();
   if (buf.size() < bytes) { out.error("MYTYPE: buffer too small"); return; }
@@ -376,11 +396,10 @@ CREATE TABLE t2 (v ext.MYTYPE('dimension=8')); -- string form (.resolve_params o
 ```
 
 <Note>
-The serialized `key=value,...` parameter string that `int_to_params` produces
-and `resolve_params` consumes is capped at `VEF_MAX_TYPE_PARAMS_STRING_LEN`
-(1024 bytes). A parameterization whose canonical string would exceed that limit
-is rejected with a defined error rather than truncated silently — keep the
-combined parameter names and values for a single type within 1024 bytes.
+The serialized `key=value,...` parameter strings that `int_to_params` produces
+and that the mutating `resolve_params` overload returns are capped at `VEF_MAX_TYPE_PARAMS_STRING_LEN`
+(1024 bytes). A returned string over that limit is rejected with `resolve_params result too large for buffer`
+rather than truncated silently — keep the combined parameter names and values for a single type within 1024 bytes.
 </Note>
 
 Whichever syntax supplies the parameters, the server validates the resulting

@@ -50,8 +50,14 @@ villagesql::custom_type!(
 `type_name`, `persisted_length`, `max_decode_buffer_length`, `encode`, `decode`, and `compare` are required. `hash` is optional but recommended, because correct `GROUP BY`, `DISTINCT`, and set operations depend on it. Give the type a default one way or the other: `default` for a value you can write as a literal, `intrinsic_default_fn` for one the extension has to compute. Setting both makes `INSTALL EXTENSION` fail. Setting neither lets the extension install, and then fails the first statement that names the type.
 
 <Info>
-**Changed in 0.0.8-dev.** The server converts a string to utf8mb4 before calling `encode`, because `encode` parses its `&str` as text. A string that is already utf8mb4, or that carries the binary charset, reaches `encode` unchanged. This happens wherever the server turns a string into a value of the type: storing it into a column, comparing a string literal against the type or passing one as its value, and binding a prepared-statement parameter. A direct SQL call to the type's generated `TYPE::from_string()` function follows the rule for any VDF's `STRING` parameter: below Protocol 4 its argument arrives exactly as sent, and from Protocol 4 the server converts it to utf8mb4.
+The server converts a string to utf8mb4 before calling `encode`, because `encode` parses its `&str` as text. A string that is already utf8mb4, or that carries the binary charset, reaches `encode` unchanged. This happens wherever the server turns a string into a value of the type: storing it into a column, comparing a string literal against the type or passing one as its value, and binding a prepared-statement parameter. A direct SQL call to the type's generated `TYPE::from_string()` function follows the same rule: this crate always negotiates VEF Protocol 3, so the argument always arrives exactly as sent, as raw bytes.
 </Info>
+
+<Warning>
+A server-side type can also declare a separate `from_binary` encode for a binary-charset value (a `_binary` string, a hex or bit literal, a `VARBINARY` column, a binary-bound prepared-statement parameter), and `to_binary`, its inverse. Both require an extension that negotiates VEF Protocol 4 or later. See [Type Operations in C++](/en/sdk/cpp/type-operations) for that mechanism, including the error `Type '%s' has no binary form; pass the value as a character string` that a type with no `from_binary` raises instead of reading the value as text.
+
+`custom_type!` does not generate either function, and this crate always registers its extensions at VEF Protocol 3, so a type built with it never reaches that mechanism: `encode` keeps getting a binary-charset value unchanged, as its raw bytes, whatever the server version.
+</Warning>
 
 ## Receiving and returning binary values
 
@@ -78,8 +84,14 @@ fn rational_numer_impl(args: &[InValue]) -> VdfReturn {
 fn rational_add_impl(args: &[InValue]) -> VdfReturn {
     match (args.get(0), args.get(1)) {
         (Some(InValue::Custom(a)), Some(InValue::Custom(b))) => {
-            let result = add_rationals(a, b);
-            VdfReturn::Binary(result)
+            let ((n1, d1), (n2, d2)) = (from_bytes(a), from_bytes(b));
+            match normalize(
+                i128::from(n1) * i128::from(d2) + i128::from(n2) * i128::from(d1),
+                i128::from(d1) * i128::from(d2),
+            ) {
+                Some((n, d)) => VdfReturn::Binary(to_bytes(n, d)),
+                None => VdfReturn::error("rational_add: overflow"),
+            }
         }
         _ => VdfReturn::null(),
     }
@@ -242,7 +254,7 @@ villagesql::parameterized_type!(
 | `int_to_params` | fn | Converts the `TYPE(N)` integer syntax into a canonical params string. |
 | `resolve_params` | fn | Validates a parsed `Params` and returns a `Resolved` (storage sizes, optionally rewritten params). |
 | `params_type` | type | Your parsed-parameter struct, e.g. `PadintParams`. |
-| `params_parse` | fn | Parses `Params` into `params_type`. Runs at most once per unique parameter combination — the SDK caches the result. |
+| `params_parse` | fn | Parses `Params` into `params_type`. `decode`, `compare`, and `hash` receive a result that the SDK caches for each unique parameter combination; `encode` parses again for every value. |
 | `params_to_strings` | fn | The inverse of `params_parse`: writes `params_type` back into canonical `(key, value)` pairs. |
 | `hash` | fn | Returns a `usize` hash given `&P`, used for `GROUP BY`, `DISTINCT`, and set operations. Optional but recommended. |
 | `default` | string literal | A valid string the server can encode at type initialization. Required unless `intrinsic_default_fn` is given. |
