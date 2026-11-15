@@ -1,0 +1,396 @@
+---
+title: "通过 MCP 将 AI 代理连接到 MySQL"
+sidebarTitle: "连接 AI 代理（MCP）"
+description: "如何使用 vsql_mcp 扩展通过 Model Context Protocol 把 VillageSQL 数据库暴露给 AI 代理——安装、最小权限数据库账户、防护措施，以及一次真实的客户端连接。"
+keywords: "mysql mcp, model context protocol mysql, vsql_mcp, mysql ai agent, claude code mysql, mcp server mysql, ai agent database access, mcp streamable http"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+需要查询数据库的 AI 代理通常通过手写的工具或边车进程与数据库对话。`vsql_mcp` 扩展去掉了这一层：它在 VillageSQL 进程内部运行一个 Model Context Protocol 服务器，所以任何 MCP 客户端都可以直接发现架构并运行查询。
+
+## vsql_mcp 做什么 {#what-vsql_mcp-does}
+
+`vsql_mcp` 是一个 Rust 扩展，从服务器进程内的后台工作线程通过 Streamable HTTP 传输（规范修订版 `2025-06-18`）提供 MCP 服务。它暴露六个工具：`list_schemas`、`list_tables`、`describe_table`、`query`、`explain` 和 `write`。`write` 工具只有在您启用它之后才会出现，它默认是禁用的。
+
+`vsql_mcp` 是预览扩展。它使用 VEF 预览能力 `thread_worker`、`sys_var`、`status_var` 和 `sql_query`，所以服务器必须在允许预览扩展的状态下启动：
+
+```bash
+mysqld --vsql_allow_preview_extensions=ON ...
+```
+
+安装之前检查该标志：
+
+```sql
+SHOW VARIABLES LIKE 'vsql_allow_preview_extensions';
+```
+
+```
++--------------------------------+-------+
+| Variable_name                  | Value |
++--------------------------------+-------+
+| vsql_allow_preview_extensions  | ON    |
++--------------------------------+-------+
+```
+
+## 创建示例数据 {#creating-sample-data}
+
+本指南使用一个专用数据库和一个小的 `posts` 表，让代理有真实的东西可查。
+
+```sql
+CREATE DATABASE mcp_guide;
+
+CREATE TABLE mcp_guide.posts (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  title VARCHAR(200) NOT NULL,
+  author VARCHAR(100) NOT NULL,
+  views INT NOT NULL DEFAULT 0
+);
+
+INSERT INTO mcp_guide.posts (title, author, views) VALUES
+  ('Getting started with VillageSQL', 'Adam', 1520),
+  ('Custom types in VEF', 'Priya', 890),
+  ('Why we built the MCP extension', 'Tomas', 430);
+```
+
+## 安装扩展 {#installing-the-extension}
+
+```sql
+INSTALL EXTENSION vsql_mcp;
+```
+
+安装它会注册其配置变量和状态变量。在您于下一节打开它之前，没有任何东西在端口上监听。
+
+## 创建最小权限账户 {#creating-a-least-privilege-account}
+
+`vsql_mcp` 运行的大多数工具调用，包括 `query`、`write`、`explain` 和表 DDL 资源，都通过一个回环连接、使用您配置的账户访问服务器。只有 `list_schemas`、`list_tables` 和 `describe_table` 在进程内运行，不需要该账户。请创建一个专用账户，范围限定在本指南使用的这一个数据库，并且只有 `SELECT`：
+
+```sql
+CREATE USER 'mcp_user'@'127.0.0.1' IDENTIFIED BY 'ChangeMe-guide-2026!';
+GRANT SELECT ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+该账户的授权才是真正的访问边界。`vsql_mcp` 自身的防护措施（下文介绍）是在这些授权之上执行的，而不是取而代之。
+
+## 配置并启用服务器 {#configuring-and-enabling-the-server}
+
+所有 `vsql_mcp` 设置都是 `SET GLOBAL vsql_mcp.<name>` 变量。把 `db_url` 指向上面创建的账户，把服务器限定到一个架构，要求 bearer 令牌，然后打开它：
+
+```sql
+SET GLOBAL vsql_mcp.db_url = 'mysql://mcp_user:ChangeMe-guide-2026!@127.0.0.1:3306/mcp_guide';
+SET GLOBAL vsql_mcp.schema = 'mcp_guide';
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'a-long-random-token';
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+```
+
+确认它正在监听：
+
+```sql
+SHOW STATUS LIKE 'vsql_mcp%';
+```
+
+```
++----------------------------+-------+
+| Variable_name              | Value |
++----------------------------+-------+
+| vsql_mcp.http_port         | 3100  |
+| vsql_mcp.https_port        | 0     |
+| vsql_mcp.rows_returned_total | 0   |
+| vsql_mcp.sessions_active   | 0     |
+| vsql_mcp.tool_calls_total  | 0     |
+| vsql_mcp.tool_errors_total | 0     |
++----------------------------+-------+
+```
+
+`http_port` 显示为 `3100`，即默认值。服务器在 `http://127.0.0.1:3100/mcp` 上监听，并且只绑定到 `127.0.0.1`。它从不直接接受远程连接；如果您需要远程访问，把它放在反向代理之后是您自己的责任。
+
+## 验证服务器能说 MCP {#verifying-the-server-speaks-mcp}
+
+在连接真实客户端之前，先用 MCP 握手直接验证 HTTP 端点。没有 bearer 令牌的请求会被拒绝：
+
+```bash
+curl -i -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
+```
+
+```
+HTTP/1.1 401 Unauthorized
+```
+
+带上令牌后，`initialize` 成功并返回一个 `Mcp-Session-Id` 头：
+
+```bash
+curl -i -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
+```
+
+```
+HTTP/1.1 200 OK
+Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606
+
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.7"}}}
+```
+
+此后这个连接上的每一个请求都需要那个会话 ID。省略它会以 JSON-RPC 错误失败，而不是静默地使用默认值：
+
+```bash
+curl -i -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -d '{"jsonrpc":"2.0","id":99,"method":"tools/list"}'
+```
+
+```
+HTTP/1.1 400 Bad Request
+
+{"error":{"code":-32600,"message":"missing Mcp-Session-Id header"},"id":99,"jsonrpc":"2.0"}
+```
+
+发送 `notifications/initialized`，然后使用 `initialize` 响应中的会话 ID 列出可用的工具：
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+```
+
+```json
+{"id":2,"jsonrpc":"2.0","result":{"tools":[
+  {"name":"list_schemas","description":"List schemas visible to the extension.","inputSchema":{"properties":{},"type":"object"}},
+  {"name":"list_tables","description":"List tables and views in a schema, with row estimates.","inputSchema":{"properties":{"schema":{"type":"string"}},"type":"object"}},
+  {"name":"describe_table","description":"Columns, types, and keys for a table.","inputSchema":{"properties":{"schema":{"type":"string"},"table":{"type":"string"}},"required":["table"],"type":"object"}},
+  {"name":"query","description":"Run a single read-only SELECT and return JSON rows.","inputSchema":{"properties":{"sql":{"type":"string"}},"required":["sql"],"type":"object"}},
+  {"name":"explain","description":"Return EXPLAIN FORMAT=JSON for a candidate query.","inputSchema":{"properties":{"sql":{"type":"string"}},"required":["sql"],"type":"object"}}
+]}}
+```
+
+列出的是五个工具，而不是六个。`write` 不在其中，因为 `allow_write` 仍然是 OFF，所以此刻连接的代理不会围绕一个它无法使用的工具来做计划。
+
+## 通过 MCP 调用工具 {#calling-tools-over-mcp}
+
+`list_tables` 显示被暴露架构中的那一个表：
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_tables","arguments":{"schema":"mcp_guide"}}}'
+```
+
+```json
+{"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"{\"schema\":\"mcp_guide\",\"tables\":[{\"name\":\"posts\",\"row_estimate\":3,\"type\":\"BASE TABLE\"}]}","type":"text"}],"isError":false}}
+```
+
+`query` 运行一条 `SELECT` 并返回实际的行：
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT id, title, author, views FROM mcp_guide.posts ORDER BY views DESC"}}}'
+```
+
+```json
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"{\"columns\":[\"id\",\"title\",\"author\",\"views\"],\"row_count\":3,\"rows\":[{\"author\":\"Adam\",\"id\":1,\"title\":\"Getting started with VillageSQL\",\"views\":1520},{\"author\":\"Priya\",\"id\":2,\"title\":\"Custom types in VEF\",\"views\":890},{\"author\":\"Tomas\",\"id\":3,\"title\":\"Why we built the MCP extension\",\"views\":430}],\"truncated\":false}","type":"text"}],"isError":false}}
+```
+
+这就是 `posts` 表中真实的示例数据，通过 MCP 协议而不是直接的 SQL 连接返回。
+
+`query` 只接受单条只读语句。其他任何东西都会在到达数据库之前被拒绝：
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"query","arguments":{"sql":"DELETE FROM mcp_guide.posts"}}}'
+```
+
+```json
+{"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"only a single read-only statement is allowed by the query tool","type":"text"}],"isError":true}}
+```
+
+## 连接真实客户端 {#connecting-a-real-client}
+
+上面的步骤证明服务器对原始 HTTP 客户端的响应是正确的。要证明代理确实能使用它，请把服务器注册到 Claude Code，并让它管理会话：
+
+```bash
+claude mcp add --transport http vsql http://127.0.0.1:3100/mcp \
+  --header "Authorization: Bearer a-long-random-token"
+```
+
+```
+Added HTTP MCP server vsql with URL: http://127.0.0.1:3100/mcp to local config
+Headers: {
+  "Authorization": "[REDACTED]"
+}
+File modified: /Users/villageadam/.claude.json [project: /path/to/your/project]
+```
+
+`local config` 把该服务器的范围限定在这一个项目。改为传入 `--scope user` 可以让它在每个项目中都可用。`claude mcp list` 显示连接状态：
+
+```
+vsql: http://127.0.0.1:3100/mcp (HTTP) - ✔ Connected
+```
+
+Claude Code 执行了它自己的 `initialize` 握手，协商了一个会话，并确认服务器能通过 MCP 应答，这就是本指南用 `SET GLOBAL` 语句配置并在上面手动测试过的同一台服务器。从这里开始，向代理询问关于 `mcp_guide` 数据库的问题会经由 `list_tables`、`describe_table` 和 `query`，与用 curl 演示的完全一样。
+
+`vsql_mcp` 没有 stdio 传输。服务器运行在数据库进程内部，所以不存在供客户端派生的子进程。只会说 stdio 的客户端，或者经由供应商云代理、无法访问 `127.0.0.1` 的远程客户端，需要在端点前面放一个 stdio 到 HTTP 的桥接或一条隧道。
+
+## write 工具 {#the-write-tool}
+
+`allow_write` 默认是 OFF，在它关闭时调用 `write` 会立即失败，不会触及数据库：
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606" \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"write","arguments":{"sql":"UPDATE mcp_guide.posts SET views = 9999 WHERE id = 1"}}}'
+```
+
+```json
+{"id":6,"jsonrpc":"2.0","result":{"content":[{"text":"the write tool is disabled (set vsql_mcp.allow_write = ON)","type":"text"}],"isError":true}}
+```
+
+把 `allow_write` 打开会让该工具出现在 `tools/list` 中，但账户自身的授权仍然适用。在 `mcp_user` 仍然只持有 `SELECT` 的情况下，同一个调用现在改为在数据库层失败：
+
+```sql
+SET GLOBAL vsql_mcp.allow_write = ON;
+```
+
+```json
+{"id":8,"jsonrpc":"2.0","result":{"content":[{"text":"ERROR 1142 (42000): UPDATE command denied to user 'mcp_user'@'localhost' for table 'posts'","type":"text"}],"isError":true}}
+```
+
+在该数据库上授予 `UPDATE` 后，同一个调用就能通过，并且确实改变了那一行：
+
+```sql
+GRANT UPDATE ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+```json
+{"id":9,"jsonrpc":"2.0","result":{"content":[{"text":"{\"affected_rows\":1}","type":"text"}],"isError":false}}
+```
+
+```sql
+SELECT id, title, views FROM mcp_guide.posts WHERE id = 1;
+```
+
+```
++----+----------------------------------+-------+
+| id | title                            | views |
++----+----------------------------------+-------+
+|  1 | Getting started with VillageSQL | 9999  |
++----+----------------------------------+-------+
+```
+
+`allow_write` 和账户的授权是两道独立的关卡，一次真实的写入需要两者都打开。写入没有像 `max_rows` 限制读取那样的行数上限：一条不带条件的 `DELETE` 会清空整个表，与其他任何设置无关。拥有生产数据库写入权限的代理，与任何其他拥有广泛写入权限的自主进程承担同样的风险：它可能执行一个对它合理、对您不合理的计划，而且比人工审查步骤能拦下的速度更快。请给 `db_url` 一个授权恰好与您愿意接受的影响范围相匹配的账户，并把 `allow_write` 视为按数据库逐一做出的决定，而不是因为某次演示需要就一直开着的默认值。
+
+本指南在继续之前把 `allow_write` 关回去并撤销 `UPDATE`，对于一个代理拥有常驻访问权限的数据库，这也是更安全的常态。
+
+```sql
+REVOKE UPDATE ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+```
+
+## 缩小代理能触及的范围 {#narrowing-what-an-agent-can-reach}
+
+有两项设置能把代理的触及范围缩得比账户授权本身更小，当一个账户不只服务于 `vsql_mcp` 时很有用。
+
+`max_rows` 限制单次 `query` 调用返回的行数，并把结果标记为 `truncated`：
+
+```sql
+SET GLOBAL vsql_mcp.max_rows = 2;
+```
+
+```json
+{"id":10,"jsonrpc":"2.0","result":{"content":[{"text":"{\"columns\":[\"id\",\"title\"],\"row_count\":2,\"rows\":[{\"id\":1,\"title\":\"Getting started with VillageSQL\"},{\"id\":2,\"title\":\"Custom types in VEF\"}],\"truncated\":true}","type":"text"}],"isError":false}}
+```
+
+`allowed_tables` 限制一条语句可以触及哪些表，通过用 `EXPLAIN FORMAT=JSON` 为该语句生成执行计划来检查。添加第二个表来观察它的执行效果：
+
+```sql
+CREATE TABLE mcp_guide.secrets (id INT PRIMARY KEY AUTO_INCREMENT, api_key VARCHAR(200) NOT NULL);
+INSERT INTO mcp_guide.secrets (api_key) VALUES ('sk-do-not-expose-this');
+GRANT SELECT ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+当同一架构中存在 `secrets`，而 `allowed_tables` 只设置为 `posts` 时，`posts` 仍然可用，`secrets` 则被拒绝：
+
+```sql
+SET GLOBAL vsql_mcp.allowed_tables = 'posts';
+```
+
+```json
+{"id":12,"jsonrpc":"2.0","result":{"content":[{"text":"table 'secrets' is not in vsql_mcp.allowed_tables","type":"text"}],"isError":true}}
+```
+
+`list_tables` 也不再列出被排除的表，所以只依靠 `list_tables` 工作的代理永远不会知道 `secrets` 的存在：
+
+```json
+{"id":13,"jsonrpc":"2.0","result":{"content":[{"text":"{\"schema\":\"mcp_guide\",\"tables\":[{\"name\":\"posts\",\"row_estimate\":3,\"type\":\"BASE TABLE\"}]}","type":"text"}],"isError":false}}
+```
+
+该允许列表是根据语句执行计划中的表来检查的，而不是从账户的授权读取的，所以它看不穿存储函数，也不会阻止读取工具调用 `db_url` 账户可以调用的任何函数。请把 `allowed_tables` 和 `max_rows` 视为叠加在账户授权之上的防护措施，而不是限定授权本身的替代品。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 代理需要直接访问数据库凭据吗？ {#does-an-agent-need-direct-access-to-the-database-credentials}
+
+不需要。代理使用 `vsql_mcp.bearer_token` 中设置的 bearer 令牌向 `vsql_mcp` 认证。`vsql_mcp.db_url` 指明的数据库账户只由扩展在内部用于运行工具查询；代理永远看不到该账户的密码。
+
+#### 我可以暴露多个架构吗？ {#can-i-expose-more-than-one-schema}
+
+可以，但把 `vsql_mcp.schema` 留空会暴露比您预期更多的东西。此时 `list_schemas` 会返回服务器上的每一个架构，包括 `mysql`、`sys` 和 `performance_schema`，而且它不会按 `db_url` 账户能访问的范围过滤：该列表在进程内针对 `information_schema.SCHEMATA` 运行，而不是通过该账户的连接。把 `vsql_mcp.schema` 限定到一个架构才是限制发现范围的方法。账户的授权仍然决定 `query` 和 `write` 实际能读什么，所以被列出的架构不一定是可读的架构。
+
+#### vsql_mcp 支持 TLS 吗？ {#does-vsql_mcp-support-tls}
+
+支持。把 `vsql_mcp.ssl_cert` 和 `vsql_mcp.ssl_key` 都设置为 PEM 文件路径后，会在 `vsql_mcp.ssl_port`（默认 `3143`）上提供 HTTPS。两者任一留空都会关闭 TLS，与端口设置无关。
+
+#### 为什么更改端口不会立即生效？ {#why-does-changing-the-port-not-take-effect-immediately}
+
+端口和 TLS 设置在服务器下一次被启用时生效。更改它们之后，请把 `vsql_mcp.vsql_mcp_enabled` 切换为 OFF 再切换为 ON。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `INSTALL EXTENSION vsql_mcp` 因预览能力错误而失败 | 使用 `--vsql_allow_preview_extensions=ON` 启动服务器，或运行 `SET PERSIST vsql_allow_preview_extensions = ON`，它立即生效，不需要重启。 |
+| `SHOW STATUS LIKE 'vsql_mcp.http_port'` 返回 `0` | 服务器没有在监听。确认 `vsql_mcp.vsql_mcp_enabled = ON`，并检查没有其他东西已经绑定到所配置的端口。 |
+| 每个请求都返回 `401 Unauthorized` | `require_auth` 为 ON，而请求缺少 `Authorization: Bearer <token>`，或者令牌与 `vsql_mcp.bearer_token` 不匹配。 |
+| `tools/call` 返回 `400` 并带有 `missing Mcp-Session-Id header` | `initialize` 之后的每个请求都必须携带 `initialize` 响应返回的 `Mcp-Session-Id` 值。 |
+| `query` 或 `write` 因 MySQL 授权错误而失败 | `vsql_mcp.db_url` 中指明的账户没有该语句所需的权限。请在那里授予它，而不只是在 `allowed_tables` 中。 |
+| `tools/list` 中没有 `write` | `vsql_mcp.allow_write` 为 OFF。把它设置为 `ON` 以启用该工具。 |
+| 客户端完全无法连接 | 确认客户端访问的是 `127.0.0.1` 和所配置的端口；`vsql_mcp` 不绑定任何其他接口。 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 用户管理](/zh/guides/user-management) — `CREATE USER`、`GRANT` 以及最小权限账户设计
+- [MySQL 安全加固](/zh/guides/security-hardening) — 超出单个扩展防护措施之外的更广泛的服务器加固
+- [将 MySQL 连接到 AI API](/zh/guides/ai-api-setup) — 另一个方向：使用 `vsql_ai` 从 MySQL 内部调用 AI API

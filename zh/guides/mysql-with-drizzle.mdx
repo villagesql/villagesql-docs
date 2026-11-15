@@ -1,0 +1,349 @@
+---
+title: "Next.js 和 Drizzle 搭配 MySQL"
+sidebarTitle: "Next.js 搭配 Drizzle"
+description: "如何使用 Drizzle ORM 和 mysql2 驱动将 Next.js App Router 应用程序连接到 MySQL：模式定义、使用 drizzle-kit 迁移、Server Components、Server Actions，以及会提供过期数据库行的静态渲染陷阱。"
+keywords: "nextjs mysql drizzle, drizzle orm mysql, drizzle-kit migrate, nextjs server action mysql, mysql2 nextjs, drizzle mysql2 driver, nextjs app router database, drizzle orm mysql2"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Drizzle ORM 是一个 TypeScript 查询构建器，它从模式文件生成 SQL 迁移，并为您提供带类型的查询 API，而没有自己的中间查询语言。本指南通过 Drizzle 和 `mysql2` 驱动将 Next.js App Router 应用程序连接到 MySQL，涵盖模式、迁移、从 Server Component 读取以及从 Server Action 写入。它假设已有一个用 `create-next-app --src-dir` 搭建好的应用，该命令会设置代码示例所使用的 `@/*` 导入别名。
+
+## 安装 Drizzle 和 MySQL 驱动 {#install-drizzle-and-the-mysql-driver}
+
+Drizzle 需要 `mysql2` 驱动来与 MySQL 通信，还需要 `drizzle-kit` 来生成和运行迁移：
+
+```bash
+npm install drizzle-orm mysql2
+npm install -D drizzle-kit tsx dotenv
+```
+
+`drizzle-kit` 迭代很快，并且在 `dist-tags` 下与 `latest` 并列发布了预发布标签（`beta`、`rc`）。安装前请检查 `npm view drizzle-orm dist-tags` 和 `npm view drizzle-kit dist-tags`，确认 `latest` 确实指向一个稳定版本而不是候选发布版本。
+
+在 `.env` 中设置连接字符串：
+
+```bash
+DATABASE_URL="mysql://drizzle_app:your_password@127.0.0.1:3306/your_database"
+```
+
+## 创建数据库用户 {#create-the-database-user}
+
+创建一个专用数据库和一个限定在该数据库范围内的用户，而不是以 `root` 身份连接应用程序：
+
+```sql
+CREATE DATABASE drizzle_guide;
+CREATE USER 'drizzle_app'@'127.0.0.1' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON drizzle_guide.* TO 'drizzle_app'@'127.0.0.1';
+```
+
+通过 Unix 套接字的连接总是与 `'localhost'` 主机进行匹配，无论存在哪些基于 IP 的授权；一个只以 `'drizzle_app'@'127.0.0.1'` 创建的用户无法通过套接字进行身份验证。到 `127.0.0.1` 的 TCP 连接通过反向 DNS 查找进行匹配，因此它是否同时满足 `'localhost'` 授权取决于服务器如何解析 `127.0.0.1`，而不是某条固定的 MySQL 规则。请授权给您的应用程序实际使用的主机，不要依赖 `127.0.0.1` 和 `localhost` 可以互换。
+
+## 定义模式 {#define-the-schema}
+
+Drizzle 的 MySQL 模式使用 `drizzle-orm/mysql-core` 中的函数来描述每一列：
+
+```typescript src/db/schema.ts
+import { int, mysqlTable, text, timestamp, varchar } from "drizzle-orm/mysql-core";
+
+export const posts = mysqlTable("posts", {
+  id: int("id").autoincrement().primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+```
+
+`varchar` 需要显式的 `length`。与 PostgreSQL 不同，MySQL 存储 `VARCHAR` 时最大长度是固化在列类型中的，因此 Drizzle 没有可以回退的默认值，需要预先提供该值。
+
+## 配置 drizzle-kit {#configure-drizzle-kit}
+
+`drizzle-kit` 读取一个配置文件来了解模式在哪里以及如何连接数据库：
+
+```typescript drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+export default defineConfig({
+  out: "./drizzle",
+  schema: "./src/db/schema.ts",
+  dialect: "mysql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL,
+  },
+});
+```
+
+`drizzle-kit` 会在您的配置文件运行之前自己读取 `.env`，因此这里的 `process.env.DATABASE_URL` 已经被填充，不需要导入 `dotenv`。这是 `drizzle-kit` 特有的：普通的 Node 或 `tsx` 脚本没有内置这样的加载器，本指南后面的验证脚本会展示这一点。
+
+把迁移脚本添加到 `package.json`：
+
+```json package.json
+{
+  "scripts": {
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
+  }
+}
+```
+
+## 生成并运行迁移 {#generate-and-run-the-migration}
+
+`drizzle-kit generate` 将模式文件与上一次生成的迁移进行比较，并写出一个新的 SQL 文件：
+
+```bash
+npm run db:generate
+```
+
+```
+No config path provided, using default 'drizzle.config.ts'
+Reading config file '/path/to/your-app/drizzle.config.ts'
+Reading schema files:
+/path/to/your-app/src/db/schema.ts
+
+1 tables
+posts 4 columns 0 indexes 0 fks
+
+[✓] Your SQL migration file ➜ drizzle/0000_premium_tiger_shark.sql 🚀
+```
+
+`drizzle-kit` 以绝对路径形式打印配置和模式路径；上面的 `/path/to/your-app` 代表您的项目目录。生成的文件名包含一个随机的两个单词后缀，因此您的文件名会不同；只有数字前缀（`0000`）对排序有意义。在模式没有变化的情况下重新运行 `db:generate` 会报告 `No schema changes, nothing to migrate`，而不是写出第二个文件。迁移本身是普通的 SQL：
+
+```sql drizzle/0000_premium_tiger_shark.sql
+CREATE TABLE `posts` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`title` varchar(255) NOT NULL,
+	`body` text NOT NULL,
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `posts_id` PRIMARY KEY(`id`)
+);
+```
+
+应用它：
+
+```bash
+npm run db:migrate
+```
+
+`drizzle-kit migrate` 第一次运行时会创建一个 `__drizzle_migrations` 表，用于跟踪哪些迁移文件已经应用过。确认两张表都存在：
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u drizzle_app -p drizzle_guide -e "SHOW TABLES;"
+```
+
+```
+Tables_in_drizzle_guide
+__drizzle_migrations
+posts
+```
+
+## 创建数据库客户端 {#create-the-database-client}
+
+`mysql2` 驱动通过连接池进行连接，Drizzle 包装该连接池：
+
+```typescript src/db/index.ts
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import * as schema from "./schema";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+const poolConnection = mysql.createPool(process.env.DATABASE_URL);
+
+export const db = drizzle(poolConnection, { schema, mode: "default" });
+```
+
+`mode: "default"` 选项是 `mysql2` 驱动特有的，在 Drizzle 的 PostgreSQL 或 SQLite 驱动上没有对应项。省略它是类型错误，而不是静默的默认值。
+
+## 在 Server Component 中读取文章 {#read-posts-in-a-server-component}
+
+Server Component 可以在渲染期间直接调用 `db.select()`，中间不需要 API 路由：
+
+```typescript src/app/page.tsx
+import { db } from "@/db";
+import { posts } from "@/db/schema";
+import { desc } from "drizzle-orm";
+import { createPost } from "./actions";
+
+export const dynamic = "force-dynamic";
+
+export default async function Home() {
+  const allPosts = await db.select().from(posts).orderBy(desc(posts.createdAt));
+
+  return (
+    <main>
+      <h1>Posts</h1>
+      <form action={createPost}>
+        <div>
+          <label htmlFor="title">Title</label>
+          <input id="title" name="title" type="text" required />
+        </div>
+        <div>
+          <label htmlFor="body">Body</label>
+          <textarea id="body" name="body" required />
+        </div>
+        <button type="submit">Create post</button>
+      </form>
+      <ul>
+        {allPosts.map((post) => (
+          <li key={post.id}>
+            <strong>{post.title}</strong>
+            <p>{post.body}</p>
+            <small>{post.createdAt.toISOString()}</small>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+## 使用 Server Action 插入文章 {#insert-posts-with-a-server-action}
+
+Server Action 在服务器上运行，可以直接传给表单的 `action` 属性：
+
+```typescript src/app/actions.ts
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { db } from "@/db";
+import { posts } from "@/db/schema";
+
+export async function createPost(formData: FormData) {
+  const title = formData.get("title");
+  const body = formData.get("body");
+
+  if (typeof title !== "string" || title.trim() === "") {
+    throw new Error("Title is required");
+  }
+  if (typeof body !== "string" || body.trim() === "") {
+    throw new Error("Body is required");
+  }
+
+  await db.insert(posts).values({ title, body });
+
+  revalidatePath("/");
+}
+```
+
+即使在每次请求都渲染的路由上，`revalidatePath("/")` 也是必需的。没有它，Server Action 的响应不保证包含调用它的那个页面的刷新副本。
+
+## 静态渲染陷阱 {#the-static-rendering-trap}
+
+`npm run build` 编译应用程序，但它还会逐路由判断一个页面是可以在构建时预渲染一次，还是必须在每次请求时渲染。一个读取数据库而同一路由中没有其他动态 API（没有 `cookies()`、没有 `headers()`、没有 `searchParams`）的 Server Component，没有给 Next.js 任何强制按请求渲染的理由，因此它会在构建期间预渲染该页面一次，之后向每个访问者提供同一份 HTML。
+
+这是可以复现的：从 `page.tsx` 中移除 `export const dynamic = "force-dynamic";` 并重新构建，得到的路由被标记为静态：
+
+```
+Route (app)
+┌ ○ /
+└ ○ /_not-found
+
+○  (Static)  prerendered as static content
+```
+
+在那次构建之后直接插入数据库的一行，在用 `npm run start` 启动构建好的应用程序时并没有出现。页面一直提供构建时捕获的行数和内容。向 `page.tsx` 添加 `export const dynamic = "force-dynamic";` 并重新构建后，路由变为动态：
+
+```
+Route (app)
+┌ ƒ /
+└ ○ /_not-found
+
+ƒ  (Dynamic)  server-rendered on demand
+```
+
+做了这个修改之后，构建后插入的一行在下一次请求时立即出现，无需重新构建。任何读取数据库并需要反映构建后写入的页面，都需要 `export const dynamic = "force-dynamic";`，或者另一个具有相同效果、强制按请求渲染的 Next.js API（比如读取 `cookies()`）。
+
+## 独立于 ORM 验证写入路径 {#verify-the-write-path-independently-of-the-orm}
+
+一个通过 Drizzle 插入并且只检查 Drizzle 自身返回值的脚本并不能证明行已到达数据库；它只能证明驱动返回时没有抛出异常。请用一个单独的查询来验证：
+
+```typescript src/db/verify-insert.ts
+import "dotenv/config";
+import { db } from "./index";
+import { posts } from "./schema";
+
+async function main() {
+  const [inserted] = await db.insert(posts).values({
+    title: "Verification post",
+    body: "Inserted by verify-insert.ts to confirm the write path works.",
+  });
+
+  console.log("Insert result:", inserted);
+  process.exit(0);
+}
+
+main();
+```
+
+用 `tsx` 运行它，它会直接执行 TypeScript：
+
+```bash
+npx tsx src/db/verify-insert.ts
+```
+
+```
+Insert result: ResultSetHeader {
+  fieldCount: 0,
+  affectedRows: 1,
+  insertId: 1,
+  info: '',
+  serverStatus: 2,
+  warningStatus: 0,
+  changedRows: 0
+}
+```
+
+脚本顶部的 `import "dotenv/config"` 在这里是必需的。Next.js 会自动为应用程序加载 `.env`，但用 `tsx` 运行的独立脚本是一个没有框架介入的普通 Node 进程，而 Node 本身不读取 `.env` 文件。
+
+然后用一个从未经过应用程序的查询来确认该行存在：
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u drizzle_app -p drizzle_guide -e "SELECT id, title, body, created_at FROM posts;"
+```
+
+```
+id	title	body	created_at
+1	Verification post	Inserted by verify-insert.ts to confirm the write path works.	2026-08-28 11:59:54
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 这在 VillageSQL 上的工作方式与在 MySQL 上相同吗？ {#does-this-work-the-same-way-with-villagesql-as-with-mysql}
+
+相同。Drizzle 的 MySQL 方言和 `mysql2` 驱动使用标准的 MySQL 线路协议，而 VillageSQL 是 MySQL 的直接替代品，具有相同的协议和客户端工具。上面的模式、迁移或查询代码中没有任何东西是特定于 MySQL 版本的。
+
+#### 我应该使用 `drizzle-kit generate` 加 `migrate`，还是 `drizzle-kit push`？ {#should-i-use-drizzle-kit-generate-and-migrate-or-drizzle-kit-push}
+
+`generate` 加 `migrate` 会写出一个 SQL 迁移文件，您可以在它针对数据库运行之前审查并提交它，这正是本指南所用的方式。`drizzle-kit push` 把模式文件与实际数据库进行比较并直接应用差异，没有迁移文件。`push` 在早期原型阶段更快，但不会留下任何关于改了什么、何时改的记录，一旦其他开发者或环境依赖该模式，它就不能替代迁移文件。
+
+#### 为什么迁移文件夹里有一张叫 `__drizzle_migrations` 的表？ {#why-does-the-migration-folder-have-a-table-called-__drizzle_migrations}
+
+`drizzle-kit migrate` 在第一次运行时创建这张表，按哈希记录它已经应用过哪些迁移文件。`migrate` 正是靠它知道要跳过已经运行过的迁移，而不是再应用一次。
+
+#### 我可以直接从 Server Component 调用 `db.insert()`，而不用 Server Action 吗？ {#can-i-call-dbinsert-directly-from-a-server-component-instead-of-a-server-action}
+
+Server Component 只在渲染期间运行；没有来自浏览器的请求来响应用户操作触发写入。写入路径需要 Server Action、Route Handler，或者调用 API 路由的客户端代码。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `Access denied for user 'drizzle_app'@'localhost' (using password: YES)` | `DATABASE_URL` 中的密码错误。即使连接的是 `127.0.0.1`，错误中显示的主机也可能是 `localhost`；这并不意味着账户的主机部分有问题。请先重新检查密码。 |
+| `ERROR 1146 (42S02): Table 'drizzle_guide.posts' doesn't exist` | 迁移从未针对这个数据库运行过。运行 `npm run db:migrate`。 |
+| `npm run build` 之后插入的一行没有出现在页面上 | 该路由在构建时被预渲染了。向页面添加 `export const dynamic = "force-dynamic";` 并重新构建。 |
+| 运行 `drizzle-kit generate` 或 `migrate` 时出现 `DATABASE_URL is not set` | `.env` 缺失，或者命令是在项目根目录之外的目录运行的，因此 `drizzle-kit` 没有找到它。 |
+| 调用 `drizzle()` 时 `mode` 选项上出现类型错误 | `mysql2` 驱动需要 `mode: "default"`（或者 `"planetscale"` 以获得 PlanetScale 特定的行为）；这个选项在 Drizzle 的 PostgreSQL 或 SQLite 驱动上不存在。 |
+
+## 另请参阅 {#see-also}
+
+- [Next.js 和 Prisma 搭配 MySQL](/zh/guides/mysql-with-prisma) — 同一个应用，用 Prisma 而不是 Drizzle 构建
+- [Next.js 搭配 MySQL](/zh/guides/nextjs-mysql) — 完全不用 ORM 的连接设置、Server Actions 和 Route Handler 模式
+- [在 ORM 中使用 MySQL：Django、Rails 和 Prisma](/zh/guides/mysql-with-orms) — 在 Drizzle 之外的 ORM 中配置 MySQL 特定的设置
+- [MySQL 连接池](/zh/guides/connection-pooling) — `mysql2` 创建的连接池如何与 MySQL 的连接限制配合

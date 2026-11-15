@@ -1,0 +1,319 @@
+---
+title: "在无服务器运行时上使用 Drizzle 连接 MySQL"
+sidebarTitle: "无服务器与 Drizzle"
+description: "为什么连接池在无服务器运行时上的工作方式与在长期运行的 Node 服务器上不同，以及每次函数调用都新建连接如何在并发负载下耗尽 MySQL 的连接限制。"
+keywords: "mysql serverless, drizzle orm serverless, mysql connection pooling serverless, hono mysql, mysql2 serverless, mysql too many connections, serverless cold start database, max_user_connections mysql, mysql lambda connections"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+长期运行的 Node 服务器在进程启动时打开一个连接池，并在每个请求中重用它，直到进程关闭。无服务器函数没有这种保证：每次调用都可能在一个全新的执行环境中运行，对上一次调用没有任何记忆，因此"按常规方式"创建连接池的代码最终可能在每一个请求上都创建一个全新的连接池，或者一个全新的连接。本指南用 Drizzle ORM 和 `mysql2` 构建一个小型 Hono 应用程序，然后测量在并发负载下，每种模式会对 MySQL 的连接数产生什么影响。
+
+## 本指南测试了什么，没有测试什么 {#what-this-guide-tested-and-what-it-did-not}
+
+下面的所有内容都在一台真实的本地 VillageSQL 服务器和一个真实的 Node 进程上运行过。该应用程序是用 `nodejs` 模板（`npm create hono@latest`）构建的 Hono 应用，在本指南的测试期间作为普通的长期运行 Node 进程运行，没有部署到 Cloudflare Workers、AWS Lambda 或 Vercel 的边缘运行时。
+
+这对本指南提出的一个具体主张和一个未提出的主张很重要：
+
+- **真正测试过的内容**：一个每次运行都打开新 MySQL 连接的请求处理程序，与一个重用在模块加载时创建一次的连接池的处理程序之间的对比。对每个版本发起并发 HTTP 请求并观察 MySQL 的连接数，忠实地再现了单个无服务器函数实例处理并发调用时、或者一个模块级代码重新运行的冷启动实例内部发生的情况。
+- **没有测试的内容**：许多独立的执行环境同时冷启动、各自运行本进程的一个副本并打开各自连接池所产生的倍增效应。AWS Lambda 或 Cloudflare Workers 上一次真实的流量突发可以同时启动数十个相互隔离的实例，每个实例中 10 个连接的连接池很快就会累加起来，即使应用了本指南中的修复也是如此。下面的"超出单个实例"部分介绍了如何应对这种情况，但本指南的 Node 进程按定义只是单个实例，无法再现这种情况。
+
+## 设置数据库 {#set-up-the-database}
+
+创建一个专用数据库和一个作用域限定于该数据库的用户：
+
+```sql
+CREATE DATABASE serverless_guide;
+CREATE USER 'serverless_app'@'127.0.0.1' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON serverless_guide.* TO 'serverless_app'@'127.0.0.1';
+```
+
+## 搭建应用程序 {#scaffold-the-application}
+
+本指南使用 Hono 的 `nodejs` 模板，它运行在 `@hono/node-server` 上，开发时不需要特定的云平台：
+
+```bash
+npm create hono@latest serverless-mysql-drizzle -- --template nodejs
+```
+
+安装 Drizzle、`mysql2` 驱动和 `drizzle-kit`：
+
+```bash
+npm install drizzle-orm mysql2 dotenv
+npm install -D drizzle-kit tsx
+```
+
+`drizzle-orm` 和 `drizzle-kit` 都在 `dist-tags` 下与 `latest` 一起发布预发布标签（`beta`、`rc`）。安装前请检查：
+
+```bash
+npm view drizzle-orm dist-tags
+npm view drizzle-kit dist-tags
+```
+
+在撰写本文时，`drizzle-orm` 的 `latest` 解析为 `0.45.2`，`drizzle-kit` 的解析为 `0.31.10`，两者都是稳定版本，而不是候选发布版本。
+
+在 `.env` 中设置连接字符串：
+
+```bash
+DATABASE_URL="mysql://serverless_app:your_password@127.0.0.1:3306/serverless_guide"
+```
+
+## 定义模式并运行迁移 {#define-the-schema-and-run-the-migration}
+
+```typescript src/db/schema.ts
+import { int, mysqlTable, text, timestamp, varchar } from "drizzle-orm/mysql-core";
+
+export const posts = mysqlTable("posts", {
+  id: int("id").autoincrement().primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+```
+
+```typescript drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+export default defineConfig({
+  out: "./drizzle",
+  schema: "./src/db/schema.ts",
+  dialect: "mysql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL,
+  },
+});
+```
+
+生成并应用迁移：
+
+```bash
+npx drizzle-kit generate
+npx drizzle-kit migrate
+```
+
+```
+Reading config file 'drizzle.config.ts'
+Reading schema files:
+src/db/schema.ts
+
+1 tables
+posts 4 columns 0 indexes 0 fks
+
+[✓] Your SQL migration file ➜ drizzle/0000_eminent_corsair.sql 🚀
+```
+
+确认表已存在：
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u serverless_app -p serverless_guide -e "SHOW TABLES; DESCRIBE posts;"
+```
+
+```
+Tables_in_serverless_guide
+__drizzle_migrations
+posts
+Field	Type	Null	Key	Default	Extra
+id	int	NO	PRI	NULL	auto_increment
+title	varchar(255)	NO		NULL	
+body	text	NO		NULL	
+created_at	timestamp	NO		now()	DEFAULT_GENERATED
+```
+
+## 反模式：每个请求一个连接 {#the-anti-pattern-a-connection-per-request}
+
+这个问题最常见的表现形式是一段单独看起来很合理的代码。它打开一个 `mysql2` 连接，运行一条查询，然后关闭连接，全都在请求处理程序内部：
+
+```typescript src/index.bad.ts
+import "dotenv/config";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import { desc } from "drizzle-orm";
+import { posts } from "./db/schema.js";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+const app = new Hono();
+
+// Anti-pattern: a fresh connection is opened inside the handler, on every
+// request. This is what naively porting a "just create a pool" snippet
+// into a function-per-invocation runtime produces.
+app.get("/posts", async (c) => {
+  try {
+    const connection = await mysql.createConnection(process.env.DATABASE_URL as string);
+    const db = drizzle(connection, { schema: { posts }, mode: "default" });
+
+    const rows = await db.select().from(posts).orderBy(desc(posts.createdAt)).limit(5);
+
+    await connection.end();
+    return c.json(rows);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) }, 503);
+  }
+});
+
+serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
+  console.log(`[bad] listening on http://localhost:${info.port}`);
+});
+```
+
+在低并发下这是可行的。五个并发客户端连续访问它三秒钟，失败响应为零。只有当并发调用的数量超过数据库对该用户的允许值时，问题才会出现。
+
+## 演示连接耗尽 {#demonstrating-the-exhaustion}
+
+MySQL 的 `max_connections` 是服务器范围的上限，在共享服务器上降低它来制造失败会影响该实例上的所有其他连接。为单个应用程序再现连接上限的一种更有针对性的方法，也是云 MySQL 提供商正是出于这个原因而使用的方法，是在账户本身上设置 `MAX_USER_CONNECTIONS`：
+
+```sql
+ALTER USER 'serverless_app'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 15;
+```
+
+```sql
+SELECT user, host, max_user_connections FROM mysql.user WHERE user = 'serverless_app';
+```
+
+```
+user	host	max_user_connections
+serverless_app	127.0.0.1	15
+```
+
+在反模式服务器运行、且 `serverless_app` 被限制为 15 个连接的情况下，持续 5 秒的 30 个并发请求突发（使用 [autocannon](https://github.com/mcollina/autocannon)）产生了以下结果：
+
+```bash
+npx autocannon -c 30 -d 5 http://localhost:3000/posts
+```
+
+```
+20916 2xx responses, 3614 non 2xx responses
+25k requests in 5.01s, 6.6 MB read
+```
+
+在突发期间，每 150ms 用 `SELECT COUNT(*) FROM information_schema.processlist WHERE user = 'serverless_app'` 采样 `serverless_app` 的活动连接数，显示该计数攀升到并超过了 15 个连接的上限（最高的几个样本为 15、15、16、17、17、17、17、25）。那 `3614` 个非 2xx 响应就是触及该上限的结果。上面的处理程序捕获错误并在每个 `503` 的响应体中返回它，因此失败的响应携带的是这个：
+
+```
+Error: User 'serverless_app' has exceeded the 'max_user_connections' resource (current value: 15)
+    code: 'ER_USER_LIMIT_REACHED',
+    errno: 1226,
+    sqlState: '42000',
+```
+
+这一切都不是 `MAX_USER_CONNECTIONS` 特有的。一台完全没有按用户限制的服务器会显示同样攀升的计数，只不过是针对 `max_connections`，并在达到服务器范围的上限时报出同样的错误，只是名称不同（`ERROR 1040 (08004): Too many connections`）。按用户的上限使得这个问题可以再现，而不会干扰同一服务器上运行的任何其他东西。
+
+## 修复方法：在处理程序之外只创建一次连接池 {#the-fix-create-the-pool-once-outside-the-handler}
+
+修复方法不是停止使用连接池。而是确保连接池只在模块加载时创建一次，而不是在处理每个请求的函数内部创建：
+
+```typescript src/db/index.ts
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import * as schema from "./schema.js";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+// Module-level pool: created once when this module is first loaded, not
+// inside a request handler. A warm serverless invocation reuses the same
+// module instance and therefore the same pool; only a cold start re-runs
+// this file and opens a fresh one.
+const poolConnection = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  connectionLimit: 10,
+  waitForConnections: true,
+  queueLimit: 0,
+});
+
+export const db = drizzle(poolConnection, { schema, mode: "default" });
+```
+
+```typescript src/index.ts
+import "dotenv/config";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { desc } from "drizzle-orm";
+import { db } from "./db/index.js";
+import { posts } from "./db/schema.js";
+
+const app = new Hono();
+
+app.get("/posts", async (c) => {
+  const rows = await db.select().from(posts).orderBy(desc(posts.createdAt)).limit(20);
+  return c.json(rows);
+});
+
+app.post("/posts", async (c) => {
+  const body = await c.req.json();
+  if (typeof body.title !== "string" || body.title.trim() === "") {
+    return c.json({ error: "title is required" }, 400);
+  }
+  if (typeof body.body !== "string" || body.body.trim() === "") {
+    return c.json({ error: "body is required" }, 400);
+  }
+  const [result] = await db.insert(posts).values({ title: body.title, body: body.body });
+  return c.json({ insertId: result.insertId }, 201);
+});
+
+serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
+  console.log(`Server is running on http://localhost:${info.port}`);
+});
+```
+
+`db/index.ts` 的顶层 `mysql.createPool()` 调用只在模块首次被导入时运行一次。在长期运行的 Node 服务器中，这意味着在进程启动时运行一次。在提供商为后续请求重用执行环境、无需冷启动的无服务器运行时上，已导入的模块仍在内存中，因此第一次调用创建的连接池会被重用而不是重新创建。只有真正的冷启动（从头重新加载模块）才会打开新的连接池。
+
+对这个版本运行同样的 30 并发、5 秒突发，`serverless_app` 仍然被限制为 15 个连接：
+
+```
+77k requests in 5.01s, 20.7 MB read
+```
+
+完全没有非 2xx 响应。在这次突发期间，对同一按用户连接数的采样在每一个样本中都稳定地保持在恰好 10，也就是连接池自身的 `connectionLimit`。无论有多少并发请求到达，连接池向 MySQL 请求的连接数从未超过它被配置保持打开的数量。在同样的 5 秒窗口内，总吞吐量也大约高出三倍（77,000 个请求对 25,000 个）。这个差距的一部分来自连接池版本在每个请求上省去了完整的 TCP 握手和身份验证往返；另一部分则是因为反模式版本的 25,000 个请求中，有许多是在触及连接上限之后快速返回的 `503` 失败，而不是完成的查询，这在没有做真正工作的情况下抬高了它的请求计数。
+
+## 超出单个实例 {#beyond-a-single-instance}
+
+上面的修复解决了本指南能够再现的问题：单个运行实例内的并发请求。它没有解决第二个只在真实无服务器平台上出现的问题：在流量高峰下，许多独立的实例同时冷启动，各自运行这段代码的一个副本，因此各自打开自己的连接池。连接池是惰性打开连接的，只在并发请求真正需要时才打开，所以十个空闲实例不会仅仅因为存在就打开 100 个连接。但一旦每个实例都在处理哪怕是适度的、普通的流量，十个 `connectionLimit` 各为 10 的实例就可能累加到 100 个连接，而此时的工作负载看起来还远谈不上异常。本指南的 Node 进程无法再现这种情况，因为它是一个进程，而不是多个。
+
+有两种方法可以解决这个问题，两者都不能替代上面的修复；它们是叠加的：
+
+- **为每个实例设置小得多的 `connectionLimit`**，通常是 1 或 2 而不是 10，因为在大多数无服务器平台上，每个并发运行的实例一次只处理少量请求。
+- **在 MySQL 前面放置一个连接池代理**，例如 ProxySQL，这样许多独立的无服务器实例就可以共享数量少得多的实际 MySQL 连接。有关 ProxySQL 如何融入这一方案，请参阅 [MySQL 连接池](/zh/guides/connection-pooling)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 为什么不直接提高 `max_connections`？ {#why-not-just-increase-max_connections}
+
+这会提高上限但不会消除它，而且每个连接都在服务器上消耗真实的内存（有关每个连接的成本明细，请参阅 [MySQL 连接池](/zh/guides/connection-pooling)）。一个可以扩展到数百个并发实例的无服务器工作负载最终会达到任何固定的上限；修复方法是阻止每个实例打开超出其需要的连接，而不是提高这些实例被允许耗尽的数量。
+
+#### 除了 Hono，这也适用于 Express 吗？ {#does-this-apply-to-express-as-well-as-hono}
+
+是的。这种失败模式关乎连接池或连接相对于请求处理程序在哪里创建，而不关乎哪个 Web 框架路由了请求。在路由处理程序内部调用 `mysql.createConnection()` 的 Express 应用有完全相同的问题，而在模块作用域调用一次 `mysql.createPool()` 则是完全相同的修复。
+
+#### `mysql2` 的内置连接池够用吗，还是我需要 ProxySQL 之类的东西？ {#is-mysql2s-built-in-pool-enough-or-do-i-need-something-like-proxysql}
+
+对于单个长期运行的服务器，`mysql2` 的连接池本身就够用；这正是 [MySQL 连接池](/zh/guides/connection-pooling) 所介绍的内容。在无服务器平台上，本指南中的模块级连接池模式可以防止一个实例打开超过其 `connectionLimit` 的连接，但它无法在多个并发运行的独立实例之间进行协调。像 ProxySQL 这样的代理才能跨实例协调。
+
+#### 为什么修复后版本的连接数恰好停在 10，而不是攀升到与测试并发数相符的 30？ {#why-did-the-fixed-versions-connection-count-sit-exactly-at-10-instead-of-climbing-to-30-matching-the-concurrency-of-the-test}
+
+因为连接池设置了 `waitForConnections: true` 且 `connectionLimit` 为 10。一旦 10 个连接都被取出，第十一个并发请求会等待某个连接归还到连接池，而不是打开新连接。请求会短暂排队，而不是让连接池无限增长。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `ERROR 1226 (42000): User '<user>' has exceeded the 'max_user_connections' resource` | 该账户已触及其 `MAX_USER_CONNECTIONS` 上限。把连接或连接池的创建移出请求处理程序；如果工作负载确实需要更多连接，用 `ALTER USER ... WITH MAX_USER_CONNECTIONS n` 提高上限。 |
+| `ERROR 1040 (08004): Too many connections` | 已达到服务器范围的 `max_connections` 上限。在没有设置按用户上限时，其根本原因与上面的按用户错误相同；先修复连接模式，再考虑提高限制。 |
+| 连接数持续攀升，且在突发结束后从不回落 | 某条代码路径创建了连接或连接池却从未关闭。处理程序中的每条代码路径，包括错误路径，都必须关闭连接，或者让有上限的连接池管理自己的生命周期。 |
+| 连接池在本地工作正常，但生产环境中的实例仍然堆积连接 | 本指南中的单实例修复无法在多个并发运行的独立无服务器实例之间进行协调。请参阅上面的"超出单个实例"。 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 连接池](/zh/guides/connection-pooling) — 连接池在长期运行的服务器上如何工作，以及 ProxySQL 如何跨多个应用服务器协调连接池
+- [Next.js 和 Drizzle 与 MySQL](/zh/guides/mysql-with-drizzle) — 在长期运行的 Next.js 服务器上使用同样的模式和 Drizzle 设置，没有无服务器的连接生命周期
+- [将 MySQL 与 ORM 一起使用：Django、Rails 和 Prisma](/zh/guides/mysql-with-orms) — 在 Drizzle 之外的 ORM 中配置 MySQL 特定的连接池设置

@@ -1,0 +1,115 @@
+---
+title: "InnoDB 如何存储数据"
+sidebarTitle: "理解 InnoDB"
+description: "MySQL 的 InnoDB 存储引擎如何在磁盘上组织数据：聚簇索引、页、缓冲池，以及这对查询性能意味着什么。"
+keywords: "mysql innodb storage, mysql clustered index, mysql buffer pool, innodb page size, mysql innodb architecture, mysql row format, innodb tablespace"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+InnoDB 是 MySQL 的默认存储引擎。理解它如何存储数据，可以解释为什么有些查询快而有些不快——尤其是为什么主键的选择很重要、为什么范围扫描胜过随机查找，以及为什么大表上的索引会损害写入性能。
+
+## 页：存储的单位 {#pages-the-unit-of-storage}
+
+InnoDB 把一切都存储在页中——默认 16KB 的固定大小块。页是 InnoDB 从磁盘读取或向磁盘写入的最小单位。当您读取一行时，InnoDB 会加载包含该行的整个 16KB 页。
+
+这有实际的后果：
+- 读取连续行的查询（范围扫描、对有序数据的全表扫描）每页只加载一次，并从中处理许多行
+- 读取随机行的查询（通过大表上的二级索引）为每一行加载一个新页——每次很可能都是一次单独的磁盘读取
+
+## 聚簇索引 {#the-clustered-index}
+
+InnoDB 把表的行存储在**聚簇索引**中——这是一棵 B 树，其叶节点包含实际的行数据，按主键物理排序。不存在单独的“表文件”和“主键索引文件”——它们是同一个结构。
+
+```sql
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    created_at  DATETIME NOT NULL
+);
+```
+
+这张表的行在磁盘上按 `id` 顺序物理存储。像 `WHERE id BETWEEN 1000 AND 2000` 这样的查询读取一段连续的页——很快。一个先取 `id = 1`、再取 `id = 500000`、再取 `id = 250` 的查询会读取三个物理上分散的页。
+
+**如果您不定义主键**，InnoDB 会创建一个隐藏的 6 字节行 ID，并把它用作聚簇索引键。这浪费了优化的机会。
+
+## 二级索引 {#secondary-indexes}
+
+每个二级索引都是一棵单独的 B 树。叶节点不存储完整的行——它们存储被索引的列值加上主键。要获取不在二级索引中的列，InnoDB 会做一次**回表查找**：它从二级索引叶节点取出主键，然后从聚簇索引中取出完整的行。
+
+```sql
+CREATE INDEX idx_customer ON orders (customer_id);
+
+-- This query uses idx_customer, then does a row lookup for each match
+SELECT amount FROM orders WHERE customer_id = 42;
+```
+
+这个两步过程正是覆盖索引重要的原因：如果二级索引包含查询需要的所有列，回表查找就被跳过了。请参阅 [MySQL 中的覆盖索引](/zh/guides/covering-indexes)。
+
+回表查找的开销也是大主键代价高昂的原因。如果您的主键是 UUID 字符串（36 字节）而不是 INT（4 字节），每个二级索引的每个条目都存储 36 字节而不是 4 字节，回表查找也要遍历一棵更深的 B 树。
+
+## 缓冲池 {#the-buffer-pool}
+
+InnoDB 在内存中的**缓冲池**里缓存页。从磁盘读取的页被加载到缓冲池中，并一直留在那里，直到内存被其他东西需要。对同一页的后续读取由 RAM 提供。
+
+```sql
+-- Check buffer pool size
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+
+-- Check hit rate (should be > 99% on a healthy server)
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+-- Innodb_buffer_pool_reads: pages read from disk
+-- Innodb_buffer_pool_read_requests: total page read requests
+-- Hit rate = 1 - (reads / read_requests)
+```
+
+在专用的数据库服务器上，把 `innodb_buffer_pool_size` 设置为可用 RAM 的 70–80%。这是对读密集型工作负载影响最大的单项配置更改——工作集放进内存的部分越多，磁盘读取就越少。
+
+## 行格式 {#row-formats}
+
+InnoDB 支持四种行格式。默认是 `DYNAMIC`。
+
+| 格式 | 可变长度列 | 溢出前的行内存储 | 说明 |
+|:-------|:------------------------|:--------------------------------|:------|
+| `REDUNDANT` | 行内或页外存储 | ~8KB | 旧格式 |
+| `COMPACT` | 行内或页外存储 | ~8KB | 较旧的格式 |
+| `DYNAMIC` | 较大时页外存储 | ~8KB | 默认；更适合 TEXT/BLOB |
+| `COMPRESSED` | 压缩后页外存储 | ~8KB | 减少磁盘占用；增加 CPU 开销 |
+
+~8KB 这个数字大约是默认 16KB 页的一半，是 InnoDB 把可变长度列数据移到页外的位置，因此一行只有少数几个大的 `VARCHAR`/`TEXT`/`BLOB` 列时，可以远远超过它而不碰到上限。但是行内存储而不移到页外的列——例如许多固定宽度的 `CHAR` 列——仍然完全计入 InnoDB 自身的行大小限制，碰到它会引发 `ERROR 1118 (42000): Row size too large (> 8126). Changing some columns to TEXT or BLOB may help.` MySQL 另有一个更高的行大小限制，为 65,535 字节，不计 BLOB/TEXT 溢出页，并且与 `ROW_FORMAT` 无关；两个限制都是真实存在的，取决于哪些列大以及它们能否移到页外，任一个都可能是您先碰到的那个。
+
+当 `VARCHAR`、`TEXT` 或 `BLOB` 列在 `DYNAMIC` 格式下溢出页时，整个值存储在溢出页中——主行中只保留一个 20 字节的指针。`COMPACT` 则改为在行内存储前 768 字节。当存在长值时，`DYNAMIC` 的做法让主行更小，这意味着每页能放更多的行，B 树也更浅。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 为什么主键的选择对性能影响这么大？ {#why-does-primary-key-choice-affect-performance-so-much}
+
+因为聚簇索引按主键物理排列行。在随机位置插入（比如 UUID 主键）会导致**页分裂**——InnoDB 必须拆分已满的页并移动数据以维持顺序。顺序主键（AUTO_INCREMENT、UUID v7）在末尾插入，避免了分裂。页分裂会使表空间碎片化，随着时间推移同时拖慢写入和读取。
+
+#### 缓冲池太小时会发生什么？ {#what-happens-when-the-buffer-pool-is-too-small}
+
+InnoDB 必须频繁地从磁盘读取页。您会看到 `Innodb_buffer_pool_reads` 不断攀升。服务器变成 I/O 受限——从 RAM 只需微秒的查询，从磁盘需要毫秒。在读密集型工作负载上，一个能容纳工作集的缓冲池几乎比任何索引优化都更有价值。
+
+#### InnoDB 和 MyISAM 有什么区别？ {#whats-the-difference-between-innodb-and-myisam}
+
+InnoDB 支持事务、外键、行级锁和崩溃恢复。MyISAM 不支持其中任何一项——它对特定的只读批量工作负载更快，但不适合大多数应用程序。InnoDB 是 MySQL 的默认引擎；除非您有特定的理由，否则请使用它。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 大表上的范围扫描很慢 | 检查缓冲池命中率；考虑增大 `innodb_buffer_pool_size` |
+| 插入随时间变慢 | 主键是顺序的吗？用 `SHOW ENGINE INNODB STATUS` 检查页分裂 |
+| RAM 充足但磁盘 I/O 很高 | 缓冲池相对于工作集可能太小；增大它 |
+| 大表且大多是全文读取 | 考虑 `DYNAMIC` 行格式，把大文本存放在主数据页之外 |
+
+VillageSQL 搭载的是同一个 InnoDB 引擎，因此本页上的每个设置都原样适用。[安装 VillageSQL](https://villagesql.com/install)，保留 InnoDB，并获得一个用于自定义类型、函数和索引的扩展框架。
+
+## 另请参阅 {#see-also}
+
+- [MySQL 索引的工作原理](/zh/guides/mysql-indexes)——B 树索引在 InnoDB 页中如何布局
+- [MySQL 中的覆盖索引](/zh/guides/covering-indexes)——为什么留在索引内可以避免昂贵的页读取
+- [MySQL 中的表分区](/zh/guides/table-partitioning)——把数据拆分到多个 InnoDB 段

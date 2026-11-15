@@ -1,0 +1,243 @@
+---
+title: "在 Docker 上运行 MySQL"
+sidebarTitle: "在 Docker 上运行"
+description: "如何在 Docker 中运行 MySQL 8.4 或 VillageSQL——官方镜像设置、持久化命名卷、Docker Compose 多服务配置、容器间网络，以及何时 Docker 比原生安装或托管云服务更适合作为部署选择。"
+keywords: "mysql docker, mysql docker container, mysql docker compose, mysql official image, mysql docker volume, docker run mysql, mysql container environment variables, mysql docker connect, mysql docker network, mysql docker persistent data, villagesql docker, mysql docker compose volume"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+官方 MySQL Docker 镜像让您可以在容器中运行一个配置完整的 MySQL 服务器。它通过环境变量自动处理初始化、用户创建和数据目录设置。
+
+## 快速开始 {#quick-start}
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -e MYSQL_DATABASE=myapp \
+  -e MYSQL_USER=appuser \
+  -e MYSQL_PASSWORD=apppass \
+  -p 3306:3306 \
+  -d mysql:8.4
+```
+
+从宿主机连接：
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u appuser -p myapp
+```
+
+或者在容器内部连接：
+
+```bash
+docker exec -it mysql-dev mysql -u root -p
+```
+
+## 环境变量 {#environment-variables}
+
+| 变量 | 必需 | 说明 |
+|:---------|:---------|:------------|
+| `MYSQL_ROOT_PASSWORD` | 是（或使用 `ALLOW_EMPTY_PASSWORD`） | root 用户密码 |
+| `MYSQL_DATABASE` | 否 | 启动时创建的数据库 |
+| `MYSQL_USER` | 否 | 要创建的非 root 用户 |
+| `MYSQL_PASSWORD` | 否 | `MYSQL_USER` 的密码 |
+| `MYSQL_ALLOW_EMPTY_PASSWORD` | 否 | 设为 `yes` 以允许空的 root 密码（仅限开发） |
+| `MYSQL_RANDOM_ROOT_PASSWORD` | 否 | 设为 `yes` 以生成随机 root 密码（记录到 stdout） |
+| `MYSQL_ONETIME_PASSWORD` | 否 | 设为 `yes` 以要求首次登录时修改密码 |
+
+`MYSQL_USER` 和 `MYSQL_PASSWORD` 必须一起设置。创建的用户获得对 `MYSQL_DATABASE` 的完全访问权限。
+
+## 使用卷持久化数据 {#persistent-data-with-volumes}
+
+没有卷时，容器被删除后所有数据都会丢失。请挂载一个卷来持久化数据目录：
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v mysql-data:/var/lib/mysql \
+  -p 3306:3306 \
+  -d mysql:8.4
+```
+
+命名卷（`mysql-data`）在容器重启和删除后依然保留。要改用宿主机目录：
+
+```bash
+-v /path/on/host:/var/lib/mysql
+```
+
+数据目录拥有 MySQL 的数据和日志。切勿在两个正在运行的 MySQL 容器之间共享一个卷。
+
+## 选择镜像和卷策略 {#choosing-an-image-and-volume-strategy}
+
+| | 官方 `mysql:8.4` | `villagesql/server:latest` |
+|:---|:---|:---|
+| 基础 | MySQL 8.4 | MySQL 8.4 跟踪分支 |
+| 扩展 | 无内置扩展 | VEF 框架；安装 `.veb` 包 |
+| 直接替代 | — | 是——相同的线路协议，相同的客户端工具 |
+| 镜像获取 | Docker Hub | Docker Hub（`villagesql/server`） |
+| 适用场景 | 标准 MySQL 工作负载 | 需要自定义类型、VDF 函数或 VEF 扩展 |
+
+| 卷类型 | 持久性 | 性能 | 可移植性 |
+|:---|:---|:---|:---|
+| 命名卷（`-v mysql-data:/var/lib/mysql`） | 在 `docker rm` 后保留 | 由 Docker 管理；在所有平台上表现良好 | 易于用 `docker volume` 命令备份 |
+| 绑定挂载（`-v /host/path:/var/lib/mysql`） | 在容器删除后保留 | 在 macOS/Windows 上较慢（文件系统转换） | 可直接从宿主机访问；更容易检查文件 |
+| 无卷（容器层） | 在 `docker rm` 时丢失 | 写入最快（临时性） | 仅限开发/测试——切勿用于您想保留的数据 |
+
+对于大多数工作负载，命名卷是正确的默认选择。当您需要直接从宿主机检查或编辑数据目录时，绑定挂载很有用，但在 macOS 和 Windows 上性能代价不可忽视。
+
+## Docker Compose {#docker-compose}
+
+对于包含多个服务的开发环境，Docker Compose 是标准做法：
+
+```yaml
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: myapp
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppass
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: myapp
+      DB_USER: appuser
+      DB_PASSWORD: apppass
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+```
+
+`healthcheck` 配合 `depends_on: condition: service_healthy` 确保应用容器等到 MySQL 准备好接受连接后才启动——而不只是等到 MySQL 已经启动。
+
+## 自定义配置 {#custom-configuration}
+
+通过挂载来传入自定义的 `my.cnf`：
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v /path/to/my.cnf:/etc/mysql/conf.d/custom.cnf:ro \
+  -d mysql:8.4
+```
+
+或者直接通过命令参数设置选项：
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -d mysql:8.4 \
+  --innodb-buffer-pool-size=512M \
+  --max-connections=200
+```
+
+## 初始化脚本 {#initialization-scripts}
+
+容器会在首次启动时（数据目录为空时）运行放在 `/docker-entrypoint-initdb.d/` 中的任何 `.sql` 或 `.sh` 文件：
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v /path/to/init-scripts:/docker-entrypoint-initdb.d:ro \
+  -d mysql:8.4
+```
+
+SQL 文件以 root 身份执行。Shell 脚本在容器环境中运行。这些脚本只在最初的第一次初始化时运行——后续的容器启动不会再运行。
+
+## 从应用连接 {#connecting-from-applications}
+
+在 Docker Compose 网络内部，容器通过服务名连接到 MySQL：
+
+```
+DB_HOST=db   # service name in docker-compose.yml
+DB_PORT=3306
+```
+
+从宿主机连接时，请使用 `127.0.0.1`（而不是 `localhost`——MySQL 的套接字在宿主机上不可用）：
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=3306
+```
+
+## 何时在 Docker 中运行 MySQL {#when-to-run-mysql-in-docker}
+
+| 场景 | Docker | 原生安装 | 托管云服务（RDS、Cloud SQL） |
+|:---|:---|:---|:---|
+| 本地开发 | 最佳选择——隔离、可复现、易于拆除 | 可行，但更难重置 | 过度——增加成本和网络延迟 |
+| CI/CD 流水线 | 最佳选择——每次运行启动一个全新实例 | 可行但配置更慢 | 可行；每次运行增加成本 |
+| 预发布环境 | 良好——在 Compose 中镜像生产拓扑 | 如果宿主机是专用的则没问题 | 如果生产环境也是托管的则良好 |
+| 生产（单服务器） | 配合命名卷和适当的备份则没问题 | 没问题；运维略简单 | 增加托管备份、HA、故障转移 |
+| 生产（高可用） | 需要编排（Kubernetes、Swarm） | 手动设置复制 | 最佳选择——内置 HA |
+| 需要 VillageSQL 扩展 | 使用 `villagesql/server` 镜像 | 从源码构建 | 托管服务上不可用 |
+| 合规/数据驻留 | 检查您的策略——数据留在主机上 | 明确——数据留在主机上 | 取决于提供商的区域配置 |
+
+## 生产环境注意事项 {#production-considerations}
+
+Docker 在生产环境中运行 MySQL 表现良好，但有几点需要注意：
+
+- **数据持久化**：使用命名卷或绑定挂载。切勿让 MySQL 数据存放在容器层中。
+- **内存限制**：在 Docker 中设置 `--memory` 以防止 MySQL 耗尽宿主机内存，并相应地调整 `innodb_buffer_pool_size`。
+- **备份**：`mysqldump` 在容器内可用：`docker exec mysql-dev mysqldump -u root -p myapp > backup.sql`
+- **日志**：在 Docker 中，MySQL 日志输出到 stdout/stderr。使用 `docker logs mysql-dev` 或配置您的日志驱动。
+- **升级**：拉取新的镜像标签，停止旧容器，用同一个卷启动新容器。使用更新版本首次启动时，MySQL 的升级过程会自动运行。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 为什么我无法从宿主机用 `mysql -h localhost` 连接？ {#why-cant-i-connect-with-mysql--h-localhost-from-the-host}
+
+在 Linux 和 macOS 上，`localhost` 会让 MySQL 客户端尝试通过 Unix 套接字连接，而该套接字在宿主机上不可用。请显式使用 `127.0.0.1`：`mysql -h 127.0.0.1 -P 3306`。
+
+#### 如何让 MySQL 数据在 Docker 中持久保存？ {#how-do-i-make-mysql-data-persist-in-docker}
+
+启动容器时把一个命名卷挂载到 `/var/lib/mysql`：`-v mysql-data:/var/lib/mysql`。没有它，所有数据都存放在容器的可写层中，并在您运行 `docker rm` 时丢失。命名卷在容器删除后依然保留，并由 Docker 管理——使用 `docker volume ls` 列出它们，使用 `docker volume inspect mysql-data` 找到存储位置。在 Docker Compose 中，请在顶层的 `volumes:` 键下声明该卷，并在服务的 `volumes:` 列表中引用它（上面 Docker Compose 一节中的示例展示了这个模式）。
+
+#### Docker Compose 中的容器如何连接到 MySQL？ {#how-do-containers-in-docker-compose-connect-to-mysql}
+
+同一个 Compose 项目中的容器共享一个默认网络。您的应用容器使用服务名作为主机名连接到 MySQL——如果您的数据库服务名为 `db`，连接字符串就是 `host=db port=3306`。容器之间不需要暴露端口；端口映射（`-p 3306:3306`）只在从宿主机连接时才需要。请在 MySQL 服务上配合 `healthcheck` 使用 `depends_on: condition: service_healthy`，以防止应用在 MySQL 准备好之前启动。
+
+#### 如何对正在运行的容器执行一个 SQL 文件？ {#how-do-i-run-a-sql-file-against-a-running-container}
+
+```bash
+docker exec -i mysql-dev mysql -u root -p myapp < /path/to/script.sql
+# or from within the container:
+docker exec -it mysql-dev mysql -u root -p myapp -e "SOURCE /tmp/script.sql"
+```
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 容器立即退出 | 检查 `docker logs mysql-dev`——缺少 `MYSQL_ROOT_PASSWORD` 或卷权限问题 |
+| `ERROR 2002: Can't connect to local MySQL server through socket` | 通过 TCP（`-h 127.0.0.1`）而不是套接字连接——Unix 套接字不在宿主机上 |
+| 应用在 MySQL 准备好之前启动 | 在 Compose 中添加 `healthcheck` 并使用 `depends_on: condition: service_healthy` |
+| `docker rm` 后数据丢失 | 没有挂载卷——用 `-v mysql-data:/var/lib/mysql` 重新创建容器 |
+| 初始化脚本没有运行 | 它们只在数据目录为空时运行（首次设置）——删除卷并重启以重新初始化 |
+
+本页的所有内容也适用于 `villagesql/server` 镜像。VillageSQL 是带扩展的 MySQL 直接替代品，所以上面的 compose 文件、卷和健康检查只需更改一处镜像名即可沿用。[在 Docker 中试用](https://villagesql.com/install)。
+
+## 另请参阅 {#see-also}
+
+- [MySQL 复制基础](/zh/guides/replication-basics) — 在 Docker Compose 中运行源/副本对
+- [MySQL 备份策略](/zh/guides/backup-strategies) — 在容器化 MySQL 中备份数据卷
+- [从 MySQL 升级](/zh/guides/upgrade) — 把容器从 MySQL 迁移到 VillageSQL
+- [在 Kubernetes 上运行 MySQL](/zh/guides/mysql-on-kubernetes) — 容器编排的下一步
+- [为 MySQL 教程安装服务器](/zh/tutorial/install-mysql) — 准备一台用来学习 SQL 的服务器

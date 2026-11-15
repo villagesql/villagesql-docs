@@ -1,0 +1,178 @@
+---
+title: "从 MySQL 查询运行 AI 模型"
+sidebarTitle: "运行 AI 提示"
+description: "如何使用 VillageSQL 的 ai_prompt() 函数直接从 MySQL 查询中调用 AI 语言模型——丰富行数据、分类数据，以及批量处理文本。"
+keywords: "mysql ai prompt, mysql call ai model, mysql ai_prompt function, mysql llm query, mysql anthropic openai, mysql ai text generation"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 没有调用 AI 模型的方法。您在 SQL 中处理数据，然后把数据移到应用程序代码中完成 AI 步骤，再把结果带回来。VillageSQL 的 `vsql_ai` 扩展添加了 `ai_prompt()`——一个直接从查询中调用 AI 模型的函数，这样数据丰富、分类和生成都可以在数据所在的地方完成。
+
+## 问题：在 SQL 和 AI 之间切换上下文 {#the-problem-context-switching-between-sql-and-ai}
+
+不使用 VillageSQL 时的典型模式：
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, review_text FROM reviews WHERE ai_label IS NULL")
+
+# Call AI for each row
+for row in rows:
+    label = openai.chat(model="gpt-4o-mini", prompt=row["review_text"])
+    db.execute("UPDATE reviews SET ai_label = ? WHERE id = ?", label, row["id"])
+```
+
+这样可行，但每行需要三次往返：SELECT、AI 调用、UPDATE。对于大表，协调开销会不断累积，而且丰富数据的逻辑位于应用程序代码中，而不是数据所在的模式中。
+
+## 使用 VillageSQL：SQL 中的 ai_prompt() {#with-villagesql-ai_prompt-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+`ai_prompt(provider, model, api_key, prompt)` 发起一次 API 调用，并以字符串形式返回响应。凡是标量函数可用的地方都可以使用它。
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+-- Enrich a single row
+SELECT review_text,
+       ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+                 CONCAT('Classify this review as positive, negative, or neutral: ', review_text)
+       ) AS sentiment
+FROM reviews
+WHERE id = 1;
+```
+
+### 批量更新行 {#updating-rows-in-bulk}
+
+最常见的用法：在现有行上回填一个丰富数据列。
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_label VARCHAR(50);
+
+SET @key = 'sk-ant-your-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE reviews
+SET ai_label = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT('Classify as positive, negative, or neutral. Reply with one word only: ', review_text)
+)
+WHERE ai_label IS NULL
+LIMIT 100;  -- Process in batches to stay within rate limits
+```
+
+在应用程序中循环运行这条 UPDATE，直到不再有 NULL 行为止。
+
+### 在 WHERE 中使用提示结果 {#using-prompt-results-in-where}
+
+您可以按 AI 输出进行过滤，不过这会对扫描中的每一行都调用模型：
+
+```sql
+-- Flag reviews that need human review
+SELECT id, review_text FROM reviews
+WHERE ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+    CONCAT('Does this review mention a refund request? Reply yes or no: ', review_text)
+) = 'yes'
+LIMIT 20;
+```
+
+出于性能考虑，优先更新一个存储列并查询该列，而不是在 WHERE 子句中调用 `ai_prompt()`。
+
+### 用多个列构建提示 {#building-prompts-from-multiple-columns}
+
+将多个列拼接到提示中，为模型提供完整的上下文：
+
+```sql
+UPDATE support_tickets
+SET ai_summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Summarize this support ticket in one sentence.\n',
+        'Subject: ', subject, '\n',
+        'Body: ', body
+    )
+)
+WHERE ai_summary IS NULL
+LIMIT 50;
+```
+
+## 性能和速率限制 {#performance-and-rate-limits}
+
+每次 `ai_prompt()` 调用都是一个独立的 HTTPS 请求。对于批量操作：
+
+- **在 UPDATE 中使用 LIMIT**——每次 AI 调用需要 5–30 秒，因此一条覆盖 100 行的批量 `UPDATE` 需要数分钟；请按每批 50–100 行处理，以保持在提供商的速率限制之内。`max_execution_time` 只限制 `SELECT`，在这里不起作用——要限制正在运行的 `UPDATE`，请从另一个会话使用 `KILL QUERY <connection_id>`。
+- **存储结果**——切勿在 SELECT 中调用 `ai_prompt()` 而不存储结果。重复的 SELECT 每次都会重新发起 API 调用。
+
+```sql
+-- Batch loop pattern (run repeatedly until done)
+UPDATE reviews
+SET ai_label = ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+    CONCAT('Label as positive, negative, or neutral. One word: ', review_text))
+WHERE ai_label IS NULL
+LIMIT 100;
+
+-- Check progress
+SELECT COUNT(*) AS remaining FROM reviews WHERE ai_label IS NULL;
+```
+
+## 选择模型 {#choosing-a-model}
+
+| 模型 | 速度 | 成本 | 适用场景 |
+|:---|:---|:---|:---|
+| `claude-haiku-4-5` | 快 | 低 | 批量分类、简单打标 |
+| `claude-sonnet-5` | 中 | 中 | 复杂推理、细致的输出 |
+| `claude-opus-5` | 慢 | 高 | 推荐默认选项——智能体和企业级工作 |
+| `claude-fable-5` | 慢 | 高 | 能力最强——高要求的推理、长周期工作 |
+| `gpt-4o-mini` | 快 | 低 | OpenAI 生态系统、简单任务 |
+| `gemini-2.5-flash` | 快 | 低 | Google 生态系统、均衡的任务 |
+
+对于分类和打标任务，请使用能给出可接受准确度的最快/最便宜的模型。将能力更强的模型留给输出质量比吞吐量更重要的任务。
+
+有关安装设置和提供商配置，请参阅 [将 MySQL 连接到 AI API](/zh/guides/ai-api-setup)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我可以在 DEFAULT 表达式中使用 ai_prompt() 吗？ {#can-i-use-ai_prompt-in-a-default-expression}
+
+不可以——在 MySQL 中，非确定性函数（`ai_prompt()` 就是其中之一）不能用于 DEFAULT 表达式或生成列。
+
+#### 我可以在存储过程中使用 ai_prompt() 吗？ {#can-i-use-ai_prompt-in-a-stored-procedure}
+
+可以。存储过程、触发器和函数都可以调用 `ai_prompt()`，并受同样的超时约束。使用触发器时请谨慎——在每次 INSERT 上调用 AI 会让每次写入都变慢。
+
+#### 如何控制响应格式？ {#how-do-i-control-the-response-format}
+
+通过提示来控制。"Reply with one word: positive, negative, or neutral" 可以为分类任务获得可预测的输出。"Return valid JSON with keys: category, confidence" 可以获得结构化输出。只要指令具体明确，模型就能可靠地遵循。
+
+#### ai_prompt() 在失败时会重试吗？ {#does-ai_prompt-retry-on-failure}
+
+不会。如果 API 调用失败，它返回 NULL。在应用程序的批处理循环中实现重试逻辑之前，请运行 `SHOW WARNINGS` 查看原因——`vsql_ai` 会抛出带有真实失败原因的 `Warning 3200`。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | 运行 `INSTALL EXTENSION vsql_ai` |
+| 返回 NULL | API 密钥错误、触发速率限制或超时——检查 `max_execution_time` |
+| 响应在句子中间停止 | 运行 `SHOW WARNINGS`——"Prompt response truncated to fit the result buffer" 警告表示回答超出了结果容量；请让模型给出更短的回答 |
+| UPDATE 运行时间过长 | 使用更小的 `LIMIT` 批次；`max_execution_time` 不适用于 `UPDATE`，请改为从另一个会话使用 `KILL QUERY <connection_id>` |
+| 模型返回意外的格式 | 收紧提示：指定确切的输出格式并给出示例 |
+| 速率限制错误 | 减小批次大小；在 UPDATE 批次之间添加 `SELECT SLEEP(1);`，或在应用程序循环中加入休眠 |
+
+## 另请参阅 {#see-also}
+
+- [将 MySQL 连接到 AI API](/zh/guides/ai-api-setup)——先安装并配置 vsql_ai 扩展
+- [MySQL 中的 AI 摘要](/zh/guides/ai-summarization)——使用 ai_prompt() 总结长文本
+- [使用 AI 在 MySQL 中分类文本](/zh/guides/text-classification)——使用 ai_prompt() 按类别为行打标
+- [对 MySQL 数据进行情感分析](/zh/guides/sentiment-analysis)——为文本的语气和情感打分

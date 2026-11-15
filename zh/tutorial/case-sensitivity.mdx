@@ -1,0 +1,158 @@
+---
+title: "MySQL 大小写敏感性"
+sidebarTitle: "大小写敏感性"
+description: "为什么 MySQL 的字符串比较忽略字母大小写，如何读取决定这一点的排序规则，以及如何改为要求区分大小写的匹配。"
+keywords: "mysql case sensitive, mysql case insensitive query, mysql collation case sensitive, mysql where case sensitive, mysql collate, mysql table name case sensitivity"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+除非您另有要求，MySQL 的字符串比较会忽略字母大小写。这让人意外一次，之后又会咬人一口，所以值得了解是什么决定了它，以及如何为单个查询改变它。
+
+开始之前，请用 `mysql -u root -p sakila` 打开客户端。
+
+## 大小写敏感性的工作原理 {#how-case-sensitivity-works}
+
+您的查询中没有任何东西决定它。决定它的是排序规则，而每个文本列都带有一个。字符集说明一列可以保存哪些字符，它的排序规则说明如何比较它们。您可以用 `COLLATE` 为单个比较覆盖排序规则：
+
+```sql
+SELECT COLUMN_LIST
+FROM TABLE_NAME
+WHERE COLUMN_NAME COLLATE COLLATION_NAME = 'SEARCH_TEXT';
+```
+
+把 `COLLATION_NAME` 换成您希望这次比较使用的排序规则，把 `SEARCH_TEXT` 换成要匹配的值。
+
+## 示例 {#examples}
+
+### 1) 2 个只有大小写不同的字符串是相等的 {#1-2-strings-that-differ-only-in-case-are-equal}
+
+```sql
+SELECT 'ABC' = 'abc' AS same;
+```
+
+```text
++------+
+| same |
++------+
+|    1 |
++------+
+1 row in set (0.00 sec)
+```
+
+### 2) 对列也是一样 {#2-the-same-holds-against-a-column}
+
+小写的搜索词找到了大写的标题。
+
+```sql
+SELECT title FROM film WHERE title = 'academy dinosaur';
+```
+
+```text
++------------------+
+| title            |
++------------------+
+| ACADEMY DINOSAUR |
++------------------+
+1 row in set (0.00 sec)
+```
+
+### 3) 读取列的排序规则 {#3-read-the-columns-collation}
+
+```sql
+SELECT COLUMN_NAME, DATA_TYPE, COLLATION_NAME
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'sakila' AND TABLE_NAME = 'film' AND COLUMN_NAME = 'title';
+```
+
+```text
++-------------+-----------+--------------------+
+| COLUMN_NAME | DATA_TYPE | COLLATION_NAME     |
++-------------+-----------+--------------------+
+| title       | varchar   | utf8mb4_0900_ai_ci |
++-------------+-----------+--------------------+
+1 row in set (0.01 sec)
+```
+
+请从末尾读排序规则的名称。`ci` 是不区分大小写，这就是示例 2 能匹配的原因。`ai` 是不区分重音，它做的是另一件事：在这个排序规则下 `'e' = 'é'` 为真，而在 `utf8mb4_0900_as_cs` 下为假。
+
+| 结尾 | 比较方式 |
+|---|---|
+| `_ci` | 忽略字母大小写 |
+| `_cs` | 区分字母大小写 |
+| `_ai` | 忽略重音 |
+| `_as` | 区分重音 |
+| `_bin` | 两者都区分，直接比较存储的值 |
+
+这个表也说明了您自己的列的排序规则名称的含义。对任何表和列运行上面的查询，就能看到您在哪些规则之下工作。
+
+### 4) 要求区分大小写的比较 {#4-ask-for-a-case-sensitive-comparison}
+
+```sql
+SELECT 'ABC' = 'abc' COLLATE utf8mb4_0900_as_cs AS case_sensitive,
+       'ABC' = 'abc' COLLATE utf8mb4_0900_ai_ci AS case_insensitive;
+```
+
+```text
++----------------+------------------+
+| case_sensitive | case_insensitive |
++----------------+------------------+
+|              0 |                1 |
++----------------+------------------+
+1 row in set (0.00 sec)
+```
+
+它对列的作用方式相同。
+
+```sql
+SELECT title FROM film WHERE title COLLATE utf8mb4_0900_as_cs = 'academy dinosaur';
+```
+
+```text
+Empty set (0.00 sec)
+```
+
+## 列上的 COLLATE 放弃了索引查找 {#collate-on-a-column-gives-up-the-index-lookup}
+
+列上的索引是按该列自己的排序规则构建的，所以用另一种排序规则做的比较无法用它来查找匹配的值。对上面的查询运行 `EXPLAIN`，报告的是扫描全部 1,000 行，而不是一次查找。这在 1,000 部电影上不花什么代价，在大表上代价很大。当您需要在每个查询上做区分大小写的匹配时，[字符集和排序规则](/zh/guides/character-sets)指南介绍了改为以那种方式存储该列的方法。
+
+## 默认值从哪里来 {#where-the-default-comes-from}
+
+创建时没有指定排序规则的数据库采用服务器的，表采用数据库的，列采用表的。所以一个在其历史中任何地方都没有指定排序规则的列，是因为一个服务器设置才在做不区分大小写的比较。名称前面的 `@@` 读取一个服务器设置，这一对会告诉您继承了哪一个：
+
+```sql
+SELECT @@collation_server AS server_collation, @@character_set_server AS server_charset;
+```
+
+您的服务器会用它启动时的设置来回答，所以请把结果当作关于您自己安装的事实，而不是关于 MySQL 的事实。
+
+## 标识符遵循不同的规则 {#identifiers-follow-a-different-rule}
+
+列名从不区分大小写。数据库名和表名是另一个问题，由 `lower_case_table_names` 决定：
+
+| 值 | 数据库名和表名 |
+|---|---|
+| `0` | 按原样存储，区分大小写地比较 |
+| `1` | 以小写存储，不区分大小写地比较 |
+| `2` | 按原样存储，不区分大小写地比较 |
+
+运行 `SELECT @@lower_case_table_names;` 查看您的情况。您无法从会话中更改它：`SET GLOBAL lower_case_table_names=1` 的回答是 `ERROR 1238 (HY000): Variable 'lower_case_table_names' is a read only variable`。它是一个启动设置，与服务器最初的设置方式绑定，所以请把答案当作您所在服务器的一个属性。
+
+实用的建议不取决于这个答案。每个数据库名和表名都用同一种大小写来写，并在所有地方使用那种拼写，这样在 2 台服务器之间移动同一段 SQL 时，一个能用的查询不会变成 `ERROR 1146 (42S02)`，也就是表不存在的错误。
+
+## 总结 {#summary}
+
+- 预期字符串比较忽略大小写，因为常用的排序规则以 `_ci` 结尾。
+- 从 `INFORMATION_SCHEMA.COLUMNS` 读取列的排序规则。
+- 从末尾读排序规则的名称：`_ci` 和 `_ai` 忽略，`_cs`、`_as` 和 `_bin` 区分。
+- 用 `COLLATE` 做一次性的区分大小写比较，并接受它放弃索引查找。
+- 不管 `lower_case_table_names` 是什么，每个数据库名和表名都保持一种拼写。
+
+## 另请参阅 {#see-also}
+
+- [LIKE](/zh/tutorial/like) — 这个问题最先出现的地方
+- [REGEXP](/zh/tutorial/regexp) — 同样的规则，不同的覆盖方式
+- [MySQL 中的字符集和排序规则](/zh/guides/character-sets) — 为列选择一个排序规则
+- [在 MySQL 中使用 utf8mb4](/zh/guides/utf8mb4) — 常用排序规则背后的字符集

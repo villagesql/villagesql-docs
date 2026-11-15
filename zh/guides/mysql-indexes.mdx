@@ -1,0 +1,189 @@
+---
+title: "MySQL 索引的工作原理"
+sidebarTitle: "使用索引"
+description: "MySQL 索引实用指南：B 树索引的工作原理、MySQL 何时使用索引、复合索引的列顺序、覆盖索引，以及常见错误。"
+keywords: "mysql index explained, mysql how indexes work, mysql b-tree index, mysql composite index, mysql covering index, mysql explain index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+索引是 MySQL 中影响最大的性能工具——也是最常被误解的。开发者在查询变慢时添加索引，在磁盘空间紧张时删除索引，却常常不理解它们为什么有帮助或有害。本指南解释其中的机制，让您能够做出正确的决定，而不是靠猜测。
+
+## 思维模型 {#the-mental-model}
+
+想象一本 800 页的书。要找到每一处提到"TCP/IP"的地方，您可以逐页阅读——这就是全表扫描。或者您可以查看书末的索引，找到"TCP/IP — 第 42、107、391 页"，然后直接翻到那些页。数据库索引做的就是这件事。
+
+MySQL 默认的索引结构是 **B 树**（平衡树）。它让值保持有序，从而支持快速查找（二分查找）、范围扫描（`BETWEEN`、`>`、`<`）和有序输出（`ORDER BY`）——这一切都不需要读取整个表。
+
+## MySQL 如何使用索引 {#how-mysql-uses-an-index}
+
+当您运行查询时，MySQL 的优化器会检查是否有索引能缩小它需要读取的行的范围。当您的查询按某个已索引的列进行筛选或排序时，它就会使用索引。
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- Without an index, this scans every row
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Add an index on user_id
+CREATE INDEX idx_user_id ON orders (user_id);
+
+-- Now MySQL jumps directly to user_id = 42 rows
+SELECT * FROM orders WHERE user_id = 42;
+```
+
+### EXPLAIN：查看 MySQL 实际在做什么 {#explain-see-what-mysql-is-actually-doing}
+
+`EXPLAIN` 显示 MySQL 计划如何执行查询。`key` 列告诉您它使用了哪个索引（没有则为 NULL），`rows` 估计它需要检查多少行。
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+| id | select_type | table  | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra          |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+|  1 | SIMPLE      | orders | NULL       | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |   100.00 | NULL           |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+```
+
+`type: ref` 表示 MySQL 使用了索引查找。`type: ALL` 表示全表扫描——通常正是您想避免的。
+
+## 复合索引：列顺序很重要 {#composite-indexes-column-order-matters}
+
+复合索引覆盖多个列。列的顺序决定了该索引何时可用。
+
+```sql
+-- Index on (user_id, status)
+CREATE INDEX idx_user_status ON orders (user_id, status);
+```
+
+MySQL 可以把这个索引用于：
+- `WHERE user_id = 42` — 可以，最左列
+- `WHERE user_id = 42 AND status = 'shipped'` — 可以，两列都用到
+- `WHERE status = 'shipped'` — **不可以**，跳过了最左列
+
+规则是：MySQL 从左侧开始使用复合索引。查询必须包含前导列才能受益。
+
+这意味着 `(user_id, status)` 和 `(status, user_id)` 是用途不同的两个索引。请围绕您最常见的查询模式来设计复合索引。
+
+## 覆盖索引：只靠索引回答查询 {#covering-indexes-serving-queries-from-the-index-alone}
+
+覆盖索引包含查询需要的所有列。MySQL 可以完全从索引回答查询，而不读取实际的行数据——在大表上这是显著的提速。
+
+```sql
+-- Query only needs user_id, status, created_at
+SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+
+-- A covering index for this query
+CREATE INDEX idx_covering ON orders (user_id, status, created_at);
+```
+
+当 MySQL 使用覆盖索引时，`EXPLAIN` 显示 `Extra: Using index`。不需要任何行查找。
+
+## 何时不该添加索引 {#when-not-to-add-an-index}
+
+索引并不是越多越好。每个索引都有代价：
+
+- **写入开销** — 每一条 INSERT、UPDATE 和 DELETE 都必须更新表上的每一个索引
+- **存储** — 在写入密集的数据上，索引可能和表本身一样大
+- **优化器复杂度** — 索引太多时，优化器有时会选错
+
+索引最有帮助的情况：
+- 列的基数高（不同值很多）——`user_id`、`email`、`order_id`
+- 查询筛选出表的一小部分
+
+索引帮助最小的情况：
+- 基数低——只有 3 个可能值的 `status`、布尔型的 `is_active`
+- 表小到全表扫描本来就很快
+- 该列写入频繁而很少被查询
+
+```sql
+-- Probably not worth indexing: 'active' and 'inactive' split the table ~50/50
+CREATE INDEX idx_active ON users (is_active);  -- likely unused by optimizer
+
+-- Worth indexing: email is unique, commonly queried
+CREATE INDEX idx_email ON users (email);
+```
+
+## 主键始终是索引 {#primary-key-is-always-an-index}
+
+InnoDB 表围绕主键组织——它不是一个单独的索引，而是行的物理存储顺序。这意味着：
+
+- 主键查找是最快的查询
+- 主键值连续时，行在物理上相邻
+- 随机主键（如 UUID v4）在插入时造成碎片——请参阅 [MySQL 中的 UUID](/zh/guides/uuids)
+
+## 常见的索引错误 {#common-index-mistakes}
+
+**在已索引的列上使用函数** — 当您把列包在函数里时，MySQL 无法使用索引：
+
+```sql
+-- Index on created_at exists, but this skips it
+SELECT * FROM orders WHERE YEAR(created_at) = 2024;
+
+-- Use a range instead — index is used
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31';
+```
+
+**LIKE 中的前导通配符** — 当模式以 `%` 开头时，索引帮不上忙：
+
+```sql
+-- Can't use index
+SELECT * FROM users WHERE email LIKE '%@example.com';
+
+-- Can use index (no leading wildcard)
+SELECT * FROM users WHERE email LIKE 'alice%';
+```
+
+**跨不同列的 OR** — MySQL 的优化器有时可以合并多个单列索引来处理 `OR` 条件，但这并不可靠。在大表上，`UNION` 更可预测：
+
+```sql
+-- Index merge may or may not kick in depending on table size and selectivity
+SELECT * FROM orders WHERE user_id = 42 OR status = 'urgent';
+
+-- UNION gives the optimizer a cleaner path
+SELECT * FROM orders WHERE user_id = 42
+UNION
+SELECT * FROM orders WHERE status = 'urgent';
+```
+
+## 查找缺失的索引 {#finding-missing-indexes}
+
+慢查询日志会记录超过时间阈值的查询——这是寻找该给什么建索引的一个好起点：
+
+```sql
+-- Enable slow query log (in MySQL config or at runtime)
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 1;  -- log queries over 1 second
+```
+
+然后对这些慢查询运行 `EXPLAIN`。留意 `type: ALL` 和数以百万计的 `rows`。
+
+## 总结 {#summary}
+
+- B 树索引让值保持有序，以支持快速查找和范围扫描
+- 当您的查询按前导的已索引列进行筛选或排序时，MySQL 会使用索引
+- 复合索引的列顺序很重要——围绕您最常见的查询来设计
+- 覆盖索引最快——查询完全从索引得到回答
+- 索引在写入时有代价；只在读取收益值得的地方添加
+- 把列包进函数就等于禁用了它的索引——请改用范围条件
+
+索引在 [VillageSQL](https://villagesql.com/install) 上的行为完全相同，VillageSQL 是带扩展的 MySQL 直接替代品，所以本策略指南可以原样适用。
+
+## 另请参阅 {#see-also}
+
+- [阅读 MySQL 的 EXPLAIN](/zh/guides/reading-explain) — 验证您的索引是否被使用，并理解 MySQL 为什么选择它们
+- [MySQL 中的覆盖索引](/zh/guides/covering-indexes) — 不需要任何行查找就能回答查询的索引
+- [MySQL 慢查询日志](/zh/guides/slow-query-log) — 找出哪些查询最先需要索引
+- [MySQL INFORMATION_SCHEMA](/zh/guides/information-schema) — 用查询找到索引元数据和未使用的索引
+- [为什么我的 MySQL 查询很慢？](/zh/guides/mysql-query-performance) — 索引所属的更大范围的调优流程
+- [MySQL 中的分页：Keyset 与 OFFSET](/zh/guides/pagination) — 对大表分页的索引驱动方式

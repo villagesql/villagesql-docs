@@ -1,0 +1,200 @@
+---
+title: "MySQL INSERT ON DUPLICATE KEY UPDATE"
+sidebarTitle: "Upsert"
+description: "INSERT ... ON DUPLICATE KEY UPDATE 如何写入一行或修改已有的那一行，为什么它报告 2 rows affected，以及今天应该采用的别名写法。"
+keywords: "mysql insert on duplicate key update, mysql on duplicate key update, mysql insert or update, insert or update mysql, mysql duplicate key update alias, mysql values function deprecated"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+{/* verify-db: sakila_practice */}
+{/* verify-reset */}
+
+有时您不知道某一行是否存在。`INSERT ... ON DUPLICATE KEY UPDATE` 在它不存在时写入它，在它存在时修改它，只用 1 条语句，而且不需要先检查。每一个"保存这个设置"和每一个必须先创建才能递增的计数器，背后都是这条语句。
+
+这些示例使用来自 [INSERT](/zh/tutorial/insert) 的 `sakila_practice` 数据库。开始之前，请再次运行那里的设置代码块，然后用 `mysql -u root -p sakila_practice` 打开客户端。
+
+## 工作原理 {#how-it-works}
+
+```sql
+INSERT INTO TABLE_NAME (COLUMN_LIST) VALUES (VALUE_LIST) AS ROW_ALIAS
+ON DUPLICATE KEY UPDATE COLUMN_NAME = ROW_ALIAS.COLUMN_NAME;
+```
+
+把 `TABLE_NAME` 替换为表，`COLUMN_LIST` 和 `VALUE_LIST` 替换为与普通插入相同的列和值，`ROW_ALIAS` 替换为您所提供的行的名字，`COLUMN_NAME` 替换为该行已存在时要修改的列。
+
+`ON DUPLICATE KEY UPDATE` 子句只在插入会违反 `PRIMARY KEY` 或 `UNIQUE` 索引的唯一性时运行。别名指代您试图插入的那一行，所以 `ROW_ALIAS.COLUMN_NAME` 是您提供的值，而裸列名是已存储的值。
+
+## 示例 {#examples}
+
+### 1) 它所避免的冲突 {#1-the-collision-this-avoids}
+
+`rating_count` 以 `rating` 为主键。写入一行。
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 178);
+```
+
+```text
+Query OK, 1 row affected (0.00 sec)
+```
+
+用新的计数再写一次，插入失败。
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 999);
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'G' for key 'rating_count.PRIMARY'
+```
+
+### 2) 插入，或更新挡路的那一行 {#2-insert-or-update-what-is-in-the-way}
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 179) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 2 rows affected (0.00 sec)
+```
+
+```sql
+SELECT * FROM rating_count;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   179 |
++--------+-------+
+1 row in set (0.00 sec)
+```
+
+存储了一行，语句却说 `2 rows affected`。这个计数是语句告诉您它走了哪条分支的方式：插入一行是 1，更新一行是 2，更新发现值已经正确则是 0。
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 179) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 0 rows affected (0.00 sec)
+```
+
+那一行被找到了，而且已经是 179，所以没有什么可写。永远不要把受影响的行数当作表中的行数来读。
+
+### 3) 同一条语句作用于不存在的行 {#3-the-same-statement-on-a-row-that-is-not-there}
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('R', 195) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 1 row affected (0.00 sec)
+```
+
+```sql
+SELECT * FROM rating_count ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   179 |
+| R      |   195 |
++--------+-------+
+2 rows in set (0.00 sec)
+```
+
+`1 row affected` 是插入分支。这条语句除了值之外什么都没变，这正是它的意义所在：调用者不必知道那一行是否存在。
+
+## 刷新整个汇总表 {#refreshing-a-whole-summary}
+
+行可以来自一个查询，这就是用 1 条语句把汇总表更新到最新的方法。别名形式在那里是不允许的。
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT rating, COUNT(*) FROM sakila.film GROUP BY rating
+AS new ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'AS new ON DUPLICATE KEY UPDATE films = new.films' at line 3
+```
+
+改为给查询自己起一个别名，方法是把它包进一个[派生表](/zh/tutorial/derived-tables)，然后从那里读取所提供的值。
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT r, c FROM (SELECT rating AS r, COUNT(*) AS c FROM sakila.film GROUP BY rating) AS new
+ON DUPLICATE KEY UPDATE films = new.c;
+```
+
+```text
+Query OK, 5 rows affected (0.01 sec)
+Records: 5  Duplicates: 1  Warnings: 0
+```
+
+```sql
+SELECT * FROM rating_count ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| NC-17  |   210 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+`Duplicates: 1` 是 `G` 那一行，它原来存的是 179，现在是 178。3 个新分级占了 5 个受影响行中的 3 个，那一次更新占了另外 2 个。`R` 已经是 195，所以它完全没有计入。
+
+## 旧代码用 VALUES() 而不是别名 {#older-code-uses-values-instead-of-an-alias}
+
+旧语句用 `VALUES(films)` 代替别名来读取所提供的值。这种形式仍然可用，但会引发一个警告。
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 178)
+ON DUPLICATE KEY UPDATE films = VALUES(films);
+SHOW WARNINGS\G
+```
+
+```text
+Query OK, 0 rows affected, 1 warning (0.00 sec)
+
+*************************** 1. row ***************************
+  Level: Warning
+   Code: 1287
+Message: 'VALUES function' is deprecated and will be removed in a future release. Please use an alias (INSERT INTO ... VALUES (...) AS alias) and replace VALUES(col) in the ON DUPLICATE KEY UPDATE clause with alias.col instead
+1 row in set (0.00 sec)
+```
+
+`\G` 像分号一样结束语句，并把每一列打印成一行，这是阅读一条宽得放不进表格的消息的方法。新语句请用别名来写，并预期在早先写的代码中遇到 `VALUES()`。
+
+## 总结 {#summary}
+
+- 当某一行可能存在也可能不存在时，用 `INSERT ... ON DUPLICATE KEY UPDATE`。
+- 预期该子句只在 `PRIMARY KEY` 或 `UNIQUE` 冲突时运行。
+- 把受影响的行数读作：插入为 1，更新为 2，无变化为 0。
+- 用 `AS alias` 给所提供的行命名，并以 `alias.column` 读取它的值。
+- 当行来自 `SELECT` 时，把查询包进派生表。
+- 把 `VALUES(col)` 换成别名形式，这正是警告 1287 所要求的。
+
+## 另请参阅 {#see-also}
+
+- [INSERT](/zh/tutorial/insert) — 普通形式和 `ERROR 1062`
+- [INSERT SELECT](/zh/tutorial/insert-select) — 来自查询的行
+- [UPDATE](/zh/tutorial/update) — 修改您知道存在的行
+- [MySQL 中的 UPSERT](/zh/guides/upsert) — REPLACE、INSERT IGNORE，以及该选哪一个

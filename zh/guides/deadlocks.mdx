@@ -1,0 +1,190 @@
+---
+title: "MySQL 中的死锁"
+sidebarTitle: "避免死锁"
+description: "MySQL 死锁如何发生、InnoDB 如何检测和解决死锁、如何阅读死锁日志，以及在应用程序中防止死锁的模式。"
+keywords: "mysql deadlock, mysql innodb deadlock, mysql deadlock error 1213, mysql deadlock detection, mysql show engine innodb status, mysql deadlock prevention, mysql lock wait timeout"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+当两个事务各自持有对方需要的锁，且双方都无法继续时，就发生了死锁。InnoDB 会自动检测到这种情况并终止其中一个事务——"牺牲者"——并报错 `ERROR 1213: Deadlock found when trying to get lock; try restarting transaction`。
+
+## 死锁如何发生 {#how-deadlocks-happen}
+
+经典模式：两个事务以相反的顺序锁定行。
+
+```sql
+-- Transaction A: locks row 1, then tries to lock row 2
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- locks row 1
+-- (Transaction B runs here and locks row 2)
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- waits for B's lock on row 2
+
+-- Transaction B: locks row 2, then tries to lock row 1
+BEGIN;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- locks row 2
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- waits for A's lock on row 1
+-- Deadlock: A waits for B, B waits for A
+```
+
+InnoDB 的死锁检测器发现这个环，并回滚锁定资源较少（或完成工作较少）的那个事务。
+
+## 阅读死锁日志 {#reading-the-deadlock-log}
+
+最近一次死锁始终可以在 InnoDB 状态输出中找到：
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+```
+
+查找 `LATEST DETECTED DEADLOCK` 部分。它显示两个事务、它们各自持有的锁、它们各自等待的锁，以及哪个事务被回滚了。
+
+```
+------------------------
+LATEST DETECTED DEADLOCK
+------------------------
+*** (1) TRANSACTION:
+TRANSACTION 12345, ACTIVE 0 sec starting index read
+MySQL thread id 10, query: UPDATE accounts SET balance = balance + 100 WHERE id = 2
+*** (1) HOLDS THE LOCK(S):
+RECORD LOCKS space id 87 page no 3 n bits 72 index PRIMARY of table accounts trx id 12345 lock_mode X locks rec but not gap
+Record lock, heap no 3 PHYSICAL RECORD: ...
+
+*** (2) TRANSACTION:
+TRANSACTION 12346, ACTIVE 0 sec starting index read
+MySQL thread id 11, query: UPDATE accounts SET balance = balance - 100 WHERE id = 1
+*** (2) HOLDS THE LOCK(S): ...
+*** (2) WAITING FOR THIS LOCK TO BE GRANTED: ...
+*** WE ROLL BACK TRANSACTION (1)
+```
+
+需要提取的关键信息：
+- 哪两个查询发生了冲突
+- 涉及哪张表和哪个索引
+- 哪个事务是牺牲者（被回滚）
+
+## 死锁预防模式 {#deadlock-prevention-patterns}
+
+### 以一致的顺序锁定行 {#lock-rows-in-consistent-order}
+
+上面的死锁之所以发生，是因为 A 先锁行 1 再锁行 2，而 B 先锁行 2 再锁行 1。如果两个事务始终按 ID 升序锁定，环就无法形成：
+
+```sql
+-- Both transactions lock in order: lower ID first
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- lower ID first
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- then higher ID
+COMMIT;
+```
+
+当您控制应用代码时，请为涉及多行的操作强制执行一致的锁定顺序。
+
+### 保持事务简短 {#keep-transactions-short}
+
+更长的事务持有锁的时间更长，给冲突的产生留出更多时间。在事务内只做最少的工作：
+
+```sql
+-- Fetch data outside the transaction, compute, then write in one short transaction
+BEGIN;
+UPDATE orders SET status = 'shipped', shipped_at = NOW() WHERE id = ?;
+COMMIT;
+-- Don't: read+compute+write all inside one long-running transaction
+```
+
+### 使用 SELECT ... FOR UPDATE 预先加锁 {#use-select--for-update-to-pre-lock}
+
+如果您的事务将要更新某一行，请在 SELECT 时就锁定它，而不是等到 UPDATE 时才遇到锁冲突：
+
+```sql
+BEGIN;
+SELECT * FROM orders WHERE id = 42 FOR UPDATE;  -- acquires write lock now
+-- ... application logic ...
+UPDATE orders SET status = 'processed' WHERE id = 42;
+COMMIT;
+```
+
+这不能消除死锁，但它让锁定顺序显式且可预测。
+
+### 死锁时重试 {#retry-on-deadlock}
+
+在并发系统中，死锁是预期之内的。应用程序的正确响应是捕获 `ERROR 1213` 并重试整个事务：
+
+```python
+MAX_RETRIES = 3
+for attempt in range(MAX_RETRIES):
+    try:
+        with connection.transaction():
+            do_work()
+        break
+    except DeadlockError:
+        if attempt == MAX_RETRIES - 1:
+            raise
+        time.sleep(0.1 * (attempt + 1))  # brief backoff
+```
+
+不要重试单条语句——要从头重试整个事务，因为 InnoDB 已经把它回滚了。
+
+## 间隙锁与临键锁 {#gap-locks-and-next-key-locks}
+
+InnoDB 使用间隙锁和临键锁来防止默认的 `REPEATABLE READ` 隔离级别下的幻读。这些范围更广的锁增加了死锁的几率。
+
+```sql
+-- Locking a non-existent id doesn't just lock a gap -- it locks up to
+-- the next existing row too (a gap lock, not a plain row lock).
+-- Locking an id that DOES exist takes only a record lock, no gap.
+SELECT * FROM orders WHERE id = 6 FOR UPDATE;
+
+-- Switching to READ COMMITTED reduces gap locking
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+`READ COMMITTED` 只使用行锁（没有间隙锁），这降低了死锁频率。代价是它允许幻读。对于大多数 OLTP 负载，`READ COMMITTED` 对死锁敏感的操作来说是一个合理的选择。
+
+## 锁等待超时 {#lock-wait-timeout}
+
+并非所有锁冲突都是死锁。如果事务 B 只是在等待 A 的锁而 A 很慢，B 会在 `innodb_lock_wait_timeout` 秒（默认值：50）后超时。错误是 `ERROR 1205: Lock wait timeout exceeded`。
+
+```sql
+SHOW VARIABLES LIKE 'innodb_lock_wait_timeout';
+-- 50 seconds by default
+
+SET SESSION innodb_lock_wait_timeout = 10;
+```
+
+超时不是死锁——InnoDB 没有回滚造成阻塞的事务，只回滚了等待的事务。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 如何查看当前所有的锁以及谁在等待？ {#how-do-i-see-all-current-locks-and-whos-waiting}
+
+```sql
+SELECT * FROM performance_schema.data_locks\G
+SELECT * FROM performance_schema.data_lock_waits\G
+```
+
+`data_locks` 显示当前持有或请求的每一个锁。`data_lock_waits` 显示哪个线程在阻塞哪个线程。
+
+#### InnoDB 总是能立即检测到死锁吗？ {#does-innodb-always-detect-deadlocks-immediately}
+
+InnoDB 的死锁检测器在发生锁冲突时同步运行。检测几乎是即时的。您可以用 `innodb_deadlock_detect = OFF` 禁用它并完全依赖 `innodb_lock_wait_timeout`，一些高并发负载出于性能考虑会这样做，但这并不常见。
+
+#### 我能防止所有死锁吗？ {#can-i-prevent-all-deadlocks}
+
+不能。死锁是对并发事务加锁的固有属性。您可以通过一致的锁定顺序和简短的事务降低其频率，而且您应该始终为它们编写重试逻辑。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 1213: Deadlock found` | 重试事务；检查 `SHOW ENGINE INNODB STATUS` 以了解锁冲突模式 |
+| `ERROR 1205: Lock wait timeout exceeded` | 某个事务持有锁的时间太长；在 `performance_schema.data_lock_waits` 中找到造成阻塞的查询 |
+| INSERT 上出现死锁，而非 UPDATE | 很可能是索引范围上的间隙锁冲突；尝试 `READ COMMITTED` 隔离级别，或以一致的顺序插入行 |
+| 同一死锁模式反复出现 | 应用程序中的锁定顺序不一致——找到这两条代码路径并强制执行规范的顺序 |
+| `SHOW ENGINE INNODB STATUS` 没有显示死锁 | 该状态只保留最近一次死锁；启用向错误日志持久记录死锁：`SET GLOBAL innodb_print_all_deadlocks = ON` |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的事务](/zh/guides/transactions) — 使死锁成为可能的事务模型
+- [InnoDB 如何存储数据](/zh/guides/innodb-storage) — InnoDB 行级锁的底层工作原理

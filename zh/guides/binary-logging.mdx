@@ -1,0 +1,207 @@
+---
+title: "MySQL 二进制日志"
+sidebarTitle: "使用二进制日志"
+description: "MySQL 二进制日志的工作原理：启用它、为复制和变更数据捕获选择 ROW、STATEMENT 或 MIXED 格式、用 mysqlbinlog 读取日志、时间点恢复，以及清除旧日志。"
+keywords: "mysql binary log, mysql binlog, mysql enable binary logging, mysql mysqlbinlog, mysql point in time recovery, mysql binlog format, mysql replication log, mysql binlog row format, mysql binary log position, mysql binlog row vs statement, mysql point in time recovery binlog, mysql change data capture, mysql cdc binlog, mysql replication setup"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 二进制日志记录对数据库所做的每一次更改——插入、更新、删除、模式更改。它是复制和时间点恢复的基础。大多数生产 MySQL 服务器都启用了二进制日志。
+
+## 启用二进制日志 {#enabling-binary-logging}
+
+MySQL 8.0 默认启用二进制日志。验证方法：
+
+```sql
+SHOW VARIABLES LIKE 'log_bin';
+-- log_bin  ON
+```
+
+在 `my.cnf` / `my.ini` 中配置：
+
+```ini
+[mysqld]
+log_bin = /var/log/mysql/mysql-bin
+binlog_format = ROW
+server_id = 1          -- required for replication; good practice to set always
+binlog_expire_logs_seconds = 604800  -- auto-purge logs older than 7 days
+max_binlog_size = 100M -- rotate to a new file when this size is reached
+```
+
+设置 `log_bin` 后，MySQL 将 binlog 文件命名为 `mysql-bin.000001`、`mysql-bin.000002` 等，并用一个索引文件（`mysql-bin.index`）列出全部文件。
+
+## 二进制日志格式 {#binary-log-formats}
+
+MySQL 支持三种 binlog 格式：
+
+| 格式 | 记录的内容 | 复制安全性 | 日志大小 | 性能影响 | 最适合 |
+|:-------|:-------------|:------------------|:---------|:------------------|:---------|
+| `ROW` | 每个受影响行在更改前后的实际行数据 | 最安全——无论副本状态如何都是确定性的 | 最大（随数据量增长，尤其是批量更新） | 源端写入开销最高 | 生产复制；时间点恢复；CDC/变更数据捕获 |
+| `STATEMENT` | 导致更改的 SQL 语句 | 对每次调用结果不同的非确定性函数（`RAND()`、`UUID()`）不安全；`NOW()` 是安全的，因为语句的时间戳随 binlog 事件一起传输 | 最小 | 开销最低 | 日志大小重要且所有语句都是确定性的读密集型工作负载 |
+| `MIXED` | 默认使用 STATEMENT；对不安全的语句切换为 ROW | 安全（需要时使用 ROW） | 中等 | 中等 | 从 STATEMENT 迁移的旧设置；不推荐用于新部署 |
+
+`ROW` 格式是推荐的默认值。即使涉及 `RAND()` 或 `UUID()` 等非确定性函数，它也能正确复制。缺点是日志文件更大——一条触及数百万行的 `UPDATE` 在 STATEMENT 格式下只产生一条语句，而在 ROW 格式下每个受影响的行产生一个行事件。
+
+### 何时启用二进制日志以及选择哪种格式 {#when-to-enable-binary-logging-and-which-format-to-choose}
+
+MySQL 8.0+ 默认启用二进制日志。问题通常是使用哪种格式，以及是否要保持开启。
+
+| 场景 | 建议 |
+|:---------|:---------------|
+| 运行任何副本 | 启用二进制日志，使用 `ROW` 格式——组复制必需，标准复制也推荐 |
+| 需要时间点恢复 | 启用二进制日志；格式不影响时间点恢复能力，但 `ROW` 提供最精确的重放 |
+| 使用 Debezium、Kafka Connect 等进行变更数据捕获（CDC） | 启用二进制日志，必须使用 `ROW` 格式——CDC 工具直接读取行级事件 |
+| 独立的开发/测试实例，无复制，无时间点恢复 | 禁用二进制日志（`--skip-log-bin`）可以减少写入开销和磁盘用量 |
+| 写入吞吐量非常高，担心日志大小 | 考虑 `binlog_row_image = MINIMAL`（只记录更改的列），而不是切换到 STATEMENT |
+| 审计或合规 | `ROW` 格式加 `binlog_row_image = FULL`（默认值）可以提供更改前后的完整记录 |
+
+检查和更改格式：
+
+```sql
+SHOW VARIABLES LIKE 'binlog_format';
+SET SESSION binlog_format = 'ROW';  -- change for current session
+```
+
+## 列出和查看二进制日志 {#listing-and-viewing-binary-logs}
+
+列出所有二进制日志文件：
+
+```sql
+SHOW BINARY LOGS;
+```
+
+检查当前的 binlog 文件和位置：
+
+```sql
+SHOW BINARY LOG STATUS;
+```
+
+从 SQL 中查看 binlog 里的事件：
+
+```sql
+SHOW BINLOG EVENTS IN 'mysql-bin.000003' LIMIT 20;
+SHOW BINLOG EVENTS IN 'mysql-bin.000003' FROM 154 LIMIT 10;
+```
+
+## mysqlbinlog {#mysqlbinlog}
+
+`mysqlbinlog` 工具将二进制日志文件解码为人类可读的 SQL。它用于时间点恢复和审计：
+
+```bash
+# Read a local binlog file
+mysqlbinlog /var/log/mysql/mysql-bin.000003
+
+# Filter by time range
+mysqlbinlog --start-datetime="2024-06-15 10:00:00" \
+            --stop-datetime="2024-06-15 12:00:00" \
+            /var/log/mysql/mysql-bin.000003
+
+# Decode ROW format events (shows actual data changes)
+mysqlbinlog --verbose /var/log/mysql/mysql-bin.000003
+
+# Read directly from a running server
+mysqlbinlog --read-from-remote-server \
+            --host=127.0.0.1 --user=root --password \
+            mysql-bin.000003
+```
+
+## 时间点恢复 {#point-in-time-recovery}
+
+将完整备份与二进制日志结合，您可以恢复到备份之后的任意时间点。
+
+**典型工作流程：**
+
+1. 使用 `mysqldump --single-transaction --source-data` 进行完整备份：
+
+```bash
+mysqldump --single-transaction --source-data=2 --all-databases \
+  -u root -p > backup.sql
+```
+
+`--source-data=2` 以注释形式在转储中写入 binlog 文件名和位置。这是您的恢复起点。
+
+2. 恢复完整备份：
+
+```bash
+mysql -u root -p < backup.sql
+```
+
+3. 从转储中找到 binlog 文件和位置：
+
+```bash
+head -50 backup.sql | grep "SOURCE_LOG_FILE"
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='mysql-bin.000003', SOURCE_LOG_POS=154;
+```
+
+4. 从该位置开始重放 binlog，直到您想撤销的事件之前的那一刻：
+
+```bash
+mysqlbinlog --start-position=154 \
+            --stop-datetime="2024-06-15 11:59:00" \
+            mysql-bin.000003 mysql-bin.000004 | mysql -u root -p
+```
+
+## 管理二进制日志 {#managing-binary-logs}
+
+手动清除旧的二进制日志：
+
+```sql
+-- Purge all logs before a specific log file
+PURGE BINARY LOGS TO 'mysql-bin.000010';
+
+-- Purge all logs older than a date
+PURGE BINARY LOGS BEFORE '2024-06-01 00:00:00';
+```
+
+使用 `binlog_expire_logs_seconds` 自动清除（MySQL 8.0+；`expire_logs_days` 已被移除）：
+
+```sql
+SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';
+SET GLOBAL binlog_expire_logs_seconds = 604800;  -- 7 days in seconds
+```
+
+切勿用 `rm` 直接删除 binlog 文件——请使用 `PURGE BINARY LOGS`，以保持索引文件的一致性。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 二进制日志会影响写入性能吗？ {#does-binary-logging-affect-write-performance}
+
+会，但影响不大。ROW 格式的日志记录增加的开销与更改的数据量成正比。对于写密集型工作负载，开销通常为 5–15%。考虑到它带来的恢复和复制能力，这几乎总是值得的。
+
+#### 我可以为特定会话跳过二进制日志吗？ {#can-i-skip-binary-logging-for-a-specific-session}
+
+```sql
+SET SESSION sql_log_bin = 0;
+-- ... operations that won't be logged ...
+SET SESSION sql_log_bin = 1;
+```
+
+这在以下情况下很有用：在不需要进一步传播的副本上加载数据，或者将批量操作排除在时间点恢复范围之外。需要 `SUPER`、`SYSTEM_VARIABLES_ADMIN` 或 `SESSION_VARIABLES_ADMIN`——只有 `BINLOG_ADMIN` 是不够的，尝试会以 ERROR 1227 失败。
+
+#### 如何知道我的二进制日志占用了多少磁盘空间？ {#how-do-i-know-how-much-disk-space-my-binary-logs-are-using}
+
+```sql
+SHOW BINARY LOGS;
+-- Sum the File_size column
+```
+
+或者在磁盘上：`du -sh /var/log/mysql/mysql-bin.*`
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 二进制日志文件占满磁盘 | 设置 `binlog_expire_logs_seconds` 或运行 `PURGE BINARY LOGS BEFORE`——切勿直接 `rm` 这些文件 |
+| `mysqlbinlog` 对 ROW 格式的输出不可读 | 添加 `--verbose`（或 `-v`）将行事件解码为伪 SQL |
+| 时间点恢复遗漏了一些更改 | 检查范围内的所有 binlog 文件是否都已包含——文件列表中的缺口会在重放中留下空洞 |
+| 复制中出现 `ERROR: Binary logging not possible` | 副本可能需要启用 `log_bin` 并设置唯一的 `server_id`——两者都是必需的 |
+| 复制延迟高 | ROW 格式产生更多数据——使用 `SHOW REPLICA STATUS\G` 检查副本的 I/O 线程和 SQL 线程延迟 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 备份策略](/zh/guides/backup-strategies)——二进制日志如何支持时间点恢复
+- [MySQL 复制基础](/zh/guides/replication-basics)——复制使用二进制日志作为其数据流
+- [MySQL 中的读副本](/zh/guides/read-replicas)——用副本重放的日志流扩展读取能力

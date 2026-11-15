@@ -1,0 +1,133 @@
+---
+title: "MySQL 中的覆盖索引"
+sidebarTitle: "使用覆盖索引"
+description: "什么是 MySQL 中的覆盖索引、它们如何消除回表查找，以及如何为您最重要的查询设计覆盖索引。"
+keywords: "mysql covering index, mysql using index, mysql index only scan, mysql composite index performance, mysql explain using index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+覆盖索引是包含查询所需的每一列的索引。先理解索引工作原理的基础知识会有帮助——[MySQL 索引的工作原理](/zh/guides/mysql-indexes)介绍了 B 树结构、键长度和选择性规则，这些在这里同样适用。当 MySQL 可以完全从索引中回答查询——而无需访问实际的表行——这被称为仅索引扫描。在大表上，这是可用的最大的单查询优化之一。
+
+## 回表查找的工作原理（以及为什么开销很大） {#how-row-lookups-work-and-why-theyre-expensive}
+
+常规的索引查找分两步：
+
+1. MySQL 搜索索引以找出哪些行匹配
+2. 对每个匹配的行，MySQL 从表中获取完整的行（即"回表查找"）
+
+第 2 步是开销大的部分。InnoDB 的聚簇索引意味着表数据按主键物理排序。当您通过二级索引查找行时，主键值是分散的——每次回表查找很可能是对不同磁盘页的随机 I/O。在大规模下，这些随机读取主导了查询时间。
+
+覆盖索引完全消除了第 2 步。
+
+## 在 EXPLAIN 中识别覆盖索引 {#identifying-a-covering-index-in-explain}
+
+`EXPLAIN` 会告诉您何时使用了覆盖索引：查找 `Extra: Using index`。如果您还不熟悉 EXPLAIN 的输出，[解读 MySQL 中的 EXPLAIN](/zh/guides/reading-explain)介绍了所有关键列。
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+CREATE INDEX idx_user_status_created ON orders (user_id, status, created_at);
+
+-- All three columns in the SELECT are in the index
+EXPLAIN SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------------+
+| type  | key                       | rows | Extra       |
++-------+---------------------------+------+-------------+
+| ref   | idx_user_status_created   |   12 | Using index |
++-------+---------------------------+------+-------------+
+```
+
+`Using index`——MySQL 只读取了索引。没有回表查找。
+
+现在添加一个不在索引中的列：
+
+```sql
+-- order_total is not in the index
+EXPLAIN SELECT user_id, status, created_at, order_total FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------+
+| type  | key                       | rows | Extra |
++-------+---------------------------+------+-------+
+| ref   | idx_user_status_created   |   12 | NULL  |
++-------+---------------------------+------+-------+
+```
+
+`Extra` 现在为空——MySQL 使用索引找到行，然后获取完整的行以取得 `order_total`。回表查找又回来了。
+
+## 设计覆盖索引 {#designing-a-covering-index}
+
+目标是包含查询涉及的每一列——`WHERE`、`ORDER BY`、`GROUP BY` 和 `SELECT` 列表中的列。列的顺序仍然遵循 `WHERE` 和 `ORDER BY` 过滤的最左前缀规则：
+
+```sql
+-- Query pattern:
+SELECT status, created_at FROM orders
+WHERE user_id = 42
+ORDER BY created_at;
+
+-- Covering index: equality column first, then sort column, then SELECT columns
+CREATE INDEX idx_covering ON orders (user_id, created_at, status);
+```
+
+- `user_id` 在最前——等值过滤列
+- `created_at` 第二——排序列（索引已排好序，无需 filesort）
+- `status` 最后——只出现在 `SELECT` 中，不参与过滤或排序
+
+`SELECT` 列放在最后，因为它们不影响找到哪些行以及按什么顺序找到——它们只是顺带被带上。
+
+## 覆盖索引何时值得 {#when-covering-indexes-are-worth-it}
+
+| 场景 | 值得吗？ |
+|:---------|:----------|
+| 大表上的高流量查询 | 值得 |
+| 窄 `SELECT` 列表（少数几列） | 值得 |
+| 读密集型负载 | 值得 |
+| 小表 | 不值得——回表查找本来就很快 |
+| `SELECT *` 查询 | 不值得——不索引整张表就无法覆盖所有列 |
+| 写密集型表 | 需要评估——每次 `INSERT`/`UPDATE`/`DELETE` 都会更新索引 |
+
+```sql
+-- Not a candidate: SELECT * means no index can cover this
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Good candidate: narrow SELECT, high-traffic query
+SELECT id, status FROM orders WHERE user_id = 42 AND created_at > '2024-01-01';
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 覆盖索引对 `SELECT *` 有帮助吗？ {#does-a-covering-index-help-with-select-}
+没有。索引只有在包含 `SELECT` 列表中的每一列时才能覆盖查询。`SELECT *` 选择所有列，所以您需要索引所有列——到那时您实际上是把整张表复制成了一个索引，这没有用处。
+
+#### 覆盖索引仍然能加速 `SELECT *` 查询吗？ {#can-a-covering-index-still-speed-up-select--queries}
+可以，部分地。即使 MySQL 必须做回表查找，索引也缩小了需要获取的行的范围。改进来自 `WHERE` 过滤，而不是来自消除回表查找。
+
+#### 我如何知道覆盖索引是否有帮助？ {#how-do-i-know-if-a-covering-index-would-help}
+运行 `EXPLAIN` 并检查 `Extra`。如果您看到 `Using index condition` 或什么都没有（没有 `Using index`），并且 `rows` 很大，那么覆盖索引可能有帮助。`EXPLAIN ANALYZE` 显示实际行数与估计行数的对比，这对确认优化器的选择很有用。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `Extra` 显示为空而不是 `Using index` | `SELECT` 中有一列不在索引中——把它加入索引，或从查询中移除它 |
+| `Extra: Using index condition` 而不是 `Using index` | 索引用于过滤但没有完全覆盖——添加剩余的 `SELECT` 列 |
+| 索引存在但 `key` 为 `NULL` | 运行 `ANALYZE TABLE` 刷新统计信息；检查查询的 `WHERE` 是否使用了索引的最左列 |
+| 覆盖索引拖慢了写入 | 这是预期的权衡——评估对您的负载来说读取收益是否大于写入开销 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 索引的工作原理](/zh/guides/mysql-indexes) — 覆盖索引所基于的 B 树基础
+- [解读 MySQL 中的 EXPLAIN](/zh/guides/reading-explain) — 如何在 EXPLAIN 输出中确认 `Using index`
+- [InnoDB 如何存储数据](/zh/guides/innodb-storage) — 为什么回表查找开销大，以及覆盖索引为什么能避免它

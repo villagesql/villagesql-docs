@@ -1,0 +1,145 @@
+---
+title: "MySQL 慢查询日志"
+sidebarTitle: "使用慢查询日志"
+description: "如何启用和使用 MySQL 的慢查询日志来找出需要优化的查询，包括日志格式、关键字段和 mysqldumpslow。"
+keywords: "mysql slow query log, mysql long_query_time, mysql enable slow query log, mysqldumpslow, mysql find slow queries, mysql query optimization"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+慢查询日志是 MySQL 内置的工具，用于找出需要关注的查询。它捕获任何耗时超过可配置阈值的查询，并把它写入日志文件。如果您不知道该优化哪些查询，就从这里开始。
+
+## 启用慢查询日志 {#enabling-the-slow-query-log}
+
+您可以在运行时启用它，无需重启服务器：
+
+```sql
+-- Enable the log
+SET GLOBAL slow_query_log = 'ON';
+
+-- Log queries that take longer than 1 second
+SET GLOBAL long_query_time = 1;
+
+-- Check where the log file is being written
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+这些设置立即生效，但在服务器重启后会重置。要使它们永久生效，请把它们添加到您的 `my.cnf` 或 `my.ini` 中：
+
+```ini
+[mysqld]
+slow_query_log = ON
+long_query_time = 1
+slow_query_log_file = /var/log/mysql/slow.log
+```
+
+## 记录的内容 {#what-gets-logged}
+
+典型的条目如下所示：
+
+```
+# Time: 2024-03-15T14:23:01.234567Z
+# User@Host: app_user[app_user] @ localhost []  Id: 142
+# Query_time: 4.521893  Lock_time: 0.000123  Rows_sent: 1  Rows_examined: 847293
+SET timestamp=1710509381;
+SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+最重要的头部字段：
+
+| 字段 | 它告诉您什么 |
+|:------|:-----------------|
+| `Query_time` | 总执行时间（秒） |
+| `Lock_time` | 等待锁所花的时间（与执行分开） |
+| `Rows_sent` | 返回给客户端的行数 |
+| `Rows_examined` | MySQL 为生成结果而读取的行数 |
+
+**`Rows_examined` / `Rows_sent` 的比值是关键信号**。如果 MySQL 检查了 847,293 行只为返回 1 行，那它几乎扫描了整张表才找到一个结果。这就是需要索引的查询。
+
+## 记录不使用索引的查询 {#logging-queries-without-indexes}
+
+一个开销更低的变体：只记录不使用任何索引的查询，不论执行时间长短。
+
+```sql
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+```
+
+这有助于在明显的索引缺失问题演变成性能问题之前把它们找出来。在繁忙的服务器上它可能产生大量日志条目，因此请与 `log_throttle_queries_not_using_indexes` 结合使用以限制速率：
+
+```sql
+-- Log at most 10 no-index queries per minute
+SET GLOBAL log_throttle_queries_not_using_indexes = 10;
+```
+
+## 用 mysqldumpslow 分析日志 {#analyzing-the-log-with-mysqldumpslow}
+
+在繁忙的服务器上，慢查询日志增长很快。`mysqldumpslow` 把相似的查询聚合起来，并按总时间排序，让您很容易找到最先要修复的查询：
+
+```bash
+# Top 10 queries by total execution time
+mysqldumpslow -s t -t 10 /var/log/mysql/slow.log
+
+# Top 10 by average execution time
+mysqldumpslow -s at -t 10 /var/log/mysql/slow.log
+
+# Top 10 queries that examined the most rows
+mysqldumpslow -s r -t 10 /var/log/mysql/slow.log
+```
+
+输出按查询的结构分组，用 `N` 和 `S` 替换字面值：
+
+```
+Count: 523  Time=4.52s (2364s)  Lock=0.00s (0s)  Rows=1.0 (523), app_user@localhost
+  SELECT * FROM orders WHERE status = 'S' ORDER BY created_at LIMIT N
+```
+
+这条查询运行了 523 次，平均 4.52 秒，总计占用 2,364 秒的服务器时间。这就是起点。
+
+## 把慢查询交给 EXPLAIN {#turning-slow-queries-into-explain}
+
+找出开销大的查询后，对它们运行 `EXPLAIN` 以查看执行计划：
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+留意 `type: ALL`（全表扫描）和 `Extra: Using filesort`。两者都可以通过索引修复 — 请参阅 [MySQL 索引的工作原理](/zh/guides/mysql-indexes) 和 [解读 MySQL 中的 EXPLAIN](/zh/guides/reading-explain)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我应该把 `long_query_time` 设为多少？ {#what-should-i-set-long_query_time-to}
+从 `1` 秒开始。处理完最糟糕的查询后，把它降到 `0.1` 以捕获中等严重程度的问题。对于性能关键的应用程序，`0.05` 或更低很常见。设为 `0` 会记录每一条查询 — 适合对特定操作做性能剖析，不适合生产监控。
+
+#### 启用慢查询日志会影响性能吗？ {#does-enabling-the-slow-query-log-affect-performance}
+影响极小。开销是每条被记录的查询产生少量 I/O。在 `long_query_time = 1` 的繁忙生产服务器上，只有真正慢的查询才会被写入 — 典型的开销可以忽略不计。记录每一条查询（`long_query_time = 0`）有可测量的开销，只应临时使用。
+
+#### 我可以从 SQL 查询慢日志，而不是读取文件吗？ {#can-i-query-the-slow-log-from-sql-instead-of-reading-the-file}
+可以，如果您配置了 `log_output = TABLE`，就可以使用 `mysql.slow_log` 表 — 不存在 `performance_schema` 慢日志表：
+
+```sql
+SET GLOBAL log_output = 'TABLE';
+SELECT * FROM mysql.slow_log ORDER BY start_time DESC LIMIT 10;
+```
+
+生产环境通常更倾向于文件输出 — 表的方式会在每条被记录的查询上增加写入开销。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 日志文件没有被创建 | 检查 MySQL 是否对日志目录有写权限 |
+| 有慢查询但没有条目 | 用 `SHOW VARIABLES LIKE 'slow_query_log'` 确认 `slow_query_log = ON` |
+| 日志增长太快 | 提高 `long_query_time` 或启用 `log_throttle_queries_not_using_indexes` |
+| 找不到 `mysqldumpslow` | 它随 MySQL 一起提供 — 检查您的 MySQL bin 目录（`which mysqldumpslow` 或在 `/usr/bin` 中查找） |
+
+慢查询日志和 `mysqldumpslow` 在 [VillageSQL](https://villagesql.com/install) 上的工作方式完全相同，VillageSQL 是带扩展的 MySQL 直接替代品。
+
+## 另请参阅 {#see-also}
+
+- [解读 MySQL 中的 EXPLAIN](/zh/guides/reading-explain) — 分析您找到的慢查询
+- [MySQL 索引的工作原理](/zh/guides/mysql-indexes) — 慢查询最常见的修复方法
+- [MySQL 连接池](/zh/guides/connection-pooling) — 慢查询日志无法捕获的另一个延迟来源
+- [为什么我的 MySQL 查询很慢？](/zh/guides/mysql-query-performance) — 如何处理日志暴露出的查询
+- [将 MySQL 与 ORM 一起使用：Django、Rails 和 Prisma](/zh/guides/mysql-with-orms) — 捕获 ORM 生成的查询

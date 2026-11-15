@@ -1,0 +1,151 @@
+---
+title: "MySQL 中的 CHECK 约束"
+sidebarTitle: "使用 CHECK 约束"
+description: "MySQL CHECK 约束的工作原理：语法、强制执行行为、命名约束、禁用约束，以及 CHECK 与触发器和应用程序级验证的比较。"
+keywords: "mysql check constraint, mysql check constraint example, mysql add check constraint, mysql constraint validation, mysql 8 check constraint, mysql create table check, mysql enforce data rules"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 强制执行 `CHECK` 约束。旧版本接受这种语法但静默忽略它——这一行为让许多从 PostgreSQL 迁移过来的开发者感到意外。
+
+## 定义 CHECK 约束 {#defining-check-constraints}
+
+可以在列定义中内联添加 `CHECK` 约束，也可以作为表级约束添加：
+
+```sql
+CREATE TABLE products (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    name     VARCHAR(100) NOT NULL,
+    price    DECIMAL(10,2) NOT NULL,
+    quantity INT NOT NULL,
+
+    -- Inline constraints
+    CONSTRAINT chk_price    CHECK (price > 0),
+    CONSTRAINT chk_quantity CHECK (quantity >= 0)
+);
+```
+
+或者在列定义中内联：
+
+```sql
+CREATE TABLE orders (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    status     VARCHAR(20) CHECK (status IN ('pending', 'shipped', 'delivered', 'cancelled')),
+    discount   DECIMAL(5,2) CHECK (discount BETWEEN 0 AND 100)
+);
+```
+
+当检查表达式跨越多列时，必须使用表级约束：
+
+```sql
+CREATE TABLE shipments (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    shipped_at   DATE,
+    delivered_at DATE,
+    CONSTRAINT chk_dates CHECK (delivered_at IS NULL OR delivered_at >= shipped_at)
+);
+```
+
+## 强制执行 {#enforcement}
+
+MySQL 在 `INSERT` 和 `UPDATE` 时强制执行 `CHECK` 约束。违反约束会返回 `ERROR 3819 (HY000): Check constraint 'name' is violated.`：
+
+```sql
+INSERT INTO products (name, price, quantity) VALUES ('Widget', -5.00, 10);
+-- ERROR 3819 (HY000): Check constraint 'chk_price' is violated.
+```
+
+错误信息包含约束名称，这就是为约束命名值得多敲几个字的原因。
+
+`CHECK` 约束在 `DELETE` 时**不**求值。在把约束本身添加到现有表时也不会重新求值——向已有违反该约束的数据的表添加约束会立即失败。
+
+## 添加和删除约束 {#adding-and-removing-constraints}
+
+向现有表添加约束：
+
+```sql
+ALTER TABLE products
+ADD CONSTRAINT chk_name_length CHECK (CHAR_LENGTH(name) >= 2);
+```
+
+删除命名约束：
+
+```sql
+ALTER TABLE products DROP CHECK chk_price;
+-- or the SQL standard syntax:
+ALTER TABLE products DROP CONSTRAINT chk_price;
+```
+
+列出表上的所有约束：
+
+```sql
+SELECT cc.constraint_name, cc.check_clause
+FROM information_schema.check_constraints cc
+JOIN information_schema.table_constraints tc
+    ON tc.constraint_schema = cc.constraint_schema
+   AND tc.constraint_name   = cc.constraint_name
+WHERE cc.constraint_schema = DATABASE()
+  AND tc.table_name = 'products';
+```
+
+## 禁用强制执行 {#disabling-enforcement}
+
+在不删除的情况下禁用特定约束：
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price NOT ENFORCED;
+```
+
+重新启用它：
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price ENFORCED;
+```
+
+`NOT ENFORCED` 在数据迁移期间很有用，此时您需要临时绕过验证。迁移完成后请重新启用强制执行。
+
+## CHECK、触发器与应用程序验证的比较 {#check-vs-triggers-vs-application-validation}
+
+| | CHECK 约束 | 触发器 | 应用程序代码 |
+|:--|:----------------|:--------|:-----------------|
+| 强制执行者 | MySQL（始终） | MySQL（始终） | 应用程序（仅当应用程序运行时） |
+| 性能 | 开销极低 | 逐行执行的开销 | 往返成本 |
+| 错误可见性 | 带约束名称的 SQL 错误 | 需要 SIGNAL 才能抛出错误 | 由应用程序定义 |
+| 跨列检查 | 是 | 是 | 是 |
+| 跨表检查 | 否 | 是（可以查询其他表） | 是 |
+| 复杂度 | 仅限简单表达式 | 任意 SQL 逻辑 | 任意代码 |
+
+对简单、自包含的规则使用 `CHECK`：有效范围、允许的值、非负数、日期顺序。当规则需要查询其他表时使用触发器。对涉及外部状态的规则（速率限制、可用性检查）使用应用程序验证。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### CHECK 约束适用于所有存储引擎吗？ {#do-check-constraints-work-on-all-storage-engines}
+
+适用。与某些 MySQL 功能不同，`CHECK` 约束适用于 InnoDB、MyISAM 和其他存储引擎。但是，MyISAM 表可以定义语法上有效的约束，而该存储引擎没有回滚功能，因此 MyISAM 上失败的约束可能留下部分数据。InnoDB 通过完整回滚干净地处理违规。
+
+#### CHECK 约束可以引用其他表吗？ {#can-check-constraints-reference-other-tables}
+
+不可以。`CHECK` 表达式仅限于当前表的当前行。`CHECK` 表达式中不允许子查询、存储函数和对其他表的引用。跨表验证请使用触发器。
+
+#### MySQL 一直都有 CHECK 约束吗？ {#were-check-constraints-always-in-mysql}
+
+旧版 MySQL 接受这种语法，但约束被静默忽略。如果您从旧模式迁移，请验证现有的 `CHECK` 子句是否有效，并且包含您希望强制执行的规则。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 3819: Check constraint violated` | INSERT 或 UPDATE 的值未通过约束——查看错误中的约束名称以确定违反了哪条规则 |
+| `ALTER TABLE ADD CONSTRAINT` 立即失败 | 表中的现有行违反了该约束——先修复数据，或在迁移期间使用 `NOT ENFORCED` |
+| 定义了 CHECK 约束但未被强制执行 | 运行的是早于强制执行的旧版 MySQL——升级或使用触发器 |
+| 无法删除约束 | 在 `DROP CHECK` 或 `DROP CONSTRAINT` 中使用约束名称（而不是列名称） |
+| 约束名称未知 | 查询 `information_schema.check_constraints` 以找到该表的约束名称 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的规范化](/zh/guides/normalization)——CHECK 约束所补充的模式设计
+- [MySQL 触发器](/zh/guides/triggers)——用于复杂验证的 CHECK 约束替代方案
+- [MySQL 中的 NULL](/zh/guides/null-in-mysql)——CHECK 约束与 NULL 之间不太直观的交互

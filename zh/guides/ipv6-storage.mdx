@@ -1,0 +1,161 @@
+---
+title: "在 MySQL 中存储 IPv6"
+sidebarTitle: "存储 IPv6 地址"
+description: "如何在 MySQL 中存储 IPv6 地址——使用 VARBINARY(16) 与 INET6_ATON，以及 VillageSQL 的 INET 类型如何在一个统一的列中处理 IPv4 和 IPv6。"
+keywords: "mysql ipv6 storage, mysql inet6_aton, mysql ipv6 column, mysql store ipv6 address, mysql ipv4 ipv6 unified, mysql varbinary ipv6"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+IPv4 可以放进一个 4 字节整数。IPv6 有 128 位，需要 16 字节的二进制存储。MySQL 为此提供了 `INET6_ATON()` 和 `INET6_NTOA()`，它们是可用的——但在一个列中混合 IPv4 和 IPv6 需要额外小心。VillageSQL 的 `INET` 类型在一个列中存储两个地址族，并提供一致的 API。
+
+## MySQL 的 IPv6 方案：VARBINARY(16) {#mysqls-ipv6-approach-varbinary16}
+
+MySQL 提供 `INET6_ATON()` 和 `INET6_NTOA()` 用于二进制 IPv6 存储。`INET6_ATON()` 同时处理 IPv4 和 IPv6：
+
+```sql
+SELECT HEX(INET6_ATON('192.168.1.5'));      -- Returns 4-byte IPv4
+SELECT HEX(INET6_ATON('2001:db8::1'));      -- Returns 16-byte IPv6
+SELECT LENGTH(INET6_ATON('192.168.1.5'));   -- Returns 4
+SELECT LENGTH(INET6_ATON('2001:db8::1'));   -- Returns 16
+```
+
+在一个列中存储两个地址族：
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address VARBINARY(16),     -- 4 bytes for IPv4, 16 bytes for IPv6
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (INET6_ATON('192.168.1.5')),
+    (INET6_ATON('2001:db8::1'));
+
+SELECT INET6_NTOA(ip_address), accessed_at FROM access_log;
+```
+
+`INET6_NTOA()` 以点分十进制返回 IPv4，以压缩写法返回 IPv6。`VARBINARY(16)` 列可以同时容纳两者。这是标准方案，而且是可用的。
+
+麻烦在于那些需要知道某一行属于哪个地址族的操作：
+
+```sql
+-- Filter only IPv6
+SELECT INET6_NTOA(ip_address) FROM access_log
+WHERE LENGTH(ip_address) = 16;
+
+-- Under MySQL 8.4's default strict mode this raises ERROR 1411 and the row is
+-- rejected. A bare SELECT INET6_ATON('not-an-ip') returns NULL with a warning.
+INSERT INTO access_log (ip_address) VALUES (INET6_ATON('not-an-ip'));
+```
+
+没有内置的方法可以从 `VARBINARY` 列中提取前缀长度、网络掩码或网络地址。
+
+## 使用 VillageSQL：统一的 INET 类型 {#with-villagesql-unified-inet-type}
+
+VillageSQL 的 `vsql_network_address` 扩展提供了一个 `INET` 类型，原生存储 IPv4 和 IPv6。同样的函数对两个地址族都适用——不需要长度检查，也不需要单独的代码路径。
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.5')),
+    (inet_from_string('2001:db8::1')),
+    (inet_from_string('::1')),            -- IPv6 loopback
+    (inet_from_string('fe80::1'));        -- link-local
+
+SELECT inet_to_string(ip_address), inet_family(ip_address) AS family
+FROM access_log;
+```
+
+### 专门处理 IPv6 {#working-with-ipv6-specifically}
+
+IPv6 地址以展开写法存储和读取：
+
+```sql
+-- Compressed input → expanded storage
+SELECT inet_to_string(inet_from_string('2001:db8::1'));
+-- Returns: 2001:0db8:0000:0000:0000:0000:0000:0001
+
+-- Extract just the address without prefix
+SELECT inet_host(inet_from_string('2001:db8::1/64'));
+-- Returns: 2001:0db8:0000:0000:0000:0000:0000:0001
+
+-- Get prefix length
+SELECT inet_masklen(inet_from_string('2001:db8::1/64'));
+-- Returns: 64
+
+-- Get network address
+SELECT cidr_to_string(inet_network(inet_from_string('2001:db8::1/64')));
+-- Returns: 2001:0db8:0000:0000:0000:0000:0000:0000/64
+
+-- Get netmask
+SELECT inet_to_string(inet_netmask(inet_from_string('2001:db8::1/64')));
+-- Returns: ffff:ffff:ffff:ffff:0000:0000:0000:0000
+```
+
+### 按地址族筛选 {#filtering-by-address-family}
+
+```sql
+-- Only IPv6 connections
+SELECT inet_to_string(ip_address), accessed_at
+FROM access_log
+WHERE inet_family(ip_address) = 6;
+
+-- Only IPv4 connections
+SELECT inet_to_string(ip_address), accessed_at
+FROM access_log
+WHERE inet_family(ip_address) = 4;
+```
+
+## MySQL 与 VillageSQL 的 IPv6 对比 {#mysql-vs-villagesql-for-ipv6}
+
+| 方案 | 存储 IPv6 | 地址族检测 | 前缀支持 | 插入时验证 |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(45)` | 是 | 手动字符串检查 | 否 | 否 |
+| `VARBINARY(16)` + `INET6_ATON` | 是 | `LENGTH() = 16` | 否 | 否（输入错误时返回 NULL） |
+| `INET`（VillageSQL） | 是 | `inet_family() = 6` | 是 | 是 |
+
+## 常见问题 {#frequently-asked-questions}
+
+#### INET 类型是否以 IPv4 映射的 IPv6 格式（::ffff:x.x.x.x）存储 IPv4？ {#does-the-inet-type-store-ipv4-in-ipv4-mapped-ipv6-format-ffffxxxx}
+
+否——IPv4 地址以原生 IPv4 存储，而不是 IPv4 映射的 IPv6。无论 IPv4 地址以何种写法写入，`inet_family()` 都返回 `4`。
+
+#### INET 是否能处理 ::1 这样的 IPv6 压缩写法？ {#does-inet-handle-ipv6-compressed-notation-like-1}
+
+是。`inet_from_string('::1')` 和 `inet_from_string('fe80::1')` 都能正确解析。输入时接受压缩写法；输出始终是展开形式。
+
+#### 我可以为 INET 列建立索引以加快查找吗？ {#can-i-index-an-inet-column-for-fast-lookups}
+
+可以——`CREATE INDEX idx_ip ON access_log(ip_address)` 是可用的。等值查找和范围扫描（用于子网查询）都会使用该索引。相关模式请参阅 [在 MySQL 中按子网查询](/zh/guides/subnet-queries)。
+
+#### VARBINARY(16) + INET6_ATON 是错误的做法吗？ {#is-varbinary16--inet6_aton-wrong}
+
+不是——它是仅使用 MySQL 时的正确方案。它比 INET 更紧凑（4 或 16 字节，而 INET 固定为 19 字节），但您会失去内置的地址族检测、前缀处理和验证。对于需要同时处理 IPv4 和 IPv6 并进行前缀相关操作的架构，`INET` 更为顺手。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.inet_from_string does not exist` | 运行 `INSTALL EXTENSION vsql_network_address` |
+| IPv6 地址以展开形式显示 | 符合预期——`2001:db8::1` 存储为 `2001:0db8:0000:0000:0000:0000:0000:0001` |
+| `inet_from_string()` 对有效的 IPv6 返回 NULL | 检查拼写错误；尝试以展开形式输入该地址以定位问题 |
+| `INET6_ATON` 返回的值与 `inet_from_string` 不同 | 底层二进制的大小不同（4 或 16 字节，而 INET 固定为 19 字节）；它们不可互换 |
+
+## 另请参阅 {#see-also}
+
+- [在 MySQL 中存储 IP 地址](/zh/guides/storing-ip-addresses) — 使用 INET 处理 IPv4/IPv6 的完整说明
+- [在 MySQL 中按子网查询](/zh/guides/subnet-queries) — 使用 INET 类型进行子网范围查询
+- [在 MySQL 中存储 MAC 地址](/zh/guides/storing-mac-addresses) — 来自同一扩展的 MACADDR 类型

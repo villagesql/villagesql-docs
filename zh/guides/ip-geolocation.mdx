@@ -1,0 +1,209 @@
+---
+title: "在 MySQL 中按 IP 进行地理定位查找"
+sidebarTitle: "查找 IP 地理位置"
+description: "如何在 MySQL 中进行 IP 地理定位查找——导入 MaxMind GeoLite2 或基于 API 的数据源、按 IP 范围查询国家和地区、准确性权衡，以及使用 VillageSQL 的 INET 类型统一进行 IPv4/IPv6 查找。"
+keywords: "mysql ip geolocation, mysql geoip database, mysql maxmind, mysql ip country lookup, mysql ip range query, mysql geolite2, ip geolocation accuracy mysql, mysql ip lookup without plugin, mysql ipv6 geolocation, ip-api mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 中的 IP 地理定位的工作方式是：导入一个把 IP 范围映射到位置的数据库，然后用范围检查查询它。标准做法把 IP 范围存储为整数并使用 `BETWEEN`。VillageSQL 的 `INET` 类型让 schema 更具表达力，并在同一张表中处理 IPv4 和 IPv6。
+
+## IP 地理定位的工作原理 {#how-ip-geolocation-works}
+
+没有任何 MySQL 函数能把 IP 映射到国家。地理定位是一个查找问题：您有一张 IP 范围表——每一行说“从 X 到 Y 的地址在国家 Z”——然后您找出哪个范围包含传入的 IP。
+
+像 MaxMind GeoLite2 这样的免费数据库以 CSV 文件的形式提供这些范围，供您导入 MySQL。
+
+## 标准做法：整数范围 {#the-standard-approach-integer-ranges}
+
+MaxMind GeoLite2（以及类似的数据库）提供的 `network` 是 CIDR 字符串，并以整数形式提供每个范围的起止值。整数做法紧凑且对索引友好：
+
+```sql
+CREATE TABLE geoip_ranges (
+    start_ip   INT UNSIGNED NOT NULL,
+    end_ip     INT UNSIGNED NOT NULL,
+    country    CHAR(2),
+    INDEX idx_start (start_ip),
+    INDEX idx_end   (end_ip)
+);
+
+-- Import from GeoLite2-Country-Blocks-IPv4.csv after converting to int ranges
+-- Then query:
+SELECT country FROM geoip_ranges
+WHERE INET_ATON('203.0.113.45') BETWEEN start_ip AND end_ip
+LIMIT 1;
+```
+
+这很快——`start_ip` 上的索引使范围扫描高效。局限是它只适用于 IPv4。IPv6 需要一张单独的表（使用 `VARBINARY(16)` 范围）。
+
+## 使用 VillageSQL：用 INET 统一 IPv4/IPv6 {#with-villagesql-unified-ipv4ipv6-with-inet}
+
+VillageSQL 的 `INET` 类型以自然的顺序存储 IPv4 和 IPv6 地址，因此您可以用一张表同时存放两个地址族。`inet_compare()` 在范围检查中取代 `BETWEEN`。
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE geoip_ranges (
+    start_ip   INET NOT NULL,
+    end_ip     INET NOT NULL,
+    country    CHAR(2),
+    region     VARCHAR(100),
+    INDEX idx_start (start_ip)
+);
+
+-- Import IPv4 ranges
+INSERT INTO geoip_ranges (start_ip, end_ip, country) VALUES
+    (inet_from_string('203.0.113.0'), inet_from_string('203.0.113.255'), 'US'),
+    (inet_from_string('198.51.100.0'), inet_from_string('198.51.100.255'), 'DE');
+
+-- Import IPv6 ranges in the same table
+INSERT INTO geoip_ranges (start_ip, end_ip, country) VALUES
+    (inet_from_string('2001:db8::'), inet_from_string('2001:db8::ffff'), 'US');
+
+-- Look up a country for an IPv4 address
+SELECT country, region FROM geoip_ranges
+WHERE inet_compare(inet_from_string('203.0.113.45'), start_ip) >= 0
+  AND inet_compare(inet_from_string('203.0.113.45'), end_ip)   <= 0
+LIMIT 1;
+
+-- Same query works for IPv6
+SELECT country FROM geoip_ranges
+WHERE inet_compare(inet_from_string('2001:db8::42'), start_ip) >= 0
+  AND inet_compare(inet_from_string('2001:db8::42'), end_ip)   <= 0
+LIMIT 1;
+```
+
+### 按 CIDR 网络存储（替代 schema） {#storing-by-cidr-network-alternative-schema}
+
+如果您的 GeoIP 数据提供的是 CIDR 块而不是起止对，请为网络列使用 `CIDR`，并通过子网查询判断包含关系：
+
+```sql
+CREATE TABLE geoip_cidrs (
+    network    CIDR NOT NULL,
+    country    CHAR(2),
+    INDEX idx_network (network)
+);
+
+INSERT INTO geoip_cidrs (network, country) VALUES
+    (cidr_from_string('203.0.113.0/24'), 'US'),
+    (cidr_from_string('198.51.100.0/24'), 'DE');
+
+-- Look up by subnet match
+SELECT country FROM geoip_cidrs
+WHERE cidr_to_string(inet_network(inet_set_masklen(
+    inet_from_string('203.0.113.45'),
+    inet_masklen(inet_from_string(cidr_to_string(network)))
+))) = cidr_to_string(network)
+LIMIT 1;
+```
+
+## 选择方法 {#choosing-an-approach}
+
+| 方法 | IPv6 | Schema | 性能 |
+|:---|:---|:---|:---|
+| `INT UNSIGNED` 范围 + `BETWEEN` | 否（单独的表） | 两张独立的 IPv4/IPv6 表 | 快——整数索引范围扫描 |
+| `INET` 范围 + `inet_compare` | 是（统一） | 一张表存放两者 | 良好——在 `start_ip` 上有索引 |
+| `CIDR` 网络 + 子网匹配 | 是（统一） | 一张表 | 较慢——逐行计算网络 |
+
+对于纯 IPv4 和最高的查询速度，`INT UNSIGNED` + `BETWEEN` 做法很难被超越。对于需要在一张表中同时处理 IPv4 和 IPv6 的 schema，`INET` 配合 `inet_compare` 更简洁，并且避免维护两张平行的表。
+
+## 比较地理定位数据源 {#comparing-geolocation-data-sources}
+
+查询 schema 只是决策的一半——数据源决定了准确性、新鲜度和成本。以下是常见选项的比较：
+
+| 数据源 | 国家级准确率 | 城市级准确率 | 延迟 | 成本 | MySQL 集成 |
+|:---|:---|:---|:---|:---|:---|
+| MaxMind GeoLite2（免费） | ~98% | ~80% | 进程内（SQL 或 `.mmdb`） | 免费，需注册 | 导入 CSV；每周更新 |
+| MaxMind GeoIP2（付费） | ~99.8% | ~85–90% | 进程内 | 每月 $20 起 | 与 GeoLite2 相同的导入流程 |
+| ip-api.com（免费层） | ~99% | ~83% | HTTP，~30–100 ms | 免费（45 请求/分钟）；付费去除限制 | 应用层 HTTP 调用；结果存入 MySQL |
+| ip-api.com（专业版） | ~99% | ~83% | HTTP，~30–100 ms | 每月 $15 起 | 相同；HTTPS + 无速率限制 |
+| ipinfo.io | ~99% | ~85% | HTTP，~30–100 ms | 免费（5 万请求/月）；超出部分为付费层 | 应用层；结果可缓存在 MySQL 中 |
+
+**国家级准确率**数字由提供商自行报告，并因地区而异——在所有数据源中，亚太和拉美地区的覆盖率往往低于北美和欧洲。
+
+**如何选择**：MaxMind GeoLite2 是标准的起点——它免费，以平面文件的形式提供，导入一次即可，并且查找完全在 MySQL 内部运行，没有外部依赖。对于生产环境中的城市级准确率，GeoIP2 Precision 是升级路径。基于 API 的数据源（ip-api.com、ipinfo.io）对低流量使用很方便，但会给每次查找增加 HTTP 延迟和速率限制的约束。
+
+## 何时使用每种方法 {#when-to-use-each-approach}
+
+| 场景 | 推荐方法 |
+|:---|:---|
+| 对已存储的访问日志做批量分析 | MySQL 中的 GeoLite2——直接在 SQL 中联接 |
+| 对每个 HTTP 请求做实时查找（高流量） | 应用程序代码中的 MaxMind `.mmdb` 读取器——无需 SQL 往返 |
+| 低流量场景的数据丰富（&lt;45 请求/分钟），无数据库导入开销 | 通过 HTTP 使用 ip-api.com 免费层 |
+| 仅 IPv4，最高查询速度 | `INT UNSIGNED` + `BETWEEN` 配合 GeoLite2 |
+| 一张表中同时存放 IPv4 + IPv6 | VillageSQL `INET` + `inet_compare` 配合 GeoLite2 |
+| 需要城市、ASN 或 ISP 数据 | GeoIP2 Precision（付费）或 ipinfo.io |
+| 隔离环境，无外部 API 调用 | MaxMind GeoLite2（本地导入） |
+| 无需设置的原型/测试 | ip-api.com 免费层 |
+
+## 导入 GeoLite2 数据 {#importing-geolite2-data}
+
+MaxMind GeoLite2（免费，需注册）提供 CSV 文件。对于基于范围的 schema：
+
+```sql
+-- After downloading GeoLite2-Country-Blocks-IPv4.csv
+-- Convert the network column to start/end ranges and load:
+LOAD DATA INFILE '/path/to/ipv4_ranges.csv'
+INTO TABLE geoip_ranges
+FIELDS TERMINATED BY ',' ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS
+(@start_ip_str, @end_ip_str, country)
+SET start_ip = inet_from_string(@start_ip_str),
+    end_ip   = inet_from_string(@end_ip_str);
+```
+
+MaxMind 还提供二进制的 `.mmdb` 格式，以及面向 Python、Node.js 和 Go 等语言的官方客户端库，在高流量场景下比 SQL 查找更快。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我应该在 MySQL 中还是在应用程序代码中做地理定位？ {#should-i-do-geolocation-in-mysql-or-in-application-code}
+
+对于高流量查找（每个 HTTP 请求），使用 MaxMind 的 `.mmdb` 读取器库在应用层做地理定位更快——在内存中二分查找，无需 SQL 往返。基于 SQL 的地理定位适合批量分析、报表查询，以及已经在 MySQL 中运行的数据流水线。
+
+#### 如何让 GeoIP 数据库保持最新？ {#how-do-i-keep-the-geoip-database-current}
+
+MaxMind 每周更新 GeoLite2。编写脚本定期下载，并对地理定位表执行 `TRUNCATE` + 重新加载。或者，使用 MaxMind 的 mmdbinspect 或刷新脚本应用增量更新。
+
+#### MySQL 中的 IP 地理定位有多准确？ {#how-accurate-is-ip-geolocation-in-mysql}
+
+准确性完全取决于数据源，而不是 MySQL schema。在国家级别，MaxMind GeoLite2（免费）对大约 98% 的 IPv4 地址是准确的。在城市级别，它降到 80% 左右。要获得更高的准确率，MaxMind 的付费产品 GeoIP2 Precision 达到约 99.8% 的国家级和约 85–90% 的城市级准确率。没有任何数据库是完美的——对于移动网络、VPN 和某些亚太地区的范围，准确率通常更低。MySQL 的查询方式对准确性没有影响；您得到的正是导入的数据所说的。
+
+#### MySQL 可以在没有插件或外部 API 的情况下查找 IP 地理位置吗？ {#can-mysql-look-up-ip-geolocation-without-a-plugin-or-external-api}
+
+可以。标准做法——也是本指南所介绍的——使用一个 GeoIP 数据库（例如 MaxMind GeoLite2），以整数范围的形式导入到普通的 MySQL 表中。查找是普通的 SQL `BETWEEN` 查询。没有插件，没有外部 API，查询时没有网络调用。唯一的依赖是导入并定期刷新来自 MaxMind 的平面 CSV 文件。VillageSQL 的 `vsql_network_address` 扩展添加了 `INET` 类型，让 IPv4/IPv6 的处理更简洁，但基本做法并不需要它。
+
+#### 我可以在一个查询中把地理定位和访问日志联接起来吗？ {#can-i-join-geolocation-with-my-access-logs-in-one-query}
+
+可以——这正是把 GeoIP 数据保存在 MySQL 中的主要原因之一：
+
+```sql
+SELECT
+    g.country,
+    COUNT(*) AS request_count
+FROM access_log a
+JOIN geoip_ranges g
+  ON inet_compare(a.ip_address, g.start_ip) >= 0
+ AND inet_compare(a.ip_address, g.end_ip)   <= 0
+GROUP BY g.country
+ORDER BY request_count DESC;
+```
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.inet_from_string does not exist` | 运行 `INSTALL EXTENSION vsql_network_address` |
+| 查找没有返回结果 | 检查该区块的 IP 范围是否已导入；试试 `SELECT COUNT(*) FROM geoip_ranges` |
+| 查找返回错误的国家 | GeoIP 数据库存在覆盖缺口——用 MaxMind 的网页查找工具核对 |
+| `LOAD DATA INFILE` 失败 | 检查 `secure_file_priv` 设置；或者改用应用程序端的批量插入 |
+
+## 另请参阅 {#see-also}
+
+- [在 MySQL 中存储 IP 地址](/zh/guides/storing-ip-addresses)——地理定位查询之前的高效 IP 存储
+- [在 MySQL 中按子网查询](/zh/guides/subnet-queries)——地理定位所基于的范围式 IP 查找

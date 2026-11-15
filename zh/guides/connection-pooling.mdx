@@ -1,0 +1,149 @@
+---
+title: "MySQL 连接池"
+sidebarTitle: "连接池"
+description: "MySQL 连接池的工作原理、持久连接为何对性能很重要，以及如何配置 ProxySQL 和应用级连接池。"
+keywords: "mysql connection pooling, mysql persistent connections, mysql max_connections, proxysql mysql, mysql connection limit, mysql too many connections, mysql pooler"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+打开一个 MySQL 连接需要时间——TCP 握手、身份验证、会话初始化。在负载之下，每个请求都打开和关闭连接的应用程序花在连接上的时间会比花在查询上的更多。连接池复用现有连接，而不是为每个请求创建新连接。
+
+## 为什么连接的开销很大 {#why-connections-are-expensive}
+
+每个 MySQL 连接都是服务器上的一个线程。建立连接时的开销包括：
+
+- TCP/TLS 握手
+- 身份验证（凭据检查、权限解析）
+- 会话变量初始化
+
+在繁忙的应用服务器上，这些开销会迅速累积。一个执行只需 1ms 的查询，如果算上连接建立，总耗时可能达到 10ms。
+
+```sql
+-- See how many connections are currently active
+SHOW STATUS LIKE 'Threads_connected';
+
+-- See the server's connection limit
+SHOW VARIABLES LIKE 'max_connections';
+
+-- See peak connections since last restart
+SHOW STATUS LIKE 'Max_used_connections';
+```
+
+## 应用级连接池 {#application-level-pooling}
+
+大多数应用框架和数据库驱动都内置了连接池。它们维护一组已打开的连接，并按需借给应用线程使用。
+
+**Node.js (mysql2)：**
+```javascript
+import mysql from 'mysql2/promise';
+
+const pool = mysql.createPool({
+  host: 'localhost',
+  user: 'app',
+  database: 'mydb',
+  waitForConnections: true,
+  connectionLimit: 10,       // max simultaneous connections
+  queueLimit: 0              // unlimited queue (0 = no limit)
+});
+
+// connection is returned to the pool automatically
+const [rows] = await pool.execute('SELECT * FROM orders WHERE id = ?', [42]);
+```
+
+**Python (SQLAlchemy)：**
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    'mysql+mysqlconnector://user:pass@localhost/mydb',
+    pool_size=10,        # persistent connections to keep open
+    max_overflow=5,      # extra connections allowed under peak load
+    pool_timeout=30,     # seconds to wait for a connection from the pool
+    pool_recycle=3600    # recycle connections after 1 hour (avoids stale connections)
+)
+```
+
+任何连接池的关键设置：
+- **pool size（池大小）**：维护多少个持久连接
+- **max overflow / queue（最大溢出/队列）**：在突发负载下允许多少个额外连接
+- **recycle / timeout（回收/超时）**：何时关闭并重新打开连接（防止连接因 MySQL 的 `wait_timeout` 而失效）
+
+## MySQL 的 wait_timeout 与失效连接 {#mysqls-wait_timeout-and-stale-connections}
+
+MySQL 会在 `wait_timeout` 秒后关闭空闲连接（默认值：28800 秒 / 8 小时）。这适用于非交互式连接——也就是应用连接池使用的那种连接。如果您的连接池持有连接的时间超过这个值，连接就会失效，下一次查询会失败并报错 `MySQL server has gone away`。
+
+```sql
+-- Check the server's idle connection timeout
+SHOW VARIABLES LIKE 'wait_timeout';
+```
+
+在连接池配置中修复它：将 `pool_recycle`（或等效设置）设为一个比 `wait_timeout` 更短的值。3600 秒（1 小时）是一个安全的默认值。
+
+## 用于多服务器部署的 ProxySQL {#proxysql-for-multi-server-setups}
+
+应用级连接池对单台服务器很有效。当您有副本或多台应用服务器时，像 ProxySQL 这样的专用代理位于应用程序和 MySQL 之间，在基础设施层面处理连接池。
+
+ProxySQL 的优势：
+- **查询路由**：将读操作发送到副本，将写操作发送到主库
+- **连接复用**：许多应用连接共享较少的 MySQL 连接
+- **故障转移**：当某台服务器宕机时重新路由流量
+
+基本的 ProxySQL 设置按查询前缀路由读写操作：
+
+```sql
+-- In ProxySQL admin interface
+-- Route SELECT queries to read hostgroup (replicas)
+INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup)
+VALUES (1, 1, '^SELECT', 2);
+
+-- All other queries go to write hostgroup (primary)
+INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup)
+VALUES (2, 1, '.*', 1);
+
+LOAD MYSQL QUERY RULES TO RUNTIME;
+SAVE MYSQL QUERY RULES TO DISK;
+```
+
+## 调整 max_connections {#tuning-max_connections}
+
+`max_connections` 设置服务器端的上限。每个连接都会消耗内存——基线大约为 1MB（即默认的 `thread_stack`），加上会话的其他静态缓冲区，再加上查询执行期间按需分配的额外内存（排序缓冲区、读取缓冲区、临时表）。在繁重的查询负载下，每个连接的开销可能达到数 MB。`max_connections` 设得太高会浪费内存；设得太低则会导致 `ERROR 1040 (08004): Too many connections`。
+
+```sql
+-- Increase max connections (requires SUPER privilege)
+SET GLOBAL max_connections = 500;
+```
+
+一个粗略的估算公式：`max_connections = (可用于连接的 RAM) / (每个连接的内存)`。监控 `Max_used_connections` 以了解实际峰值，然后将 `max_connections` 设置为比该值高 20–30%。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我的连接池应该有多少个连接？ {#how-many-connections-should-my-pool-have}
+
+从数据库服务器的 CPU 核心数开始，然后根据负载向上调整。I/O 密集型负载可以从多于 CPU 核心数的连接中受益；CPU 密集型负载则不能。HikariCP 的著名公式 `connections = (core_count * 2) + effective_spindle_count` 是为机械硬盘设计的——它不适用于 SSD。在现代基础设施上，请在峰值负载下用 `Threads_running` 测量您的实际并发度，并以此作为基线。
+
+#### `Threads_connected` 和 `Threads_running` 有什么区别？ {#whats-the-difference-between-threads_connected-and-threads_running}
+
+`Threads_connected` 统计所有打开的连接——包括闲置在连接池中的连接。`Threads_running` 统计此刻正在执行查询的连接。两者之差就是您的空闲连接数。对于一个健康的连接池来说，`Threads_connected` 较大而 `Threads_running` 较小是正常的。
+
+#### 我应该在 PHP 中使用持久连接吗？ {#should-i-use-persistent-connections-in-php}
+
+请避免。PHP 没有重置复用连接的机制——未关闭的事务、表锁、临时表和已更改的会话变量都会延续到下一个请求。这可能导致死锁、数据损坏和难以复现的错误。请改用正规的连接池（带连接池的 PDO，或 ProxySQL 之类的代理）。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 1040 (08004): Too many connections` | 增大 `max_connections`、减小池大小，或添加 ProxySQL |
+| `MySQL server has gone away` | 连接已失效——将 `pool_recycle` 设得比 `wait_timeout` 短 |
+| `Threads_connected` 很高但吞吐量很低 | 连接池过大——空闲连接消耗内存；减小池大小 |
+| 负载下连接延迟激增 | 连接池过小——请求排队等待连接；增大池大小或添加代理 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 慢查询日志](/zh/guides/slow-query-log) — 区分查询延迟和连接开销
+- [MySQL 复制基础](/zh/guides/replication-basics) — 跨主库和副本的连接池
+- [MySQL 中的只读副本](/zh/guides/read-replicas) — 读写分离时按角色设置连接池
+- [在 ORM 中使用 MySQL：Django、Rails 和 Prisma](/zh/guides/mysql-with-orms) — 每个 ORM 打开的连接池

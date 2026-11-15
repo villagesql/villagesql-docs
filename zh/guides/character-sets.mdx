@@ -1,0 +1,195 @@
+---
+title: "MySQL 字符集和排序规则"
+sidebarTitle: "选择字符集"
+description: "MySQL 字符集和排序规则的工作原理：utf8mb4 与 utf8 的对比、选择排序规则、在数据库和列级别设置字符集、排序行为，以及修复字符集问题。"
+keywords: "mysql character set, mysql collation, mysql utf8mb4, mysql utf8 vs utf8mb4, mysql charset, mysql unicode, mysql collation comparison, mysql set charset, mysql character encoding"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 的字符集控制字符串如何存储（哪些字节表示哪些字符）。排序规则控制字符串如何比较和排序。一开始就把这两项设置正确，可以避免日后难以修复的数据损坏和错误排序。
+
+## utf8mb4——正确的默认值 {#utf8mb4--the-right-default}
+
+始终使用 `utf8mb4`。MySQL 的 `utf8`（不带 `mb4`）是一种 3 字节编码，无法存储 4 字节的 Unicode 字符——其中包括表情符号、许多汉字和各种符号。`utf8mb4` 才是完整的 UTF-8 编码。
+
+```sql
+-- Verify your database is using utf8mb4
+SHOW CREATE DATABASE myapp;
+-- Should show: DEFAULT CHARACTER SET utf8mb4
+```
+
+如果您的旧数据库使用 `utf8`，迁移到 `utf8mb4` 需要转换数据库、表和列。
+
+### 字符集速查 {#character-set-quick-reference}
+
+| 字符集 | 适用场景 | 避免场景 | 选错后的迁移成本 |
+|:-------------|:---------|:-----------|:------------------------|
+| `utf8mb4` | 任何新模式——处理所有 Unicode，包括表情符号和现代 CJK 字符 | 新工作中绝不应避免 | 不适用——这就是正确的默认值 |
+| `utf8`（旧的 3 字节） | 绝不——保留它的唯一理由是您无法安排迁移窗口 | 存储表情符号、增补 CJK 字符或任何 4 字节 Unicode | 中等——`ALTER TABLE … CONVERT TO CHARACTER SET utf8mb4`；重建每个受影响的表 |
+| `latin1` | 旧模式中的单字节西欧文本；对于纯 ASCII 数据比 `utf8mb4` 略省存储 | 任何用户生成的内容、多语言数据或任何接触 Web 的内容 | 高——二进制安全的转换不是自动的；latin1 范围之外的数据会静默损坏 |
+| `binary` / `BLOB` | 原始字节——文件内容、加密哈希、打包的二进制格式 | 您要搜索、排序或显示的文本 | 低——`BINARY` 列没有字符集语义；转换为文本字符集需要应用程序级别的解码 |
+
+成本列说的是日后修正错误选择所需的工作量，而不是字符集本身的性能成本。`latin1` 是陷阱：它接受任何字节值而不报错，所以坏数据会悄悄进入，直到您尝试显示或转换时才暴露出来。
+
+## 排序规则 {#collations}
+
+排序规则决定排序顺序和比较行为。常见选择：
+
+| 排序规则 | 排序行为 | 区分大小写 | 区分重音 |
+|:----------|:-------------|:--------------|:----------------|
+| `utf8mb4_general_ci` | 近似的 Unicode 顺序 | 否 | 否 |
+| `utf8mb4_unicode_ci` | 完整的 Unicode 算法 | 否 | 否 |
+| `utf8mb4_0900_ai_ci` | Unicode 9.0，最准确 | 否 | 否 |
+| `utf8mb4_bin` | 二进制（逐字节） | 是 | 是 |
+| `utf8mb4_0900_as_cs` | Unicode 9.0 | 是 | 是 |
+
+`utf8mb4_0900_ai_ci` 是默认排序规则，也是最好的通用选择。它正确处理 Unicode，不区分大小写（`ci`），也不区分重音（`ai`）。只有在需要精确字节匹配时才使用 `utf8mb4_bin`。
+
+`ci` = 不区分大小写，`cs` = 区分大小写，`ai` = 不区分重音，`as` = 区分重音。
+
+## 设置字符集 {#setting-character-sets}
+
+**创建数据库时：**
+```sql
+CREATE DATABASE myapp
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_0900_ai_ci;
+```
+
+**创建表时：**
+```sql
+CREATE TABLE users (
+    id   INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+**在列级别（覆盖表的默认值）：**
+```sql
+CREATE TABLE products (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(100),
+    description TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+);
+```
+
+当某一列需要区分大小写的匹配，而表的其余部分使用不区分大小写时，列级字符集很有用。
+
+**更改列的字符集：**
+```sql
+ALTER TABLE users
+MODIFY name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+**转换整张表：**
+```sql
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+`CONVERT TO` 用一条语句更改每一列。它会重建表，因此耗时与表的大小成正比。
+
+## 检查字符集 {#checking-character-sets}
+
+```sql
+-- Database level
+SHOW CREATE DATABASE myapp;
+
+-- Table and column level
+SHOW CREATE TABLE users;
+
+-- Connection level
+SHOW VARIABLES LIKE 'character_set%';
+SHOW VARIABLES LIKE 'collation%';
+```
+
+在 `SHOW CREATE TABLE` 的输出中，没有显示字符集的列继承了表的默认值。
+
+## 连接字符集 {#connection-character-set}
+
+连接字符集控制 MySQL 期望从客户端收到的编码，以及用于字符串字面量的编码。请始终显式设置它：
+
+```sql
+SET NAMES utf8mb4;
+-- equivalent to:
+SET character_set_client = utf8mb4;
+SET character_set_results = utf8mb4;
+SET character_set_connection = utf8mb4;
+```
+
+当您在连接字符串中设置字符集时，大多数驱动程序会自动完成这一步。连接默认使用 `utf8mb4`，因此很少需要显式覆盖。
+
+## 排序规则对查询的影响 {#collation-effects-on-queries}
+
+排序规则影响 `WHERE`、`ORDER BY` 和唯一性：
+
+```sql
+-- utf8mb4_0900_ai_ci: these three are equal
+SELECT * FROM users WHERE name = 'alice';  -- matches Alice, ALICE, alice
+
+-- utf8mb4_bin: exact match only
+SELECT * FROM users WHERE name COLLATE utf8mb4_bin = 'alice';  -- only 'alice'
+```
+
+要用与列默认值不同的排序规则排序：
+
+```sql
+SELECT name FROM users ORDER BY name COLLATE utf8mb4_unicode_ci;
+```
+
+## 从 utf8 转换到 utf8mb4 {#converting-from-utf8-to-utf8mb4}
+
+如果您的旧数据库使用 `utf8`（3 字节），请转换它：
+
+```sql
+-- Convert one table
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+-- Update the database default
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+同时更新服务器配置，使 `utf8mb4` 成为新连接的默认值：
+
+```ini
+[mysqld]
+character_set_server = utf8mb4
+collation_server = utf8mb4_0900_ai_ci
+
+[client]
+default-character-set = utf8mb4
+```
+
+转换大表需要时间并会重建表。请安排在维护窗口期间进行，或使用在线模式变更工具。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 为什么 MySQL 中的 `utf8` 不支持表情符号？ {#why-does-utf8-in-mysql-not-support-emoji}
+
+MySQL 的 `utf8` 是 UTF-8 的一个非标准 3 字节子集，早于 4 字节的 Unicode 扩展。表情符号（以及许多其他现代 Unicode 字符）需要 4 个字节。`utf8mb4` 才是 UTF-8 的正确完整实现。旧的 `utf8` 别名仅为向后兼容而存在——切勿在新模式中使用它。
+
+#### 更改排序规则会影响现有数据吗？ {#does-changing-collation-affect-existing-data}
+
+更改排序规则不会改变存储的字节。它改变的是这些字节的比较和排序方式。但是，唯一索引是按排序规则强制执行的，因此从 `_bin` 改为 `_ci` 可能会暴露出必须先解决的冲突（`Alice` 和 `alice` 变得相等）。
+
+#### 我应该使用哪种排序规则？ {#which-collation-should-i-use}
+
+大多数情况下使用 `utf8mb4_0900_ai_ci`——它是默认排序规则，并且能很好地处理 Unicode。只有在需要精确字节匹配时才使用 `utf8mb4_bin`。新项目中请避免使用 `utf8mb4_general_ci`——它早于 `_0900_ai_ci`，并且对一些 Unicode 边缘情况的处理不正确。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 表情符号被存为 `????` | 列或连接正在使用 `utf8`（3 字节）——转换为 `utf8mb4` |
+| `Incorrect string value` 错误 | 插入的字符是该列的字符集无法编码的——把该列转换为 `utf8mb4` |
+| 排序顺序错误 | 排序规则不匹配——检查 `SHOW CREATE TABLE`，并在 `ORDER BY` 中设置显式的 `COLLATE` |
+| 区分大小写的比较不起作用 | 列使用的是 `_ci` 排序规则——在 WHERE 子句中使用 `COLLATE utf8mb4_bin`，或更改该列的排序规则 |
+| `Illegal mix of collations` 错误 | 比较的列或字面量使用了不同的排序规则——添加 `COLLATE` 使它们一致，或转换该列 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 字符串函数](/zh/guides/string-functions)——行为取决于排序规则的字符串函数
+- [MySQL 中的 utf8mb4：存储表情符号和完整 Unicode](/zh/guides/utf8mb4)——utf8 与 utf8mb4 的陷阱以及表情符号的存储
+- [MySQL 大小写敏感性](/zh/tutorial/case-sensitivity)——排序规则对比较结果的决定作用

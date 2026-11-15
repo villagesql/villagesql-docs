@@ -1,0 +1,230 @@
+---
+title: "MySQL 中的零停机模式变更"
+sidebarTitle: "零停机模式变更"
+description: "如何在不阻塞读写的情况下对线上 MySQL 表运行 ALTER TABLE，在线 DDL 何时无能为力，以及 gh-ost 如何填补这一空白。"
+keywords: "mysql zero downtime, mysql online ddl, alter table lock none, algorithm inplace, algorithm instant, gh-ost, mysql alter table blocking, mysql schema change production"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+在有实时流量的表上运行 `ALTER TABLE` 会引出一个问题：这条语句在运行时会阻塞应用程序吗？本指南在一张真实的表上直接测量这一点，并且全程有一个并发连接在观察。[MySQL 中的模式迁移](/zh/guides/schema-migrations)介绍了如何组织迁移文件并进行版本管理。本指南介绍的是，当其中一个迁移文件针对线上表运行时，这张表实际上会发生什么。
+
+## 测试设置 {#test-setup}
+
+本指南中的每个数字都来自同一张表：在本地 VillageSQL 服务器上加载了 3,276,802 行（168.7 MB 数据）的 `orders` 表。
+
+```sql
+CREATE TABLE orders (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  amount_cents INT NOT NULL,
+  created_at DATETIME NOT NULL
+) ENGINE=InnoDB;
+```
+
+行是用数字表交叉联接生成的，然后用针对自身的 `INSERT ... SELECT` 翻倍几次，达到几百万行。确切的大小对下面的结论并不重要，但这张表必须足够大，使得一次完整的表重建耗时超过几分之一秒，否则您无法观察到任何与之并发运行的操作。
+
+## 在线 ALTER 不会阻塞流量 {#an-online-alter-does-not-block-traffic}
+
+在上面这张 327 万行的表上，用 `ALGORITHM=INPLACE, LOCK=NONE` 添加一个二级索引：
+
+```sql
+ALTER TABLE orders ADD INDEX idx_customer_id (customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+从头到尾耗时 1.003 秒。在它运行期间，第二个连接上的 `SHOW PROCESSLIST` 显示它是一个真实的、正在进行中的操作：
+
+```
+Id   User  Host       db        Command  Time  State           Info
+325  root  localhost  zdt_demo  Query    0     altering table  ALTER TABLE orders ADD INDEX idx_customer_id (customer_id), ALGORITHM=INPLACE, LOCK=NONE
+```
+
+`information_schema.INNODB_TRX` 把同一张表上另一次单独的 `ADD INDEX` 显示为一个正在运行的事务：
+
+```
+trx_id: 6472
+trx_state: RUNNING
+trx_query: ALTER TABLE orders ADD INDEX idx_status (status), ALGORITHM=INPLACE, LOCK=NONE
+```
+
+在上面的 `ALTER` 仍处于 `altering table` 状态时打开第三个连接，从中针对同一张表运行的 `INSERT` 和 `SELECT` 都立即完成：
+
+```sql
+INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
+VALUES (999999, 'pending', 500, NOW(), 0, 0);
+-- 0.009s
+SELECT COUNT(*) FROM orders WHERE status='paid';
+-- 0.271s
+```
+
+两条语句都没有等待 `ALTER` 完成。这正是 `LOCK=NONE` 的全部意义：表重建在后台进行，使用 InnoDB 的在线 DDL 日志捕获并发变更，针对该表的 DML 继续在原有的数据结构上执行，直到重建追上进度并完成切换。
+
+## ALGORITHM=INSTANT 与 ALGORITHM=INPLACE {#algorithminstant-vs-algorithminplace}
+
+并非每个在线操作的代价都相同。用 `ALGORITHM=INSTANT` 在表末尾添加一列只会更改表的元数据；它从不读取或重写任何一行：
+
+```sql
+ALTER TABLE orders ADD COLUMN priority TINYINT NOT NULL DEFAULT 0, ALGORITHM=INSTANT;
+-- 0.011s
+```
+
+把同样形态的变更——添加一个带默认值的可空列——改为强制通过 `ALGORITHM=INPLACE` 执行：
+
+```sql
+ALTER TABLE orders ADD COLUMN priority2 TINYINT NOT NULL DEFAULT 0, ALGORITHM=INPLACE, LOCK=NONE;
+-- 0.244s
+```
+
+在这张 327 万行的表上，对于功能上相同的列添加，`INSTANT` 比 `INPLACE` 快了大约 20 倍。`INPLACE` 仍然需要触及表的数据字典条目，并与任何并发 DML 协调；`INSTANT` 两者都不需要。这个差距随表的大小而增长：`INSTANT` 的耗时与行数无关，保持恒定，而 `INPLACE` 随行数增长。
+
+`INSTANT` 并非对每个操作都可用。添加带 `BLOB`/`TEXT` 默认值的列，或更改现有列的类型，会回退到 `INPLACE` 或 `COPY`。在任意位置（包括表的中间）添加列也使用 `INSTANT`（MySQL 8.0.29+）。
+
+## 在线 DDL 无能为力时：列类型变更 {#when-online-ddl-cannot-help-a-column-type-change}
+
+并非每个 `ALTER TABLE` 都能避免锁。更改列的数据类型需要 MySQL 重写每一行，而 `INPLACE` 做不到这一点：
+
+```sql
+ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+```
+ERROR 1846 (0A000) at line 2: ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.
+```
+
+对同一变更请求 `ALGORITHM=INSTANT` 会以同样的方式失败，只是原因不同：
+
+```
+ERROR 1846 (0A000) at line 2: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table to change column type. Try ALGORITHM=COPY/INPLACE.
+```
+
+MySQL 对这条语句唯一接受的算法是 `COPY`，它会重建整张表，并在整个过程中持有排他锁。针对同一张表运行它，并在重建期间从第二个连接插入一行，直接展示了这种差别：
+
+```sql
+ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=COPY;
+-- 6.776s
+```
+
+在 `ALTER` 开始 0.3 秒后发出的并发 `INSERT`，直到 `ALTER` 接近完成时才返回：
+
+```sql
+INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
+VALUES (1, 'pending', 1, NOW(), 0, 0);
+-- 6.466s
+```
+
+在这段时间里，`SHOW PROCESSLIST` 显示 `ALTER` 处于 `copy to tmp table` 状态，而被阻塞的 `INSERT` 在它旁边处于 `Waiting for table metadata lock` 状态。这个状态就是诊断依据：它指出了被卡住的语句，并告诉您它是在锁后面排队，而不是运行得慢。对这同一条语句用 `LOCK=NONE` 尝试快速失败，正是让您在针对生产表运行它之前就知道，它将在重写期间一直阻塞写入者的方法。
+
+## 外键与在线 DDL {#foreign-keys-and-online-ddl}
+
+外键增加的限制与 `ALGORITHM` 和 `LOCK` 无关。在带有 `FOREIGN KEY (order_id) REFERENCES orders(id)` 的子表 `order_items` 上，普通的 `ADD COLUMN` 仍然能用 `ALGORITHM=INSTANT` 在毫秒内完成，即使表上带有外键也是如此。但有两个操作无论用什么算法都会直接失败：
+
+删除外键所依赖的父表主键：
+
+```sql
+ALTER TABLE orders DROP PRIMARY KEY, ADD PRIMARY KEY (id, customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+```
+ERROR 1553 (HY000) at line 2: Cannot drop index 'PRIMARY': needed in a foreign key constraint
+```
+
+脱离其引用的父表列，单独更改子表列的类型：
+
+```sql
+ALTER TABLE order_items MODIFY COLUMN order_id INT NOT NULL, ALGORITHM=COPY;
+```
+
+```
+ERROR 3780 (HY000) at line 2: Referencing column 'order_id' and referenced column 'id' in foreign key constraint 'fk_order' are incompatible.
+```
+
+这两个错误都发生在解析和验证阶段，早于 MySQL 选择算法。如果一次迁移需要更改涉及外键的列，就必须在同一次迁移中删除并重新创建该外键，并且父表列和子表列的类型在每一步都必须保持两边兼容。
+
+## 用 gh-ost 完成在线 DDL 无法安全完成的变更 {#gh-ost-for-changes-online-ddl-cannot-do-safely}
+
+上面的 `MODIFY COLUMN ... ALGORITHM=COPY` 就是在线 DDL 无能为力的情形：它需要完整的行重写，但您不想在线上表上持锁这么久。`gh-ost` 的处理方式是：用新模式构建该表的一个副本（"ghost" 表），然后在后台把现有行复制进去，同时通过流式读取二进制日志（而不是使用触发器）来重放复制期间对原表的每一次写入。最后用一次短暂的原子重命名完成切换。
+
+`gh-ost` 拒绝迁移被其他表以外键引用的表：上一节中的 `order_items` 表有一个 `FOREIGN KEY (order_id) REFERENCES orders(id)`，在该约束仍然存在的情况下针对 `orders` 运行 `gh-ost` 会立即失败，并报 `FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out`。在针对被其他表引用的表运行 `gh-ost` 之前，请先删除该外键（或传入 `--discard-foreign-keys`，它会替您删除外键且不会重新创建）。
+
+在删除了 `order_items` 的外键之后，正是为了这类变更，针对同一张 3,276,802 行的表安装并运行了 `gh-ost`：
+
+```bash
+# macOS
+brew install gh-ost
+
+# Linux (Debian/Ubuntu)
+curl -LO https://github.com/github/gh-ost/releases/latest/download/gh-ost.amd64.deb
+sudo dpkg -i gh-ost.amd64.deb
+```
+
+```bash
+gh-ost \
+  --user=root --password= \
+  --host=127.0.0.1 --port=3306 \
+  --database=zdt_demo --table=orders \
+  --alter="MODIFY COLUMN customer_id BIGINT NOT NULL" \
+  --allow-on-master \
+  --initially-drop-ghost-table \
+  --exact-rowcount \
+  --chunk-size=2000 \
+  --default-retries=5 \
+  --execute
+```
+
+使用真实密码时，请通过 `-conf` 文件传入，而不是在命令行上使用 `--password`——命令行上的密码可以被主机上的任何其他用户通过 `ps` 看到，并且会留在 shell 历史记录中。
+
+不带 `--execute` 时，`gh-ost` 以试运行模式运行：它连接、流式读取 binlog，并打印它将用于 ghost 表的 `CREATE TABLE` 语句，但不做任何更改。带上 `--execute` 后，它在 13.112 秒内完成了整个迁移，并在过程中打印进度：
+
+```
+Copy: 596000/3276802 18.2%; Applied: 0; Backlog: 1/1000; Time: 3s(total), 3s(copy); ...; ETA: 8s
+Copy: 1762000/3276802 53.8%; Applied: 0; Backlog: 0/1000; Time: 7s(total), 7s(copy); ...; ETA: 5s
+Copy: 3276802/3276802 100.0%; Applied: 0; Backlog: 0/1000; Time: 12s(total), 12s(copy); ...; ETA: due
+```
+
+在同一迁移的第二次运行开始三秒后，针对线上 `orders` 表的一条并发 `INSERT` 在 0.007 秒内返回，`gh-ost` 自己的进度行也确认它捕获并重放了这次写入（`Applied: 1`）：
+
+```
+Copy: 1812000/3276803 55.3%; Applied: 1; Backlog: 1/1000; Time: 7s(total), 7s(copy); ...
+```
+
+切换之后，`SHOW CREATE TABLE orders` 显示 `customer_id` 为 `bigint`，行数完全吻合（3,276,803，即原来的行数加上迁移期间插入的那一行），并且在迁移中途插入的那一行也带着正确的值存在。`gh-ost` 把原表重命名为 `_orders_del` 而不是删除它，因此迁移前的表仍然在那里，供您在确认切换后进行比较或手动删除。
+
+这次运行针对的是一台已经设置了 `binlog_format=ROW` 和 `log_bin=ON` 的独立服务器，`gh-ost` 需要这些设置来流式读取变更；它不适用于基于语句的复制。它还要求表有主键或唯一键。这里两者都不需要额外设置，因为它们是常见的默认值，但在依赖 `gh-ost` 处理一张您尚未检查过的表之前，请先确认这两点。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我如何提前知道 ALTER TABLE 会不会阻塞我的表？ {#how-do-i-know-in-advance-whether-an-alter-table-will-block-my-table}
+
+在运行语句之前给它加上 `ALGORITHM=INPLACE, LOCK=NONE`（或只加 `LOCK=NONE`）。如果 MySQL 能在不阻塞的情况下完成变更，它就会运行。如果不能，它会立即返回错误，而不是运行并阻塞。无论哪种情况，您都能得到一个明确的答案，无需猜测或阅读源代码。
+
+#### 为什么 ALGORITHM=INSTANT 在列类型变更时失败？ {#why-did-algorithminstant-fail-for-a-column-type-change}
+
+`INSTANT` 只在 MySQL 能把变更表达为纯元数据更新时才有效。更改列的存储类型意味着每一现有行的磁盘表示对新类型来说都是错的，这需要读取并重写各行。这排除了 `INSTANT`，而且专门对于类型变更，也排除了 `INPLACE`；只有 `COPY` 能做到。
+
+#### gh-ost 需要设置复制吗？ {#does-gh-ost-need-replication-set-up}
+
+不需要。它读取被迁移服务器的二进制日志，任何设置了 `binlog_format=ROW` 的服务器都会生成该日志，无论它是否有副本。`gh-ost` 也支持针对副本运行并在主库上切换，这对于非常大或非常热的表是更安全的模式，但那是一种部署选择，而不是让它运行起来的必要条件。
+
+#### gh-ost 完成后旧表会怎样？ {#what-happens-to-the-old-table-after-gh-ost-finishes}
+
+默认情况下，`gh-ost` 会给原表加上后缀重命名（在上面捕获的运行中是 `_del`），而不是删除它。它会一直留在模式中，不被使用，直到您自己删除它。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `ERROR 1846: ALGORITHM=INPLACE is not supported` | 该操作需要完整重写。在维护窗口中使用 `ALGORITHM=COPY`，或在线上表上使用 `gh-ost`/`pt-online-schema-change`。 |
+| `ERROR 1846: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table...` | 该变更不是纯元数据变更。先尝试 `ALGORITHM=INPLACE, LOCK=NONE`，如果也失败，再回退到 `COPY`。 |
+| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | 先删除引用它的外键，完成索引变更，然后重新创建外键。 |
+| `ERROR 3780: Referencing column ... and referenced column ... are incompatible` | 外键中的子表列和父表列必须保持类型兼容。同时更改两边，或在迁移期间删除外键。 |
+| 一个 `COPY` 算法的 `ALTER` 一直阻塞着写入者，看不到尽头 | 在 `SHOW PROCESSLIST` 中查看它的状态，在 `information_schema.INNODB_TRX` 中查看它已运行多久。如果无法接受等它结束，就终止它并改用 `gh-ost`。 |
+| `gh-ost` 拒绝启动 | 确认 `binlog_format=ROW`，并且目标表有主键或唯一键；两者都是必需的。 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的模式迁移](/zh/guides/schema-migrations)——组织并版本管理那些生成本指南所运行的 `ALTER TABLE` 语句的迁移文件
+- [理解 MySQL 索引](/zh/guides/mysql-indexes)——MySQL 在在线 `ADD INDEX` 期间构建的索引之后如何影响查询性能
+- [在 MySQL 中阅读 EXPLAIN 输出](/zh/guides/reading-explain)——在迁移完成后检查新添加的索引是否真的被使用

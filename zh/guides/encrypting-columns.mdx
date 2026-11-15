@@ -1,0 +1,141 @@
+---
+title: "在 MySQL 中加密列"
+sidebarTitle: "加密列"
+description: "如何在 MySQL 中加密敏感的列数据——为什么 MySQL 的 AES_ENCRYPT 使用不安全的默认模式，以及 VillageSQL 的 encrypt() 如何自动修复这一问题。"
+keywords: "mysql encrypt column, mysql AES_ENCRYPT secure, mysql column encryption, mysql encrypt PII, mysql aes cbc iv, mysql encrypt decrypt data"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 内置了 `AES_ENCRYPT()`。问题在于它的默认模式——`aes-128-ecb`——是不安全的。ECB 加密是确定性的：用同一个密钥加密同一段明文，总是产生同样的密文。看到您加密列的攻击者无需知道密钥就能发现重复的值。VillageSQL 的 `encrypt()` 自动使用带随机 IV 的 CBC 模式，所以相同的输入每次都产生不同的输出。
+
+## MySQL 的默认值：ECB 模式 {#the-mysql-default-ecb-mode}
+
+MySQL 的 `AES_ENCRYPT(data, key)` 默认使用 `aes-128-ecb`（`block_encryption_mode`）。ECB——电子密码本——独立加密每个块，没有任何随机性。两行相同的值会产生相同的密文：
+
+```sql
+-- These two rows will have identical encrypted values
+INSERT INTO users (email, ssn_enc)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'secretkey')),
+       ('bob@example.com',   AES_ENCRYPT('123-45-6789', 'secretkey'));
+
+-- An attacker can see that Alice and Bob have the same SSN
+-- without knowing the key or the plaintext
+SELECT HEX(ssn_enc) FROM users;
+```
+
+MySQL 8.0 允许您把 `block_encryption_mode` 改为使用 CBC，但那样您就必须自己管理 IV：生成它、把它与密文一起存储，并在每次调用 `AES_DECRYPT()` 时传回去。
+
+## 标准的变通方法：AES-CBC 配合手动 IV {#the-standard-workaround-manual-iv-with-aes-cbc}
+
+在 MySQL 中正确使用 CBC 模式需要显式地存储和传递 IV：
+
+```sql
+SET @@block_encryption_mode = 'aes-256-cbc';
+
+-- Must generate and store IV alongside ciphertext
+SET @iv = RANDOM_BYTES(16);
+INSERT INTO users (email, ssn_enc, ssn_iv)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'key', @iv), @iv);
+
+-- Must retrieve IV to decrypt
+SELECT AES_DECRYPT(ssn_enc, 'key', ssn_iv) AS ssn
+FROM users WHERE email = 'alice@example.com';
+```
+
+这是正确的，但很繁琐——每张表都需要一个额外的 IV 列，每个访问加密数据的查询都必须传递 IV。
+
+## 使用 VillageSQL：自动 IV 管理 {#with-villagesql-automatic-iv-management}
+
+VillageSQL 的 `vsql_crypto` 扩展添加了 `encrypt()` 和 `decrypt()`，它们自动处理 IV。每次调用都会重新生成 IV，并把它放在存储值中密文的前面。`decrypt()` 会提取它，您无需操心。
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+CREATE TABLE users (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    email   VARCHAR(255),
+    ssn_enc VARBINARY(255)   -- IV + ciphertext stored together
+);
+
+SET @key = 'my-32-byte-key-for-aes-256-here!';  -- 32 bytes → AES-256
+
+-- Same plaintext encrypts to different ciphertext every time
+INSERT INTO users (email, ssn_enc) VALUES
+    ('alice@example.com', encrypt('123-45-6789', @key, 'aes-256')),
+    ('bob@example.com',   encrypt('123-45-6789', @key, 'aes-256'));
+
+-- Decrypt in a SELECT
+SELECT email, CONVERT(decrypt(ssn_enc, @key, 'aes-256') USING utf8mb4) AS ssn FROM users;
+```
+
+没有 IV 列，查询中也没有 IV 参数。两行相同的 SSN 产生不同的密文——没有模式泄露。
+
+### 密钥长度 {#key-sizes}
+
+| 加密算法 | 密钥长度 | 何时使用 |
+|:---|:---|:---|
+| `'aes'` 或 `'aes-128'` | 16 字节 | 敏感度较低的数据、对性能敏感的负载 |
+| `'aes-192'` | 24 字节 | 中等安全性 |
+| `'aes-256'` | 32 字节 | PII、金融数据、任何受监管的数据——推荐的默认值 |
+
+比加密算法要求更短的密钥会引发 `ERROR 3200: VDF error in function 'encrypt': key too short for <cipher>: need N bytes, got M`——它不会被零填充。更长的密钥会被静默截断。请使用恰好 16、24 或 32 字节。
+
+### 存储什么 {#what-to-store}
+
+`VARBINARY` 列保存的是密文，前面加上了 IV（16 字节）。当明文长度恰好是 16 的倍数时，PKCS7 填充总是会添加一个完整的额外 AES 块（16 字节）——填充永远不会是零字节。所以安全的公式是明文长度 + 总共 32 字节（16 字节用于 IV，最多 16 字节用于填充）。为列留出余量：
+
+```sql
+-- For strings up to ~200 chars: VARBINARY(255) is sufficient
+-- For longer text: VARBINARY(500) or BLOB
+ssn_enc   VARBINARY(64),    -- SSNs, short codes
+addr_enc  VARBINARY(512),   -- Addresses, longer strings
+notes_enc BLOB              -- Free-form text
+```
+
+## 这不能覆盖的内容 {#what-this-doesnt-cover}
+
+SQL 中的列级加密保护静态数据，防范有数据库访问权限但没有密钥的人。它不能防范：
+
+- 持有密钥并查询解密数据的应用代码——攻破应用的攻击者两者都能得到
+- 对加密列进行过滤或排序的查询（不解密就无法 `WHERE ssn = ?`）
+
+对于可搜索加密或信封密钥管理（轮换密钥而无需重新加密所有数据），您需要在应用层增加额外的基础设施。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我应该把加密密钥存储在哪里？ {#where-should-i-store-the-encryption-key}
+
+不要存在数据库里。密钥应放在密钥管理服务（AWS Secrets Manager、HashiCorp Vault、GCP Secret Manager）或环境变量中，由应用程序在运行时加载。存储在它所加密的同一个数据库中的密钥不提供任何保护。
+
+#### 我能在加密列上搜索吗？ {#can-i-search-on-encrypted-columns}
+
+不能直接搜索。解密每一行来查找匹配项是全表扫描。常见模式：在加密列旁边存储该值的确定性哈希用于等值查找（用 `sha256(ssn)` 查找 SSN），或者在应用层解密并构建加密的搜索索引。
+
+#### 如果我丢失了密钥会怎样？ {#what-happens-if-i-lose-the-key}
+
+数据将无法恢复。请把密钥与数据库分开备份。考虑信封加密——用主密钥包裹数据密钥——这样您可以轮换主密钥而无需重新加密所有数据。
+
+#### 我能用 DEFAULT 表达式加密列吗？ {#can-i-encrypt-a-column-with-a-default-expression}
+
+目前不能。非确定性函数（由于随机 IV，`encrypt()` 属于此类）不能用在 DEFAULT 表达式中。请在每条 INSERT 中生成加密值。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.encrypt does not exist` | 运行 `INSTALL EXTENSION vsql_crypto` |
+| `decrypt()` 返回 NULL | 密文已损坏、密钥错误，或指定了错误的加密算法类型 |
+| 相同明文的加密值相同 | 您在使用 ECB 模式下的 MySQL `AES_ENCRYPT`——改用 `encrypt()` |
+| 列太小，放不下密文 | 给您的 VARBINARY 大小加上 32 字节（16 字节用于 IV + 最多 16 字节用于填充） |
+| 密钥长度错误 | AES-128 需要 16 字节，AES-192 需要 24 字节，AES-256 需要 32 字节——检查 `LENGTH(@key)` |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的对称加密](/zh/guides/symmetric-encryption) — 这背后的加密算法和密钥管理
+- [MySQL 中的密码哈希](/zh/guides/password-hashing) — 对于凭据，哈希比加密更好
+- [在 MySQL 中哈希数据](/zh/guides/hashing-data) — 不需要解密时的单向指纹

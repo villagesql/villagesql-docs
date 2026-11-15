@@ -1,0 +1,249 @@
+---
+title: "如何在 MySQL 中存储真正的布尔值"
+sidebarTitle: "布尔列"
+description: "如何使用 VillageSQL 的 vsql_boolean 扩展在 MySQL 中存储 true 和 false——为什么 TINYINT(1) 接受 5 和 -1，以及 STRICTBOOL 如何拒绝它们。"
+keywords: "mysql boolean, mysql tinyint 1 boolean, mysql bool column, mysql true false column, strictbool, vsql_boolean"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 没有布尔类型。`BOOL` 和 `BOOLEAN` 是 `TINYINT(1)` 的别名写法，而它可以存储一个字节能容纳的任何数字。该列存放 `5` 和 `-1` 与存放 `0` 和 `1` 一样轻松，并且原样返回。VillageSQL 的 `vsql_boolean` 扩展添加了一个 `STRICTBOOL` 列类型，它只保存两个值并拒绝其他一切。
+
+## TINYINT(1) 为什么会出问题 {#why-tinyint1-bites}
+
+下面是 MySQL 提供的列，插入了四行：
+
+```sql
+CREATE TABLE accounts_tinyint (id INT PRIMARY KEY, active BOOL);
+
+INSERT INTO accounts_tinyint VALUES (1, TRUE), (2, FALSE), (3, 5), (4, -1);
+
+SELECT id, active FROM accounts_tinyint;
+```
+
+```
++----+--------+
+| id | active |
++----+--------+
+|  1 |      1 |
+|  2 |      0 |
+|  3 |      5 |
+|  4 |     -1 |
++----+--------+
+```
+
+没有任何东西提出异议。现在用两种方式问同一个问题：
+
+```sql
+SELECT COUNT(*) AS rows_that_are_truthy FROM accounts_tinyint WHERE active;
+SELECT COUNT(*) AS matches_equals_true  FROM accounts_tinyint WHERE active = TRUE;
+```
+
+```
++----------------------+
+| rows_that_are_truthy |
++----------------------+
+|                    3 |
++----------------------+
++---------------------+
+| matches_equals_true |
++---------------------+
+|                   1 |
++---------------------+
+```
+
+三行为真值，一行等于 `TRUE`。两条查询看起来都正确，却互相矛盾，因为 `TRUE` 是字面量 `1`，而 `WHERE active` 测试的是任何非零值。存放 `5` 的那一行在一条查询下是活跃的，在另一条查询下是不活跃的。模式中没有任何东西阻止 `5` 被写入，所以这个矛盾要到后来才被发现——由一份对不上数的报表发现。
+
+## STRICTBOOL 列 {#the-strictbool-column}
+
+```sql
+INSTALL EXTENSION vsql_boolean;
+```
+
+```sql
+CREATE TABLE accounts (
+    id     INT PRIMARY KEY,
+    email  VARCHAR(64),
+    active STRICTBOOL NOT NULL DEFAULT 'false'
+);
+```
+
+该列接受字符串 `'true'`/`'false'`、`'t'`/`'f'`、`'yes'`/`'no'`、`'on'`/`'off'` 和 `'1'`/`'0'`，不区分大小写。请以字符串形式传入；裸数字会被拒绝。无论写入哪种拼写，返回的都是 `true` 或 `false`：
+
+```sql
+INSERT INTO accounts (id, email, active) VALUES
+    (1, 'ana@example.com',  'true'),
+    (2, 'ben@example.com',  'no'),
+    (3, 'cleo@example.com', 'on'),
+    (4, 'dev@example.com',  '0');
+
+INSERT INTO accounts (id, email) VALUES (5, 'eve@example.com');
+
+SELECT id, email, active FROM accounts;
+```
+
+```
++----+------------------+--------+
+| id | email            | active |
++----+------------------+--------+
+|  1 | ana@example.com  | true   |
+|  2 | ben@example.com  | false  |
+|  3 | cleo@example.com | true   |
+|  4 | dev@example.com  | false  |
+|  5 | eve@example.com  | false  |
++----+------------------+--------+
+```
+
+第 5 行没有提供值，取了列的默认值。任何不在接受拼写范围内的值都会在应该被拒绝的地方——插入时——被拒绝：
+
+```sql
+INSERT INTO accounts (id, email, active) VALUES (6, 'f@example.com', 'maybe');
+```
+
+```
+ERROR 1366 (HY000): Incorrect STRICTBOOL value: 'maybe' for column 'active' at row 1
+```
+
+按您写入时的方式过滤该值：
+
+```sql
+SELECT email FROM accounts WHERE active = 'true';
+```
+
+```
++------------------+
+| email            |
++------------------+
+| ana@example.com  |
+| cleo@example.com |
++------------------+
+```
+
+## 计数 {#counting}
+
+该类型附带两个聚合函数。`boolean_sum` 统计为真的行数，`boolean_avg` 给出它们所占的比例：
+
+```sql
+SELECT boolean_sum(active) AS active_accounts,
+       ROUND(boolean_avg(active), 2) AS active_share,
+       COUNT(*) AS total
+FROM accounts;
+```
+
+```
++-----------------+--------------+-------+
+| active_accounts | active_share | total |
++-----------------+--------------+-------+
+|               2 |          0.4 |     5 |
++-----------------+--------------+-------+
+```
+
+两个聚合函数都忽略 NULL，因此比例是在给出了回答的行上计算的：
+
+```sql
+CREATE TABLE survey (id INT PRIMARY KEY, agreed STRICTBOOL);
+INSERT INTO survey VALUES (1, 'true'), (2, 'false'), (3, NULL);
+
+SELECT boolean_sum(agreed) AS yes,
+       ROUND(boolean_avg(agreed), 2) AS share,
+       COUNT(*) AS rows_total
+FROM survey;
+```
+
+```
++------+-------+------------+
+| yes  | share | rows_total |
++------+-------+------------+
+|    1 |   0.5 |          3 |
++------+-------+------------+
+```
+
+两个回答中有一个"是"，比例为 0.5，而总行数为三行。如果您希望将 NULL 计为 false，请在查询中明确写出，而不是指望聚合函数替您假定。
+
+## 索引 {#indexing}
+
+`STRICTBOOL` 列可以像其他列一样建立索引：
+
+```sql
+CREATE INDEX idx_active ON accounts (active);
+```
+
+索引是否值得，还是那个老问题。只有当两个值中的一个很少见时，这种列才有选择性，例如账户表上的 `locked` 标志，几乎没有账户被锁定。
+
+## 迁移现有的列 {#migrating-an-existing-column}
+
+您不能就地转换 `TINYINT` 列。服务器会拒绝：
+
+```sql
+ALTER TABLE accounts_tinyint MODIFY active STRICTBOOL;
+```
+
+```
+ERROR 3219 (HY000): Cannot convert column 'active' to custom type 'STRICTBOOL'
+```
+
+请改为添加第二列并填充它：
+
+```sql
+ALTER TABLE accounts_tinyint ADD COLUMN active_bool STRICTBOOL NOT NULL DEFAULT 'false';
+
+UPDATE accounts_tinyint SET active_bool = 'true'  WHERE active <> 0;
+UPDATE accounts_tinyint SET active_bool = 'false' WHERE active = 0;
+
+SELECT id, active, active_bool FROM accounts_tinyint;
+```
+
+```
++----+--------+-------------+
+| id | active | active_bool |
++----+--------+-------------+
+|  1 |      1 | true        |
+|  2 |      0 | false       |
+|  3 |      5 | true        |
+|  4 |     -1 | true        |
++----+--------+-------------+
+```
+
+这两条语句各自赋了一个字面量。计算值的语句会被拒绝，因为 `STRICTBOOL` 列不接受字符串表达式：
+
+```sql
+UPDATE accounts_tinyint SET active_bool = IF(active <> 0, 'true', 'false');
+```
+
+```
+ERROR 3219 (HY000): Incorrect STRICTBOOL value: cannot implicitly cast string expression. Use explicit conversion for column 'active_bool' at row 1
+```
+
+错误信息要求的显式转换就是该类型自己的函数，所以用一条语句也可以完成：
+
+```sql
+UPDATE accounts_tinyint SET active_bool = STRICTBOOL::from_string(IF(active <> 0, 'true', 'false'));
+```
+
+迁移也是决定那些 `5` 和 `-1` 行含义的时机。上面把所有非零值都变成了 `true`，这与 `WHERE active` 的判断一致。如果您系统中的某份报表用的是 `active = 1`，它的结果就不同，而现在正是您发现这一点的时候。
+
+新列正确之后，删除旧列并重命名：
+
+```sql
+ALTER TABLE accounts_tinyint DROP COLUMN active;
+ALTER TABLE accounts_tinyint RENAME COLUMN active_bool TO active;
+```
+
+## 故障排除 {#troubleshooting}
+
+| 错误 | 修复 |
+|---|---|
+| `Incorrect STRICTBOOL value: '<value>'` | 该值不是接受的拼写之一。请使用带引号的 `'true'`/`'false'`、`'t'`/`'f'`、`'yes'`/`'no'`、`'on'`/`'off'` 或 `'1'`/`'0'` |
+| `Incorrect STRICTBOOL value: cannot implicitly cast string expression` | 右侧是计算得出的。请用 `STRICTBOOL::from_string(...)` 包裹它，或者为每种结果分别赋一个字面量 |
+| `Cannot convert column '<col>' to custom type 'STRICTBOOL'` | `ALTER ... MODIFY` 无法转换到该类型。请添加新列并填充它 |
+| `FUNCTION <db>.boolean_sum does not exist` | 运行 `INSTALL EXTENSION vsql_boolean` |
+| `NOT NULL` 列拒绝省略了它的插入 | 像上面的示例那样，为该列指定显式的 `DEFAULT` |
+
+## 另请参阅 {#see-also}
+
+- [vsql_boolean](/zh/extensions/vsql-boolean)——该扩展的参考页面，列出它添加的每个函数
+- [选择数据类型](/zh/guides/choosing-data-types)——更窄的列何时值得使用
+- [MySQL 中的 NULL](/zh/guides/null-in-mysql)——布尔聚合函数跳过的内容
+- [MySQL 中的 CHECK 约束](/zh/guides/check-constraints)——拒绝错误值的另一种方法

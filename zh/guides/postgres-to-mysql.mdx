@@ -1,0 +1,222 @@
+---
+title: "将 PostgreSQL 转换为 MySQL：迁移指南"
+sidebarTitle: "从 PostgreSQL 迁移"
+description: "如何将 PostgreSQL 数据库迁移到 MySQL：数据类型映射、AUTO_INCREMENT 与序列的对比、SQL 方言差异，以及需要避免的迁移陷阱。"
+keywords: "postgresql to mysql migration, postgres to mysql, mysql vs postgresql differences, mysql auto_increment vs sequence, mysql migration guide, convert postgresql schema to mysql, mysql dialect differences, convert postgresql to mysql, postgresql to mysql converter, convert postgres to mysql, migrate data from postgres to mysql, migrate postgres database to mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+PostgreSQL 和 MySQL 共享 ANSI SQL 语法，但在足够多的方面存在分歧，因此迁移需要仔细关注数据类型、默认行为和 SQL 方言差异。大部分工作是模式转换，以及修复依赖 PostgreSQL 特有功能的查询。
+
+本指南介绍从 PostgreSQL 迁移到 MySQL，这是迁移到 [VillageSQL](https://villagesql.com/install) 之类 MySQL 兼容服务器时的常见方向——VillageSQL 是一个开源的 MySQL 即插即用替代品，并在其之上添加了 PostgreSQL 风格的扩展框架。正因为有这个框架，本指南不仅涵盖您的模式和数据，还为您的 PostgreSQL 扩展安排了落脚之处；请参阅下面的[迁移您的扩展](#bringing-your-extensions)。如果您是反方向迁移数据，下面的类型映射和方言差异反过来同样适用，但迁移工具部分不适用。
+
+## 我应该使用哪种方法 {#which-approach-should-i-use}
+
+- **一次性切换**——使用 `pg_dump` 和 `LOAD DATA INFILE` 进行转储/恢复。请参阅下面的[迁移工具](#migration-tools)和[迁移方法](#migration-approach)。
+- **迁移期间源数据库需要保持在线并可写，或需要持续同步**——改为使用带 JDBC sink 连接器的 Debezium 进行持续复制，而不是一次性转储。
+
+## 迁移工具 {#migration-tools}
+
+**`pg_dump` + 手动模式转换**是主要路径，除了标准的 PostgreSQL 和 MySQL 客户端工具之外不需要任何东西：
+
+```bash
+# Schema only, plain SQL text
+pg_dump -s -f schema.sql mydb
+
+# Data only, as INSERT statements (portable, but slower to load than COPY)
+pg_dump -a --inserts -f data.sql mydb
+```
+
+`pg_dump` 的模式输出使用 PostgreSQL 语法（`SERIAL`、`BOOLEAN`、PostgreSQL 特有的 `CREATE TABLE` 子句），因此模式文件需要按照下面的类型映射表手动转换，才能在 MySQL 上运行。没有任何工具能在每种情况下都自动且正确地完成这种转换——请把它当作大多数迁移的默认路径。
+
+**带 JDBC sink 连接器的 Debezium**（[debezium.io](https://debezium.io)，Apache-2.0 许可证，积极维护中）读取 PostgreSQL 的预写日志，并通过 Kafka Connect 将变更流式传输到 MySQL，提供持续复制而不是一次性复制。当源数据库在迁移期间必须保持在线并可写，或者您需要的是持续同步而不是一次切换时，它是正确的工具。它需要一个运行中的 Kafka 和 Kafka Connect 集群，这比一次性迁移所需的基础设施多得多——对于单次切换，请改用 `pg_dump`。
+
+## 数据类型映射 {#data-type-mapping}
+
+| PostgreSQL 类型 | MySQL 等价类型 | 说明 |
+|:----------------|:----------------|:------|
+| `SERIAL` / `BIGSERIAL` | `INT AUTO_INCREMENT` / `BIGINT AUTO_INCREMENT` | MySQL 使用 AUTO_INCREMENT，而不是序列 |
+| `TEXT` | `TEXT` 或 `LONGTEXT` | MySQL 的 TEXT 限制为 65,535 字节；更大的值请使用 LONGTEXT |
+| `VARCHAR`（无长度限制） | 不支持 | MySQL 的 VARCHAR 需要指定长度；请改用 TEXT |
+| `BOOLEAN` | `TINYINT(1)` | MySQL 没有真正的布尔类型；采用 0/1 约定 |
+| `BYTEA` | `BLOB` 或 `LONGBLOB` | 二进制数据 |
+| `JSONB` | `JSON` | MySQL 的 JSON 以带校验的文本存储；没有 JSONB 二进制格式 |
+| `UUID` | `CHAR(36)` 或 `BINARY(16)` | 没有原生 UUID 类型；请参阅 [MySQL 中的 UUID](/zh/guides/uuids) |
+| `TIMESTAMP WITH TIME ZONE` | `DATETIME` + 显式时区处理 | MySQL 的 DATETIME 没有时区；请参阅[时间戳与时区](/zh/guides/timestamps-timezones) |
+| `NUMERIC` / `DECIMAL` | `DECIMAL(p,s)` | MySQL 中必须指定精度和小数位数 |
+| `ARRAY` | 不支持 | 规范化为子表 |
+| `HSTORE` | `JSON` | 键值对；在 MySQL 中使用 JSON |
+| `INTERVAL` | 不支持作为列类型 | 以 INT 存储秒数，或使用应用侧逻辑 |
+
+## 序列与 AUTO_INCREMENT {#sequences-vs-auto_increment}
+
+PostgreSQL 使用序列（独立的对象）来生成自增值。MySQL 使用 `AUTO_INCREMENT` 作为列属性：
+
+**PostgreSQL：**
+```sql
+CREATE SEQUENCE orders_id_seq;
+CREATE TABLE orders (
+    id INTEGER DEFAULT nextval('orders_id_seq') PRIMARY KEY
+);
+```
+
+**MySQL 等价写法：**
+```sql
+CREATE TABLE orders (
+    id INT AUTO_INCREMENT PRIMARY KEY
+);
+```
+
+在 MySQL 中获取最后插入的 ID：`SELECT LAST_INSERT_ID();`（等价于 PostgreSQL 的 `currval()` 或 `RETURNING id`）。
+
+## SQL 方言差异 {#sql-dialect-differences}
+
+**字符串连接：**
+```sql
+-- PostgreSQL
+SELECT first_name || ' ' || last_name FROM users;
+
+-- MySQL
+SELECT CONCAT(first_name, ' ', last_name) FROM users;
+```
+
+**字符串引号：**
+```sql
+-- PostgreSQL: double quotes for identifiers, single quotes for strings
+SELECT "first_name" FROM users WHERE status = 'active';
+
+-- MySQL: backticks for identifiers, single quotes for strings
+SELECT `first_name` FROM users WHERE status = 'active';
+```
+
+只有启用了 `ANSI_QUOTES` SQL 模式，MySQL 才接受用双引号括起的标识符。
+
+**ILIKE（不区分大小写的 LIKE）：**
+```sql
+-- PostgreSQL
+SELECT * FROM users WHERE name ILIKE '%alice%';
+
+-- MySQL (case-insensitive by default with ci collations)
+SELECT * FROM users WHERE name LIKE '%alice%';
+```
+
+在 `utf8mb4_0900_ai_ci`（MySQL 8.x 的默认值）或类似的 `_ci` 排序规则下，MySQL 的字符串比较默认不区分大小写。如果您需要区分大小写的匹配，请使用 `_bin` 排序规则。
+
+**RETURNING 子句：**
+```sql
+-- PostgreSQL
+INSERT INTO users (name) VALUES ('Alice') RETURNING id;
+
+-- MySQL (no RETURNING)
+INSERT INTO users (name) VALUES ('Alice');
+SELECT LAST_INSERT_ID();
+```
+
+**LIMIT / OFFSET：**
+```sql
+-- PostgreSQL
+SELECT * FROM orders LIMIT 10 OFFSET 20;
+
+-- MySQL (same syntax)
+SELECT * FROM orders LIMIT 10 OFFSET 20;
+-- or shorthand:
+SELECT * FROM orders LIMIT 20, 10;  -- LIMIT offset, count
+```
+
+**模式与数据库：**
+PostgreSQL 在一个数据库内使用模式（`mydb.public.orders`）。MySQL 把"模式"和"数据库"当作同义词——不存在数据库内的模式这一概念。PostgreSQL 所说的模式，在 MySQL 中就是数据库。
+
+**UNIQUE 索引中的 NULL 处理：**
+PostgreSQL 允许唯一列中存在多个 NULL 值（NULL 彼此不相等）。MySQL（InnoDB）同样允许唯一索引中存在多个 NULL——行为相同。
+
+**CTE：**
+MySQL 支持 CTE，包括递归 CTE。请参阅 [MySQL 公用表表达式](/zh/tutorial/cte)。
+
+**窗口函数：**
+MySQL 支持窗口函数。请参阅 [MySQL 中的窗口函数](/zh/guides/window-functions)。
+
+**存储过程和函数：**
+PostgreSQL 用 PL/pgSQL 编写过程逻辑，带有异常处理和丰富的控制流。MySQL 使用自己的过程式 SQL 方言，不支持 PL/pgSQL，并且在客户端工具中需要更改 `DELIMITER`，这样过程体内的分号才不会被解析为语句结束：
+
+```sql
+-- MySQL: a stored procedure with an OUT parameter
+DELIMITER ;;
+CREATE PROCEDURE total_orders(IN cust_id INT, OUT total INT)
+BEGIN
+    SELECT COUNT(*) INTO total FROM orders WHERE customer_id = cust_id;
+END;;
+DELIMITER ;
+
+CALL total_orders(1, @t);
+SELECT @t;
+```
+
+从 PL/pgSQL 到 MySQL 过程式语法没有自动转换——请逐个手动重写过程，并预计异常处理逻辑（`EXCEPTION WHEN ...` 块）需要最多的返工，因为 MySQL 的 `DECLARE ... HANDLER` 工作方式不同。请参阅 [MySQL 中的存储过程](/zh/guides/stored-procedures)。
+
+**标识符的大小写敏感性：**
+PostgreSQL 把不带引号的标识符折叠为小写，并把带引号的标识符（`"MyTable"`）视为区分大小写。MySQL 的规则不同：数据库名和表名是否区分大小写，取决于 `lower_case_table_names` 系统变量和底层文件系统，而不是引号。列名、索引名和存储例程名在查找时从不区分大小写，与平台无关。不要假设一个依赖区分大小写的 PostgreSQL 表名的模式在迁移后行为完全一致——请检查目标服务器上的 `lower_case_table_names`。
+
+## 没有 MySQL 等价物的功能 {#features-without-mysql-equivalents}
+
+一些 PostgreSQL 功能没有直接的等价物：
+
+| PostgreSQL 功能 | MySQL 中的情况 |
+|:-------------------|:----------------|
+| 数组作为列类型 | 规范化为子表 |
+| 表继承 | 不支持；使用独立的表 |
+| 自定义运算符 | 不支持 |
+| 完整的 `LISTEN`/`NOTIFY` | 不支持；使用应用侧轮询或消息队列 |
+| 部分索引（索引上的 `WHERE` 子句） | 不支持；使用生成列为子集建立索引 |
+| 物化视图 | 没有原生支持；用表 + 存储过程近似实现 |
+| 用于批量加载的 `COPY` 命令 | 使用 `LOAD DATA INFILE` 或 MySQL Shell 的 `loadDump` |
+
+## 迁移您的扩展 {#bringing-your-extensions}
+
+PostgreSQL 依靠 `pgcrypto`、`pg_trgm` 和 `uuid-ossp` 等扩展来提供其本身不附带的功能。原版 MySQL 没有等价的机制来添加这类功能——但 VillageSQL 有：VillageSQL 扩展框架（VEF）允许您使用 `INSTALL EXTENSION` 将自定义 SQL 函数和类型安装到服务器中。VillageSQL 的一些扩展正是上述 PostgreSQL 扩展的直接移植：
+
+| PostgreSQL 扩展 | VillageSQL 扩展 | 涵盖内容 |
+|:----------------------|:----------------------|:-------|
+| `pgcrypto` | `vsql_crypto` | 哈希、HMAC、AES 加密、密码哈希（仅 PBKDF2——bcrypt 哈希无法沿用）。请参阅[在 MySQL 中哈希数据](/zh/guides/hashing-data)。 |
+| `uuid-ossp` | `vsql_uuid` | 原生 UUID 列类型，以及 v1–v7 生成函数。请参阅 [MySQL 中的 UUID](/zh/guides/uuids)。 |
+| —（内置的 `inet`/`cidr`/`macaddr` 类型） | `vsql_network_address` | IPv4、IPv6 和 MAC 地址类型。请参阅[在 MySQL 中存储 IP 地址](/zh/guides/storing-ip-addresses)。 |
+| `pg_trgm` | `vsql_trgm` | 基于三元组的字符串相似度搜索。请参阅 [MySQL 中的三元组相似度](/zh/guides/trigram-similarity)。 |
+
+如果您的 PostgreSQL 数据库依赖此处未列出的扩展，它可能还没有 VillageSQL 等价物——在断定该功能彻底不可用之前，请先查看 VillageSQL 文档中的扩展目录。如果该依赖是您自己团队编写的自定义 PostgreSQL 扩展，VEF 同样是移植它的工具：[`vsql-extension-builder`](https://github.com/villagesql/villagesql-skills/tree/main/skills/vsql-extension-builder) 技能会引导 AI 编码代理在 VillageSQL 上重建自定义扩展，从需求分析一直到经过测试、附带文档的 `.veb` 包。
+
+## 迁移方法 {#migration-approach}
+
+1. **从 PostgreSQL 导出模式**（`pg_dump --schema-only`），并按照上面的类型映射手动转换每个表。
+2. **从 PostgreSQL 导出数据**为 CSV（`COPY table TO '/tmp/table.csv' CSV HEADER`）。
+3. **使用 `LOAD DATA INFILE` 或 `mysqlimport` 将数据加载**到 MySQL。
+4. **测试查询**——找出所有 PostgreSQL 特有的语法并重写。
+5. **验证行数和校验和**——对每个表执行 `SELECT COUNT(*)`；抽查关键行。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### MySQL 支持像 PostgreSQL 的 `ON CONFLICT` 那样的 `UPSERT` 吗？ {#does-mysql-support-upsert-like-postgresqls-on-conflict}
+
+支持，但语法不同。请参阅 [MySQL 中的 UPSERT](/zh/guides/upsert)。MySQL 的 `INSERT ... ON DUPLICATE KEY UPDATE` 和 `REPLACE INTO` 涵盖了与 PostgreSQL 的 `ON CONFLICT DO UPDATE` 和 `ON CONFLICT DO NOTHING` 相同的用例。
+
+#### 如何在 MySQL 中处理 PostgreSQL 的 `BOOLEAN` 列？ {#how-do-i-handle-postgresqls-boolean-columns-in-mysql}
+
+使用 `TINYINT(1)`。用 1 表示 true，0 表示 false。大多数 MySQL 客户端库和 ORM 会自动处理这一点，并将 TINYINT(1) 列呈现为布尔值。您也可以使用 `BIT(1)`，但 TINYINT(1) 得到的工具支持更广泛。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `||` 连接出现语法错误 | 替换为 `CONCAT()` |
+| `ILIKE` 无法识别 | 使用 `LIKE`（在 ci 排序规则下默认不区分大小写） |
+| 双引号标识符不起作用 | 启用 `ANSI_QUOTES` SQL 模式，或改用反引号 |
+| `RETURNING` 子句不起作用 | 在 INSERT 之后使用 `LAST_INSERT_ID()`；MySQL 没有等价物 |
+| `SERIAL` 的行为与 Postgres 不同 | MySQL 确实接受 `SERIAL`——它是 `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE` 的别名，比 Postgres 的 `SERIAL` 更宽，并带有隐式唯一键。要得到更窄的 Postgres 等价物，请显式使用 `INT AUTO_INCREMENT` |
+| 数组列失败 | 规范化为带外键的子表 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的模式迁移](/zh/guides/schema-migrations)——运行迁移所需的 DDL 变更
+- [选择 MySQL 数据类型](/zh/guides/choosing-data-types)——将 PostgreSQL 类型映射到 MySQL 等价类型
+- [MySQL 与 PostgreSQL：您应该选择哪一个？](/zh/guides/mysql-vs-postgresql)——迁移背后的逐项功能比较

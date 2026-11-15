@@ -1,0 +1,142 @@
+---
+title: "在 MySQL 中生成随机数据"
+sidebarTitle: "生成随机数据"
+description: "如何在 MySQL 中生成随机数据——加密安全的字节、随机 UUID 和测试数据——使用 RAND()、RANDOM_BYTES() 和 VillageSQL 的 gen_random_bytes()。"
+keywords: "mysql random data, mysql generate random bytes, mysql random uuid, mysql random token, mysql random test data, mysql gen_random_bytes"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 的 `RAND()` 生成伪随机数，用于打乱查询结果之类的用途。它不是加密安全的，而当您生成令牌、盐或 nonce 时，这一点很重要。`RANDOM_BYTES()` 填补了这个空缺，而 VillageSQL 的 `vsql_crypto` 扩展添加了 `gen_random_bytes()` 和 `gen_random_uuid()`，作为统一加密 API 的一部分。
+
+## MySQL 的随机函数 {#mysqls-random-functions}
+
+MySQL 提供两个用途截然不同的内置随机函数：
+
+**`RAND()`**——返回 0 到 1 之间的伪随机浮点数。速度快，适合非安全用途：随机化查询结果、加权采样、随机选取行。不是加密安全的。
+
+```sql
+-- Shuffle query results
+SELECT * FROM products ORDER BY RAND() LIMIT 10;
+
+-- Random integer in a range
+SELECT FLOOR(RAND() * 100) AS random_0_to_99;
+```
+
+**`RANDOM_BYTES(n)`**——以 `VARBINARY` 形式返回 `n` 个加密安全的随机字节。用于令牌、盐、nonce 和密钥。
+
+```sql
+-- 16-byte cryptographic token
+SELECT HEX(RANDOM_BYTES(16)) AS token;
+
+-- Use as a session token
+INSERT INTO sessions (token, user_id, expires_at)
+VALUES (RANDOM_BYTES(32), 42, NOW() + INTERVAL 7 DAY);
+```
+
+## 使用 VillageSQL：gen_random_bytes() 和 gen_random_uuid() {#with-villagesql-gen_random_bytes-and-gen_random_uuid}
+
+VillageSQL 的 `vsql_crypto` 扩展添加了 `gen_random_bytes()` 和 `gen_random_uuid()`，它们使用 OpenSSL 的 `RAND_bytes()`——与 `RANDOM_BYTES()` 相同的熵源。
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+选择它们而不是内置函数的主要原因是一致性：当您已经在使用 `vsql_crypto` 的 `digest()`、`hmac()` 或 `encrypt()` 时，把所有加密操作放在一个扩展中可以简化升级和审计。
+
+```sql
+-- Cryptographically secure random bytes
+SELECT HEX(gen_random_bytes(16)) AS token_hex;
+SELECT HEX(gen_random_bytes(32)) AS session_key;
+
+-- Verify length
+SELECT LENGTH(gen_random_bytes(24));  -- Returns 24
+
+-- Random UUID v4
+SELECT gen_random_uuid();
+-- Returns: 'de2ae351-fc1b-4182-b6a5-72d11a341dc3' (different every call)
+```
+
+### 生成测试数据 {#generating-test-data}
+
+随机函数在填充测试表时很有用：
+
+```sql
+-- Insert 1000 rows of test data. WITH RECURSIVE must immediately precede
+-- the SELECT it attaches to, so it goes after the INSERT's column list.
+INSERT INTO test_users (username, email, score, token)
+WITH RECURSIVE n AS (
+    SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 1000
+)
+SELECT
+    CONCAT('user_', i),
+    CONCAT('user', i, '@example.com'),
+    FLOOR(RAND() * 100),
+    gen_random_bytes(16)
+FROM n;
+```
+
+### 一次性令牌和邀请码 {#one-time-tokens-and-invite-codes}
+
+```sql
+CREATE TABLE invites (
+    token     VARBINARY(32) PRIMARY KEY,
+    email     VARCHAR(255),
+    used      TINYINT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO invites (token, email)
+VALUES (gen_random_bytes(32), 'newuser@example.com');
+
+-- Return token as hex for use in a URL
+SELECT HEX(token) AS invite_link, email FROM invites WHERE used = 0;
+```
+
+## 选择合适的函数 {#choosing-the-right-function}
+
+| 函数 | 输出 | 加密安全 | 适用场景 |
+|:---|:---|:---|:---|
+| `RAND()` | 0–1 的浮点数 | 否 | 打乱顺序、采样、加权选择 |
+| `FLOOR(RAND() * n)` | 0–(n-1) 的整数 | 否 | 测试数据的随机整数 |
+| `RANDOM_BYTES(n)` | VARBINARY | 是 | 令牌、nonce、盐——MySQL 内置 |
+| `gen_random_bytes(n)` | VARBINARY | 是 | 与 RANDOM_BYTES 相同，与 vsql_crypto API 统一 |
+| `gen_random_uuid()` | VARCHAR（UUID 字符串） | 是 | 字符串形式的 UUID v4——不需要 vsql_uuid |
+
+`RANDOM_BYTES()` 和 `gen_random_bytes()` 在功能上等价——两者返回相同质量的随机性。如果您已经在使用 `vsql_crypto`，请使用 `gen_random_bytes()` 以便把加密相关的函数集中在一处。如果您只需要随机字节而不需要别的，MySQL 的 `RANDOM_BYTES()` 就足够了。
+
+如果您需要带可排序变体（v7）和二进制存储的 UUID 类型，请使用 `vsql_uuid` 扩展而不是 `gen_random_uuid()`。完整的比较请参阅 [MySQL 中的 UUID](/zh/guides/uuids)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### RAND() 可以安全地用于生成令牌吗？ {#is-rand-safe-for-generating-tokens}
+
+不可以。`RAND()` 是一个由可预测状态播种的伪随机数生成器。它用于 `ORDER BY RAND()` 之类的非安全用途没有问题，但用 `RAND()` 生成的令牌理论上可以被预测。对任何涉及安全的用途，请使用 `RANDOM_BYTES()` 或 `gen_random_bytes()`。
+
+#### 一个安全令牌需要多少字节？ {#how-many-bytes-do-i-need-for-a-secure-token}
+
+32 字节（256 位）是会话令牌和 API 密钥的标准长度。16 字节（128 位）是实际安全的最低要求。保险起见，请使用 32 字节。
+
+#### 我可以把 gen_random_bytes() 用作 DEFAULT 吗？ {#can-i-use-gen_random_bytes-as-a-default}
+
+不可以。MySQL 本身允许在 DEFAULT 表达式中使用非确定性函数——`UUID()`、`RAND()` 和 `NOW()` 在那里都能用。`gen_random_bytes()` 被拒绝，是因为它是一个注册为非确定性的 VillageSQL 扩展函数，而无论 MySQL 本身允许什么，VEF 都会在 DEFAULT 表达式中阻止这类函数。请改为在每条 INSERT 语句中生成该值。
+
+#### gen_random_uuid() 和 vsql_uuid 的 UUID_V4() 有什么区别？ {#whats-the-difference-between-gen_random_uuid-and-uuid_v4-from-vsql_uuid}
+
+`gen_random_uuid()` 返回一个 `VARCHAR` 的 UUID 字符串。`vsql_uuid` 扩展的 `UUID_V4()` 返回原生 `UUID` 类型，采用 16 字节的二进制存储。如果您将 UUID 用作主键，请优先使用 `vsql_uuid` 的 `UUID_V4()` 或 `UUID_V7()`。当您只需要一个 UUID 字符串且不想安装另一个扩展时，请使用 `gen_random_uuid()`。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.gen_random_bytes does not exist` | 运行 `INSTALL EXTENSION vsql_crypto` |
+| 令牌看起来是连续的或可预测的 | 您可能用了 `RAND()` 而不是 `gen_random_bytes()` |
+| `gen_random_bytes()` 返回 NULL | 检查参数是否为正整数 |
+| `DEFAULT (gen_random_bytes(32))` 被拒绝 | MySQL 不允许非确定性的默认值——请在每条 INSERT 中生成 |
+
+## 另请参阅 {#see-also}
+
+- [在 MySQL 中进行密码哈希](/zh/guides/password-hashing)——将随机字节用作凭据存储的盐
+- [MySQL 中的 UUID](/zh/guides/uuids)——UUID v4 是加密随机性的常见用途

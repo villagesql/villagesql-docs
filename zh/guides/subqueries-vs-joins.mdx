@@ -1,0 +1,152 @@
+---
+title: "MySQL 中的子查询与 JOIN"
+sidebarTitle: "比较子查询与 JOIN"
+description: "在 MySQL 中何时使用子查询、何时使用 JOIN：相关子查询与非相关子查询、EXISTS 与 IN、性能差异，以及 MySQL 优化器如何处理每一种。"
+keywords: "mysql subquery vs join, mysql subquery performance, mysql semi join, mysql rewrite subquery as join, mysql subquery optimizer, mysql join or subquery faster"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+子查询和 JOIN 常常产生相同的结果。两者之间的选择影响可读性、对 NULL 的正确处理，以及在某些情况下的性能。
+
+## 子查询的类型 {#types-of-subqueries}
+
+**非相关子查询**只运行一次，其结果供外层查询使用：
+
+```sql
+-- Runs once: find all orders over the average amount
+SELECT id, amount
+FROM orders
+WHERE amount > (SELECT AVG(amount) FROM orders);
+```
+
+**相关子查询**引用外层查询的列，因此每一行都运行一次：
+
+```sql
+-- Runs once per customer: find customers who have at least one order over $500
+SELECT c.name
+FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+```
+
+相关子查询在大表上可能很慢：子查询会为外层查询的每一行执行一次。使用 `EXPLAIN` 查看 MySQL 如何执行它们。
+
+## IN、EXISTS 与 JOIN {#in-vs-exists-vs-join}
+
+这三种模式常常解决同一个问题：
+
+```sql
+-- IN subquery
+SELECT name FROM customers
+WHERE id IN (SELECT customer_id FROM orders WHERE amount > 500);
+
+-- EXISTS
+SELECT name FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+
+-- JOIN (with DISTINCT to avoid duplicates)
+SELECT DISTINCT c.name
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 500;
+```
+
+| 做法 | 适用场景 |
+|:---------|:------------|
+| `IN (subquery)` | 子查询返回一个小的静态列表；简单情况下易读 |
+| `EXISTS` | 只检查是否存在；在第一个匹配处停止；对 NULL 安全 |
+| `JOIN` | 需要两张表的列；MySQL 优化器有更大的灵活性 |
+
+MySQL 优化器通常会在内部把 `IN (subquery)` 重写为半连接，因此性能差异往往可以忽略。对于较大的子查询结果集，`EXISTS` 或 `JOIN` 更可靠。
+
+## NOT IN 的 NULL 问题 {#the-null-problem-with-not-in}
+
+当子查询返回任何 NULL 时，`NOT IN` 的行为会出人意料：
+
+```sql
+-- This returns zero rows if ANY customer_id in orders is NULL
+SELECT name FROM customers
+WHERE id NOT IN (SELECT customer_id FROM orders);
+```
+
+如果 `orders.customer_id` 哪怕只有一行是 NULL，整个 `NOT IN` 就返回空。这是正确的 SQL 行为：`NULL` 是未知值，因此 `NOT IN (NULL, 1, 2)` 对每一次比较都是 UNKNOWN。请改用 `NOT EXISTS`：
+
+```sql
+-- Safe: returns customers with no orders, even if some order rows have NULL customer_id
+SELECT name FROM customers c
+WHERE NOT EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id
+);
+```
+
+有关 MySQL 中 NULL 行为的更多信息，请参阅 [MySQL 中的 NULL](/zh/guides/null-in-mysql)。
+
+## FROM 中的子查询（派生表） {#subqueries-in-from-derived-tables}
+
+`FROM` 子句中的子查询会创建一个派生表：
+
+```sql
+SELECT dept, avg_salary
+FROM (
+    SELECT department AS dept, AVG(salary) AS avg_salary
+    FROM employees
+    GROUP BY department
+) dept_stats
+WHERE avg_salary > 80000;
+```
+
+对于这种模式，CTE 通常更清晰：逻辑在顶部命名并定义，而不是内联嵌套。请参阅 [何时 MySQL CTE 优于派生表](/zh/guides/ctes-in-mysql)。
+
+## 性能考量 {#performance-considerations}
+
+MySQL 优化器会重写许多子查询模式。在手动优化之前：
+
+1. 对子查询版本和 JOIN 版本都运行 `EXPLAIN`，查看 MySQL 实际执行的内容
+2. 确保连接列/相关列上存在索引，这通常才是瓶颈
+3. 只有当 `EXPLAIN` 显示执行计划有显著差异时才重写
+
+| 模式 | 注意事项 |
+|:--------|:----------|
+| SELECT 中的相关子查询 | 每行运行一次，在大表上可能是 O(n²) |
+| 返回大结果集的 `IN (subquery)` | 通常会被半连接重写优化；检查 `EXPLAIN` |
+| 可能含 NULL 的 `NOT IN` | 结果错误，请使用 `NOT EXISTS` |
+| FROM 中的派生表 | 优化器可能合并也可能不合并；检查 `EXPLAIN` |
+
+## 常见问题 {#frequently-asked-questions}
+
+#### JOIN 总是比子查询快吗？ {#is-join-always-faster-than-a-subquery}
+
+不一定。MySQL 8.0 的优化器在许多情况下会把 `IN (subquery)` 重写为半连接，生成与显式 JOIN 相同的执行计划。请用 `EXPLAIN` 测量，而不是假定某种形式总是更快。
+
+#### 什么时候应该用 EXISTS 代替 IN？ {#when-should-i-use-exists-instead-of-in}
+
+当您只关心是否存在匹配（而不关心匹配的数据是什么）、子查询可能返回 NULL，或者子查询返回大结果集时，使用 `EXISTS`。`EXISTS` 在第一个匹配处短路；`IN` 必须构建完整列表。
+
+#### 什么是半连接？ {#whats-a-semi-join}
+
+半连接返回左表中至少有一个右表匹配行的行，并且不会因多个匹配而产生重复的左表行。MySQL 优化器在内部使用半连接来高效执行 `IN (subquery)` 和 `EXISTS`。您无法在 SQL 中直接写半连接，但 `EXISTS` 和 `IN (subquery)` 都会促使优化器考虑它。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `NOT IN` 意外返回空结果 | 子查询结果中有 NULL，请改用 `NOT EXISTS` |
+| 相关子查询非常慢 | 在相关列上添加索引；考虑重写为 JOIN |
+| 同一查询用 JOIN 比用 IN 子查询快 | 优化器可能没有重写 IN 子查询，请尝试重写为 JOIN |
+| 派生表查询很慢 | 检查 MySQL 是否物化了派生表，请尝试重写为 CTE 或 JOIN。不要使用 `SQL_NO_CACHE`：它所控制的查询缓存已在 MySQL 8.0 中移除，因此该提示只会产生一条弃用警告 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL JOIN 性能与常见错误](/zh/guides/joins)：是什么让这个对比中的 JOIN 一侧变慢
+- [何时 MySQL CTE 优于派生表](/zh/guides/ctes-in-mysql)：深层嵌套子查询的更清晰替代方案
+- [MySQL 子查询](/zh/tutorial/subqueries)和[相关子查询](/zh/tutorial/correlated-subqueries)：关于编写它们的教程课程
+- [MySQL EXISTS](/zh/tutorial/exists)：永远不会使行数倍增的形式

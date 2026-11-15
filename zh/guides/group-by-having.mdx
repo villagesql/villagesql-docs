@@ -1,0 +1,177 @@
+---
+title: "MySQL GROUP BY 性能与大规模分组"
+sidebarTitle: "GROUP BY 性能"
+description: "为什么 MySQL 的 GROUP BY 会构建临时表，索引如何消除它，同一个过滤条件放在 WHERE 与 HAVING 中的开销差别，以及 ANY_VALUE 何时是安全的。"
+keywords: "mysql group by performance, mysql group by slow, mysql group by using temporary, mysql group by index, mysql any_value, mysql group by temporary table, mysql tmp_table_size group by"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+一个在测试表上几毫秒返回的 `GROUP BY`，在真实的表上可能要花几分钟，而查询文本完全相同。区别在于服务器是可以按分组顺序遍历索引，还是必须先构建一个临时表。本指南讲的就是这个区别，以及决定您得到哪一种结果的那些选择。
+
+如果您还在学习这些子句本身，教程会用示例数据库讲解它们：[聚合函数](/zh/tutorial/aggregate-functions)、[GROUP BY](/zh/tutorial/group-by)、[HAVING](/zh/tutorial/having)、[COUNT DISTINCT](/zh/tutorial/count-distinct)、[GROUP_CONCAT](/zh/tutorial/group-concat) 和 [WITH ROLLUP](/zh/tutorial/with-rollup)。
+
+本页上的每个查询和执行计划都来自 1 台针对 Sakila 示例数据库的服务器。开销和行数估计来自 InnoDB 的采样统计信息和您的 `optimizer_switch` 设置，因此您的数字会有所不同。可以沿用的是每个计划的形状。
+
+## 没有索引的分组会构建临时表 {#grouping-without-an-index-builds-a-temporary-table}
+
+要对行分组，服务器必须把每个分组的行聚到一起。当分组列上没有索引时，它通过构建一个临时表来做到这一点：
+
+```sql
+EXPLAIN SELECT rating, COUNT(*) FROM film GROUP BY rating\G
+```
+
+```text
+         type: ALL
+possible_keys: NULL
+          key: NULL
+         rows: 1000
+        Extra: Using temporary
+```
+
+`Using temporary` 就是要找的那一行。在 1,000 行上它不花任何开销。这个表在放得下时保存在内存中，放不下时就溢出到磁盘，而这正是分组报表不再快速的地方。
+
+哪个设置限制这部分内存，取决于服务器用于内部临时表的引擎。在更改任何东西之前，先检查您的设置：
+
+```sql
+SELECT @@internal_tmp_mem_storage_engine AS engine,
+       @@temptable_max_ram, @@temptable_max_mmap, @@tmp_table_size;
+```
+
+它们各司其职，并且在 `TempTable` 下全部生效。`temptable_max_ram` 和 `temptable_max_mmap` 限制该引擎在所有会话中可持有的总量。`tmp_table_size` 限制每个单独的内部临时表：设为 1 KB 时，一个针对 1,000 行的分组查询使 `Created_tmp_disk_tables` 从 0 变为 1；设为 64 MB 时，同一个查询留在内存中。请观察这个计数器，而不是猜测：
+
+```sql
+SHOW SESSION STATUS LIKE 'Created_tmp_disk_tables';
+```
+
+分组列上的索引会完全消除这一步，因为索引本身已经是那个顺序：
+
+```sql
+EXPLAIN SELECT customer_id, COUNT(*) FROM payment GROUP BY customer_id\G
+```
+
+```text
+         type: index
+possible_keys: idx_fk_customer_id
+          key: idx_fk_customer_id
+         rows: 16500
+        Extra: Using index
+```
+
+没有 `Using temporary`，也没有 `Using filesort`。服务器按顺序读取索引，对每一段相等的值计数，然后输出一行。`Using index` 表示它根本没有触碰表本身。
+
+因此，对于一个慢的 `GROUP BY`，首先要检查的是：是否有一个索引以分组列开头，并且顺序与您分组的顺序相同。`(a, b)` 上的复合索引可以服务 `GROUP BY a` 和 `GROUP BY a, b`。对于 `GROUP BY b`，服务器仍然可以把它当作覆盖索引来扫描，报告为 `type: index` 和 `Using index`，但行不是按分组顺序到达的，所以 `Using temporary` 又随之出现。
+
+## WHERE 和 HAVING 不是风格选择 {#where-and-having-are-not-a-style-choice}
+
+两者都可以表达过滤条件。它们的开销不同，因为 `WHERE` 在分组之前运行，而 `HAVING` 在分组之后运行。
+
+针对分组列本身的条件可以用两种方式写，并且含义相同，这使它成为一个公平的比较。放在 `WHERE` 中时，服务器先缩小索引范围，然后只对读到的内容分组：
+
+```sql
+EXPLAIN FORMAT=TREE SELECT customer_id, COUNT(*) FROM payment WHERE customer_id <= 100 GROUP BY customer_id\G
+```
+
+```text
+-> Group aggregate: count(0)  (cost=814 rows=599)
+    -> Filter: (payment.customer_id <= 100)  (cost=543 rows=2710)
+        -> Covering index range scan on payment using idx_fk_customer_id over (customer_id <= 100)  (cost=543 rows=2710)
+```
+
+放在 `HAVING` 中时，同样的限制来得太晚，无法缩小任何范围：
+
+```sql
+EXPLAIN FORMAT=TREE SELECT customer_id, COUNT(*) FROM payment GROUP BY customer_id HAVING customer_id <= 100\G
+```
+
+```text
+-> Filter: (payment.customer_id <= 100)  (cost=3324 rows=599)
+    -> Group aggregate: count(0)  (cost=3324 rows=599)
+        -> Covering index scan on payment using idx_fk_customer_id  (cost=1674 rows=16500)
+```
+
+输出的行相同，估计开销是 4 倍。`WHERE` 版本读取估计 2,710 个索引条目；`HAVING` 版本读取整个索引，然后把大多数分组丢掉。
+
+这些估计来自 InnoDB 的采样统计信息和 `mysql.server_cost` 中的开销常量，因此您的数字会与这些不同。可以沿用的是这 2 个计划的形状。
+
+规则是：只要条件检验的是行，就放在 `WHERE` 中。只对检验分组的条件使用 `HAVING`，在实践中这意味着任何包含聚合的条件。一个不含聚合的 `HAVING` 子句几乎总是一个放错了地方的 `WHERE` 子句，而含有聚合的 `WHERE` 会得到 `ERROR 1111 (HY000): Invalid use of group function`。
+
+## ONLY_FULL_GROUP_BY 与逃生口 {#only_full_group_by-and-the-escape-hatch}
+
+`only_full_group_by` 默认开启，它会以 `ERROR 1055` 拒绝选择了既未分组也未聚合的列的查询。原因是这样的查询没有确定的答案：分组中有很多行，而没有任何东西指明要显示哪一行。
+
+`ANY_VALUE()` 告诉服务器您接受任意一行，查询随即可以运行：
+
+```sql
+SELECT rating, ANY_VALUE(title) AS a_title, COUNT(*) AS films
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+这里有意不显示输出。返回哪个标题是不确定的，因此本页上打印的任何结果都会是您无法复现的值。
+
+当列函数依赖于分组列而服务器无法证明这一点时，使用 `ANY_VALUE()`，这是正当的用例。不要用它来压制一个在分组内确实会变化的列上的错误：您得到的值不是第一个、不是最小的，也不是任何您可以依赖的东西，并且它会随着计划的改变而改变。`MIN()` 或 `MAX()` 说明了您的意图，而且开销相同。
+
+在全局范围关闭 `only_full_group_by`，会把每一个这样的错误变成一个没人看见的错误答案。这是错误的修复方式。
+
+该检查能看穿建立在分组**列**之上的表达式，因此 `SELECT COALESCE(rating, 'unrated') ... GROUP BY rating` 会被接受。它看不穿建立在分组**表达式**之上的表达式。按 `DATE_FORMAT(payment_date, '%Y-%m')` 分组并选择 `COALESCE(DATE_FORMAT(payment_date, '%Y-%m'), 'ALL')`，同样的 `ERROR 1055` 会指出 `payment_date`，因为服务器比较的是这 2 个表达式，而不是它们内部的列。这是常见的报表场景，解决办法是在派生表中分组，然后在外层包装结果：
+
+```sql
+SELECT COALESCE(month, 'ALL') AS month, payments
+FROM (SELECT DATE_FORMAT(payment_date, '%Y-%m') AS month, COUNT(*) AS payments
+      FROM payment GROUP BY DATE_FORMAT(payment_date, '%Y-%m')) AS m
+ORDER BY month;
+```
+
+## 聚合一对多联接 {#aggregating-a-one-to-many-join}
+
+在分组之前联接会使行数成倍增加，因此针对结果的 `SUM` 会重复计数。症状是总数高出一个没人能解释的倍数。
+
+在各自的子查询中分别聚合每一侧，然后联接结果，而不是先联接再分组：
+
+```sql
+SELECT c.last_name, p.payments, r.rentals
+FROM customer AS c
+JOIN (SELECT customer_id, COUNT(*) AS payments FROM payment GROUP BY customer_id) AS p
+  ON p.customer_id = c.customer_id
+JOIN (SELECT customer_id, COUNT(*) AS rentals FROM rental GROUP BY customer_id) AS r
+  ON r.customer_id = c.customer_id
+ORDER BY c.last_name
+LIMIT 5;
+```
+
+每个子查询的聚合只针对属于它的行。先联接两个表再分组，会把付款数乘以租赁数，使两个计数都被放大。[MySQL JOIN 性能与常见错误](/zh/guides/joins) 介绍了这种成倍增加本身。
+
+## 当您不想折叠行时 {#when-you-do-not-want-the-rows-collapsed}
+
+`GROUP BY` 用每个分组 1 行来替换原来的行。当您想让聚合值*伴随*每一行时，窗口函数可以做到这一点而不折叠任何东西，并且通常不需要临时表：
+
+```sql
+SELECT customer_id, amount, SUM(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM payment;
+```
+
+[MySQL 8.4 中的窗口函数](/zh/guides/window-functions) 对它们有完整的介绍。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 原因与修复 |
+|:--------|:---------|
+| `GROUP BY` 很慢 | 没有以分组列开头的索引。在 `EXPLAIN` 中检查 `Using temporary`。 |
+| 很慢，并且磁盘很忙 | 临时表超出了内存预算并溢出。先缩小行数，然后为单个表提高 `tmp_table_size`，或为服务器总量提高 `temptable_max_ram`。 |
+| `ERROR 1055` | 某个选择的列既未分组也未聚合。对它分组、聚合，或者去掉它。 |
+| `HAVING` 过滤很慢 | 它不含聚合，所以应放在 `WHERE` 中。 |
+| 总数过高 | 一对多联接在分组之前使行数成倍增加。 |
+| `GROUP_CONCAT` 结果被截断 | 它达到了 `group_concat_max_len`，这会发出警告而不是报错。 |
+| 分组以意外的顺序返回 | `GROUP BY` 不承诺任何顺序。添加 `ORDER BY`。 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 8.4 中的窗口函数](/zh/guides/window-functions)——不折叠行的聚合
+- [MySQL JOIN 性能与常见错误](/zh/guides/joins)——为什么一对多联接会放大总数
+- [MySQL CTE 何时优于派生表](/zh/guides/ctes-in-mysql)——在主查询之前预先聚合
+- [常见 MySQL 错误](/zh/guides/common-mysql-errors)——上下文中的 ERROR 1055 和 ERROR 1111
+- [GROUP BY](/zh/tutorial/group-by)——如果您想先学习子句本身，请看教程

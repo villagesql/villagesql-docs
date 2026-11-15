@@ -1,0 +1,157 @@
+---
+title: "在 MySQL 中选择主键策略"
+sidebarTitle: "选择主键"
+description: "比较 MySQL 中的 AUTO_INCREMENT、BINARY(16) UUID 和原生 UUID 类型——各自适用的场景，以及如何避免日后让您吃苦头的取舍。"
+keywords: "mysql primary key strategy, auto increment vs uuid mysql, mysql uuid primary key, mysql uuid binary, mysql distributed primary key, mysql uuid v7"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+主键的决定很难撤销。早期的错误选择——比如说，当外键已经散布在十二张表中之后，再做一次从 `INT AUTO_INCREMENT` 迁走的模式迁移——是很痛苦的。本指南介绍三种主要方法、各自适用的场景，以及 VillageSQL 带来的新选择。
+
+## MySQL 的默认选择：AUTO_INCREMENT {#the-mysql-default-auto_increment}
+
+`AUTO_INCREMENT` 整数成为默认选择是有原因的。它们很小（4 或 8 字节），插入快，天然有序，并且在调试器或日志文件中可以直接读懂。
+
+```sql
+CREATE TABLE orders (
+    id     BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+InnoDB 的聚簇索引按主键顺序存储行。使用自增键时，每个新行都追加到 B 树的末尾。这意味着没有页分裂、没有索引碎片，以及快速的顺序插入。对大多数单数据库应用来说，这是正确的选择。
+
+`AUTO_INCREMENT` 的问题在您扩展或集成时才会显现：
+
+- **暴露行数**：ID 序列本身就相当于一次 `SELECT COUNT(*)`，让 API 客户端知道有多少订单。URL 中的连续 ID 让用户可以枚举记录。
+- **分布式生成**：在多个写入者之间生成唯一 ID 需要协调——序列服务器、指定的写入者，或手动划分 ID 范围。
+- **数据合并**：合并来自不同数据库的两张表会产生 ID 冲突。您将不得不重新编号。
+
+如果这些都不适用于您，`AUTO_INCREMENT` 很可能就是正确答案。保留它。
+
+## 当您需要全局唯一 ID 时 {#when-you-need-globally-unique-ids}
+
+标准解决方案是 UUID：128 位的随机标识符，可以在任何节点上独立生成，无需协调，并且在实践中不会冲突。
+
+MySQL 内置的 `UUID()` 以 `CHAR(36)` 字符串返回一个 v1 UUID。您可以直接存储它，但这有代价：`CHAR(36)` 占 36 字节，而二进制等价形式只占 16 字节；并且随机 UUID（v4）会导致 InnoDB 索引碎片，因为新行不会落在索引末尾——它们落在任意位置，迫使页分裂。
+
+标准的变通方案是 `BINARY(16)` 加手动转换：
+
+```sql
+CREATE TABLE orders (
+    id      BINARY(16) PRIMARY KEY,
+    user_id INT NOT NULL,
+    placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert: convert string UUID to binary at write time
+INSERT INTO orders (id, user_id)
+VALUES (UUID_TO_BIN(UUID(), 1), 101);
+
+-- Read: convert back to readable format
+SELECT BIN_TO_UUID(id, 1), user_id FROM orders;
+```
+
+`UUID_TO_BIN()` 中的 `1` 标志会重新排列时间戳位，使 v1 UUID 按时间顺序排序。这专门减少了 v1 UUID 的碎片，但手动编码/解码给每条查询都增加了麻烦。
+
+## 使用 VillageSQL：原生 UUID 类型和可排序版本 {#with-villagesql-native-uuid-type-and-sortable-versions}
+
+VillageSQL 的 `vsql_uuid` 扩展添加了原生 `UUID` 列类型，以及 UUID v1 到 v7 的生成函数。无需手动编码/解码，而且 UUID v7 干净利落地解决了插入碎片问题。
+
+```sql
+INSTALL EXTENSION vsql_uuid;
+```
+
+```sql
+CREATE TABLE orders (
+    id      UUID PRIMARY KEY,
+    user_id INT NOT NULL,
+    placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- UUID_V7 embeds a Unix timestamp in the high bits —
+-- new values are always larger, so inserts always append to the index
+INSERT INTO orders (id, user_id) VALUES (UUID_V7(), 101);
+INSERT INTO orders (id, user_id) VALUES (UUID_V7(), 102);
+
+-- ORDER BY id is roughly chronological — v7 embeds a millisecond timestamp
+SELECT user_id, placed_at FROM orders ORDER BY id;
+
+-- The timestamp is recoverable as a datetime or Unix epoch
+SELECT UUID_TIMESTAMP(id), UUID_EPOCH(id), user_id FROM orders;
+```
+
+`UUID` 类型在磁盘上存储 16 字节，并自动以标准的 36 字符字符串格式显示。您的查询中不再需要 `UUID_TO_BIN` 或 `BIN_TO_UUID`。
+
+对于确定性 ID——相同的输入总是产生相同的 UUID——请使用 v3 或 v5：
+
+```sql
+-- Deterministic UUID from a namespace + name (useful for idempotent imports)
+-- UUID_NS_DNS() returns the RFC 9562 DNS namespace, so no literal is needed
+SELECT UUID_V5(UUID_NS_DNS(), 'user@example.com');
+```
+
+关于 UUID 存储机制和插入碎片问题的详细信息，请参阅 [MySQL 中的 UUID](/zh/guides/uuids)。
+
+### UUID 版本参考 {#uuid-version-reference}
+
+| 版本 | 可排序 | 适用场景 |
+|:---|:---|:---|
+| `UUID_V4()` | 否 | 通用随机 ID，插入量低 |
+| `UUID_V7()` | 是 | 主键、高插入量——推荐的默认选择 |
+| `UUID_V6()` | 是 | 需要有序输出的 v1 系统的即插即用替代——把 v1 的时间戳位重排到高位 |
+| `UUID_V1()` | 否 | 遗留兼容——v1 嵌入了时间戳，但位顺序不可排序 |
+| `UUID_V3()` | 否 | 由命名空间 + 名称生成的确定性 ID（MD5） |
+| `UUID_V5()` | 否 | 由命名空间 + 名称生成的确定性 ID（SHA-1） |
+
+其他函数：`UUID_IS_VALID(string)` 对非 NULL 字符串返回 1 或 0，表示它是否为格式正确的 UUID；当参数本身为 NULL 时返回 NULL。它接受文本且从不报错，这正是处理来自外部系统的 ID 时所需要的。`UUID_VERSION(uuid)` 返回版本号，用于对已经以 `UUID` 类型存储的 ID 进行路由。`UUID_COMPARE(uuid1, uuid2)` 返回 -1、0 或 1，用于显式的字典序比较。
+
+## 选择策略 {#choosing-a-strategy}
+
+| 策略 | 适用场景 | 注意事项 |
+|:---|:---|:---|
+| `BIGINT AUTO_INCREMENT` | 单数据库应用、内部 ID、高插入量 | 暴露行数；无法跨数据库合并 |
+| `BINARY(16)` + `UUID_TO_BIN` | 不依赖 VillageSQL 的可移植 UUID | 每条查询都要手动编码/解码；使用 `UUID_TO_BIN(UUID(), 1)` 以减少碎片 |
+| 原生 `UUID` + `UUID_V7()` | 分布式系统、公开 ID、可安全合并的模式 | 需要 VillageSQL；16 字节，而整数为 4–8 字节 |
+| 复合自然键 | 从业务数据派生的 ID（国家 + 代码等） | 宽键会拖慢连接和外键；如果业务数据变化则有风险 |
+
+对大多数开始新项目的团队：内部表使用 `BIGINT AUTO_INCREMENT`，带有面向公众的 ID 或可能跨系统合并的数据的表使用原生 `UUID` 加 `UUID_V7()`。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 什么时候该用 UUID_V7，什么时候该用 UUID_V4？ {#when-should-i-use-uuid_v7-vs-uuid_v4}
+
+对高写入量表的主键使用 `UUID_V7()`。它在高位嵌入了时间戳，因此新 UUID 总是排在现有 UUID 之后——这可以防止 InnoDB 在插入时分裂索引页。只有在您需要没有任何排序语义的随机 ID 时（例如一次性令牌），才使用 `UUID_V4()`。
+
+#### 我可以把 UUID 用作 DEFAULT 表达式吗？ {#can-i-use-uuid-as-a-default-expression}
+
+MySQL 本身允许在 `DEFAULT` 表达式中使用 `UUID()`、`RAND()` 和 `NOW()` 之类的非确定性函数。真正的限制是 VillageSQL 特有的：注册为非确定性的扩展函数——例如 `UUID_V7()`——会被阻止用于 `DEFAULT` 表达式，而 `UUID_V3()`/`UUID_V5()` 之类的确定性函数是允许的。不过这种允许对这里的主键并没有用处：`UUID_V3()`/`UUID_V5()` 在 `DEFAULT` 表达式中接受的是固定参数（`DEFAULT` 无法读取其他列），所以每一行都会得到完全相同的 UUID——第二条 `INSERT` 会与第一条在主键上冲突。请改为在每条 `INSERT` 语句中生成 `UUID_V7()`。
+
+#### 外键也应该用 UUID 吗？ {#should-i-use-uuid-for-foreign-keys-too}
+
+应该，但要注意存储成本：引用表中的每一行，UUID 外键占 16 字节，而整数只占 4–8 字节。在有数百万行和多个 UUID 外键的表上，这会累积起来。对于纯内部引用，`AUTO_INCREMENT` 加整数外键更精简。
+
+#### UUID_V3 和 UUID_V5 有什么区别？ {#whats-the-difference-between-uuid_v3-and-uuid_v5}
+
+两者都从命名空间和名称生成确定性 UUID——相同的输入总是产生相同的输出。v3 使用 MD5；v5 使用 SHA-1。新代码请优先使用 v5，因为 SHA-1 略强一些。只有当您需要匹配由使用 v3 的系统生成的 ID 时，才使用 v3。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.UUID_V7 does not exist` | 运行 `INSTALL EXTENSION vsql_uuid` |
+| `DEFAULT (UUID_V7())` 被拒绝 | MySQL 不允许非确定性的默认值——请在每条 INSERT 中生成 UUID |
+| UUID 主键比预期慢 | 检查您使用的是 `UUID_V7()` 而不是 `UUID_V4()`。随机 UUID 会导致 B 树页分裂。 |
+| `Extension vsql_uuid is already installed` | 已经加载——无需操作 |
+| 对 UUID 外键的连接失败并报错 `ERROR 3219: Unable to implicitly cast a non-custom type during compare with a custom type in =` | 两侧都必须是原生 `UUID` 类型。将 `UUID` 列与 `CHAR(36)`/`VARCHAR` 的 UUID 字符串连接会引发此错误，而不会静默地不匹配 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的 UUID](/zh/guides/uuids)——深入了解 MySQL 中的 UUID 版本和存储
+- [InnoDB 如何存储数据](/zh/guides/innodb-storage)——为什么主键的选择会影响物理存储布局
+- [MySQL 索引的工作原理](/zh/guides/mysql-indexes)——主键始终是聚簇 B 树索引
+- [MySQL 中的分页：键集与 OFFSET](/zh/guides/pagination)——键同时充当分页游标

@@ -1,0 +1,180 @@
+---
+title: "使用 AI 在 MySQL 中对文本分类"
+sidebarTitle: "对文本分类"
+description: "如何使用 VillageSQL 的 ai_prompt() 函数在 MySQL 中对文本分类：无需离开 SQL，即可按类别、意图或主题为行打标签。"
+keywords: "mysql text classification, mysql ai classify, mysql label rows ai, mysql spam detection sql, mysql topic classification, mysql ai_prompt classification"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+文本分类（根据内容把行归入类别）通常意味着把数据导出到 Python 脚本、调用 AI 模型，再把结果导入回来。VillageSQL 的 `ai_prompt()` 让您直接在 SQL 中完成分类，让逻辑贴近数据，并省去导出/导入的循环。
+
+## 问题：在 SQL 之外分类 {#the-problem-classification-outside-sql}
+
+没有 VillageSQL 时的典型工作流：
+
+```python
+rows = db.query("SELECT id, body FROM support_tickets WHERE category IS NULL")
+for row in rows:
+    category = llm.classify(row["body"], labels=["billing", "technical", "shipping", "other"])
+    db.execute("UPDATE support_tickets SET category = ? WHERE id = ?", category, row["id"])
+```
+
+这可以工作，但分类逻辑存在于应用代码中。迁移、回填和一次性的重新打标签都需要运行脚本，而不是运行一条 SQL 查询。
+
+## 使用 VillageSQL：把 ai_prompt() 用作分类器 {#with-villagesql-ai_prompt-as-a-classifier}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+可靠分类的关键是一个严谨的提示词：列举确切的类别，告诉模型只返回其中之一，并可选地给出一个示例。
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE support_tickets ADD COLUMN category VARCHAR(20);
+
+-- max_execution_time only bounds SELECT statements in MySQL/VillageSQL —
+-- it has no effect on INSERT/UPDATE/DELETE, including this UPDATE. To
+-- bound how long a batch UPDATE can run, use KILL QUERY against the
+-- connection's own id from a timer, not a session variable set beforehand.
+
+UPDATE support_tickets
+SET category = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Classify this support ticket into exactly one of these categories: ',
+        'billing, technical, shipping, other. ',
+        'Reply with the category name only, lowercase, no punctuation.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE category IS NULL
+LIMIT 100;
+```
+
+### 验证分类输出 {#validating-classification-output}
+
+模型偶尔会返回意外的输出。请原样存储结果，然后单独验证：
+
+```sql
+-- Check what labels the model returned
+SELECT DISTINCT category, COUNT(*) AS cnt
+FROM support_tickets
+GROUP BY category
+ORDER BY cnt DESC;
+
+-- Fix off-label results
+UPDATE support_tickets
+SET category = 'other'
+WHERE category NOT IN ('billing', 'technical', 'shipping', 'other');
+```
+
+### 多标签分类 {#multi-label-classification}
+
+当一行可以属于多个类别时，请要求返回一个 JSON 数组，并把它存储在 `JSON` 列中：
+
+```sql
+ALTER TABLE articles ADD COLUMN topics JSON;
+
+UPDATE articles
+SET topics = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Return a JSON array of topics that apply to this article. ',
+        'Choose from: ["technology", "business", "health", "science", "politics"]. ',
+        'Return only the JSON array, no other text.\n\n',
+        'Article: ', content
+    )
+)
+WHERE topics IS NULL
+LIMIT 50;
+
+-- Query rows tagged with a specific topic
+SELECT title FROM articles
+WHERE JSON_CONTAINS(topics, '"technology"');
+```
+
+### 构建置信度分数 {#building-a-confidence-score}
+
+要求模型返回同时包含标签和置信度的结构化 JSON：
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_result JSON;
+
+UPDATE reviews
+SET ai_result = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Classify this review. Return JSON with keys "label" (positive/negative/neutral) ',
+        'and "confidence" (high/medium/low). Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE ai_result IS NULL
+LIMIT 100;
+
+-- Query by label and confidence
+SELECT review_text,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) AS label,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) AS confidence
+FROM reviews
+WHERE JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) = 'negative'
+  AND JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) = 'high';
+```
+
+## 有效的提示词模式 {#prompt-patterns-that-work}
+
+| 目标 | 提示词模式 |
+|:---|:---|
+| 单一标签 | "Classify as X, Y, or Z. Reply with one word only." |
+| 置信度评分 | `{"label": "X", "confidence": "high/medium/low"}` |
+| 多标签 | "Return a JSON array of applicable labels from [X, Y, Z]." |
+| 二元判断 | "Does this text contain X? Reply yes or no." |
+
+给模型更少的类别可选，准确率会更高。超过 5 到 6 个选项会降低快速/廉价模型的可靠性。
+
+有关设置和提供商选项，请参阅 [将 MySQL 连接到 AI API](/zh/guides/ai-api-setup)。有关更广泛的 ai_prompt() 用法模式，请参阅 [从 MySQL 查询运行 AI 模型](/zh/guides/ai-prompts-in-mysql)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 与训练过的模型相比，AI 分类的准确率如何？ {#how-accurate-is-ai-classification-compared-to-a-trained-model}
+
+像 Claude Haiku 这样有能力的模型，无需任何训练数据就能在简单明确的分类任务上达到高准确率。对于区别细微的领域特定类别，您可能需要在提示词中提供示例，或使用更大的模型。
+
+#### 我可以用触发器在行插入时对其分类吗？ {#can-i-classify-rows-as-theyre-inserted-using-a-trigger}
+
+可以，但请谨慎：在每次 INSERT 时调用 `ai_prompt()` 的触发器会让每次写入耗时 5 到 30 秒。更好的做法是在定期批处理作业中分类，并接受标签可用前的短暂延迟。
+
+#### 模型返回 NULL 的行该如何处理？ {#how-do-i-handle-rows-where-the-model-returns-null}
+
+API 调用失败时，`ai_prompt()` 返回 NULL。在您的批处理循环中，持续运行 UPDATE 直到不再有 NULL，并为瞬时故障加入重试逻辑。
+
+#### 分类应该用什么模型？ {#what-model-should-i-use-for-classification}
+
+从 `claude-haiku-4-5` 或 `gpt-4o-mini` 开始，两者都快速且廉价。只有在准确率无法接受时，才升级到能力更强的模型。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | 运行 `INSTALL EXTENSION vsql_ai` |
+| 返回 NULL | 检查 API 密钥和 `max_execution_time`；验证模型名称 |
+| 标签超出允许的集合 | 在 UPDATE 之后添加一条查询来规范化意外的值 |
+| 结构化输出的 JSON 解析错误 | 在提示词中加入"Return only valid JSON, no other text" |
+| 准确率低 | 在提示词中加入 2 到 3 个示例；尝试能力更强的模型 |
+
+## 另请参阅 {#see-also}
+
+- [从 MySQL 查询运行 AI 模型](/zh/guides/ai-prompts-in-mysql)：用于分类的 ai_prompt() 函数
+- [对 MySQL 数据进行情感分析](/zh/guides/sentiment-analysis)：一项相关的文本分析任务
+- [MySQL 中的 AI 摘要](/zh/guides/ai-summarization)：ai_prompt() 在存储文本上的另一种应用

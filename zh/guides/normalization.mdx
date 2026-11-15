@@ -1,0 +1,155 @@
+---
+title: "MySQL 中的规范化"
+sidebarTitle: "规范化模式"
+description: "如何规范化 MySQL 数据库模式：通过示例讲解第一、第二和第三范式，以及何时反规范化是合理的。"
+keywords: "mysql normalization, database normalization mysql, mysql normal forms, 1nf 2nf 3nf mysql, mysql schema design, mysql denormalization, mysql third normal form"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+数据库规范化是组织表以减少冗余并防止更新异常的过程。大多数应用程序应该达到第三范式（3NF）。超过这一步，收益大多是理论上的，而连接的复杂性却是实实在在的。
+
+## 第一范式（1NF） {#first-normal-form-1nf}
+
+当每一列都保存原子值——每个单元格一个值——并且没有重复组时，表就处于 1NF。
+
+**违反 1NF** — 多个值塞进一列：
+
+```sql
+CREATE TABLE orders (
+    id          INT PRIMARY KEY,
+    customer    VARCHAR(100),
+    product_ids VARCHAR(255)  -- "1,4,7" — not atomic
+);
+```
+
+**满足 1NF** — 每个单元格一个值，重复组提取到子表：
+
+```sql
+CREATE TABLE orders (
+    id       INT PRIMARY KEY,
+    customer VARCHAR(100)
+);
+
+CREATE TABLE order_items (
+    order_id   INT,
+    product_id INT,
+    PRIMARY KEY (order_id, product_id)
+);
+```
+
+## 第二范式（2NF） {#second-normal-form-2nf}
+
+当表处于 1NF 并且每个非键列都依赖于**整个**主键——而不只是它的一部分——时，表就处于 2NF。这只适用于具有复合主键的表。
+
+**违反 2NF** — `product_name` 只依赖于 `product_id`，而不是完整的 `(order_id, product_id)` 键：
+
+```sql
+CREATE TABLE order_items (
+    order_id     INT,
+    product_id   INT,
+    product_name VARCHAR(100),  -- partial dependency: only needs product_id
+    quantity     INT,
+    PRIMARY KEY (order_id, product_id)
+);
+```
+
+**满足 2NF** — 把 `product_name` 移到它自己的表中：
+
+```sql
+CREATE TABLE products (
+    id   INT PRIMARY KEY,
+    name VARCHAR(100)
+);
+
+CREATE TABLE order_items (
+    order_id   INT,
+    product_id INT,
+    quantity   INT,
+    PRIMARY KEY (order_id, product_id),
+    FOREIGN KEY (product_id) REFERENCES products (id)
+);
+```
+
+## 第三范式（3NF） {#third-normal-form-3nf}
+
+当表处于 2NF 并且没有任何非键列依赖于另一个非键列时，表就处于 3NF。这种依赖称为传递依赖。
+
+**违反 3NF** — `city` 和 `state` 依赖于 `zip_code`，而不是直接依赖于 `customer_id`：
+
+```sql
+CREATE TABLE customers (
+    id       INT PRIMARY KEY,
+    name     VARCHAR(100),
+    zip_code VARCHAR(10),
+    city     VARCHAR(100),  -- transitively depends on zip_code
+    state    CHAR(2)        -- transitively depends on zip_code
+);
+```
+
+**满足 3NF** — 提取传递依赖：
+
+```sql
+CREATE TABLE zip_codes (
+    zip_code VARCHAR(10) PRIMARY KEY,
+    city     VARCHAR(100),
+    state    CHAR(2)
+);
+
+CREATE TABLE customers (
+    id       INT PRIMARY KEY,
+    name     VARCHAR(100),
+    zip_code VARCHAR(10),
+    FOREIGN KEY (zip_code) REFERENCES zip_codes (zip_code)
+);
+```
+
+在实践中，把邮政编码提取到单独的表对大多数应用程序来说是过度设计。原则比在每一个边缘情况下机械地遵守更重要。
+
+## 何时反规范化 {#when-to-denormalize}
+
+规范化提高写入完整性并减少冗余，但在读取时增加连接开销。读密集型或分析型工作负载有时值得有意地反规范化。
+
+| 场景 | 规范化 | 反规范化 |
+|:---------|:----------|:------------|
+| 频繁写入，数据完整性至关重要 | 是 | — |
+| 连接 6 张以上表的报表查询 | — | 考虑 |
+| 小数据集（< 100K 行） | 是 | 不需要 |
+| 数据仓库或分析副本 | — | 是 |
+| 读写混合的 OLTP 应用程序 | 是 | 仅限热点路径 |
+
+在反规范化之前先检查索引——大多数连接慢的问题都是缺少索引的问题。在连接列上添加覆盖索引往往就是您所需要的全部；请参阅 [MySQL 索引的工作原理](/zh/guides/mysql-indexes)。
+
+反规范化最适合用于读副本或 OLAP 存储——而不是您的应用程序写入的那些表。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我需要超越 3NF 吗？ {#do-i-need-to-go-beyond-3nf}
+
+对大多数应用程序来说，3NF 就够了。Boyce-Codd 范式（BCNF）处理的是重叠候选键在 3NF 下仍然允许异常的边缘情况——这种情况在学术练习之外很少出现。除非您有一个特定的异常要消除，否则请止步于 3NF。
+
+#### 我应该为了性能而反规范化吗？ {#should-i-denormalize-for-performance}
+
+先做性能分析，再重构。大多数慢查询是由缺少索引引起的，而不是连接。先添加索引。如果索引良好的查询在大表上仍然很慢，请考虑在读副本或物化汇总表上反规范化，而不是在事务数据库上。
+
+#### 违反 2NF 和违反 3NF 有什么区别？ {#whats-the-difference-between-a-2nf-violation-and-a-3nf-violation}
+
+违反 2NF 是指某一列依赖于主键的*一部分*（只有复合主键才可能）。违反 3NF 是指某一列依赖于*另一个非键列*。2NF 关乎部分键依赖；3NF 关乎经由非键列的传递依赖。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 重复数据出现在多行中 | 很可能违反了 2NF 或 3NF——把重复的数据移到它自己的表中 |
+| 更新异常（改了一行，其他行变得过期） | 传递依赖——提取到查找表 |
+| 连接 5 张以上表的查询很慢 | 先检查 FK 列上的索引；只有在索引无济于事时才反规范化 |
+| 规范化的模式太复杂难以查询 | 考虑读优化的视图或反规范化的分析副本 |
+
+## 另请参阅 {#see-also}
+
+- [选择 MySQL 数据类型](/zh/guides/choosing-data-types) — 模式规范化之后挑选合适的类型
+- [MySQL 中的外键](/zh/guides/foreign-keys) — 强制执行规范化所创建的关系
+- [MySQL 中的 CHECK 约束](/zh/guides/check-constraints) — 外键完整性之外的额外规则
+- [Sakila 示例数据库](/zh/tutorial/sakila-database) — 一个可供练习的规范化模式

@@ -1,0 +1,166 @@
+---
+title: "对 MySQL 数据进行情感分析"
+sidebarTitle: "分析情感"
+description: "如何使用 VillageSQL 的 ai_prompt() 对存储在 MySQL 中的文本进行情感分析 — 不离开 SQL 即可为评论、支持工单和反馈打分。"
+keywords: "mysql sentiment analysis, mysql ai sentiment, mysql review sentiment, mysql positive negative neutral, mysql text sentiment score, mysql ai_prompt sentiment"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+情感分析告诉您一段文本表达的是正面、负面还是中性的情绪。最常见的用例是产品评论和支持工单 — 无需逐行阅读，一眼就能知道客户是满意还是沮丧。MySQL 没有内置的情感函数。VillageSQL 的 `ai_prompt()` 添加了一个。
+
+## 标准方法：应用层情感分析 {#standard-approach-application-layer-sentiment}
+
+典型的做法是在 MySQL 之外运行情感打分 — 把行拉取到一个 Python 脚本中，由它调用情感库或 AI API，然后把分数写回去。这可行，但它把您的数据管道拆成了两部分：一些逻辑在 SQL 中，一些在 Python 中，批量重新打分还需要运行脚本。
+
+## 使用 VillageSQL：在 SQL 中进行情感分析 {#with-villagesql-sentiment-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+情感分析是一项分类任务。提示词指定评价等级，并要求返回单个词的结果：
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE reviews ADD COLUMN sentiment VARCHAR(10);
+
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE reviews
+SET sentiment = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'What is the sentiment of this review? ',
+        'Reply with exactly one word: positive, negative, or neutral.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment IS NULL
+LIMIT 100;
+```
+
+打上标签后，就可以像查询任何其他列一样查询情感：
+
+```sql
+-- Sentiment distribution
+SELECT sentiment, COUNT(*) AS count
+FROM reviews
+GROUP BY sentiment
+ORDER BY count DESC;
+
+-- Recent negative reviews that need attention
+SELECT id, review_text, created_at
+FROM reviews
+WHERE sentiment = 'negative'
+  AND created_at > NOW() - INTERVAL 7 DAY
+ORDER BY created_at DESC;
+```
+
+### 添加数值分数 {#adding-a-numeric-score}
+
+对于趋势分析和求平均值，请要求返回 1–5 的分数而不是标签：
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_score TINYINT;
+
+UPDATE reviews
+SET sentiment_score = CAST(ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Rate the sentiment of this review from 1 (very negative) to 5 (very positive). ',
+        'Reply with a single digit only.\n\n',
+        'Review: ', review_text
+    )
+) AS SIGNED)
+WHERE sentiment_score IS NULL
+LIMIT 100;
+
+-- Average sentiment over time
+SELECT DATE(created_at) AS day,
+       ROUND(AVG(sentiment_score), 2) AS avg_score,
+       COUNT(*) AS review_count
+FROM reviews
+WHERE sentiment_score IS NOT NULL
+GROUP BY DATE(created_at)
+ORDER BY day DESC;
+```
+
+### 基于方面的情感分析 {#aspect-based-sentiment}
+
+如果您想按主题拆分情感 — 产品质量、配送、客户服务各自如何 — 请要求返回结构化的 JSON 输出：
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_detail JSON;
+
+UPDATE reviews
+SET sentiment_detail = ai_prompt(
+    'anthropic',
+    'claude-sonnet-5',  -- better model for nuanced structured output
+    @key,
+    CONCAT(
+        'Analyze this review and return JSON with sentiment scores for each aspect. ',
+        'Keys: product_quality, shipping, customer_service. ',
+        'Values: positive, negative, neutral, or null if not mentioned. ',
+        'Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment_detail IS NULL
+LIMIT 50;
+
+SELECT
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.product_quality')) AS product,
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.shipping')) AS shipping,
+    review_text
+FROM reviews
+WHERE JSON_EXTRACT(sentiment_detail, '$.shipping') = '"negative"';
+```
+
+## 准确性说明 {#accuracy-notes}
+
+快速、廉价的模型（Claude Haiku、GPT-4o mini）对于直截了当的正面/负面/中性分类是可靠的。细微的情况 — 讽刺、褒贬混杂的评论、特定领域的用语 — 使用能力更强的模型会更好。如果准确性很重要，请在运行完整回填之前，抽取一部分模型输出与人工标签进行对照验证。
+
+有关设置和提供商选项，请参阅 [将 MySQL 连接到 AI API](/zh/guides/ai-api-setup)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 这与文本分类有何不同？ {#how-is-this-different-from-text-classification}
+
+情感分析是一项专注于情绪基调的特定分类任务。[用 AI 在 MySQL 中进行文本分类](/zh/guides/text-classification) 介绍了通用模式；本指南展示了针对情感的提示词和基于分数的输出。
+
+#### 我可以在插入行时运行情感分析吗？ {#can-i-run-sentiment-analysis-as-rows-are-inserted}
+
+可以通过触发器实现，但在 API 调用运行期间，每次 INSERT 会花费 5–30 秒。更好的做法是在计划的批处理作业中运行情感打分。
+
+#### 非英语文本怎么办？ {#what-about-non-english-text}
+
+能力强的 AI 模型可以很好地处理多种语言。如果准确性下降，请在提示词中指明预期的语言："Rate the sentiment of this French review..."
+
+#### 如何处理 NULL 结果？ {#how-do-i-handle-null-results}
+
+`ai_prompt()` 在失败时返回 NULL。请循环运行 UPDATE 批处理，直到没有 NULL 行为止，并在您的应用程序中按速率限制控制节奏。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | 运行 `INSTALL EXTENSION vsql_ai` |
+| 返回 NULL | 检查 API 密钥、`max_execution_time` 和模型名称 |
+| 分数列填入的是 0 而不是 NULL | `CAST('positive' AS SIGNED)` 返回 0 — 模型返回了非数字文本。收紧提示词："Reply with a single digit only, no other text." |
+| 标签不一致 | 在提示词中添加 "Reply with exactly one word"；用 UPDATE 之后的查询进行规范化 |
+
+## 另请参阅 {#see-also}
+
+- [从 MySQL 查询中运行 AI 模型](/zh/guides/ai-prompts-in-mysql) — 为情感打分提供支持的 ai_prompt() 函数
+- [用 AI 在 MySQL 中进行文本分类](/zh/guides/text-classification) — 在情感之外按类别为文本打标签
+- [MySQL 中的 AI 摘要](/zh/guides/ai-summarization) — 为您正在打分的文本生成摘要

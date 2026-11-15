@@ -1,0 +1,172 @@
+---
+title: "MySQL 中的生成列"
+sidebarTitle: "使用生成列"
+description: "MySQL 生成列的工作原理：VIRTUAL 与 STORED、表达式与索引、函数索引模式，以及生成列何时可以取代应用层计算。"
+keywords: "mysql generated column, mysql virtual column, mysql stored generated column, mysql computed column, mysql generated column index, mysql functional index, mysql as generated"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+生成列是一种其值由表达式推导而来、而不是由应用程序存储的列。MySQL 会自动计算它——您在 schema 中定义一次公式，MySQL 就会保持其一致。
+
+## 语法 {#syntax}
+
+```sql
+column_name data_type [GENERATED ALWAYS] AS (expression) [VIRTUAL | STORED]
+```
+
+```sql
+CREATE TABLE orders (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    subtotal    DECIMAL(10,2) NOT NULL,
+    tax_rate    DECIMAL(5,4) NOT NULL,
+    tax_amount  DECIMAL(10,2) AS (subtotal * tax_rate) VIRTUAL,
+    total       DECIMAL(10,2) AS (subtotal + subtotal * tax_rate) STORED
+);
+```
+
+## VIRTUAL 与 STORED {#virtual-vs-stored}
+
+| | VIRTUAL | STORED |
+|:--|:--------|:-------|
+| 存储 | 不占用磁盘存储——读取时计算 | 在 INSERT/UPDATE 时写入磁盘 |
+| 计算时机 | 每次 SELECT | 每次 INSERT/UPDATE |
+| 磁盘空间 | 节省空间 | 像普通列一样占用空间 |
+| 可以建索引 | 可以（索引存储计算后的值） | 可以 |
+| 可以作为外键目标 | 不可以 | 不可以 |
+| 是否默认 | 是——省略时默认为 VIRTUAL | 需显式指定 |
+
+当计算开销大、并且读取该列的次数远多于写入时，使用 `STORED`。当需要关注存储空间或写入频繁时，使用 `VIRTUAL`（默认值）。
+
+## 表达式 {#expressions}
+
+生成列表达式可以引用同一行中的其他列。它们不能引用其他生成列，也不能调用非确定性函数。
+
+```sql
+CREATE TABLE users (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    first_name VARCHAR(50),
+    last_name  VARCHAR(50),
+    full_name  VARCHAR(101) AS (CONCAT(first_name, ' ', last_name)) VIRTUAL,
+    email      VARCHAR(100),
+    email_lower VARCHAR(100) AS (LOWER(email)) STORED
+);
+```
+
+生成列中允许使用的函数必须是确定性的——相同的输入总是产生相同的输出。不允许使用：`NOW()`、`RAND()`、`UUID()`、子查询、存储函数。
+
+从 JSON 中提取字段是一个常见的用例：
+
+```sql
+CREATE TABLE events (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    payload JSON,
+    user_id INT AS (payload->>'$.user_id') STORED,
+    action  VARCHAR(50) AS (payload->>'$.action') VIRTUAL
+);
+```
+
+## 为生成列建索引 {#indexing-generated-columns}
+
+您可以在生成列上添加索引。对于 `VIRTUAL` 列，MySQL 会将计算后的值物化到索引中。
+
+```sql
+CREATE TABLE events (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    occurred_at DATETIME NOT NULL,
+    ym          VARCHAR(7) AS (DATE_FORMAT(occurred_at, '%Y-%m')) VIRTUAL
+);
+
+-- Index the computed ym. (Note: YEAR_MONTH is a reserved word — the
+-- INTERVAL unit in INTERVAL '1-2' YEAR_MONTH — so an unquoted column
+-- can't be named year_month.)
+ALTER TABLE events ADD INDEX idx_ym (ym);
+
+-- This query now uses the index
+SELECT * FROM events WHERE ym = '2024-06';
+```
+
+这也是构建**函数索引**的方法——即在列的函数结果上而不是原始列值上建立索引。MySQL 8.0.13+ 直接支持函数索引（`INDEX (LOWER(email))`），其内部会创建一个隐藏的生成列：
+
+```sql
+-- Functional index syntax (MySQL 8.0.13+)
+CREATE TABLE users (
+    id    INT PRIMARY KEY,
+    email VARCHAR(100),
+    INDEX idx_email_lower ((LOWER(email)))  -- note the double parentheses
+);
+
+-- Equivalent to:
+CREATE TABLE users (
+    id          INT PRIMARY KEY,
+    email       VARCHAR(100),
+    email_lower VARCHAR(100) AS (LOWER(email)) VIRTUAL,
+    INDEX idx_email_lower (email_lower)
+);
+```
+
+## 插入和更新 {#inserting-and-updating}
+
+您不能在 `INSERT` 或 `UPDATE` 中为生成列赋值。列的值始终由表达式推导。您可以显式地写 `DEFAULT`，但仅限于此：
+
+```sql
+-- Correct: omit the generated column entirely
+INSERT INTO orders (subtotal, tax_rate) VALUES (100.00, 0.08);
+
+-- Correct: DEFAULT is allowed
+INSERT INTO orders (subtotal, tax_rate, total) VALUES (100.00, 0.08, DEFAULT);
+
+-- Error: cannot assign a value to a generated column
+INSERT INTO orders (subtotal, tax_rate, total) VALUES (100.00, 0.08, 108.00);
+```
+
+## ALTER TABLE {#alter-table}
+
+向现有表添加生成列：
+
+```sql
+ALTER TABLE orders
+ADD COLUMN discount_pct DECIMAL(5,2)
+    AS (CASE WHEN subtotal > 1000 THEN 0.10 ELSE 0.00 END) VIRTUAL;
+```
+
+更改生成列的表达式。`VIRTUAL`/`STORED` 存储类别必须保持不变——切换它会引发 `ERROR 3106: 'Changing the STORED status' is not supported for generated columns`，因此更改存储类别意味着删除并重新添加该列：
+
+```sql
+ALTER TABLE orders
+MODIFY COLUMN tax_amount DECIMAL(10,2)
+    AS (ROUND(subtotal * tax_rate, 2)) VIRTUAL;
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我可以在 WHERE 子句中使用生成列吗？ {#can-i-use-a-generated-column-in-a-where-clause}
+
+可以。对于没有索引的 `VIRTUAL` 列，MySQL 在扫描期间计算表达式。对于 `STORED` 列或带索引的 `VIRTUAL` 列，值已经物化。使用 `EXPLAIN` 验证是否使用了索引。
+
+#### 源列更改时，生成列会自动更新吗？ {#does-a-generated-column-update-automatically-when-the-source-columns-change}
+
+会。MySQL 在每次读取时重新计算 `VIRTUAL` 生成列。`STORED` 生成列在每次影响表达式中所含列的 `INSERT` 或 `UPDATE` 时被重新计算并写入。
+
+#### 我可以将生成列用作分区键吗？ {#can-i-use-a-generated-column-as-a-partition-key}
+
+可以，`STORED` 和 `VIRTUAL` 生成列都可以。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 3105: The value specified for generated column is not allowed` | 您在 INSERT/UPDATE 中为生成列赋了显式值——省略它或使用 DEFAULT |
+| `ERROR 3763: Expression of generated column '<col>' contains a disallowed function: <name>` | 表达式使用了 `NOW()`、`RAND()`、`UUID()` 或子查询——替换为确定性的替代方案 |
+| 生成列未使用索引 | 检查 `EXPLAIN`——WHERE 子句的表达式必须与生成列的表达式完全一致；`WHERE LOWER(email)` 会使用 `LOWER(email)` 生成列的索引，但 `WHERE LOWER(TRIM(email))` 不会 |
+| `STORED` 列拖慢写入 | 每次 INSERT/UPDATE 都会重新计算并存储表达式——如果读取性能不是首要目标，请切换到 `VIRTUAL` |
+| `ALTER TABLE` 添加生成列很慢 | 对于 `STORED` 生成列，MySQL 会重建表；添加 `VIRTUAL` 列要快得多（在许多情况下只修改元数据） |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的 JSON](/zh/guides/json-in-mysql)——主要用例：用生成列为 JSON 字段建索引
+- [MySQL 索引的工作原理](/zh/guides/mysql-indexes)——生成列上的索引与普通索引的工作方式相同
+- [选择 MySQL 数据类型](/zh/guides/choosing-data-types)——生成列何时优于存储派生值
+- [MySQL 中的软删除](/zh/guides/soft-deletes)——软删除行的唯一约束修复方法

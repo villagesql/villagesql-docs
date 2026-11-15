@@ -1,0 +1,187 @@
+---
+title: "MySQL JOIN 性能与常见错误"
+sidebarTitle: "JOIN 性能"
+description: "MySQL JOIN 为何运行缓慢或返回错误的行：缺少索引、WHERE 抵消了 LEFT JOIN、重复行、NULL 连接键，以及没有 FULL OUTER JOIN。"
+keywords: "mysql join performance, mysql slow join, mysql left join returns fewer rows, mysql join duplicate rows, mysql full outer join, mysql join index, mysql join explain"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+JOIN 第一次能用，之后却出问题。查询是正确的 SQL，服务器不报任何错误，而结果是一个您没有预料到的行数，或者一份要跑 40 秒的报表。本指南涵盖这些情况：什么让连接变慢，以及连接悄悄返回错误行的 4 种方式。
+
+如果您还在决定该写哪种连接，教程会针对一个示例数据库逐一讲解：
+[连接的工作原理](/zh/tutorial/joins)、[INNER JOIN](/zh/tutorial/inner-join)、
+[LEFT JOIN](/zh/tutorial/left-join)、[RIGHT JOIN](/zh/tutorial/right-join)、
+[CROSS JOIN](/zh/tutorial/cross-join) 和 [自连接](/zh/tutorial/self-join)。
+
+## 本指南使用的表 {#the-tables-used-in-this-guide}
+
+```sql
+CREATE TABLE customers (
+    id    INT PRIMARY KEY AUTO_INCREMENT,
+    name  VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT,    -- nullable: orders without a customer
+    amount      DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+INSERT INTO orders VALUES
+    (1, 1, 99.00),   -- Alice's order
+    (2, 1, 45.00),   -- Alice's second order
+    (3, 2, 120.00),  -- Bob's order
+    (4, NULL, 15.00); -- order with no customer
+```
+
+## 为连接列建立索引 {#index-the-join-column}
+
+连接列上没有索引时，服务器会在一侧构建哈希表，然后扫描另一侧。`EXPLAIN FORMAT=TREE` 会把它标出来：
+
+```sql
+EXPLAIN FORMAT=TREE SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id\G
+```
+
+```text
+*************************** 1. row ***************************
+EXPLAIN: -> Inner hash join (o.customer_id = c.id)  (cost=2 rows=3)
+    -> Table scan on o  (cost=0.117 rows=4)
+    -> Hash
+        -> Table scan on c  (cost=0.55 rows=3)
+```
+
+哈希连接把每个表读一遍。在 7 行数据上这算不了什么。在真实的表上，这是 2 次全表扫描加上保存哈希所需的内存，而当构建侧放不进 `join_buffer_size` 时，服务器会把它分批溢出到磁盘。添加索引后，这一切都被一次查找取代：
+
+```sql
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+```
+
+再次请求同一个计划，哈希就不见了：
+
+```sql
+EXPLAIN FORMAT=TREE SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id\G
+```
+
+```text
+*************************** 1. row ***************************
+EXPLAIN: -> Nested loop inner join  (cost=1.95 rows=4)
+    -> Table scan on c  (cost=0.55 rows=3)
+    -> Index lookup on o using idx_orders_customer (customer_id=c.id)  (cost=0.378 rows=1.33)
+```
+
+请为一对多关系中"多"的一侧的外键列建立索引。"一"的一侧的主键已经有索引，所以那一侧什么都不需要做。
+
+在默认的 `EXPLAIN` 输出中，同样的 2 个计划显示为 `Extra: Using join
+buffer (hash join)` 和 `type: ref`。该表格还显示服务器选择的连接顺序，一旦查询涉及 3 个或更多表，这一点就很重要：服务器从上到下读取它们，第一个表的行数估计会逐级乘入下面的每一个表。
+[阅读 EXPLAIN 输出](/zh/guides/reading-explain) 介绍了计划的其余部分。
+
+等值条件是哈希连接能够查找的东西。改为在范围或不等式上连接，服务器仍然会构建哈希，但没有东西可以用来查找：计划显示为 `Inner hash join (no condition)`，其上方有一个 `Filter` 执行测试，于是每一对行都先被组合再被丢弃。这正是带索引的等值连接所避免的开销。
+
+## WHERE 子句把 LEFT JOIN 变回 INNER JOIN {#a-where-clause-turns-a-left-join-back-into-an-inner-join}
+
+最常见的行数错误，而且没有任何警告。
+
+```sql
+-- Excludes customers with no orders, so this is an inner join now
+SELECT c.name, o.amount
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 50;
+
+-- Keeps customers with no orders
+SELECT c.name, o.amount
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id AND o.amount > 50;
+```
+
+连接先执行，给没有匹配的客户一个 NULL 的 `o.amount`。然后 `WHERE` 测试每一行，`NULL > 50` 的结果是 NULL 而不是真，于是这些行被丢弃。把条件移进 `ON`，它就成为匹配判断的一部分。
+
+规则是：在外连接中，针对内表的条件放在 `ON`，针对保留表的条件放在 `WHERE`。例外是 `WHERE <inner table key> IS NULL`，这种情况下丢弃已匹配的行正是目的所在。
+
+## 连接列中的 NULL 不匹配任何东西 {#a-null-in-the-join-column-matches-nothing}
+
+`orders.customer_id` 可以为空，而订单 4 没有客户。内连接会丢弃它，因为 NULL 不等于任何东西，包括另一个 NULL。
+
+```sql
+SELECT c.name, o.amount
+FROM customers c
+INNER JOIN orders o ON o.customer_id = c.id
+ORDER BY c.name, o.amount;
+```
+
+```text
++-------+--------+
+| name  | amount |
++-------+--------+
+| Alice |  45.00 |
+| Alice |  99.00 |
+| Bob   | 120.00 |
++-------+--------+
+3 rows in set (0.00 sec)
+```
+
+4 个订单只得到 3 行。Carol 不在其中，因为她没有订单，这是符合预期的一半。订单 4 不在其中，因为它的 `customer_id` 是 NULL，这是让人意外的一半：这一行存在，它的金额是真实的，但没有任何连接条件能够触及它。基于这个连接计算的收入总额会少 15.00，而且没有任何提示。
+
+当连接列可以为空时，请在写连接之前决定孤立行应当如何处理。从 `orders` 出发的 `LEFT JOIN` 会保留它，客户名为 NULL。
+[MySQL 中的 NULL](/zh/guides/null-in-mysql) 介绍了背后的比较规则。
+
+## 一对多连接会让行数成倍增加 {#a-one-to-many-join-multiplies-your-rows}
+
+连接为每个匹配返回 1 行，所以连接到一个含有多个匹配行的表时，左侧的行会按匹配数重复。基于该结果计算的合计就会出错，通常偏高，而查询看起来仍然是正确的。
+
+```sql
+-- Alice appears twice, because she has 2 orders
+SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON o.customer_id = c.id;
+```
+
+在把重复行当作错误处理之前，请确认这个关系确实是一对一。当它是一对多，而您想要每个客户 1 行时，请做聚合：`GROUP BY c.id`，并对被连接表的列使用 `SUM` 或 `COUNT`。请参阅 [MySQL GROUP BY 性能](/zh/guides/group-by-having)。
+
+同一个查询中有 2 个一对多连接时，同样的算术会错得更快，因为 2 组匹配会相互相乘。请在各自的子查询中分别聚合，而不是同时连接两者。
+
+## 缺少 ON 会得到所有组合 {#a-missing-on-gives-you-every-combination}
+
+MySQL 接受没有 `ON` 子句的 `INNER JOIN`，并把它当作交叉连接，所以一个笔误会产生两个表的笛卡尔积，而不是报错。2 个各有 10,000 行的表会得到 1 亿行。
+
+当连接返回的行数大得可疑、整得可疑时，请先检查是否缺少 `ON`，再考虑其他原因。在旧语法中，`FROM` 中表之间的逗号是同一回事，匹配条件通常在更下面的 `WHERE` 中。
+
+## MySQL 没有 FULL OUTER JOIN {#mysql-has-no-full-outer-join}
+
+MySQL 中没有 `FULL OUTER JOIN`。请用 `UNION` 合并 2 个部分：
+
+```sql
+SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+UNION
+SELECT c.name, o.amount FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id;
+```
+
+`UNION` 会去除重复行，这正是让 2 个部分干净地合并起来的关键。`UNION ALL` 完全不能模拟全外连接：它会把每个匹配行返回两次，每个部分各一次。当您的数据中有需要保留的重复行时，请按键列去重，而不是改用 `UNION ALL`。
+
+## JOIN 还是子查询 {#join-or-subquery}
+
+连接和 `IN` 子查询常常表达同一个筛选，优化器偏好哪一个取决于数据。当您只需要知道相关行是否存在，而不需要它的任何列时，`EXISTS` 通常更易读，并且让服务器在第一个匹配处就停下。
+[MySQL 中的子查询与 JOIN](/zh/guides/subqueries-vs-joins) 结合计划对两者做了比较。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 原因与修复 |
+|:--------|:---------|
+| `LEFT JOIN` 返回的行比预期少 | 针对右表的 `WHERE` 条件丢弃了 NULL 行。把它移到 `ON`。 |
+| 大表上的连接很慢 | "多"的一侧的连接列没有索引。在 `EXPLAIN` 中查找 `type: ALL`。 |
+| 出现意外的重复行 | 该关系是一对多。用 `GROUP BY` 聚合，或确认它应当是一对一。 |
+| 合计偏高 | 同一原因：连接重复了左侧的行，所以求和把它计了好几次。 |
+| 连接返回一个巨大且凑整的行数 | 缺少 `ON` 子句，所以这个连接是交叉连接。 |
+| 两个表中都存在的行却不见了 | 连接列在一侧为 NULL，所以没有任何东西与之匹配。 |
+| `RIGHT JOIN` 难以理解 | 交换两个表，改写为 `LEFT JOIN`。结果相同。 |
+
+## 另请参阅 {#see-also}
+
+- [阅读 EXPLAIN 输出](/zh/guides/reading-explain) — 告诉您连接使用了哪个索引的计划
+- [MySQL 中的外键](/zh/guides/foreign-keys) — 决定该为哪个列建索引的约束
+- [MySQL GROUP BY 性能](/zh/guides/group-by-having) — 把一对多连接聚合回 1 行
+- [连接的工作原理](/zh/tutorial/joins) — 教程，如果您想先学基础

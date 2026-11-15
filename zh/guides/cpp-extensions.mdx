@@ -1,0 +1,184 @@
+---
+title: "编写 C++ 扩展"
+sidebarTitle: "编写 C++ 扩展"
+description: "如何用 C++ 编写 VillageSQL 扩展——何时选择 C++、CMake 设置、类型化包装器、构建和测试。"
+keywords: "villagesql extension c++, vef sdk, vdf c++, custom sql function c++, vsql extension template"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+VillageSQL 扩展是服务器在运行时加载的共享库。VEF SDK 提供类型化的 C++ 包装器，让您无需接触原始 FFI 即可编写扩展函数。本指南将带您从零开始构建一个最小的扩展。
+
+## 何时选择 C++ {#when-to-choose-c}
+
+在以下情况下，C++ 是正确的选择：
+
+- 您的团队已经有 C++ 代码库，并希望扩展使用同一种语言
+- 您需要具有精确二进制布局的自定义类型（C++ 类型构建器是最完整的 API）
+- 您正在使用现有的 C++ 库，并希望将其作为 SQL 函数公开
+
+如果您更喜欢 Rust 且没有 C++ 方面的要求，请参阅[编写 Rust 扩展](/zh/guides/rust-extensions)。
+
+## 先决条件 {#prerequisites}
+
+在编写扩展代码之前，您需要一个 VillageSQL 构建——扩展会链接到服务器的 SDK 头文件和构建树。
+
+您还需要：
+
+- **C++17 编译器** — GCC 8+、Clang 8+ 或 MSVC 2019+
+- **CMake 3.18+** — 扩展模板使用 CMake
+
+如果您尚未构建服务器，请先按照[从源代码构建](/zh/8.4/stable/source)指南操作。
+
+## CMake 设置 {#cmake-setup}
+
+最快的入门方式是使用 [vsql-extension-template](https://github.com/villagesql/vsql-extension-template)。Fork 它或克隆它：
+
+```bash
+git clone https://github.com/villagesql/vsql-extension-template my-extension
+cd my-extension
+```
+
+模板的 `CMakeLists.txt` 为您处理了 VEF 的构建设置——复制模板并加以改编，而不是从零编写 CMake。使用 `-DVillageSQL_BUILD_DIR` 配置构建目录：
+
+```bash
+mkdir build && cd build
+cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+make
+```
+
+`-DVillageSQL_BUILD_DIR` 告诉 CMake 您的 VillageSQL 构建在哪里，以便它找到 SDK 头文件。这会在构建输出中生成一个 `.veb` 文件。完整的 CMake 设置请参阅[创建扩展](/zh/extensions/build/create)和 [vsql-extension-template](https://github.com/villagesql/vsql-extension-template)。
+
+## 一个最小的 C++ VDF {#a-minimal-vdf-in-c}
+
+包含 VEF SDK 头文件并使用构建器 API 注册您的函数。下面是一个实现字符串反转函数的完整扩展：
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+void my_reverse_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();   // std::string_view
+    auto buf = out.buffer();   // Span<char>
+
+    if (sv.size() > buf.size()) {
+        out.error("my_reverse: input exceeds buffer size");
+        return;
+    }
+
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = sv[sv.size() - 1 - i];
+    }
+    out.set_length(sv.size());
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&my_reverse_impl>("my_reverse")
+            .returns(STRING)
+            .param(STRING)
+            .build())
+)
+```
+
+有几点需要注意：
+
+- 包含 `<villagesql/vsql.h>`，而不是 `<villagesql/extension.h>`（那是旧的 V1 头文件）
+- 类型化参数包装器（`StringArg`、`IntArg`、`RealArg`）检查空值并公开类型化的值——没有原始指针运算
+- `out.set_null()`、`out.warning(msg)` 和 `out.error(msg)` 是三种非成功返回
+- `VEF_GENERATE_ENTRY_POINTS` 接受一个 `make_extension()` 构建器，而不是原始结构体
+
+对于返回整数或实数的函数：
+
+```cpp
+void count_vowels_impl(StringArg input, IntResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    long long count = 0;
+    for (char c : input.value()) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    out.set(count);
+}
+```
+
+要将函数声明为确定性的——相同的输入始终产生相同的输出——请在构建器链中添加 `.deterministic()`：
+
+```cpp
+.func(make_func<&my_reverse_impl>("my_reverse")
+    .returns(STRING)
+    .param(STRING)
+    .deterministic()
+    .build())
+```
+
+确定性函数可以用在生成列和函数索引中。只有当确实成立时才添加 `.deterministic()`。
+
+## 构建 {#building}
+
+在上面 CMake 设置一节的 cmake 配置步骤之后，构建并安装：
+
+```bash
+make
+make install
+```
+
+`make install` 将 `.veb` 文件复制到您的 VillageSQL 扩展目录。
+
+## 安装与测试 {#installing-and-testing}
+
+连接到 VillageSQL 并安装扩展：
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+验证它已加载：
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+调用您的函数：
+
+```sql
+SELECT my_reverse('Hello, World!');
+-- → !dlroW ,olleH
+```
+
+对于自动化测试，请在 `mysql-test/t/` 中编写一个 MySQL 测试框架套件：
+
+```sql
+-- mysql-test/t/basic.test
+INSTALL EXTENSION my_extension;
+SELECT my_reverse('abc');
+SELECT my_reverse('');
+SELECT my_reverse(NULL);
+UNINSTALL EXTENSION my_extension;
+```
+
+生成预期结果并运行：
+
+```bash
+cd /path/to/villagesql/build/mysql-test
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test --record
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test
+```
+
+## 另请参阅 {#see-also}
+
+- [创建扩展](/zh/extensions/build/create) — 完整的 C++ SDK 参考：类型化包装器、自定义类型、聚合函数、系统变量
+- [扩展 API 参考](/zh/sdk/cpp/extension-api-reference) — VDF 约定、空值处理、缓冲区大小、错误语义
+- [编写 Rust 扩展](/zh/guides/rust-extensions) — 完成同一任务的 Rust 路径

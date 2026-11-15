@@ -1,0 +1,158 @@
+---
+title: "MySQL 中的 HMAC 签名"
+sidebarTitle: "创建 HMAC 签名"
+description: "如何使用 VillageSQL 的 hmac() 函数在 MySQL 中计算和验证 HMAC 签名——用于 webhook 验证、数据完整性和篡改检测。"
+keywords: "mysql hmac, mysql hmac sha256, mysql data integrity signature, mysql webhook verification, mysql tamper detection, mysql hmac function"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+哈希告诉您数据长什么样。HMAC 告诉您数据来自知道密钥的人。当您要验证某一行没有被篡改、某个 webhook 负载是真实的、或者某个令牌是由您的系统生成而不是伪造的时，这个区别就很重要。MySQL 没有内置的 HMAC 函数——标准答案是在应用程序代码中计算它。VillageSQL 的 `hmac()` 让您可以在 SQL 中完成。
+
+## 问题：没有内置 HMAC {#the-problem-no-built-in-hmac}
+
+MySQL 有 `SHA2()` 和 `MD5()` 用于哈希，但没有任何接受密钥的函数。HMAC（基于哈希的消息认证码）使用共享密钥生成认证码——它与普通哈希有根本的不同，因为没有密钥的人无法重现它。
+
+典型的做法是在写入数据库之前在应用程序中计算 HMAC：
+
+```python
+# Python: compute HMAC in app code before writing
+import hmac, hashlib
+sig = hmac.new(b'secret_key', row_data.encode(), hashlib.sha256).hexdigest()
+db.execute("INSERT INTO audit_log (data, signature) VALUES (?, ?)", (row_data, sig))
+```
+
+这可以工作，但意味着每条写入路径——每种语言、每个服务和每个批量加载器——都必须复制签名逻辑。绕过应用程序的迁移脚本会写入未签名的行。
+
+## 使用 VillageSQL：SQL 中的 hmac() {#with-villagesql-hmac-in-sql}
+
+VillageSQL 的 `vsql_crypto` 扩展添加了 `hmac(data, key, algorithm)`，它返回一个完全在 MySQL 中计算的 `VARBINARY` 认证码。
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+### 在触发器中为行签名 {#signing-rows-in-a-trigger}
+
+使用触发器在写入时为每一行签名，无论是哪条应用程序路径创建了它：
+
+```sql
+CREATE TABLE audit_log (
+    id        INT AUTO_INCREMENT PRIMARY KEY,
+    event     VARCHAR(255),
+    payload   TEXT,
+    signature VARBINARY(32),   -- 32 bytes for HMAC-SHA256
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Sign every insert automatically
+DELIMITER $$
+CREATE TRIGGER sign_audit_log
+BEFORE INSERT ON audit_log
+FOR EACH ROW
+BEGIN
+    SET NEW.signature = hmac(
+        CONCAT(NEW.event, '|', COALESCE(NEW.payload, '')),
+        'your-hmac-secret-key',
+        'sha256'
+    );
+END$$
+DELIMITER ;
+```
+
+```sql
+INSERT INTO audit_log (event, payload)
+VALUES ('user.login', '{"user_id": 42, "ip": "10.0.1.5"}');
+
+-- Verify a row hasn't been tampered with
+SELECT
+    event,
+    payload,
+    signature = hmac(
+        CONCAT(event, '|', COALESCE(payload, '')),
+        'your-hmac-secret-key',
+        'sha256'
+    ) AS valid
+FROM audit_log;
+```
+
+### 验证 webhook 负载 {#verifying-webhook-payloads}
+
+如果您的应用程序存储传入的 webhook 负载，您可以在处理之前直接在 SQL 中验证签名：
+
+```sql
+-- Webhook arrives with header X-Signature: <hex>
+-- Store the raw payload and verify before processing
+SELECT
+    payload,
+    HEX(hmac(payload, 'webhook-secret', 'sha256')) AS expected_sig,
+    incoming_sig = HEX(hmac(payload, 'webhook-secret', 'sha256')) AS valid
+FROM webhook_queue
+WHERE id = 1;
+```
+
+### 支持的算法 {#supported-algorithms}
+
+| 算法 | 调用 | 使用场景 |
+|:---|:---|:---|
+| HMAC-SHA256 | `hmac(data, key, 'sha256')` | 通用——推荐的默认选择 |
+| HMAC-SHA512 | `hmac(data, key, 'sha512')` | 需要更高的安全余量 |
+| HMAC-SHA1 | `hmac(data, key, 'sha1')` | 仅用于旧系统兼容 |
+| HMAC-MD5 | `hmac(data, key, 'md5')` | 仅用于旧系统兼容 |
+
+新代码请使用 HMAC-SHA256。HMAC 结构不会继承底层哈希的碰撞漏洞，因此 HMAC-SHA1 并不像普通 SHA-1 那样已被攻破——但 SHA-1 已被弃用，监管机构将其视为旧算法。不要在新代码中使用它。
+
+## HMAC 与普通哈希 {#hmac-vs-plain-hash}
+
+| | 普通哈希（`digest()`） | HMAC（`hmac()`） |
+|:---|:---|:---|
+| **需要密钥** | 否 | 是 |
+| **没有密钥也可伪造** | 是——任何人都可以对相同数据做哈希 | 否 |
+| **用途** | 校验和、去重、数据指纹 | 认证、篡改检测、签名 |
+| **可由谁验证** | 任何人 | 只有持有密钥的人 |
+
+如果您要保护的数据是公开的，普通哈希证明不了任何事。当您需要证明数据由知道密钥的人产生时，使用 HMAC。关于不带密钥的哈希，请参阅 [在 MySQL 中对数据进行哈希](/zh/guides/hashing-data)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 把 HMAC 密钥存在触发器中安全吗？ {#is-storing-the-hmac-key-in-the-trigger-safe}
+
+不安全——它被硬编码在触发器定义中，任何有 `SHOW CREATE TRIGGER` 权限的人都能看到。在生产环境中，请从安全的配置路径获取密钥，或者将其作为应用程序在连接时设置的会话变量传入。将密钥视为凭据。
+
+#### 我可以用 HMAC 验证查询结果在传输中没有被篡改吗？ {#can-i-use-hmac-to-verify-query-results-havent-been-altered-in-transit}
+
+HMAC 防御的是未经授权的修改，而不是窃听。对于传输中的保护，请为您的 MySQL 连接使用 TLS。HMAC 的用处在于检测数据到达数据库之后的篡改。
+
+#### 如何轮换 HMAC 密钥？ {#how-do-i-rotate-the-hmac-key}
+
+在切换之前，用新密钥重新签名所有现有行：
+
+```sql
+UPDATE audit_log
+SET signature = hmac(
+    CONCAT(event, '|', COALESCE(payload, '')),
+    'new-hmac-key',
+    'sha256'
+);
+-- Then update the key in your application/trigger
+```
+
+#### hmac() 对相同的输入返回相同的输出吗？ {#does-hmac-return-the-same-output-for-the-same-inputs}
+
+是的——HMAC 是确定性的。相同的数据 + 相同的密钥 + 相同的算法总是产生相同的结果。这正是验证能够工作的原因。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.hmac does not exist` | 运行 `INSTALL EXTENSION vsql_crypto` |
+| `hmac()` 返回 NULL | 检查数据或密钥参数中是否有 NULL，或者算法名称是否不受支持 |
+| 验证总是返回 0 | 检查数据字符串是否与签名时逐字节完全相同——空白、编码和 NULL 处理都有影响 |
+| 签名列全是 NULL | 触发器在运行，但密钥或数据为 NULL——在可空字段外面加上 `COALESCE` |
+
+## 另请参阅 {#see-also}
+
+- [在 MySQL 中对数据进行哈希](/zh/guides/hashing-data)——用于数据指纹和去重的无密钥哈希
+- [从触发器发送 Webhook](/zh/guides/http-webhooks)——HMAC 是为 webhook 负载签名的标准方式

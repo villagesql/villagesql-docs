@@ -1,0 +1,134 @@
+---
+title: "MySQL GROUP_CONCAT"
+sidebarTitle: "GROUP_CONCAT"
+description: "GROUP_CONCAT 如何把 MySQL 组中的值连接成 1 个字符串，如何排序和分隔它们，以及只给一个警告就截断它的字节限制。"
+keywords: "mysql group_concat, group_concat mysql, mysql concatenate rows, mysql group_concat separator, mysql group_concat order by, group_concat_max_len"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`COUNT` 告诉您一个组里有多少行。`GROUP_CONCAT` 告诉您它们是什么，方法是把它们的值连接成 1 个字符串。它是保留明细而不是把它归约为一个数字的聚合。
+
+开始之前，请用 `mysql -u root -p sakila` 打开客户端。
+
+## GROUP_CONCAT 的工作原理 {#how-group_concat-works}
+
+```sql
+SELECT GROUPING_COLUMN,
+       GROUP_CONCAT(COLUMN_NAME ORDER BY COLUMN_NAME SEPARATOR 'SEPARATOR_TEXT')
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN;
+```
+
+把 `GROUPING_COLUMN` 换成定义各个组的列，把 `TABLE_NAME` 换成表，把 `COLUMN_NAME` 换成要连接的列，把 `SEPARATOR_TEXT` 换成放在值之间的东西。`ORDER BY` 和 `SEPARATOR` 都是可选的，它们位于括号之内，而不是在外围的查询中。
+
+没有 `SEPARATOR` 时，值用逗号连接，没有空格。没有 `ORDER BY` 时，它们以不确定的顺序到达。
+
+## 示例 {#examples}
+
+### 1) 连接每个组中的值 {#1-join-the-values-in-each-group}
+
+```sql
+SELECT rating, GROUP_CONCAT(title ORDER BY title SEPARATOR ', ') AS titles
+FROM film
+WHERE length = 185
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+--------------------------------------------------+
+| rating | titles                                           |
++--------+--------------------------------------------------+
+| G      | CONTROL ANTHEM, DARN FORRESTER, MUSCLE BRIGHT    |
+| PG     | WORST BANGER                                     |
+| PG-13  | CHICAGO NORTH, GANGS PRIDE, POND SEATTLE         |
+| R      | HOME PITY, SOLDIERS EVOLUTION, SWEET BROTHERHOOD |
++--------+--------------------------------------------------+
+4 rows in set (0.00 sec)
+```
+
+4 行而不是 5 行，因为没有 `NC-17` 电影时长 185 分钟，`WHERE` 在分组之前删除了它的行。一个没有行剩下的组不会出现。
+
+### 2) 去掉重复项 {#2-drop-the-repeats}
+
+括号内的 `DISTINCT` 去掉每个组内的重复值。
+
+```sql
+SELECT rating, GROUP_CONCAT(DISTINCT rental_rate ORDER BY rental_rate) AS rates
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+----------------+
+| rating | rates          |
++--------+----------------+
+| G      | 0.99,2.99,4.99 |
+| PG     | 0.99,2.99,4.99 |
+| PG-13  | 0.99,2.99,4.99 |
+| R      | 0.99,2.99,4.99 |
+| NC-17  | 0.99,2.99,4.99 |
++--------+----------------+
+5 rows in set (0.00 sec)
+```
+
+没有 `DISTINCT` 时，每个字符串会为组内的每部电影保存 1 份租金，178 到 223 份之间，而最长的 2 个会碰到下一节讲的限制。这里也是默认的分隔符：一个逗号，别无其他。
+
+## 结果在 group_concat_max_len 字节处被截断 {#the-result-is-cut-off-at-group_concat_max_len-bytes}
+
+这就是陷阱。服务器会截断变得太长的 `GROUP_CONCAT` 结果，并且不报错误。这个限制是一个设置，所以下面的数字是这台服务器的，而不是 MySQL 的属性，而且它数的是字节而不是字符。
+
+```sql
+SELECT LENGTH(GROUP_CONCAT(title)) AS bytes FROM film;
+```
+
+```text
++-------+
+| bytes |
++-------+
+|  1024 |
++-------+
+1 row in set, 1 warning (0.00 sec)
+```
+
+恰好 1,024，这本身就可疑：真实的总长度很少会刚好是这样一个整的数字。请对照设置检查它。
+
+```sql
+SELECT @@group_concat_max_len AS max_len;
+```
+
+```text
++---------+
+| max_len |
++---------+
+|    1024 |
++---------+
+1 row in set (0.00 sec)
+```
+
+第一个查询的结果末尾报告了一个警告，`SHOW WARNINGS` 说明了丢失的内容：`Warning 1260 Row 65 was cut by GROUP_CONCAT()`。这个字符串保存了 1,000 个标题中完整的 64 个，然后在第 65 个的中间停下。
+
+请在 `GROUP_CONCAT` 之后自己运行 `SHOW WARNINGS`，看到同样的消息。
+
+`SET SESSION group_concat_max_len = 100000;` 为您连接的余下时间提高这个限制，并在您重新连接时恢复。因为这个限制数的是字节，ASCII 之外的文本会比数字所暗示的更早被截断：在 `utf8mb4` 中一个字符最多可以占 4 个字节。
+
+在您检查之前，请把长度恰好等于 `group_concat_max_len` 的结果当作已被截断，并留意结果末尾的警告计数。
+
+## 总结 {#summary}
+
+- 用 `GROUP_CONCAT` 把一个组中的值连接成 1 个字符串。
+- 把 `ORDER BY`、`SEPARATOR` 和 `DISTINCT` 放在括号之内。
+- 不指定分隔符时，预期是一个没有空格的逗号。
+- 预期在 `group_concat_max_len` 字节处被截断，伴随一个警告而不是错误。
+- 每当长度恰好等于限制时，怀疑发生了截断。
+
+## 另请参阅 {#see-also}
+
+- [聚合函数](/zh/tutorial/aggregate-functions) — 返回数字的那些聚合
+- [GROUP BY](/zh/tutorial/group-by) — 构建 `GROUP_CONCAT` 所连接的组
+- [MySQL 字符串函数](/zh/guides/string-functions) — 事后重塑字符串
+- [MySQL GROUP BY 性能](/zh/guides/group-by-having) — 大规模构建这些字符串的代价

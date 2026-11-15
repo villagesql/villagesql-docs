@@ -1,0 +1,62 @@
+---
+title: "在 Kubernetes 上运行 MySQL"
+sidebarTitle: "Kubernetes 上的 MySQL"
+description: "在 Kubernetes 中运行 MySQL 需要什么：StatefulSet 与 Operator 的对比、存储决策，以及对何时托管数据库才是更好答案的坦诚分析。"
+keywords: "mysql kubernetes, mysql statefulset, mysql operator kubernetes, mysql k8s persistent volume, run database on kubernetes"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Kubernetes 是为无状态工作负载而构建的，而 MySQL 恰恰相反。在 Kubernetes 上运行 MySQL 完全可行，也被广泛采用；只是这意味着 Kubernetes 不会免费替您解决数据库的任何难题。本指南介绍三种投入程度、真正重要的存储决策，以及您根本不应该这样做的情况。
+
+## 三种入手方式 {#three-ways-in}
+
+**单实例 StatefulSet。** 一个 MySQL Pod 加一个 PersistentVolumeClaim。这种形态适合开发环境、CI 和内部工具，在这些场景中，节点故障时几分钟的停机是可以接受的。它大致相当于 Kubernetes 版的"一个带卷的 Docker 容器"，[Docker 指南](/zh/guides/mysql-on-docker)介绍的 MySQL 端配置同样适用于此。
+
+容易让人栽跟头的要点，按它们在清单中出现的位置列出：
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+spec:
+  replicas: 1            # one writer; MySQL doesn't scale writes by replica count
+  volumeClaimTemplates:  # storage that survives the pod
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+```
+
+将 Pod 的内存 request 和 limit 设为相同的值，并把 `innodb_buffer_pool_size` 控制在该值以内（limit 的 50% 到 70%）。超出内存 limit 的 MySQL Pod 会在写入途中被 OOM 终止；与 Docker 的故障模式相同，修复方法也相同。
+
+**Operator。** 对于任何接近生产形态的部署，请使用 Operator 而不是手工编写的 StatefulSet：Oracle 的 MySQL Operator、Percona 的 Operator，或者用于分片规模的 Vitess。Operator 把运维手册——置备副本、编排故障转移、协调备份——编码为控制器。代价是引入一个新的依赖，它有自己的升级节奏和故障模式，您必须在事故发生之前而不是事故当中理解它们。
+
+**集群旁边的托管数据库。** 在 Kubernetes 中运行应用程序，并将其指向 RDS、Cloud SQL 或其他托管 MySQL。对于小团队来说这是默认答案：备份、故障转移和补丁由别人承担，而您的集群保持无状态。
+
+## 存储是真正重要的决策 {#storage-is-the-decision-that-matters}
+
+- **始终使用 PVC，绝不使用 `emptyDir`。** `emptyDir` 卷会随 Pod 一起消失，而 MySQL Pod 会因为与您无关的各种原因被重新调度。
+- **优先选择由网络块存储支持的存储类**（EBS、PD 及同类产品）。`ReadWriteOnce` 正是数据库所需要的；网络文件系统（NFS 风格的 `ReadWriteMany`）正是它不需要的。
+- **本地 NVMe 更快也更危险。** 本地卷把 Pod 固定在某个节点上；除非有复制覆盖，否则节点丢失就是数据丢失。只在由 Operator 管理的副本集中搭配使用本地存储。
+- **在做出决定之前对 IOPS 做基准测试。** 大型云厂商的默认存储类通常按容量而不是按 IOPS 配置，一个在笔记本电脑上运行良好的数据库，在配置不足的卷上会慢得像爬。
+
+## 没有陷阱的探针 {#probes-without-foot-guns}
+
+运行查询的存活探针可能会杀死一个只是短暂变慢的健康服务器（缓冲池冷启动、长时间 DDL），而 Kubernetes 在恢复途中重启 MySQL 会让恢复花更长时间。保持存活探针最小化（进程是否在接受 TCP 连接），并把真正的健康检查（`mysqladmin ping`、副本延迟）放进就绪探针，它只影响流量路由。
+
+## 何时不要这样做 {#when-not-to-do-this}
+
+当数据库是您产品的唯一事实来源、团队中没有同时了解这两个系统的值班人员，或者您的云平台以可接受的成本提供托管服务时，请跳过"MySQL 跑在 Kubernetes 里"这个方案。坦率的权衡是：Kubernetes 恰恰在运维失误最难挽回的那个组件上增加了运维面。
+
+VillageSQL 可以在 MySQL 能运行的任何地方运行，并且在上面任何一份清单中，`villagesql/server` 镜像都可以直接替换 `mysql`：相同的数据目录布局、相同的端口、相同的客户端。
+
+## 另请参阅 {#see-also}
+
+- [Docker 上的 MySQL](/zh/guides/mysql-on-docker) — Kubernetes 所建立在其之上的容器基础
+- [复制基础](/zh/guides/replication-basics) — Operator 替您自动化的内容
+- [备份策略](/zh/guides/backup-strategies) — 备份仍然需要；PVC 快照不是备份策略

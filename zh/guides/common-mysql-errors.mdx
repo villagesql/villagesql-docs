@@ -1,0 +1,99 @@
+---
+title: "常见 MySQL 错误及其修复方法"
+sidebarTitle: "常见错误"
+description: "解读人人都会遇到的 MySQL 错误：访问被拒绝（1045）、无法连接（2002）、ONLY_FULL_GROUP_BY（1055）、语法错误（1064）和重复键（1062）。"
+keywords: "mysql error 1045 access denied, mysql error 2002 can't connect, only_full_group_by error, mysql error 1055, mysql error 1064, mysql duplicate entry 1062"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+五个错误占了大多数 MySQL 支持问题。下面的每一个都按服务器发出的原样展示，并说明它的真实含义和修复方法。它们在 VillageSQL 上的行为完全相同。
+
+## ERROR 2002：无法通过套接字连接 {#error-2002-cant-connect-through-socket}
+
+```text
+ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/tmp/nosuch.sock' (2)
+```
+
+客户端根本没有连到服务器。这是连接问题，不是认证问题：要么服务器没有运行，要么客户端找错了地方。`(2)` 是 errno 2，即"没有此文件"（no such file）。
+
+- 检查服务器是否在运行：`pgrep mysqld` 或您的服务管理器。
+- `mysql -h localhost` 使用 Unix 套接字。如果服务器监听的是另一个套接字路径，请传入它：`mysql -S /path/to/mysql.sock`。
+- 要强制使用 TCP 而不是套接字，请使用 `-h 127.0.0.1`，而不是 `-h localhost`。
+
+## ERROR 1045：访问被拒绝 {#error-1045-access-denied}
+
+```text
+ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)
+```
+
+与 2002 相反：连到了服务器，而服务器拒绝了凭据。请仔细读这条消息。它指出了三个事实：
+
+- 服务器认为您是**哪个用户**。
+- 您从**哪个主机**连接。MySQL 账户是 `user@host` 对：`'app'@'localhost'` 和 `'app'@'%'` 是不同的账户，有不同的密码和授权。
+- **`using password: YES/NO`**——是否发送了密码。`NO` 通常表示客户端在它读取的环境或配置文件中没有找到密码。
+
+修复方法是确认您的主机对应的是哪个账户（以管理员身份执行 `SELECT user, host FROM mysql.user;`），并用 `ALTER USER` 重置其密码。请参阅 [用户管理](/zh/guides/user-management)。
+
+## ERROR 1055：ONLY_FULL_GROUP_BY {#error-1055-only_full_group_by}
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'myapp.orders.total' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+产生该错误的查询：
+
+```sql
+SELECT customer_id, total
+FROM orders
+GROUP BY customer_id;
+```
+
+每个组有一个 `customer_id` 但有多个 `total` 值，而查询从未说明它想要哪一个。旧版 MySQL 会任意选一个；从 5.7 起，默认的 `ONLY_FULL_GROUP_BY` 模式把这变成了一个错误，它是在保护您免受一个一直以来就是错误的查询的影响。三种真正的修复方法：
+
+```sql
+-- Say what you meant with an aggregate
+SELECT customer_id, SUM(total) FROM orders GROUP BY customer_id;
+
+-- Or group by every selected column
+SELECT customer_id, total FROM orders GROUP BY customer_id, total;
+
+-- Or, if any value from the group is genuinely fine, say so explicitly
+SELECT customer_id, ANY_VALUE(total) FROM orders GROUP BY customer_id;
+```
+
+在 `sql_mode` 中禁用 `ONLY_FULL_GROUP_BY` 也能消除错误，但这是错误的答案：它把错误变回了静默的任意结果。关于 `ANY_VALUE()` 承诺什么、不承诺什么，请参阅 [MySQL GROUP BY 性能](/zh/guides/group-by-having)。
+
+## ERROR 1064：语法错误 {#error-1064-syntax-error}
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'SELEC 1' at line 1
+```
+
+引号中的片段从解析器无法接受的第一个标记开始，所以实际的错误就在引号起始处或其之前。常见的原因：关键字拼写错误、列列表中缺少逗号、保留字用作标识符却没有加反引号，或者一个多余的引号把半条语句变成了字符串。
+
+## ERROR 1062：重复条目 {#error-1062-duplicate-entry}
+
+```text
+ERROR 1062 (23000): Duplicate entry '1' for key 'orders.PRIMARY'
+```
+
+唯一约束尽到了职责。消息指出了值和索引，所以诊断已经完成；要决定的是这次插入应该意味着什么：
+
+- 该行绝不应该出现两次：修复产生重复键的生成器。
+- 插入应该改为更新现有行：使用 `INSERT ... ON DUPLICATE KEY UPDATE`。请参阅 [Upsert](/zh/guides/upsert)。
+- 插入应该被静默跳过：`INSERT IGNORE`，请谨慎使用，因为它也会压制其他错误。
+
+## 读懂任何 MySQL 错误 {#reading-any-mysql-error}
+
+`ERROR <number> (<SQLSTATE>): <message>` 这个模式携带三个信号。编号是 MySQL 特有的，也是最好的搜索关键字。SQLSTATE 类别是可移植的：`28000` 是认证，`42000` 是查询问题，`23000` 是约束违规，`HY000` 是通用类别。客户端错误（2xxx，如 2002）从未到达服务器；服务器端错误（1xxx）表示连接正常。
+
+## 另请参阅 {#see-also}
+
+- [用户管理](/zh/guides/user-management)——访问被拒绝错误背后的账户模型
+- [MySQL GROUP BY 性能](/zh/guides/group-by-having)——ONLY_FULL_GROUP_BY，以及为什么禁用它是错误的修复方法
+- [MySQL GROUP BY](/zh/tutorial/group-by)——关于编写该子句的教程课程
+- [Upsert](/zh/guides/upsert)——把重复键错误变成更新
+- [为 MySQL 教程安装服务器](/zh/tutorial/install-mysql)——连接错误，以及可以重现它们的命令

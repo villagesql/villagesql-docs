@@ -1,0 +1,122 @@
+---
+title: "MySQL 中的多维范围查询"
+sidebarTitle: "多维查询"
+description: "如何使用 VillageSQL 的 vsql_cube 扩展在 MySQL 中存储和查询多维数据——跨多个数值属性的包含、重叠和最近邻查询。"
+keywords: "mysql multi-dimensional range query, mysql geometric type, mysql cube extension, mysql nearest neighbor, mysql n-dimensional search, vsql_cube"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  本指南需要 VillageSQL 0.0.4 或更高版本。
+</Note>
+
+MySQL 没有内置的方式来表示 n 维空间中的点或区域。您可以把多个数值列的 AND 条件串起来，但那只能处理包含关系——它无法扩展到距离查询，也不能让您把一行的属性当作一个统一的几何值。VillageSQL 的 `vsql_cube` 扩展添加了 `cube` 自定义类型，让这两种查询都变得自然。
+
+## 问题 {#the-problem}
+
+假设您有一个产品目录，每个产品有价格、平均评分和评论数。一位买家想要价格在 $50–$200 之间、评分至少 3.5、评论数至少 50 的产品。这是一个三路 AND：
+
+```sql
+-- Works for containment, but doesn't generalize
+SELECT name FROM products
+WHERE price BETWEEN 50 AND 200
+  AND rating BETWEEN 3.5 AND 5.0
+  AND reviews BETWEEN 50 AND 1000;
+```
+
+AND 链能找到匹配项。但如果您想找与给定产品最相似的 5 个产品——在价格、评分和评论数上同时最接近——SQL 没有自然的答案。您必须把候选项拉到应用代码中，在那里计算距离。
+
+## 使用 VillageSQL：cube 类型 {#with-villagesql-the-cube-type}
+
+```sql
+INSTALL EXTENSION vsql_cube;
+```
+
+`cube` 类型存储 n 维空间中的一个点或一个盒子。点是一个位置；盒子是由两个角坐标定义的区域。两者都存放在普通的列中。
+
+```sql
+CREATE TABLE products (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255),
+    attrs `cube`(3)
+);
+```
+
+`cube` 是 MySQL 的保留字，所以在 DDL 中要用反引号括起来。维度参数（`3`）是必需的——不带数字的裸 `cube` 不受支持。
+
+### 插入数据 {#inserting-data}
+
+直接插入坐标字符串，让列自身的转换来解析它。不要把它包在 `cube_point_nd()` 中：那会返回一个无参数的 `cube`，它无法隐式转换为带维度参数的 `cube(3)` 列（`ERROR 3219`）。
+
+```sql
+INSERT INTO products (name, attrs) VALUES
+    ('Budget Widget',   '29.99,4.1,320'),
+    ('Standard Widget', '79.99,4.4,1250'),
+    ('Premium Widget',  '149.99,4.7,890'),
+    ('Discount Widget', '19.99,3.2,45'),
+    ('Pro Widget',      '199.99,4.8,2100');
+```
+
+这里的坐标是 `(price, rating, review_count)`——每个产品一个点。
+
+### 使用 cube_contains 进行范围查询 {#range-queries-with-cube_contains}
+
+把您的搜索区域定义为一个盒子。`cube_box_nd()` 先接受下角的坐标，再接受上角的坐标，所以一个三维盒子需要六个数字。
+
+```sql
+-- Products: $50–$200, rating 3.5–5.0, 50–2000 reviews
+SET @region = cube_box_nd(50.0, 3.5, 50, 200.0, 5.0, 2000);
+
+SELECT name FROM products
+WHERE cube_contains(@region, attrs);
+```
+
+当产品的点落在盒子内时，`cube_contains(@region, attrs)` 返回 1——等价于同时满足全部三个 AND 条件，但还可以与距离查询组合。
+
+### 使用 cube_distance 进行最近邻查询 {#nearest-neighbor-with-cube_distance}
+
+要找到与给定产品最相似的产品，请在属性空间中测量欧几里得距离：
+
+```sql
+-- 3 products most similar to Standard Widget (79.99, 4.4, 1250)
+SET @target = cube_point_nd(79.99, 4.4, 1250);
+
+SELECT name,
+       ROUND(cube_distance(attrs, @target), 2) AS distance
+FROM products
+WHERE name != 'Standard Widget'
+ORDER BY cube_distance(attrs, @target)
+LIMIT 3;
+```
+
+关于缩放的说明：价格是几百量级，评分是 0–5，评论数可能是几千。原始的欧几里得距离会被评论数主导。如果您想要平衡的相似度评分，请在插入之前把三个维度归一化到共同的尺度（例如 0–1）。
+
+### 检查重叠 {#checking-overlap}
+
+如果两个盒子共享任何空间，`cube_overlaps()` 返回 1——这对检查某个产品是否符合多个促销区间中的任意一个很有用：
+
+```sql
+SET @promo_a = cube_box_nd(0.0, 4.5, 500, 100.0, 5.0, 9999);
+SET @promo_b = cube_box_nd(100.0, 4.0, 100, 300.0, 5.0, 9999);
+
+SELECT name FROM products
+WHERE cube_overlaps(@promo_a, attrs) OR cube_overlaps(@promo_b, attrs);
+```
+
+## 故障排除 {#troubleshooting}
+
+| 错误 | 修复 |
+|---|---|
+| `ERROR: Function 'cube_point_nd' does not exist` | 运行 `INSTALL EXTENSION vsql_cube` |
+| 列类型 `cube` 无法识别 | 确认您运行的是 VillageSQL 0.0.4 或更高版本 |
+| 列声明被拒绝 | 在 DDL 中用反引号括起 `cube`：`` `cube`(N) `` |
+| 距离结果看起来不对 | 归一化坐标——原始的欧几里得距离会被尺度最大的维度扭曲 |
+
+## 另请参阅 {#see-also}
+
+- [在 MySQL 中生成向量嵌入](/zh/guides/vector-embeddings) — AI 生成的向量作为多维相似度的另一种方法
+- [如何在 MySQL 中实现全文搜索](/zh/guides/full-text-search) — 基于关键词的搜索作为文本数据的替代方案
+- [如何为您的数据选择合适的列类型](/zh/guides/choosing-data-types) — 何时使用 cube 而不是标准列类型

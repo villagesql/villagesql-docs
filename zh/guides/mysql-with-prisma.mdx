@@ -1,0 +1,229 @@
+---
+title: "Next.js 和 Prisma 搭配 MySQL"
+sidebarTitle: "Next.js 搭配 Prisma"
+description: "在 Prisma 7 和 MySQL 上端到端构建 Next.js App Router 应用程序：模式、迁移、Prisma 7 现在要求的驱动适配器，以及一个可用的读写页面。本指南中的每条命令都可以原样在 VillageSQL 上运行。"
+keywords: "nextjs prisma mysql, prisma driver adapter mysql, prisma 7 mysql, prisma migrate mysql, prisma server action, villagesql prisma"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Prisma 是使用最广泛的 TypeScript ORM 之一，而 Next.js 的 App Router 是新项目接入数据库的常见方式。本指南构建一个小型 Next.js 应用，通过 Prisma 7 列出并创建 MySQL 中的行，涵盖自旧版 Prisma 教程以来发生变化的部分：连接 URL 移出了模式文件，驱动适配器不再是可选的。因为 VillageSQL 是 MySQL 的直接替代品，这里的每条命令都可以原样在它上面运行。
+
+## 创建数据库 {#create-the-database}
+
+Prisma 需要两个数据库：一个供您的应用使用，另一个是它内部用来计算迁移的"影子"数据库。创建这两个数据库，以及一个对两者都有权限的专用用户：
+
+```sql
+CREATE DATABASE prisma_guide CHARACTER SET utf8mb4;
+CREATE DATABASE prisma_guide_shadow CHARACTER SET utf8mb4;
+CREATE USER 'prisma_app'@'127.0.0.1' IDENTIFIED BY 'change-me';
+GRANT ALL PRIVILEGES ON prisma_guide.* TO 'prisma_app'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON prisma_guide_shadow.* TO 'prisma_app'@'127.0.0.1';
+```
+
+影子数据库只需要存在即可。Prisma 会自动在其中创建和删除表。预先创建它并把该数据库的权限授予应用用户，而不是在 `*.*` 上授予更宽泛的 `CREATE`/`DROP` 权限让 Prisma 自己创建影子数据库，这样可以把密码泄露的影响范围限制在两个数据库，而不是整台服务器。
+
+## 搭建应用 {#scaffold-the-app}
+
+```bash
+npx create-next-app@latest my-app --typescript --app --src-dir
+cd my-app
+npm install prisma@7 @prisma/client@7
+```
+
+请固定主版本号。在撰写本文时，npm 上 `prisma` 的 `latest` 标签指向一个 8.0 候选发布版本：可以试用，但对于一份要持续可用的指南来说是错误的默认值。
+
+## 初始化 Prisma {#initialize-prisma}
+
+```bash
+npx prisma init --datasource-provider mysql --no-skills
+```
+
+`prisma init` 默认会运行一个 postinstall 步骤，把 Claude Code、Cursor 和 Windsurf 的代理技能搭建到您的仓库中（`.claude/`、`.windsurf/`、`.agents/`，外加一个 `skills-lock.json`）。`--no-skills` 跳过这一步。如果您在使用 Prisma 的同时也使用 AI 编码代理，这是一个确实有用的功能，只是不在本指南的范围内。
+
+这会创建 `prisma/schema.prisma`、一个 `.env` 文件和 `prisma7.config.ts`（在 Prisma 7 中配置文件名带有版本后缀）。设置连接字符串：
+
+```bash .env
+DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide"
+SHADOW_DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide_shadow"
+```
+
+旧版 Prisma 教程把数据源 URL 直接放在 `schema.prisma` 中。从 Prisma 7 开始，连接 URL（包括影子数据库 URL）放在 `prisma7.config.ts` 中，而不是模式文件中：
+
+```ts prisma7.config.ts
+import "dotenv/config";
+import { defineConfig } from "prisma/config";
+
+export default defineConfig({
+  schema: "prisma/schema.prisma",
+  migrations: { path: "prisma/migrations" },
+  datasource: {
+    url: process.env["DATABASE_URL"],
+    shadowDatabaseUrl: process.env["SHADOW_DATABASE_URL"],
+  },
+});
+```
+
+`schema.prisma` 保留 `prisma init` 创建的 `generator` 块，现在数据源上只声明 provider，不带连接 URL：
+
+```prisma prisma/schema.prisma
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String   @db.VarChar(255)
+  body      String   @db.Text
+  createdAt DateTime @default(now())
+}
+```
+
+## 运行迁移 {#run-the-migration}
+
+```bash
+npx prisma migrate dev --name init
+```
+
+这会应用模式，生成 `prisma/migrations/<timestamp>_init/migration.sql`，并替您调用 `prisma generate`。确认表已存在：
+
+```sql
+SHOW TABLES FROM prisma_guide;
+-- _prisma_migrations, Post
+```
+
+## 使用驱动适配器连接 {#connect-with-a-driver-adapter}
+
+Prisma 7 生成的客户端不再自行连接：不带参数的 `new PrismaClient()` 现在无法通过类型检查。您需要传给它一个驱动适配器，每种数据库一个包：
+
+```bash
+npm install @prisma/adapter-mariadb mariadb
+```
+
+`@prisma/adapter-mariadb` 是同时适用于 MariaDB 和 MySQL 的适配器：线路协议是共享的，所以它在 VillageSQL 上的工作方式与在原版 MySQL 上相同。设置一个单例，这样 Next.js 开发模式下的热重载就不会在每次保存文件时打开一个新的连接池：
+
+```ts src/lib/prisma.ts
+import { PrismaClient } from "@/generated/prisma/client";
+import { PrismaMariaDb } from "@prisma/adapter-mariadb";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+const adapter = new PrismaMariaDb(process.env.DATABASE_URL!);
+
+export const prisma = globalForPrisma.prisma ?? new PrismaClient({ adapter });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+### 新账户的首次连接 {#the-first-connection-to-a-new-account}
+
+MySQL 8 和 VillageSQL 使用 `caching_sha2_password` 插件创建账户。某个账户第一次进行身份验证时，客户端必须完成一次 RSA 密钥交换；之后服务器会缓存结果，后续连接走一条跳过该步骤的更快路径。`@prisma/adapter-mariadb` 拒绝在未加密的连接上进行这种交换，因此在一台从未验证过这个账户的服务器上，构建会失败：
+
+```
+Database error. Code: `45028`. Message: `pool timeout: failed to retrieve a connection
+from pool after 10000ms (pool connections: active=0 idle=0 limit=10)`
+```
+
+那条消息中没有任何内容提到身份验证，而 `active=0 idle=0` 让它读起来像是服务器无法访问。底层驱动的错误更具体：
+
+```
+RSA public key is not available client side. Either set option `cachingRsaPublicKey`
+to indicate public key path, or allow public key retrieval with option
+`allowPublicKeyRetrieval`
+```
+
+对于本地开发，把该选项添加到连接 URL：
+
+```bash .env
+DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide?allowPublicKeyRetrieval=true"
+```
+
+通过未加密连接获取密钥会把密码暴露给任何能够拦截第一次握手的人，因此除了本地服务器之外，对任何服务器都请使用 TLS 而不是这个选项。
+
+这与 [FastAPI 指南](/zh/guides/fastapi-sqlalchemy-mysql)针对 `asyncmy` 记录的陷阱相同，而且它时有时无的原因也相同：一旦任何客户端（包括 `mysql` CLI）为该账户完成过一次完整的身份验证，缓存的结果就会掩盖这个问题，直到缓存被 `FLUSH PRIVILEGES` 或服务器重启清除。
+
+生成的客户端的导入路径有两个怪癖。它没有 `index.ts`，因此您要导入 `@/generated/prisma/client`（文件），而不是 `@/generated/prisma`（目录）。而且该文件中的每个导出都标注了 `@ts-nocheck`，因为它是生成的代码，供您导入而不是阅读。
+
+## 在 Server Component 中读写 {#read-and-write-from-a-server-component}
+
+```tsx src/app/page.tsx
+import { prisma } from "@/lib/prisma";
+import { revalidatePath } from "next/cache";
+
+async function createPost(formData: FormData) {
+  "use server";
+  const title = formData.get("title") as string;
+  const body = formData.get("body") as string;
+  await prisma.post.create({ data: { title, body } });
+  revalidatePath("/");
+}
+
+export default async function Home() {
+  const posts = await prisma.post.findMany({ orderBy: { createdAt: "desc" } });
+
+  return (
+    <main>
+      <form action={createPost}>
+        <input name="title" placeholder="Title" required />
+        <textarea name="body" placeholder="Body" required />
+        <button type="submit">Create post</button>
+      </form>
+      <ul>
+        {posts.map((post) => (
+          <li key={post.id}>
+            <strong>{post.title}</strong>
+            <p>{post.body}</p>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+`prisma.post.findMany()` 作为 Server Component 运行，因此列表渲染时数据已经在 HTML 中，没有客户端获取。表单提交到一个 Server Action（`"use server"`），它通过同一个 Prisma 客户端写入，并调用 `revalidatePath("/")`，这样新文章无需客户端刷新就会显示出来。
+
+此时运行 `npm run build` 实际上会查询数据库：因为首页没有使用动态 API，Next.js 会在构建时把它预渲染为静态内容，这意味着 `findMany()` 在构建期间运行，而不只是在请求时运行。如果您的数据库在 `npm run build` 期间不可达，构建就会在那里失败，因此这个应用的 CI 流水线在构建时就需要一个可达的数据库，而不只是在运行时。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 生产环境需要影子数据库吗？ {#do-i-need-the-shadow-database-in-production}
+
+不需要。`prisma migrate dev` 在您开发时用它来检测模式漂移。在生产环境中，使用 `prisma migrate deploy`，它应用现有的迁移文件，完全不触碰影子数据库。
+
+#### 为什么我的独立脚本报错 "Cannot read properties of undefined (reading 'prepareCacheLength')"？ {#why-does-my-standalone-script-fail-with-cannot-read-properties-of-undefined-reading-preparecachelength}
+
+在那个脚本的环境中 `process.env.DATABASE_URL` 是 `undefined`。Next.js 会为 `next dev` 和 `next build` 自动加载 `.env`，但普通的 `node` 或 `tsx` 脚本不会。在脚本顶部添加 `import "dotenv/config"`。
+
+#### 我可以改用 `@prisma/adapter-pg` 的 MySQL 对应物吗？ {#can-i-use-prismaadapter-pgs-mysql-equivalent-instead}
+
+没有 MySQL 专属的适配器名称。`@prisma/adapter-mariadb` 就是 Prisma 为 MariaDB 和 MySQL（包括 VillageSQL）提供的那一个。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `Error: P3014` / "User was denied access on the database `prisma_migrate_shadow_db_...`" | 您的应用用户不能创建数据库。预先创建一个专用的影子数据库并授予权限，或者在接受权衡的前提下授予更宽泛的 `CREATE`/`DROP` 权限。 |
+| `error: The datasource property 'shadowDatabaseUrl' is no longer supported in schema files` | 您在使用 Prisma 5/6 风格的、内联连接 URL 的 `schema.prisma`。把 `url` 和 `shadowDatabaseUrl` 都移到 `prisma7.config.ts` 的 `datasource` 块中。 |
+| `pool timeout: failed to retrieve a connection from pool` 且 `active=0 idle=0` | 该账户从未在这台服务器上完成过完整的 `caching_sha2_password` 身份验证，而适配器不会在未加密的情况下做 RSA 交换。本地开发时向 `DATABASE_URL` 添加 `?allowPublicKeyRetrieval=true`，或者通过 TLS 连接。 |
+| `new PrismaClient()` 上出现 `Expected 1 arguments, but got 0` | Prisma 7 需要驱动适配器。安装 `@prisma/adapter-mariadb` 并传入 `new PrismaClient({ adapter })`。 |
+| `info You don't have any generators defined in your schema.prisma, so nothing will be generated.` | 您的 `schema.prisma` 缺少 `generator client` 块。把它加回去；删除它（哪怕是在精简文件时不小心删掉）意味着 `prisma generate` 不会生成任何东西。 |
+| `Module not found: Can't resolve '@/generated/prisma'` | 请改为导入 `@/generated/prisma/client`。生成的输出没有 `index.ts` 汇总文件。 |
+
+## 另请参阅 {#see-also}
+
+- [Next.js 和 Drizzle 搭配 MySQL](/zh/guides/mysql-with-drizzle) — 同一个应用，用更轻量、SQL 优先的 ORM 而不是 Prisma 构建
+- [Next.js 搭配 MySQL](/zh/guides/nextjs-mysql) — 完全不用 ORM 的连接设置、Server Actions 和 Route Handler 模式
+- [在 ORM 中使用 MySQL](/zh/guides/mysql-with-orms) — 对每个 ORM 都重要的设置，不只是 Prisma
+- [连接池](/zh/guides/connection-pooling) — 驱动适配器的连接池大小如何与您的进程数相互作用

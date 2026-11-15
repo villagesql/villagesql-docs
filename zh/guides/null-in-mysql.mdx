@@ -1,0 +1,203 @@
+---
+title: "MySQL 中的 NULL"
+sidebarTitle: "处理 NULL"
+description: "NULL 在 MySQL 中如何工作：三值逻辑、比较和聚合中的常见陷阱，以及索引如何处理 NULL 值。"
+keywords: "mysql null, mysql ifnull, mysql coalesce, mysql three valued logic, mysql null index, mysql null aggregate, mysql null join"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 中的 NULL 不表示零、空字符串或 false。它表示未知——这种区别会导致难以追踪的缺陷，因为查询不会报错，而是静默地返回错误的结果。
+
+## NULL 不是一个值 {#null-is-not-a-value}
+
+NULL 表示值的缺失。把 NULL 与任何东西比较——包括另一个 NULL——不会返回 true 或 false。它返回 NULL。
+
+```sql
+SELECT NULL = NULL;    -- NULL (not 1)
+SELECT NULL != NULL;   -- NULL (not 0)
+SELECT NULL = 0;       -- NULL
+SELECT NULL = '';      -- NULL
+SELECT 1 + NULL;       -- NULL
+SELECT 'hello' || NULL; -- NULL (logical OR with NULL is unknown, not concatenation — see below)
+```
+
+默认情况下，MySQL 的 `sql_mode` 不包含 `PIPES_AS_CONCAT`，因此 `||` 是逻辑 OR，而不是字符串连接——`'hello' || 'world'` 的求值结果是 `0`，而不是 `'helloworld'`。这与 PostgreSQL 和 ANSI 标准不同，在那里 `||` 总是连接。在 MySQL 中请使用 `CONCAT()` 进行字符串连接。
+
+这就是三值逻辑：true、false 和未知（NULL）。任何与 NULL 的比较都产生未知，MySQL 在 `WHERE` 子句中把未知当作 false 处理。这意味着被过滤列中为 NULL 的行会被静默地排除。
+
+```sql
+CREATE TABLE users (
+    id       INT PRIMARY KEY AUTO_INCREMENT,
+    email    VARCHAR(255),
+    referrer VARCHAR(255)  -- nullable
+);
+
+INSERT INTO users (email, referrer) VALUES
+    ('a@example.com', 'google'),
+    ('b@example.com', NULL),
+    ('c@example.com', 'twitter');
+
+-- This returns only 1 row — both the 'google' row and the NULL row are excluded
+SELECT * FROM users WHERE referrer != 'google';
+```
+
+要包含 NULL 行，请显式使用 `IS NULL`：
+
+```sql
+SELECT * FROM users WHERE referrer != 'google' OR referrer IS NULL;
+```
+
+## 测试 NULL {#testing-for-null}
+
+始终使用 `IS NULL` 和 `IS NOT NULL`，绝不使用 `= NULL` 或 `!= NULL`：
+
+```sql
+-- Wrong — always returns no rows
+SELECT * FROM users WHERE referrer = NULL;
+
+-- Correct
+SELECT * FROM users WHERE referrer IS NULL;
+SELECT * FROM users WHERE referrer IS NOT NULL;
+```
+
+MySQL 还提供 `<=>`（NULL 安全的相等运算符），它把两个 NULL 视为相等：
+
+```sql
+SELECT NULL <=> NULL;  -- 1 (true)
+SELECT NULL <=> 0;     -- 0 (false)
+```
+
+当您希望在 `WHERE` 子句中让 NULL 与 NULL 匹配时，这很有用，例如比较两个可能为 NULL 的列的查询。
+
+## 聚合中的 NULL {#null-in-aggregates}
+
+聚合函数（`COUNT`、`SUM`、`AVG` 等）忽略 NULL 值——`COUNT(*)` 除外。
+
+```sql
+SELECT
+    COUNT(*)        AS total_rows,      -- counts all rows including NULLs
+    COUNT(referrer) AS has_referrer,    -- counts only non-NULL referrer values
+    AVG(referrer)   AS avg_referrer     -- ignores NULLs in the average
+FROM users;
+```
+
+```
+total_rows | has_referrer
+-----------+-------------
+3          | 2
+```
+
+`COUNT(*)` 返回 3。`COUNT(referrer)` 返回 2——NULL 行被排除了。这是有意为之的行为，但它会让那些预期 `COUNT(column)` 等于 `COUNT(*)` 的开发者感到意外。
+
+## 在表达式中处理 NULL {#handling-null-in-expressions}
+
+当列为 NULL 时，使用 `COALESCE` 替换为默认值：
+
+```sql
+-- Returns the first non-NULL value in the list
+SELECT email, COALESCE(referrer, 'direct') AS source FROM users;
+```
+
+```
+email           | source
+----------------+---------
+a@example.com  | google
+b@example.com  | direct
+c@example.com  | twitter
+```
+
+对于双参数的情况，`IFNULL(column, default)` 是等价的：
+
+```sql
+SELECT email, IFNULL(referrer, 'direct') AS source FROM users;
+```
+
+`NULLIF(a, b)` 在 `a = b` 时返回 NULL，否则返回 `a`。对于避免除以零很有用：
+
+```sql
+SELECT total_revenue / NULLIF(order_count, 0) AS avg_order_value FROM stats;
+```
+
+| 函数 | 行为 | 使用场景 |
+|:---------|:---------|:---------|
+| `COALESCE(a, b, ...)` | 返回列表中第一个非 NULL 的值 | 您有多个回退选项 |
+| `IFNULL(a, b)` | 如果 `a` 为 NULL 则返回 `b`，否则返回 `a` | 单个回退值；对于两个参数，语法比 `COALESCE` 更简单 |
+| `NULLIF(a, b)` | 如果 `a = b` 则返回 NULL，否则返回 `a` | 抑制哨兵值（例如，在计数为 0 时避免除以零） |
+
+NULL 还会以不明显的方式影响 JOIN 的行为。`LEFT JOIN` 在没有匹配时为右侧列返回 NULL，而在 `WHERE` 中对这些 NULL 列过滤会把它静默地变成 `INNER JOIN`。请参阅 [MySQL LEFT JOIN](/zh/tutorial/left-join)，其中在示例数据库上演示了 ON 与 WHERE 的区别。
+
+## NULL 与索引 {#null-and-indexes}
+
+MySQL 索引存储 NULL 值。`WHERE col IS NULL` 查询可以使用 `col` 上的索引。然而：
+
+- 在 `UNIQUE` 索引中，`NULL` 值不被视为相等——唯一列可以包含多个 NULL 值
+- 在复合索引中，任何列位置上的 NULL 都正常建立索引
+
+```sql
+CREATE TABLE sessions (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT,           -- nullable: anonymous sessions
+    token      VARCHAR(64) NOT NULL UNIQUE,
+    created_at DATETIME NOT NULL,
+    INDEX idx_user (user_id)  -- indexes NULL values too
+);
+
+-- This query can use idx_user
+SELECT * FROM sessions WHERE user_id IS NULL;
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 对于可选的文本字段，我应该使用 NULL 还是空字符串？ {#should-i-use-null-or-empty-string-for-optional-text-fields}
+对于真正缺失的数据，优先使用 NULL。空字符串（`''`）表示"显式设置为空"，与"未提供"不同。混用它们会造成不一致——`WHERE col IS NULL` 和 `WHERE col = ''` 是不同的条件。选定一种约定并始终如一地应用它。
+
+#### 为什么 `NOT IN` 遇到 NULL 时行为异常？ {#why-does-not-in-behave-unexpectedly-with-nulls}
+子查询返回任何 NULL 时，`NOT IN` 总是返回空结果集：
+
+```sql
+-- If any value in category_ids is NULL, this returns no rows
+SELECT * FROM products WHERE category_id NOT IN (SELECT id FROM categories);
+```
+
+当子查询可能返回 NULL 时，请改用 `NOT EXISTS`：
+
+```sql
+SELECT * FROM products p
+WHERE NOT EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id);
+```
+
+#### `ORDER BY` 会对 NULL 排序吗？ {#does-order-by-sort-nulls}
+会。默认情况下，MySQL 在升序时把 NULL 值排在最前面，在降序时排在最后面。MySQL 不支持 `NULLS FIRST` / `NULLS LAST` 语法（那是 PostgreSQL 的）。要控制 NULL 的位置，请使用排序表达式：
+
+```sql
+-- NULLs last in ascending order
+SELECT * FROM users ORDER BY referrer IS NULL, referrer ASC;
+
+-- NULLs first in ascending order (default behavior, but explicit)
+SELECT * FROM users ORDER BY referrer IS NULL DESC, referrer ASC;
+```
+
+`col IS NULL` 对非 NULL 值求值为 0，对 NULL 求值为 1，因此按它升序排序会把 NULL 推到末尾。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `WHERE col != 'value'` 排除了 NULL 行 | 在条件中添加 `OR col IS NULL` |
+| `COUNT(column)` 与 `COUNT(*)` 不一致 | 预期行为——`COUNT(column)` 跳过 NULL。要统计总行数，请使用 `COUNT(*)` |
+| `NOT IN` 子查询返回空结果 | 子查询返回了 NULL——请改用 `NOT EXISTS` |
+| WHERE 中的 `= NULL` 什么都匹配不到 | 替换为 `IS NULL` |
+| UNIQUE 列允许重复的 NULL | 预期行为——在唯一索引中 NULL 不被视为相等 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL JOIN 性能与常见错误](/zh/guides/joins) — NULL 在连接中导致的行数错误缺陷
+- [MySQL 中的 CHECK 约束](/zh/guides/check-constraints) — 强制执行 NOT NULL 和其他列规则
+- [MySQL 中真正的布尔类型](/zh/guides/boolean-columns) — 布尔聚合如何处理 NULL
+- [MySQL INNER JOIN](/zh/tutorial/inner-join) — 为什么内连接会丢弃一行而不是显示 NULL
+- [MySQL 运算符](/zh/tutorial/operators) — 为什么与 NULL 的比较返回 NULL
+- [MySQL IS NULL](/zh/tutorial/is-null) — 在 WHERE 子句中测试缺失的值
+- [MySQL LEFT JOIN](/zh/tutorial/left-join) — 外连接中的 NULL 从何而来

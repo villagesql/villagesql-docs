@@ -1,0 +1,147 @@
+---
+title: "MySQL 中的对称加密"
+sidebarTitle: "使用对称加密"
+description: "对称加密在 MySQL 中如何工作：AES 密钥长度、CBC 与 ECB 模式、MySQL 的 AES_ENCRYPT 局限，以及何时在 SQL 中加密、何时在应用层加密。"
+keywords: "mysql symmetric encryption, mysql AES encrypt, mysql aes-256, mysql encrypt decrypt, mysql aes cbc ecb, mysql encryption key management"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+对称加密使用同一个密钥进行加密和解密。当您需要存储敏感数据并在以后取回原始值时，它是正确的工具；这一点与单向的哈希不同。MySQL 内置了 `AES_ENCRYPT()`，但它默认使用一种不安全的模式。本指南介绍其中的取舍、如何在 MySQL 中正确使用 AES，以及何时在 SQL 中加密、何时在应用层加密。
+
+## AES 加密在 MySQL 中如何工作 {#how-aes-encryption-works-in-mysql}
+
+MySQL 的 `AES_ENCRYPT(data, key)` 使用 128 位 AES，密钥从密钥字符串派生。默认模式是 ECB（电子密码本），每个 16 字节的块独立加密。ECB 是确定性的：相同的 16 字节输入总是产生相同的 16 字节输出。这使得密文中的模式清晰可见。
+
+```sql
+-- ECB default: identical inputs → identical outputs
+SELECT HEX(AES_ENCRYPT('same data', 'key')) AS first,
+       HEX(AES_ENCRYPT('same data', 'key')) AS second;
+-- Both columns are identical
+```
+
+CBC 模式（密码块链接）解决了这个问题：在加密前把每个块与前一个密文块进行异或运算，并为第一个块使用随机的初始化向量（IV）。相同的明文在每次调用时都会产生不同的密文。
+
+MySQL 支持 CBC，但您必须通过修改 `block_encryption_mode` 来主动启用，并自行管理 IV：
+
+```sql
+SET @@block_encryption_mode = 'aes-256-cbc';
+SET @iv = RANDOM_BYTES(16);
+
+SET @ciphertext = AES_ENCRYPT('sensitive data', 'my-32-byte-key-here-padded-to-32', @iv);
+SELECT AES_DECRYPT(@ciphertext, 'my-32-byte-key-here-padded-to-32', @iv);
+```
+
+## 使用 VillageSQL：自动的 CBC 和 IV 处理 {#with-villagesql-automatic-cbc-and-iv-handling}
+
+VillageSQL 的 `vsql_crypto` 扩展提供了 `encrypt()` 和 `decrypt()`，它们使用 AES-CBC，并在每次调用时生成随机 IV。IV 被前置到密文中：不需要额外的列，也不需要额外的参数。
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+SET @key = 'my-32-byte-key-here-padded-to-32';  -- exactly 32 bytes for AES-256
+
+-- Different ciphertext every call — CBC with random IV
+SELECT HEX(encrypt('same data', @key, 'aes-256')) AS first,
+       HEX(encrypt('same data', @key, 'aes-256')) AS second;
+-- Both columns differ
+
+-- Round-trip
+SET @enc = encrypt('sensitive data', @key, 'aes-256');
+SELECT CONVERT(decrypt(@enc, @key, 'aes-256') USING utf8mb4);
+-- Returns: sensitive data
+```
+
+### AES 密钥长度 {#aes-key-sizes}
+
+| 加密算法 | 密钥长度 | 安全级别 |
+|:---|:---|:---|
+| `'aes'` 或 `'aes-128'` | 16 字节 | 128 位，足以应对大多数用例 |
+| `'aes-192'` | 24 字节 | 192 位 |
+| `'aes-256'` | 32 字节 | 256 位，用于受监管的数据（PII、HIPAA、PCI） |
+
+密钥长度按密钥字符串的字节数强制执行。密钥短于加密算法所要求的长度时，会报 `ERROR 3200: VDF error in function 'encrypt': key too short for <cipher>: need N bytes, got M`，而不是用零填充；更长的密钥会被静默截断到所需长度。如果遇到意外行为，请检查 `LENGTH(@key)`。
+
+### 存储加密数据 {#storing-encrypted-data}
+
+`encrypt()` 返回 `VARBINARY`。存储的值包含前置在密文前的 16 字节 IV。请据此设定列的大小：
+
+```sql
+CREATE TABLE customer_data (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    email    VARCHAR(255),
+    ssn_enc  VARBINARY(64),    -- short strings up to ~32 chars
+    notes_enc BLOB              -- longer text
+);
+
+SET @key = 'my-32-byte-key-here-padded-to-32';
+
+INSERT INTO customer_data (email, ssn_enc)
+VALUES ('alice@example.com', encrypt('123-45-6789', @key, 'aes-256'));
+
+SELECT email, CONVERT(decrypt(ssn_enc, @key, 'aes-256') USING utf8mb4) AS ssn
+FROM customer_data;
+```
+
+## MySQL 与 VillageSQL 对比 {#mysql-vs-villagesql-comparison}
+
+| | `AES_ENCRYPT()`（MySQL 默认） | `encrypt()`（VillageSQL） |
+|:---|:---|:---|
+| **默认模式** | ECB（不安全） | 带随机 IV 的 CBC |
+| **IV 管理** | 手动，需单独存储 | 自动，前置到输出中 |
+| **对架构的影响** | CBC 需要 IV 列 | 密文 + IV 只占一列 |
+| **重复的明文** | 相同密文（ECB） | 每次密文都不同 |
+| **密钥长度控制** | 通过 `block_encryption_mode` 设置 | 通过加密算法类型参数 |
+
+## 何时在 SQL 中加密、何时在应用层加密 {#when-to-encrypt-in-sql-vs-application-layer}
+
+在 SQL 中加密很方便，但有取舍：
+
+| | SQL 层加密 | 应用层加密 |
+|:---|:---|:---|
+| **密钥位置** | 在查询/触发器中（若出现在日志中则有风险） | 在密钥管理器中，不在 SQL 中 |
+| **可搜索性** | 无法按加密值过滤 | 同样的限制 |
+| **批量操作** | 加密在数据库中完成 | 必须经过应用代码 |
+| **密钥轮换** | 需要在 SQL 中重新加密全部数据 | 可在应用中用旧密钥解密、用新密钥重新加密 |
+| **审计跟踪** | 查询日志可能暴露明文 | 应用控制记录的内容 |
+
+当您信任应用程序，但担心数据库级别的访问（备份、只读副本、泄露的数据库凭据）时，SQL 层加密对保护静态数据很有用。应用层加密让您对密钥有更多控制，并避免让明文接触到 SQL 日志。
+
+有关列级模式和架构设计，请参阅 [在 MySQL 中加密列](/zh/guides/encrypting-columns)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 对称加密和非对称加密有什么区别？ {#whats-the-difference-between-symmetric-and-asymmetric-encryption}
+
+对称加密（AES）使用同一个密钥进行加密和解密。它速度快，适合批量数据。非对称加密（RSA）用公钥加密、私钥解密，适合密钥交换，但对批量数据来说太慢。对于存储敏感的列数据，对称 AES 是正确的选择。
+
+#### 我可以在加密列上搜索吗？ {#can-i-search-on-an-encrypted-column}
+
+不能直接搜索。要按加密值查找行，您必须解密每一行，也就是全表扫描。一种常见的变通方法：把明文的带密钥哈希（HMAC）存放在一个单独的带索引列中，用于等值查找。这会泄露两行具有相同的值，但不会泄露值是什么。
+
+#### 如何轮换加密密钥？ {#how-do-i-rotate-encryption-keys}
+
+读取每一行，用旧密钥解密，用新密钥重新加密，再写回。对于大表，请分批进行。这是 SQL 层加密的主要运维成本。信封加密（用主密钥加密数据密钥）让您可以轮换主密钥而不必触碰数据。
+
+#### AES 加密能防范 SQL 注入吗？ {#does-aes-encryption-protect-against-sql-injection}
+
+不能。加密保护的是存储的值。SQL 注入是输入验证问题：能运行任意 SQL 的攻击者可以直接调用 `decrypt()`。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.encrypt does not exist` | 运行 `INSTALL EXTENSION vsql_crypto` |
+| `decrypt()` 返回 NULL | 密钥错误、加密算法类型错误或密文损坏 |
+| `AES_ENCRYPT` 对相同输入产生相同输出 | 您正在使用 ECB 模式。请改用 `encrypt()`，或设置 `block_encryption_mode = 'aes-256-cbc'` 并手动管理 IV |
+| 列太小 | 给 `VARBINARY` 的大小加 32 字节（16 字节用于 IV，最多 16 字节用于 AES 块填充） |
+| `key too short for <cipher>` | 检查 `LENGTH(@key)`，它必须至少为该加密算法所需的密钥长度（16、24 或 32 字节）。更长的密钥会被静默截断，因此请使用精确的长度以避免意外 |
+
+## 另请参阅 {#see-also}
+
+- [在 MySQL 中加密列](/zh/guides/encrypting-columns)：使用 vsql_crypto 在列级别应用加密
+- [在 MySQL 中哈希数据](/zh/guides/hashing-data)：不需要解密时的单向操作

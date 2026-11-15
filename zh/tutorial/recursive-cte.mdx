@@ -1,0 +1,114 @@
+---
+title: "MySQL 递归 CTE"
+sidebarTitle: "递归 CTE"
+description: "MySQL 递归 CTE 如何从自己的输出生成行，每个递归 CTE 都需要的 2 个部分，以及用 ERROR 3636 阻止失控查询的深度限制。"
+keywords: "mysql recursive cte, mysql with recursive, mysql hierarchical query, mysql generate series, mysql error 3636, mysql anchor member"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+普通的 CTE 读取表。递归 CTE 读取它自己，所以每一轮行都会产生下一轮。SQL 正是用它来遍历层级结构或生成序列，而这两件事都是普通的 `SELECT` 做不到的。
+
+开始之前，请用 `mysql -u root -p sakila` 打开客户端。
+
+## 递归 CTE 的工作原理 {#how-a-recursive-cte-works}
+
+```sql
+WITH RECURSIVE CTE_NAME AS (
+  SELECT SEED_VALUE AS COLUMN_NAME
+  UNION ALL
+  SELECT NEXT_EXPRESSION FROM CTE_NAME WHERE STOP_CONDITION
+)
+SELECT COLUMN_NAME FROM CTE_NAME;
+```
+
+把 `CTE_NAME` 替换为结果的名称，`COLUMN_NAME` 替换为它生成的列，`SEED_VALUE` 替换为起始值，`NEXT_EXPRESSION` 替换为从上一行生成下一行的表达式，`STOP_CONDITION` 替换为最终会不成立的测试。
+
+递归 CTE 有 2 种部分，由 `UNION ALL` 连在一起：
+
+- 一个**种子**，也叫锚定成员，它完全不提及 CTE，并生成起始行。
+- 一个**递归成员**，它从 CTE 本身选取数据。
+
+大多数递归 CTE 各有且只有 1 个，这就是下面的形式。MySQL 接受其中任一种多于 1 个，也接受用 `UNION` 代替 `UNION ALL`，后者会对每一轮去重。这两种情况都不常见，但遇到时值得认出来。
+
+服务器先运行种子，然后针对上一轮生成的结果运行递归部分，反复进行，直到某一轮不再产生任何行。递归部分中的 `WHERE` 正是最终让这件事发生的东西。
+
+关键字是 `WITH RECURSIVE`，它放在 `WITH` 上，而不是放在 CTE 上。
+
+## 数到 5 {#counting-to-5}
+
+```sql
+WITH RECURSIVE numbers AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM numbers WHERE n < 5
+)
+SELECT n FROM numbers;
+```
+
+```text
++------+
+| n    |
++------+
+|    1 |
+|    2 |
+|    3 |
+...
++------+
+5 rows in set (0.00 sec)
+```
+
+种子生成第 1 行。递归部分取这一行生成 2，再取 2 生成 3，到达 5 时停止，因为 `WHERE n < 5` 不再产生下一行。
+
+这样的序列比看上去更有用。把它与真实数据连接，就能得到一个范围内每一天的行，包括什么都没发生的日子，而只查询数据本身的查询无法做到这一点。
+
+## 省略停止条件 {#leaving-out-the-stop-condition}
+
+去掉 `WHERE`，递归部分就总会再产生一行。
+
+```sql
+WITH RECURSIVE numbers AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM numbers
+)
+SELECT n FROM numbers;
+```
+
+```text
+ERROR 3636 (HY000): Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.
+```
+
+服务器会把它停下来，而不是让它永远运行。这个限制是一个设置：
+
+```sql
+SELECT @@cte_max_recursion_depth AS max_depth;
+```
+
+```text
++-----------+
+| max_depth |
++-----------+
+|      1000 |
++-----------+
+1 row in set (0.01 sec)
+```
+
+消息中的计数比设置值大 1，因为突破限制的那一轮在服务器停止之前就已被计入。
+
+请先把 `ERROR 3636` 理解为停止条件缺失或有误。只有当您确实需要比默认值更多的轮数时，用 `SET SESSION cte_max_recursion_depth = 5000;` 提高限制才是对的。当查询本来就永远不会停止时，这样做是错的，因为它只会花更长时间才失败，而且照样失败。这个设置是一个变量，所以上面的 1,000 是这台服务器的值，而不是 MySQL 的固定属性。
+
+## 总结 {#summary}
+
+- 当 CTE 读取自身时，写 `WITH RECURSIVE`。
+- 给它一个种子部分和一个递归成员，由 `UNION ALL` 连在一起。
+- 把停止条件放在递归部分的 `WHERE` 中。
+- 在去改那个设置之前，先把 `ERROR 3636` 理解为失控的递归。
+
+## 另请参阅 {#see-also}
+
+- [公用表表达式](/zh/tutorial/cte) — 非递归的那一种
+- [UNION](/zh/tutorial/union) — 把这 2 个部分连在一起的运算符
+- [MySQL CTE 何时胜过派生表](/zh/guides/ctes-in-mysql) — 优化器如何处理它们

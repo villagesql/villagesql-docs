@@ -1,0 +1,173 @@
+---
+title: "在 MySQL 中存储 MAC 地址"
+sidebarTitle: "存储 MAC 地址"
+description: "如何在 MySQL 中存储 MAC 地址 — 为什么 VARCHAR 不够用，以及 VillageSQL 的 MACADDR 和 MACADDR8 类型如何提供紧凑存储、格式规范化和 OUI 提取。"
+keywords: "mysql mac address storage, mysql macaddr type, mysql store mac address, mysql oui extraction, mysql network device table, mysql eui64"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 中的 MAC 地址通常存储为 `VARCHAR(17)`。这能存下它们，但它接受任何字符串，不做任何规范化，并且在 6 字节就够用的情况下花费 17 字节。VillageSQL 的 `MACADDR` 类型在插入时验证格式，规范化为一致的表示形式，并附带 OUI 提取功能。
+
+## MySQL 的默认做法：VARCHAR(17) {#the-mysql-default-varchar17}
+
+```sql
+CREATE TABLE devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address VARCHAR(17),
+    hostname    VARCHAR(255)
+);
+
+INSERT INTO devices (mac_address, hostname) VALUES
+    ('08:00:2b:01:02:03', 'server-01'),
+    ('08-00-2B-01-02-04', 'server-02');  -- different format, uppercase
+```
+
+两行都插入成功。现在同一列中有同一个厂商前缀的两种表示形式。去重查询变成了字符串规范化问题。没有任何机制保证该列确实存放着有效的 MAC 地址。
+
+## 标准的变通方法：BINARY(6) {#the-standard-workaround-binary6}
+
+紧凑存储：插入时转换为二进制，读取时转换回字符串。
+
+```sql
+CREATE TABLE devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address BINARY(6),
+    hostname    VARCHAR(255)
+);
+
+-- No built-in conversion — typically done in application code
+-- or manually with UNHEX after stripping colons
+INSERT INTO devices (mac_address, hostname)
+VALUES (UNHEX(REPLACE('08:00:2b:01:02:03', ':', '')), 'server-01');
+
+SELECT LOWER(INSERT(INSERT(INSERT(INSERT(INSERT(
+    HEX(mac_address), 3,0,':'), 6,0,':'), 9,0,':'), 12,0,':'), 15,0,':'))
+AS mac FROM devices;
+```
+
+这就是手动重建。它可行，但冗长且脆弱，而且仍然不验证输入。
+
+## 使用 VillageSQL：MACADDR 和 MACADDR8 {#with-villagesql-macaddr-and-macaddr8}
+
+VillageSQL 的 `vsql_network_address` 扩展添加了 `MACADDR`（6 字节 IEEE 802 格式）和 `MACADDR8`（8 字节 EUI-64 格式）类型，带有自动格式规范化和验证。
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address MACADDR,
+    hostname    VARCHAR(255)
+);
+
+-- All three formats parse to the same stored value
+INSERT INTO devices (mac_address, hostname) VALUES
+    (macaddr_from_string('08:00:2b:01:02:03'), 'server-01'),   -- colon notation
+    (macaddr_from_string('08-00-2b-01-02-04'), 'server-02'),   -- hyphen notation
+    (macaddr_from_string('0800.2b01.0206'),    'server-03');   -- Cisco dot notation
+
+-- Always returns normalized colon format
+SELECT macaddr_to_string(mac_address), hostname FROM devices;
+```
+
+输出：
+```
+08:00:2b:01:02:03   server-01
+08:00:2b:01:02:04   server-02
+08:00:2b:01:02:06   server-03
+```
+
+### OUI 提取 {#oui-extraction}
+
+MAC 地址的前 3 个字节标识制造商（OUI — 组织唯一标识符）。`macaddr_trunc()` 把最后 3 个字节清零，只留下 OUI：
+
+```sql
+-- Find all devices from the same manufacturer. CAST to CHAR here works
+-- around a known issue where GROUP BY truncates this expression's result
+-- to the underlying type's stored length instead of the full string.
+SELECT CAST(macaddr_to_string(macaddr_trunc(mac_address)) AS CHAR(20)) AS oui,
+       COUNT(*) AS device_count
+FROM devices
+GROUP BY CAST(macaddr_to_string(macaddr_trunc(mac_address)) AS CHAR(20))
+ORDER BY device_count DESC;
+
+-- Filter by manufacturer OUI
+SELECT hostname, macaddr_to_string(mac_address)
+FROM devices
+WHERE macaddr_trunc(mac_address) = macaddr_from_string('08:00:2b:00:00:00');
+```
+
+### 比较和排序 {#comparison-and-sorting}
+
+```sql
+-- Sort devices by MAC address
+SELECT hostname, macaddr_to_string(mac_address)
+FROM devices
+ORDER BY mac_address;
+
+-- Find a specific device
+SELECT hostname FROM devices
+WHERE mac_address = macaddr_from_string('08:00:2b:01:02:03');
+```
+
+### EUI-64 MAC 地址（MACADDR8） {#eui-64-mac-addresses-macaddr8}
+
+现代硬件越来越多地使用 8 字节的 EUI-64 标识符。`MACADDR8` 类型处理这些标识符：
+
+```sql
+CREATE TABLE modern_devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address MACADDR8
+);
+
+INSERT INTO modern_devices VALUES
+    (1, macaddr8_from_string('08:00:2b:01:02:03:04:05'));
+
+SELECT macaddr8_to_string(mac_address) FROM modern_devices;
+-- Returns: 08:00:2b:01:02:03:04:05
+```
+
+## 方法比较 {#comparing-approaches}
+
+| 方法 | 存储 | 验证格式 | 规范化输入 | OUI 提取 |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(17)` | 17 字节 | 否 | 否 | 手动字符串切片 |
+| `BINARY(6)` + 手动 UNHEX | 6 字节 | 否 | 否 | 手动二进制掩码 |
+| `MACADDR`（VillageSQL） | 6 字节 | 是 | 是（冒号格式） | `macaddr_trunc()` |
+| `MACADDR8`（VillageSQL） | 8 字节 | 是 | 是 | — |
+
+## 常见问题 {#frequently-asked-questions}
+
+#### MACADDR 接受大写十六进制吗？ {#does-macaddr-accept-uppercase-hex}
+
+是的 — `08:00:2B:01:02:03` 和 `08:00:2b:01:02:03` 都能正确解析，并且存储结果完全相同。
+
+#### 我可以把 MACADDR 用作主键吗？ {#can-i-use-macaddr-as-a-primary-key}
+
+可以。`MACADDR` 支持索引和相等比较。对于以 MAC 作为自然标识符的网络设备表，它是一个合理的主键。
+
+#### MACADDR 和 MACADDR8 有什么区别？ {#whats-the-difference-between-macaddr-and-macaddr8}
+
+`MACADDR` 是大多数网络硬件使用的 6 字节 IEEE 802 MAC-48 格式。`MACADDR8` 是一些现代网络接口和 IPv6 链路本地地址生成所使用的 8 字节 EUI-64 格式。当您存储 EUI-64 标识符时，请使用 `MACADDR8`。
+
+#### 如何在 MACADDR 和 MACADDR8 之间转换？ {#how-do-i-convert-between-macaddr-and-macaddr8}
+
+没有内置的转换函数。如果您需要把 MAC-48 扩展为 EUI-64（在中间插入 `ff:fe`），请在调用 `macaddr8_from_string()` 之前在应用程序代码中完成。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.macaddr_from_string does not exist` | 运行 `INSTALL EXTENSION vsql_network_address` |
+| `macaddr_from_string()` 返回 NULL | 输入不是有效的 MAC 地址格式 |
+| OUI 查询没有返回结果 | 检查您比较的是否是完整的 6 字节截断后的 MAC：`macaddr_from_string('xx:xx:xx:00:00:00')` |
+| WHERE 中混合的 MAC 格式不匹配 | 它们会匹配 — `MACADDR` 在插入时规范化所有格式 |
+
+## 另请参阅 {#see-also}
+
+- [在 MySQL 中存储 IP 地址](/zh/guides/storing-ip-addresses) — 对 IP 采用同样的网络地址存储模式

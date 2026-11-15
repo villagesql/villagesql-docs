@@ -1,0 +1,298 @@
+---
+title: "Rails 8 与 MySQL"
+sidebarTitle: "Rails 与 ActiveRecord"
+description: "如何在 MySQL 而不是默认的 SQLite 上搭建 Rails 8 应用：--database 标志、为专用用户配置的 database.yml、迁移，以及针对在线服务器的可用 ActiveRecord CRUD 路径。"
+keywords: "rails 8 mysql, rails mysql2, rails database.yml mysql, rails new database mysql, activerecord mysql, rails db:create mysql, rails mysql2 gem, rails max_connections"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+不带任何标志运行 `rails new`，开发环境得到的是 SQLite，而不是 MySQL。让 Rails 8 应用指向 MySQL，需要在搭建时加一个显式标志、一份写明真实用户和主机的 `database.yml`，以及一个需要原生 MySQL 客户端库才能编译的 gem。本指南针对一台在线的 MySQL 兼容服务器逐一讲解这三点，下面的所有内容实际运行时使用的数据库都是 VillageSQL。
+
+## 搭建前确认工具链 {#confirm-the-toolchain-before-scaffolding}
+
+Rails 8 需要 Ruby 3.2 或更高版本。在运行 `rails new` 之前检查机器上安装了什么：
+
+```bash
+ruby -v
+which rails
+```
+
+在只有系统 Ruby 的全新 macOS 安装上，这可能返回类似这样的内容：
+
+```
+ruby 2.6.10p210 (2022-04-12 revision 67958) [universal.arm64e-darwin25]
+```
+
+Ruby 2.6 无法运行 Rails 8。用 Homebrew 安装当前版本的 Ruby，并把它放在 `PATH` 中系统 Ruby 的前面：
+
+```bash
+brew install ruby
+export PATH="/opt/homebrew/opt/ruby/bin:/opt/homebrew/lib/ruby/gems/4.0.0/bin:$PATH"
+ruby -v
+```
+
+这产生了 `ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25]`，远高于 Rails 8 的最低要求。安装 Rails 本身时请带上版本约束，而不是信任 `gem install rails` 解析出的任何版本：
+
+```bash
+gem install rails -v '~> 8.0'
+rails -v
+```
+
+这安装了 Rails 8.1.3.1。Rails 8.1 满足 `~> 8.0` 约束，因为该运算符的含义是"至少 8.0，低于 9.0"。
+
+## 使用 MySQL 适配器搭建 {#scaffold-with-the-mysql-adapter}
+
+Rails 8 默认不使用 MySQL 或 PostgreSQL。运行 `rails new --help` 可以看到实际的默认值：
+
+```
+-d, [--database=DATABASE]  # Preconfigure for selected database
+                            # Default: sqlite3
+                            # Possible values: mysql, trilogy, postgresql, sqlite3, mariadb-mysql, mariadb-trilogy
+```
+
+在 Rails 8 中 `mysql` 仍然是正确的值；它选择 `mysql2` gem 和适配器。`trilogy` 是 Rails 同样支持的另一个纯 Ruby 的 MySQL 协议适配器，与本指南的选择不同。用 `mysql` 值搭建应用：
+
+```bash
+rails new . --database=mysql --skip-git
+```
+
+这会把 `mysql2` 写入 `Gemfile`，并生成一份预先配置了 `adapter: mysql2` 的 `config/database.yml`。`--skip-git` 是可选的，仅当应用目录不打算成为独立的 git 仓库时才有意义。
+
+`mysql2` gem 带有原生扩展，需要带头文件的 MySQL 客户端库才能编译。如果没有，`bundle install` 会在 `mysql2` 这一步失败。在使用 Homebrew 的 macOS 上：
+
+```bash
+brew install mysql-client
+bundle config set build.mysql2 --with-mysql-dir=/opt/homebrew/opt/mysql-client
+bundle install
+```
+
+`mysql-client` 在 Homebrew 中是 keg-only 的（它不会被符号链接到 `/opt/homebrew`，因为它与完整的 `mysql` formula 冲突），这正是需要通过 `bundle config` 显式告知其位置、而不能依赖 `PATH` 的原因。设置好之后，`bundle install` 编译并安装了 `mysql2 0.5.7`，以及 Rails 8.1.3.1 的其余依赖集。
+
+## 创建专用数据库和用户 {#create-a-dedicated-database-and-user}
+
+不要让新应用使用 `root` 账户。在运行中的服务器上创建一个数据库和一个受限范围的用户：
+
+```bash
+mysql -S /tmp/mysql.sock -u root -e "
+CREATE DATABASE IF NOT EXISTS rails_guide;
+CREATE USER IF NOT EXISTS 'rails_app'@'127.0.0.1' IDENTIFIED BY 'railspass123';
+GRANT ALL PRIVILEGES ON rails_guide.* TO 'rails_app'@'127.0.0.1';
+"
+```
+
+让 `config/database.yml` 通过 TCP 而不是 Unix 套接字指向这个用户，因为 `rails_app` 被授权的访问来源是 `127.0.0.1`，而不是 `localhost`：
+
+```yaml
+default: &default
+  adapter: mysql2
+  encoding: utf8mb4
+  max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+  username: rails_app
+  password: railspass123
+  host: 127.0.0.1
+  port: 3306
+
+development:
+  <<: *default
+  database: rails_guide
+
+test:
+  <<: *default
+  database: rails_guide_test
+```
+
+## `rails db:create` 实际需要什么 {#what-rails-dbcreate-actually-needs}
+
+`rails db:create` 创建的不只是当前 `RAILS_ENV` 下命名的那个数据库。当 `rails_app` 只被授予了 `rails_guide.*` 的权限时，运行它产生了这样的结果：
+
+```
+Mysql2::Error::ConnectionError: Access denied for user 'rails_app'@'127.0.0.1' to database 'rails_guide_test'
+Couldn't create 'rails_guide_test' database. Please check your configuration.
+Created database 'rails_guide'
+```
+
+`rails_guide` 创建成功了：`GRANT ALL PRIVILEGES ON rails_guide.*` 足以创建一个尚不存在的数据库，因为该授权的范围是数据库名，而不是某个已存在的对象。但 `rails db:create` 在同一次运行中还会尝试创建 `test` 环境的数据库，而 `rails_guide_test` 从未被授权。该任务默认同时创建 `development` 和 `test` 数据库；只有 `production` 被排除在外。
+
+授予第二个数据库名的权限即可解决：
+
+```bash
+mysql -S /tmp/mysql.sock -u root -e "
+GRANT ALL PRIVILEGES ON rails_guide_test.* TO 'rails_app'@'127.0.0.1';
+"
+rails db:create
+```
+
+```
+Database 'rails_guide' already exists
+Created database 'rails_guide_test'
+```
+
+只要受限范围的非特权用户被授予了 Rails 将尝试创建的每一个数据库名的权限，而不只是 `RAILS_ENV` 中命名的那一个，它就足以运行 `rails db:create`。不需要超级用户或全局 `CREATE` 权限。
+
+## 迁移并直接对照服务器验证 {#migrate-and-verify-against-the-server-directly}
+
+生成一个 `Post` 模型并迁移：
+
+```bash
+rails generate model Post title:string body:text
+rails db:migrate
+```
+
+生成的迁移：
+
+```ruby
+class CreatePosts < ActiveRecord::Migration[8.1]
+  def change
+    create_table :posts do |t|
+      t.string :title
+      t.text :body
+
+      t.timestamps
+    end
+  end
+end
+```
+
+通过直接查询服务器来确认表已存在，而不是信任 Rails 自己的迁移输出：
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D rails_guide -e "SHOW TABLES; DESCRIBE posts;"
+```
+
+```
+Tables_in_rails_guide
+ar_internal_metadata
+posts
+schema_migrations
+
+Field       Type          Null  Key  Default  Extra
+id          bigint        NO    PRI  NULL     auto_increment
+title       varchar(255)  YES        NULL
+body        text          YES        NULL
+created_at  datetime(6)   NO         NULL
+updated_at  datetime(6)   NO         NULL
+```
+
+## 连接路由和控制器，并对照服务器测试 {#wire-up-a-route-a-controller-and-test-against-the-server}
+
+为 `index` 和 `create` 添加一个资源式路由：
+
+```ruby
+# config/routes.rb
+Rails.application.routes.draw do
+  resources :posts, only: [:index, :create]
+end
+```
+
+一个最小的 JSON 控制器：
+
+```ruby
+# app/controllers/posts_controller.rb
+class PostsController < ApplicationController
+  skip_forgery_protection only: :create
+
+  def index
+    posts = Post.order(created_at: :desc)
+    render json: posts.as_json(only: [:id, :title, :body, :created_at])
+  end
+
+  def create
+    post = Post.create!(post_params)
+    render json: post.as_json(only: [:id, :title, :body, :created_at]), status: :created
+  end
+
+  private
+
+  def post_params
+    params.require(:post).permit(:title, :body)
+  end
+end
+```
+
+启动服务器，并用 `curl` 调用这两个动作：
+
+```bash
+rails server -p 3210
+```
+
+```bash
+curl -s http://127.0.0.1:3210/posts
+# []
+
+curl -s -X POST http://127.0.0.1:3210/posts \
+  -H "Content-Type: application/json" \
+  -d '{"post":{"title":"Hello VillageSQL","body":"First post from Rails"}}'
+# {"id":1,"title":"Hello VillageSQL","body":"First post from Rails","created_at":"2026-08-28T19:40:37.844Z"}
+
+curl -s http://127.0.0.1:3210/posts
+# [{"id":1,"title":"Hello VillageSQL","body":"First post from Rails","created_at":"2026-08-28T19:40:37.844Z"}]
+```
+
+不要止步于 HTTP 响应。确认写入确实落到了实际的表中：
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D rails_guide -e "SELECT id, title, body, created_at FROM posts;"
+```
+
+```
+id  title              body                     created_at
+1   Hello VillageSQL   First post from Rails    2026-08-28 19:40:37.844329
+```
+
+这一行存在，内容与 ActiveRecord 报告的一致，并且时间戳证实 `created_at` 正确地经由 `mysql2` 往返。
+
+## 连接池大小和 Puma 的线程数是同一个数字 {#connection-pool-size-and-pumas-thread-count-are-the-same-number}
+
+Rails 8.1 生成的 `database.yml` 不再使用您可能从旧版 Rails 中熟悉的 `pool` 键。它使用 `max_connections`：
+
+```yaml
+max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+```
+
+`pool:` 键仍然有效且不会产生警告：当 `max_connections` 不存在时，`max_connections` 会回退到它，这是一个普通的查找，没有弃用路径。Rails 8.1 弃用的是 Ruby 方法 `HashConfig#pool`，它现在是 `HashConfig#max_connections` 的别名，而这与 `database.yml` 中的键是两回事。把两个键设成不同的值不会被静默处理。它会在启动时报错：
+
+```
+RuntimeError: Ambiguous configuration: 'pool' (10) and 'max_connections' (20) are set to different values. Prefer just 'max_connections'.
+```
+
+这一点之所以重要，是因为同一个环境变量也决定了 Puma 线程池的大小。`config/puma.rb` 直接读取它，并附有一条明确说明这一点的注释：
+
+```ruby
+# threads. This includes Active Record's `pool` parameter in `database.yml`.
+threads_count = ENV.fetch("RAILS_MAX_THREADS", 3)
+threads threads_count, threads_count
+```
+
+这两个默认值并不相同：如果 `RAILS_MAX_THREADS` 未设置，`database.yml` 回退到 5 个连接，而 `puma.rb` 回退到 3 个线程。保持默认值时，连接池的连接数多于 Puma 可用来使用它们的线程数，这是安全的，只是略有浪费。一旦确定了目标线程数，就显式设置 `RAILS_MAX_THREADS`，两个设置会一起变动。连接池小于线程数才是危险的方向：线程会排队等待空闲连接，而在负载下这表现为请求延迟，日志中却没有任何错误来解释它。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### `--database=mysql` 在每个 Rails 8 版本中安装的都是同一个 gem 吗？ {#does---databasemysql-install-the-same-gem-in-every-rails-8-version}
+
+在 Rails 8 内，是的。它解析为 `mysql2` gem 和 `mysql2` 适配器，已在 Rails 8.1.3.1 上通过 `rails new --help` 确认。`trilogy` 是同一标志的另一个有效值：它是纯 Ruby 的 MySQL 线路协议客户端，没有需要编译的原生扩展，因此免去了 `mysql-client` 头文件依赖，代价是使用不同的 gem。请在搭建时选定一个；它们不是日后不动 `database.yml` 和 `Gemfile` 就能互换的适配器。
+
+#### 为什么 `rails db:create` 需要针对特定数据库的授权，而不只是 `CREATE` 权限？ {#why-does-rails-dbcreate-need-a-database-specific-grant-instead-of-just-create-privilege}
+
+即使 `dbname` 尚不存在，MySQL 的 `GRANT ... ON dbname.* TO user` 也有效，并且它授权创建那个特定的数据库。它不授权创建名称不同的数据库。由于 `rails db:create` 在一次运行中根据 `config/database.yml` 同时创建 `development` 和 `test` 数据库，受限范围的用户需要对每一个数据库名各有一条授权，而不是只对您日常打算使用的那个环境授权一次。
+
+#### 针对 VillageSQL 运行迁移，与针对原版 MySQL 有什么不同吗？ {#do-i-need-to-run-migrations-against-villagesql-any-differently-than-against-stock-mysql}
+
+没有。本指南中的每条命令，`rails db:create`、`rails db:migrate`、`rails generate model`，都未经修改地在 VillageSQL 服务器上运行。VillageSQL 是 MySQL 的即插即用替代品，所以 `mysql2` 和 ActiveRecord 的 MySQL 适配器看到的线路协议和 `SHOW`/`DESCRIBE` 输出，与在 MySQL 本身上看到的相同。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| 您想要 MySQL，但 `rails new` 选择了 SQLite | 省略了 `--database` 标志；Rails 8 的默认值是 `sqlite3`。带上 `--database=mysql` 重新运行。 |
+| `bundle install` 编译 `mysql2` 失败 | 未安装 MySQL 客户端库。先 `brew install mysql-client` 并设置 `bundle config set build.mysql2 --with-mysql-dir=/opt/homebrew/opt/mysql-client`，然后重试。 |
+| `rails db:create` 期间出现 `Mysql2::Error::ConnectionError: Access denied for user ... to database '..._test'` | 受限范围的用户只被授予了开发数据库名的权限。对 `<database>_test` 也授予相同的权限。 |
+| `RuntimeError: Ambiguous configuration: 'pool' ... and 'max_connections' ...` | `database.yml` 把两个键设成了不同的值。只保留 `max_connections`。 |
+| 用 `host: localhost` 连接失败，但 `host: 127.0.0.1` 可以 | MySQL 用户是为特定主机创建的（`'user'@'127.0.0.1'`），这与经由 `localhost` 走 Unix 套接字的连接不匹配。让 `database.yml` 中的主机与 `CREATE USER` 语句中命名的主机一致。 |
+
+## 另请参阅 {#see-also}
+
+- [在 ORM 中使用 MySQL：Django、Rails 和 Prisma](/zh/guides/mysql-with-orms)——跨三个框架、在设置层面的 Rails 配置
+- [MySQL 连接池](/zh/guides/connection-pooling)——不依赖任何特定框架的连接池行为

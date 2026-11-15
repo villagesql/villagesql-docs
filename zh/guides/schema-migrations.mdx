@@ -1,0 +1,147 @@
+---
+title: "MySQL 中的模式迁移"
+sidebarTitle: "运行迁移"
+description: "如何安全地运行 MySQL 模式迁移：ALTER TABLE 的行为、在线 DDL、大表迁移，以及如何使用 pt-online-schema-change 或 gh-ost。"
+keywords: "mysql schema migration, mysql alter table, mysql online ddl, mysql alter table lock, pt-online-schema-change, gh-ost mysql, mysql add column production"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+在线上 MySQL 数据库上进行模式变更，既可能微不足道（向小表添加一个可为空的列），也可能十分危险（修改一个每秒处理 50K 写入的 500GB 表上的列）。区别在于 MySQL 是否锁表，以及锁多久。
+
+## ALTER TABLE 的工作方式 {#how-alter-table-works}
+
+MySQL 的 `ALTER TABLE` 有两种模式，取决于操作和版本：
+
+**重建式 DDL**（旧行为）：MySQL 使用新模式创建一个新表，复制所有行，交换两个表，然后删除原表。整个过程中表被锁定、禁止写入 — 在大表上需要几分钟到几小时。
+
+**在线 DDL**：许多操作可以在不阻塞读写的情况下运行。MySQL 就地执行变更，或者在后台重建表，同时允许并发 DML。要探测某个具体操作会怎样执行，请显式添加 `ALGORITHM` 和 `LOCK` 子句 — 如果 MySQL 无法满足所请求的约束，它会拒绝该语句：
+
+```sql
+-- Fail fast if the operation would require any locking
+ALTER TABLE orders ADD COLUMN notes TEXT, LOCK=NONE;
+```
+
+## 在线 DDL 锁模式 {#online-ddl-lock-modes}
+
+`ALGORITHM` 和 `LOCK` 子句控制 MySQL 执行变更的方式：
+
+| ALGORITHM | 行为 |
+|:----------|:---------|
+| `INSTANT` | 只更改元数据 — 不重建表，不读取行。MySQL 8.0 中对部分操作可用。 |
+| `INPLACE` | 以最小的锁定就地修改表。行可能不会被重建。 |
+| `COPY` | 创建新表，复制所有行。最慢；部分操作必须使用它。 |
+
+| LOCK | 行为 |
+|:-----|:---------|
+| `NONE` | 不加锁 — 变更期间读写正常进行 |
+| `SHARED` | 读锁 — 读取继续，写入阻塞 |
+| `EXCLUSIVE` | 完全锁定 — 读写都阻塞 |
+
+```sql
+-- Request a specific algorithm; fails if MySQL can't do it that way
+ALTER TABLE orders
+    ADD COLUMN notes TEXT,
+    ALGORITHM=INSTANT;
+
+-- Fail if the operation would require a write lock
+ALTER TABLE orders
+    ADD COLUMN notes TEXT,
+    LOCK=NONE;
+```
+
+## 哪些快，哪些慢 {#whats-fast-vs-whats-slow}
+
+使用 `ALGORITHM=INSTANT`（MySQL 8.0）的操作几乎是瞬时完成的，与表大小无关：
+- 在任意位置添加列（MySQL 8.0.29+）
+- 添加/删除虚拟生成列
+- 更改列的默认值
+
+需要 `ALGORITHM=COPY` 的操作会在整个过程中阻塞写入：
+- 更改列的数据类型
+- 转换字符集
+- （添加全文索引*不*属于这一类 — 它以 `INPLACE` 运行，但始终至少需要 `LOCK=SHARED`，因此读取继续而写入阻塞；`LOCK=NONE` 会被拒绝并报 ERROR 1846）
+
+大多数索引添加使用 `ALGORITHM=INPLACE, LOCK=NONE` — 表的重建在后台进行，DML 照常执行。在 100GB 的表上添加索引需要时间，但不会阻塞您的应用程序。
+
+## 生产环境中的大表迁移 {#large-table-migrations-in-production}
+
+对于那些需要 `ALGORITHM=COPY`、而表又大到无法锁定的操作，请使用外部工具：
+
+### pt-online-schema-change（Percona Toolkit） {#pt-online-schema-change-percona-toolkit}
+
+```bash
+pt-online-schema-change \
+  --alter "ADD COLUMN notes TEXT" \
+  --execute \
+  D=mydb,t=orders
+```
+
+`pt-osc` 创建一个影子表，分批复制行，使用触发器复制持续进行的写入，然后交换两个表。应用程序没有停机时间。
+
+### gh-ost（GitHub） {#gh-ost-github}
+
+```bash
+gh-ost \
+  --user=root --host=localhost \
+  --database=mydb --table=orders \
+  --alter="ADD COLUMN notes TEXT" \
+  --execute
+```
+
+`gh-ost` 使用二进制日志而不是触发器，这在高写入负载下更可靠。它是高流量表的首选工具。
+
+两种工具都要求表有主键。
+
+## 迁移工具与版本控制 {#migration-tools-and-version-control}
+
+在纳入版本控制的迁移文件中跟踪模式变更。常见工具：
+
+| 工具 | 语言 | 风格 |
+|:-----|:---------|:------|
+| Flyway | Java/任意 | 基于 SQL；带版本号的文件 |
+| Liquibase | Java/任意 | XML/YAML/SQL；变更集 |
+| golang-migrate | Go | 基于 SQL；带编号的文件 |
+| Alembic | Python | Python 或 SQL；从模型自动生成 |
+
+每个工具都在数据库中维护一张迁移表，用于跟踪哪些迁移已经运行，因此重复运行是安全的。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我可以在不锁表的情况下添加列吗？ {#can-i-add-a-column-without-locking-the-table}
+
+在任意位置添加可为空的列使用 `ALGORITHM=INSTANT`，无论表大小都在几毫秒内完成（MySQL 8.0.29+）。如果不行，请使用 `ALGORITHM=INPLACE, LOCK=NONE`，或者使用 pt-osc 或 gh-ost。
+
+#### 如何检查 ALTER TABLE 是否会锁定我的表？ {#how-do-i-check-if-an-alter-table-will-lock-my-table}
+
+在语句中添加 `ALGORITHM=INPLACE, LOCK=NONE`。如果 MySQL 能够不加锁地执行，它就会执行；如果不能，它会返回错误 — 无论哪种方式，您都能得到明确的答案，无需猜测：
+
+```sql
+-- If this succeeds, the index add won't lock the table
+ALTER TABLE orders ADD INDEX idx_customer (customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+当您对生产环境中的大表没有把握时，请先在表的副本上测试。
+
+#### 我应该在事务中运行迁移吗？ {#should-i-run-migrations-inside-a-transaction}
+
+DDL 语句（`ALTER TABLE`、`CREATE INDEX`、`DROP TABLE`）在 MySQL 中会导致隐式提交 — 它们无法回滚。把它们放在 `BEGIN`/`COMMIT` 块中运行并不能保护您。请在应用程序层面规划回滚策略（双写、功能开关），而不是依赖事务回滚。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ALTER TABLE` 阻塞了生产流量 | 如果可用，使用 `ALGORITHM=INSTANT`，或者对大表使用 pt-osc/gh-ost |
+| `ERROR 1846: ALGORITHM=INSTANT is not supported` | 该操作需要重建表 — 使用 `ALGORITHM=INPLACE` 或在线工具 |
+| pt-osc 因触发器错误而失败 | 表上已经有触发器 — 使用 gh-ost（基于二进制日志，不用触发器） |
+| 迁移运行了两次 | 迁移工具的跟踪表不同步 — 检查模式版本表 |
+| 长时间运行的 ALTER 持有锁 | 用 `KILL <query_id>` 终止它，改用在线工具 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 备份策略](/zh/guides/backup-strategies) — 迁移前务必备份
+- [MySQL 中的事务](/zh/guides/transactions) — 哪些迁移操作在 MySQL 中是事务性的
+- [MySQL 中的表分区](/zh/guides/table-partitioning) — 分区变更也是模式迁移
+- [将 MySQL 与 ORM 一起使用：Django、Rails 和 Prisma](/zh/guides/mysql-with-orms) — 安全地应用 ORM 生成的 DDL

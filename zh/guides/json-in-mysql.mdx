@@ -1,0 +1,154 @@
+---
+title: "MySQL 中的 JSON"
+sidebarTitle: "存储 JSON 数据"
+description: "如何在 MySQL 中存储、查询和索引 JSON 数据：JSON 列类型、路径表达式、JSON 函数，以及如何用生成列为 JSON 字段建立索引。"
+keywords: "mysql json, mysql json column, mysql json_extract, mysql json path, mysql json functions, mysql json index, mysql json generated column"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 的原生 `JSON` 列类型在插入时验证 JSON，以二进制格式存储以便高效访问，并提供一组函数，用于读取和修改单个字段而无需解析整个文档。
+
+## 存储 JSON {#storing-json}
+
+```sql
+CREATE TABLE products (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    name       VARCHAR(100) NOT NULL,
+    attributes JSON
+);
+
+INSERT INTO products (name, attributes) VALUES (
+    'Laptop',
+    '{"brand": "Acme", "ram_gb": 16, "tags": ["portable", "pro"]}'
+);
+```
+
+MySQL 在插入时验证 JSON。插入格式错误的 JSON 会报错。
+
+## 读取 JSON 字段 {#reading-json-fields}
+
+使用 `JSON_EXTRACT(column, path)` 或简写 `->`：
+
+```sql
+-- These are equivalent
+SELECT JSON_EXTRACT(attributes, '$.brand') FROM products;
+SELECT attributes -> '$.brand' FROM products;
+```
+
+两者都返回一个 JSON 值——带引号的字符串 `"Acme"`。要获得不带引号的普通字符串，请使用 `->>`（它是 `JSON_UNQUOTE(JSON_EXTRACT(...))` 的简写）：
+
+```sql
+SELECT attributes ->> '$.brand' FROM products;  -- returns: Acme
+```
+
+路径语法：
+- `$.key` — 访问对象字段
+- `$.array[0]` — 按下标访问数组元素
+- `$.array[*]` — 数组的所有元素
+- `$.**` — 递归通配符（任意深度的所有值）
+
+## 按 JSON 字段筛选 {#filtering-on-json-fields}
+
+```sql
+-- Find all 16GB RAM products
+SELECT name FROM products
+WHERE attributes ->> '$.ram_gb' = '16';
+
+-- Check if a key exists
+SELECT name FROM products
+WHERE JSON_EXTRACT(attributes, '$.brand') IS NOT NULL;
+
+-- Check if an array contains a value
+SELECT name FROM products
+WHERE JSON_CONTAINS(attributes -> '$.tags', '"portable"');
+```
+
+请注意，`->>` 返回字符串，所以与 `'16'`（而不是 `16`）比较才是正确的，除非您显式转换：`CAST(attributes ->> '$.ram_gb' AS UNSIGNED)`。
+
+## 修改 JSON {#modifying-json}
+
+```sql
+-- Add or update a field
+UPDATE products
+SET attributes = JSON_SET(attributes, '$.color', 'silver')
+WHERE id = 1;
+
+-- Remove a field
+UPDATE products
+SET attributes = JSON_REMOVE(attributes, '$.tags')
+WHERE id = 1;
+
+-- Insert only if the key doesn't exist
+UPDATE products
+SET attributes = JSON_INSERT(attributes, '$.warranty_years', 2)
+WHERE id = 1;
+```
+
+关键函数：
+
+| 函数 | 行为 |
+|:---------|:---------|
+| `JSON_SET(doc, path, val)` | 设置值——插入或替换 |
+| `JSON_INSERT(doc, path, val)` | 仅当路径不存在时插入 |
+| `JSON_REPLACE(doc, path, val)` | 仅当路径存在时替换 |
+| `JSON_REMOVE(doc, path)` | 删除路径上的值 |
+
+## 为 JSON 字段建立索引 {#indexing-json-fields}
+
+JSON 列本身不能直接建立索引。要为某个特定的 JSON 字段建立索引，请创建一个生成列，然后为它建立索引：
+
+```sql
+ALTER TABLE products
+    ADD COLUMN brand VARCHAR(100) GENERATED ALWAYS AS (attributes ->> '$.brand') VIRTUAL;
+
+CREATE INDEX idx_brand ON products (brand);
+```
+
+现在 `WHERE attributes ->> '$.brand' = 'Acme'` 可以使用 `idx_brand`。MySQL 能识别出生成列的表达式与查询条件相匹配。
+
+[选择 MySQL 数据类型](/zh/guides/choosing-data-types) 对此有更详细的介绍——只要您查询某个 JSON 字段的频率高到需要索引，这就是推荐的模式。
+
+## JSON 与规范化列的对比 {#json-vs-normalized-columns}
+
+| | JSON 列 | 规范化列 |
+|:--|:------------|:-------------------|
+| 架构灵活性 | 任意结构，无需迁移 | 固定结构，需要迁移 |
+| 索引 | 仅能通过生成列 | 可直接为任意列建索引 |
+| 查询复杂度 | 路径表达式、JSON 函数 | 标准 SQL |
+| 连接 | 无法基于 JSON 键连接 | 完整的 JOIN 支持 |
+| 存储 | 更大（二进制 JSON 开销） | 更紧凑 |
+| 数据完整性 | 没有列级约束 | `NOT NULL`、`DEFAULT`、外键 |
+
+当结构确实可变时（用户可配置的属性、事件元数据、第三方 API 载荷），请使用 JSON。当结构固定，并且您需要按字段筛选、连接或聚合时，请使用规范化列。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我可以为 JSON 数组建立索引以支持包含查询吗？ {#can-i-index-a-json-array-for-containment-queries}
+
+标准索引无法直接做到。对于 `JSON_CONTAINS` 查询，唯一的选择是全表扫描，除非您把数组提取到单独的子表（规范化），或者在一个把数组展平的生成列上使用全文索引。对于高吞吐量的包含查询，规范化是更好的路径。
+
+#### `->` 和 `->>` 有什么区别？ {#whats-the-difference-between---and--}
+
+`->` 返回 JSON 值（字符串带有外围引号）。`->>` 返回去掉引号的字符串。对于显示、拼接以及任何使用文本的场景，`->>` 才是您想要的。不过，通过 `->` 做等值比较仍然可行：MySQL 会先把另一个操作数强制转换为 JSON，所以 `attributes -> '$.brand' = 'Acme'` 确实能匹配。
+
+#### 存储 JSON 会影响性能吗？ {#does-storing-json-hurt-performance}
+
+从一个大的 JSON 文档中读取单个字段需要解析二进制结构，这比解析文本快，但比读取原生列慢。对于频繁访问的字段，生成列加索引的模式能让读取性能与原生列相当。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 插入时报 `ERROR 3140: Invalid JSON` | 修正 JSON 语法——MySQL 在插入时验证 |
+| `WHERE attributes -> '$.key' = 'value'` 不返回任何行 | 引号不是原因——该比较是 JSON 感知的，确实能匹配。请检查路径本身，并确认值是 JSON 字符串而不是数字 |
+| JSON 字段查询没有使用索引 | 在路径表达式上添加生成列，并为它建立索引 |
+| `JSON_CONTAINS` 对嵌套数组不匹配 | 检查路径和引号——`JSON_CONTAINS` 中的字符串值必须是带引号的 JSON：`'"value"'` 而不是 `'value'` |
+
+## 另请参阅 {#see-also}
+
+- [选择 MySQL 数据类型](/zh/guides/choosing-data-types) — 何时使用 JSON，何时使用规范化列
+- [MySQL 中的生成列](/zh/guides/generated-columns) — 用虚拟生成列为 JSON 字段建立索引
+- [从 SQL 发起 HTTP 请求](/zh/guides/http-requests-in-mysql) — 解析 HTTP API 响应中的 JSON

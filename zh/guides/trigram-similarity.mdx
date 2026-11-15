@@ -1,0 +1,149 @@
+---
+title: "MySQL 中的三元组相似度搜索"
+sidebarTitle: "三元组相似度"
+description: "如何使用 VillageSQL 的 vsql_trgm 扩展在 MySQL 中查找相似字符串——基于三元组模型的相似度评分、模糊匹配和单词级相似度。"
+keywords: "mysql trigram similarity, mysql fuzzy search, mysql similar strings, mysql pg_trgm, vsql_trgm, mysql text similarity"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  本指南需要 VillageSQL 0.0.4 或更高版本。
+</Note>
+
+MySQL 内置的字符串函数——`LIKE`、`SOUNDEX`、`LEVENSHTEIN`——可以完成基本匹配，但它们都无法给出一个可以用来排序或设定阈值的连续相似度分数。VillageSQL 的 `vsql_trgm` 扩展增加了基于三元组的相似度：一个介于 0 和 1 之间的数字，用来衡量两个字符串有多相似，因此您可以在一条查询中对结果排序并按相似度过滤。
+
+## 三元组的工作原理 {#how-trigrams-work}
+
+三元组是由 3 个连续字符组成的一组。`vsql_trgm` 将输入转为小写，按非字母数字字符拆分，在每个单词前面补两个空格、后面补一个空格，然后在每个补齐后的单词上滑动一个 3 字符的窗口。相似度是两个输入共有的三元组数量，除以两者合计的不同三元组数量——即它们并集的大小，而不是较大集合的大小。
+
+```
+"cat" → pad to "  cat " → ["  c", " ca", "cat", "at "]
+"car" → pad to "  car " → ["  c", " ca", "car", "ar "]
+shared: 2, union: 4 + 4 − 2 = 6 → similarity 0.333
+```
+
+关于多单词字符串有两点需要了解：它们在处理前会被**转为小写**，因此 `"Cat"` 和 `"cat"` 产生相同的三元组。它们还会**按非字母数字字符拆分**，因此每个单词会被独立补齐并生成三元组——`"hello world"` 分别从 `"  hello "` 和 `"  world "` 生成三元组，而不是从一个补齐后的整体字符串生成。不存在 `"o w"` 或 `" wo"` 这样的三元组。
+
+相似度的范围从 0（没有共同之处）到 1（完全相同）。
+
+## 开始使用 {#getting-started}
+
+```sql
+INSTALL EXTENSION vsql_trgm;
+```
+
+## 核心函数 {#core-functions}
+
+### trgm_similarity——连续分数 {#trgm_similarity--continuous-score}
+
+```sql
+SELECT vsql_trgm.trgm_similarity('adidas', 'adidos');   -- 0.4
+SELECT vsql_trgm.trgm_similarity('cat', 'dog');          -- 0
+SELECT vsql_trgm.trgm_similarity('mysql', 'mysql');      -- 1
+```
+
+当任一参数为 NULL 时，所有函数都返回 NULL。
+
+### trgm_similar——阈值检查 {#trgm_similar--threshold-check}
+
+如果相似度等于或高于 0.3（PostgreSQL 的默认值），返回 1，否则返回 0：
+
+```sql
+SELECT vsql_trgm.trgm_similar('cat', 'car');   -- 1
+SELECT vsql_trgm.trgm_similar('cat', 'dog');   -- 0
+```
+
+要使用自定义阈值：
+
+```sql
+SELECT vsql_trgm.trgm_similar_threshold('cat', 'car', 0.6);  -- 0
+SELECT vsql_trgm.trgm_similar_threshold('cat', 'car', 0.3);  -- 1
+```
+
+### trgm_distance——相似度的补数 {#trgm_distance--complement-of-similarity}
+
+即 `1 - similarity`。当您希望最接近的结果排在最前面时，适合用于 ORDER BY：
+
+```sql
+SELECT vsql_trgm.trgm_distance('mysql', 'mysqk');  -- 0.5
+```
+
+## 在表中查找近似匹配 {#finding-near-matches-in-a-table}
+
+最常见的用法：查找与搜索词相似的行。
+
+```sql
+SELECT
+    name,
+    vsql_trgm.trgm_similarity(name, 'adidas') AS score
+FROM products
+WHERE vsql_trgm.trgm_similarity(name, 'adidas') > 0.3
+ORDER BY score DESC
+LIMIT 10;
+```
+
+这可以处理拼写错误、替代拼写和部分匹配——这些都是 `LIKE '%adidas%'` 会漏掉的情况。
+
+## 单词相似度 {#word-similarity}
+
+`trgm_word_similarity` 查找查询字符串与目标中任意连续子串之间的最佳匹配。当搜索词可能是较长字符串中的一个单词时，这很有用。
+
+```sql
+-- Find products whose name contains something close to "widget"
+SELECT name, vsql_trgm.trgm_word_similarity('widget', name) AS score
+FROM products
+WHERE vsql_trgm.trgm_word_similar('widget', name) = 1
+ORDER BY score DESC;
+```
+
+`trgm_strict_word_similarity` 是一个更严格的变体，要求匹配与单词边界对齐。
+
+| 函数 | 阈值 |
+|---|---|
+| `trgm_word_similar(a, b)` | 0.6 |
+| `trgm_strict_word_similar(a, b)` | 0.5 |
+
+## 查看三元组 {#inspecting-trigrams}
+
+`trgm_show` 以 JSON 数组的形式返回字符串排序后的三元组集合：
+
+```sql
+SELECT vsql_trgm.trgm_show('cat');
+-- '["  c"," ca","at ","cat"]'
+```
+
+这对于调试两个字符串为什么得到这样的分数很有用。
+
+## 函数参考 {#function-reference}
+
+| 函数 | 返回值 | 说明 |
+|---|---|---|
+| `trgm_similarity(a, b)` | REAL | 0–1 相似度分数 |
+| `trgm_distance(a, b)` | REAL | 1 − similarity |
+| `trgm_similar(a, b)` | INT | 相似度 ≥ 0.3 时为 1 |
+| `trgm_similar_threshold(a, b, t)` | INT | 相似度 ≥ t 时为 1 |
+| `trgm_word_similarity(a, b)` | REAL | 最佳子串匹配分数 |
+| `trgm_word_distance(a, b)` | REAL | 1 − word_similarity |
+| `trgm_word_similar(a, b)` | INT | word_similarity ≥ 0.6 时为 1 |
+| `trgm_strict_word_similarity(a, b)` | REAL | 与单词边界对齐的分数 |
+| `trgm_strict_word_distance(a, b)` | REAL | 1 − strict_word_similarity |
+| `trgm_strict_word_similar(a, b)` | INT | strict_word_similarity ≥ 0.5 时为 1 |
+| `trgm_show(text)` | TEXT | 三元组的 JSON 数组 |
+
+## 已知限制 {#known-limitations}
+
+**没有索引加速。** 扩展 SDK 中提供了自定义索引类型的预览功能，但在每个服务器构建版本上，用于附加索引的 DDL 都会被拒绝（`ERROR 3219: Extended Index feature not yet implemented`），因此 `WHERE trgm_similarity(col, 'term') > 0.3` 需要全表扫描。对于大表，请先用 `LIKE` 或全文搜索预过滤以缩小候选集，然后再用 `trgm_similarity` 重新评分。
+
+**没有会话级阈值。** PostgreSQL 的 `set_limit()` / `show_limit()` 无法在 VEF 中实现（VEF 函数是无状态的）。请使用 `trgm_similar_threshold(a, b, t)` 显式传入阈值。
+
+**不返回数组。** `trgm_show` 返回的是 JSON 字符串，而不是原生数组类型。
+
+## 另请参阅 {#see-also}
+
+- [如何在 MySQL 中实现全文搜索](/zh/guides/full-text-search)
+- [如何在 MySQL 中按读音和编辑距离匹配名称](/zh/guides/fuzzy-string-matching)
+- [如何在 SQL 中操作和转换字符串](/zh/guides/string-functions)
+- [如何在 MySQL 中使用 LIKE 匹配模式](/zh/tutorial/like)
