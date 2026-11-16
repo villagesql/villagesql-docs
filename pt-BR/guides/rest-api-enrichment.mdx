@@ -1,0 +1,181 @@
+---
+title: "Enriquecendo Linhas com Dados de APIs Externas"
+sidebarTitle: "Enriquecimento via API REST"
+description: "Como trazer dados ao vivo de APIs REST externas para os resultados de consultas do MySQL usando a extensão vsql_http do VillageSQL."
+keywords: "mysql rest api, mysql api enrichment, mysql http query, mysql external data, vsql_http enrichment"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Alguns dados não vivem no seu banco de dados — taxas de câmbio, status de envio, consultas de geolocalização, detalhes de produtos de terceiros. A abordagem padrão é buscá-los no código da aplicação e, então, guardá-los em cache em uma tabela ou costurá-los com os resultados da consulta na camada da aplicação. A extensão `vsql_http` do VillageSQL permite que você traga esses dados diretamente de uma consulta ou os armazene em uma coluna com um único UPDATE.
+
+## Configuração {#setup}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+## Padrão 1: Armazene o Enriquecimento em uma Coluna {#pattern-1-store-enrichment-in-a-column}
+
+O uso mais comum: preencher uma coluna com dados buscados de uma API externa. Execute um UPDATE que chama a API por linha, armazene o resultado e depois consulte a coluna armazenada.
+
+Este exemplo busca o status de envio de cada pedido:
+
+```sql
+ALTER TABLE orders ADD COLUMN shipping_status VARCHAR(100);
+
+UPDATE orders
+SET shipping_status = JSON_VALUE(
+  JSON_UNQUOTE(JSON_EXTRACT(
+    CONVERT(
+      vsql_http.http_get(
+        CONCAT('https://api.shipping.com/track/', tracking_number)
+      ) USING utf8mb4
+    ),
+    '$.content'
+  )),
+  '$.status'
+)
+WHERE tracking_number IS NOT NULL
+  AND shipping_status IS NULL
+LIMIT 50;
+```
+
+Execute isso em um loop a partir da sua aplicação até não restarem linhas com `shipping_status IS NULL`. Processe em lotes para ficar dentro dos limites de taxa da API.
+
+Depois do preenchimento, as consultas usam a coluna armazenada — nenhuma chamada de API por consulta:
+
+```sql
+SELECT id, customer_id, shipping_status
+FROM orders
+WHERE shipping_status = 'delivered'
+ORDER BY updated_at DESC;
+```
+
+## Padrão 2: Consulta ao Vivo em uma Query {#pattern-2-live-lookup-in-a-query}
+
+Para dados que mudam rápido demais para serem guardados em cache — taxas de câmbio, preços em tempo real — você pode chamar a API inline no SELECT. Cada linha do resultado dispara uma requisição, então mantenha o conjunto de resultados pequeno.
+
+```sql
+-- Fetch the current USD/EUR exchange rate and apply it to each row
+SET @rate_resp = CONVERT(
+  vsql_http.http_get('https://api.exchangerate.example.com/latest?base=USD')
+  USING utf8mb4
+);
+SET @rate_body = JSON_UNQUOTE(JSON_EXTRACT(@rate_resp, '$.content'));
+SET @eur_rate = CAST(JSON_VALUE(@rate_body, '$.rates.EUR') AS DECIMAL(10,6));
+
+SELECT
+  id,
+  amount_usd,
+  ROUND(amount_usd * @eur_rate, 2) AS amount_eur
+FROM invoices
+WHERE currency = 'USD'
+LIMIT 100;
+```
+
+Busque o valor compartilhado uma vez em uma variável e depois use a variável na consulta — não chame `http_get()` dentro da expressão do SELECT, a menos que cada linha realmente precise de uma chamada de API diferente.
+
+## Padrão 3: Enriquecimento Condicional {#pattern-3-conditional-enrichment}
+
+Busque somente para as linhas que realmente precisam, usando WHERE para filtrar antes de chamar a API:
+
+```sql
+-- Only enrich rows missing geocoordinates
+UPDATE locations
+SET
+  lat = CAST(JSON_VALUE(
+    JSON_UNQUOTE(JSON_EXTRACT(
+      CONVERT(
+        vsql_http.http_get(
+          CONCAT('https://api.geocode.example.com/json?address=',
+                 vsql_http.url_encode(address))
+        ) USING utf8mb4
+      ),
+      '$.content'
+    )),
+    '$.lat'
+  ) AS DECIMAL(10,7)),
+  lng = CAST(JSON_VALUE(
+    JSON_UNQUOTE(JSON_EXTRACT(
+      CONVERT(
+        vsql_http.http_get(
+          CONCAT('https://api.geocode.example.com/json?address=',
+                 vsql_http.url_encode(address))
+        ) USING utf8mb4
+      ),
+      '$.content'
+    )),
+    '$.lng'
+  ) AS DECIMAL(10,7))
+WHERE lat IS NULL
+  AND address IS NOT NULL
+LIMIT 25;
+```
+
+Observe `url_encode()` envolvendo o endereço — sempre codifique dados do usuário antes de embuti-los em uma URL.
+
+## Tratando Erros da API {#handling-api-errors}
+
+Todas as funções da `vsql_http` retornam NULL em falha de conexão, com um aviso carregando a mensagem de erro do curl. Verifique o código de status antes de usar o conteúdo:
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_get('https://api.example.com/data/123') USING utf8mb4
+);
+
+SELECT
+  CASE
+    WHEN @resp IS NULL          THEN 'connection_failed'
+    WHEN JSON_VALUE(@resp, '$.status') = '200' THEN
+      JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content'))
+    WHEN JSON_VALUE(@resp, '$.status') = '404' THEN 'not_found'
+    ELSE CONCAT('error_', JSON_VALUE(@resp, '$.status'))
+  END AS result;
+```
+
+Em loops de UPDATE em massa, as linhas que recebem uma resposta NULL ou diferente de 200 mantêm o valor da coluna em NULL, então você pode executar o UPDATE de novo para tentar novamente as linhas que falharam.
+
+## Considerações de Desempenho {#performance-considerations}
+
+**Cada chamada HTTP é síncrona e bloqueia a consulta.** Um lote de 50 linhas, cada uma chamando uma API de 200ms, leva no mínimo 10 segundos. `max_execution_time` só limita instruções `SELECT` — não tem efeito aqui. Para limitar quanto tempo este `UPDATE` pode rodar, obtenha o ID da conexão com `SELECT CONNECTION_ID()` antes e execute `KILL QUERY <id>` de outra sessão se ele demorar demais:
+
+```sql
+UPDATE orders
+SET shipping_status = JSON_VALUE(
+  JSON_UNQUOTE(JSON_EXTRACT(
+    CONVERT(vsql_http.http_get(
+      CONCAT('https://api.shipping.com/track/', tracking_number)
+    ) USING utf8mb4),
+    '$.content'
+  )),
+  '$.status'
+)
+WHERE shipping_status IS NULL
+LIMIT 50;
+```
+
+Prefira armazenar os resultados a consultar ao vivo — depois que um valor está em uma coluna, as consultas seguintes não tocam a rede.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| O UPDATE demora demais | Reduza o `LIMIT`; `max_execution_time` não se aplica a `UPDATE`, use `KILL QUERY <connection_id>` de outra sessão em vez disso |
+| Retorna NULL para todas as linhas | A API está inacessível a partir do host do servidor; verifique `SHOW WARNINGS` para ver a mensagem de erro do curl e confira o acesso à rede |
+| A extração de JSON retorna NULL | `content` é uma string codificada em JSON, não um objeto aninhado, então um caminho de uma única etapa `'$.content.field'` nunca resolve. Primeiro remova as aspas — `JSON_UNQUOTE(JSON_EXTRACT(resp, '$.content'))` — e depois extraia os campos dali. Isso independe do tamanho da resposta |
+| Os parâmetros da URL não estão sendo codificados corretamente | Envolva os valores com `vsql_http.url_encode()` |
+| Erros de limite de taxa da API | Reduza o LIMIT por lote; adicione `SELECT SLEEP(1)` entre os lotes |
+
+## Próximos Passos {#next-steps}
+
+- [Fazendo requisições HTTP a partir do SQL](/pt-BR/guides/http-requests-in-mysql) — referência completa das funções e análise de respostas
+- [Enviando webhooks a partir de triggers](/pt-BR/guides/http-webhooks) — enviar mudanças para fora em vez de trazer dados para dentro
+
+## Veja também {#see-also}
+
+- [Fazendo Requisições HTTP a partir do SQL](/pt-BR/guides/http-requests-in-mysql) — as funções HTTP usadas para as chamadas de API
+- [JSON no MySQL](/pt-BR/guides/json-in-mysql) — analisando as respostas JSON retornadas pelas APIs
+- [Servindo Tabelas como uma API REST](/pt-BR/guides/rest-api-from-tables) — publicando as suas próprias tabelas por HTTP

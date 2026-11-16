@@ -1,0 +1,186 @@
+---
+title: "在 MySQL 中生成向量嵌入"
+sidebarTitle: "生成嵌入"
+description: "如何使用 VillageSQL 的 ai_embedding() 函数在 MySQL 中生成和存储向量嵌入——用于语义搜索、相似度匹配和推荐系统。"
+keywords: "mysql vector embeddings, mysql ai_embedding, mysql semantic search, mysql text embeddings, mysql openai embeddings, mysql similarity search"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+向量嵌入把文本表示为捕捉语义含义的数字数组。关于同一主题的两段文本即使没有共同的词，也会有相似的向量。MySQL 没有内置的生成嵌入的方法。VillageSQL 的 `vsql_ai` 扩展增加了 `ai_embedding()`，它调用一个嵌入模型，并以 JSON 数组的形式返回向量，供您存储和查询。
+
+## 嵌入的用途 {#what-embeddings-are-for}
+
+嵌入模型把文本转换为固定长度的浮点数向量。两个向量之间的距离反映语义相似度：
+
+- `"dog"` 和 `"puppy"` → 相似的向量
+- `"dog"` 和 `"database index"` → 距离很远的向量
+
+这使语义搜索（查找与查询*含义*相同的行）、聚类和推荐成为可能——这些都是关键字搜索处理不好的。
+
+## 使用 VillageSQL：ai_embedding() {#with-villagesql-ai_embedding}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+`ai_embedding(provider, model, api_key, text)` 调用一个嵌入模型并返回一个 JSON 数组字符串。
+
+```sql
+SET @key = 'your-openai-api-key';
+
+SELECT ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning is fascinating');
+-- Returns: [0.02646778, 0.019067757, -0.05332306, ...]
+```
+
+### 字符集转换 {#the-charset-conversion}
+
+在 VillageSQL 0.0.6 及更早版本上，`ai_embedding()` 返回 binary 字符集，而 MySQL 的 JSON 解析器拒绝 binary 字符串——结果必须先经过 `CONVERT(... USING utf8mb4)`，才能进入 `JSON` 列或 JSON 函数：
+
+```sql
+-- On 0.0.6 and earlier, this throws an error — JSON_LENGTH rejects binary charset
+-- ERROR 3144 (22032): Cannot create a JSON value from a string with CHARACTER SET 'binary'
+SELECT JSON_LENGTH(ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning'));
+
+-- This works on every version
+SELECT JSON_LENGTH(
+  CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning')
+          USING utf8mb4)
+);
+```
+
+VillageSQL 0.0.7 及更高版本直接返回正确的字符集，因此在那里不再需要 `CONVERT`——但保留它没有害处，所以下面的每个示例仍然使用它，以兼容 0.0.6 及更早版本。
+
+### 存储嵌入 {#storing-embeddings}
+
+将 JSON 数组存入 `JSON` 列：
+
+```sql
+CREATE TABLE documents (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    title    VARCHAR(255),
+    content  TEXT,
+    embedding JSON
+);
+
+SET @key = 'your-openai-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this INSERT.
+
+INSERT INTO documents (title, content, embedding) VALUES
+    ('Intro to ML',
+     'Machine learning is a subset of artificial intelligence',
+     CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                          'Machine learning is a subset of artificial intelligence')
+             USING utf8mb4)),
+    ('Neural Networks',
+     'Deep learning uses multi-layer neural networks',
+     CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                          'Deep learning uses multi-layer neural networks')
+             USING utf8mb4));
+
+-- Confirm the vectors parsed as JSON
+SELECT id, JSON_LENGTH(embedding) AS dimensions FROM documents;
+```
+
+### 为现有行回填嵌入 {#backfilling-embeddings-on-existing-rows}
+
+```sql
+ALTER TABLE documents ADD COLUMN embedding JSON;
+
+SET @key = 'your-openai-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE documents
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, content)
+                        USING utf8mb4)
+WHERE embedding IS NULL
+LIMIT 50;  -- Process in batches
+```
+
+## 选择模型 {#choosing-a-model}
+
+| 提供商 | 模型 | 维度 | 适用场景 |
+|:---|:---|:---|:---|
+| `'openai'` | `text-embedding-3-small` | 1536 | 性价比最高——准确度好、成本较低 |
+| `'openai'` | `text-embedding-3-large` | 3072 | 需要更高准确度 |
+| `'google'` | `gemini-embedding-001` | 3072 | Google 生态系统 |
+| `'local'` | 任何 Ollama 模型（例如 `nomic-embed-text`） | 不定 | 私有数据；不需要 API 密钥 |
+
+对一个表中的所有嵌入使用同一个模型。来自不同模型的嵌入不可比较——混用它们会产生毫无意义的相似度分数。
+
+Anthropic 目前不提供嵌入 API。
+
+## 语义搜索 {#semantic-search}
+
+MySQL 和 VillageSQL 都不提供原生的向量距离函数。完整的相似度搜索——在大表中查找最近的向量——在应用程序代码中运行。典型的架构是：把嵌入存储在 MySQL 中，取出它们，在应用程序中计算余弦相似度，然后返回最匹配的结果。
+
+```sql
+-- Generate a query embedding
+SET @query_embedding = ai_embedding('openai', 'text-embedding-3-small', @key, 'neural networks');
+
+-- Retrieve stored embeddings to process in application code
+SELECT id, title, embedding FROM documents;
+```
+
+把结果传给向量相似度库（NumPy、scikit-learn、Faiss）来查找最近邻。对于生产规模的搜索，请考虑在 MySQL 之外配备专用的向量数据库。
+
+## 嵌入什么内容 {#what-to-embed}
+
+嵌入的质量取决于您嵌入的内容。一些模式：
+
+```sql
+-- Embed the full content for document search
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, content)
+                        USING utf8mb4);
+
+-- Embed a specific field for product search
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, product_description)
+                        USING utf8mb4);
+
+-- Embed concatenated fields for richer context
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                            CONCAT(product_name, '. ', category, '. ', product_description))
+                        USING utf8mb4);
+```
+
+把要嵌入的文本控制在几千个 token 以内。更长的文本会被嵌入模型截断。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我可以比较来自不同模型的嵌入吗？ {#can-i-compare-embeddings-from-different-models}
+
+不能。来自 `text-embedding-3-small` 和 `gemini-embedding-001` 的嵌入位于不同的向量空间——相互比较时它们的相似度分数毫无意义。每列统一使用一个模型。
+
+#### 嵌入占用多少存储空间？ {#how-much-storage-do-embeddings-take}
+
+一个包含 1536 个浮点数的 JSON 数组，作为文本字符串每行大约占 10–15 KB。对于大表，这会累积起来。请考虑是需要存储所有嵌入，还是只存储您要查询的那些。
+
+#### ai_embedding() 支持批量输入吗？ {#does-ai_embedding-support-batch-input}
+
+不支持——每次调用处理一个文本输入。要批量生成嵌入，请在应用程序中循环遍历各行，并分批调用 `UPDATE`。
+
+#### 如果文本太长会怎样？ {#what-happens-if-the-text-is-too-long}
+
+嵌入模型会在其 token 限制处截断输入（OpenAI 模型通常为 8191 个 token）。嵌入是基于截断后的文本计算的。对于长文档，请嵌入摘要或前几段，而不是全文。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.ai_embedding does not exist` | 运行 `INSTALL EXTENSION vsql_ai` |
+| `ERROR 3144: Cannot create a JSON value from a string with CHARACTER SET 'binary'` | 把调用包在 `CONVERT(... USING utf8mb4)` 中——请参阅[字符集转换](#the-charset-conversion) |
+| `ai_embedding()` 返回 NULL | 检查 API 密钥；验证模型名称；检查 `max_execution_time` |
+| 相似度搜索返回错误的结果 | 确认所有嵌入使用同一个模型；检查嵌入生成时的内容是否与您搜索的内容一致 |
+| 生成嵌入耗时太长 | 使用 LIMIT 分批处理；每次 API 调用生成一个嵌入大约需要 1–3 秒 |
+
+## 另请参阅 {#see-also}
+
+- [将 MySQL 连接到 AI API](/zh/guides/ai-api-setup)——安装和配置 vsql_ai 扩展
+- [从 MySQL 查询运行 AI 模型](/zh/guides/ai-prompts-in-mysql)——作为嵌入补充的文本生成
+- [MySQL 中的 UUID](/zh/guides/uuids)——嵌入查找表的稳定行标识符
+- [多维范围查询](/zh/guides/cube-queries)——不用 AI 向量的几何包含和距离查询

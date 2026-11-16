@@ -1,0 +1,203 @@
+---
+title: "NULL no MySQL"
+sidebarTitle: "Trabalhando com NULL"
+description: "Como o NULL funciona no MySQL: lógica de três valores, armadilhas comuns com comparações e agregações, e como os índices lidam com valores NULL."
+keywords: "mysql null, mysql ifnull, mysql coalesce, mysql three valued logic, mysql null index, mysql null aggregate, mysql null join"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+NULL no MySQL não significa zero, string vazia ou falso. Significa desconhecido — e essa distinção causa bugs difíceis de rastrear, porque as consultas executam sem erros e retornam resultados errados silenciosamente.
+
+## NULL Não É um Valor {#null-is-not-a-value}
+
+NULL representa a ausência de um valor. Comparar NULL com qualquer coisa — incluindo outro NULL — não retorna verdadeiro nem falso. Retorna NULL.
+
+```sql
+SELECT NULL = NULL;    -- NULL (not 1)
+SELECT NULL != NULL;   -- NULL (not 0)
+SELECT NULL = 0;       -- NULL
+SELECT NULL = '';      -- NULL
+SELECT 1 + NULL;       -- NULL
+SELECT 'hello' || NULL; -- NULL (logical OR with NULL is unknown, not concatenation — see below)
+```
+
+Por padrão, o `sql_mode` do MySQL não inclui `PIPES_AS_CONCAT`, então `||` é OU lógico, não concatenação de strings — `'hello' || 'world'` é avaliado como `0`, não como `'helloworld'`. Isso difere do PostgreSQL e do padrão ANSI, em que `||` sempre concatena. Use `CONCAT()` para concatenação de strings no MySQL.
+
+Isto é lógica de três valores: verdadeiro, falso e desconhecido (NULL). Qualquer comparação com NULL produz desconhecido, que o MySQL trata como falso em cláusulas `WHERE`. Isso significa que linhas com NULL em uma coluna filtrada são silenciosamente excluídas.
+
+```sql
+CREATE TABLE users (
+    id       INT PRIMARY KEY AUTO_INCREMENT,
+    email    VARCHAR(255),
+    referrer VARCHAR(255)  -- nullable
+);
+
+INSERT INTO users (email, referrer) VALUES
+    ('a@example.com', 'google'),
+    ('b@example.com', NULL),
+    ('c@example.com', 'twitter');
+
+-- This returns only 1 row — both the 'google' row and the NULL row are excluded
+SELECT * FROM users WHERE referrer != 'google';
+```
+
+Para incluir as linhas com NULL, use `IS NULL` explicitamente:
+
+```sql
+SELECT * FROM users WHERE referrer != 'google' OR referrer IS NULL;
+```
+
+## Testando NULL {#testing-for-null}
+
+Use sempre `IS NULL` e `IS NOT NULL`, nunca `= NULL` ou `!= NULL`:
+
+```sql
+-- Wrong — always returns no rows
+SELECT * FROM users WHERE referrer = NULL;
+
+-- Correct
+SELECT * FROM users WHERE referrer IS NULL;
+SELECT * FROM users WHERE referrer IS NOT NULL;
+```
+
+O MySQL também oferece `<=>` (o operador de igualdade seguro para NULL), que trata dois NULLs como iguais:
+
+```sql
+SELECT NULL <=> NULL;  -- 1 (true)
+SELECT NULL <=> 0;     -- 0 (false)
+```
+
+Isso é útil em cláusulas `WHERE` quando você quer casar NULL com NULL, como em consultas que comparam duas colunas potencialmente nulas.
+
+## NULL em Agregações {#null-in-aggregates}
+
+As funções de agregação (`COUNT`, `SUM`, `AVG` etc.) ignoram valores NULL — exceto `COUNT(*)`.
+
+```sql
+SELECT
+    COUNT(*)        AS total_rows,      -- counts all rows including NULLs
+    COUNT(referrer) AS has_referrer,    -- counts only non-NULL referrer values
+    AVG(referrer)   AS avg_referrer     -- ignores NULLs in the average
+FROM users;
+```
+
+```
+total_rows | has_referrer
+-----------+-------------
+3          | 2
+```
+
+`COUNT(*)` retorna 3. `COUNT(referrer)` retorna 2 — a linha com NULL é excluída. Esse é o comportamento pretendido, mas surpreende desenvolvedores que esperam que `COUNT(coluna)` seja igual a `COUNT(*)`.
+
+## Tratando NULL em Expressões {#handling-null-in-expressions}
+
+Use `COALESCE` para fornecer um valor padrão quando uma coluna é NULL:
+
+```sql
+-- Returns the first non-NULL value in the list
+SELECT email, COALESCE(referrer, 'direct') AS source FROM users;
+```
+
+```
+email           | source
+----------------+---------
+a@example.com  | google
+b@example.com  | direct
+c@example.com  | twitter
+```
+
+`IFNULL(coluna, padrão)` é equivalente para o caso de dois argumentos:
+
+```sql
+SELECT email, IFNULL(referrer, 'direct') AS source FROM users;
+```
+
+`NULLIF(a, b)` retorna NULL quando `a = b`; caso contrário, retorna `a`. Útil para evitar divisão por zero:
+
+```sql
+SELECT total_revenue / NULLIF(order_count, 0) AS avg_order_value FROM stats;
+```
+
+| Função | Comportamento | Use quando |
+|:---------|:---------|:---------|
+| `COALESCE(a, b, ...)` | Retorna o primeiro valor não NULL da lista | Você tem várias opções de fallback |
+| `IFNULL(a, b)` | Retorna `b` se `a` for NULL; caso contrário, `a` | Um único valor de fallback; sintaxe mais simples que `COALESCE` para dois argumentos |
+| `NULLIF(a, b)` | Retorna NULL se `a = b`; caso contrário, retorna `a` | Suprimir um valor sentinela (por exemplo, evitar divisão por zero quando a contagem é 0) |
+
+NULL também afeta o comportamento de JOIN de formas não óbvias. Um `LEFT JOIN` retorna NULL para as colunas do lado direito quando não há correspondência, e filtrar por essas colunas NULL no `WHERE` o converte silenciosamente em um `INNER JOIN`. Consulte [MySQL LEFT JOIN](/pt-BR/tutorial/left-join) para a distinção entre ON e WHERE, trabalhada em um banco de dados de exemplo.
+
+## NULL e Índices {#null-and-indexes}
+
+Os índices do MySQL armazenam valores NULL. Uma consulta `WHERE col IS NULL` pode usar um índice em `col`. No entanto:
+
+- Valores `NULL` não são considerados iguais em um índice `UNIQUE` — uma coluna única pode conter vários valores NULL
+- Em um índice composto, NULL em qualquer posição de coluna é indexado normalmente
+
+```sql
+CREATE TABLE sessions (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT,           -- nullable: anonymous sessions
+    token      VARCHAR(64) NOT NULL UNIQUE,
+    created_at DATETIME NOT NULL,
+    INDEX idx_user (user_id)  -- indexes NULL values too
+);
+
+-- This query can use idx_user
+SELECT * FROM sessions WHERE user_id IS NULL;
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Devo usar NULL ou string vazia para campos de texto opcionais? {#should-i-use-null-or-empty-string-for-optional-text-fields}
+Prefira NULL para dados genuinamente ausentes. String vazia (`''`) significa "definido explicitamente como vazio" e é diferente de "não informado". Misturar os dois cria inconsistência — `WHERE col IS NULL` e `WHERE col = ''` são condições diferentes. Escolha uma convenção e aplique-a de forma consistente.
+
+#### Por que `NOT IN` se comporta de forma inesperada com NULLs? {#why-does-not-in-behave-unexpectedly-with-nulls}
+`NOT IN` com uma subconsulta que retorna qualquer NULL sempre retorna um conjunto de resultados vazio:
+
+```sql
+-- If any value in category_ids is NULL, this returns no rows
+SELECT * FROM products WHERE category_id NOT IN (SELECT id FROM categories);
+```
+
+Use `NOT EXISTS` em vez disso quando a subconsulta pode retornar NULLs:
+
+```sql
+SELECT * FROM products p
+WHERE NOT EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id);
+```
+
+#### `ORDER BY` ordena NULLs? {#does-order-by-sort-nulls}
+Sim. Por padrão, o MySQL ordena os valores NULL primeiro em ordem ascendente e por último em ordem descendente. O MySQL não oferece suporte à sintaxe `NULLS FIRST` / `NULLS LAST` (isso é PostgreSQL). Para controlar a posição dos NULLs, use uma expressão de ordenação:
+
+```sql
+-- NULLs last in ascending order
+SELECT * FROM users ORDER BY referrer IS NULL, referrer ASC;
+
+-- NULLs first in ascending order (default behavior, but explicit)
+SELECT * FROM users ORDER BY referrer IS NULL DESC, referrer ASC;
+```
+
+`col IS NULL` é avaliado como 0 para valores não NULL e 1 para NULL, então ordenar por ele em ordem ascendente empurra os NULLs para o final.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `WHERE col != 'value'` exclui linhas com NULL | Adicione `OR col IS NULL` à condição |
+| `COUNT(coluna)` não bate com `COUNT(*)` | Esperado — `COUNT(coluna)` pula NULLs. Use `COUNT(*)` para o total de linhas |
+| Subconsulta com `NOT IN` retorna resultado vazio | A subconsulta retorna NULL — use `NOT EXISTS` em vez disso |
+| `= NULL` no WHERE não casa com nada | Substitua por `IS NULL` |
+| Coluna UNIQUE permite NULLs duplicados | Comportamento esperado — NULLs não são considerados iguais em índices únicos |
+
+## Veja também {#see-also}
+
+- [Desempenho de JOIN no MySQL e erros comuns](/pt-BR/guides/joins) — os bugs de contagem errada de linhas que o NULL causa em um join
+- [Restrições CHECK no MySQL](/pt-BR/guides/check-constraints) — aplicando NOT NULL e outras regras de coluna
+- [Booleanos de Verdade no MySQL](/pt-BR/guides/boolean-columns) — como as agregações booleanas tratam NULL
+- [MySQL INNER JOIN](/pt-BR/tutorial/inner-join) — por que um inner join descarta uma linha em vez de mostrar NULL
+- [Operadores do MySQL](/pt-BR/tutorial/operators) — por que uma comparação com NULL retorna NULL
+- [MySQL IS NULL](/pt-BR/tutorial/is-null) — testando um valor ausente em uma cláusula WHERE
+- [MySQL LEFT JOIN](/pt-BR/tutorial/left-join) — de onde vêm os NULLs em um outer join

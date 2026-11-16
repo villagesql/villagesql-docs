@@ -1,0 +1,262 @@
+---
+title: "Go e sqlc com MySQL"
+sidebarTitle: "Go com sqlc"
+description: "Como usar o sqlc para gerar código Go com segurança de tipos a partir de schema e consultas SQL no MySQL e no VillageSQL, incluindo anotações de consulta, configuração do sqlc.yaml e o tratamento de colunas anuláveis no código gerado."
+keywords: "sqlc mysql, sqlc golang, go mysql sqlc, sqlc.yaml mysql, sqlc query annotations, go-sql-driver mysql, sqlc generate, type safe sql go, sqlc execlastid"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O sqlc gera structs e métodos de consulta em Go diretamente a partir do SQL, de modo que o código da sua aplicação chama funções Go comuns em vez de construir consultas em tempo de execução. Não há uma camada de ORM entre o seu código e o SQL que você escreveu. Este guia configura uma pequena tabela `posts`, gera código com o sqlc para o MySQL e o executa em um servidor ativo.
+
+## Instalando o sqlc {#installing-sqlc}
+
+Instale o sqlc com o Homebrew, ou com `go install` se preferir gerenciá-lo como uma ferramenta Go:
+
+```bash
+brew install sqlc
+```
+
+```bash
+go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
+```
+
+Confirme a versão:
+
+```bash
+sqlc version
+```
+
+```
+v1.31.1
+```
+
+## Estrutura do Projeto {#project-layout}
+
+Crie um módulo Go e três arquivos: um schema, um arquivo de consultas e um arquivo de configuração do sqlc.
+
+```bash
+mkdir go-sqlc-mysql && cd go-sqlc-mysql
+go mod init go-sqlc-mysql
+```
+
+`schema.sql` define a tabela a partir da qual o sqlc vai gerar os tipos. `body` não tem a restrição `NOT NULL`, o que importa mais adiante:
+
+```sql
+CREATE TABLE posts (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    title VARCHAR(255) NOT NULL,
+    body TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+);
+```
+
+## Escrevendo Consultas Anotadas {#writing-annotated-queries}
+
+O sqlc lê arquivos SQL comuns e transforma um comentário `-- name:` acima de cada instrução em um método Go gerado. A palavra após o nome da consulta define a forma do retorno: `:one` para uma única linha, `:many` para um slice, `:exec` para nenhum valor de retorno, `:execresult` para o `sql.Result` bruto e `:execrows` para a contagem de linhas afetadas.
+
+As instruções `INSERT` do MySQL não suportam `RETURNING`, então obter o ID de uma nova linha exige uma anotação dedicada. `:execlastid` chama `sql.Result.LastInsertId()` para você e o retorna diretamente:
+
+```sql
+-- name: GetPost :one
+SELECT id, title, body, created_at FROM posts WHERE id = ?;
+
+-- name: ListPosts :many
+SELECT id, title, body, created_at FROM posts ORDER BY id;
+
+-- name: CreatePost :execlastid
+INSERT INTO posts (title, body) VALUES (?, ?);
+```
+
+## Configurando o sqlc.yaml {#configuring-sqlcyaml}
+
+`sqlc.yaml` aponta o sqlc para os arquivos de schema e de consultas e define o engine MySQL. Os caminhos são resolvidos em relação à localização do `sqlc.yaml`, não ao diretório de onde você executa o `sqlc`:
+
+```yaml
+version: "2"
+sql:
+  - schema: "schema.sql"
+    queries: "query.sql"
+    engine: "mysql"
+    gen:
+      go:
+        package: "posts"
+        out: "posts"
+        sql_package: "database/sql"
+        emit_json_tags: true
+```
+
+`package` e `out` nomeiam o pacote Go gerado e o diretório em que ele é gravado. `sql_package: "database/sql"` diz ao sqlc para gerar código para o `database/sql` da biblioteca padrão, que é o que o `go-sql-driver/mysql` implementa.
+
+## Gerando o Código {#generating-code}
+
+```bash
+sqlc generate
+```
+
+Isso produz três arquivos em `posts/`: `db.go` (a struct `Queries` e seu construtor), `models.go` (a struct `Post`) e `query.sql.go` (um método por consulta anotada). `models.go` é onde a coluna anulável `body` aparece:
+
+```go
+type Post struct {
+	ID        uint64         `json:"id"`
+	Title     string         `json:"title"`
+	Body      sql.NullString `json:"body"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+```
+
+## Colunas Anuláveis Geram sql.NullString, Não um Pointer {#nullable-columns-generate-sqlnullstring-not-a-pointer}
+
+Como `body TEXT` não tem a restrição `NOT NULL`, o sqlc gerou `sql.NullString` para ela, em vez de uma `string` simples ou um `*string`. A mesma regra se aplica a `CreatePostParams`, gerada a partir da lista de parâmetros da instrução `INSERT`:
+
+```go
+type CreatePostParams struct {
+	Title string         `json:"title"`
+	Body  sql.NullString `json:"body"`
+}
+```
+
+Isso significa que cada inserção precisa construir um `sql.NullString` explicitamente, mesmo para passar um valor:
+
+```go
+_, err := queries.CreatePost(ctx, posts.CreatePostParams{
+	Title: "Hello VillageSQL",
+	Body:  sql.NullString{String: "First post generated with sqlc.", Valid: true},
+})
+```
+
+Para inserir uma linha sem body, defina `Valid: false` em vez de deixar o campo como uma string vazia. O valor zero de um `sql.NullString{}` vazio já tem `Valid: false`, então ele é equivalente a escrever `sql.NullString{Valid: false}` explicitamente:
+
+```go
+_, err = queries.CreatePost(ctx, posts.CreatePostParams{
+	Title: "No body",
+	Body:  sql.NullString{Valid: false},
+})
+```
+
+Ler uma coluna anulável de volta exige verificar `.Valid` antes de confiar em `.String`:
+
+```go
+post, err := queries.GetPost(ctx, id)
+if post.Body.Valid {
+	fmt.Println(post.Body.String)
+}
+```
+
+Se uma coluna precisa permitir `NULL`, faça disso uma decisão deliberada de schema. Adicionar `NOT NULL` a `body` em `schema.sql` e executar `sqlc generate` novamente muda o campo gerado de `sql.NullString` para uma `string` simples em todos os lugares em que ele aparece, o que remove a verificação de `.Valid` de cada ponto de chamada.
+
+## Conectando e Executando Migrações {#connecting-and-running-migrations}
+
+Crie o banco de dados e um usuário de aplicação com uma senha real, restrito a esse único banco de dados:
+
+```sql
+CREATE DATABASE sqlc_guide;
+CREATE USER 'sqlc_app'@'127.0.0.1' IDENTIFIED BY 'sqlc_app_pw';
+GRANT ALL PRIVILEGES ON sqlc_guide.* TO 'sqlc_app'@'127.0.0.1';
+```
+
+Aplique o `schema.sql` com o cliente `mysql` antes de executar a aplicação:
+
+```bash
+mysql -u root sqlc_guide < schema.sql
+```
+
+Adicione o driver e conecte-se por TCP com `parseTime=true`, que é necessário para que as colunas `TIMESTAMP` e `DATETIME` do MySQL sejam lidas como `time.Time` do Go em vez de `[]byte`:
+
+```bash
+go get github.com/go-sql-driver/mysql
+```
+
+```go
+db, err := sql.Open("mysql", "sqlc_app:sqlc_app_pw@tcp(127.0.0.1:3306)/sqlc_guide?parseTime=true")
+if err != nil {
+	log.Fatalf("open: %v", err)
+}
+defer db.Close()
+
+queries := posts.New(db)
+```
+
+## CreatePost Retorna int64, GetPost Recebe uint64 {#createpost-returns-int64-getpost-takes-uint64}
+
+`id BIGINT UNSIGNED` é mapeado para `uint64` em todos os lugares em que o sqlc o gera como coluna, incluindo o parâmetro `id` de `GetPost`. Mas `CreatePost`, gerado com `:execlastid`, retorna um `int64` simples. Isso vem de `sql.Result.LastInsertId()`, que a biblioteca padrão define como `int64` independentemente de a coluna ter sinal ou não. Passar um ID recém-criado para `GetPost` exige uma conversão explícita:
+
+```go
+id, err := queries.CreatePost(ctx, posts.CreatePostParams{
+	Title: "Hello VillageSQL",
+	Body:  sql.NullString{String: "First post generated with sqlc.", Valid: true},
+})
+
+post, err := queries.GetPost(ctx, uint64(id))
+```
+
+Executando o programa completo de ponta a ponta em um servidor ativo:
+
+```bash
+go run .
+```
+
+```
+created post id=1
+created post id=2
+fetched post: id=1 title="Hello VillageSQL" body.Valid=true body="First post generated with sqlc." created_at=2026-08-28 12:31:37 +0000 UTC
+total posts: 2
+  id=1 title="Hello VillageSQL" body.Valid=true
+  id=2 title="No body" body.Valid=false
+```
+
+Verificado diretamente no banco de dados, independentemente da saída do próprio programa:
+
+```sql
+SELECT id, title, body, created_at FROM posts ORDER BY id;
+```
+
+```
+id	title	body	created_at
+1	Hello VillageSQL	First post generated with sqlc.	2026-08-28 12:31:37
+2	No body	NULL	2026-08-28 12:31:37
+```
+
+## Ajustando o Pool de Conexões {#tuning-the-connection-pool}
+
+O `database/sql` gerencia seu próprio pool de conexões por baixo de `sql.Open`, e a struct `Queries` gerada pelo sqlc usa qualquer pool que o `*sql.DB` passado a ela já tenha. Duas configurações importam especificamente para um backend MySQL:
+
+```go
+db.SetMaxOpenConns(10)
+db.SetMaxIdleConns(10)
+db.SetConnMaxLifetime(time.Hour)
+```
+
+`SetConnMaxLifetime` deve ser definido abaixo do `wait_timeout` do MySQL, cujo padrão neste servidor é 28800 segundos (8 horas). Sem isso, conexões que o MySQL já fechou do lado do servidor permanecem no pool do Go como entradas ociosas até que uma consulta em uma delas falhe.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### O sqlc executa contra um banco de dados ativo? {#does-sqlc-run-against-a-live-database}
+
+Somente quando você habilita isso explicitamente. `sqlc generate` analisa `schema.sql` e `query.sql` estaticamente e não precisa de um servidor em execução. `sqlc vet` e `sqlc push` podem se conectar a um banco de dados real para verificações adicionais, mas o fluxo básico de `generate` deste guia nunca abre uma conexão.
+
+#### O que acontece se uma consulta em query.sql tiver um erro de sintaxe? {#what-happens-if-a-query-in-querysql-has-a-syntax-error}
+
+`sqlc generate` falha com um erro de análise que nomeia o arquivo e a linha antes de gerar qualquer coisa. Nada é gravado no diretório de saída em caso de falha, então uma consulta quebrada nunca produz código gerado obsoleto ou parcial.
+
+#### O sqlc pode gerar código para INSERT ... ON DUPLICATE KEY UPDATE? {#can-sqlc-generate-code-for-insert--on-duplicate-key-update}
+
+Sim. O sqlc o analisa como uma instrução `INSERT` normal. Anote-a com `:exec`, `:execresult`, `:execrows` ou `:execlastid`, dependendo de qual parte do resultado você precisa, da mesma forma que qualquer outra inserção.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `sqlc generate` informa que não encontra `schema.sql` | Os caminhos em `sqlc.yaml` são relativos ao diretório do próprio arquivo de configuração, não ao diretório de onde você executou o `sqlc`. Use `sqlc generate -f /full/path/to/sqlc.yaml` se estiver executando de outro lugar. |
+| O código gerado não compila: `undefined: sql.NullString` | Adicione `"database/sql"` aos imports do arquivo, ou gere novamente com `sqlc generate`, que adiciona o import automaticamente quando existe uma coluna anulável. |
+| `sql: Scan error ... unsupported Scan, storing driver.Value type []uint8 into type *time.Time` | Adicione `parseTime=true` ao DSN passado para `sql.Open`. |
+| O body da linha inserida é uma string vazia em vez de NULL | `sql.NullString{}` sem `Valid: true` insere `NULL` corretamente, mas `sql.NullString{String: ""}` sem definir `Valid` também tem `Valid: false` e se comporta da mesma forma. Verifique se não definiu `Valid: true` acidentalmente com uma string vazia, o que insere uma string vazia, não NULL. |
+
+## Veja também {#see-also}
+
+- [MySQL e ORMs](/pt-BR/guides/mysql-with-orms) — a abordagem de construção de consultas em tempo de execução à qual o sqlc é uma alternativa
+- [Migrações de Schema no MySQL](/pt-BR/guides/schema-migrations) — versionar as mudanças de `schema.sql` com segurança depois que a tabela está em produção
+- [Pool de Conexões no MySQL](/pt-BR/guides/connection-pooling) — dimensionamento do pool e conexões persistentes além dos padrões do `database/sql`

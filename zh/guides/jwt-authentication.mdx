@@ -1,0 +1,192 @@
+---
+title: "如何使用 JWT 认证 MySQL 用户"
+sidebarTitle: "JWT 认证"
+description: "如何使用 VillageSQL 的 vsql_oauth2 扩展让 MySQL 账户通过 JSON Web Token 登录——签名密钥、声明映射、角色授予，以及为什么被拒绝的令牌看起来像密码错误。"
+keywords: "mysql jwt authentication, mysql oauth login, mysql oidc, jwks mysql, mysql token login, vsql_oauth2"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  本指南使用的是预览能力。请使用
+  `--vsql_allow_preview_extensions=ON` 启动服务器，否则 `INSTALL EXTENSION` 会被拒绝。
+</Note>
+
+一旦已经有了身份提供方，数据库密码就变得难以管理。它们单独签发、单独轮换，并且在拿到密码的人离开之后依然存在。VillageSQL 的 `vsql_oauth2` 扩展让账户改用 JSON Web Token 登录：提供方签发令牌，服务器验证签名和过期时间，令牌中的一个声明指明账户。
+
+## 设置签名密钥 {#set-up-a-signing-key}
+
+该扩展验证签名的方式有两种：对照从 JWKS 端点获取的密钥（与真实提供方配合时使用的方式），或者对照您粘贴进去的一个公钥。静态密钥是查看整个流程运转的最快方式，所以本指南从它开始。
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt_private.pem
+openssl rsa -pubout -in jwt_private.pem -out jwt_public.pem
+```
+
+```sql
+INSTALL EXTENSION vsql_oauth2;
+
+SET GLOBAL vsql_oauth2.public_key = '-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----';
+SET GLOBAL vsql_oauth2.username_claim = 'sub';
+```
+
+`username_claim` 指明携带账户名的声明。它默认为 `sub`，下面的示例令牌使用的就是它。
+
+与真实提供方配合时，您改为设置 `jwks_url`。扩展会获取密钥，按 `jwks_refresh_interval` 中的间隔重新获取，并在令牌指明了缓存中没有的密钥 id 时立即重新获取。还请设置 `issuer` 和 `audience`，这样为其他系统签发的令牌不会在这里被接受。
+
+## 创建账户 {#create-the-account}
+
+该账户是一个普通的 MySQL 账户，在创建时指定为使用该扩展进行认证。它带有自己的授权：
+
+```sql
+CREATE USER 'analyst'@'%' IDENTIFIED WITH vsql_oauth2;
+GRANT SELECT ON shop.* TO 'analyst'@'%';
+```
+
+没有密码需要设置，也没有密码需要轮换。
+
+会话以令牌指明的账户运行，而不是以发起连接的账户运行。这个名称来自 `username_claim` 中的声明，默认为 `sub`。只要该声明的值是 `analyst`，上面的语句就足够了。当您的提供方在那里放的是别的东西，比如一个电子邮件地址时，请同时创建那个账户，并让发起连接的账户代理到它：
+
+```sql
+CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
+CREATE USER 'alice@example.com';
+GRANT SELECT ON shop.* TO 'alice@example.com';
+GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
+```
+
+没有人直接以 `alice@example.com` 登录，所以它不需要自己的密码。运行着 `validate_password` 的服务器会拒绝创建没有密码的账户，并回应 `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`。在这种情况下，请给该账户一个没有人持有的密码，或者一个完全不允许登录的认证插件。
+
+没有代理授权时，登录会被拒绝，并报 `ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing proxy privilege.`
+
+## 登录 {#log-in}
+
+令牌放在通常放密码的位置传输，经由内置的 `mysql_clear_password` 插件，客户端必须显式启用它：
+
+```bash
+MYSQL_PWD="$TOKEN" mysql -h 127.0.0.1 -u analyst --enable-cleartext-plugin
+```
+
+用 `--password=` 传递令牌会让它出现在进程列表中，这就是令牌改放在环境变量中的原因。
+
+在会话内部，`CURRENT_USER()` 是数据库账户，而 `@@external_user` 保留着令牌携带的身份，这正是审计记录中需要的：
+
+```sql
+SELECT CURRENT_USER() AS logged_in_as, @@external_user AS token_identity;
+```
+
+```
++--------------+----------------+
+| logged_in_as | token_identity |
++--------------+----------------+
+| analyst@%    | analyst        |
++--------------+----------------+
+```
+
+<Warning>
+  `mysql_clear_password` 在协议层以明文发送令牌。请在每一个
+  以这种方式认证的连接上使用 TLS，否则路径上的任何东西都能读取令牌，
+  并在它过期之前重放。
+</Warning>
+
+## 从令牌映射角色 {#mapping-roles-from-the-token}
+
+账户也可以从令牌获取权限。把扩展指向携带角色的声明，并打开授予：
+
+```sql
+SET GLOBAL vsql_oauth2.roles_claim = 'roles';
+SET GLOBAL vsql_oauth2.auto_grant = ON;
+```
+
+创建一个角色，以及一个自身没有任何权限的账户：
+
+```sql
+CREATE ROLE 'shop_reader';
+GRANT SELECT ON shop.* TO 'shop_reader';
+
+CREATE USER 'dana'@'%' IDENTIFIED WITH vsql_oauth2;
+```
+
+携带 `"roles": ["shop_reader"]` 的令牌登录后，该角色处于激活状态：
+
+```sql
+SELECT CURRENT_USER() AS account, CURRENT_ROLE() AS roles_now;
+```
+
+```
++---------+-------------------+
+| account | roles_now         |
++---------+-------------------+
+| dana@%  | `shop_reader`@`%` |
++---------+-------------------+
+```
+
+`roles_filter` 缩小被考虑的角色名范围，而 `roles_transform_pattern` 与 `roles_transform_replacement` 把提供方给出的名称改写为数据库角色名，适用于组名看起来不像角色名的提供方。
+
+<Warning>
+  `auto_grant` 会写入一条真实的授权，并且它在登录结束后依然存在。上面的登录之后，
+  这条授权就在服务器中了：
+
+```sql
+SELECT FROM_USER AS role_granted, TO_USER AS to_account
+FROM mysql.role_edges WHERE TO_USER = 'dana';
+```
+
+```
++--------------+------------+
+| role_granted | to_account |
++--------------+------------+
+| shop_reader  | dana       |
++--------------+------------+
+```
+
+  之后关闭 `auto_grant` 并不会把它收回。一个令牌，只出现一次，
+  就会扩大该账户的权限，直到有人撤销该角色。请在启用之前先限定
+  `roles_filter`，并把这个声明视为您的提供方必须被信任才能设置的东西。
+</Warning>
+
+`auto_grant` 关闭时，同一个令牌仍能登录，角色会被跳过而不是授予，`CURRENT_ROLE()` 为 `NONE`。每个被跳过的角色都会写入错误日志：`VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`。`auto_create` 对账户的行为与之相同，它会在服务器从未见过的主体第一次登录时创建一个账户。两者默认都是关闭的，而且两者都把这台服务器的控制权交给了您的提供方。
+
+## 被拒绝的令牌看起来像密码错误 {#a-rejected-token-looks-like-a-wrong-password}
+
+每一种失败都产生同一个错误，而且是那个普通的错误：
+
+```
+ERROR 1045 (28000): Access denied for user 'analyst'@'localhost' (using password: NO)
+```
+
+过期的令牌、用错误密钥签名的令牌，以及误输入的普通密码，都会产生完全相同的输出，包括 `using password: NO`——这有误导性，因为确实发送了令牌。服务器错误日志中也不会出现任何有区分度的信息，即使在 `log_error_verbosity=3` 下也是如此。
+
+所以请从令牌而不是从错误入手调试。解码令牌，并按以下顺序检查四件事：
+
+1. **`exp`** 在未来。提供方与服务器之间的时钟偏差也算在内。
+2. **签名密钥匹配。** 检查令牌的 `kid` 是 JWKS 文档仍在发布的密钥。文档中不再包含的密钥看起来与伪造的令牌一模一样。
+3. **`iss` 和 `aud`** 与您配置的值匹配（如果您配置了它们）。
+4. **`username_claim` 中的声明指向一个存在的账户**，拼写与账户的拼写一致。
+
+解码载荷只需要一个 shell，不需要其他工具：
+
+```bash
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null
+```
+
+## 故障排除 {#troubleshooting}
+
+| 症状 | 修复 |
+|---|---|
+| 安装时报 `ERROR 3219 ... requires preview capabilities` | 使用 `--vsql_allow_preview_extensions=ON` 启动服务器 |
+| 每次尝试都报 `Access denied` | 逐一完成上面的四项检查。无论什么原因，消息都是一样的 |
+| 客户端从不发送令牌 | 传入 `--enable-cleartext-plugin`。其他客户端有各自启用 `mysql_clear_password` 的方式 |
+| 登录原本正常，然后一起失效 | 提供方轮换了密钥。检查 `jwks_url` 可以访问，并且令牌的 `kid` 出现在它返回的文档中 |
+| 某个账户拥有没有人授予过的权限 | `auto_grant` 根据令牌声明授予了它们。检查 `mysql.role_edges` 并撤销 |
+| 重新安装扩展后设置消失 | `UNINSTALL EXTENSION` 会删除持久化的设置。请重新应用它们 |
+
+## 另请参阅 {#see-also}
+
+- [vsql_oauth2](/zh/extensions/vsql-oauth2) — 该扩展的参考页面，列出它添加的每一项设置
+- [MySQL 用户管理](/zh/guides/user-management) — 以令牌认证的账户仍然需要的授权
+- [MySQL 安全加固](/zh/guides/security-hardening) — TLS 以及连接层面的其他内容
+- [使用 HMAC 为数据签名](/zh/guides/hmac-mysql) — 在 SQL 内部而不是在登录时验证签名

@@ -1,0 +1,164 @@
+---
+title: "从触发器发送 Webhook"
+sidebarTitle: "HTTP Webhook"
+description: "如何使用 VillageSQL 的 vsql_http 扩展从 MySQL 触发器发送 HTTP webhook——在 INSERT、UPDATE 或 DELETE 时自动把行变更推送到外部服务。"
+keywords: "mysql webhook trigger, mysql http trigger, mysql after insert webhook, mysql push notification, vsql_http trigger"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+让外部系统与您的数据库保持同步通常意味着轮询——外部服务定期查询您的 API 以获取变更，或者您的应用程序代码在每次写入后发布事件。借助 VillageSQL 的 `vsql_http` 扩展，触发器可以直接发送 HTTP 请求，因此外部系统在行发生变化的那一刻就能收到通知，不需要应用层的事件发布。
+
+## 设置 {#setup}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+## 基本的 Webhook 触发器 {#basic-webhook-trigger}
+
+一个向 webhook 端点 POST 负载的 `AFTER INSERT` 触发器：
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',     'order.created',
+    'id',        NEW.id,
+    'customer',  NEW.customer_id,
+    'total',     NEW.total,
+    'status',    NEW.status
+  );
+  SET @ignored = vsql_http.http_post(
+    'https://hooks.example.com/orders',
+    'application/json',
+    @payload
+  );
+END$$
+DELIMITER ;
+```
+
+结果被赋给 `@ignored`——触发器不使用响应，但这个赋值抑制了“结果未使用”的警告。NULL 表示连接失败；无论哪种情况触发器都会完成，INSERT 照常执行。
+
+## 控制超时 {#controlling-timeouts}
+
+默认情况下，`vsql_http` 使用 30 秒超时。一个缓慢或不可用的 webhook 端点会把写入阻塞那么长时间。使用带选项 JSON 的 `http_request()` 来设置更紧的期限：
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',    'order.created',
+    'id',       NEW.id,
+    'customer', NEW.customer_id,
+    'total',    NEW.total
+  );
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    NULL,
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+3 秒的超时限制了 webhook 延迟能够阻塞写入的时长。请求要么完成，要么放弃——INSERT 不会被回滚。
+
+## UPDATE 和 DELETE 触发器 {#update-and-delete-triggers}
+
+同样的模式适用于更新和删除。使用 `OLD` 包含先前的值：
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_update
+  AFTER UPDATE ON orders
+  FOR EACH ROW
+BEGIN
+  IF NEW.status != OLD.status THEN
+    SET @payload = JSON_OBJECT(
+      'event',      'order.status_changed',
+      'id',         NEW.id,
+      'old_status', OLD.status,
+      'new_status', NEW.status
+    );
+    SET @ignored = vsql_http.http_request(
+      'POST',
+      'https://hooks.example.com/orders',
+      NULL,
+      @payload,
+      'application/json',
+      '{"timeout": 3}'
+    );
+  END IF;
+END$$
+DELIMITER ;
+```
+
+`IF NEW.status != OLD.status` 这个守卫避免了在不改变 status 的 UPDATE 语句上触发 webhook——让 webhook 的数量与有意义的变更成比例。
+
+## 认证 {#authentication}
+
+在 `http_request()` 的 `headers_json` 参数中传入 API 密钥或 bearer 令牌：
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT('id', NEW.id, 'total', NEW.total);
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    '{"Authorization": "Bearer your-webhook-secret"}',
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+把密钥存储在配置表中，并在触发器执行时把它们取到变量里，而不是在触发器主体中硬编码。
+
+## 重要注意事项 {#important-caveats}
+
+**触发器是同步的**。HTTP 调用会阻塞，直到完成或超时。一个缓慢或宕机的 webhook 端点会阻塞对该表的每一次写入。始终设置较短的超时（2–5 秒），并把端点设计为立即响应（把工作放入队列，不要在请求中同步处理）。
+
+**失败默认是静默的**。如果 HTTP 调用返回 NULL（连接失败），触发器不会引发错误，写入会成功——一条警告携带着 curl 的错误消息，但触发器中没有任何东西检查它。非 2xx 响应同样静默返回——`http_post()` 无论状态码如何都返回 JSON，触发器不会检查它。如果可靠投递很重要，请改用事务性发件箱模式：在同一事务中把事件写入 `outbox` 表，然后用一个单独的进程投递它们。
+
+**触发器对每一行各触发一次**。`FOR EACH ROW` 意味着一个批量的 `UPDATE orders SET status = 'shipped'` 命中 1000 行就会发送 1000 次 webhook 调用。这可能压垮端点并耗尽连接限制。对于批量操作，请抑制触发器或使用发件箱模式。
+
+**没有重试逻辑**。失败的请求就一直是失败的。请在接收系统或发件箱进程中构建重试和死信处理，而不是在触发器中。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| 写入变慢 | webhook 端点很慢——在 `http_request()` 选项中设置较短的超时 |
+| 创建时触发器主体报错 | 检查在 `CREATE TRIGGER` 之前是否设置了 `DELIMITER $$` |
+| 没有收到 webhook | 返回 NULL 表示连接失败——用 `SHOW WARNINGS` 查看 curl 的错误消息，并验证从服务器主机的网络访问 |
+| 批量 UPDATE 时 webhook 调用过多 | 用 `IF NEW.col != OLD.col` 守卫，或在批处理操作时抑制触发器 |
+
+## 后续步骤 {#next-steps}
+
+- [从 SQL 发起 HTTP 请求](/zh/guides/http-requests-in-mysql)——包括响应解析在内的完整函数参考
+- [用 API 数据补充行](/zh/guides/rest-api-enrichment)——把外部数据拉入您的表
+- [MySQL 中的触发器](/zh/guides/triggers)——通用触发器模式以及 BEFORE 与 AFTER 的语义
+
+## 另请参阅 {#see-also}
+
+- [从 SQL 发起 HTTP 请求](/zh/guides/http-requests-in-mysql)——webhook 触发器中使用的 vsql_http 函数
+- [MySQL 触发器](/zh/guides/triggers)——触发 webhook 的触发器机制
+- [MySQL 中的 HMAC 签名](/zh/guides/hmac-mysql)——为 webhook 负载签名以供接收方验证

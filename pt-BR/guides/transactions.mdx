@@ -1,0 +1,147 @@
+---
+title: "Transações no MySQL"
+sidebarTitle: "Usando Transações"
+description: "Como funcionam as transações no MySQL: COMMIT, ROLLBACK, níveis de isolamento e como usar transações para manter os dados consistentes."
+keywords: "mysql transactions, mysql isolation level, mysql repeatable read, mysql read committed, mysql transaction locking, mysql transaction isolation levels"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma transação agrupa várias instruções SQL em uma única unidade de trabalho. Ou todas elas têm sucesso, ou nenhuma delas tem. Sem transações, uma falha no meio de uma operação de várias etapas — um pagamento, uma transferência, um pedido — pode deixar seus dados em um estado intermediário quebrado.
+
+## O Básico: BEGIN, COMMIT, ROLLBACK {#the-basics-begin-commit-rollback}
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- debit Alice
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- credit Bob
+
+COMMIT;  -- both changes are saved
+```
+
+Se algo der errado entre os dois updates:
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+
+-- error occurs here, or you decide to cancel
+
+ROLLBACK;  -- neither change is saved — balance unchanged
+```
+
+`ROLLBACK` desfaz tudo até o `START TRANSACTION`. O banco de dados fica como estava antes de a transação começar.
+
+`BEGIN` e `START TRANSACTION` são equivalentes. Os dois iniciam uma nova transação.
+
+## Autocommit {#autocommit}
+
+Por padrão, o MySQL roda em modo autocommit — cada instrução é sua própria transação, confirmada imediatamente. É por isso que `DELETE FROM orders WHERE id = 5` tem efeito na hora, sem um `COMMIT` explícito.
+
+Chamar `START TRANSACTION` suspende temporariamente o autocommit durante essa transação.
+
+```sql
+-- Check current autocommit setting
+SHOW VARIABLES LIKE 'autocommit';
+
+-- Disable autocommit for the session
+SET autocommit = 0;
+
+-- Now every statement is part of a transaction until you COMMIT or ROLLBACK
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+```
+
+Desabilitar o autocommit significa que você precisa executar `COMMIT` ou `ROLLBACK` explicitamente depois de cada operação. Se você desconectar sem confirmar, o MySQL reverte qualquer transação aberta.
+
+## Níveis de Isolamento {#isolation-levels}
+
+Quando várias transações rodam ao mesmo tempo, os níveis de isolamento controlam o que cada transação pode ver das outras. O padrão do MySQL é `REPEATABLE READ`.
+
+| Nível | Leituras Sujas | Leituras Não Repetíveis | Leituras Fantasma |
+|:------|:------------|:---------------------|:--------------|
+| `READ UNCOMMITTED` | Possíveis | Possíveis | Possíveis |
+| `READ COMMITTED` | Evitadas | Possíveis | Possíveis |
+| `REPEATABLE READ` | Evitadas | Evitadas | Evitadas* |
+| `SERIALIZABLE` | Evitadas | Evitadas | Evitadas |
+
+*O REPEATABLE READ do InnoDB evita leituras fantasma por meio de gap locks, o que é mais estrito do que o padrão SQL exige.
+
+**READ COMMITTED** é uma escolha comum para aplicações que priorizam a vazão. Ele evita leituras sujas (ver dados não confirmados de outras transações), mas permite leituras não repetíveis (a mesma linha lida duas vezes em uma transação pode retornar valores diferentes se outra transação confirmou entre as leituras).
+
+```sql
+-- Set isolation level for the current session
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- Or for the next transaction only
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+-- ...
+```
+
+## Savepoints {#savepoints}
+
+Os savepoints permitem reverter parte de uma transação sem abandonar o todo:
+
+```sql
+START TRANSACTION;
+
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+SAVEPOINT after_order;
+
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 42);
+
+-- something went wrong with the item — roll back just this part
+ROLLBACK TO SAVEPOINT after_order;
+
+-- the order is still there; we can retry the item insert
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 43);
+
+COMMIT;
+```
+
+## O Que as Transações Não Cobrem {#what-transactions-dont-cover}
+
+Nem todas as instruções do MySQL podem ser revertidas. Instruções DDL (`CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`) causam um commit implícito — o MySQL confirma qualquer transação aberta antes de executá-las, e o próprio DDL não pode ser revertido.
+
+```sql
+START TRANSACTION;
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+
+DROP TABLE temp_data;  -- implicit commit happens here — the INSERT is committed
+
+ROLLBACK;  -- nothing to roll back; everything was already committed
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### O que acontece se uma transação nunca é confirmada? {#what-happens-if-a-transaction-is-never-committed}
+Se você fecha a conexão sem confirmar, o MySQL reverte automaticamente a transação aberta. Se o servidor cai, o redo log do InnoDB recupera as transações confirmadas e reverte as não confirmadas na inicialização.
+
+#### Posso usar transações com MyISAM? {#can-i-use-transactions-with-myisam}
+Não. As transações exigem um mecanismo de armazenamento transacional. O InnoDB (o mecanismo padrão do MySQL) oferece suporte completo a transações. O MyISAM não — as instruções em tabelas MyISAM têm efeito imediato e não podem ser revertidas.
+
+#### Por quanto tempo uma transação pode ficar aberta? {#how-long-can-a-transaction-stay-open}
+Tecnicamente, pelo tempo que for necessário, mas transações longas mantêm locks e consomem espaço do undo log, o que causa problemas de desempenho para as outras transações. A variável `innodb_lock_wait_timeout` (padrão: 50 segundos) controla por quanto tempo uma transação espera por um lock antes de retornar um erro. Mantenha as transações curtas e confirme assim que o trabalho terminar.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| As alterações não persistem | Verifique se o autocommit está desligado — pode ser necessário chamar `COMMIT` explicitamente |
+| `ROLLBACK` não tem efeito | Uma instrução DDL (`CREATE`, `ALTER`, `DROP`) causou um commit implícito no meio da transação |
+| A transação está bloqueando outras consultas | Uma transação longa está mantendo locks — confirme ou reverta sem demora; verifique `SHOW ENGINE INNODB STATUS` para informações sobre locks |
+| `ERROR 1205: Lock wait timeout exceeded` | Outra transação mantém um lock conflitante; tente de novo depois que a transação bloqueadora terminar |
+
+## Veja também {#see-also}
+
+- [Chaves Estrangeiras no MySQL](/pt-BR/guides/foreign-keys) — as verificações de chave estrangeira fazem parte do trabalho de uma transação
+- [Deadlocks no MySQL](/pt-BR/guides/deadlocks) — o que acontece quando duas transações bloqueiam uma à outra
+- [UPSERT no MySQL](/pt-BR/guides/upsert) — INSERT ... ON DUPLICATE KEY UPDATE dentro de transações
+- [Inserções em Massa no MySQL](/pt-BR/guides/bulk-inserts) — agrupando escritas em transações para ganhar velocidade
+- [MySQL COMMIT e ROLLBACK](/pt-BR/tutorial/transactions) — START TRANSACTION, COMMIT e ROLLBACK com exemplos resolvidos

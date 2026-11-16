@@ -1,0 +1,211 @@
+---
+title: "WITH ROLLUP no MySQL"
+sidebarTitle: "WITH ROLLUP"
+description: "Como WITH ROLLUP adiciona linhas de subtotal e de total a um resultado GROUP BY do MySQL, o que os NULLs nessas linhas significam, e como GROUPING os distingue de NULLs reais."
+keywords: "mysql with rollup, group by with rollup, mysql subtotal row, mysql grouping function, mysql total row sql, mysql rollup null"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`GROUP BY` dá a você 1 linha por grupo e nenhuma linha para o todo. `WITH ROLLUP`
+adiciona essa linha, e os subtotais intermediários quando você agrupa por várias colunas.
+Isso evita executar uma segunda consulta e somar os números por conta própria.
+
+Abra o cliente com `mysql -u root -p sakila` antes de começar.
+
+## Como WITH ROLLUP funciona {#how-with-rollup-works}
+
+```sql
+SELECT GROUPING_COLUMN, AGGREGATE_FUNCTION(COLUMN_NAME)
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN WITH ROLLUP;
+```
+
+Substitua `GROUPING_COLUMN` pela coluna que define os grupos, `TABLE_NAME`
+pela tabela, e `AGGREGATE_FUNCTION(COLUMN_NAME)` pelo que calcular por
+grupo. `WITH ROLLUP` vai no final da cláusula `GROUP BY`.
+
+O servidor retorna os grupos normais, depois linhas extras em que uma coluna de agrupamento
+é posta de lado e seu agregado cobre tudo. Ele coloca NULL nas colunas
+que pôs de lado, e é assim que você identifica essas linhas.
+
+## Exemplos {#examples}
+
+### 1) Adicione uma linha de total {#1-add-a-total-row}
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
+| NC-17  |   210 |
+| NULL   |  1000 |
++--------+-------+
+6 rows in set (0.00 sec)
+```
+
+6 linhas em vez de 5. A última tem NULL onde uma classificação estaria, e sua
+contagem é a tabela inteira.
+
+### 2) Subtotais também {#2-subtotals-as-well}
+
+Agrupe por 2 colunas e você obtém um subtotal por valor da primeira, depois o
+total geral.
+
+```sql
+SELECT rating, rental_rate, COUNT(*) AS films
+FROM film
+WHERE length = 185
+GROUP BY rating, rental_rate WITH ROLLUP;
+```
+
+```text
++--------+-------------+-------+
+| rating | rental_rate | films |
++--------+-------------+-------+
+| G      |        2.99 |     1 |
+| G      |        4.99 |     2 |
+| G      |        NULL |     3 |
+| PG     |        2.99 |     1 |
+| PG     |        NULL |     1 |
+| PG-13  |        2.99 |     2 |
+| PG-13  |        4.99 |     1 |
+| PG-13  |        NULL |     3 |
+| R      |        2.99 |     1 |
+| R      |        4.99 |     2 |
+| R      |        NULL |     3 |
+| NULL   |        NULL |    10 |
++--------+-------------+-------+
+12 rows in set (0.00 sec)
+```
+
+Leia uma linha pelas colunas que estão NULL. `G / NULL / 3` é o subtotal de `G`
+em todas as taxas. `NULL / NULL / 10` é o total geral, que bate com os 10
+filmes que duram 185 minutos.
+
+As linhas de rollup vêm logo depois dos grupos que elas resumem, em vez de se juntarem no
+final, então o resultado é lido de cima para baixo como um relatório.
+
+## Distinguindo um NULL de rollup de um NULL real {#telling-a-rollup-null-from-a-real-one}
+
+O NULL em uma linha de rollup significa "todos os valores desta coluna". Um NULL nos dados
+significa "nenhum valor registrado". Eles são impressos de forma idêntica, então em uma coluna que pode ser
+NULL você não consegue distinguir os 2 só de olhar.
+
+`GROUPING()` responde à pergunta diretamente. Ela retorna 1 quando a coluna foi
+posta de lado naquela linha e 0 caso contrário.
+
+```sql
+SELECT rating, GROUPING(rating) AS is_total, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++--------+----------+-------+
+| rating | is_total | films |
++--------+----------+-------+
+| G      |        0 |   178 |
+| PG     |        0 |   194 |
+| PG-13  |        0 |   223 |
+| R      |        0 |   195 |
+| NC-17  |        0 |   210 |
+| NULL   |        1 |  1000 |
++--------+----------+-------+
+6 rows in set (0.00 sec)
+```
+
+`rating` nunca é NULL no Sakila, então aqui as 2 perguntas têm a mesma resposta.
+Em uma coluna que de fato contém NULLs, testar `rating IS NULL` pegaria os dois
+tipos de linha e `GROUPING(rating) = 1` pega apenas o rollup.
+
+## ORDER BY move o total, e muda a ordenação {#order-by-moves-the-total-and-changes-the-sort}
+
+Os exemplos acima não têm `ORDER BY`, e isso é proposital: `WITH ROLLUP` coloca
+cada linha de rollup logo abaixo dos grupos que ela resume, e ordenar joga esse
+arranjo fora.
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| NULL   |  1000 |
+| G      |   178 |
+| NC-17  |   210 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
++--------+-------+
+6 rows in set (0.00 sec)
+```
+
+2 coisas se moveram. O total geral foi ordenado para o topo, porque NULL vem antes de
+todo valor real na ordenação. E as classificações saíram em ordem alfabética, e não na
+ordem declarada do `ENUM` que [GROUP BY](/pt-BR/tutorial/group-by) mostrou, porque
+ordenar um resultado de rollup o ordena como texto.
+
+Então decida o que você quer. Deixe o `ORDER BY` de fora para um relatório que é lido como
+subtotais sob seus grupos, ou adicione-o e aceite que as linhas de rollup caem
+onde a ordenação as colocar.
+
+## Rotulando as linhas de rollup {#labeling-the-rollup-rows}
+
+Uma coluna de NULLs não é o que você quer em um relatório. `COALESCE` retorna seu
+primeiro argumento que não é NULL, então ele coloca uma palavra ali em vez disso.
+
+```sql
+SELECT COALESCE(rating, 'All ratings') AS label, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++-------------+-------+
+| label       | films |
++-------------+-------+
+| G           |   178 |
+| PG          |   194 |
+| PG-13       |   223 |
+| R           |   195 |
+| NC-17       |   210 |
+| All ratings |  1000 |
++-------------+-------+
+6 rows in set (0.00 sec)
+```
+
+Isso fica bem legível, e só é seguro aqui porque `rating` nunca é NULL nos
+dados. Em uma coluna que pode ser NULL, `COALESCE` rotularia lacunas reais como totais,
+então use `GROUPING()` no teste em vez disso.
+
+## Resumo {#summary}
+
+- Adicione `WITH ROLLUP` ao final de `GROUP BY` para obter linhas de subtotal e de total.
+- Leia NULL em uma coluna de agrupamento como "todos os valores desta coluna".
+- Espere um subtotal por valor de cada coluna anterior quando você agrupa por várias.
+- Use `GROUPING(column)` para distinguir uma linha de rollup de uma linha em que os dados são NULL.
+- Espere que `ORDER BY` mova as linhas de rollup e ordene um `ENUM` como texto.
+
+## Veja também {#see-also}
+
+- [GROUP BY](/pt-BR/tutorial/group-by) — os grupos aos quais isto adiciona totais
+- [Funções de agregação](/pt-BR/tutorial/aggregate-functions) — o que é totalizado
+- [IS NULL](/pt-BR/tutorial/is-null) — a outra coisa que um NULL nessa coluna pode significar
+- [Desempenho de GROUP BY no MySQL](/pt-BR/guides/group-by-having) — o que o agrupamento custa em grande escala

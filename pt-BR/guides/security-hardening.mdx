@@ -1,0 +1,249 @@
+---
+title: "Hardening de Segurança do MySQL"
+sidebarTitle: "Hardening do MySQL"
+description: "Como proteger um servidor MySQL: executar mysql_secure_installation, remover usuários anônimos, restringir o acesso root, aplicar políticas de senha, auditar privilégios, habilitar SSL/TLS e reduzir a superfície de ataque."
+keywords: "mysql security, mysql hardening, mysql secure installation, mysql ssl tls, mysql password policy, mysql root security, mysql user privileges audit, mysql security best practices"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma instalação padrão do MySQL prioriza a facilidade de configuração em vez da segurança. Fazer o hardening de um servidor de produção significa remover padrões que faziam sentido no laptop de um desenvolvedor, mas que são inadequados quando o servidor é alcançável por aplicações ou pela rede.
+
+## Hardening por Contexto de Implantação {#hardening-by-deployment-context}
+
+Nem todo passo de hardening tem a mesma relação entre risco e atrito. Use esta tabela para priorizar:
+
+| Passo | Produção exposta à internet | Rede interna/privada | Dev / staging |
+|:-----|:--------------------------|:------------------------|:--------------|
+| Executar `mysql_secure_installation` | Obrigatório | Obrigatório | Recomendado |
+| Remover usuários anônimos | Obrigatório | Obrigatório | Recomendado |
+| Restringir root ao localhost | Obrigatório | Obrigatório | Recomendado |
+| Remover o banco de dados test | Obrigatório | Obrigatório | Opcional |
+| Componente `validate_password` | Obrigatório | Obrigatório | Opcional — pode atrapalhar a iteração rápida |
+| Política de expiração de senha | Obrigatório | Recomendado | Pular |
+| Contas de aplicação com privilégio mínimo | Obrigatório | Obrigatório | Recomendado |
+| Restringir o host nos grants (sem `'%'`) | Obrigatório | Obrigatório | Opcional |
+| `REQUIRE SSL` nas contas | Obrigatório | Recomendado | Pular |
+| Certificados TLS personalizados assinados por CA | Obrigatório | Opcional — autoassinado é aceitável | Pular |
+| `bind-address` para o IP interno | Obrigatório | Recomendado | Opcional |
+| Desabilitar `local_infile` | Obrigatório | Recomendado | Opcional |
+| `skip_name_resolve` | Recomendado | Recomendado | Opcional |
+| Bloquear ou descartar contas não usadas | Obrigatório | Obrigatório | Opcional |
+
+**Exposto à internet** significa que a porta 3306 é alcançável de fora da sua rede privada, mesmo que atrás de um balanceador de carga. Aplique todas as linhas "Obrigatório" sem exceção.
+
+**Rede interna/privada** cobre servidores acessíveis apenas dentro de uma VPC, de uma sub-rede privada ou da rede do escritório. Algumas mitigações (certificados assinados por CA, obrigatoriedade de SSL em todas as contas) adicionam sobrecarga operacional com ganho marginal — mas senhas fortes, privilégio mínimo e restrições de bind-address continuam inegociáveis.
+
+**Máquinas de dev/staging** são a fonte mais comum de vazamento de credenciais. Pular a complexidade de senha ou deixar grants de host `'%'` no lugar é aceitável somente se a instância for inalcançável de fora do seu laptop ou do ambiente de CI. Se o staging compartilha uma rede com dados de produção, trate-o no mínimo como interno/privado.
+
+## mysql_secure_installation {#mysql_secure_installation}
+
+Execute isto imediatamente após instalar o MySQL em qualquer servidor que não seja uma máquina de desenvolvimento local:
+
+```bash
+mysql_secure_installation
+```
+
+Ele percorre os passos de hardening mais críticos:
+
+- Definir a senha do root (se ainda não estiver definida)
+- Remover usuários anônimos
+- Proibir o login remoto do root
+- Remover o banco de dados test
+- Recarregar as tabelas de privilégios
+
+Esses quatro passos eliminam a superfície de ataque mais comum em uma instalação nova.
+
+## Restrições da Conta Root {#root-account-restrictions}
+
+O root deve se conectar apenas a partir de `localhost`. Verifique e imponha isso:
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = 'root';
+-- Should show only 'localhost', '127.0.0.1', '::1'
+```
+
+Se o root tiver uma entrada de host `'%'`, remova-a:
+
+```sql
+DROP USER 'root'@'%';
+```
+
+Para administração remota, crie uma conta de DBA nomeada com acesso de host limitado em vez de usar o root remotamente.
+
+## Remova Usuários Anônimos e o Banco de Dados Test {#remove-anonymous-users-and-test-database}
+
+```sql
+-- Remove any anonymous accounts
+DELETE FROM mysql.user WHERE user = '';
+FLUSH PRIVILEGES;
+
+-- Remove the test database (readable by anonymous users by default)
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE db = 'test' OR db = 'test\\_%';
+FLUSH PRIVILEGES;
+```
+
+## Política de Senhas {#password-policy}
+
+O MySQL 8.0+ inclui o componente `validate_password`, que impõe regras de complexidade de senha. Ele precisa ser instalado antes do uso — o `mysql_secure_installation` se oferece para instalá-lo automaticamente. Para instalar manualmente:
+
+```sql
+INSTALL COMPONENT 'file://component_validate_password';
+```
+
+Verifique se ele está ativo:
+
+```sql
+SHOW VARIABLES LIKE 'validate_password%';
+```
+
+Configure os requisitos mínimos:
+
+```sql
+SET GLOBAL validate_password.length = 12;
+SET GLOBAL validate_password.mixed_case_count = 1;
+SET GLOBAL validate_password.number_count = 1;
+SET GLOBAL validate_password.special_char_count = 1;
+SET GLOBAL validate_password.policy = 'MEDIUM';
+```
+
+Níveis de política: `LOW` (apenas comprimento), `MEDIUM` (comprimento + classes de caracteres), `STRONG` (+ verificação de dicionário).
+
+Defina a expiração de senha para contas que podem ser esquecidas:
+
+```sql
+ALTER USER 'admin'@'localhost' PASSWORD EXPIRE INTERVAL 90 DAY;
+```
+
+## Contas de Usuário com Privilégio Mínimo {#least-privilege-user-accounts}
+
+As contas de aplicação devem ter os privilégios mínimos necessários. Consulte [Gerenciamento de Usuários do MySQL](/pt-BR/guides/user-management) para a sintaxe completa do GRANT.
+
+Padrões comuns:
+
+```sql
+-- Read-only replica account
+CREATE USER 'app_read'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT ON myapp.* TO 'app_read'@'10.0.1.%';
+
+-- Application write account (no schema changes)
+CREATE USER 'app_write'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT, INSERT, UPDATE, DELETE ON myapp.* TO 'app_write'@'10.0.1.%';
+
+-- Migration account (schema changes allowed, used only by deploy scripts)
+CREATE USER 'app_migrate'@'localhost' IDENTIFIED BY 'strong_password';
+GRANT ALL PRIVILEGES ON myapp.* TO 'app_migrate'@'localhost';
+```
+
+Restrinja os hosts o máximo possível — use notação de sub-rede ou IPs específicos, não `'%'`.
+
+## Auditando Privilégios Existentes {#auditing-existing-privileges}
+
+Revise todas as contas e seus privilégios:
+
+```sql
+-- List all user accounts
+SELECT user, host, account_locked, password_expired
+FROM mysql.user
+ORDER BY user, host;
+
+-- Check for overly broad grants
+SELECT user, host, Select_priv, Insert_priv, Update_priv, Delete_priv,
+       Super_priv, Grant_priv
+FROM mysql.user
+WHERE host = '%' OR Super_priv = 'Y';
+```
+
+Remova ou bloqueie as contas que não estão em uso ativo:
+
+```sql
+ALTER USER 'old_account'@'%' ACCOUNT LOCK;
+-- Or drop entirely:
+DROP USER 'old_account'@'%';
+```
+
+## Conexões SSL/TLS {#ssltls-connections}
+
+O MySQL 8.0 habilita SSL/TLS por padrão e gera certificados automaticamente na inicialização. Verifique se está ativo:
+
+```sql
+SHOW VARIABLES LIKE '%ssl%';
+-- ssl_ca, ssl_cert, ssl_key should show file paths
+-- have_ssl no longer exists on MySQL 8.4 (ERROR 1193). To confirm TLS is in
+-- use, run SHOW STATUS LIKE 'Ssl_cipher' on an actual TLS connection.
+```
+
+Exija SSL para contas específicas:
+
+```sql
+ALTER USER 'app_write'@'%' REQUIRE SSL;
+```
+
+Para verificar se uma conexão de cliente está usando SSL:
+
+```sql
+SHOW STATUS LIKE 'Ssl_cipher';
+-- Non-empty value means the current connection is encrypted
+```
+
+Para produção, substitua os certificados autoassinados gerados automaticamente por certificados de uma CA confiável.
+
+## Acesso de Rede {#network-access}
+
+Restrinja o MySQL para escutar apenas nas interfaces necessárias. No `my.cnf`:
+
+```ini
+[mysqld]
+bind-address = 127.0.0.1     # local only
+# or
+bind-address = 10.0.1.5      # specific internal IP
+```
+
+Se o MySQL não deve ser alcançável pela rede de forma alguma (aplicação no mesmo host), faça o bind em `127.0.0.1` e nunca exponha a porta 3306 externamente. As regras de firewall são uma segunda camada de defesa, não um substituto para restringir o bind address.
+
+## Desabilitando Recursos Arriscados {#disabling-risky-features}
+
+Desligue os recursos que sua aplicação não usa:
+
+```sql
+-- Prevent MySQL from reading/writing files on the server filesystem
+-- (prevents SQL injection attacks that use LOAD DATA INFILE to read /etc/passwd)
+SET GLOBAL local_infile = 0;
+```
+
+No `my.cnf`:
+
+```ini
+[mysqld]
+local_infile = 0
+skip_name_resolve = 1       # don't do reverse DNS lookups; use IPs in grants
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### A instalação padrão do MySQL 8.4 é segura? {#is-the-default-mysql-84-install-secure}
+
+Melhor do que os padrões antigos do MySQL, mas ainda não passou por hardening para produção. O MySQL 8.4 gera uma senha de root aleatória e habilita SSL por padrão. Você ainda precisa: verificar se a senha do root é forte, remover usuários anônimos, restringir o acesso por host e configurar o componente `validate_password`.
+
+#### Devo executar o MySQL como root? {#should-i-run-mysql-as-root}
+
+Nunca. O MySQL deve ser executado como um usuário de sistema dedicado e com poucos privilégios (normalmente `mysql`). Executar o processo do servidor como root significa que um exploit do MySQL pode levar ao comprometimento total do sistema.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1045: Access denied for user 'root'@'%'` | O login remoto do root está corretamente bloqueado — crie um usuário administrador nomeado com acesso de host específico |
+| A aplicação não consegue se conectar depois de adicionar `REQUIRE SSL` | O cliente precisa usar as flags de SSL: `--ssl-mode=REQUIRED`; verifique se os certificados do servidor são válidos |
+| `validate_password` rejeitando uma senha | Verifique a política atual: `SHOW VARIABLES LIKE 'validate_password%'`; confirme que a senha atende a todos os requisitos |
+| Não encontro a senha do root em uma instalação nova | O MySQL 8.0 registra a senha temporária do root no log de erros na primeira inicialização — encontre o caminho do log com `SELECT @@GLOBAL.log_error;` e depois execute `grep 'temporary password' <path>` |
+| Grants de host `'%'` ainda visíveis depois do DELETE | Execute `FLUSH PRIVILEGES` após qualquer modificação direta em `mysql.user` |
+
+## Veja também {#see-also}
+
+- [Gerenciamento de Usuários do MySQL](/pt-BR/guides/user-management) — criando usuários e concedendo acesso com privilégio mínimo
+- [Hashing de Senhas no MySQL](/pt-BR/guides/password-hashing) — protegendo credenciais de nível de aplicação armazenadas no MySQL
+- [Autenticação JWT no MySQL](/pt-BR/guides/jwt-authentication) — movendo a emissão e a rotação de credenciais para o seu provedor de identidade

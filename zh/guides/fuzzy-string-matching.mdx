@@ -1,0 +1,189 @@
+---
+title: "MySQL 中的语音匹配与编辑距离"
+sidebarTitle: "模糊字符串匹配"
+description: "如何使用 VillageSQL 的 vsql_fuzzystrmatch 扩展在 MySQL 中按读音和编辑距离匹配字符串——Soundex、Levenshtein、Metaphone 和 Double Metaphone。"
+keywords: "mysql soundex, mysql levenshtein, mysql metaphone, mysql phonetic matching, mysql edit distance, vsql_fuzzystrmatch, mysql name matching"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  本指南需要 VillageSQL 0.0.4 或更高版本。
+</Note>
+
+两个指向同一事物的字符串——一个人名、一家公司、一个地点——在实际中往往看起来并不相同。拼写错误、音译、转录错误和地区差异都会产生 `=` 和 `LIKE` 无法捕捉的变化。VillageSQL 的 `vsql_fuzzystrmatch` 扩展提供了四种方法：Soundex（按读音相似分组）、Levenshtein 编辑距离（逐字符计算代价）、Metaphone（基于发音的编码）和 Double Metaphone（处理来自多种语言来源的歧义发音）。
+
+## 安装 {#installation}
+
+```sql
+INSTALL EXTENSION vsql_fuzzystrmatch;
+```
+
+这些函数可以不加限定符直接调用。它们也可以以 `vsql_fuzzystrmatch.soundex(...)` 的形式调用，即用所属扩展的名称加以限定——这是 VEF 的名称解析，而不是真正的 schema，`vsql_fuzzystrmatch` 不会出现在 `SHOW DATABASES` 中。当任一参数为 NULL 时，所有函数都返回 NULL。
+
+## Soundex {#soundex}
+
+Soundex 根据英文单词的读音将其简化为一个 4 字符的代码。代码相同的单词被视为语音匹配。
+
+```sql
+SELECT vsql_fuzzystrmatch.soundex('Robert');   -- R163
+SELECT vsql_fuzzystrmatch.soundex('Rupert');   -- R163
+SELECT vsql_fuzzystrmatch.soundex('Smith');    -- S530
+SELECT vsql_fuzzystrmatch.soundex('Smythe');   -- S530
+```
+
+`difference` 返回一个 0–4 的分数，表示两个字符串的 Soundex 代码有多少个字符相同。4 = 代码完全相同。
+
+```sql
+SELECT vsql_fuzzystrmatch.difference('Robert', 'Rupert');   -- 4
+SELECT vsql_fuzzystrmatch.difference('Robert', 'Sylvia');   -- 0
+```
+
+**在以下情况使用 Soundex**：您需要简单的读音相似分组，并且数据主要是英文人名。它速度快、易于解释，但可能把不相关的名字混为一谈，并且无法处理非英语的发音。
+
+### 在表中查找语音匹配 {#finding-phonetic-matches-in-a-table}
+
+```sql
+SELECT name
+FROM customers
+WHERE vsql_fuzzystrmatch.soundex(name) = vsql_fuzzystrmatch.soundex('Smith')
+ORDER BY name;
+```
+
+要查找所有读音接近（不一定代码完全相同）的名字：
+
+```sql
+SELECT name, vsql_fuzzystrmatch.difference(name, 'Johnson') AS score
+FROM customers
+WHERE vsql_fuzzystrmatch.difference(name, 'Johnson') >= 3
+ORDER BY score DESC;
+```
+
+## Levenshtein 编辑距离 {#levenshtein-edit-distance}
+
+Levenshtein 计算将一个字符串变为另一个字符串所需的最少单字符编辑次数——插入、删除、替换。
+
+```sql
+SELECT vsql_fuzzystrmatch.levenshtein('kitten', 'sitting');   -- 3
+SELECT vsql_fuzzystrmatch.levenshtein('mysql', 'mysql');      -- 0
+SELECT vsql_fuzzystrmatch.levenshtein('abc', 'xyz');          -- 3
+```
+
+**在以下情况使用编辑距离**：您需要匹配只相差少量拼写错误的字符串，并且需要精确控制距离阈值。
+
+### 自定义操作代价 {#custom-operation-costs}
+
+`levenshtein_cost` 允许您为插入、删除和替换设置不同的权重：
+
+```sql
+-- Substitutions cost 2, insertions and deletions cost 1
+SELECT vsql_fuzzystrmatch.levenshtein_cost('abc', 'xyz', 1, 1, 2);  -- 6
+```
+
+### 提前退出阈值 {#early-exit-threshold}
+
+`levenshtein_less_equal` 在距离超过阈值后立即短路——用于过滤时更高效。当实际距离超过 `max_d` 时，它返回 `max_d + 1`，而不是计算完整的距离：
+
+```sql
+-- Distance is 3, max_d is 5: returns real distance
+SELECT vsql_fuzzystrmatch.levenshtein_less_equal('kitten', 'sitting', 5);   -- 3
+
+-- Distance is 3, max_d is 2: cap fires, returns max_d + 1
+SELECT vsql_fuzzystrmatch.levenshtein_less_equal('abc', 'xyz', 2);          -- 3 (= max_d + 1)
+```
+
+与自定义代价结合使用：
+
+```sql
+SELECT vsql_fuzzystrmatch.levenshtein_less_equal_cost('abc', 'xyz', 1, 1, 1, 2);  -- 3
+```
+
+两个输入字符串都必须 ≤ 255 个字符。代价必须为非负数。
+
+### 按编辑距离去重 {#deduplication-by-edit-distance}
+
+```sql
+SELECT a.name, b.name, vsql_fuzzystrmatch.levenshtein(a.name, b.name) AS dist
+FROM companies a
+JOIN companies b ON a.id < b.id
+WHERE vsql_fuzzystrmatch.levenshtein_less_equal(a.name, b.name, 2) <= 2
+ORDER BY dist;
+```
+
+## Metaphone {#metaphone}
+
+Metaphone 比 Soundex 应用了更多的英语发音规则，并产生可变长度的输出。`max_output_length` 参数限制结果的长度。
+
+```sql
+SELECT vsql_fuzzystrmatch.metaphone('Robert', 10);    -- RBRT
+SELECT vsql_fuzzystrmatch.metaphone('Thompson', 10);  -- 0MPSN
+SELECT vsql_fuzzystrmatch.metaphone('Robert', 2);     -- RB  (truncated)
+```
+
+**在以下情况使用 Metaphone**：Soundex 产生过多误报，或者对不太常见的名字漏掉匹配。它处理更多的发音模式（TH → 0、不发音的字母等）。
+
+## Double Metaphone {#double-metaphone}
+
+Double Metaphone 处理来自多种语言来源的歧义发音——德语、斯拉夫语、西班牙语、希伯来语等来源的名字，它们会以不同的方式被英语化。它产生两个代码：主代码和备选代码。
+
+```sql
+SELECT vsql_fuzzystrmatch.dmetaphone('Robert');      -- RPRT
+SELECT vsql_fuzzystrmatch.dmetaphone_alt('Robert');  -- RPRT  (no alternate)
+
+SELECT vsql_fuzzystrmatch.dmetaphone('Schmidt');     -- XMT
+SELECT vsql_fuzzystrmatch.dmetaphone_alt('Schmidt'); -- SMT   (alternate pronunciation)
+```
+
+当不存在备选代码时，`dmetaphone_alt` 回退为主代码。
+
+**在以下情况使用 Double Metaphone**：您的数据包含来自多种语言背景的名字，或者 Metaphone 漏掉了人工会认为等价的匹配。
+
+### 用两个代码匹配 {#matching-with-both-codes}
+
+```sql
+-- Match if either the primary or alternate code aligns
+SELECT name
+FROM customers
+WHERE vsql_fuzzystrmatch.dmetaphone(name) = vsql_fuzzystrmatch.dmetaphone('Schmidt')
+   OR vsql_fuzzystrmatch.dmetaphone_alt(name) = vsql_fuzzystrmatch.dmetaphone('Schmidt')
+   OR vsql_fuzzystrmatch.dmetaphone(name) = vsql_fuzzystrmatch.dmetaphone_alt('Schmidt');
+```
+
+## 选择方法 {#choosing-an-approach}
+
+| 情况 | 推荐方法 |
+|---|---|
+| 英文人名按读音相似分组 | Soundex |
+| 带距离预算的拼写错误容忍 | Levenshtein |
+| 比 Soundex 更好的英语发音处理 | Metaphone |
+| 来自混合语言背景的名字 | Double Metaphone |
+| 需要相似度分数而不是阈值 | [trgm_similarity](/zh/guides/trigram-similarity) |
+
+## 函数参考 {#function-reference}
+
+| 函数 | 返回值 | 说明 |
+|---|---|---|
+| `soundex(text)` | TEXT | 4 字符 Soundex 代码 |
+| `difference(text, text)` | INT | 0–4 的 Soundex 重合分数 |
+| `levenshtein(s, t)` | INT | 编辑距离，所有操作代价为 1 |
+| `levenshtein_cost(s, t, ins, del, sub)` | INT | 带自定义代价的编辑距离 |
+| `levenshtein_less_equal(s, t, max_d)` | INT | 距离 ≤ max_d 时返回距离；否则返回 max_d+1 |
+| `levenshtein_less_equal_cost(s, t, ins, del, sub, max_d)` | INT | 自定义代价 + 提前退出 |
+| `metaphone(text, max_len)` | TEXT | Metaphone 代码，截断到 max_len |
+| `dmetaphone(text)` | TEXT | Double Metaphone 主代码 |
+| `dmetaphone_alt(text)` | TEXT | Double Metaphone 备选代码 |
+
+## 已知限制 {#known-limitations}
+
+**不支持函数重载**。VEF 仅按名称注册函数；两个同名函数不能共存。PostgreSQL 使用重载的地方（`levenshtein` 的 2 参数与 5 参数版本），本扩展使用不同的名称（`levenshtein` 与 `levenshtein_cost`）。
+
+**字符串长度限制**。`levenshtein` 的输入必须 ≤ 255 个字符。
+
+## 另请参阅 {#see-also}
+
+- [如何在 MySQL 中用三元组相似度查找相似字符串](/zh/guides/trigram-similarity)
+- [如何在 MySQL 中实现全文搜索](/zh/guides/full-text-search)
+- [如何在 SQL 中操作和转换字符串](/zh/guides/string-functions)
+- [MySQL REGEXP](/zh/tutorial/regexp)

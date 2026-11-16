@@ -1,0 +1,187 @@
+---
+title: "Diferenciação de maiúsculas e minúsculas no MySQL"
+sidebarTitle: "Maiúsculas e minúsculas"
+description: "Por que uma comparação de strings no MySQL ignora a diferença entre maiúsculas e minúsculas, como ler a collation que decide isso, e como pedir uma correspondência que respeite maiúsculas e minúsculas."
+keywords: "mysql case sensitive, mysql case insensitive query, mysql collation case sensitive, mysql where case sensitive, mysql collate, mysql table name case sensitivity"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma comparação de strings no MySQL ignora a diferença entre maiúsculas e minúsculas, a menos que você peça o contrário. Isso
+surpreende as pessoas uma vez e depois as pega mais tarde, então vale a pena saber o que
+decide isso e como mudar para uma única consulta.
+
+Abra o cliente com `mysql -u root -p sakila` antes de começar.
+
+## Como a diferenciação de maiúsculas e minúsculas funciona {#how-case-sensitivity-works}
+
+Nada na sua consulta decide isso. Uma collation decide, e toda coluna de texto
+carrega uma. Um conjunto de caracteres diz quais caracteres uma coluna pode conter, e sua
+collation diz como compará-los. Você sobrescreve a collation para uma única
+comparação com `COLLATE`:
+
+```sql
+SELECT COLUMN_LIST
+FROM TABLE_NAME
+WHERE COLUMN_NAME COLLATE COLLATION_NAME = 'SEARCH_TEXT';
+```
+
+Substitua `COLLATION_NAME` pela collation que você quer que a comparação use, e
+`SEARCH_TEXT` pelo valor a corresponder.
+
+## Exemplos {#examples}
+
+### 1) 2 strings que diferem só em maiúsculas e minúsculas são iguais {#1-2-strings-that-differ-only-in-case-are-equal}
+
+```sql
+SELECT 'ABC' = 'abc' AS same;
+```
+
+```text
++------+
+| same |
++------+
+|    1 |
++------+
+1 row in set (0.00 sec)
+```
+
+### 2) O mesmo vale contra uma coluna {#2-the-same-holds-against-a-column}
+
+Um termo de busca em minúsculas encontra um título em maiúsculas.
+
+```sql
+SELECT title FROM film WHERE title = 'academy dinosaur';
+```
+
+```text
++------------------+
+| title            |
++------------------+
+| ACADEMY DINOSAUR |
++------------------+
+1 row in set (0.00 sec)
+```
+
+### 3) Ler a collation da coluna {#3-read-the-columns-collation}
+
+```sql
+SELECT COLUMN_NAME, DATA_TYPE, COLLATION_NAME
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'sakila' AND TABLE_NAME = 'film' AND COLUMN_NAME = 'title';
+```
+
+```text
++-------------+-----------+--------------------+
+| COLUMN_NAME | DATA_TYPE | COLLATION_NAME     |
++-------------+-----------+--------------------+
+| title       | varchar   | utf8mb4_0900_ai_ci |
++-------------+-----------+--------------------+
+1 row in set (0.01 sec)
+```
+
+Leia o nome de uma collation a partir do final. `ci` é case-insensitive (ignora maiúsculas e minúsculas), e é por isso que
+o exemplo 2 correspondeu. `ai` é accent-insensitive (ignora acentos), e faz um trabalho separado: sob
+esta collation `'e' = 'é'` é verdadeiro, e sob `utf8mb4_0900_as_cs` é
+falso.
+
+| Final | A comparação |
+|---|---|
+| `_ci` | ignora maiúsculas e minúsculas |
+| `_cs` | respeita maiúsculas e minúsculas |
+| `_ai` | ignora acentos |
+| `_as` | respeita acentos |
+| `_bin` | respeita os dois, comparando diretamente os valores armazenados |
+
+Essa tabela é também o que o nome da sua própria coluna significa. Execute a consulta acima
+contra qualquer tabela e coluna para ver sob quais regras você está trabalhando.
+
+### 4) Pedir uma comparação que respeite maiúsculas e minúsculas {#4-ask-for-a-case-sensitive-comparison}
+
+```sql
+SELECT 'ABC' = 'abc' COLLATE utf8mb4_0900_as_cs AS case_sensitive,
+       'ABC' = 'abc' COLLATE utf8mb4_0900_ai_ci AS case_insensitive;
+```
+
+```text
++----------------+------------------+
+| case_sensitive | case_insensitive |
++----------------+------------------+
+|              0 |                1 |
++----------------+------------------+
+1 row in set (0.00 sec)
+```
+
+Funciona do mesmo jeito em uma coluna.
+
+```sql
+SELECT title FROM film WHERE title COLLATE utf8mb4_0900_as_cs = 'academy dinosaur';
+```
+
+```text
+Empty set (0.00 sec)
+```
+
+## COLLATE em uma coluna abre mão da busca pelo índice {#collate-on-a-column-gives-up-the-index-lookup}
+
+O índice de uma coluna é construído na collation da própria coluna, então uma comparação
+em outra collation não pode usá-lo para encontrar os valores correspondentes. O `EXPLAIN` da
+consulta acima informa uma varredura de todas as 1.000 linhas em vez de uma busca. Isso não custa
+nada em 1.000 filmes e custa muito em uma tabela grande. Quando você precisa de
+correspondência que respeite maiúsculas e minúsculas em todas as consultas, o guia
+[Conjuntos de caracteres e collations](/pt-BR/guides/character-sets) cobre como armazenar a
+coluna dessa forma em vez disso.
+
+## De onde vem o padrão {#where-the-default-comes-from}
+
+Um banco de dados criado sem collation recebe a do servidor, uma tabela recebe a do
+banco de dados, e uma coluna recebe a da tabela. Então uma coluna sem nenhuma collation nomeada
+em nenhum ponto de sua história está comparando sem diferenciar maiúsculas e minúsculas por causa de uma configuração
+do servidor. `@@` na frente de um nome lê uma configuração do servidor, e este par diz a você
+qual delas você herdou:
+
+```sql
+SELECT @@collation_server AS server_collation, @@character_set_server AS server_charset;
+```
+
+Seu servidor responde com o que quer que tenha sido definido na inicialização, então trate o resultado como um
+fato sobre a sua própria instalação, e não sobre o MySQL.
+
+## Identificadores seguem uma regra diferente {#identifiers-follow-a-different-rule}
+
+Nomes de coluna nunca diferenciam maiúsculas de minúsculas. Nomes de banco de dados e de tabela são uma questão
+separada, decidida por `lower_case_table_names`:
+
+| Valor | Nomes de banco de dados e de tabela |
+|---|---|
+| `0` | armazenados como escritos e comparados diferenciando maiúsculas e minúsculas |
+| `1` | armazenados em minúsculas e comparados sem diferenciar maiúsculas e minúsculas |
+| `2` | armazenados como escritos e comparados sem diferenciar maiúsculas e minúsculas |
+
+Execute `SELECT @@lower_case_table_names;` para ver em que situação você está. Você não pode mudar
+isso a partir de uma sessão: `SET GLOBAL lower_case_table_names=1` responde
+`ERROR 1238 (HY000): Variable 'lower_case_table_names' is a read only variable`.
+É uma configuração de inicialização, ligada a como o servidor foi configurado pela primeira vez, então trate a
+resposta como uma propriedade do servidor em que você está.
+
+O conselho prático não depende da resposta. Escreva todo nome de banco de dados e de
+tabela em uma única caixa e use essa grafia em todo lugar, para que mover o mesmo
+SQL entre 2 servidores não possa transformar uma consulta que funciona em `ERROR 1146 (42S02)`, o
+erro para uma tabela que não existe.
+
+## Resumo {#summary}
+
+- Espere que uma comparação de strings ignore maiúsculas e minúsculas, porque a collation usual termina em `_ci`.
+- Leia a collation de uma coluna em `INFORMATION_SCHEMA.COLUMNS`.
+- Leia o nome de uma collation a partir do final: `_ci` e `_ai` ignoram, `_cs`, `_as` e `_bin` respeitam.
+- Use `COLLATE` para uma comparação pontual que respeite maiúsculas e minúsculas, e aceite que ela abre mão da busca pelo índice.
+- Mantenha uma única grafia para todo nome de banco de dados e de tabela, seja o que for que `lower_case_table_names` diga.
+
+## Veja também {#see-also}
+
+- [LIKE](/pt-BR/tutorial/like) — onde isso aparece primeiro
+- [REGEXP](/pt-BR/tutorial/regexp) — a mesma regra, com outra forma de sobrescrevê-la
+- [Conjuntos de caracteres e collations no MySQL](/pt-BR/guides/character-sets) — escolhendo uma para uma coluna
+- [Usando utf8mb4 no MySQL](/pt-BR/guides/utf8mb4) — o conjunto de caracteres por trás da collation usual

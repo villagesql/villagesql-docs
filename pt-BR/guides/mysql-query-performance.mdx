@@ -1,0 +1,187 @@
+---
+title: "Por Que Minha Consulta MySQL Está Lenta?"
+sidebarTitle: "Desempenho de Consultas"
+description: "Diagnostique e corrija consultas MySQL lentas usando EXPLAIN, o slow query log e as causas mais comuns: índices ausentes, má seleção de índice e padrões N+1."
+keywords: "mysql slow query, mysql query optimization, mysql explain, mysql missing index, mysql performance tuning, mysql query slow"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Consultas lentas quase sempre se resumem a um punhado de causas comuns: um índice ausente, o índice errado, uma consulta escrita de um jeito que impede o uso do índice, funções aplicadas a colunas indexadas, padrões N+1 ou contenção com outras consultas executando ao mesmo tempo. A maioria delas pode ser diagnosticada com dois comandos: `EXPLAIN` e o slow query log. Comece por aí.
+
+## Passo 1: Leia o EXPLAIN {#step-1-read-explain}
+
+Execute `EXPLAIN` antes da consulta que você quer investigar:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE customer_id = 42;
+```
+
+Você verá uma saída como esta:
+
+```
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 843201 |    10.00 | Using where |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+```
+
+Cinco colunas fazem a maior parte do trabalho de diagnóstico:
+
+**`possible_keys`** — os índices que o MySQL considerou para esta consulta. `NULL` significa que não existem índices relevantes nas colunas da sua cláusula `WHERE`.
+
+**`key`** — o índice que o MySQL de fato escolheu. Se `possible_keys` lista candidatos mas `key` é `NULL`, o MySQL decidiu que uma varredura completa da tabela era mais barata — normalmente um sinal de que as estatísticas estão desatualizadas ou de que a tabela é pequena o suficiente para o otimizador dispensar o índice.
+
+**`type`** — o método de acesso que o MySQL usou. Esta é a coluna mais importante. `ALL` significa uma varredura completa da tabela: o MySQL leu todas as linhas para encontrar as que correspondem. Em uma tabela com 800.000 linhas, isso são 800.000 leituras de linha para uma consulta que pode retornar 1. `ref` ou `eq_ref` significa que o MySQL usou uma busca por índice, que é o que você quer.
+
+**`key`** — qual índice o MySQL escolheu. `NULL` significa que nenhum índice foi usado (veja `possible_keys` acima).
+
+**`rows`** — a estimativa do MySQL de quantas linhas ele vai examinar. Um número alto em relação ao número de linhas que você espera receber é um sinal de que algo está errado.
+
+**`Extra`** — informações complementares. `Using filesort` significa que o MySQL teve de ordenar o conjunto de resultados em memória ou em disco porque nenhum índice cobria o `ORDER BY`. `Using temporary` significa que o MySQL construiu uma tabela temporária, o que acontece com certas consultas com `GROUP BY` e `DISTINCT`. Ambos são sinais de alerta em tabelas grandes.
+
+Depois de ler as estimativas, use `EXPLAIN ANALYZE` para ver o que de fato aconteceu no momento da execução:
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 42;
+```
+
+`EXPLAIN ANALYZE` executa a consulta e reporta as contagens de linhas e os tempos reais ao lado das estimativas. Se a estimativa diz 800.000 linhas e o real diz 800.000 linhas, a estimativa estava certa e a varredura é real. Se o real é muito menor, o otimizador pode ter feito uma escolha ruim com base em estatísticas desatualizadas.
+
+## Passo 2: As Causas Mais Comuns {#step-2-the-most-common-causes}
+
+### Índice ausente {#missing-index}
+
+A consulta do exemplo acima varre a tabela `orders` inteira porque não há índice em `customer_id`. A correção é direta:
+
+```sql
+ALTER TABLE orders ADD INDEX idx_customer_id (customer_id);
+```
+
+Depois de adicionar o índice, execute `EXPLAIN` novamente. A coluna `type` deve mudar de `ALL` para `ref`, e `key` deve mostrar o nome do seu novo índice.
+
+### Índice errado {#wrong-index}
+
+Às vezes o MySQL escolhe um índice que não é a melhor opção. `EXPLAIN` informa qual ele escolheu. Para testar se um índice diferente se sairia melhor, use `FORCE INDEX`:
+
+```sql
+EXPLAIN SELECT * FROM orders FORCE INDEX (idx_created_at) WHERE customer_id = 42;
+```
+
+Se o índice forçado produz uma estimativa de `rows` menor, considere se as estatísticas do índice original estão desatualizadas. `ANALYZE TABLE orders` as recalcula. Se o MySQL escolhe consistentemente o índice errado, você também pode ter um índice que não é mais útil — removê-lo o tira de consideração.
+
+### Problema da coluna inicial {#leading-column-problem}
+
+Um índice composto em `(customer_id, status, created_at)` é eficiente quando sua consulta filtra por `customer_id` ou por `customer_id` e `status` juntos. Ele não pode ser usado com eficiência se sua consulta filtra apenas por `status` ou apenas por `created_at`, porque o índice é ordenado primeiro por `customer_id`.
+
+```sql
+-- Uses the composite index efficiently
+SELECT * FROM orders WHERE customer_id = 42 AND status = 'pending';
+
+-- Can't use the composite index — status isn't the leading column
+SELECT * FROM orders WHERE status = 'pending';
+```
+
+Se você precisa filtrar apenas por `status`, adicione um índice separado em `status`.
+
+### SELECT * {#select-}
+
+Nomear apenas as colunas de que você precisa não é só uma questão de estilo — afeta o desempenho. Quando o MySQL consegue satisfazer uma consulta inteiramente a partir de um índice (um índice de cobertura), ele nunca toca nas linhas reais da tabela. `SELECT *` quebra isso: força o MySQL a buscar cada linha correspondente na tabela para recuperar colunas que não estão no índice.
+
+```sql
+-- May require a table row lookup for each match
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Can use a covering index on (customer_id, status, total)
+SELECT status, total FROM orders WHERE customer_id = 42;
+```
+
+### Funções em colunas indexadas {#functions-on-indexed-columns}
+
+Envolver uma coluna indexada em uma função geralmente impede o uso do índice. O MySQL não pode usar um índice B-tree para responder "quais linhas têm um `created_at` em que `YEAR()` retorna 2024", porque o índice armazena timestamps brutos, não anos calculados.
+
+```sql
+-- Can't use an index on created_at
+WHERE YEAR(created_at) = 2024
+
+-- Can use an index on created_at
+WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31 23:59:59'
+```
+
+O mesmo problema se aplica a `LOWER()`, `DATE()`, aritmética sobre colunas e qualquer outra coisa que transforme o valor antes da comparação.
+
+### Consultas N+1 {#n1-queries}
+
+Às vezes o problema não é uma única consulta lenta — são centenas de consultas rápidas. Um padrão comum: buscar uma lista de pedidos e depois executar uma consulta separada para cada pedido para obter o nome do cliente. Com 200 pedidos, são 201 consultas. Cada uma é rápida, mas juntas elas somam segundos.
+
+A correção é trazer os dados em uma única consulta com um `JOIN`:
+
+```sql
+SELECT o.id, o.total, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE o.created_at > '2024-01-01';
+```
+
+## Passo 3: Habilite o Slow Query Log {#step-3-enable-the-slow-query-log}
+
+Configure isto uma vez e deixe rodando — ele captura em segundo plano as consultas que excedem um limite de tempo, revelando problemas que você não sabia que existiam. Habilite-o em tempo de execução:
+
+```sql
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 1;  -- log queries taking more than 1 second
+```
+
+Verifique onde o arquivo de log está sendo gravado:
+
+```sql
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+Para resumir o log e ver quais consultas aparecem com mais frequência ou consomem mais tempo total, use `mysqldumpslow`:
+
+```bash
+mysqldumpslow -s t /path/to/slow-query.log
+```
+
+Reduzir `long_query_time` para 0.1 ou 0.5 captura consultas que são rápidas individualmente mas se acumulam ao longo de muitas chamadas.
+
+## Passo 4: Verifique o SHOW PROCESSLIST {#step-4-check-show-processlist}
+
+Use isto quando algo está lento neste momento — uma consulta que está rodando há tempo demais, ou uma aplicação que está travada agora. `SHOW PROCESSLIST` mostra cada conexão ativa e há quanto tempo cada consulta está em execução:
+
+```sql
+SHOW PROCESSLIST;
+```
+
+Uma consulta presa no estado `Waiting for table metadata lock` ou `Waiting for lock` não está lenta por causa de um plano ruim — ela está bloqueada por outra consulta que mantém um lock. Para mais detalhes sobre contenção de locks, verifique:
+
+```sql
+SHOW ENGINE INNODB STATUS;
+```
+
+A seção `TRANSACTIONS` mostra quais transações estão esperando e quais estão mantendo locks.
+
+## Referência Rápida {#quick-reference}
+
+| Sintoma | Causa provável | Correção |
+|:--------|:------------|:----|
+| `EXPLAIN` mostra `type: ALL` | Índice ausente | Adicione um índice nas colunas do `WHERE` |
+| `Extra: Using filesort` | Nenhum índice para o `ORDER BY` | Adicione um índice que cubra as colunas de ordenação |
+| `Extra: Using temporary` | `GROUP BY` ou `DISTINCT` complexo | Revise a consulta ou adicione um índice |
+| Consulta rápida em tabela pequena, lenta em tabela grande | Varredura completa da tabela | Adicione um índice |
+| Muitas consultas rápidas que se acumulam | Padrão N+1 | Reescreva com `JOIN` |
+| Consulta lenta só às vezes | Contenção de locks | Verifique `SHOW PROCESSLIST` e `INNODB STATUS` |
+
+Todos os diagnósticos desta página funcionam no [VillageSQL](https://villagesql.com/install), um substituto direto do MySQL com extensões, então você pode adotá-lo sem reaprender seu fluxo de trabalho de tuning.
+
+## Veja também {#see-also}
+
+- [Como funcionam os índices do MySQL](/pt-BR/guides/mysql-indexes) — o modelo mental por trás da seleção de índices e da estrutura B-tree
+- [Índices de cobertura](/pt-BR/guides/covering-indexes) — como escrever consultas que nunca saem do índice
+- [Lendo a saída do EXPLAIN](/pt-BR/guides/reading-explain) — um olhar mais profundo sobre cada coluna do plano do EXPLAIN
+- [Usando o slow query log](/pt-BR/guides/slow-query-log) — configuração, rotação e análise com `mysqldumpslow`
+- [MySQL CROSS JOIN](/pt-BR/tutorial/cross-join) — o acidental, e quão grande ele fica

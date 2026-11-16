@@ -1,0 +1,85 @@
+---
+title: "MySQL 中的 utf8mb4：存储表情符号和完整 Unicode"
+sidebarTitle: "utf8mb4 和表情符号"
+description: "为什么 MySQL 的 utf8 字符集拒绝表情符号，如何安全地将表转换为 utf8mb4，以及曾经让转换失败的索引长度限制。"
+keywords: "mysql utf8mb4, mysql emoji, incorrect string value mysql, convert utf8 to utf8mb4, utf8mb4 vs utf8, mysql unicode"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 中名为 `utf8` 的字符集并不是 UTF-8。它是一个每字符三字节的子集（`utf8mb3`），定格在表情符号出现之前，任何四字节字符——表情符号、许多 CJK 表意文字、数学符号——都无法存入其中。`utf8mb4` 才是真正的 UTF-8。在 MySQL 8.0 及更高版本上，它是新表的默认值，但在旧版本上创建的表，或在 DDL 中显式指定 `utf8` 的表，仍然带着这个陷阱。
+
+## 失败的情形 {#the-failure}
+
+```sql
+CREATE TABLE notes_mb3 (
+  body VARCHAR(100)
+) CHARACTER SET utf8mb3;
+
+INSERT INTO notes_mb3 (body) VALUES ('launch day 🚀');
+```
+
+```text
+ERROR 1366 (HY000): Incorrect string value: '\xF0\x9F\x9A\x80' for column 'body' at row 1
+```
+
+`\xF0\x9F\x9A\x80` 是火箭表情符号的四个字节。关闭严格 SQL 模式后，这会变成一个警告，有问题的字符会被悄悄替换为 `?`，而字符串的其余部分被保留——这更糟糕：您要在几周后才从数据中发现问题。
+
+## 找出需要转换的内容 {#find-what-needs-converting}
+
+向元数据询问哪些表和列仍在使用三字节 utf8：
+
+```sql
+SELECT table_schema, table_name, column_name, character_set_name
+FROM information_schema.columns
+WHERE character_set_name = 'utf8mb3'
+  AND table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys');
+```
+
+也要检查模式和表的默认值，否则新列一出生就是错的：
+
+```sql
+SELECT schema_name, default_character_set_name
+FROM information_schema.schemata;
+```
+
+## 转换 {#convert}
+
+`CONVERT TO CHARACTER SET` 会重写表，同时转换列定义和存储的数据：
+
+```sql
+ALTER TABLE notes_mb3 CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+然后修正默认值，让将来的对象继承正确的字符集：
+
+```sql
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+在大表上这是一次完整重写；请把它当作任何其他阻塞式 `ALTER` 来对待，并用您常用的在线迁移工具来运行。请参阅[模式迁移](/zh/guides/schema-migrations)。
+
+转换前需要检查两件事：
+
+- **索引长度。** 一个 `VARCHAR(255)` 唯一索引在 utf8mb3 下需要 765 字节，而在 utf8mb4 下需要 1,020 字节。现代 InnoDB 默认值（`DYNAMIC` 行格式）允许 3,072 字节，因此这主要影响从很旧的服务器带过来、使用 `REDUNDANT` 或 `COMPACT` 行格式的表。如果 `ALTER` 因最大键长度错误而失败，请先检查表的行格式。
+- **连接字符集。** 存储只是路径的一半。如果客户端连接协商的是 `utf8mb3`，即使列能容纳表情符号，它们也会在传输途中丢失。请验证您的会话实际使用的是什么：
+
+```sql
+SHOW VARIABLES LIKE 'character_set_c%';
+```
+
+您希望 `character_set_client` 和 `character_set_connection` 都显示为 `utf8mb4`。大多数现代驱动程序默认就是这样；较旧的 JDBC 和 PHP 配置可能固定为 `utf8`。
+
+## 关于排序规则，简要说明 {#collation-briefly}
+
+字符集决定字节的含义；排序规则决定它们如何比较。对于 MySQL 8.x 上的 utf8mb4，`utf8mb4_0900_ai_ci` 是默认值，也是通常情况下的正确答案：不区分重音、不区分大小写、正确的 Unicode 9.0 排序。在按字符串列联接的表之间混用排序规则会强制转换并可能跳过索引，因此请选定一种并在所有地方使用它。[字符集和排序规则](/zh/guides/character-sets)深入介绍了比较规则。
+
+## 另请参阅 {#see-also}
+
+- [字符集和排序规则](/zh/guides/character-sets)——本指南所属的更广泛的字符集模型
+- [模式迁移](/zh/guides/schema-migrations)——在生产环境中安全地运行转换 ALTER
+- [选择数据类型](/zh/guides/choosing-data-types)——当每个字符都可能占四字节时如何确定列大小
+- [将 MySQL 与 ORM 一起使用：Django、Rails 和 Prisma](/zh/guides/mysql-with-orms)——使用此字符集的 ORM 连接设置
+- [MySQL 大小写敏感性](/zh/tutorial/case-sensitivity)——解读此字符集附带的排序规则

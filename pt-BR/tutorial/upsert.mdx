@@ -1,0 +1,224 @@
+---
+title: "INSERT ON DUPLICATE KEY UPDATE no MySQL"
+sidebarTitle: "Upsert"
+description: "Como INSERT ... ON DUPLICATE KEY UPDATE grava uma linha ou altera a que já está lá, por que ele informa 2 linhas afetadas, e a forma com alias que você deve escrever hoje."
+keywords: "mysql insert on duplicate key update, mysql on duplicate key update, mysql insert or update, insert or update mysql, mysql duplicate key update alias, mysql values function deprecated"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+{/* verify-db: sakila_practice */}
+{/* verify-reset */}
+
+Às vezes você não sabe se uma linha está lá. `INSERT ... ON DUPLICATE KEY
+UPDATE` a grava se não estiver e a altera se estiver, em 1 instrução e
+sem uma verificação antes. É a instrução por trás de todo "salvar esta configuração" e
+de todo contador que precisa ser criado antes de poder ser incrementado.
+
+Estes exemplos usam o banco de dados `sakila_practice` da lição sobre
+[INSERT](/pt-BR/tutorial/insert). Execute o bloco de configuração de lá novamente antes de começar,
+depois abra o cliente com `mysql -u root -p sakila_practice`.
+
+## Como funciona {#how-it-works}
+
+```sql
+INSERT INTO TABLE_NAME (COLUMN_LIST) VALUES (VALUE_LIST) AS ROW_ALIAS
+ON DUPLICATE KEY UPDATE COLUMN_NAME = ROW_ALIAS.COLUMN_NAME;
+```
+
+Substitua `TABLE_NAME` pela tabela, `COLUMN_LIST` e `VALUE_LIST` pelas
+colunas e valores como em um insert comum, `ROW_ALIAS` por um nome para a
+linha que você está oferecendo, e `COLUMN_NAME` pela coluna a alterar quando a linha
+já está lá.
+
+A cláusula `ON DUPLICATE KEY UPDATE` é executada apenas quando o insert violaria uma
+`PRIMARY KEY` ou um índice `UNIQUE`. O alias nomeia a linha que você tentou inserir,
+então `ROW_ALIAS.COLUMN_NAME` é o valor que você ofereceu e o nome da coluna sem qualificação é
+o valor já armazenado.
+
+## Exemplos {#examples}
+
+### 1) A colisão que isto evita {#1-the-collision-this-avoids}
+
+`rating_count` tem `rating` como chave primária. Grave uma linha.
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 178);
+```
+
+```text
+Query OK, 1 row affected (0.00 sec)
+```
+
+Grave-a de novo com uma nova contagem e o insert falha.
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 999);
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'G' for key 'rating_count.PRIMARY'
+```
+
+### 2) Insira, ou atualize o que está no caminho {#2-insert-or-update-what-is-in-the-way}
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 179) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 2 rows affected (0.00 sec)
+```
+
+```sql
+SELECT * FROM rating_count;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   179 |
++--------+-------+
+1 row in set (0.00 sec)
+```
+
+Uma linha está armazenada e a instrução diz `2 rows affected`. Essa contagem é a
+forma de a instrução dizer qual caminho ela tomou: 1 para uma linha inserida, 2 para uma
+linha atualizada, e 0 quando a atualização encontrou o valor já correto.
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 179) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 0 rows affected (0.00 sec)
+```
+
+A linha foi encontrada e já tinha 179, então não havia nada para gravar. Nunca
+leia a contagem de linhas afetadas como uma contagem de linhas na tabela.
+
+### 3) A mesma instrução em uma linha que não está lá {#3-the-same-statement-on-a-row-that-is-not-there}
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('R', 195) AS new
+ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+Query OK, 1 row affected (0.00 sec)
+```
+
+```sql
+SELECT * FROM rating_count ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   179 |
+| R      |   195 |
++--------+-------+
+2 rows in set (0.00 sec)
+```
+
+`1 row affected` é o caminho do insert. Nada na instrução mudou
+além dos valores, e esse é o objetivo dela: quem a chama não precisa saber
+se a linha está lá.
+
+## Atualizando um resumo inteiro {#refreshing-a-whole-summary}
+
+As linhas podem vir de uma consulta, que é como uma tabela de resumo é atualizada
+em 1 instrução. A forma com alias não é permitida ali.
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT rating, COUNT(*) FROM sakila.film GROUP BY rating
+AS new ON DUPLICATE KEY UPDATE films = new.films;
+```
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'AS new ON DUPLICATE KEY UPDATE films = new.films' at line 3
+```
+
+Em vez disso, dê à consulta um alias próprio, envolvendo-a em uma
+[tabela derivada](/pt-BR/tutorial/derived-tables), e leia os valores oferecidos a partir
+dela.
+
+```sql
+INSERT INTO rating_count (rating, films)
+SELECT r, c FROM (SELECT rating AS r, COUNT(*) AS c FROM sakila.film GROUP BY rating) AS new
+ON DUPLICATE KEY UPDATE films = new.c;
+```
+
+```text
+Query OK, 5 rows affected (0.01 sec)
+Records: 5  Duplicates: 1  Warnings: 0
+```
+
+```sql
+SELECT * FROM rating_count ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| NC-17  |   210 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+`Duplicates: 1` é a linha `G`, que estava armazenada como 179 e agora é 178. As 3
+classificações novas respondem por 3 das 5 linhas afetadas e essa única atualização pelas
+outras 2. `R` já tinha 195, então não entrou na contagem.
+
+## Código mais antigo usa VALUES() em vez de um alias {#older-code-uses-values-instead-of-an-alias}
+
+Instruções mais antigas leem o valor oferecido com `VALUES(films)` no lugar do
+alias. Essa forma ainda funciona, e gera um aviso.
+
+```sql
+INSERT INTO rating_count (rating, films) VALUES ('G', 178)
+ON DUPLICATE KEY UPDATE films = VALUES(films);
+SHOW WARNINGS\G
+```
+
+```text
+Query OK, 0 rows affected, 1 warning (0.00 sec)
+
+*************************** 1. row ***************************
+  Level: Warning
+   Code: 1287
+Message: 'VALUES function' is deprecated and will be removed in a future release. Please use an alias (INSERT INTO ... VALUES (...) AS alias) and replace VALUES(col) in the ON DUPLICATE KEY UPDATE clause with alias.col instead
+1 row in set (0.00 sec)
+```
+
+`\G` termina uma instrução como um ponto e vírgula faz e imprime 1 coluna por linha,
+que é como você lê uma mensagem larga demais para uma tabela. Escreva instruções novas com
+um alias, e espere encontrar `VALUES()` em código escrito antes.
+
+## Resumo {#summary}
+
+- Use `INSERT ... ON DUPLICATE KEY UPDATE` quando a linha pode ou não estar lá.
+- Espere que a cláusula seja executada apenas em uma colisão de `PRIMARY KEY` ou `UNIQUE`.
+- Leia a contagem de linhas afetadas como 1 para um insert, 2 para uma atualização, e 0 para nenhuma mudança.
+- Nomeie a linha oferecida com `AS alias` e leia os valores dela como `alias.column`.
+- Envolva a consulta em uma tabela derivada quando as linhas vêm de um `SELECT`.
+- Substitua `VALUES(col)` pela forma com alias, que é o que o aviso 1287 pede.
+
+## Veja também {#see-also}
+
+- [INSERT](/pt-BR/tutorial/insert) — a forma simples e `ERROR 1062`
+- [INSERT SELECT](/pt-BR/tutorial/insert-select) — linhas de uma consulta
+- [UPDATE](/pt-BR/tutorial/update) — alterando uma linha que você sabe que está lá
+- [UPSERT no MySQL](/pt-BR/guides/upsert) — REPLACE, INSERT IGNORE, e qual escolher

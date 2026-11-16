@@ -1,0 +1,184 @@
+---
+title: "MySQL 触发器"
+sidebarTitle: "编写触发器"
+description: "MySQL 触发器如何工作：CREATE TRIGGER 语法、BEFORE 与 AFTER、NEW 和 OLD 行引用、同一事件的多个触发器，以及触发器何时有助于、何时有损于可维护性。"
+keywords: "mysql triggers, mysql create trigger, mysql before after trigger, mysql trigger example, mysql NEW OLD trigger, mysql trigger insert update delete, mysql audit trigger"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+触发器是在插入、更新或删除某一行时自动运行的 SQL。MySQL 在数据变更之前或之后触发它，让您可以访问正在写入的行值。
+
+## 创建触发器 {#creating-a-trigger}
+
+```sql
+CREATE TRIGGER trigger_name
+    {BEFORE | AFTER} {INSERT | UPDATE | DELETE}
+    ON table_name
+    FOR EACH ROW
+BEGIN
+    -- trigger body
+END;
+```
+
+一个实际的例子：记录每次价格变更：
+
+```sql
+CREATE TABLE price_history (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    product_id  INT,
+    old_price   DECIMAL(10,2),
+    new_price   DECIMAL(10,2),
+    changed_at  DATETIME DEFAULT NOW()
+);
+
+DELIMITER $$
+
+CREATE TRIGGER log_price_change
+    AFTER UPDATE ON products
+    FOR EACH ROW
+BEGIN
+    IF OLD.price <> NEW.price THEN
+        INSERT INTO price_history (product_id, old_price, new_price)
+        VALUES (NEW.id, OLD.price, NEW.price);
+    END IF;
+END$$
+
+DELIMITER ;
+```
+
+删除触发器：
+
+```sql
+DROP TRIGGER IF EXISTS log_price_change;
+```
+
+列出当前数据库中的所有触发器：
+
+```sql
+SHOW TRIGGERS\G
+-- or
+SELECT trigger_name, event_manipulation, event_object_table, action_timing
+FROM information_schema.triggers
+WHERE trigger_schema = DATABASE();
+```
+
+## BEFORE 与 AFTER {#before-vs-after}
+
+| | BEFORE 触发器 | AFTER 触发器 |
+|:--|:--------------|:-------------|
+| 运行时机 | 行写入之前 | 行写入之后 |
+| 可以修改 `NEW` 值 | 是，更改会应用到该行 | 否，行已经写入 |
+| 可以看到 `OLD` 值 | 是（UPDATE/DELETE） | 是（UPDATE/DELETE） |
+| 用途 | 验证、设置默认值、数据规范化 | 审计日志、级联到其他表、通知 |
+
+`BEFORE INSERT` 触发器可以设置默认值或拒绝错误数据。`AFTER INSERT` 触发器可以在插入成功后写入审计记录。
+
+## NEW 和 OLD 引用 {#new-and-old-references}
+
+| 触发器类型 | `NEW` | `OLD` |
+|:-------------|:------|:------|
+| `INSERT` | 新行的值 | 不可用 |
+| `UPDATE` | 更新后的新值 | 更新前的原始值 |
+| `DELETE` | 不可用 | 被删除行的值 |
+
+在 `BEFORE` 触发器中修改 `NEW` 值，可以改变实际写入的内容：
+
+```sql
+CREATE TRIGGER normalize_email
+    BEFORE INSERT ON users
+    FOR EACH ROW
+BEGIN
+    SET NEW.email = LOWER(TRIM(NEW.email));
+END;
+```
+
+## 同一事件的多个触发器 {#multiple-triggers-per-event}
+
+MySQL 支持在同一张表和同一事件上定义多个触发器。`FOLLOWS` 和 `PRECEDES` 关键字控制执行顺序：
+
+```sql
+CREATE TRIGGER audit_insert
+    AFTER INSERT ON orders
+    FOR EACH ROW
+    FOLLOWS another_trigger
+BEGIN
+    INSERT INTO audit_log (action, table_name, row_id, happened_at)
+    VALUES ('INSERT', 'orders', NEW.id, NOW());
+END;
+```
+
+没有 `FOLLOWS`/`PRECEDES` 时，MySQL 按创建时间分配执行顺序。
+
+## 在触发器中引发错误 {#raising-errors-in-triggers}
+
+使用 `SIGNAL` 中止操作并向调用者返回错误：
+
+```sql
+CREATE TRIGGER enforce_minimum_price
+    BEFORE INSERT ON products
+    FOR EACH ROW
+BEGIN
+    IF NEW.price < 0.01 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Price must be at least $0.01';
+    END IF;
+END;
+```
+
+当 `BEFORE` 触发器发出错误信号时，插入/更新/删除会被中止，不会写入任何内容。
+
+## 触发器的限制 {#trigger-limitations}
+
+MySQL 触发器有几项值得了解的限制：
+- 触发器不能调用返回结果集的存储过程
+- 触发器不能直接使用 `COMMIT`、`ROLLBACK` 或 `SAVEPOINT`（它们参与外围的事务）
+- 触发器不能引用定义它的那张表（在大多数情况下，不能通过对同一张表的直接查询递归调用触发器）
+- `AFTER` 触发器不能修改 `NEW` 值，因为行已经写入
+- MySQL 不支持语句级触发器（每个触发器都是 `FOR EACH ROW`）
+
+## 何时使用触发器 {#when-to-use-triggers}
+
+触发器适用于：
+- 审计日志：无论来自哪个应用程序，都记录谁在何时更改了什么
+- 强制执行 CHECK 约束无法表达的复杂约束
+- 保持派生数据同步（反规范化的汇总列、审计时间戳）
+
+在以下情况下避免使用触发器：
+- 逻辑复杂到调试它需要追踪隐藏的副作用
+- 性能至关重要：每个触发器在每条受影响的语句上按行触发
+- 触发器修改数据的方式会让不知道它存在的应用程序开发者感到意外
+
+隐藏的触发器是"这一行为什么变了？"这类困惑的常见来源。如果存在触发器，请在应用程序级别显著地记录它，而不只是记录在数据库中。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### LOAD DATA INFILE 期间会触发触发器吗？ {#do-triggers-fire-during-load-data-infile}
+
+会。`INSERT` 触发器会为 `LOAD DATA INFILE` 加载的每一行触发。如果您的触发器做了大量工作，通过 LOAD DATA 批量加载会比先加载到暂存表、再用 INSERT...SELECT 复制慢得多（后者也会触发触发器，但您可以用 `SET @disable_trigger = TRUE` 加上触发器内部的条件检查来临时禁用它们）。
+
+#### 触发器可以调用存储过程吗？ {#can-triggers-call-stored-procedures}
+
+可以，但有一个例外：被调用的过程不能返回结果集（不带 `INTO` 的 `SELECT`）。如果返回了，MySQL 会报错。从触发器调用的过程可以使用 `OUT` 参数和 `SELECT...INTO`。
+
+#### REPLACE INTO 会触发触发器吗？ {#do-triggers-fire-on-replace-into}
+
+当发生冲突时，`REPLACE` 以 DELETE + INSERT 的方式执行。冲突时，目标表上的四个触发器都会按以下顺序触发：`BEFORE INSERT`（重复键检查），然后是针对冲突行的 `BEFORE DELETE` 和 `AFTER DELETE`，最后是 `AFTER INSERT`。因为这次删除是真正的行删除，引用表上的 `ON DELETE CASCADE` 规则确实会触发。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 触发器没有触发 | 确认触发器存在：`SHOW TRIGGERS LIKE 'table_name'`，同时验证事件（INSERT/UPDATE/DELETE）和时机（BEFORE/AFTER）与您的预期一致 |
+| `ERROR 1442: Can't update table in stored function/trigger` | 在大多数情况下，触发器不能直接对定义它的同一张表执行 INSERT/UPDATE/DELETE，请写入另一张表，或使用在 DML 之后调用的存储过程 |
+| AFTER 触发器的更改没有持久化 | `AFTER` 触发器不能修改 `NEW`，如果需要更改正在写入的行，请改用 `BEFORE` |
+| 触发器拖慢了批量插入 | 触发器按行触发，对于批量加载，请考虑临时禁用触发器或加载到暂存表 |
+| 触发器中的 `SIGNAL` 没有传到应用程序 | 某些驱动会吞掉触发器的错误，请检查 `SHOW WARNINGS` 并验证驱动的错误处理配置 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的存储过程](/zh/guides/stored-procedures)：触发器可以调用的逻辑
+- [从触发器发送 Webhook](/zh/guides/http-webhooks)：从触发器主体发起 HTTP 调用
+- [MySQL 中的 CHECK 约束](/zh/guides/check-constraints)：触发器常实现的验证规则的更简单替代方案

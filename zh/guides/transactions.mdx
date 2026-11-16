@@ -1,0 +1,147 @@
+---
+title: "MySQL 中的事务"
+sidebarTitle: "使用事务"
+description: "MySQL 事务如何工作：COMMIT、ROLLBACK、隔离级别，以及如何使用事务保持数据一致。"
+keywords: "mysql transactions, mysql isolation level, mysql repeatable read, mysql read committed, mysql transaction locking, mysql transaction isolation levels"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+事务把多条 SQL 语句组合成一个工作单元。要么全部成功，要么全部不生效。没有事务时，多步操作（一次付款、一次转账、一个订单）中途失败会让您的数据处于损坏的中间状态。
+
+## 基础：BEGIN、COMMIT、ROLLBACK {#the-basics-begin-commit-rollback}
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- debit Alice
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- credit Bob
+
+COMMIT;  -- both changes are saved
+```
+
+如果两次更新之间出了问题：
+
+```sql
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+
+-- error occurs here, or you decide to cancel
+
+ROLLBACK;  -- neither change is saved — balance unchanged
+```
+
+`ROLLBACK` 会撤销自 `START TRANSACTION` 以来的所有更改。数据库保持事务开始前的状态。
+
+`BEGIN` 和 `START TRANSACTION` 是等价的。两者都开始一个新事务。
+
+## 自动提交 {#autocommit}
+
+默认情况下，MySQL 以自动提交模式运行：每条语句都是它自己的事务，并立即提交。这就是为什么 `DELETE FROM orders WHERE id = 5` 无需显式 `COMMIT` 就立即生效。
+
+调用 `START TRANSACTION` 会在该事务期间临时暂停自动提交。
+
+```sql
+-- Check current autocommit setting
+SHOW VARIABLES LIKE 'autocommit';
+
+-- Disable autocommit for the session
+SET autocommit = 0;
+
+-- Now every statement is part of a transaction until you COMMIT or ROLLBACK
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+```
+
+禁用自动提交意味着您必须在每次操作后显式 `COMMIT` 或 `ROLLBACK`。如果您在未提交的情况下断开连接，MySQL 会回滚任何打开的事务。
+
+## 隔离级别 {#isolation-levels}
+
+当多个事务同时运行时，隔离级别控制每个事务能从其他事务看到什么。MySQL 的默认级别是 `REPEATABLE READ`。
+
+| 级别 | 脏读 | 不可重复读 | 幻读 |
+|:------|:------------|:---------------------|:--------------|
+| `READ UNCOMMITTED` | 可能 | 可能 | 可能 |
+| `READ COMMITTED` | 防止 | 可能 | 可能 |
+| `REPEATABLE READ` | 防止 | 防止 | 防止* |
+| `SERIALIZABLE` | 防止 | 防止 | 防止 |
+
+*InnoDB 的 REPEATABLE READ 通过间隙锁防止幻读，这比 SQL 标准的要求更严格。
+
+**READ COMMITTED** 是优先考虑吞吐量的应用程序的常见选择。它防止脏读（看到其他事务未提交的数据），但允许不可重复读（在一个事务中读取同一行两次，如果另一个事务在两次读取之间提交了，可能返回不同的值）。
+
+```sql
+-- Set isolation level for the current session
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- Or for the next transaction only
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+-- ...
+```
+
+## 保存点 {#savepoints}
+
+保存点让您可以回滚事务的一部分，而不放弃整个事务：
+
+```sql
+START TRANSACTION;
+
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+SAVEPOINT after_order;
+
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 42);
+
+-- something went wrong with the item — roll back just this part
+ROLLBACK TO SAVEPOINT after_order;
+
+-- the order is still there; we can retry the item insert
+INSERT INTO order_items (order_id, product_id) VALUES (LAST_INSERT_ID(), 43);
+
+COMMIT;
+```
+
+## 事务不涵盖的内容 {#what-transactions-dont-cover}
+
+并非所有 MySQL 语句都可以回滚。DDL 语句（`CREATE TABLE`、`ALTER TABLE`、`DROP TABLE`）会导致隐式提交：MySQL 在执行它们之前会提交任何打开的事务，而 DDL 本身无法回滚。
+
+```sql
+START TRANSACTION;
+INSERT INTO orders (customer_id, amount) VALUES (1, 99.00);
+
+DROP TABLE temp_data;  -- implicit commit happens here — the INSERT is committed
+
+ROLLBACK;  -- nothing to roll back; everything was already committed
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 如果事务一直没有提交会怎样？ {#what-happens-if-a-transaction-is-never-committed}
+如果您在未提交的情况下关闭连接，MySQL 会自动回滚打开的事务。如果服务器崩溃，InnoDB 的重做日志会在启动时恢复已提交的事务，并回滚未提交的事务。
+
+#### 我可以在 MyISAM 上使用事务吗？ {#can-i-use-transactions-with-myisam}
+不能。事务需要支持事务的存储引擎。InnoDB（MySQL 的默认引擎）完全支持事务。MyISAM 不支持：针对 MyISAM 表的语句立即生效，并且无法回滚。
+
+#### 事务可以保持打开多长时间？ {#how-long-can-a-transaction-stay-open}
+从技术上讲可以按需保持任意长时间，但长时间运行的事务会持有锁并消耗撤销日志空间，从而给其他事务带来性能问题。`innodb_lock_wait_timeout` 变量（默认：50 秒）控制事务在返回错误之前等待锁的时间。请保持事务简短，并在工作完成后立即提交。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 更改没有持久化 | 检查自动提交是否已关闭，您可能需要显式调用 `COMMIT` |
+| `ROLLBACK` 没有效果 | 某条 DDL 语句（`CREATE`、`ALTER`、`DROP`）在事务中途导致了隐式提交 |
+| 事务阻塞了其他查询 | 某个长时间运行的事务正在持有锁，请及时提交或回滚；用 `SHOW ENGINE INNODB STATUS` 查看锁信息 |
+| `ERROR 1205: Lock wait timeout exceeded` | 另一个事务持有冲突的锁；等造成阻塞的事务完成后重试 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的外键](/zh/guides/foreign-keys)：外键检查是事务工作的一部分
+- [MySQL 中的死锁](/zh/guides/deadlocks)：两个事务互相锁住对方时会发生什么
+- [MySQL 中的 UPSERT](/zh/guides/upsert)：事务中的 INSERT ... ON DUPLICATE KEY UPDATE
+- [MySQL 中的批量插入](/zh/guides/bulk-inserts)：把写入分批放入事务以提高速度
+- [MySQL COMMIT 和 ROLLBACK](/zh/tutorial/transactions)：带有完整示例的 START TRANSACTION、COMMIT 和 ROLLBACK

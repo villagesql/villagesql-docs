@@ -1,0 +1,328 @@
+---
+title: "使用 Testcontainers 针对 MySQL 进行测试"
+sidebarTitle: "Testcontainers 测试"
+description: "如何使用 Testcontainers 针对临时的 MySQL 或 VillageSQL 容器运行真正的集成测试，而不是模拟数据库：设置、加载架构、清理，以及模拟数据库无法捕获的问题。"
+keywords: "testcontainers mysql, testcontainers go mysql, integration testing mysql, ephemeral database testing, mysql docker test, ci database testing, testcontainers-go, mock database vs real database"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+模拟数据库驱动可以让测试跑得很快，但它只能返回您让它返回的内容。它无法强制执行唯一约束、无法拒绝违反严格模式的值，也无法应用您真实的架构。Testcontainers 为测试启动一个真实的、用完即弃的 MySQL 容器，并在测试结束后删除它，因此测试运行所针对的服务器与您的应用程序在生产环境中所针对的服务器相同。
+
+## Testcontainers 如何融入测试套件 {#how-testcontainers-fits-into-a-test-suite}
+
+Testcontainers 是一个库，不是一个单独的服务。它与您的机器或 CI 运行器上已经运行的 Docker 守护进程通信，在测试主体运行前启动一个容器，等到容器真正准备好接受连接，并在测试结束时把它拆除。每个测试（或每个测试文件，取决于您如何划分范围）都有自己的容器，因此测试之间不共享状态，也不需要一个必须有人记得重置的共享测试数据库。
+
+本指南使用 Go 和官方的 `testcontainers-go` MySQL 模块，因为 Go 的 `testing` 包让容器的生命周期易于完整展示。Testcontainers 为 Java、Python 和 Node.js/TypeScript 提供了等效的模块；设置因语言而异，但模式（启动容器、等待就绪、加载架构、运行测试、拆除）是相同的。
+
+## 项目设置 {#project-setup}
+
+```bash
+go mod init villagesql/testcontainers-guide
+go get github.com/testcontainers/testcontainers-go/modules/mysql
+go get github.com/go-sql-driver/mysql
+```
+
+这会把 `testcontainers-go` 本身作为 MySQL 模块的传递依赖拉取进来，同时拉取测试用来实际连接和运行查询的 `go-sql-driver/mysql` 驱动。
+
+## 架构和被测代码 {#the-schema-and-the-code-under-test}
+
+一个带有值得测试的约束的最小架构：
+
+```sql
+-- schema.sql
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    age TINYINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_users_email (email)
+);
+```
+
+以及一个使用标准库 `database/sql`、带有两个方法的小型数据访问层：
+
+```go
+// store.go
+package store
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+type User struct {
+	ID    int
+	Email string
+	Name  string
+	Age   int
+}
+
+type UserStore struct {
+	db *sql.DB
+}
+
+func NewUserStore(db *sql.DB) *UserStore {
+	return &UserStore{db: db}
+}
+
+func (s *UserStore) CreateUser(email, name string, age int) (int, error) {
+	result, err := s.db.Exec(
+		"INSERT INTO users (email, name, age) VALUES (?, ?, ?)",
+		email, name, age,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert user: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("read generated id: %w", err)
+	}
+	return int(id), nil
+}
+
+func (s *UserStore) GetUserByEmail(email string) (*User, error) {
+	row := s.db.QueryRow(
+		"SELECT id, email, name, age FROM users WHERE email = ?",
+		email,
+	)
+	var u User
+	if err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Age); err != nil {
+		return nil, fmt.Errorf("query user: %w", err)
+	}
+	return &u, nil
+}
+```
+
+这里没有任何代码知道自己正在被测试。接下来的测试完全按照应用程序调用它的方式来运行这段代码。
+
+## 启动容器并加载架构 {#starting-the-container-and-loading-the-schema}
+
+```go
+// store_test.go
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"testing"
+
+	"github.com/go-sql-driver/mysql"
+	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
+)
+
+func newTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+
+	ctx := context.Background()
+
+	container, err := tcmysql.Run(ctx,
+		"mysql:8.0.36",
+		tcmysql.WithDatabase("appdb"),
+		tcmysql.WithUsername("appuser"),
+		tcmysql.WithPassword("apppass"),
+		tcmysql.WithScripts(filepath.Join("schema.sql")),
+	)
+	if err != nil {
+		t.Fatalf("failed to start MySQL container: %s", err)
+	}
+	t.Cleanup(func() {
+		if err := container.Terminate(ctx); err != nil {
+			t.Logf("failed to terminate container: %s", err)
+		}
+	})
+
+	connStr, err := container.ConnectionString(ctx, "parseTime=true")
+	if err != nil {
+		t.Fatalf("failed to build connection string: %s", err)
+	}
+
+	db, err := sql.Open("mysql", connStr)
+	if err != nil {
+		t.Fatalf("failed to open database connection: %s", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("failed to ping database: %s", err)
+	}
+
+	return db
+}
+```
+
+`tcmysql.WithScripts` 把 `schema.sql` 挂载到容器的 `/docker-entrypoint-initdb.d/` 目录中，官方 MySQL 镜像会在容器第一次以空数据目录启动时自动运行它一次。`container.ConnectionString` 返回一个可直接使用的 DSN，其中已经填好了用户名、密码、主机和映射端口。无论测试通过还是失败，`t.Cleanup` 调用都会按后进先出的顺序运行，正是它们拆除了容器：没有需要单独记住的拆除步骤。
+
+## 针对真实数据库运行测试 {#running-a-test-against-the-real-database}
+
+```go
+func TestCreateAndGetUser(t *testing.T) {
+	db := newTestDB(t)
+	s := NewUserStore(db)
+
+	id, err := s.CreateUser("ada@example.com", "Ada Lovelace", 36)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %s", err)
+	}
+	if id == 0 {
+		t.Fatalf("expected a nonzero generated id")
+	}
+
+	got, err := s.GetUserByEmail("ada@example.com")
+	if err != nil {
+		t.Fatalf("GetUserByEmail failed: %s", err)
+	}
+	if got.Name != "Ada Lovelace" || got.Age != 36 {
+		t.Fatalf("got unexpected user: %+v", got)
+	}
+}
+```
+
+用 `go test -v` 运行它会启动一个真实的容器、应用架构、通过 `CreateUser` 插入一行、通过 `GetUserByEmail` 读回它，然后拆除容器：
+
+```
+=== RUN   TestCreateAndGetUser
+2026/08/28 12:53:15 🐳 Creating container for image mysql:8.0.36
+2026/08/28 12:53:16 ⏳ Waiting for container id ec9a06c2dd5d image: mysql:8.0.36. Waiting for: all of: [log message "port: 3306  MySQL Community Server"]
+2026/08/28 12:53:21 🔔 Container is ready: ec9a06c2dd5d
+2026/08/28 12:53:23 🐳 Terminating container: ec9a06c2dd5d
+--- PASS: TestCreateAndGetUser (7.51s)
+PASS
+```
+
+这次运行使用的是已经拉取过的 `mysql:8.0.36` 镜像。在从未拉取过该镜像的机器上，第一次运行明显更久：在这里测量的一次运行中，套件中的第一个测试端到端耗时 25.95 秒（包括镜像拉取），而同一次 `go test` 调用中之后的每个测试耗时 6.8 到 7.5 秒，因为 Docker 只拉取镜像一次，而 Testcontainers 在之后的每次 `Run` 调用中都从本地已有的镜像启动一个新容器。具体从"容器已启动"到"容器已就绪"，这次运行中的 MySQL 容器大约用了 5 秒才接受连接。
+
+## 为什么不模拟数据库 {#why-not-mock-the-database}
+
+`database/sql` 的模拟对象返回的是您让它返回的内容。它没有约束引擎，也没有严格模式，因此当您的代码向 MySQL 发送一个 MySQL 会拒绝的值时，它无法重现 MySQL 实际的行为。本项目 `store_test.go` 中针对真实容器的两个测试直接证明了这一点。
+
+架构声明了 `UNIQUE KEY uq_users_email (email)`。针对真实容器两次插入相同的电子邮件会失败，并报出一个具体的、真实的 MySQL 错误：
+
+```go
+func TestDuplicateEmailIsRejected(t *testing.T) {
+	db := newTestDB(t)
+	s := NewUserStore(db)
+
+	if _, err := s.CreateUser("grace@example.com", "Grace Hopper", 40); err != nil {
+		t.Fatalf("first CreateUser failed: %s", err)
+	}
+
+	_, err := s.CreateUser("grace@example.com", "Grace Hopper Duplicate", 41)
+	if err == nil {
+		t.Fatalf("expected an error inserting a duplicate email, got nil")
+	}
+
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		t.Fatalf("expected a *mysql.MySQLError, got %T: %s", err, err)
+	}
+	if mysqlErr.Number != 1062 {
+		t.Fatalf("expected MySQL error 1062 (ER_DUP_ENTRY), got %d: %s", mysqlErr.Number, mysqlErr.Message)
+	}
+}
+```
+
+这个测试针对真实容器通过了，`mysqlErr.Number` 等于 `1062`，也就是 MySQL 对唯一键冲突返回的真实 `ER_DUP_ENTRY` 代码。模拟对象需要被事先告知以这种确切形式返回这个确切的错误；而真实数据库之所以强制执行它，是因为约束存在于架构中，而不是存在于测试中。
+
+`age` 列是 `TINYINT UNSIGNED`，因此它不能保存负数。在 MySQL 的默认严格模式下（自 MySQL 5.7 起为默认），服务器会拒绝超出范围的值，而不是静默地把它钳制为零：
+
+```go
+func TestOutOfRangeAgeIsRejected(t *testing.T) {
+	db := newTestDB(t)
+	s := NewUserStore(db)
+
+	_, err := s.CreateUser("negative-age@example.com", "Out Of Range", -1)
+	if err == nil {
+		t.Fatalf("expected an error inserting a negative age into TINYINT UNSIGNED, got nil")
+	}
+
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		t.Fatalf("expected a *mysql.MySQLError, got %T: %s", err, err)
+	}
+	if mysqlErr.Number != 1264 {
+		t.Fatalf("expected MySQL error 1264 (ER_WARN_DATA_OUT_OF_RANGE), got %d: %s", mysqlErr.Number, mysqlErr.Message)
+	}
+}
+```
+
+这个测试也针对真实容器通过了，错误为 `1264`，即 `ER_WARN_DATA_OUT_OF_RANGE`。这两种行为都不来自应用代码。两者都来自 MySQL 本身，这正是数据库级别的模拟对象无法重现它们的原因，除非手工编码来伪造这一个特定情况。
+
+## 改为让 Testcontainers 指向 VillageSQL 镜像 {#pointing-testcontainers-at-a-villagesql-image-instead}
+
+VillageSQL 使用与 MySQL 相同的线路协议，因此同一个 `testcontainers-go` MySQL 模块可以驱动 `villagesql/server` 容器，而不是标准的 `mysql` 容器。这样做需要一处改动。该模块默认的就绪检查等待的是字面日志行 `port: 3306  MySQL Community Server`，而 VillageSQL 的启动日志从不打印这一行；VillageSQL 自己的就绪行是 `... ready for connections. Version: '8.4.11-villagesql-0.0.6' ... port: 3306 ...`。覆盖等待策略以匹配这一行就足够了：
+
+```go
+import (
+	"github.com/testcontainers/testcontainers-go"
+	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
+	"github.com/testcontainers/testcontainers-go/wait"
+)
+
+container, err := tcmysql.Run(ctx,
+	"villagesql/server:latest",
+	tcmysql.WithDatabase("appdb"),
+	tcmysql.WithUsername("appuser"),
+	tcmysql.WithPassword("apppass"),
+	tcmysql.WithScripts(filepath.Join("schema.sql")),
+	testcontainers.WithWaitStrategy(
+		wait.ForLog("ready for connections").WithOccurrence(2),
+	),
+)
+```
+
+需要 `WithOccurrence(2)`，是因为入口脚本会先启动一个临时服务器来运行初始化脚本，然后再启动容器持续运行的真正服务器。请注意第二次出现实际上是什么：日志中有三行匹配，因为真正服务器的启动会为 X Plugin 打印一行，为 `mysqld` 本身打印一行。第二次出现是 X Plugin 那一行，它比 `mysqld` 宣布自己就绪早不到一毫秒，因此在实践中等待它已经足够接近。如果您希望等待精确固定在服务器那一行，请改为匹配 `"/usr/bin/mysqld: ready for connections"`，因为该字符串恰好出现两次。采用这个等待策略后，在这里捕获的一次运行中，容器在 6.81 秒内完成了启动、应用 `schema.sql` 并接受连接，`SELECT VERSION()` 返回 `8.4.11-villagesql-0.0.6`。其他所有部分，包括 `WithDatabase`、`WithUsername`、`WithPassword`、`WithScripts` 和 `ConnectionString`，都无需改动即可工作。
+
+## 选择镜像和版本 {#choosing-an-image-and-version}
+
+对于任何在 CI 中运行的测试，请固定一个精确的标签而不是 `latest`，这样上游镜像的新版本就不会在您不知情的情况下改变测试结果：
+
+```go
+tcmysql.Run(ctx, "mysql:8.0.36", ...)
+```
+
+对于 VillageSQL，一旦您有了想要停留的版本，就以同样的方式固定：
+
+```go
+tcmysql.Run(ctx, "villagesql/server:mysql-8.4_0.0.6", ...)
+```
+
+在决定使用某个标签之前，请运行 `docker manifest inspect <image>:<tag>`，以确认它存在并查看它发布了哪些架构；在撰写本文时，`mysql:8.0.36` 和 `villagesql/server:latest` 都发布了 `amd64` 和 `arm64` 清单，因此同一个标签无需平台覆盖即可在 Intel 和 Apple Silicon 的 CI 运行器上运行。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### Testcontainers 需要真实的 Docker 守护进程，还是可以配合模拟对象使用？ {#does-testcontainers-need-a-real-docker-daemon-or-does-it-work-with-a-mock}
+
+它需要一个从测试运行处可以访问的真实 Docker 守护进程：本地的 Docker Desktop，或 CI 中的 Docker-in-Docker 或挂载了 Docker 套接字的运行器。如果运行测试的机器上 `docker info` 失败，Testcontainers 就无法启动容器，测试会在到达您的代码之前就因连接错误而失败。
+
+#### 每个测试都有自己的容器，还是多个测试可以共享一个？ {#does-each-test-get-its-own-container-or-can-tests-share-one}
+
+这是您在测试代码中做出的选择，不是 Testcontainers 强加的。像上面展示的那样，在每个 `Test...` 函数内部调用启动容器的辅助函数，会让每个测试拥有自己的容器和最强的隔离。在 `TestMain` 中启动一次容器并在包内的测试之间共享它会更快，但这样每个测试都要负责清理自己插入的行，以免看到其他测试的数据。
+
+#### 容器需要多长时间才能就绪？ {#how-long-does-a-container-take-to-become-ready}
+
+在为本指南捕获的运行中，镜像已在本地拉取的情况下，`mysql:8.0.36` 容器从"容器已启动"到"准备好接受连接"大约用了 5 秒，`villagesql/server:latest` 容器用时相当。在从未拉取过镜像的 `go test` 运行中，第一个启动的容器耗时明显更长，因为它还要承担镜像拉取的开销；这里测量的一次运行中，第一个容器用了 25.95 秒。
+
+#### 我可以运行已在使用的架构迁移工具，而不是一个纯 SQL 文件吗？ {#can-i-run-the-schema-migration-tool-i-already-use-instead-of-a-plain-sql-file}
+
+可以。`WithScripts` 只是把文件挂载到 `/docker-entrypoint-initdb.d/` 中，该目录接受 `.sql` 和 `.sh` 文件。该目录中的 shell 脚本可以调用任何能够针对主机和端口运行的迁移工具，只要该工具在容器内可用，或者您在脚本中安装它。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `failed to start MySQL container` 并带有 Docker 连接错误 | 在运行测试前，运行 `docker info` 以确认 Docker 守护进程正在运行且可访问 |
+| 容器已启动但等待策略始终不匹配，随后测试因超时失败 | 默认的 `testcontainers-go` MySQL 等待策略查找的是 MySQL 特有的日志行；启动日志不同的非标准镜像需要自己的 `testcontainers.WithWaitStrategy(...)`，如上面 VillageSQL 一节所示 |
+| `WithScripts` 的文件似乎没有运行 | 初始化脚本只在容器第一次以空数据目录启动时运行一次；带有现有卷的容器在停止并重启后不会再次运行它们 |
+| 测试只在 CI 中很慢 | 确认 CI 运行器已缓存镜像或能快速拉取；同时确认运行器有可用的 Docker 套接字，因为某些沙箱化的 CI 环境会阻止直接访问 Docker |
+| 尽管插入明显失败，`*mysql.MySQLError` 类型断言仍然失败 | 确认导入的是 `github.com/go-sql-driver/mysql`，并使用 `errors.As` 而不是直接类型断言，因为 `database/sql` 可能会包装驱动错误 |
+
+## 另请参阅 {#see-also}
+
+- [Docker 上的 MySQL](/zh/guides/mysql-on-docker)：Testcontainers 所基于的镜像、环境变量和卷行为
+- [MySQL 中的模式迁移](/zh/guides/schema-migrations)：在生产环境中运行本指南通过 `WithScripts` 加载的同一批架构变更
+- [MySQL 与 ORM](/zh/guides/mysql-with-orms)：针对 Testcontainers 管理的数据库使用 ORM 自己的连接池和迁移工具

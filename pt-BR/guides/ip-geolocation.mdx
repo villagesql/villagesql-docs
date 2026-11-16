@@ -1,0 +1,209 @@
+---
+title: "Consultas de Geolocalização por IP no MySQL"
+sidebarTitle: "Consultando Geolocalização por IP"
+description: "Como fazer consultas de geolocalização por IP no MySQL — importando o MaxMind GeoLite2 ou uma fonte de dados baseada em API, consultando intervalos de IP para obter país e região, trade-offs de precisão, e usando o tipo INET do VillageSQL para consultas unificadas de IPv4/IPv6."
+keywords: "mysql ip geolocation, mysql geoip database, mysql maxmind, mysql ip country lookup, mysql ip range query, mysql geolite2, ip geolocation accuracy mysql, mysql ip lookup without plugin, mysql ipv6 geolocation, ip-api mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A geolocalização por IP no MySQL funciona importando um banco de dados que mapeia intervalos de IP para localizações e depois consultando-o com verificações de intervalo. A abordagem padrão armazena os intervalos de IP como inteiros e usa `BETWEEN`. O tipo `INET` do VillageSQL torna o schema mais expressivo e trata IPv4 e IPv6 na mesma tabela.
+
+## Como Funciona a Geolocalização por IP {#how-ip-geolocation-works}
+
+Não existe uma função do MySQL que mapeie um IP para um país. A geolocalização é um problema de consulta: você tem uma tabela de intervalos de IP — cada linha diz "os endereços de X a Y estão no país Z" — e você encontra qual intervalo contém o IP recebido.
+
+Bancos de dados gratuitos como o MaxMind GeoLite2 fornecem esses intervalos como arquivos CSV que você importa para o MySQL.
+
+## A Abordagem Padrão: Intervalos de Inteiros {#the-standard-approach-integer-ranges}
+
+O MaxMind GeoLite2 (e bancos de dados semelhantes) vêm com `network` como uma string CIDR e o início/fim de cada intervalo como inteiros. A abordagem com inteiros é compacta e amigável a índices:
+
+```sql
+CREATE TABLE geoip_ranges (
+    start_ip   INT UNSIGNED NOT NULL,
+    end_ip     INT UNSIGNED NOT NULL,
+    country    CHAR(2),
+    INDEX idx_start (start_ip),
+    INDEX idx_end   (end_ip)
+);
+
+-- Import from GeoLite2-Country-Blocks-IPv4.csv after converting to int ranges
+-- Then query:
+SELECT country FROM geoip_ranges
+WHERE INET_ATON('203.0.113.45') BETWEEN start_ip AND end_ip
+LIMIT 1;
+```
+
+Isso é rápido — o índice em `start_ip` permite uma varredura de intervalo eficiente. A limitação é que só funciona para IPv4. Uma tabela separada (com intervalos `VARBINARY(16)`) é necessária para IPv6.
+
+## Com o VillageSQL: IPv4/IPv6 Unificados com INET {#with-villagesql-unified-ipv4ipv6-with-inet}
+
+O tipo `INET` do VillageSQL armazena endereços IPv4 e IPv6 com ordenação natural, para que você possa usar uma única tabela para ambas as famílias. `inet_compare()` toma o lugar de `BETWEEN` nas verificações de intervalo.
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE geoip_ranges (
+    start_ip   INET NOT NULL,
+    end_ip     INET NOT NULL,
+    country    CHAR(2),
+    region     VARCHAR(100),
+    INDEX idx_start (start_ip)
+);
+
+-- Import IPv4 ranges
+INSERT INTO geoip_ranges (start_ip, end_ip, country) VALUES
+    (inet_from_string('203.0.113.0'), inet_from_string('203.0.113.255'), 'US'),
+    (inet_from_string('198.51.100.0'), inet_from_string('198.51.100.255'), 'DE');
+
+-- Import IPv6 ranges in the same table
+INSERT INTO geoip_ranges (start_ip, end_ip, country) VALUES
+    (inet_from_string('2001:db8::'), inet_from_string('2001:db8::ffff'), 'US');
+
+-- Look up a country for an IPv4 address
+SELECT country, region FROM geoip_ranges
+WHERE inet_compare(inet_from_string('203.0.113.45'), start_ip) >= 0
+  AND inet_compare(inet_from_string('203.0.113.45'), end_ip)   <= 0
+LIMIT 1;
+
+-- Same query works for IPv6
+SELECT country FROM geoip_ranges
+WHERE inet_compare(inet_from_string('2001:db8::42'), start_ip) >= 0
+  AND inet_compare(inet_from_string('2001:db8::42'), end_ip)   <= 0
+LIMIT 1;
+```
+
+### Armazenando por rede CIDR (schema alternativo) {#storing-by-cidr-network-alternative-schema}
+
+Se os seus dados de GeoIP fornecem blocos CIDR em vez de pares início/fim, use `CIDR` para a coluna de rede e resolva a contenção por meio de consultas de sub-rede:
+
+```sql
+CREATE TABLE geoip_cidrs (
+    network    CIDR NOT NULL,
+    country    CHAR(2),
+    INDEX idx_network (network)
+);
+
+INSERT INTO geoip_cidrs (network, country) VALUES
+    (cidr_from_string('203.0.113.0/24'), 'US'),
+    (cidr_from_string('198.51.100.0/24'), 'DE');
+
+-- Look up by subnet match
+SELECT country FROM geoip_cidrs
+WHERE cidr_to_string(inet_network(inet_set_masklen(
+    inet_from_string('203.0.113.45'),
+    inet_masklen(inet_from_string(cidr_to_string(network)))
+))) = cidr_to_string(network)
+LIMIT 1;
+```
+
+## Escolhendo uma Abordagem {#choosing-an-approach}
+
+| Abordagem | IPv6 | Schema | Desempenho |
+|:---|:---|:---|:---|
+| Intervalo `INT UNSIGNED` + `BETWEEN` | Não (tabela separada) | Duas tabelas separadas para IPv4/IPv6 | Rápido — varredura de intervalo em índice de inteiros |
+| Intervalo `INET` + `inet_compare` | Sim (unificado) | Uma única tabela para ambos | Bom — indexado em `start_ip` |
+| Rede `CIDR` + correspondência de sub-rede | Sim (unificado) | Uma única tabela | Mais lento — cálculo de rede por linha |
+
+Para IPv4 puro e velocidade máxima de consulta, a abordagem `INT UNSIGNED` + `BETWEEN` é difícil de superar. Para schemas que precisam tratar IPv4 e IPv6 em uma única tabela, `INET` com `inet_compare` é mais limpo e evita manter duas tabelas paralelas.
+
+## Comparando Fontes de Dados de Geolocalização {#comparing-geolocation-data-sources}
+
+O schema de consulta é apenas metade da decisão — a fonte de dados determina a precisão, a atualidade e o custo. Veja como as opções comuns se comparam:
+
+| Fonte de dados | Precisão por país | Precisão por cidade | Latência | Custo | Integração com MySQL |
+|:---|:---|:---|:---|:---|:---|
+| MaxMind GeoLite2 (gratuito) | ~98% | ~80% | No processo (SQL ou `.mmdb`) | Gratuito, exige cadastro | Importar CSV; atualizar semanalmente |
+| MaxMind GeoIP2 (pago) | ~99,8% | ~85–90% | No processo | A partir de US$ 20/mês | Mesmo fluxo de importação do GeoLite2 |
+| ip-api.com (nível gratuito) | ~99% | ~83% | HTTP, ~30–100 ms | Gratuito (45 req/min); o pago remove o limite | Chamada HTTP na camada de aplicação; resultados armazenados no MySQL |
+| ip-api.com (pro) | ~99% | ~83% | HTTP, ~30–100 ms | A partir de US$ 15/mês | Igual; HTTPS + sem limite de taxa |
+| ipinfo.io | ~99% | ~85% | HTTP, ~30–100 ms | Gratuito (50 mil req/mês); níveis pagos acima disso | Camada de aplicação; resultados podem ser armazenados em cache no MySQL |
+
+Os valores de **precisão por país** são autorreportados pelos provedores e variam por região — a cobertura da Ásia-Pacífico e da América Latina tende a ser menor do que a da América do Norte e da Europa em todas as fontes.
+
+**Qual escolher:** o MaxMind GeoLite2 é o ponto de partida padrão — é gratuito, vem como arquivos simples que você importa uma vez, e as consultas rodam inteiramente dentro do MySQL, sem dependência externa. Para precisão em nível de cidade em produção, o GeoIP2 Precision é o caminho de upgrade. As fontes baseadas em API (ip-api.com, ipinfo.io) são convenientes para uso de baixo volume, mas adicionam latência HTTP e uma dependência de limite de taxa a cada consulta.
+
+## Quando Usar Cada Abordagem {#when-to-use-each-approach}
+
+| Cenário | Abordagem recomendada |
+|:---|:---|
+| Análise em lote de logs de acesso armazenados | GeoLite2 no MySQL — join diretamente em SQL |
+| Consulta em tempo real a cada requisição HTTP (alto volume) | Leitor `.mmdb` do MaxMind no código da aplicação — sem ida e volta ao SQL |
+| Enriquecimento de baixo volume (&lt;45 req/min), sem sobrecarga de importação no banco | Nível gratuito do ip-api.com via HTTP |
+| Somente IPv4, velocidade máxima de consulta | `INT UNSIGNED` + `BETWEEN` com GeoLite2 |
+| IPv4 + IPv6 em uma única tabela | `INET` do VillageSQL + `inet_compare` com GeoLite2 |
+| Dados de cidade, ASN ou ISP necessários | GeoIP2 Precision (pago) ou ipinfo.io |
+| Ambiente isolado da rede, sem chamadas a APIs externas | MaxMind GeoLite2 (importação local) |
+| Prototipagem / testes sem configuração | Nível gratuito do ip-api.com |
+
+## Importando Dados do GeoLite2 {#importing-geolite2-data}
+
+O MaxMind GeoLite2 (gratuito, exige cadastro) fornece arquivos CSV. Para o schema baseado em intervalos:
+
+```sql
+-- After downloading GeoLite2-Country-Blocks-IPv4.csv
+-- Convert the network column to start/end ranges and load:
+LOAD DATA INFILE '/path/to/ipv4_ranges.csv'
+INTO TABLE geoip_ranges
+FIELDS TERMINATED BY ',' ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS
+(@start_ip_str, @end_ip_str, country)
+SET start_ip = inet_from_string(@start_ip_str),
+    end_ip   = inet_from_string(@end_ip_str);
+```
+
+O MaxMind também fornece um formato binário `.mmdb` e bibliotecas cliente oficiais para linguagens como Python, Node.js e Go, que são mais rápidas do que consultas SQL em cenários de alto volume.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Devo fazer a geolocalização no MySQL ou no código da aplicação? {#should-i-do-geolocation-in-mysql-or-in-application-code}
+
+Para consultas de alto volume (a cada requisição HTTP), a geolocalização na camada de aplicação usando a biblioteca de leitura `.mmdb` do MaxMind é mais rápida — busca binária em memória, sem ida e volta ao SQL. A geolocalização baseada em SQL faz sentido para análises em lote, consultas de relatórios e pipelines de dados que já rodam no MySQL.
+
+#### Como mantenho o banco de dados de GeoIP atualizado? {#how-do-i-keep-the-geoip-database-current}
+
+O MaxMind atualiza o GeoLite2 semanalmente. Crie um script para download periódico e `TRUNCATE` + recarga da tabela de geolocalização. Como alternativa, use o mmdbinspect do MaxMind ou um script de atualização para aplicar atualizações incrementais.
+
+#### Quão precisa é a geolocalização por IP no MySQL? {#how-accurate-is-ip-geolocation-in-mysql}
+
+A precisão depende inteiramente da fonte de dados, não do schema do MySQL. Em nível de país, o MaxMind GeoLite2 (gratuito) é preciso para aproximadamente 98% dos endereços IPv4. Em nível de cidade, cai para cerca de 80%. Para maior precisão, o produto pago GeoIP2 Precision do MaxMind chega a ~99,8% por país e ~85–90% por cidade. Nenhum banco de dados é perfeito — a precisão é tipicamente menor para redes móveis, VPNs e alguns intervalos da Ásia-Pacífico. A abordagem de consulta no MySQL não tem efeito sobre a precisão; você obtém exatamente o que os dados importados dizem.
+
+#### O MySQL pode consultar geolocalização por IP sem um plugin ou API externa? {#can-mysql-look-up-ip-geolocation-without-a-plugin-or-external-api}
+
+Sim. A abordagem padrão — e o que este guia cobre — usa um banco de dados de GeoIP (como o MaxMind GeoLite2) importado para uma tabela MySQL comum como intervalos de inteiros. As consultas são consultas SQL `BETWEEN` simples. Sem plugin, sem API externa, sem chamada de rede no momento da consulta. A única dependência é importar e atualizar periodicamente os arquivos CSV simples do MaxMind. A extensão `vsql_network_address` do VillageSQL adiciona um tipo `INET` para um tratamento mais limpo de IPv4/IPv6, mas ela não é necessária para a abordagem básica.
+
+#### Posso fazer join da geolocalização com meus logs de acesso em uma única consulta? {#can-i-join-geolocation-with-my-access-logs-in-one-query}
+
+Sim — esse é um dos principais motivos para manter os dados de GeoIP no MySQL:
+
+```sql
+SELECT
+    g.country,
+    COUNT(*) AS request_count
+FROM access_log a
+JOIN geoip_ranges g
+  ON inet_compare(a.ip_address, g.start_ip) >= 0
+ AND inet_compare(a.ip_address, g.end_ip)   <= 0
+GROUP BY g.country
+ORDER BY request_count DESC;
+```
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.inet_from_string does not exist` | Execute `INSTALL EXTENSION vsql_network_address` |
+| A consulta não retorna resultados | Verifique se o intervalo de IP desse bloco foi importado; tente `SELECT COUNT(*) FROM geoip_ranges` |
+| A consulta retorna o país errado | Os bancos de dados de GeoIP têm lacunas de cobertura — verifique com a ferramenta de consulta web do MaxMind |
+| `LOAD DATA INFILE` falha | Verifique a configuração `secure_file_priv`; como alternativa, use inserções em lote do lado da aplicação |
+
+## Veja também {#see-also}
+
+- [Armazenando Endereços IP no MySQL](/pt-BR/guides/storing-ip-addresses) — armazenamento eficiente de IPs antes das consultas de geolocalização
+- [Consultando por Sub-rede no MySQL](/pt-BR/guides/subnet-queries) — consultas de IP baseadas em intervalo sobre as quais a geolocalização se apoia

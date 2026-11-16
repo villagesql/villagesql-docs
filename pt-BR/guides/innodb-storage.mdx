@@ -1,0 +1,115 @@
+---
+title: "Como o InnoDB Armazena Dados"
+sidebarTitle: "Entendendo o InnoDB"
+description: "Como o engine de armazenamento InnoDB do MySQL organiza os dados em disco: índices clusterizados, páginas, o buffer pool e o que isso significa para o desempenho das consultas."
+keywords: "mysql innodb storage, mysql clustered index, mysql buffer pool, innodb page size, mysql innodb architecture, mysql row format, innodb tablespace"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O InnoDB é o engine de armazenamento padrão do MySQL. Entender como ele armazena os dados explica por que algumas consultas são rápidas e outras não — especialmente por que a escolha da chave primária importa, por que varreduras de intervalo superam buscas aleatórias, e por que índices em tabelas grandes podem prejudicar o desempenho de gravação.
+
+## Páginas: A Unidade de Armazenamento {#pages-the-unit-of-storage}
+
+O InnoDB armazena tudo em páginas — blocos de tamanho fixo de 16KB por padrão. Uma página é a menor unidade que o InnoDB lê do disco ou grava nele. Quando você lê uma linha, o InnoDB carrega a página inteira de 16KB que a contém.
+
+Isso tem consequências práticas:
+- Consultas que leem linhas sequenciais (varreduras de intervalo, varreduras completas de tabela em dados ordenados) carregam cada página uma vez e processam muitas linhas dela
+- Consultas que leem linhas aleatórias (por índice secundário em uma tabela grande) carregam uma nova página para cada linha — cada uma provavelmente uma leitura de disco separada
+
+## O Índice Clusterizado {#the-clustered-index}
+
+O InnoDB armazena as linhas da tabela em um **índice clusterizado** — uma B-tree em que os nós folha contêm os dados reais das linhas, fisicamente ordenados pela chave primária. Não existe um "arquivo da tabela" e um "arquivo do índice da chave primária" separados — eles são a mesma estrutura.
+
+```sql
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    created_at  DATETIME NOT NULL
+);
+```
+
+As linhas desta tabela são fisicamente armazenadas em disco na ordem de `id`. Uma consulta como `WHERE id BETWEEN 1000 AND 2000` lê um intervalo contíguo de páginas — rápido. Uma consulta que recupera a linha `id = 1`, depois `id = 500000`, depois `id = 250` lê três páginas fisicamente dispersas.
+
+**Se você não define uma chave primária**, o InnoDB cria um ID de linha oculto de 6 bytes e o usa como chave do índice clusterizado. Isso desperdiça a oportunidade de otimização.
+
+## Índices Secundários {#secondary-indexes}
+
+Cada índice secundário é uma B-tree separada. Os nós folha não armazenam a linha completa — eles armazenam os valores das colunas indexadas mais a chave primária. Para recuperar colunas que não estão no índice secundário, o InnoDB faz uma **busca de linha**: ele pega a chave primária da folha do índice secundário e busca a linha completa no índice clusterizado.
+
+```sql
+CREATE INDEX idx_customer ON orders (customer_id);
+
+-- This query uses idx_customer, then does a row lookup for each match
+SELECT amount FROM orders WHERE customer_id = 42;
+```
+
+Esse processo em duas etapas é o motivo pelo qual os índices de cobertura importam: se o índice secundário inclui todas as colunas de que a consulta precisa, a busca de linha é dispensada. Consulte [Índices de Cobertura no MySQL](/pt-BR/guides/covering-indexes).
+
+O custo da busca de linha também é o motivo pelo qual chaves primárias grandes são caras. Se a sua chave primária é uma string UUID (36 bytes) em vez de um INT (4 bytes), cada índice secundário armazena 36 bytes por entrada em vez de 4, e a busca de linha percorre uma B-tree mais profunda.
+
+## O Buffer Pool {#the-buffer-pool}
+
+O InnoDB mantém páginas em cache na memória, no **buffer pool**. Uma página lida do disco é carregada no buffer pool e permanece lá até que a memória seja necessária para outra coisa. Leituras subsequentes da mesma página são servidas a partir da RAM.
+
+```sql
+-- Check buffer pool size
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+
+-- Check hit rate (should be > 99% on a healthy server)
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+-- Innodb_buffer_pool_reads: pages read from disk
+-- Innodb_buffer_pool_read_requests: total page read requests
+-- Hit rate = 1 - (reads / read_requests)
+```
+
+Em um servidor de banco de dados dedicado, defina `innodb_buffer_pool_size` entre 70–80% da RAM disponível. Essa é a mudança de configuração de maior impacto para cargas de trabalho com muitas leituras — quanto mais do conjunto de trabalho cabe na memória, menos leituras de disco.
+
+## Formatos de Linha {#row-formats}
+
+O InnoDB suporta quatro formatos de linha. O padrão é `DYNAMIC`.
+
+| Formato | Colunas de comprimento variável | Armazenamento inline antes do overflow | Observações |
+|:-------|:------------------------|:--------------------------------|:------|
+| `REDUNDANT` | Armazenadas inline ou fora da página | ~8KB | Formato legado |
+| `COMPACT` | Armazenadas inline ou fora da página | ~8KB | Formato mais antigo |
+| `DYNAMIC` | Armazenadas fora da página quando grandes | ~8KB | Padrão; melhor para TEXT/BLOB |
+| `COMPRESSED` | Comprimidas fora da página | ~8KB | Reduz o uso de disco; adiciona sobrecarga de CPU |
+
+O valor de ~8KB, aproximadamente metade da página padrão de 16KB, é o ponto em que o InnoDB move os dados de colunas de comprimento variável para fora da página, de modo que uma linha com poucas colunas `VARCHAR`/`TEXT`/`BLOB` grandes pode crescer bem além dele sem atingir um teto. Mas as colunas que ficam armazenadas inline em vez de ir para fora da página — muitas colunas `CHAR` de largura fixa, por exemplo — ainda contam integralmente para o limite de tamanho de linha do próprio InnoDB, e atingi-lo gera `ERROR 1118 (42000): Row size too large (> 8126). Changing some columns to TEXT or BLOB may help.` O limite de tamanho de linha do MySQL, separado e maior, é de 65.535 bytes sem contar as páginas de overflow de BLOB/TEXT, e se aplica independentemente de `ROW_FORMAT`; ambos os limites são reais, e qualquer um deles pode ser o primeiro que você atinge, dependendo de quais colunas são grandes e de elas poderem ou não ir para fora da página.
+
+Quando uma coluna `VARCHAR`, `TEXT` ou `BLOB` ultrapassa a página no formato `DYNAMIC`, o valor inteiro é armazenado em páginas de overflow — somente um pointer de 20 bytes permanece na linha principal. `COMPACT` armazena os primeiros 768 bytes inline em vez disso. A abordagem de `DYNAMIC` mantém a linha principal menor quando existem valores longos, o que significa que mais linhas cabem por página e a B-tree permanece mais rasa.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Por que a escolha da chave primária afeta tanto o desempenho? {#why-does-primary-key-choice-affect-performance-so-much}
+
+Porque o índice clusterizado ordena fisicamente as linhas pela chave primária. Inserções em posições aleatórias (como chaves primárias UUID) causam **divisões de página** — o InnoDB precisa dividir páginas cheias e mover dados para manter a ordem. Chaves primárias sequenciais (AUTO_INCREMENT, UUID v7) inserem no final e evitam divisões. As divisões de página fragmentam o tablespace e tornam tanto gravações quanto leituras mais lentas com o tempo.
+
+#### O que acontece quando o buffer pool é pequeno demais? {#what-happens-when-the-buffer-pool-is-too-small}
+
+O InnoDB precisa ler páginas do disco com frequência. Você verá `Innodb_buffer_pool_reads` subindo. O servidor fica limitado por I/O — consultas que levariam microssegundos a partir da RAM levam milissegundos a partir do disco. Em uma carga de trabalho com muitas leituras, um buffer pool que comporta o conjunto de trabalho vale mais do que quase qualquer otimização de índice.
+
+#### Qual é a diferença entre InnoDB e MyISAM? {#whats-the-difference-between-innodb-and-myisam}
+
+O InnoDB suporta transações, chaves estrangeiras, bloqueio em nível de linha e recuperação após falhas. O MyISAM não suporta nenhum desses — ele é mais rápido para cargas de trabalho específicas em massa somente leitura, mas inadequado para a maioria das aplicações. O InnoDB é o padrão do MySQL; use-o a menos que tenha um motivo específico para não usar.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| Varreduras de intervalo lentas em tabelas grandes | Verifique a taxa de acerto do buffer pool; considere aumentar `innodb_buffer_pool_size` |
+| Inserções ficando lentas com o tempo | A chave primária é sequencial? Verifique divisões de página com `SHOW ENGINE INNODB STATUS` |
+| I/O de disco alto apesar de RAM adequada | O buffer pool pode estar subdimensionado para o conjunto de trabalho; aumente-o |
+| Tabela grande com leituras majoritariamente de texto completo | Considere o formato de linha `DYNAMIC` para manter textos grandes fora da página principal |
+
+O VillageSQL traz o mesmo engine InnoDB, então todas as configurações desta página se aplicam sem alterações. [Instale o VillageSQL](https://villagesql.com/install) para manter o InnoDB e ganhar um framework de extensões para tipos, funções e índices personalizados.
+
+## Veja também {#see-also}
+
+- [Como Funcionam os Índices do MySQL](/pt-BR/guides/mysql-indexes) — como os índices B-tree são dispostos dentro das páginas do InnoDB
+- [Índices de Cobertura no MySQL](/pt-BR/guides/covering-indexes) — por que permanecer no índice evita leituras de página caras
+- [Particionamento de Tabelas no MySQL](/pt-BR/guides/table-partitioning) — dividindo os dados em vários segmentos do InnoDB

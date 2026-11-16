@@ -1,0 +1,262 @@
+---
+title: "Go 和 sqlc 与 MySQL"
+sidebarTitle: "Go 与 sqlc"
+description: "如何使用 sqlc 从 SQL schema 和查询生成类型安全的 Go 代码，用于 MySQL 和 VillageSQL，包括查询注解、sqlc.yaml 配置，以及生成代码对可空列的处理。"
+keywords: "sqlc mysql, sqlc golang, go mysql sqlc, sqlc.yaml mysql, sqlc query annotations, go-sql-driver mysql, sqlc generate, type safe sql go, sqlc execlastid"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+sqlc 直接从 SQL 生成 Go 结构体和查询方法，因此您的应用程序代码调用的是普通的 Go 函数，而不是在运行时构建查询。在您的代码和您编写的 SQL 之间没有 ORM 层。本指南创建一个小型的 `posts` 表，用 sqlc 针对 MySQL 生成代码，并在一个真实运行的服务器上运行它。
+
+## 安装 sqlc {#installing-sqlc}
+
+使用 Homebrew 安装 sqlc；如果您希望将其作为 Go 工具管理，也可以使用 `go install`：
+
+```bash
+brew install sqlc
+```
+
+```bash
+go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
+```
+
+确认版本：
+
+```bash
+sqlc version
+```
+
+```
+v1.31.1
+```
+
+## 项目布局 {#project-layout}
+
+创建一个 Go 模块和三个文件：一个 schema、一个查询文件和一个 sqlc 配置文件。
+
+```bash
+mkdir go-sqlc-mysql && cd go-sqlc-mysql
+go mod init go-sqlc-mysql
+```
+
+`schema.sql` 定义 sqlc 将从中生成类型的表。`body` 没有 `NOT NULL` 约束，这一点稍后会很重要：
+
+```sql
+CREATE TABLE posts (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    title VARCHAR(255) NOT NULL,
+    body TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+);
+```
+
+## 编写带注解的查询 {#writing-annotated-queries}
+
+sqlc 读取普通的 SQL 文件，并将每条语句上方的 `-- name:` 注释转换为一个生成的 Go 方法。查询名称后面的词决定返回形式：`:one` 返回单行，`:many` 返回切片，`:exec` 不返回值，`:execresult` 返回原始的 `sql.Result`，`:execrows` 返回受影响的行数。
+
+MySQL 的 `INSERT` 语句不支持 `RETURNING`，因此要取回新行的 ID 需要一个专门的注解。`:execlastid` 会替您调用 `sql.Result.LastInsertId()` 并直接返回它：
+
+```sql
+-- name: GetPost :one
+SELECT id, title, body, created_at FROM posts WHERE id = ?;
+
+-- name: ListPosts :many
+SELECT id, title, body, created_at FROM posts ORDER BY id;
+
+-- name: CreatePost :execlastid
+INSERT INTO posts (title, body) VALUES (?, ?);
+```
+
+## 配置 sqlc.yaml {#configuring-sqlcyaml}
+
+`sqlc.yaml` 将 sqlc 指向 schema 文件和查询文件，并设置 MySQL 引擎。路径相对于 `sqlc.yaml` 所在的位置解析，而不是相对于您运行 `sqlc` 的目录：
+
+```yaml
+version: "2"
+sql:
+  - schema: "schema.sql"
+    queries: "query.sql"
+    engine: "mysql"
+    gen:
+      go:
+        package: "posts"
+        out: "posts"
+        sql_package: "database/sql"
+        emit_json_tags: true
+```
+
+`package` 和 `out` 指定生成的 Go 包名和写入目录。`sql_package: "database/sql"` 告诉 sqlc 针对标准库的 `database/sql` 生成代码，这正是 `go-sql-driver/mysql` 所实现的接口。
+
+## 生成代码 {#generating-code}
+
+```bash
+sqlc generate
+```
+
+这会在 `posts/` 中生成三个文件：`db.go`（`Queries` 结构体及其构造函数）、`models.go`（`Post` 结构体）和 `query.sql.go`（每个带注解的查询对应一个方法）。可空的 `body` 列出现在 `models.go` 中：
+
+```go
+type Post struct {
+	ID        uint64         `json:"id"`
+	Title     string         `json:"title"`
+	Body      sql.NullString `json:"body"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+```
+
+## 可空列生成 sql.NullString，而不是指针 {#nullable-columns-generate-sqlnullstring-not-a-pointer}
+
+因为 `body TEXT` 没有 `NOT NULL` 约束，sqlc 为它生成了 `sql.NullString`，而不是普通的 `string` 或 `*string`。同样的规则适用于从 `INSERT` 语句的参数列表生成的 `CreatePostParams`：
+
+```go
+type CreatePostParams struct {
+	Title string         `json:"title"`
+	Body  sql.NullString `json:"body"`
+}
+```
+
+这意味着每次插入都必须显式构造一个 `sql.NullString`，即使是为了传入一个值：
+
+```go
+_, err := queries.CreatePost(ctx, posts.CreatePostParams{
+	Title: "Hello VillageSQL",
+	Body:  sql.NullString{String: "First post generated with sqlc.", Valid: true},
+})
+```
+
+要插入一行没有正文的记录，请设置 `Valid: false`，而不是将字段留为空字符串。空的 `sql.NullString{}` 零值已经是 `Valid: false`，因此它等同于显式写 `sql.NullString{Valid: false}`：
+
+```go
+_, err = queries.CreatePost(ctx, posts.CreatePostParams{
+	Title: "No body",
+	Body:  sql.NullString{Valid: false},
+})
+```
+
+读回可空列时，需要先检查 `.Valid`，再信任 `.String`：
+
+```go
+post, err := queries.GetPost(ctx, id)
+if post.Body.Valid {
+	fmt.Println(post.Body.String)
+}
+```
+
+如果某一列需要允许 `NULL`，请把它作为一个有意的 schema 决定。在 `schema.sql` 中为 `body` 添加 `NOT NULL` 并重新运行 `sqlc generate`，生成的字段会在所有出现的地方从 `sql.NullString` 变为普通的 `string`，从而移除每个调用点的 `.Valid` 检查。
+
+## 连接并运行迁移 {#connecting-and-running-migrations}
+
+创建数据库和一个使用真实密码的应用程序用户，权限限定在该数据库内：
+
+```sql
+CREATE DATABASE sqlc_guide;
+CREATE USER 'sqlc_app'@'127.0.0.1' IDENTIFIED BY 'sqlc_app_pw';
+GRANT ALL PRIVILEGES ON sqlc_guide.* TO 'sqlc_app'@'127.0.0.1';
+```
+
+在运行应用程序之前，用 `mysql` 客户端应用 `schema.sql`：
+
+```bash
+mysql -u root sqlc_guide < schema.sql
+```
+
+添加驱动，并通过 TCP 使用 `parseTime=true` 连接；MySQL 的 `TIMESTAMP` 和 `DATETIME` 列需要该参数才能扫描到 Go 的 `time.Time` 中，而不是 `[]byte`：
+
+```bash
+go get github.com/go-sql-driver/mysql
+```
+
+```go
+db, err := sql.Open("mysql", "sqlc_app:sqlc_app_pw@tcp(127.0.0.1:3306)/sqlc_guide?parseTime=true")
+if err != nil {
+	log.Fatalf("open: %v", err)
+}
+defer db.Close()
+
+queries := posts.New(db)
+```
+
+## CreatePost 返回 int64，GetPost 接受 uint64 {#createpost-returns-int64-getpost-takes-uint64}
+
+`id BIGINT UNSIGNED` 在 sqlc 将其作为列生成的所有地方都映射为 `uint64`，包括 `GetPost` 的 `id` 参数。但是用 `:execlastid` 生成的 `CreatePost` 返回的是普通的 `int64`。这来自 `sql.Result.LastInsertId()`，标准库将其定义为 `int64`，与列实际是否有符号无关。将刚创建的 ID 传入 `GetPost` 需要显式转换：
+
+```go
+id, err := queries.CreatePost(ctx, posts.CreatePostParams{
+	Title: "Hello VillageSQL",
+	Body:  sql.NullString{String: "First post generated with sqlc.", Valid: true},
+})
+
+post, err := queries.GetPost(ctx, uint64(id))
+```
+
+针对真实运行的服务器端到端运行完整程序：
+
+```bash
+go run .
+```
+
+```
+created post id=1
+created post id=2
+fetched post: id=1 title="Hello VillageSQL" body.Valid=true body="First post generated with sqlc." created_at=2026-08-28 12:31:37 +0000 UTC
+total posts: 2
+  id=1 title="Hello VillageSQL" body.Valid=true
+  id=2 title="No body" body.Valid=false
+```
+
+直接对照数据库检查，不依赖程序自身的输出：
+
+```sql
+SELECT id, title, body, created_at FROM posts ORDER BY id;
+```
+
+```
+id	title	body	created_at
+1	Hello VillageSQL	First post generated with sqlc.	2026-08-28 12:31:37
+2	No body	NULL	2026-08-28 12:31:37
+```
+
+## 调优连接池 {#tuning-the-connection-pool}
+
+`database/sql` 在 `sql.Open` 之下管理自己的连接池，sqlc 生成的 `Queries` 结构体使用您传入的 `*sql.DB` 已有的连接池。对于 MySQL 后端，有两个设置尤其重要：
+
+```go
+db.SetMaxOpenConns(10)
+db.SetMaxIdleConns(10)
+db.SetConnMaxLifetime(time.Hour)
+```
+
+`SetConnMaxLifetime` 应设置为低于 MySQL 的 `wait_timeout`，该值在此服务器上默认为 28800 秒（8 小时）。如果不设置，MySQL 已在服务器端关闭的连接会作为空闲条目留在 Go 连接池中，直到针对其中某个连接的查询失败。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### sqlc 会针对真实运行的数据库运行吗？ {#does-sqlc-run-against-a-live-database}
+
+只有在您显式启用时才会。`sqlc generate` 静态解析 `schema.sql` 和 `query.sql`，不需要正在运行的服务器。`sqlc vet` 和 `sqlc push` 可以连接到真实数据库进行额外检查，但本指南中的基本 `generate` 工作流从不打开连接。
+
+#### 如果 query.sql 中的某个查询有语法错误会怎样？ {#what-happens-if-a-query-in-querysql-has-a-syntax-error}
+
+`sqlc generate` 会在生成任何内容之前失败，并给出指明文件和行号的解析错误。失败时不会向输出目录写入任何内容，因此有问题的查询永远不会产生过时或不完整的生成代码。
+
+#### sqlc 可以为 INSERT ... ON DUPLICATE KEY UPDATE 生成代码吗？ {#can-sqlc-generate-code-for-insert--on-duplicate-key-update}
+
+可以。sqlc 将其解析为普通的 `INSERT` 语句。根据您需要结果的哪一部分，用 `:exec`、`:execresult`、`:execrows` 或 `:execlastid` 注解它，与任何其他插入相同。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `sqlc generate` 报告找不到 `schema.sql` | `sqlc.yaml` 中的路径相对于配置文件自身所在的目录，而不是您运行 `sqlc` 的目录。如果您在其他地方运行，请使用 `sqlc generate -f /full/path/to/sqlc.yaml`。 |
+| 生成的代码无法编译：`undefined: sql.NullString` | 将 `"database/sql"` 添加到文件的导入中，或者用 `sqlc generate` 重新生成；当存在可空列时，它会自动添加该导入。 |
+| `sql: Scan error ... unsupported Scan, storing driver.Value type []uint8 into type *time.Time` | 在传给 `sql.Open` 的 DSN 中添加 `parseTime=true`。 |
+| 插入行的 body 是空字符串而不是 NULL | 没有 `Valid: true` 的 `sql.NullString{}` 会正确插入 `NULL`，而未设置 `Valid` 的 `sql.NullString{String: ""}` 同样是 `Valid: false`，行为相同。请检查是否在值为空字符串时意外设置了 `Valid: true`，这确实会插入空字符串而不是 NULL。 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 与 ORM](/zh/guides/mysql-with-orms)——sqlc 所替代的运行时构建查询的方法
+- [MySQL 中的 Schema 迁移](/zh/guides/schema-migrations)——表进入生产环境后安全地为 `schema.sql` 的变更做版本管理
+- [MySQL 连接池](/zh/guides/connection-pooling)——超出 `database/sql` 默认值的连接池大小设置和持久连接

@@ -1,0 +1,190 @@
+---
+title: "MySQL 中的表分区"
+sidebarTitle: "对表进行分区"
+description: "MySQL 表分区如何工作：RANGE、LIST、HASH 和 KEY 分区类型、分区裁剪、分区何时能提升性能，以及常见陷阱。"
+keywords: "mysql table partitioning, mysql partition by range, mysql partition pruning, mysql partitioning example, mysql range partition, mysql list partition, mysql partition performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+分区把一张逻辑表拆分为多个物理段。MySQL 根据分区表达式把行路由到各个分区，而按分区键过滤的查询可以跳过整个分区，这种优化称为分区裁剪。分区需要 InnoDB 或 NDB 存储引擎。
+
+## 分区何时有帮助 {#when-partitioning-helps}
+
+在以下情况下，分区裁剪能带来真正的收益：
+- 表太大，无法放入缓冲池，并且查询始终按分区键过滤
+- 您定期删除旧数据：`ALTER TABLE t DROP PARTITION p_old` 是瞬时完成的，而 DELETE 很慢
+
+在以下情况下，分区没有帮助：
+- 查询不按分区键过滤（必须扫描所有分区）
+- 表可以轻松放入内存
+- 您试图用它替代正确的索引：未分区表上的一个好索引，往往胜过没有匹配索引的分区表
+
+## RANGE 分区 {#range-partitioning}
+
+根据分区键是否落在某个范围内把行分配到分区。最常见的用例是基于日期的归档。
+
+```sql
+CREATE TABLE orders (
+    id          INT NOT NULL,
+    customer_id INT,
+    amount      DECIMAL(10,2),
+    created_at  DATE NOT NULL
+)
+PARTITION BY RANGE COLUMNS (created_at) (
+    PARTITION p2022 VALUES LESS THAN ('2023-01-01'),
+    PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+    PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+请始终包含一个 `MAXVALUE` 分区，以接住不属于任何已定义范围的行。没有它，超出已定义范围的插入会失败并报错。
+
+添加新分区：
+
+```sql
+-- Only works if the last partition is not MAXVALUE
+ALTER TABLE orders ADD PARTITION (
+    PARTITION p2025 VALUES LESS THAN ('2026-01-01')
+);
+
+-- If MAXVALUE exists, reorganize it:
+ALTER TABLE orders REORGANIZE PARTITION p_future INTO (
+    PARTITION p2025 VALUES LESS THAN ('2026-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+瞬时删除旧数据：
+
+```sql
+ALTER TABLE orders DROP PARTITION p2022;
+```
+
+## LIST 分区 {#list-partitioning}
+
+根据分区键的精确值分配行。
+
+```sql
+CREATE TABLE customers (
+    id     INT NOT NULL,
+    name   VARCHAR(100),
+    region VARCHAR(20) NOT NULL
+)
+PARTITION BY LIST COLUMNS (region) (
+    PARTITION p_north VALUES IN ('WA', 'OR', 'ID', 'MT'),
+    PARTITION p_south VALUES IN ('CA', 'NV', 'AZ', 'NM'),
+    PARTITION p_east  VALUES IN ('NY', 'NJ', 'CT', 'MA')
+);
+```
+
+插入的 region 不在任何分区列表中时会失败。对字符串列请使用 `LIST COLUMNS`：单独的 `LIST` 只支持整数表达式。
+
+## HASH 和 KEY 分区 {#hash-and-key-partitioning}
+
+`HASH` 和 `KEY` 把行均匀分布到固定数量的分区中。它们不支持按值进行分区裁剪，但可以通过把行分散到多个分区来提高并发写入吞吐量。
+
+```sql
+-- HASH: you define the expression
+CREATE TABLE sessions (
+    id         INT NOT NULL,
+    user_id    INT NOT NULL,
+    data       TEXT
+)
+PARTITION BY HASH (user_id)
+PARTITIONS 8;
+
+-- KEY: MySQL uses the primary key automatically
+CREATE TABLE logs (
+    id         BIGINT AUTO_INCREMENT,
+    message    TEXT,
+    PRIMARY KEY (id)
+)
+PARTITION BY KEY ()
+PARTITIONS 4;
+```
+
+## 分区裁剪 {#partition-pruning}
+
+只有当 `WHERE` 子句直接按分区表达式过滤时，裁剪才会生效。对于 `RANGE COLUMNS (created_at)`，按 `created_at` 过滤可以正确裁剪：
+
+```sql
+-- Pruned: MySQL scans only p2024
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31';
+
+-- NOT pruned: wrapping the column in YEAR() defeats pruning
+-- MySQL can't map YEAR(created_at) = 2024 back to the RANGE COLUMNS expression
+SELECT * FROM orders WHERE YEAR(created_at) = 2024;
+```
+
+要验证裁剪，请运行 `EXPLAIN` 并检查 `partitions` 列：
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE created_at = '2024-06-15'\G
+```
+
+如果 `partitions` 只显示一个或少数几个分区名，说明裁剪正在生效。如果它显示所有分区，说明过滤条件没有被应用。
+
+## 分区的限制 {#partitioning-constraints}
+
+- **每个唯一键（包括主键）都必须包含分区表达式中的所有列。** 如果您想按 `created_at` 分区，每个唯一键都必须包含 `created_at`：对于只有单独 `PRIMARY KEY (id)` 的表，您无法添加分区，除非先把主键改为 `PRIMARY KEY (id, created_at)`。
+- MySQL 的分区表不支持 `FOREIGN KEY` 约束。
+- 一张表最多可以有 8192 个分区（MySQL 8.0 及以上版本）。
+
+## 分区与索引 {#partitioning-vs-indexing}
+
+| | 分区 | 索引 |
+|:--|:------------|:---------|
+| 最适合 | 基于范围的数据裁剪、归档删除 | 点查找、任意列上的范围扫描 |
+| 需要修改架构 | 是 | 是（ALTER TABLE ADD INDEX） |
+| 加速任意查询 | 只加速按分区键过滤的查询 | 任何使用索引列的查询 |
+| 删除旧数据 | 瞬时（`DROP PARTITION`） | 需要 DELETE + 索引维护 |
+| 外键 | 不支持 | 支持 |
+
+先从索引开始。只有当您在大表上有已证实的性能问题，并且有与查询模式匹配的明确分区键时，才添加分区。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我可以对现有的表进行分区吗？ {#can-i-partition-an-existing-table}
+
+可以，使用 `ALTER TABLE`：
+
+```sql
+ALTER TABLE orders
+PARTITION BY RANGE COLUMNS (created_at) (
+    PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+    PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+这会重写整张表，在大表上可能耗费大量时间和磁盘空间。
+
+#### 如何检查某一行在哪个分区中？ {#how-do-i-check-which-partition-a-row-is-in}
+
+```sql
+SELECT PARTITION_NAME, TABLE_ROWS
+FROM information_schema.partitions
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'orders';
+```
+
+要查看某一特定行会进入哪个分区，请使用 `EXPLAIN PARTITIONS` 并配合与该行匹配的 WHERE 子句。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 1526: Table has no partition for value` | RANGE 或 LIST 没有匹配的分区。为 RANGE 添加 `MAXVALUE` 分区，或在 LIST 中处理缺失的值 |
+| `ERROR 1503: A PRIMARY KEY must include all columns in the table's partitioning function` | 把分区键列添加到主键定义中 |
+| 分区裁剪没有发生 | 检查 `EXPLAIN` 的 partitions 列；确保 WHERE 子句直接使用分区列，而不是把它包在函数中 |
+| `ALTER TABLE DROP PARTITION` 返回错误 | 表必须是 RANGE 或 LIST 分区。HASH 和 KEY 分区不能单独删除 |
+| 分区后性能更差 | 查询可能没有进行裁剪。请用 EXPLAIN 验证，并检查每个分区上是否为 WHERE 中使用的列建立了索引 |
+
+## 另请参阅 {#see-also}
+
+- [InnoDB 如何存储数据](/zh/guides/innodb-storage)：分区所基于的存储引擎
+- [MySQL 索引如何工作](/zh/guides/mysql-indexes)：分区内的索引与分区裁剪
+- [MySQL 中的模式迁移](/zh/guides/schema-migrations)：如何在现有表上添加或更改分区

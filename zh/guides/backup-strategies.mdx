@@ -1,0 +1,204 @@
+---
+title: "MySQL 备份策略"
+sidebarTitle: "规划备份"
+description: "如何备份 MySQL 数据库：使用 mysqldump 进行逻辑备份、MySQL Shell 的转储工具、基于二进制日志的时间点恢复，以及生产系统的备份最佳实践。"
+keywords: "mysql backup, mysqldump, mysql backup strategy, mysql point in time recovery, mysql backup restore, mysql dump database, mysql incremental backup, mysql backup best practices, mysql backup automation, mysql backup compression, mysql point in time recovery binlog, mysqlpump, mysql shell dump, percona xtrabackup"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 备份策略由两部分组成：对数据做一个一致的快照（完整备份），以及有办法重放快照之后发生的更改（时间点恢复）。合适的工具取决于数据库大小、可接受的恢复时间，以及您能承受丢失多少数据。
+
+## mysqldump——逻辑备份 {#mysqldump--logical-backups}
+
+`mysqldump` 将数据导出为 SQL 语句。这是可移植性最好的格式，适用于任何大小的数据库，不过对于大型数据集，它的恢复速度比二进制备份慢。
+
+**备份单个数据库：**
+
+```bash
+mysqldump -u root -p myapp > myapp_backup.sql
+```
+
+**备份所有数据库：**
+
+```bash
+mysqldump -u root -p --all-databases > all_databases.sql
+```
+
+**InnoDB 的推荐选项：**
+
+```bash
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --routines \
+  --triggers \
+  --events \
+  -u root -p myapp > myapp_backup.sql
+```
+
+| 选项 | 用途 |
+|:-----|:--------|
+| `--single-transaction` | 不锁表的一致快照（仅限 InnoDB） |
+| `--source-data=2` | 以注释形式记录 binlog 位置——时间点恢复所必需 |
+| `--routines` | 包含存储过程和函数 |
+| `--triggers` | 包含触发器（默认开启，但显式写出更清楚） |
+| `--events` | 包含计划事件 |
+
+如果不加 `--single-transaction`，mysqldump 会用 `LOCK TABLES` 锁表，在转储期间阻塞写入。
+
+**从转储文件恢复：**
+
+```bash
+mysql -u root -p myapp < myapp_backup.sql
+```
+
+要恢复所有数据库：`mysql -u root -p < all_databases.sql`
+
+## 使用二进制日志进行时间点恢复 {#point-in-time-recovery-with-binary-logs}
+
+完整备份只能保护到最后一次备份的时间点。二进制日志让您可以重放备份之后发生的每一次更改。
+
+**要求：**
+- 已启用二进制日志（`log_bin = ON`）
+- 备份时使用了 `--source-data=2`（记录起始 binlog 位置）
+
+**工作流程：**
+
+1. 恢复完整备份：
+```bash
+mysql -u root -p < myapp_backup.sql
+```
+
+2. 从转储文件中找到 binlog 起始位置：
+```bash
+head -50 myapp_backup.sql | grep "SOURCE_LOG_FILE"
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='mysql-bin.000003', SOURCE_LOG_POS=154;
+```
+
+3. 重放二进制日志，直到您想撤销的事件之前的那一刻：
+```bash
+mysqlbinlog \
+  --start-position=154 \
+  --stop-datetime="2024-06-15 11:59:00" \
+  mysql-bin.000003 mysql-bin.000004 | mysql -u root -p
+```
+
+有关 mysqlbinlog 选项的完整说明，请参阅 [MySQL 二进制日志](/zh/guides/binary-logging)。
+
+## MySQL Shell 转储工具 {#mysql-shell-dump-utilities}
+
+MySQL Shell（`mysqlsh`）提供了比 `mysqldump` 更快的转储和加载工具。它们使用并行线程并生成压缩输出，因此适合大型数据库。
+
+```bash
+# Dump a single schema
+mysqlsh root@localhost -- util dump-schemas '["myapp"]' --outputUrl=/backups/myapp
+
+# Load it back
+mysqlsh root@localhost -- util load-dump /backups/myapp
+```
+
+MySQL Shell 转储工具默认压缩输出（zstd），并且可以在多个 CPU 核心上并行执行转储和加载。对于超过几 GB 的数据库，它与 `mysqldump` 的速度差异很明显。
+
+## 备份方法比较 {#backup-methods-compared}
+
+| 方法 | 备份大小 | 备份速度 | 恢复速度 | 一致性 | MySQL 兼容性 |
+|:-------|:-----------|:-------------|:-------------|:------------|:-------------------|
+| `mysqldump` | 大（纯 SQL） | 慢 | 慢（重新执行 SQL） | 一致快照（`--single-transaction`） | 任何 MySQL 版本 |
+| `mysqlpump` | 大（纯 SQL） | 较快（并行转储） | 慢（重新执行 SQL） | 仅按表一致 | 已在 8.4 中移除——不再提供该二进制文件 |
+| MySQL Shell 转储 | 小（zstd 压缩） | 快（并行、压缩） | 快（并行加载） | 一致快照 | MySQL 8.0+ |
+| Percona XtraBackup | 大（物理复制） | 快（热复制，感知 InnoDB） | 非常快（文件复制） | 完整的 InnoDB 一致性 | 相同的主版本 |
+| 冷文件复制 | 大（物理复制） | 快 | 非常快（文件复制） | 仅在服务器停止时一致 | 相同的 MySQL 版本 |
+
+`mysqldump` 仍然是可移植性和简单性的首选。对于大型数据库，MySQL Shell 转储实际上已经取代了 `mysqlpump`——它更快、生成的文件更小，并且支持 MySQL 8.0+。`mysqlpump` 已在 MySQL 8.4 中移除——构建中完全不包含该二进制文件，因此任何调用它的脚本都会直接失败。
+
+对于超过约 50 GB 且恢复时间很重要的生产数据库，Percona XtraBackup 或 MySQL Shell 转储是切实可行的选择。
+
+### 何时使用每种方法 {#when-to-use-each-method}
+
+| 方法 | 适用场景 | 避免场景 |
+|:-------|:---------|:-----------|
+| `mysqldump` | 需要可移植性；在 MySQL 版本之间迁移；数据库小于约 10 GB；您想要人类可读的备份 | 数据库很大且恢复时间至关重要；您需要一分钟以内的备份窗口 |
+| MySQL Shell 转储 | 数据库很大（10 GB 以上）；您想要带压缩的并行加载 | 未安装或不允许使用 MySQL Shell |
+| `mysqlpump` | （已在 MySQL 8.4 中移除——不再提供该二进制文件。请改用 MySQL Shell 转储。） | — |
+| Percona XtraBackup | 非常大的 InnoDB 数据库；您需要对性能影响最小的热物理备份；恢复速度至关重要 | 混合存储引擎（MyISAM）；您无法安装第三方工具；不值得引入这种复杂性的较小数据库 |
+| 冷文件复制 | 开发/测试环境；离线服务器；高风险迁移前的快速快照 | 不能容忍停机的生产服务器；任何服务器必须保持运行的情况 |
+
+## 调度备份 {#scheduling-backups}
+
+运行每夜转储的 cron 作业是最常见的生产设置：
+
+```bash
+# /etc/cron.d/mysql-backup
+0 2 * * * mysql_user /usr/local/bin/mysql-backup.sh
+```
+
+```bash
+#!/bin/bash
+# mysql-backup.sh
+DATE=$(date +%Y-%m-%d)
+BACKUP_DIR=/backups/mysql
+
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --all-databases \
+  -u backup_user -p"$MYSQL_BACKUP_PASSWORD" \
+  | gzip > "$BACKUP_DIR/all_databases_$DATE.sql.gz"
+
+# Keep 14 days of backups
+find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
+```
+
+备份用户只需要 `SELECT`、`LOCK TABLES`、`SHOW VIEW`、`TRIGGER`、`EVENT`、`RELOAD` 和 `PROCESS` 权限——而不是 `ALL PRIVILEGES`。没有 `PROCESS` 时，`mysqldump` 仍能完成，但在它尝试转储表空间元数据时，每次运行都会向 stderr 打印一条 "Access denied ... PROCESS privilege" 错误。
+
+## 验证备份 {#verifying-backups}
+
+没有测试过的备份不是备份。请定期验证：
+
+```bash
+# Test restore to a separate instance
+mysql -u root -p --host=test-server < all_databases.sql
+
+# Quick sanity check — verify row counts
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+```
+
+至少每月一次的自动恢复测试可以在损坏、权限问题和磁盘空间问题造成影响之前发现它们。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### `--single-transaction` 适用于所有存储引擎吗？ {#does---single-transaction-work-with-all-storage-engines}
+
+不适用。`--single-transaction` 使用一致读快照，只有 InnoDB 支持。同一数据库中的 MyISAM 表在转储期间仍会被 `LOCK TABLES` 锁住。如果您混用了多种引擎，单靠 `--single-transaction` 不足以得到完全一致的转储。
+
+#### 我应该保留备份多久？ {#how-long-should-i-retain-backups}
+
+最低限度：每日备份保留 7–14 天，每周备份保留 4 周，每月备份保留一年。保留期取决于法规要求以及您可能需要恢复到多久以前。二进制日志的保留时间应足以覆盖从您最早保留的备份到现在之间的间隔。
+
+#### 复制数据目录是有效的备份吗？ {#is-copying-the-data-directory-a-valid-backup}
+
+只有先关闭服务器（冷复制）才有效。正在运行的 MySQL 服务器写入数据文件的方式不适合直接复制——您会得到一个损坏的备份。要在不停止服务器的情况下进行热备份，请使用 MySQL Shell 的转储工具或 Percona XtraBackup。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `mysqldump` 在大表上挂起 | 添加 `--quick`，逐行流式输出，而不是把整张表缓冲在内存中 |
+| 恢复失败并报 `ERROR 1824: Failed to open the referenced table`（或某一行上的 `ERROR 1452`） | `mysqldump` 默认已经在输出中加上了 `SET FOREIGN_KEY_CHECKS=0`，因此原样恢复的完整转储不会遇到此问题。它出现在恢复手工编辑过的或部分的转储时（只提取了部分表，或删除了外键检查的那几行）——此时请在文件开头添加 `SET FOREIGN_KEY_CHECKS=0;` |
+| 转储文件太大 | 使用压缩：`mysqldump ... \| gzip > backup.sql.gz`；恢复时用 `zcat backup.sql.gz \| mysql ...` |
+| 时间点恢复遗漏了更改 | 二进制日志文件有缺口——确认范围内的所有日志文件都已按顺序重放 |
+| 备份用户无法转储触发器 | 授予 `TRIGGER` 权限：`GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |
+
+切换到 [VillageSQL](https://villagesql.com/install) 后，您的备份脚本无需改动。它是 MySQL 的直接替代品，因此本指南中的 mysqldump 命令、二进制日志设置和恢复手册都可以原样使用。
+
+## 另请参阅 {#see-also}
+
+- [MySQL 二进制日志](/zh/guides/binary-logging)——二进制日志支撑时间点恢复
+- [MySQL 复制基础](/zh/guides/replication-basics)——复制依赖同样的二进制日志基础设施
+- [在 Docker 上运行 MySQL](/zh/guides/mysql-on-docker)——容器化 MySQL 的备份和卷
+- [从 MySQL 升级](/zh/guides/upgrade)——升级到 VillageSQL 从备份开始
+- [MySQL 8.0 停止支持后升级到 8.4](/zh/guides/mysql-80-eol-upgrade)——这些备份所保护的 8.0 到 8.4 升级

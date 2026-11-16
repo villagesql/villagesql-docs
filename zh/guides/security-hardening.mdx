@@ -1,0 +1,249 @@
+---
+title: "MySQL 安全加固"
+sidebarTitle: "加固 MySQL"
+description: "如何保护 MySQL 服务器：运行 mysql_secure_installation、删除匿名用户、限制 root 访问、强制执行密码策略、审计权限、启用 SSL/TLS，以及减小攻击面。"
+keywords: "mysql security, mysql hardening, mysql secure installation, mysql ssl tls, mysql password policy, mysql root security, mysql user privileges audit, mysql security best practices"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+默认的 MySQL 安装把易于设置放在安全之前。加固生产服务器意味着移除那些在开发者笔记本电脑上合理、但在服务器可被应用程序或网络访问时不再合适的默认设置。
+
+## 按部署场景加固 {#hardening-by-deployment-context}
+
+并非每个加固步骤都有相同的风险/阻力权衡。请使用下表确定优先级：
+
+| 步骤 | 面向互联网的生产环境 | 内部/私有网络 | 开发/预发布 |
+|:-----|:--------------------------|:------------------------|:--------------|
+| 运行 `mysql_secure_installation` | 必需 | 必需 | 推荐 |
+| 删除匿名用户 | 必需 | 必需 | 推荐 |
+| 将 root 限制为 localhost | 必需 | 必需 | 推荐 |
+| 删除 test 数据库 | 必需 | 必需 | 可选 |
+| `validate_password` 组件 | 必需 | 必需 | 可选 — 可能妨碍快速迭代 |
+| 密码过期策略 | 必需 | 推荐 | 跳过 |
+| 最小权限的应用账户 | 必需 | 必需 | 推荐 |
+| 在授权中限制主机（不用 `'%'`） | 必需 | 必需 | 可选 |
+| 账户上的 `REQUIRE SSL` | 必需 | 推荐 | 跳过 |
+| 自定义 CA 签名的 TLS 证书 | 必需 | 可选 — 自签名证书可接受 | 跳过 |
+| `bind-address` 设为内部 IP | 必需 | 推荐 | 可选 |
+| 禁用 `local_infile` | 必需 | 推荐 | 可选 |
+| `skip_name_resolve` | 推荐 | 推荐 | 可选 |
+| 锁定或删除未使用的账户 | 必需 | 必需 | 可选 |
+
+**面向互联网**指端口 3306 可从您的私有网络之外访问，即使它位于负载均衡器之后。请无例外地应用每一个"必需"行。
+
+**内部/私有网络**涵盖只能在 VPC、私有子网或办公网络内访问的服务器。某些缓解措施（CA 签名证书、在每个账户上强制 SSL）会增加运维开销而收益有限 — 但强密码、最小权限和 bind-address 限制仍然是不可妥协的。
+
+**开发/预发布**机器是凭据泄露最常见的来源。只有当实例无法从您的笔记本电脑或 CI 环境之外访问时，跳过密码复杂度要求或保留 `'%'` 主机授权才可以接受。如果预发布环境与生产数据共享网络，至少要把它当作内部/私有网络对待。
+
+## mysql_secure_installation {#mysql_secure_installation}
+
+在任何不是本地开发机的服务器上安装 MySQL 后，立即运行此命令：
+
+```bash
+mysql_secure_installation
+```
+
+它会引导您完成最关键的加固步骤：
+
+- 设置 root 密码（如果尚未设置）
+- 删除匿名用户
+- 禁止远程 root 登录
+- 删除 test 数据库
+- 重新加载权限表
+
+这四个步骤消除了全新安装上最常见的攻击面。
+
+## root 账户限制 {#root-account-restrictions}
+
+root 应该只从 `localhost` 连接。验证并强制执行这一点：
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = 'root';
+-- Should show only 'localhost', '127.0.0.1', '::1'
+```
+
+如果 root 有 `'%'` 主机条目，请删除它：
+
+```sql
+DROP USER 'root'@'%';
+```
+
+对于远程管理，请创建一个具名的、主机访问受限的 DBA 账户，而不是远程使用 root。
+
+## 删除匿名用户和 test 数据库 {#remove-anonymous-users-and-test-database}
+
+```sql
+-- Remove any anonymous accounts
+DELETE FROM mysql.user WHERE user = '';
+FLUSH PRIVILEGES;
+
+-- Remove the test database (readable by anonymous users by default)
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE db = 'test' OR db = 'test\\_%';
+FLUSH PRIVILEGES;
+```
+
+## 密码策略 {#password-policy}
+
+MySQL 8.0+ 包含 `validate_password` 组件，它强制执行密码复杂度规则。使用前必须先安装 — `mysql_secure_installation` 会提议自动安装它。要手动安装：
+
+```sql
+INSTALL COMPONENT 'file://component_validate_password';
+```
+
+验证它是否已激活：
+
+```sql
+SHOW VARIABLES LIKE 'validate_password%';
+```
+
+配置最低要求：
+
+```sql
+SET GLOBAL validate_password.length = 12;
+SET GLOBAL validate_password.mixed_case_count = 1;
+SET GLOBAL validate_password.number_count = 1;
+SET GLOBAL validate_password.special_char_count = 1;
+SET GLOBAL validate_password.policy = 'MEDIUM';
+```
+
+策略级别：`LOW`（仅长度）、`MEDIUM`（长度 + 字符类别）、`STRONG`（+ 字典检查）。
+
+为可能被遗忘的账户设置密码过期：
+
+```sql
+ALTER USER 'admin'@'localhost' PASSWORD EXPIRE INTERVAL 90 DAY;
+```
+
+## 最小权限用户账户 {#least-privilege-user-accounts}
+
+应用程序账户应只拥有所需的最小权限。有关完整的 GRANT 语法，请参阅 [MySQL 用户管理](/zh/guides/user-management)。
+
+常见模式：
+
+```sql
+-- Read-only replica account
+CREATE USER 'app_read'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT ON myapp.* TO 'app_read'@'10.0.1.%';
+
+-- Application write account (no schema changes)
+CREATE USER 'app_write'@'10.0.1.%' IDENTIFIED BY 'strong_password';
+GRANT SELECT, INSERT, UPDATE, DELETE ON myapp.* TO 'app_write'@'10.0.1.%';
+
+-- Migration account (schema changes allowed, used only by deploy scripts)
+CREATE USER 'app_migrate'@'localhost' IDENTIFIED BY 'strong_password';
+GRANT ALL PRIVILEGES ON myapp.* TO 'app_migrate'@'localhost';
+```
+
+尽可能严格地限制主机 — 使用子网表示法或特定 IP，而不是 `'%'`。
+
+## 审计现有权限 {#auditing-existing-privileges}
+
+审查所有账户及其权限：
+
+```sql
+-- List all user accounts
+SELECT user, host, account_locked, password_expired
+FROM mysql.user
+ORDER BY user, host;
+
+-- Check for overly broad grants
+SELECT user, host, Select_priv, Insert_priv, Update_priv, Delete_priv,
+       Super_priv, Grant_priv
+FROM mysql.user
+WHERE host = '%' OR Super_priv = 'Y';
+```
+
+删除或锁定不再活跃使用的账户：
+
+```sql
+ALTER USER 'old_account'@'%' ACCOUNT LOCK;
+-- Or drop entirely:
+DROP USER 'old_account'@'%';
+```
+
+## SSL/TLS 连接 {#ssltls-connections}
+
+MySQL 8.0 默认启用 SSL/TLS，并在启动时自动生成证书。验证它是否已激活：
+
+```sql
+SHOW VARIABLES LIKE '%ssl%';
+-- ssl_ca, ssl_cert, ssl_key should show file paths
+-- have_ssl no longer exists on MySQL 8.4 (ERROR 1193). To confirm TLS is in
+-- use, run SHOW STATUS LIKE 'Ssl_cipher' on an actual TLS connection.
+```
+
+要求特定账户使用 SSL：
+
+```sql
+ALTER USER 'app_write'@'%' REQUIRE SSL;
+```
+
+要验证客户端连接是否正在使用 SSL：
+
+```sql
+SHOW STATUS LIKE 'Ssl_cipher';
+-- Non-empty value means the current connection is encrypted
+```
+
+对于生产环境，请用受信任 CA 颁发的证书替换自动生成的自签名证书。
+
+## 网络访问 {#network-access}
+
+限制 MySQL 只监听必要的接口。在 `my.cnf` 中：
+
+```ini
+[mysqld]
+bind-address = 127.0.0.1     # local only
+# or
+bind-address = 10.0.1.5      # specific internal IP
+```
+
+如果 MySQL 完全不应从网络访问（应用程序在同一主机上），请绑定到 `127.0.0.1`，并且永远不要对外暴露端口 3306。防火墙规则是第二层防御，不能替代对绑定地址的限制。
+
+## 禁用有风险的功能 {#disabling-risky-features}
+
+关闭您的应用程序不使用的功能：
+
+```sql
+-- Prevent MySQL from reading/writing files on the server filesystem
+-- (prevents SQL injection attacks that use LOAD DATA INFILE to read /etc/passwd)
+SET GLOBAL local_infile = 0;
+```
+
+在 `my.cnf` 中：
+
+```ini
+[mysqld]
+local_infile = 0
+skip_name_resolve = 1       # don't do reverse DNS lookups; use IPs in grants
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 默认的 MySQL 8.4 安装安全吗？ {#is-the-default-mysql-84-install-secure}
+
+比旧版 MySQL 的默认设置好，但仍未针对生产环境加固。MySQL 8.4 会生成随机的 root 密码并默认启用 SSL。您仍然需要：确认 root 密码足够强、删除匿名用户、限制主机访问，以及配置 `validate_password` 组件。
+
+#### 我应该以 root 身份运行 MySQL 吗？ {#should-i-run-mysql-as-root}
+
+绝不。MySQL 应该以专用的低权限系统用户（通常是 `mysql`）运行。以 root 身份运行服务器进程意味着一次 MySQL 漏洞利用可能导致整个系统沦陷。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 1045: Access denied for user 'root'@'%'` | root 远程登录已被正确阻止 — 创建一个具名的、具有特定主机访问权限的管理员用户 |
+| 添加 `REQUIRE SSL` 后应用程序无法连接 | 客户端需要使用 SSL 标志：`--ssl-mode=REQUIRED`；验证服务器证书有效 |
+| `validate_password` 拒绝某个密码 | 检查当前策略：`SHOW VARIABLES LIKE 'validate_password%'`；确保密码满足所有要求 |
+| 在新安装上找不到 root 密码 | MySQL 8.0 在首次启动时把临时 root 密码记录到错误日志中 — 用 `SELECT @@GLOBAL.log_error;` 找到日志路径，然后运行 `grep 'temporary password' <path>` |
+| DELETE 之后仍能看到主机 `'%'` 的授权 | 对 `mysql.user` 做任何直接修改后，请运行 `FLUSH PRIVILEGES` |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 用户管理](/zh/guides/user-management) — 创建用户并授予最小权限访问
+- [MySQL 中的密码哈希](/zh/guides/password-hashing) — 保护存储在 MySQL 中的应用程序级凭据
+- [MySQL 中的 JWT 身份验证](/zh/guides/jwt-authentication) — 将凭据的签发和轮换移交给您的身份提供者

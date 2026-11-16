@@ -1,0 +1,160 @@
+---
+title: "Escolhendo Tipos de Dados do MySQL"
+sidebarTitle: "Escolhendo Tipos de Dados"
+description: "Como escolher o tipo de dados certo do MySQL para suas colunas: inteiros, strings, datas e JSON — com custos de armazenamento e trade-offs de desempenho."
+keywords: "mysql data types, mysql varchar vs text, mysql int vs bigint, mysql datetime vs timestamp, mysql data type size, mysql column types, mysql json type"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O tipo de dados que você atribui a uma coluna afeta o tamanho do armazenamento, a eficiência dos índices e o comportamento das consultas. Escolher um tipo maior do que o necessário desperdiça espaço em cada linha e em cada índice que inclui essa coluna. Escolher um tipo pequeno demais causa erros de truncamento ou perda silenciosa de dados.
+
+## Tipos Inteiros {#integer-types}
+
+O MySQL tem cinco tipos inteiros. Escolha o menor que caiba na faixa esperada.
+
+| Tipo | Armazenamento | Faixa (com sinal) | Use quando |
+|:-----|:--------|:---------------|:---------|
+| `TINYINT` | 1 byte | -128 a 127 | Flags, códigos de status, enumerações pequenas |
+| `SMALLINT` | 2 bytes | -32.768 a 32.767 | Contagens ou IDs que não passarão de ~32K |
+| `MEDIUMINT` | 3 bytes | -8,3M a 8,3M | IDs ou contadores de faixa intermediária |
+| `INT` | 4 bytes | -2,1B a 2,1B | A maioria dos IDs e contadores |
+| `BIGINT` | 8 bytes | ±9,2 quintilhões | IDs grandes, timestamps Unix em milissegundos |
+
+`INT UNSIGNED` dobra a faixa positiva para ~4,3B. Use `UNSIGNED` em chaves primárias e chaves estrangeiras que são sempre positivas — é faixa extra de graça.
+
+`BIGINT` ocupa o dobro do armazenamento de `INT`. Não o use como padrão para todos os IDs — `INT` comporta mais de 2 bilhões de linhas, o que é mais do que a maioria das tabelas jamais alcança.
+
+## Tipos de String {#string-types}
+
+### VARCHAR vs CHAR {#varchar-vs-char}
+
+`VARCHAR(n)` armazena somente os bytes que a string contém (mais 1 ou 2 bytes para o comprimento). `CHAR(n)` sempre armazena exatamente `n` bytes, preenchendo as strings mais curtas com espaços.
+
+| Tipo | Armazenamento | Use quando |
+|:-----|:--------|:---------|
+| `CHAR(n)` | Sempre n bytes | Strings de comprimento fixo (códigos de país, flags de status como 'Y'/'N', hashes MD5) |
+| `VARCHAR(n)` | Comprimento real + 1 ou 2 bytes | Strings de comprimento variável (nomes, e-mails, URLs) |
+
+`CHAR` pode ser ligeiramente mais rápido para valores de comprimento fixo, porque nenhum prefixo de comprimento precisa ser analisado. Para qualquer coisa variável, use `VARCHAR`.
+
+### VARCHAR vs TEXT {#varchar-vs-text}
+
+```sql
+-- VARCHAR stores inline in the row (up to row size limit)
+name VARCHAR(255)
+
+-- TEXT stores off-page once it exceeds a threshold; inline storage is limited
+description TEXT
+```
+
+Os valores `VARCHAR` até o limite de tamanho da linha são armazenados na própria página do índice clusterizado. Os valores `TEXT` (e `BLOB`) são armazenados em páginas de overflow quando ficam grandes o suficiente. Isso significa que:
+- As colunas `VARCHAR` são incluídas diretamente nos índices
+- As colunas `TEXT` não podem ser totalmente indexadas — você precisa de um comprimento de prefixo: `INDEX (description(100))`
+
+Use `VARCHAR` para strings que você sabe que têm menos de algumas centenas de caracteres. Use `TEXT` para conteúdo longo (artigos, comentários, HTML) em que o armazenamento na linha não faz sentido.
+
+## Tipos de Data e Hora {#date-and-time-types}
+
+| Tipo | Armazenamento | Faixa | Use quando |
+|:-----|:--------|:------|:---------|
+| `DATE` | 3 bytes | 1000-01-01 a 9999-12-31 | Somente data, sem hora |
+| `TIME` | 3 bytes | -838:59:59 a 838:59:59 | Duração ou hora do dia |
+| `DATETIME` | 8 bytes | 1000-01-01 a 9999-12-31 | Timestamps sem conversão de fuso horário |
+| `TIMESTAMP` | 4 bytes | 1970-01-01 a 2038-01-19 | Timestamps com atualização automática; armazenado em UTC, exibido no fuso horário da sessão |
+| `YEAR` | 1 byte | 1901 a 2155 | Somente o ano |
+
+A distinção principal entre `DATETIME` e `TIMESTAMP`:
+
+- `TIMESTAMP` armazena os valores em UTC e os converte para o `time_zone` da sessão na leitura. Se a sua aplicação opera em vários fusos horários, `TIMESTAMP` faz a conversão automaticamente.
+- `DATETIME` armazena o valor literal sem conversão de fuso horário — o que você coloca é o que você recebe de volta.
+- `TIMESTAMP` tem um limite em 2038 (estouro do timestamp Unix). Para qualquer data além de 2038, use `DATETIME`.
+
+```sql
+-- TIMESTAMP auto-updates on insert and update
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+```
+
+Para uma discussão completa sobre o tratamento de fusos horários, consulte [Timestamps e Fusos Horários no MySQL](/pt-BR/guides/timestamps-timezones).
+
+## Decimal e Ponto Flutuante {#decimal-and-floating-point}
+
+| Tipo | Armazenamento | Precisão | Use quando |
+|:-----|:--------|:----------|:---------|
+| `DECIMAL(p,s)` | Variável | Exata | Dinheiro, cálculos financeiros — nunca use FLOAT para moeda |
+| `FLOAT` | 4 bytes | ~7 dígitos significativos | Dados científicos em que valores aproximados são aceitáveis |
+| `DOUBLE` | 8 bytes | ~15 dígitos significativos | Valores aproximados de maior precisão |
+
+`FLOAT` e `DOUBLE` usam ponto flutuante binário, que não consegue representar frações decimais com exatidão. `0.1 + 0.2` em ponto flutuante é `0.30000000000000004`. Para dinheiro, use sempre `DECIMAL`.
+
+```sql
+-- Correct: exact decimal arithmetic
+price DECIMAL(10, 2)   -- up to 99,999,999.99
+
+-- Wrong: floating-point rounding errors will appear in financial calculations
+price FLOAT
+```
+
+## JSON {#json}
+
+As colunas `JSON` armazenam JSON validado e oferecem operadores de consulta baseados em caminho.
+
+```sql
+-- Store structured data without a fixed schema
+CREATE TABLE events (
+    id      INT PRIMARY KEY AUTO_INCREMENT,
+    payload JSON NOT NULL
+);
+
+-- Extract a field
+SELECT payload->>'$.user_id' FROM events;
+
+-- Filter on a nested field
+SELECT * FROM events WHERE payload->>'$.event_type' = 'purchase';
+```
+
+As colunas `JSON` não podem ser indexadas diretamente. Para indexar um campo JSON consultado com frequência, use uma coluna gerada:
+
+```sql
+ALTER TABLE events
+    ADD COLUMN event_type VARCHAR(50) AS (payload->>'$.event_type') STORED,
+    ADD INDEX idx_event_type (event_type);
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Devo usar INT ou BIGINT para chaves primárias? {#should-i-use-int-or-bigint-for-primary-keys}
+
+`INT` comporta 2,1 bilhões de linhas como inteiro com sinal, 4,3 bilhões sem sinal. Para a maioria das tabelas, `INT UNSIGNED` é suficiente. Use `BIGINT` se você realmente espera passar disso, ou se está usando IDs no estilo UUID que não cabem em 4 bytes.
+
+#### Posso usar VARCHAR(255) em tudo para não ter que pensar nisso? {#can-i-use-varchar255-everywhere-to-avoid-thinking-about-it}
+
+Pode, mas declarações `VARCHAR` mais longas produzem chaves de índice mais largas, o que aumenta o uso de memória do índice e reduz quantas entradas de índice cabem por página. Declare o máximo realista — `VARCHAR(100)` para um campo de nome, não `VARCHAR(255)`. O custo real de armazenamento corresponde ao comprimento dos dados, mas o comprimento da chave de índice é fixado no tamanho declarado.
+
+#### Qual é a diferença prática entre NULL e um valor padrão? {#whats-the-practical-difference-between-null-and-a-default-value}
+
+`NULL` significa "desconhecido" — ele se propaga pelas expressões e é excluído das funções de agregação. Um valor padrão como `0` ou `''` significa "definido explicitamente como vazio". Escolha `NULL` para dados realmente ausentes; escolha um padrão para cenários de "ainda não definido" em que você quer que a coluna tenha um valor sensato imediatamente. Misturar os dois cria inconsistência nas consultas.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `Data too long for column` | O tipo da coluna é estreito demais — aumente o comprimento do `VARCHAR` ou mude para `TEXT` |
+| Erros de arredondamento em cálculos financeiros | Substitua `FLOAT`/`DOUBLE` por `DECIMAL(p,s)` |
+| `TIMESTAMP` mostra a hora errada | O `time_zone` da sessão difere do esperado — verifique `SELECT @@session.time_zone` |
+| Não é possível criar um índice em uma coluna TEXT | Use um índice de prefixo: `INDEX (col(100))`, ou adicione uma coluna gerada |
+| A chave primária INT está se aproximando do limite | Altere para `BIGINT` ou `INT UNSIGNED` antes de atingir o teto |
+
+## Veja também {#see-also}
+
+- [Normalização no MySQL](/pt-BR/guides/normalization) — o contexto de design de esquema para as decisões de tipo
+- [JSON no MySQL](/pt-BR/guides/json-in-mysql) — o tipo de coluna JSON como alternativa flexível a esquemas rígidos
+- [Como Funcionam os Índices do MySQL](/pt-BR/guides/mysql-indexes) — a escolha do tipo de dados afeta o tamanho e a eficiência do índice
+- [Consultas de intervalo multidimensionais](/pt-BR/guides/cube-queries) — o tipo cube para armazenar e consultar dados geométricos n-dimensionais
+- [MySQL vs PostgreSQL: Qual Você Deve Usar?](/pt-BR/guides/mysql-vs-postgresql) — como os dois bancos de dados diferem em tipos e mais
+- [utf8mb4 no MySQL: Armazenando Emojis e Unicode Completo](/pt-BR/guides/utf8mb4) — charsets de coluna e a realidade dos quatro bytes
+- [Booleanos de Verdade no MySQL](/pt-BR/guides/boolean-columns) — um tipo de coluna que recusa tudo exceto true e false
+- [MySQL SELECT](/pt-BR/tutorial/select) — a lição do tutorial que lê essas colunas de volta

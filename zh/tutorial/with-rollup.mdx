@@ -1,0 +1,185 @@
+---
+title: "MySQL WITH ROLLUP"
+sidebarTitle: "WITH ROLLUP"
+description: "WITH ROLLUP 如何给 MySQL GROUP BY 结果添加小计行和总计行，这些行中的 NULL 是什么意思，以及 GROUPING 如何把它们与真正的 NULL 区分开。"
+keywords: "mysql with rollup, group by with rollup, mysql subtotal row, mysql grouping function, mysql total row sql, mysql rollup null"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`GROUP BY` 给您每组 1 行，但没有整体的那一行。`WITH ROLLUP` 补上这一行，当您按多列分组时，还补上中间的小计。它省去了再运行一个查询、自己把数字加起来的工夫。
+
+开始之前，请用 `mysql -u root -p sakila` 打开客户端。
+
+## WITH ROLLUP 的工作原理 {#how-with-rollup-works}
+
+```sql
+SELECT GROUPING_COLUMN, AGGREGATE_FUNCTION(COLUMN_NAME)
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN WITH ROLLUP;
+```
+
+把 `GROUPING_COLUMN` 替换为定义分组的列，`TABLE_NAME` 替换为表，`AGGREGATE_FUNCTION(COLUMN_NAME)` 替换为每组要计算的内容。`WITH ROLLUP` 放在 `GROUP BY` 子句的末尾。
+
+服务器返回正常的分组，然后是额外的行，在这些行中某个分组列被搁置，聚合则涵盖全部行。它在被搁置的列中放 NULL，您就是靠这个认出那些行的。
+
+## 示例 {#examples}
+
+### 1) 添加总计行 {#1-add-a-total-row}
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
+| NC-17  |   210 |
+| NULL   |  1000 |
++--------+-------+
+6 rows in set (0.00 sec)
+```
+
+6 行而不是 5 行。最后一行在本应是分级的位置是 NULL，它的计数是整个表。
+
+### 2) 还有小计 {#2-subtotals-as-well}
+
+按 2 列分组，您得到第一列每个值的小计，然后是总计。
+
+```sql
+SELECT rating, rental_rate, COUNT(*) AS films
+FROM film
+WHERE length = 185
+GROUP BY rating, rental_rate WITH ROLLUP;
+```
+
+```text
++--------+-------------+-------+
+| rating | rental_rate | films |
++--------+-------------+-------+
+| G      |        2.99 |     1 |
+| G      |        4.99 |     2 |
+| G      |        NULL |     3 |
+| PG     |        2.99 |     1 |
+| PG     |        NULL |     1 |
+| PG-13  |        2.99 |     2 |
+| PG-13  |        4.99 |     1 |
+| PG-13  |        NULL |     3 |
+| R      |        2.99 |     1 |
+| R      |        4.99 |     2 |
+| R      |        NULL |     3 |
+| NULL   |        NULL |    10 |
++--------+-------------+-------+
+12 rows in set (0.00 sec)
+```
+
+按哪些列为 NULL 来读一行。`G / NULL / 3` 是 `G` 在所有价格上的小计。`NULL / NULL / 10` 是总计，与时长 185 分钟的 10 部影片一致。
+
+汇总行紧跟在它们所汇总的分组之后，而不是集中在底部，所以结果从上到下读起来像一份报表。
+
+## 区分汇总 NULL 与真正的 NULL {#telling-a-rollup-null-from-a-real-one}
+
+汇总行中的 NULL 表示"这一列的每个值"。数据中的 NULL 表示"没有记录值"。它们打印出来一模一样，所以在一个可以为 NULL 的列上，您无法靠看来区分这 2 种。
+
+`GROUPING()` 直接回答这个问题。当该列在这一行中被搁置时它返回 1，否则返回 0。
+
+```sql
+SELECT rating, GROUPING(rating) AS is_total, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++--------+----------+-------+
+| rating | is_total | films |
++--------+----------+-------+
+| G      |        0 |   178 |
+| PG     |        0 |   194 |
+| PG-13  |        0 |   223 |
+| R      |        0 |   195 |
+| NC-17  |        0 |   210 |
+| NULL   |        1 |  1000 |
++--------+----------+-------+
+6 rows in set (0.00 sec)
+```
+
+`rating` 在 Sakila 中从不为 NULL，所以这里这 2 个问题的答案相同。在一个确实含有 NULL 的列上，测试 `rating IS NULL` 会抓到两种行，而 `GROUPING(rating) = 1` 只抓到汇总行。
+
+## ORDER BY 会移动总计，并改变排序 {#order-by-moves-the-total-and-changes-the-sort}
+
+上面的示例没有 `ORDER BY`，这是有意的：`WITH ROLLUP` 把每个汇总行直接放在它所汇总的分组下面，而排序会把这种排列丢掉。
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| NULL   |  1000 |
+| G      |   178 |
+| NC-17  |   210 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
++--------+-------+
+6 rows in set (0.00 sec)
+```
+
+2 件事变了。总计排到了最上面，因为 NULL 排在每个真实值之前。而且分级按字母顺序出现，而不是按 [GROUP BY](/zh/tutorial/group-by) 中显示的 `ENUM` 声明顺序，因为对汇总结果排序是把它当作文本来排的。
+
+所以请决定您要哪一种。想要一份小计位于各组之下的报表，就不加 `ORDER BY`；或者加上它，并接受汇总行落在排序把它们放到的任何位置。
+
+## 给汇总行加标签 {#labeling-the-rollup-rows}
+
+一列 NULL 不是您在报表中想要的。`COALESCE` 返回它第一个不为 NULL 的参数，所以它可以在那里放一个词。
+
+```sql
+SELECT COALESCE(rating, 'All ratings') AS label, COUNT(*) AS films
+FROM film
+GROUP BY rating WITH ROLLUP;
+```
+
+```text
++-------------+-------+
+| label       | films |
++-------------+-------+
+| G           |   178 |
+| PG          |   194 |
+| PG-13       |   223 |
+| R           |   195 |
+| NC-17       |   210 |
+| All ratings |  1000 |
++-------------+-------+
+6 rows in set (0.00 sec)
+```
+
+这样读起来很好，但它在这里安全只是因为数据中的 `rating` 从不为 NULL。在一个可以为 NULL 的列上，`COALESCE` 会把真正的空缺标记为总计，所以请改用 `GROUPING()` 来做测试。
+
+## 总结 {#summary}
+
+- 在 `GROUP BY` 的末尾加上 `WITH ROLLUP`，得到小计行和总计行。
+- 把分组列中的 NULL 读作"这一列的每个值"。
+- 按多列分组时，预期前面每一列的每个值都有一个小计。
+- 用 `GROUPING(column)` 把汇总行与数据为 NULL 的行区分开。
+- 预期 `ORDER BY` 会移动汇总行，并把 `ENUM` 当作文本排序。
+
+## 另请参阅 {#see-also}
+
+- [GROUP BY](/zh/tutorial/group-by) — `WITH ROLLUP` 为其添加总计的那些分组
+- [聚合函数](/zh/tutorial/aggregate-functions) — 被加总的东西
+- [IS NULL](/zh/tutorial/is-null) — 那一列中的 NULL 可能有的另一种含义
+- [MySQL GROUP BY 性能](/zh/guides/group-by-having) — 大规模分组的代价

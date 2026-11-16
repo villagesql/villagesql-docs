@@ -1,0 +1,213 @@
+---
+title: "在 MySQL 中按子网查询"
+sidebarTitle: "按子网查询"
+description: "如何在 MySQL 中按 IP 子网查询行：使用 INET_ATON 进行位运算范围检查，以及使用 VillageSQL 的 INET 类型和网络函数编写更简洁的子网查询。"
+keywords: "mysql subnet query, mysql ip range query, mysql cidr query, mysql inet subnet filter, mysql ip in subnet, mysql network address query"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+要找出 IP 地址落在某个子网内的所有行，需要把数值形式的 IP 与一个范围进行比较。MySQL 的标准做法是使用 `INET_ATON()` 配合位运算。VillageSQL 的 `INET` 类型提供了网络函数，让同样的查询更易读，并且同时适用于 IPv4 和 IPv6。
+
+## 标准做法：位运算范围检查 {#the-standard-approach-bitwise-range-checks}
+
+对于 IPv4，`INET_ATON()` 把地址转换为无符号 32 位整数。子网成员检查就是一次按位与运算：如果 `(ip & netmask) == network_address`，则该 IP 在子网内。
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INT UNSIGNED,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (INET_ATON('192.168.1.10')),
+    (INET_ATON('192.168.1.50')),
+    (INET_ATON('192.168.2.1')),
+    (INET_ATON('10.0.0.5'));
+
+-- Find all IPs in 192.168.1.0/24
+SELECT INET_NTOA(ip_address) FROM access_log
+WHERE ip_address BETWEEN INET_ATON('192.168.1.0')
+                     AND INET_ATON('192.168.1.255');
+
+-- Or using bitwise AND with the netmask
+SELECT INET_NTOA(ip_address) FROM access_log
+WHERE (ip_address & 0xFFFFFF00) = INET_ATON('192.168.1.0');
+```
+
+两种写法对 IPv4 都有效。`BETWEEN` 写法更易读。当子网参数是变量时，位运算写法更容易组合。
+
+两种写法都不适用于 IPv6：`INET_ATON()` 只处理 IPv4。
+
+## 使用 VillageSQL：INET 列上的网络函数 {#with-villagesql-network-functions-on-inet-columns}
+
+VillageSQL 的 `vsql_network_address` 扩展提供了直接回答"这个地址是否在那个子网内"的包含谓词：`inet_contained_by()`、`inet_contains()` 和 `inet_overlaps()`；此外还有 `inet_network()`、`inet_set_masklen()` 和 `inet_compare()`，可用于手动构建检查。所有这些函数都同时适用于 IPv4 和 IPv6 的 `INET` 列。
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.10')),
+    (inet_from_string('192.168.1.50')),
+    (inet_from_string('192.168.2.1')),
+    (inet_from_string('10.0.0.5')),
+    (inet_from_string('192.168.1.200'));
+```
+
+### 子网包含查询 {#subnet-containment-query}
+
+要检查存储的 IP 是否属于某个子网，把地址按子网的前缀长度做掩码，再把结果与目标网络比较：
+
+```sql
+-- All IPs in 192.168.1.0/24
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip_address, 24)))
+    = '192.168.1.0/24';
+```
+
+子网来自变量时的参数化版本：
+
+```sql
+SET @subnet     = '192.168.1.0/24';
+SET @prefix_len = inet_masklen(inet_from_string(@subnet));
+SET @network    = cidr_to_string(cidr_from_string(@subnet));
+
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip_address, @prefix_len)))
+    = @network;
+```
+
+### 包含谓词 {#containment-predicates}
+
+该扩展以函数形式提供了 PostgreSQL 的五个包含谓词。它们接受两个 `INET` 值，返回 `1`、`0` 或 `NULL`：
+
+| 函数 | PostgreSQL 运算符 | 为真的条件 |
+|:---|:---|:---|
+| `inet_contained_by(a, b)` | `a << b` | `a` 在 `b` 内，且 `b` 是更宽的网络 |
+| `inet_contained_by_or_equals(a, b)` | `a <<= b` | `a` 在 `b` 内，或两个网络相等 |
+| `inet_contains(a, b)` | `a >> b` | `a` 是更宽的网络，且 `b` 在它内部 |
+| `inet_contains_or_equals(a, b)` | `a >>= b` | `b` 在 `a` 内，或两个网络相等 |
+| `inet_overlaps(a, b)` | `a && b` | 任一网络包含另一个，或两者相等 |
+
+上面的子网查询变成了一次调用：
+
+```sql
+-- All IPs in 192.168.1.0/24
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE inet_contained_by(ip_address, inet_from_string('192.168.1.0/24'));
+```
+
+比较时只看每个值的网络部分，并取两者中较短的前缀长度。因此 `192.168.1.5/24` 和 `192.168.1.9/24` 是同一个网络，严格形式对它们返回 `0`，而 `_or_equals` 形式返回 `1`。不同地址族的两个地址永远不匹配：把 IPv4 值与 IPv6 值比较会返回 `0`，而不是报错，这与 PostgreSQL 一致。
+
+两个参数都必须是 `INET`。`CIDR` 值不会被自动转换：
+
+```text
+ERROR 3219 (HY000): Cannot initialize function 'inet_contains': argument 1 type mismatch (expected vsql_network_address.INET, got vsql_network_address.CIDR)
+```
+
+请像上面的示例那样，对子网使用 `inet_from_string()`。这些函数在 `vsql_network_address` 0.0.5 中加入。
+
+### 使用 inet_compare 进行基于范围的包含检查 {#range-based-containment-with-inet_compare}
+
+另一种做法可以避免对每一行重新计算网络地址，在您手头有广播地址时很有用：
+
+```sql
+-- IPs in 192.168.1.0/24: from .0 to .255
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE inet_compare(ip_address, inet_from_string('192.168.1.0'))   >= 0
+  AND inet_compare(ip_address, inet_from_string('192.168.1.255')) <= 0;
+```
+
+### IPv6 子网查询（相同模式） {#ipv6-subnet-queries-same-pattern}
+
+同样的 `inet_network()` 做法无需任何改动即可用于 IPv6：
+
+```sql
+CREATE TABLE ipv6_log (id INT, ip INET);
+INSERT INTO ipv6_log VALUES
+    (1, inet_from_string('2001:db8::1')),
+    (2, inet_from_string('2001:db8::100')),
+    (3, inet_from_string('2001:db9::1'));
+
+-- Find all IPs in 2001:db8::/32
+SET @v6_prefix = 32;
+SET @v6_network = '2001:0db8:0000:0000:0000:0000:0000:0000/32';
+
+SELECT inet_to_string(ip) FROM ipv6_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip, @v6_prefix)))
+    = @v6_network;
+```
+
+### 网络表模式 {#networks-table-pattern}
+
+一个常见的用例：一张存放授权 CIDR 的 `networks` 表，然后检查传入的 IP 是否在其中任何一个网络内。
+
+```sql
+CREATE TABLE networks (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    network CIDR,
+    label   VARCHAR(100)
+);
+
+INSERT INTO networks (network, label) VALUES
+    (cidr_from_string('192.168.1.0/24'), 'office-lan'),
+    (cidr_from_string('10.0.0.0/8'),     'vpn-range'),
+    (cidr_from_string('172.16.0.0/12'),  'docker-range');
+
+-- Is an incoming IP in any authorized network?
+-- inet_masklen() takes INET, not CIDR — convert via string to get the prefix length
+SELECT label FROM networks
+WHERE cidr_to_string(inet_network(inet_set_masklen(
+    inet_from_string('192.168.1.42'),
+    inet_masklen(inet_from_string(cidr_to_string(network)))
+))) = cidr_to_string(network);
+```
+
+## 标准 MySQL 与 VillageSQL 对比 {#standard-vs-villagesql}
+
+| 做法 | IPv6 | 可读性 | 无需手动计算 |
+|:---|:---|:---|:---|
+| `BETWEEN INET_ATON()` | 否 | 中等 | 需要手动计算广播地址 |
+| 使用 `INET_ATON()` 的按位与 | 否 | 低 | 需要手动计算网络掩码 |
+| `inet_network()` + `inet_set_masklen()` | 是 | 高 | 由函数完成计算 |
+| `inet_contained_by()` | 是 | 高 | 一次调用，无需手动计算 |
+
+## 常见问题 {#frequently-asked-questions}
+
+#### VillageSQL 有 PostgreSQL 的 `<<` 包含运算符吗？ {#does-villagesql-have-postgresqls--containment-operator}
+
+有同样的行为，但以函数而不是运算符的形式提供：`inet_contained_by()` 对应 `<<`，`inet_contains()` 对应 `>>`，`_or_equals` 变体对应 `<<=` 和 `>>=`，`inet_overlaps()` 对应 `&&`。请参阅 [包含谓词](#containment-predicates)。
+
+#### 子网查询会使用索引吗？ {#does-the-subnet-query-use-the-index}
+
+`cidr_to_string(inet_network(inet_set_masklen(...)))` 模式不会使用索引扫描，它会为每一行重新计算网络地址。对于大表，`inet_compare` 范围做法对索引更友好，因为它把查询表达为 `ip_address` 列上的一个范围。
+
+#### 我可以同时存储子网并查询包含关系吗？ {#can-i-store-subnets-and-query-containment-at-the-same-time}
+
+可以。把主机地址和子网都存放在 `INET` 列中，然后用 `inet_contained_by(host_ip, subnet)` 比较它们。如果子网存放在 `CIDR` 列中，请先转换：包含谓词两侧都接受 `INET`，并且不会自动转换 `CIDR`。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.inet_network does not exist` | 运行 `INSTALL EXTENSION vsql_network_address` |
+| 子网查询没有返回任何行 | 确认 `@network` 与展开后的 CIDR 字符串一致。IPv6 CIDR 使用展开表示法 |
+| 范围查询包含了子网之外的地址 | 检查广播地址；对于 /24，范围是 `.0` 到 `.255` |
+| IPv4/IPv6 混合列返回错误结果 | IPv4 和 IPv6 地址不会重叠。查询对每个地址族分别返回正确结果 |
+
+## 另请参阅 {#see-also}
+
+- [在 MySQL 中存储 IP 地址](/zh/guides/storing-ip-addresses)：子网查询中使用的 INET 类型
+- [MySQL 中的 IPv6 存储](/zh/guides/ipv6-storage)：使用 INET 时，子网查询对 IPv6 的用法相同
+- [在 MySQL 中按 IP 进行地理位置查询](/zh/guides/ip-geolocation)：超越子网，进一步利用 IP 数据

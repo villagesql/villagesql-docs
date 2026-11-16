@@ -1,0 +1,285 @@
+---
+title: "Next.js 搭配 MySQL"
+sidebarTitle: "不用 ORM 的 Next.js"
+description: "使用原始 mysql2 驱动将 Next.js App Router 应用程序连接到 MySQL：连接池单例、从 Server Component 查询、用 Server Action 写入，以及一个 JSON Route Handler，中间不使用任何 ORM。"
+keywords: "nextjs mysql, mysql2 nextjs, next.js server action mysql, next.js route handler mysql, mysql connection pool nextjs, nextjs app router mysql, mysql2 connection pool singleton"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Next.js App Router 应用程序从三个不同的地方与 MySQL 对话：Server Components、Server Actions 和 Route Handlers。本指南使用原始 `mysql2` 驱动和一个共享的连接池，从这三个地方连接 MySQL，中间不使用任何 ORM。因为 VillageSQL 是 MySQL 的直接替代品，这里的每条语句都可以原样在它上面运行。
+
+## 设置数据库 {#setting-up-the-database}
+
+创建一个专用数据库和应用用户，而不是以 root 身份连接：
+
+```sql
+CREATE DATABASE nextjs_guide;
+
+CREATE USER 'nextjs_app'@'127.0.0.1' IDENTIFIED BY 'nextjs_dev_pw';
+GRANT ALL PRIVILEGES ON nextjs_guide.* TO 'nextjs_app'@'127.0.0.1';
+```
+
+创建一张用来操作的表：
+
+```sql
+CREATE TABLE notes (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  body VARCHAR(280) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+搭建应用并安装驱动：
+
+```bash
+npx create-next-app@latest nextjs-mysql --typescript --app --src-dir
+npm install mysql2
+```
+
+把连接详情存放在 `.env.local` 中，而不是源代码里：
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=nextjs_app
+DB_PASSWORD=nextjs_dev_pw
+DB_NAME=nextjs_guide
+```
+
+## 连接池 {#the-connection-pool}
+
+应用中每个与 MySQL 对话的地方都从同一个模块 `src/lib/db.ts` 导入同一个连接池：
+
+```typescript
+import mysql from "mysql2/promise";
+
+// Next.js dev mode reloads route modules on every file save, but it keeps the
+// Node.js process alive between reloads. A pool created at module scope gets
+// re-created on every reload unless it is cached somewhere that survives the
+// reload. `globalThis` survives; module-level variables do not.
+const globalForPool = globalThis as unknown as {
+  vsqlPool: mysql.Pool | undefined;
+};
+
+export const pool =
+  globalForPool.vsqlPool ??
+  mysql.createPool({
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT ?? 3306),
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPool.vsqlPool = pool;
+}
+```
+
+这与跨热重载缓存 Prisma 或 Drizzle 客户端所用的模式相同，只是直接应用到了 `mysql2` 连接池上。`connectionLimit`、`waitForConnections` 和 `queueLimit` 在 [MySQL 连接池](/zh/guides/connection-pooling)中有解释；本指南关注连接池位于 Next.js 进程内部时有什么不同。
+
+在开发模式下，`globalThis` 缓存不是可选的。在这个应用上做的一次测试证明了原因：在有缓存的情况下运行 `npm run dev`，连续保存 `src/lib/db.ts` 四次，全程只有一个 `nextjs_app` 连接保持打开，用以下语句检查：
+
+```sql
+SELECT COUNT(*) FROM information_schema.processlist WHERE user = 'nextjs_app';
+```
+
+移除 `globalThis` 缓存，针对一个全新的 `next dev` 进程重复同样的四次保存，这个数字增长到了五。每次重载都重新运行了模块顶层，每次运行都再次调用 `mysql.createPool()`，却从未关闭之前的连接池。要观察这一点，请编辑连接池模块本身：保存一个只是导入它的页面不会重新运行它，因为 Turbopack 在重新编译期间会保留未改动的模块。在生产环境中这不会发生，因为 `next build` 编译应用一次，`next start` 运行它时不会重载模块，但这个保护在生产环境中没有任何成本，并且能防止开发环境中一个真实的、可复现的连接泄漏。
+
+## 从 Server Component 查询 {#querying-from-a-server-component}
+
+`src/app/page.tsx` 直接在 Server Component 中用参数化查询读取 `notes`：
+
+```typescript
+import { pool } from "@/lib/db";
+import { addNote } from "./actions";
+import type { RowDataPacket } from "mysql2";
+
+interface Note extends RowDataPacket {
+  id: number;
+  body: string;
+  created_at: Date;
+}
+
+async function getNotes(): Promise<Note[]> {
+  const [rows] = await pool.query<Note[]>(
+    "SELECT id, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
+    [20],
+  );
+  return rows;
+}
+
+export default async function Home() {
+  const notes = await getNotes();
+  // ...renders `notes`, including note.created_at.toISOString()
+}
+```
+
+绝不要通过拼接或插入用户输入来构建查询字符串。上面的 `LIMIT ?` 占位符由 `mysql2` 填充，而不是字符串拼接，正是这一点让像 `20; DROP TABLE notes` 这样的值除了无法解析为数字之外什么也做不了。
+
+`mysql2` 把 MySQL 的 `TIMESTAMP` 列作为 JavaScript `Date` 对象返回，而不是字符串。在上面的 `Note` 接口把 `created_at` 的类型定为 `Date` 的情况下，把它直接当作 JSX 渲染（`{note.created_at}`）会在应用运行之前就通不过 `npm run build` 的类型检查：
+
+```
+error TS2322: Type 'Date' is not assignable to type 'ReactNode'.
+```
+
+没有那个类型注解，同样的错误会更晚、更糟糕地浮现出来：变成运行时崩溃而不是构建时错误：`Error: Objects are not valid as a React child (found: [object Date])`。无论哪种情况，修复方法相同：在渲染该值的地方对它调用 `.toISOString()`（或使用格式化库），而不是把它当作字符串。
+
+用 `npm run build` 构建应用会显示这个页面不依赖请求时数据（没有 `cookies()`、没有 `headers()`、没有标记为动态的东西），因此 Next.js 在构建时把它预渲染为静态内容：
+
+```
+Route (app)
+┌ ○ /
+├ ○ /_not-found
+└ ƒ /api/notes
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+```
+
+这意味着 `getNotes()` 中的查询只在 `next build` 期间运行一次，数据库在构建时必须可达。下面的 Server Action 通过在每次写入后重新验证页面来保持页面内容最新，而不是在每次请求时重新运行查询。
+
+## 用 Server Action 写入 {#writing-with-a-server-action}
+
+`src/app/actions.ts` 通过同一个连接池执行插入：
+
+```typescript
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { pool } from "@/lib/db";
+
+export async function addNote(formData: FormData) {
+  const body = formData.get("body");
+
+  if (typeof body !== "string" || body.trim().length === 0) {
+    return;
+  }
+
+  await pool.execute("INSERT INTO notes (body) VALUES (?)", [body.trim()]);
+
+  revalidatePath("/");
+}
+```
+
+首页上的表单直接把这个函数作为它的 `action` 传入：
+
+```tsx
+<form action={addNote}>
+  <input type="text" name="body" maxLength={280} required />
+  <button type="submit">Add</button>
+</form>
+```
+
+通过真实浏览器提交这个表单，填入 "Server Action verified end to end" 并点击 Add，插入了一个新行而没有整页导航，并且由于 `revalidatePath("/")`，该行立即出现在渲染的列表中。之后直接查询数据库确认了写入：
+
+```sql
+SELECT * FROM notes;
+```
+
+```
+id  body                                 created_at
+1   First note, inserted while setting up the guide.   2026-08-28 12:17:51
+2   Server Action verified end to end                  2026-08-28 12:19:37
+```
+
+`revalidatePath("/")` 使上一节中缓存的静态渲染失效，因此下一次请求会重新运行 `getNotes()`，而不是提供构建时的快照。没有这个调用，静态页面的数据缓存永远不会注意到新行。
+
+## JSON Route Handler {#a-json-route-handler}
+
+Server Components 和 Server Actions 覆盖的是由 Next.js 自身渲染的页面。Route Handler 是以 ORM 为中心的指南通常跳过的部分，因为它是普通的 HTTP API 接口而不是页面：`src/app/api/notes/route.ts` 以 JSON 响应 `GET` 请求，服务于移动客户端、webhook 或任何不是 Next.js 前端的调用方。
+
+```typescript
+import { NextResponse } from "next/server";
+import { pool } from "@/lib/db";
+import type { RowDataPacket } from "mysql2";
+
+interface Note extends RowDataPacket {
+  id: number;
+  body: string;
+  created_at: Date;
+}
+
+export async function GET() {
+  const [rows] = await pool.query<Note[]>(
+    "SELECT id, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
+    [20],
+  );
+
+  return NextResponse.json({ notes: rows });
+}
+```
+
+用 `npm run start`（默认端口 3000）运行构建好的应用并请求这个路由，会返回 `notes` 中的真实行，而不是占位数据，其中包括上面 Server Action 插入的那一行：
+
+```bash
+curl http://localhost:3000/api/notes
+```
+
+```json
+{"notes":[{"id":2,"body":"Server Action verified end to end","created_at":"2026-08-28T19:19:37.000Z"},{"id":1,"body":"First note, inserted while setting up the guide.","created_at":"2026-08-28T19:17:51.000Z"}]}
+```
+
+与首页不同，这个路由间接地读取请求时数据（它在每次调用时查询数据库，而不是在构建时），因此上面同一份构建输出把它标记为 `ƒ`（动态）而不是 `○`（静态）。
+
+## Next.js 中的连接池大小 {#connection-pool-sizing-in-nextjs}
+
+Route Handler 每收到一个请求就运行一次，在并发负载下，多个请求可能同时在处理中。连接池的存在就是为了让这些请求共享有限数量的 MySQL 连接，而不是每个请求各自打开一个。
+
+向正在运行的应用的 `/api/notes` 发出 20 个并发请求，并立即检查服务器：
+
+```sql
+SHOW STATUS LIKE 'Threads_connected';
+```
+
+结果显示只有 4 个连接在使用中，而连接池配置的是 `connectionLimit: 10`。`Threads_connected` 统计的是服务器上的每一个连接，不只是这个应用的，因此当您需要按用户统计的数字时，请使用本指南前面的 `information_schema.processlist` 查询。确切的数字取决于每个查询完成的速度相对于突发请求到达时刻的关系，因此更慢的查询或更繁忙的服务器会显示更高的数字，最高到配置的上限。无论如何，它证实的是连接池在这一突发期间排队并复用连接，而不是打开 20 个。提高 `connectionLimit` 会提高在其余请求进入连接池内部队列等待（受 `queueLimit` 限制，`queueLimit` 为 `0` 时不受限制）之前可以并行运行查询的请求数量；它不会改变应用能接受多少请求，只改变同一时刻有多少请求可以在 MySQL 上处于查询中。
+
+Next.js 特有的两件事在实践中会影响这个数字：
+
+- **每个服务器进程都有自己的连接池。** 运行多个实例的 Next.js 部署（多个 `next start` 进程，或多个无服务器函数实例）会把 `connectionLimit` 乘以正在运行的实例数。请把 `connectionLimit` 和 MySQL 的 `max_connections` 放在一起考虑，而不是只看 `connectionLimit`。
+- **如果连接池没有缓存在 `globalThis` 上，开发模式可能会在单个进程内让连接池成倍增加**，如上面连接池一节所示。这在生产构建中不会发生，但在开发期间值得检查，因为其症状（MySQL 报告的打开连接数远超应用所需）看起来与生产环境的大小配置问题一模一样。
+
+## 改用 ORM {#choosing-an-orm-instead}
+
+本指南直接使用 `mysql2`，因为原始连接池是每个 Next.js 与 MySQL 集成都共有的部分，无论上面放的是什么。如果应用程序能从生成的类型、迁移或查询构建器中受益，请参阅 [Next.js 和 Prisma 搭配 MySQL](/zh/guides/mysql-with-prisma) 或 [Next.js 和 Drizzle 搭配 MySQL](/zh/guides/mysql-with-drizzle) 了解 MySQL 特定的设置，以及[在 ORM 中使用 MySQL](/zh/guides/mysql-with-orms) 了解对各种 ORM 普遍重要的设置。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 为什么渲染 `note.created_at` 会失败，而不是直接打印成文本？ {#why-does-rendering-notecreated_at-fail-instead-of-just-printing-as-text}
+
+`mysql2` 把 MySQL 的 `TIMESTAMP` 或 `DATETIME` 列解码为 JavaScript `Date` 对象，而 TypeScript 的 `ReactNode` 类型和 React 本身都不能把它直接作为 JSX 渲染。在列的类型定为 `Date` 的情况下，`npm run build` 会在类型检查时用 `error TS2322: Type 'Date' is not assignable to type 'ReactNode'` 捕获 `{note.created_at}`。没有那个类型，同样的错误会到达运行时并抛出 `Error: Objects are not valid as a React child (found: [object Date])`。在渲染之前对该值调用 `.toISOString()`、`.toLocaleString()` 或使用格式化库。
+
+#### 如果我只预期少量用户，还需要连接池吗？ {#do-i-need-a-connection-pool-if-i-only-expect-a-few-users}
+
+需要。即使流量很轻，Next.js 也可能并发运行多个请求（一次页面加载同时调用了一个 Route Handler、两个浏览器标签页、一个爬取站点的机器人），而每个 MySQL 连接都是服务器上的一个真实线程。一个 `connectionLimit` 较小的连接池（对小型应用来说十是一个合理的默认值）在空闲时没有任何成本，并能防止一阵并发请求各自打开一个连接。
+
+#### 我可以从 Route Handler 调用 Server Action，或者反过来吗？ {#can-i-call-a-server-action-from-a-route-handler-or-the-other-way-around}
+
+Route Handler 可以调用 Server Action 所调用的同一个函数，因为两者都只是使用连接池的异步函数。不同之处在于调用约定：Server Action 由 `<form action>` 或 React 的 `useActionState` 调用，而 Route Handler 由 HTTP 请求调用。把数据库逻辑放在一个普通函数中共享，并从两者调用它，而不是让其中一个直接调用另一个。
+
+#### 为什么首页是静态的，而 API 路由不是？ {#why-is-the-home-page-static-but-the-api-route-is-not}
+
+Next.js 逐路由决定这一点，依据是该路由是否读取请求时数据。本指南中的 `src/app/page.tsx` 没有调用 `cookies()` 或 `headers()` 之类的运行时 API，因此 `next build` 预渲染它一次，并提供该快照直到 `revalidatePath` 使其失效。本指南中的 Route Handler 没有应用这样的缓存，因此它在每次请求时都查询数据库。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `error TS2322: Type 'Date' is not assignable to type 'ReactNode'`（构建时）或 `Error: Objects are not valid as a React child (found: [object Date])`（运行时，未加类型时） | `TIMESTAMP` 或 `DATETIME` 列以 `Date` 对象返回。在渲染前调用 `.toISOString()` 或对它进行格式化。 |
+| `next dev` 期间 MySQL 连接数持续攀升 | 连接池没有缓存在 `globalThis` 上，因此每次热重载都会创建一个新的连接池。添加本指南中展示的 `globalForPool` 保护。 |
+| Server Action 运行了，但页面从不显示新数据 | 为读取已更改数据的路径添加 `revalidatePath`（或 `revalidateTag`）。没有它，静态渲染的页面会一直提供构建时的快照。 |
+| Route Handler 或 Server Action 报 `Error: connect ECONNREFUSED 127.0.0.1:3306`（端口可能不同） | 运行 Next.js 的进程无法访问 MySQL 服务器。确认服务器正在运行，并且 `.env.local` 指向正确的主机和端口。 |
+| 负载下连接过多 | 提高 MySQL 的 `max_connections`，降低每个进程的 `connectionLimit`，或减少正在运行的 Next.js 实例数。请参阅[连接池](/zh/guides/connection-pooling)。 |
+
+## 另请参阅 {#see-also}
+
+- [Next.js 和 Prisma 搭配 MySQL](/zh/guides/mysql-with-prisma) — 同一个应用，用 Prisma 而不是原始驱动构建
+- [Next.js 和 Drizzle 搭配 MySQL](/zh/guides/mysql-with-drizzle) — 同一个应用，用 Drizzle 而不是原始驱动构建
+- [MySQL 连接池](/zh/guides/connection-pooling) — `connectionLimit`、`waitForConnections` 和 `queueLimit` 的工作原理，与任何框架无关
+- [在 ORM 中使用 MySQL](/zh/guides/mysql-with-orms) — 当 ORM 位于应用程序和 MySQL 之间时重要的设置

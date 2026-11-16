@@ -1,0 +1,167 @@
+---
+title: "Resumo com IA no MySQL"
+sidebarTitle: "Resumindo com IA"
+description: "Como resumir textos longos armazenados no MySQL usando o ai_prompt() do VillageSQL — gerando resumos de tickets de suporte, artigos e documentos diretamente em SQL."
+keywords: "mysql ai summarization, mysql summarize text sql, mysql ai_prompt summarize, mysql text summary column, mysql document summary, mysql support ticket summary"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O resumo converte um texto longo em uma versão mais curta que captura os pontos principais. Tickets de suporte, feedback de clientes, artigos e entradas de log se beneficiam de um campo de resumo curto que permite examinar o conteúdo rapidamente. O MySQL não tem uma função de resumo. O `ai_prompt()` do VillageSQL adiciona uma.
+
+## Com o VillageSQL: Resumos em SQL {#with-villagesql-summaries-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+Um prompt de resumo especifica o tamanho desejado e o que manter:
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE support_tickets ADD COLUMN summary VARCHAR(500);
+
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE support_tickets
+SET summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Summarize this support ticket in one sentence. ',
+        'Include the main issue and any resolution mentioned.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE summary IS NULL
+LIMIT 100;
+```
+
+Consulte os resumos como qualquer outra coluna — sem chamada de IA no momento da leitura:
+
+```sql
+-- Recent tickets with AI summaries for quick triage
+SELECT id, created_at, summary
+FROM support_tickets
+WHERE created_at > NOW() - INTERVAL 24 HOUR
+ORDER BY created_at DESC;
+```
+
+### Resumos estruturados {#structured-summaries}
+
+Para casos de uso em que você precisa extrair campos específicos, peça uma saída em JSON:
+
+```sql
+ALTER TABLE support_tickets ADD COLUMN ai_extract JSON;
+
+UPDATE support_tickets
+SET ai_extract = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Extract key information from this support ticket. ',
+        'Return JSON with keys: issue (string), urgency (low/medium/high), ',
+        'product_mentioned (string or null), resolution_needed (boolean). ',
+        'Return only valid JSON.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE ai_extract IS NULL
+LIMIT 100;
+
+-- Triage: high-urgency tickets with no resolution
+SELECT id, body,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.issue')) AS issue,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.product_mentioned')) AS product
+FROM support_tickets
+WHERE JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.urgency')) = 'high'
+ORDER BY created_at DESC;
+```
+
+### Resumindo conteúdo de várias colunas {#summarizing-multi-column-content}
+
+Construa um contexto mais rico para o modelo juntando vários campos:
+
+```sql
+UPDATE articles
+SET summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Write a two-sentence summary of this article for a preview card.\n\n',
+        'Title: ', title, '\n',
+        'Author: ', author_name, '\n',
+        'Body: ', LEFT(body, 3000)   -- trim very long bodies
+    )
+)
+WHERE summary IS NULL
+LIMIT 50;
+```
+
+`LEFT(body, 3000)` evita enviar textos excessivamente longos ao modelo. A maioria dos modelos de IA tem um limite de tokens; para documentos muito longos, resuma os primeiros milhares de caracteres ou divida o conteúdo em partes.
+
+## Controle de Tamanho e Estilo {#length-and-style-control}
+
+A formulação do prompt controla o tamanho e o tom da saída:
+
+| Objetivo | Formulação do prompt |
+|:---|:---|
+| Uma frase | "Summarize in one sentence." |
+| Tamanho de tweet | "Summarize in 280 characters or fewer." |
+| Resumo executivo | "Write a 2–3 sentence executive summary." |
+| Tópicos | "Summarize as 3 bullet points." |
+| Orientado à ação | "What does this ticket ask us to do? One sentence." |
+
+Para resumos usados em prévias de interface, especifique um limite de caracteres para evitar transbordamento.
+
+## Seleção de Modelo {#model-selection}
+
+O resumo é, em geral, bem tratado por modelos mais rápidos e baratos. Use `claude-haiku-4-5` ou `gpt-4o-mini` para resumo em massa. Passe para `claude-sonnet-5` quando:
+
+- O texto de origem é longo e complexo
+- Você precisa de extração estruturada em JSON com campos cheios de nuances
+- A precisão dos fatos extraídos importa mais do que o custo
+
+Para configuração e opções de provedor, consulte [Conectando o MySQL a APIs de IA](/pt-BR/guides/ai-api-setup).
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Qual o tamanho máximo do texto de origem? {#how-long-can-the-source-text-be}
+
+O limite prático é de alguns milhares de palavras por chamada. Os modelos de IA têm limites de tokens (normalmente de 100K a 200K tokens para os modelos atuais), mas entradas muito longas custam mais e demoram mais. Para documentos com mais de ~5000 palavras, resuma a primeira seção, ou divida em partes e resuma cada parte.
+
+#### Posso usar resumos em um índice de busca de texto completo? {#can-i-use-summaries-in-a-full-text-search-index}
+
+Sim — adicione um índice FULLTEXT na coluna de resumo depois de preenchê-la. Os resumos costumam ser alvos melhores para busca de texto completo do que o conteúdo bruto, porque são mais curtos e mais densos em palavras-chave.
+
+#### O mesmo documento sempre produzirá o mesmo resumo? {#will-the-same-document-always-produce-the-same-summary}
+
+Não — os modelos de IA são probabilísticos. O mesmo prompt pode produzir uma saída ligeiramente diferente em chamadas diferentes. Se a consistência importa, gere o resumo uma vez e armazene-o; não o gere novamente a cada leitura.
+
+#### Como resumo linhas que já foram resumidas? {#how-do-i-summarize-rows-that-have-already-been-summarized}
+
+Não resuma novamente a menos que o conteúdo de origem tenha mudado. Use `WHERE summary IS NULL` para processar apenas linhas novas ou atualizadas. Se precisar acompanhar mudanças, adicione uma coluna `summary_updated_at` e compare-a com o timestamp da última modificação do conteúdo.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | Execute `INSTALL EXTENSION vsql_ai` |
+| Retorna NULL | Execute `SHOW WARNINGS` para a causa real, depois verifique a chave de API, `max_execution_time` e o nome do modelo |
+| Resumo longo ou curto demais | Torne o prompt mais restrito: especifique um limite de caracteres ou de frases |
+| O modelo repete o texto de origem em vez de resumir | Adicione "Do not copy sentences from the original" ao prompt |
+| A extração estruturada em JSON tem chaves faltando | Adicione "If a field is not mentioned, use null" ao prompt |
+
+## Veja também {#see-also}
+
+- [Executando Modelos de IA a partir de Consultas MySQL](/pt-BR/guides/ai-prompts-in-mysql) — a função ai_prompt() sobre a qual este guia se baseia
+- [Análise de Sentimento em Dados do MySQL](/pt-BR/guides/sentiment-analysis) — outro padrão de análise de texto com ai_prompt()
+- [Classificando Texto no MySQL com IA](/pt-BR/guides/text-classification) — categorizando texto usando a mesma abordagem

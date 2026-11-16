@@ -1,0 +1,138 @@
+---
+title: "在 MySQL 中对数据进行哈希"
+sidebarTitle: "数据哈希"
+description: "如何在 MySQL 中对数据进行哈希以用于完整性检查、去重和数据指纹——通过 VillageSQL 的 digest() 函数使用 SHA-256 和其他算法。"
+keywords: "mysql sha256 hash, mysql digest function, mysql data integrity hash, mysql checksum column, mysql hash binary, mysql sha2 vs digest"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 内置了 `MD5()`、`SHA1()` 和 `SHA2()`。它们可以工作，但返回的是十六进制字符串——一个 SHA-256 哈希是 64 个字符，而底层数据只有 32 字节。以二进制形式存储哈希可以把大小减半，建索引也更高效。VillageSQL 的 `vsql_crypto` 扩展中的 `digest()` 返回原始二进制，并且为每种算法提供同一个函数。
+
+## MySQL 默认方式：分散的函数，十六进制输出 {#the-mysql-default-scattered-functions-hex-output}
+
+MySQL 提供了三个独立的哈希函数：
+
+```sql
+SELECT MD5('hello');                 -- 32-char hex string
+SELECT SHA1('hello');                -- 40-char hex string
+SELECT SHA2('hello', 256);          -- 64-char hex string (SHA-256)
+SELECT SHA2('hello', 512);          -- 128-char hex string (SHA-512)
+```
+
+它们可以工作，但存储是浪费的。256 位的 SHA2 返回一个 64 字符的 VARCHAR——是所需字节数的两倍，因为哈希的每个字节被编码为两个十六进制数字。要得到二进制输出，您需要写 `UNHEX(SHA2('hello', 256))`，这可以工作，但要始终如一地输入很麻烦。
+
+也没有 `sha224` 或 `sha384` 选项——您只能使用 MySQL 暴露的那些。
+
+## 标准变通方法：UNHEX + SHA2 {#the-standard-workaround-unhex--sha2}
+
+为了紧凑的二进制存储，开发者把 `SHA2()` 包在 `UNHEX()` 中：
+
+```sql
+CREATE TABLE files (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    path     VARCHAR(500),
+    sha256   BINARY(32)
+);
+
+INSERT INTO files (path, sha256)
+VALUES ('/data/report.pdf', UNHEX(SHA2(LOAD_FILE('/data/report.pdf'), 256)));
+
+-- Find duplicate files by hash
+SELECT sha256, COUNT(*) AS count
+FROM files
+GROUP BY sha256
+HAVING count > 1;
+```
+
+这为您带来紧凑的存储。它稍微有些冗长，但这是标准做法，对于 SHA-256 和 SHA-512 工作得很好。
+
+## 使用 VillageSQL：digest() {#with-villagesql-digest}
+
+VillageSQL 的 `vsql_crypto` 扩展添加了 `digest(data, algorithm)`，它直接返回 `VARBINARY` 哈希——不需要 `UNHEX()` 包装。
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+-- digest() returns VARBINARY — no UNHEX wrapper
+CREATE TABLE files (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    path    VARCHAR(500),
+    sha256  VARBINARY(32)
+);
+
+INSERT INTO files (path, sha256)
+VALUES ('/data/report.pdf', digest(LOAD_FILE('/data/report.pdf'), 'sha256'));
+
+-- Compare hashes for duplicate detection
+SELECT path FROM files
+WHERE sha256 = digest(LOAD_FILE('/data/incoming.pdf'), 'sha256');
+```
+
+当您需要可读的字符串用于日志或显示时，使用 `HEX()`：
+
+```sql
+SELECT path, HEX(sha256) AS hash_hex FROM files;
+```
+
+### 支持的算法 {#supported-algorithms}
+
+| 算法 | digest() 调用 | 输出大小 | 使用场景 |
+|:---|:---|:---|:---|
+| SHA-256 | `digest(data, 'sha256')` | 32 字节 | 通用完整性检查 |
+| SHA-512 | `digest(data, 'sha512')` | 64 字节 | 需要更高的抗碰撞性 |
+| SHA-224 | `digest(data, 'sha224')` | 28 字节 | 空间受限且需要 SHA-2 系列 |
+| SHA-384 | `digest(data, 'sha384')` | 48 字节 | 介于 256 和 512 之间 |
+| SHA-1 | `digest(data, 'sha1')` | 20 字节 | 仅用于旧系统兼容 |
+| MD5 | `digest(data, 'md5')` | 16 字节 | 仅用于旧系统兼容 |
+
+不要在新应用中使用 MD5 或 SHA-1——两者都有已知的碰撞漏洞。SHA-256 是大多数用途的实用默认选择。
+
+具体到密码存储，`digest()` 是错误的工具——请参阅 [MySQL 中的密码哈希](/zh/guides/password-hashing) 了解 `crypt()` 和 `gen_salt()`。
+
+## 何时使用每种方法 {#when-to-use-each-approach}
+
+| 方法 | 使用场景 |
+|:---|:---|
+| `SHA2(data, 256)` | 您只需要十六进制输出；纯 MySQL 技术栈 |
+| `UNHEX(SHA2(data, 256))` | 二进制存储，不依赖 VillageSQL |
+| `digest(data, 'sha256')` | 干净的二进制输出，并且算法灵活 |
+
+对于 VillageSQL 上的新项目，`digest()` 是更简洁的选择。对于现有的纯 MySQL 应用，`UNHEX(SHA2())` 同样正确。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### digest() 和 SHA2() 有什么区别？ {#whats-the-difference-between-digest-and-sha2}
+
+`SHA2('hello', 256)` 返回一个 64 字符的十六进制字符串。`digest('hello', 'sha256')` 返回一个 32 字节的 `VARBINARY`。它们计算的是同一个哈希——区别在于编码。二进制存储更紧凑，建索引更快。
+
+#### 我可以用 digest() 检测重复行吗？ {#can-i-use-digest-to-detect-duplicate-rows}
+
+可以。将 `digest(content, 'sha256')` 存储在带索引的列中，然后查询 `WHERE sha256 = digest(incoming_content, 'sha256')`。这是对上传文件去重、检测变更的记录或构建按内容寻址的查找的常见模式。
+
+#### digest() 对密码安全吗？ {#is-digest-safe-for-passwords}
+
+不安全。`digest()` 是快速哈希——它在微秒级完成计算。密码哈希需要缓慢的、迭代的算法。请使用同一扩展中的 `crypt()` 和 `gen_salt()`。请参阅 [MySQL 中的密码哈希](/zh/guides/password-hashing)。
+
+#### digest() 支持 HMAC 吗？ {#does-digest-support-hmac}
+
+不支持——`digest()` 是不带密钥的普通哈希。对于带密钥的认证码，请使用 `hmac()`。请参阅 [MySQL 中的 HMAC 签名](/zh/guides/hmac-mysql)。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.digest does not exist` | 运行 `INSTALL EXTENSION vsql_crypto` |
+| `digest()` 返回 NULL | 检查是否有 NULL 输入或确实无法识别的算法名称。大小写不是问题——名称匹配不区分大小写，因此 `'SHA256'` 和 `'sha256'` 返回相同的输出 |
+| 以十六进制存储的哈希看起来大小翻倍 | 列是 VARCHAR 而不是 VARBINARY——对于 SHA-256 请改为 `VARBINARY(32)` |
+| 两个相同的字符串哈希结果不同 | 验证编码和排序规则——哈希区分大小写，并且逐字节精确 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的密码哈希](/zh/guides/password-hashing)——专为凭据设计的缓慢自适应哈希
+- [MySQL 中的 HMAC 签名](/zh/guides/hmac-mysql)——用于完整性验证和 webhook 验证的带密钥哈希
+- [MySQL 中的对称加密](/zh/guides/symmetric-encryption)——当您需要取回数据而不只是指纹时

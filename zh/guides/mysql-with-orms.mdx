@@ -1,0 +1,107 @@
+---
+title: "在 ORM 中使用 MySQL：Django、Rails 和 Prisma"
+sidebarTitle: "MySQL 搭配 ORM"
+description: "为 MySQL 正确配置 Django、Rails 和 Prisma：字符集和严格模式设置、N+1 问题，以及何时该退回到原始 SQL。"
+keywords: "django mysql settings, rails mysql config, prisma mysql, orm n+1 queries, mysql strict mode orm, activerecord mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ORM 是大多数应用程序实际与 MySQL 对话的方式，而大多数 ORM 问题都能追溯到少数几行配置和一种查询模式。本指南介绍 Django、Rails 和 Prisma 在 MySQL 端的设置，以及防止 ORM 生成的 SQL 成为您产品中最慢部分的习惯。因为 VillageSQL 是 MySQL 的直接替代品，这里的每一项配置都可以原样用于它：ORM 察觉不到差别。
+
+## 处处都重要的设置 {#the-settings-that-matter-everywhere}
+
+无论使用哪个框架，三件事必须成立：
+
+- **连接使用 `utf8mb4`**，否则 emoji 会在传输中损坏。请参阅 [utf8mb4 与 emoji](/zh/guides/utf8mb4)。
+- **严格 SQL 模式已开启**（这是 MySQL 8.x 的默认设置），这样错误数据会报错，而不是被静默截断。
+- **连接池大小是有意设定的。** 每个框架都会为每个进程打开一个连接池；在选定数字之前，先乘以您的进程数。请参阅[连接池](/zh/guides/connection-pooling)。
+
+## Django {#django}
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.mysql",
+        "NAME": "myapp",
+        "USER": "app",
+        "PASSWORD": environ["DB_PASSWORD"],
+        "HOST": "127.0.0.1",
+        "PORT": "3306",
+        "OPTIONS": {
+            "charset": "utf8mb4",
+            "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
+    }
+}
+```
+
+Django 特定的说明：
+
+- 使用 `mysqlclient`，这是 Django 文档推荐的、持续维护的 C 驱动。
+- Django 在 Python 中模拟了一些约束；也要添加真正的数据库约束（`unique=True` 会成为真正的唯一索引，但 check 约束需要在 `Meta` 中使用 `CheckConstraint`）。
+- `select_related()`（JOIN）和 `prefetch_related()`（第二个查询）是解决 N+1 的工具；何时使用见下文。
+
+## Rails {#rails}
+
+```yaml
+# config/database.yml
+production:
+  adapter: mysql2
+  database: myapp
+  username: app
+  password: <%= ENV["DB_PASSWORD"] %>
+  host: 127.0.0.1
+  encoding: utf8mb4
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+```
+
+Rails 特定的说明：
+
+- `database.yml` 中的 `encoding: utf8mb4` 同时设置连接字符集和 `rails db:create` 的默认值。
+- ActiveRecord 验证（`validates_uniqueness_of`）在并发下存在竞争；为每个唯一性验证配上真正的唯一索引，并让 [1062 重复键错误](/zh/guides/common-mysql-errors)成为最后一道防线。
+- `includes` 是解决 N+1 的工具；`strict_loading` 模式会把延迟加载变成错误，这样 N+1 会在开发阶段失败，而不是发布到线上。
+- Rails 8.1 在 `database.yml` 中生成 `max_connections`，而旧版本生成的是 `pool`。`pool:` 键仍然可以静默地工作，作为 `max_connections` 读取的回退值；把两者设成不同的值会在启动时抛出异常。请参阅 [Rails 8 搭配 MySQL](/zh/guides/rails-mysql) 了解完整的应用，包括 Rails 8 不再默认使用 MySQL 之后所需要的 `--database=mysql` 标志。
+
+## Prisma {#prisma}
+
+```prisma
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+```
+
+```text
+DATABASE_URL="mysql://app:password@127.0.0.1:3306/myapp?connection_limit=10"
+```
+
+Prisma 特定的说明：
+
+- Prisma 默认使用 utf8mb4；需要注意的设置是 URL 中的 `connection_limit`，它的默认值偏低。
+- `prisma migrate` 根据模式漂移生成 DDL。在应用到生产环境之前，请阅读生成的 SQL，就像您对待手写的迁移一样。请参阅[模式迁移](/zh/guides/schema-migrations)。
+- 关系查询使用 `include`；当您遍历结果并逐个访问关系时，就会出现 N+1 的形态。
+- Prisma 7 把上面的连接 URL 从 `schema.prisma` 移到了一个单独的配置文件中，并且需要驱动适配器才能连接。请参阅 [Next.js 和 Prisma 搭配 MySQL](/zh/guides/mysql-with-prisma) 了解完整的 Prisma 7 应用。
+
+## N+1 问题，一次讲清 {#the-n1-problem-once}
+
+通用的 ORM 性能缺陷：加载 100 个订单，然后延迟加载每个订单的客户，ORM 就会发出 101 个查询。修复方法在每个框架中都是同一个思路——预先声明您需要的关系，让 ORM 用一到两个查询把它们取出来（`select_related` / `includes` / `include`）。检测工具也是通用的：在开发环境中打开查询日志，阅读 ORM 实际发送的内容，或者在生产环境中观察[慢查询日志](/zh/guides/slow-query-log)。
+
+## 何时退回到 SQL {#when-to-drop-to-sql}
+
+ORM 在 CRUD 上物有所值，在分析查询上则不然。窗口函数、CTE、批量 upsert 和多表报表查询，用 SQL 写比用一串试图表达它们的查询构建器链更清晰。每个 ORM 都有逃生通道（Django 的 `raw()`、Rails 的 `find_by_sql`、Prisma 的 `$queryRaw`）；为那 5% 值得这样做的查询使用它是好的工程实践，而不是认输。这也是 VillageSQL 扩展函数进入 ORM 应用程序的方式：`SELECT UUID_V7()` 或 `ai_prompt(...)` 可以通过任何一个这样的逃生通道工作，因为 ORM 只是把 SQL 原样传递过去。
+
+## 另请参阅 {#see-also}
+
+- [Next.js 和 Prisma 搭配 MySQL](/zh/guides/mysql-with-prisma) — 基于 Prisma 7 的完整应用，不只是配置
+- [Next.js 和 Drizzle 搭配 MySQL](/zh/guides/mysql-with-drizzle) — 基于 Drizzle 的完整应用，一个上面未涉及的、更轻量、SQL 优先的替代方案
+- [Next.js 搭配 MySQL](/zh/guides/nextjs-mysql) — 完全不用 ORM 的连接设置和查询模式
+- [Rails 8 搭配 MySQL](/zh/guides/rails-mysql) — 完整的应用，包括 Rails 8 选择 MySQL 所需要的脚手架标志
+- [Laravel 12 搭配 MySQL](/zh/guides/laravel-mysql) — 基于 Laravel 的 Eloquent ORM 的完整应用，上面未涉及
+- [Go 和 sqlc 搭配 MySQL](/zh/guides/go-sqlc-mysql) — 生成的类型安全查询，而不是运行时 ORM
+- [连接池](/zh/guides/connection-pooling) — 跨进程调整连接池大小
+- [utf8mb4 与 emoji](/zh/guides/utf8mb4) — 上面每个配置都设置的字符集
+- [慢查询日志](/zh/guides/slow-query-log) — 捕获 ORM 生成的内容
+- [模式迁移](/zh/guides/schema-migrations) — 安全地应用 ORM 生成的 DDL

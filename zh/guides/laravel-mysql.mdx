@@ -1,0 +1,267 @@
+---
+title: "Laravel 12 与 MySQL"
+sidebarTitle: "Laravel 与 Eloquent"
+description: "针对 MySQL 设置 Laravel 12：.env 连接块、运行迁移、Eloquent 模型、使用 $fillable 的批量赋值保护，以及对照真实数据库验证写入。"
+keywords: "laravel mysql, laravel 12 mysql, laravel eloquent mysql, laravel migrate mysql, laravel .env database, laravel fillable, laravel database connection, villagesql laravel"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+新建的 Laravel 12 项目在 `.env` 中自带一个被注释掉的 MySQL 连接块，就位于当前生效的 `DB_CONNECTION` 行的正下方，使用的是每个 MySQL 客户端都熟悉的主机、端口、数据库、用户名和密码这一套形式。取消注释并填入真实值，就是全部的集成工作。本指南从头到尾讲解这个设置：连接、运行迁移，以及通过 Eloquent 读写。
+
+## 创建项目 {#creating-the-project}
+
+```bash
+composer create-project laravel/laravel laravel-mysql "12.*"
+```
+
+这会安装 Laravel 12 及其依赖，生成应用密钥，并创建一个默认的 SQLite 数据库，使应用无需任何配置即可立即运行。确认版本：
+
+```bash
+php artisan --version
+```
+
+```
+Laravel Framework 12.68.0
+```
+
+Laravel 12 需要 PHP 8.2 或更高版本。在尚未安装 PHP 的 macOS 上，`brew install php composer` 会同时安装两者；Homebrew 构建的 PHP 8.5 默认包含 `pdo_mysql` 和 `mysqli`，所以 MySQL 不需要额外的扩展设置。
+
+## 创建数据库和用户 {#creating-the-database-and-user}
+
+创建一个专用数据库和一个范围受限的用户，而不是把应用指向 `root`：
+
+```sql
+CREATE DATABASE laravel_guide;
+CREATE USER 'laravel_app'@'127.0.0.1' IDENTIFIED BY 'your-password';
+GRANT ALL PRIVILEGES ON laravel_guide.* TO 'laravel_app'@'127.0.0.1';
+```
+
+## 配置连接 {#configuring-the-connection}
+
+打开 `.env`，把 `DB_CONNECTION` 从 `sqlite` 改为 `mysql`，然后填入连接细节：
+
+```bash
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=laravel_guide
+DB_USERNAME=laravel_app
+DB_PASSWORD=your-password
+```
+
+这里 Laravel 通过 TCP 连接到 `127.0.0.1`，也就是上面 `CREATE USER` 语句授权的那个主机。VillageSQL 是 MySQL 的直接替代品，所以 `config/database.php` 和 `.env` 中的键都不需要改动。
+
+`config/database.php` 默认在 `mysql` 连接上设置了 `'strict' => true`。这会让会话进入 MySQL 的标准严格 SQL 模式：
+
+```sql
+SELECT @@sql_mode;
+```
+
+```
+ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+```
+
+这组模式在 VillageSQL 上原样运行。没有任何严格模式标志需要为兼容性而禁用或绕过。
+
+## 运行迁移 {#running-migrations}
+
+Laravel 的默认迁移会创建 `users`、`cache` 和 `jobs` 表。针对已配置的连接运行它们：
+
+```bash
+php artisan migrate:fresh
+```
+
+```
+INFO  Preparing database.
+
+Creating migration table ....................................... 2.76ms DONE
+
+INFO  Running migrations.
+
+0001_01_01_000000_create_users_table ........................... 8.69ms DONE
+0001_01_01_000001_create_cache_table ........................... 4.42ms DONE
+0001_01_01_000002_create_jobs_table ............................ 6.31ms DONE
+```
+
+为 `posts` 表生成一个模型及其迁移：
+
+```bash
+php artisan make:model Post -m
+```
+
+```
+INFO  Model [app/Models/Post.php] created successfully.
+
+INFO  Migration [database/migrations/..._create_posts_table.php] created successfully.
+```
+
+在生成的迁移中添加 `title` 和 `body` 列：
+
+```php
+Schema::create('posts', function (Blueprint $table) {
+    $table->id();
+    $table->string('title');
+    $table->text('body');
+    $table->timestamps();
+});
+```
+
+运行它，然后直接在服务器上确认表的结构：
+
+```bash
+php artisan migrate
+```
+
+```sql
+DESCRIBE posts;
+```
+
+```
+Field       Type              Null  Key  Default  Extra
+id          bigint unsigned   NO    PRI  NULL     auto_increment
+title       varchar(255)      NO         NULL
+body        text              NO         NULL
+created_at  timestamp         YES        NULL
+updated_at  timestamp         YES        NULL
+```
+
+## Eloquent 与批量赋值保护 {#eloquent-and-mass-assignment-protection}
+
+Laravel 的 Eloquent 模型默认阻止批量赋值，除非字段列在 `$fillable` 中：
+
+```php
+class Post extends Model
+{
+    protected $fillable = ['title', 'body'];
+}
+```
+
+`id`、`created_at` 和 `updated_at` 被有意排除在外。向 `create()` 传入 `id` 不会报错，也不会覆盖值；Eloquent 会静默丢弃任何不在 `$fillable` 中的键：
+
+```php
+$post = Post::create(['title' => 'Tinker test', 'body' => 'via fillable', 'id' => 999]);
+echo $post->id;
+```
+
+```
+1
+```
+
+该行得到的是下一个自增值，而不是 `999`。当 `store()` 方法直接接受请求体时，这一点很重要：如果没有 `$fillable` 限定列，客户端可以传入 `id` 或时间戳字段，并被照单全收。`$fillable` 保护模型；请求验证是另一个独立的关注点，它检查传入数据的形态。
+
+## 路由和控制器 {#routes-and-a-controller}
+
+Laravel 12 的默认骨架把路由保持得很精简：`routes/web.php` 存放路由，`bootstrap/app.php` 负责接入中间件和异常处理，不再有旧的 `Http/Kernel.php` 文件。生成一个控制器：
+
+```bash
+php artisan make:controller PostController
+```
+
+```php
+class PostController extends Controller
+{
+    public function index(): JsonResponse
+    {
+        return response()->json(Post::latest()->get());
+    }
+
+    public function store(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'body' => 'required|string',
+        ]);
+
+        $post = Post::create($validated);
+
+        return response()->json($post, 201);
+    }
+}
+```
+
+注册路由：
+
+```php
+use App\Http\Controllers\PostController;
+
+Route::get('/posts', [PostController::class, 'index']);
+Route::post('/posts', [PostController::class, 'store']);
+```
+
+`routes/web.php` 运行在 Laravel 基于会话的 CSRF 中间件之后，该中间件会以 `419 Page Expired` 拒绝一个普通的 `curl -X POST`，因为请求没有携带 CSRF 令牌。对于面向浏览器的表单路由，这是符合预期的；真实的表单通过隐藏字段提交令牌。对于打算被直接调用、没有表单也没有令牌的路由，请在 `bootstrap/app.php` 中把它排除：
+
+```php
+->withMiddleware(function (Middleware $middleware): void {
+    $middleware->validateCsrfTokens(except: [
+        'posts',
+    ]);
+})
+```
+
+## 端到端验证 {#verifying-end-to-end}
+
+启动内置服务器并测试两个路由。表中已经有了上面 `$fillable` 演示中的那一行，所以 index 路由会返回它：
+
+```bash
+php artisan serve --port=8123
+```
+
+```bash
+curl -s http://127.0.0.1:8123/posts
+```
+
+```json
+[{"id":1,"title":"Tinker test","body":"via fillable","created_at":"2026-08-28T19:49:05.000000Z","updated_at":"2026-08-28T19:49:05.000000Z"}]
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8123/posts -d "title=Hello VillageSQL" -d "body=First post from curl"
+```
+
+```json
+{"title":"Hello VillageSQL","body":"First post from curl","updated_at":"2026-08-28T19:49:21.000000Z","created_at":"2026-08-28T19:49:21.000000Z","id":2}
+```
+
+直接查询数据库来确认两行都已落库，而不是只相信 JSON 响应：
+
+```sql
+SELECT * FROM laravel_guide.posts;
+```
+
+```
+id  title              body                    created_at           updated_at
+1   Tinker test        via fillable            2026-08-28 19:49:05  2026-08-28 19:49:05
+2   Hello VillageSQL   First post from curl    2026-08-28 19:49:21  2026-08-28 19:49:21
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 为什么 Laravel 默认使用 SQLite 而不是 MySQL？ {#why-does-laravel-default-to-sqlite-instead-of-mysql}
+
+近期的 Laravel 版本让新项目默认使用 SQLite，这样 `php artisan serve` 无需任何配置即可立即运行。`.env` 文件仍然在当前生效的 `DB_CONNECTION` 行正下方保留着 MySQL 连接键，只是被注释掉了。切换到 MySQL 只是取消注释并填入五个值，而不是新增一个配置段。
+
+#### Eloquent 需要任何特殊配置才能与 VillageSQL 配合吗？ {#does-eloquent-need-any-special-configuration-to-work-with-villagesql}
+
+不需要。VillageSQL 是 MySQL 的直接替代品，使用同样的线路协议，所以 Laravel 的 `mysql` 驱动、它的严格 SQL 模式设置以及它的查询语法都可以原样运行。
+
+#### `$fillable` 和请求验证有什么区别？ {#whats-the-difference-between-fillable-and-request-validation}
+
+`$request->validate()` 决定从传入请求中接受哪些字段，并以 422 响应拒绝格式错误的输入。模型上的 `$fillable` 决定您传给 `create()` 或 `fill()` 的字段中有哪些会被真正写入数据库。只使用 `$request->validate()` 时，如果别处的某个控制器调用了 `Post::create($request->all())`，模型仍然暴露在批量赋值之下；而 `$fillable` 无论哪个控制器调用都会保护模型。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| POST 请求返回 `419 Page Expired` | 该路由运行在 CSRF 中间件之后。提交一个带 `@csrf` 的真实表单，或者如果它打算被直接调用，就在 `bootstrap/app.php` 中用 `validateCsrfTokens(except: [...])` 排除该路由。 |
+| `SQLSTATE[HY000] [2002] Connection refused` | `.env` 中的 `DB_PORT` 与 VillageSQL 实际监听的端口不一致。确认服务器启动时使用的端口。 |
+| `SQLSTATE[HY000] [1045] Access denied for user '<user>'@'localhost' (using password: YES)` | `DB_USERNAME` 或 `DB_PASSWORD` 错误，或者该用户没有任何覆盖 `DB_DATABASE` 的授权。即使 `DB_HOST` 是 `127.0.0.1`，错误也可能显示 `'localhost'`：除非打开了 `skip_name_resolve`，否则 MySQL 会通过反向 DNS 解析连接 IP，并报告它匹配到的主机名。请确认授权是为错误中实际指明的主机创建的，它可能与 `DB_HOST` 中的值不同。 |
+| 传给 `create()` 的字段没有保存 | 它不在模型的 `$fillable` 数组中。当 `$fillable` 非空时，Eloquent 会静默丢弃该字段而不是抛出异常；把它加入 `$fillable`，或者如果您有意绕过这道防护，就使用 `forceFill()`。 |
+
+## 另请参阅 {#see-also}
+
+- [在 ORM 中使用 MySQL：Django、Rails 和 Prisma](/zh/guides/mysql-with-orms) — 从与 ORM 无关的角度看同样的连接级设置和 N+1 模式
+- [MySQL 中的模式迁移](/zh/guides/schema-migrations) — Laravel 的迁移文件在 `ALTER TABLE` 之下对表做了什么
+- [MySQL 连接池](/zh/guides/connection-pooling) — 为真实流量下的 Laravel 应用配置持久连接

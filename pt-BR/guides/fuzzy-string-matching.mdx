@@ -1,0 +1,189 @@
+---
+title: "Correspondência Fonética e Distância de Edição no MySQL"
+sidebarTitle: "Correspondência Aproximada de Strings"
+description: "Como fazer correspondência de strings por som e distância de edição no MySQL usando a extensão vsql_fuzzystrmatch do VillageSQL — Soundex, Levenshtein, Metaphone e Double Metaphone."
+keywords: "mysql soundex, mysql levenshtein, mysql metaphone, mysql phonetic matching, mysql edit distance, vsql_fuzzystrmatch, mysql name matching"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  Este guia requer o VillageSQL 0.0.4 ou posterior.
+</Note>
+
+Duas strings que se referem à mesma coisa — o nome de uma pessoa, uma empresa, um lugar — muitas vezes parecem diferentes na prática. Erros de ortografia, transliterações, erros de transcrição e variações regionais produzem variações que `=` e `LIKE` não capturam. A extensão `vsql_fuzzystrmatch` do VillageSQL oferece quatro abordagens: Soundex (agrupamento por sonoridade semelhante), distância de edição de Levenshtein (custo caractere por caractere), Metaphone (codificação baseada na pronúncia) e Double Metaphone (trata pronúncias ambíguas de múltiplas origens linguísticas).
+
+## Instalação {#installation}
+
+```sql
+INSTALL EXTENSION vsql_fuzzystrmatch;
+```
+
+As funções funcionam sem qualificação. Elas também podem ser chamadas como `vsql_fuzzystrmatch.soundex(...)`, qualificando pelo nome da extensão proprietária — isso é a resolução de nomes do VEF, não um schema real, e `vsql_fuzzystrmatch` não aparece em `SHOW DATABASES`. Todas retornam NULL quando qualquer argumento é NULL.
+
+## Soundex {#soundex}
+
+O Soundex reduz uma palavra em inglês a um código de 4 caracteres com base em como ela soa. Palavras com o mesmo código são consideradas correspondências fonéticas.
+
+```sql
+SELECT vsql_fuzzystrmatch.soundex('Robert');   -- R163
+SELECT vsql_fuzzystrmatch.soundex('Rupert');   -- R163
+SELECT vsql_fuzzystrmatch.soundex('Smith');    -- S530
+SELECT vsql_fuzzystrmatch.soundex('Smythe');   -- S530
+```
+
+`difference` retorna uma pontuação de 0 a 4 para quantos caracteres do código Soundex duas strings compartilham. 4 = códigos idênticos.
+
+```sql
+SELECT vsql_fuzzystrmatch.difference('Robert', 'Rupert');   -- 4
+SELECT vsql_fuzzystrmatch.difference('Robert', 'Sylvia');   -- 0
+```
+
+**Use o Soundex quando** você quiser um agrupamento simples por sonoridade semelhante e seus dados forem principalmente nomes em inglês. Ele é rápido e fácil de explicar, mas pode confundir nomes sem relação e não captura a fonética de outros idiomas.
+
+### Encontrando correspondências fonéticas em uma tabela {#finding-phonetic-matches-in-a-table}
+
+```sql
+SELECT name
+FROM customers
+WHERE vsql_fuzzystrmatch.soundex(name) = vsql_fuzzystrmatch.soundex('Smith')
+ORDER BY name;
+```
+
+Para encontrar todos os nomes que são uma correspondência fonética próxima (não necessariamente com códigos idênticos):
+
+```sql
+SELECT name, vsql_fuzzystrmatch.difference(name, 'Johnson') AS score
+FROM customers
+WHERE vsql_fuzzystrmatch.difference(name, 'Johnson') >= 3
+ORDER BY score DESC;
+```
+
+## Distância de edição de Levenshtein {#levenshtein-edit-distance}
+
+Levenshtein conta o número mínimo de edições de um único caractere — inserções, exclusões, substituições — necessárias para transformar uma string em outra.
+
+```sql
+SELECT vsql_fuzzystrmatch.levenshtein('kitten', 'sitting');   -- 3
+SELECT vsql_fuzzystrmatch.levenshtein('mysql', 'mysql');      -- 0
+SELECT vsql_fuzzystrmatch.levenshtein('abc', 'xyz');          -- 3
+```
+
+**Use a distância de edição quando** você quiser corresponder strings que diferem por um pequeno número de erros de digitação e quiser controle preciso sobre o limite de distância.
+
+### Custos de operação personalizados {#custom-operation-costs}
+
+`levenshtein_cost` permite atribuir pesos diferentes a inserções, exclusões e substituições:
+
+```sql
+-- Substitutions cost 2, insertions and deletions cost 1
+SELECT vsql_fuzzystrmatch.levenshtein_cost('abc', 'xyz', 1, 1, 2);  -- 6
+```
+
+### Limite com saída antecipada {#early-exit-threshold}
+
+`levenshtein_less_equal` interrompe o cálculo assim que a distância excede um limite — mais eficiente para filtragem. Quando a distância real excede `max_d`, ela retorna `max_d + 1` em vez de calcular a distância completa:
+
+```sql
+-- Distance is 3, max_d is 5: returns real distance
+SELECT vsql_fuzzystrmatch.levenshtein_less_equal('kitten', 'sitting', 5);   -- 3
+
+-- Distance is 3, max_d is 2: cap fires, returns max_d + 1
+SELECT vsql_fuzzystrmatch.levenshtein_less_equal('abc', 'xyz', 2);          -- 3 (= max_d + 1)
+```
+
+Combinada com custos personalizados:
+
+```sql
+SELECT vsql_fuzzystrmatch.levenshtein_less_equal_cost('abc', 'xyz', 1, 1, 1, 2);  -- 3
+```
+
+Ambas as strings de entrada devem ter ≤ 255 caracteres. Os custos não podem ser negativos.
+
+### Deduplicação por distância de edição {#deduplication-by-edit-distance}
+
+```sql
+SELECT a.name, b.name, vsql_fuzzystrmatch.levenshtein(a.name, b.name) AS dist
+FROM companies a
+JOIN companies b ON a.id < b.id
+WHERE vsql_fuzzystrmatch.levenshtein_less_equal(a.name, b.name, 2) <= 2
+ORDER BY dist;
+```
+
+## Metaphone {#metaphone}
+
+O Metaphone aplica mais regras de pronúncia do inglês do que o Soundex e produz uma saída de comprimento variável. O parâmetro `max_output_length` limita o resultado.
+
+```sql
+SELECT vsql_fuzzystrmatch.metaphone('Robert', 10);    -- RBRT
+SELECT vsql_fuzzystrmatch.metaphone('Thompson', 10);  -- 0MPSN
+SELECT vsql_fuzzystrmatch.metaphone('Robert', 2);     -- RB  (truncated)
+```
+
+**Use o Metaphone quando** o Soundex produzir falsos positivos demais ou deixar de encontrar correspondências para nomes menos comuns. Ele trata mais padrões de pronúncia (TH → 0, letras mudas etc.).
+
+## Double Metaphone {#double-metaphone}
+
+O Double Metaphone trata pronúncias ambíguas de múltiplas origens linguísticas — nomes de origem alemã, eslava, espanhola, hebraica e outras que são anglicizados de maneiras diferentes. Ele produz dois códigos: primário e alternativo.
+
+```sql
+SELECT vsql_fuzzystrmatch.dmetaphone('Robert');      -- RPRT
+SELECT vsql_fuzzystrmatch.dmetaphone_alt('Robert');  -- RPRT  (no alternate)
+
+SELECT vsql_fuzzystrmatch.dmetaphone('Schmidt');     -- XMT
+SELECT vsql_fuzzystrmatch.dmetaphone_alt('Schmidt'); -- SMT   (alternate pronunciation)
+```
+
+Quando não existe um código alternativo, `dmetaphone_alt` retorna o código primário.
+
+**Use o Double Metaphone quando** seus dados contiverem nomes de múltiplas origens linguísticas, ou quando o Metaphone deixar de encontrar correspondências que uma pessoa consideraria equivalentes.
+
+### Correspondência com ambos os códigos {#matching-with-both-codes}
+
+```sql
+-- Match if either the primary or alternate code aligns
+SELECT name
+FROM customers
+WHERE vsql_fuzzystrmatch.dmetaphone(name) = vsql_fuzzystrmatch.dmetaphone('Schmidt')
+   OR vsql_fuzzystrmatch.dmetaphone_alt(name) = vsql_fuzzystrmatch.dmetaphone('Schmidt')
+   OR vsql_fuzzystrmatch.dmetaphone(name) = vsql_fuzzystrmatch.dmetaphone_alt('Schmidt');
+```
+
+## Escolhendo uma abordagem {#choosing-an-approach}
+
+| Situação | Abordagem recomendada |
+|---|---|
+| Agrupamento de nomes em inglês por sonoridade semelhante | Soundex |
+| Tolerância a erros de digitação com um orçamento de distância | Levenshtein |
+| Fonética do inglês melhor que o Soundex | Metaphone |
+| Nomes de origens linguísticas mistas | Double Metaphone |
+| Pontuação de similaridade em vez de um limite | [trgm_similarity](/pt-BR/guides/trigram-similarity) |
+
+## Referência de funções {#function-reference}
+
+| Função | Retorna | Observações |
+|---|---|---|
+| `soundex(text)` | TEXT | Código Soundex de 4 caracteres |
+| `difference(text, text)` | INT | Pontuação de sobreposição Soundex de 0 a 4 |
+| `levenshtein(s, t)` | INT | Distância de edição, todas as operações custam 1 |
+| `levenshtein_cost(s, t, ins, del, sub)` | INT | Distância de edição com custos personalizados |
+| `levenshtein_less_equal(s, t, max_d)` | INT | Distância se ≤ max_d; caso contrário max_d+1 |
+| `levenshtein_less_equal_cost(s, t, ins, del, sub, max_d)` | INT | Custos personalizados + saída antecipada |
+| `metaphone(text, max_len)` | TEXT | Código Metaphone, truncado em max_len |
+| `dmetaphone(text)` | TEXT | Código primário do Double Metaphone |
+| `dmetaphone_alt(text)` | TEXT | Código alternativo do Double Metaphone |
+
+## Limitações conhecidas {#known-limitations}
+
+**Sem sobrecarga de funções.** O VEF registra funções apenas pelo nome; duas funções com o mesmo nome não podem coexistir. Onde o PostgreSQL usa sobrecargas (`levenshtein` com 2 ou 5 argumentos), esta extensão usa nomes distintos (`levenshtein` e `levenshtein_cost`).
+
+**Limite de comprimento de string.** As entradas de `levenshtein` devem ter ≤ 255 caracteres.
+
+## Veja também {#see-also}
+
+- [Como encontrar strings semelhantes com similaridade de trigramas no MySQL](/pt-BR/guides/trigram-similarity)
+- [Como implementar busca em texto completo no MySQL](/pt-BR/guides/full-text-search)
+- [Como manipular e transformar strings em SQL](/pt-BR/guides/string-functions)
+- [MySQL REGEXP](/pt-BR/tutorial/regexp)

@@ -1,0 +1,195 @@
+---
+title: "Conjuntos de Caracteres e Collations do MySQL"
+sidebarTitle: "Escolhendo Conjuntos de Caracteres"
+description: "Como funcionam os conjuntos de caracteres e as collations do MySQL: utf8mb4 vs utf8, escolha de collations, definição de conjuntos de caracteres no nível do banco de dados e da coluna, comportamento de ordenação e correção de problemas de charset."
+keywords: "mysql character set, mysql collation, mysql utf8mb4, mysql utf8 vs utf8mb4, mysql charset, mysql unicode, mysql collation comparison, mysql set charset, mysql character encoding"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O conjunto de caracteres do MySQL controla como as strings são armazenadas (quais bytes representam quais caracteres). A collation controla como as strings são comparadas e ordenadas. Acertar isso desde o início evita dados corrompidos e ordenações quebradas que são dolorosos de corrigir depois.
+
+## utf8mb4 — O Padrão Certo {#utf8mb4--the-right-default}
+
+Use sempre `utf8mb4`. O `utf8` do MySQL (sem o `mb4`) é uma codificação de 3 bytes que não consegue armazenar caracteres Unicode de 4 bytes — o que inclui emojis, muitos caracteres chineses e vários símbolos. `utf8mb4` é a codificação UTF-8 completa.
+
+```sql
+-- Verify your database is using utf8mb4
+SHOW CREATE DATABASE myapp;
+-- Should show: DEFAULT CHARACTER SET utf8mb4
+```
+
+Se você está em um banco de dados legado que usa `utf8`, migrar para `utf8mb4` exige converter o banco de dados, as tabelas e as colunas.
+
+### Referência rápida de conjuntos de caracteres {#character-set-quick-reference}
+
+| Conjunto de caracteres | Use quando | Evite quando | Custo de migração se estiver errado |
+|:-------------|:---------|:-----------|:------------------------|
+| `utf8mb4` | Qualquer esquema novo — trata todo o Unicode, incluindo emojis e CJK moderno | Nunca evite em trabalho novo | N/A — é o padrão certo |
+| `utf8` (legado, 3 bytes) | Nunca — o único motivo para mantê-lo é não conseguir agendar uma janela de migração | Armazenar emojis, caracteres CJK suplementares ou qualquer Unicode de 4 bytes | Médio — `ALTER TABLE … CONVERT TO CHARACTER SET utf8mb4`; reconstrói cada tabela afetada |
+| `latin1` | Texto da Europa Ocidental de um byte em um esquema legado; armazenamento ligeiramente menor que `utf8mb4` para dados somente ASCII | Qualquer conteúdo gerado por usuários, dados multilíngues ou qualquer coisa que toque a web | Alto — a conversão binary-safe não é automática; dados fora da faixa do latin1 se corrompem silenciosamente |
+| `binary` / `BLOB` | Bytes brutos — conteúdo de arquivos, hashes criptográficos, formatos binários compactados | Texto que você vai pesquisar, ordenar ou exibir | Baixo — colunas `BINARY` não têm semântica de charset; converter para um charset de texto exige decodificação no nível da aplicação |
+
+A coluna de custo trata do trabalho necessário para corrigir uma escolha errada depois, não do custo de desempenho do charset em si. O `latin1` é a armadilha: ele aceita qualquer valor de byte sem erro, então os dados ruins entram em silêncio e só aparecem quando você tenta exibi-los ou convertê-los.
+
+## Collations {#collations}
+
+A collation determina a ordem de classificação e o comportamento de comparação. Escolhas comuns:
+
+| Collation | Comportamento de ordenação | Sensível a maiúsculas | Sensível a acentos |
+|:----------|:-------------|:--------------|:----------------|
+| `utf8mb4_general_ci` | Ordem Unicode aproximada | Não | Não |
+| `utf8mb4_unicode_ci` | Algoritmo Unicode completo | Não | Não |
+| `utf8mb4_0900_ai_ci` | Unicode 9.0, o mais preciso | Não | Não |
+| `utf8mb4_bin` | Binário (byte a byte) | Sim | Sim |
+| `utf8mb4_0900_as_cs` | Unicode 9.0 | Sim | Sim |
+
+`utf8mb4_0900_ai_ci` é a collation padrão e a melhor escolha de uso geral. Ela trata o Unicode corretamente, não diferencia maiúsculas de minúsculas (`ci`) e não diferencia acentos (`ai`). Use `utf8mb4_bin` somente quando precisar de correspondência exata de bytes.
+
+`ci` = não diferencia maiúsculas (case-insensitive), `cs` = diferencia maiúsculas (case-sensitive), `ai` = não diferencia acentos (accent-insensitive), `as` = diferencia acentos (accent-sensitive).
+
+## Definindo Conjuntos de Caracteres {#setting-character-sets}
+
+**Na criação do banco de dados:**
+```sql
+CREATE DATABASE myapp
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_0900_ai_ci;
+```
+
+**Na criação da tabela:**
+```sql
+CREATE TABLE users (
+    id   INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+**No nível da coluna (sobrescreve o padrão da tabela):**
+```sql
+CREATE TABLE products (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(100),
+    description TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+);
+```
+
+Conjuntos de caracteres no nível da coluna são úteis quando uma coluna precisa de correspondência sensível a maiúsculas enquanto o restante da tabela usa correspondência insensível.
+
+**Alterar o conjunto de caracteres de uma coluna:**
+```sql
+ALTER TABLE users
+MODIFY name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+**Converter uma tabela inteira:**
+```sql
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+`CONVERT TO` altera todas as colunas em uma única instrução. Ele reconstrói a tabela, então leva um tempo proporcional ao tamanho da tabela.
+
+## Verificando Conjuntos de Caracteres {#checking-character-sets}
+
+```sql
+-- Database level
+SHOW CREATE DATABASE myapp;
+
+-- Table and column level
+SHOW CREATE TABLE users;
+
+-- Connection level
+SHOW VARIABLES LIKE 'character_set%';
+SHOW VARIABLES LIKE 'collation%';
+```
+
+As colunas na saída de `SHOW CREATE TABLE` que não mostram um charset estão herdando o padrão da tabela.
+
+## Conjunto de Caracteres da Conexão {#connection-character-set}
+
+O conjunto de caracteres da conexão controla a codificação que o MySQL espera do cliente e usa para literais de string. Defina-o sempre explicitamente:
+
+```sql
+SET NAMES utf8mb4;
+-- equivalent to:
+SET character_set_client = utf8mb4;
+SET character_set_results = utf8mb4;
+SET character_set_connection = utf8mb4;
+```
+
+A maioria dos drivers faz isso automaticamente quando você define o charset na string de conexão. As conexões usam `utf8mb4` por padrão, então sobrescritas explícitas raramente são necessárias.
+
+## Efeitos da Collation nas Consultas {#collation-effects-on-queries}
+
+A collation afeta `WHERE`, `ORDER BY` e a unicidade:
+
+```sql
+-- utf8mb4_0900_ai_ci: these three are equal
+SELECT * FROM users WHERE name = 'alice';  -- matches Alice, ALICE, alice
+
+-- utf8mb4_bin: exact match only
+SELECT * FROM users WHERE name COLLATE utf8mb4_bin = 'alice';  -- only 'alice'
+```
+
+Para ordenar com uma collation diferente do padrão da coluna:
+
+```sql
+SELECT name FROM users ORDER BY name COLLATE utf8mb4_unicode_ci;
+```
+
+## Convertendo de utf8 para utf8mb4 {#converting-from-utf8-to-utf8mb4}
+
+Se o seu banco de dados legado usa `utf8` (3 bytes), converta-o:
+
+```sql
+-- Convert one table
+ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+-- Update the database default
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+Atualize também a configuração do servidor para tornar `utf8mb4` o padrão de novas conexões:
+
+```ini
+[mysqld]
+character_set_server = utf8mb4
+collation_server = utf8mb4_0900_ai_ci
+
+[client]
+default-character-set = utf8mb4
+```
+
+Converter tabelas grandes leva tempo e reconstrói a tabela. Agende durante uma janela de manutenção ou use uma ferramenta de mudança de esquema online.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Por que o `utf8` do MySQL não suporta emojis? {#why-does-utf8-in-mysql-not-support-emoji}
+
+O `utf8` do MySQL é um subconjunto não padrão de 3 bytes do UTF-8 que antecede a extensão Unicode de 4 bytes. Os emojis (e muitos outros caracteres Unicode modernos) exigem 4 bytes. `utf8mb4` é a implementação completa e correta do UTF-8. O antigo alias `utf8` existe somente para compatibilidade retroativa — nunca o use em esquemas novos.
+
+#### Alterar a collation afeta os dados existentes? {#does-changing-collation-affect-existing-data}
+
+Alterar a collation não altera os bytes armazenados. Altera a forma como esses bytes são comparados e ordenados. Porém, os índices únicos são aplicados usando a collation, então mudar de `_bin` para `_ci` pode revelar colisões (`Alice` e `alice` passam a ser iguais) que precisam ser resolvidas antes.
+
+#### Qual collation devo usar? {#which-collation-should-i-use}
+
+`utf8mb4_0900_ai_ci` para a maioria dos casos de uso — é a collation padrão e trata bem o Unicode. Use `utf8mb4_bin` somente quando precisar de correspondência exata de bytes. Evite `utf8mb4_general_ci` em projetos novos — ela antecede `_0900_ai_ci` e trata alguns casos extremos de Unicode incorretamente.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| Emojis armazenados como `????` | A coluna ou a conexão está usando `utf8` (3 bytes) — converta para `utf8mb4` |
+| Erro `Incorrect string value` | Inserção de caracteres que o charset da coluna não consegue codificar — converta a coluna para `utf8mb4` |
+| A ordem de classificação está errada | Incompatibilidade de collation — verifique `SHOW CREATE TABLE` e defina um `COLLATE` explícito no `ORDER BY` |
+| A comparação sensível a maiúsculas não funciona | A coluna usa uma collation `_ci` — use `COLLATE utf8mb4_bin` na cláusula WHERE ou altere a collation da coluna |
+| Erro `Illegal mix of collations` | Comparação de colunas ou literais com collations diferentes — adicione `COLLATE` para que correspondam, ou converta a coluna |
+
+## Veja também {#see-also}
+
+- [Funções de String do MySQL](/pt-BR/guides/string-functions) — funções de string cujo comportamento depende da collation
+- [utf8mb4 no MySQL: Armazenando Emojis e Unicode Completo](/pt-BR/guides/utf8mb4) — a armadilha utf8 vs utf8mb4 e o armazenamento de emojis
+- [Diferenciação de maiúsculas e minúsculas no MySQL](/pt-BR/tutorial/case-sensitivity) — o que uma collation decide sobre uma comparação

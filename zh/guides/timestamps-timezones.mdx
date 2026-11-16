@@ -1,0 +1,156 @@
+---
+title: "MySQL 中的时间戳与时区"
+sidebarTitle: "处理时区"
+description: "MySQL 如何处理 DATETIME 与 TIMESTAMP、时区的存储和转换，以及当您的应用程序跨越多个时区时如何避免常见错误。"
+keywords: "mysql timestamp timezone, mysql datetime vs timestamp, mysql utc, mysql time_zone, mysql convert timezone, mysql current_timestamp, mysql daylight saving"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+时区错误是最难调试的错误之一：它们随服务器位置时隐时现，在开发环境和生产环境中表现不同，而且往往只在夏令时切换之后才暴露出来。根本原因几乎总是 MySQL 存储时间的方式与应用程序期望读取它的方式不一致。
+
+## DATETIME 与 TIMESTAMP {#datetime-vs-timestamp}
+
+这两种类型看起来相似，但在关键时刻（读取时）的行为不同。
+
+| 类型 | 存储 | 范围 | 时区行为 |
+|:-----|:--------|:------|:-------------------|
+| `DATETIME` | 8 字节 | 1000-01-01 到 9999-12-31 | 不转换，按字面值存储并返回 |
+| `TIMESTAMP` | 4 字节 | 1970-01-01 到 2038-01-19 | 以 UTC 存储；读取时转换为会话 `time_zone` |
+
+`TIMESTAMP` 会自动转换值：
+- **INSERT/UPDATE** 时：从会话 `time_zone` 转换为 UTC 存储
+- **SELECT** 时：从 UTC 转换回会话 `time_zone` 显示
+
+`DATETIME` 不做任何转换。您写入什么值，就取回什么值。
+
+像 `'America/New_York'` 这样的命名时区需要加载时区表（请参阅下文的 [命名时区](#named-time-zones)），刚初始化的服务器没有这些表。在运行下面的示例之前，请用 `SELECT COUNT(*) FROM mysql.time_zone_name;` 检查；如果结果是 `0`，请先加载时区表，或改用 `'-05:00'` 这样的数字偏移量。
+
+```sql
+SET time_zone = 'America/New_York';
+
+CREATE TABLE events (
+    ts  TIMESTAMP,
+    dt  DATETIME
+);
+
+INSERT INTO events VALUES ('2024-03-15 12:00:00', '2024-03-15 12:00:00');
+
+-- Switch to a different timezone and re-read
+SET time_zone = 'America/Los_Angeles';
+SELECT ts, dt FROM events;
+-- ts: 2024-03-15 09:00:00  (converted: UTC-8 vs UTC-5 = 3 hours earlier)
+-- dt: 2024-03-15 12:00:00  (unchanged)
+```
+
+## 2038 年问题 {#the-2038-problem}
+
+`TIMESTAMP` 以 32 位 Unix 时间戳存储。它无法表示 `2038-01-19 03:14:07 UTC` 之后的日期。任何存储未来日期的应用程序（预订、订阅、计划事件）都应使用 `DATETIME` 以避免触及这个限制。
+
+```sql
+-- This will fail or behave unexpectedly near or after 2038
+expiry_date TIMESTAMP   -- wrong
+
+-- Use DATETIME for dates beyond 2038
+expiry_date DATETIME    -- correct
+```
+
+## 服务器时区与会话时区 {#server-and-session-time-zones}
+
+MySQL 有两个相互独立的时区设置：
+
+```sql
+-- Server's global time zone (set at startup or in my.cnf)
+SELECT @@global.time_zone;
+
+-- Session time zone (can differ per connection)
+SELECT @@session.time_zone;
+```
+
+如果 `time_zone` 显示为 `SYSTEM`，MySQL 使用的是操作系统的时区。这在操作系统发生变化（服务器迁移、夏令时切换）之前都能正常工作，之后您的时间戳就会发生偏移。
+
+**最佳实践**：把服务器显式设置为 UTC，并在应用程序中处理显示转换。
+
+```ini
+# my.cnf
+[mysqld]
+default-time-zone = '+00:00'
+```
+
+或者在运行时设置：
+```sql
+SET GLOBAL time_zone = '+00:00';
+SET SESSION time_zone = '+00:00';
+```
+
+## 命名时区 {#named-time-zones}
+
+`'+00:00'` 和 `'UTC'` 都有效，但像 `'America/New_York'` 这样的命名时区需要加载时区表。如果 `CONVERT_TZ()` 返回 NULL 或命名时区失败，说明这些表缺失。
+
+```sql
+-- Check if named timezone tables are loaded
+SELECT COUNT(*) FROM mysql.time_zone_name;
+
+-- Load them (run from the OS shell)
+-- mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql
+```
+
+```sql
+-- Convert between time zones
+SELECT CONVERT_TZ('2024-03-15 12:00:00', 'America/New_York', 'UTC');
+-- Returns: 2024-03-15 16:00:00  (March 15 is EDT = UTC-4, so noon EDT = 16:00 UTC)
+```
+
+## AUTO_UPDATE 列 {#auto_update-columns}
+
+`TIMESTAMP` 列支持在插入和更新时自动填充：
+
+```sql
+CREATE TABLE posts (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    title      VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+如果会话时区是 UTC，`CURRENT_TIMESTAMP` 就以 UTC 求值，因此无论谁从哪个时区连接，`created_at` 和 `updated_at` 的存储都是一致的。
+
+您可以用 `DATETIME` 和 `NOW()` 做同样的事：
+
+```sql
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+```
+
+`NOW()` 返回会话时区中的当前日期和时间，这是把会话统一为 UTC 的另一个理由。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我应该把时间戳以 UTC 存入 DATETIME，还是使用 TIMESTAMP？ {#should-i-store-timestamps-as-utc-in-datetime-or-use-timestamp}
+
+如果您的日期不超过 2038 年的上限，`TIMESTAMP` 更简洁，它会自动处理 UTC 转换。对于 2038 年之后的未来日期，或需要存储 1970 年之前的历史日期的应用程序，请使用 `DATETIME`，并在应用层强制使用 UTC，也就是在插入前始终转换为 UTC。
+
+#### 为什么服务器迁移后时间戳会偏移？ {#why-do-timestamps-shift-after-a-server-migration}
+
+旧服务器使用 `time_zone = SYSTEM` 指向某个操作系统时区；新服务器指向另一个时区（或 UTC）。以 UTC 存储的 `TIMESTAMP` 值在两个时区中都能正确显示，但如果有任何值是按系统时区而不是 UTC 存储的，它们就会偏移。迁移前请在两台服务器上用 `SELECT @@global.time_zone` 进行审计。
+
+#### 如何只存储日期而不带时间部分？ {#how-do-i-store-just-a-date-with-no-time-component}
+
+使用 `DATE`。它占 3 字节存储，没有一天中的时间，也没有时区歧义。无论会话时区如何，像 `WHERE date_col = '2024-03-15'` 这样的操作都是无歧义的。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 部署后时间戳偏移了几个小时 | 不同环境的会话或服务器 `time_zone` 不同，请统一为 UTC |
+| `CONVERT_TZ()` 返回 NULL | 命名时区表未加载，请运行 `mysql_tzinfo_to_sql` |
+| 2038 年之后的日期无法存储 | 使用 `DATETIME` 代替 `TIMESTAMP` |
+| 夏令时切换后 `TIMESTAMP` 显示错误的时间 | 设置 `time_zone = '+00:00'` 而不是 `SYSTEM`，以避免对操作系统夏令时的依赖 |
+| `updated_at` 没有自动更新 | 列需要 `ON UPDATE CURRENT_TIMESTAMP` 子句 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 日期和时间函数](/zh/guides/date-time-functions)：用于处理 DATETIME 和 TIMESTAMP 值的函数

@@ -1,0 +1,156 @@
+---
+title: "在 MySQL 中存储 IP 地址"
+sidebarTitle: "存储 IP 地址"
+description: "如何在 MySQL 中高效地存储 IP 地址 — 为什么 VARCHAR 和 INT 不够用，以及 VillageSQL 的 INET 类型如何在一个列中处理 IPv4 和 IPv6。"
+keywords: "mysql store ip address, mysql inet type, mysql ip address column, mysql ipv4 storage, mysql ip validation, mysql ip address best practice"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+大多数 MySQL 模式把 IP 地址存储为 `VARCHAR(45)`。这能用，但它浪费空间，完全不验证格式，并且按字典序而不是数值排序 — 所以 `192.168.1.10` 排在 `192.168.1.9` 前面。VillageSQL 的 `INET` 类型解决了所有这些问题，并在同一列中处理 IPv4 和 IPv6。
+
+## MySQL 的默认做法：VARCHAR {#the-mysql-default-varchar}
+
+最直接的方法：
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address VARCHAR(45),    -- fits IPv4 (15 chars) and IPv6 (39 chars)
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES ('192.168.1.5');
+```
+
+`VARCHAR(45)` 存储您给它的任何字符串。没有验证 — `'not-an-ip'` 插入时不会报错。排序不遵循数值顺序，而与子网比较需要字符串操作或转换函数。
+
+## 标准的变通方法：INT UNSIGNED + INET_ATON {#the-standard-workaround-int-unsigned--inet_aton}
+
+对于 IPv4，MySQL 的 `INET_ATON()` 把点分十进制字符串转换为 4 字节整数。这很紧凑，并且排序正确：
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INT UNSIGNED,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address)
+VALUES (INET_ATON('192.168.1.5'));
+
+SELECT INET_NTOA(ip_address) AS ip FROM access_log;
+```
+
+这对于只有 IPv4 的模式很有效。问题在于 IPv6：`INT UNSIGNED` 无法容纳 128 位地址。IPv6 需要 `VARBINARY(16)` 和 `INET6_ATON()` / `INET6_NTOA()`，这意味着在需要支持 IPv6 时要做模式变更。
+
+## 使用 VillageSQL：INET 类型 {#with-villagesql-the-inet-type}
+
+VillageSQL 的 `vsql_network_address` 扩展添加了原生的 `INET` 类型，它以紧凑的二进制格式存储 IPv4 和 IPv6 地址 — 两个地址族每行固定 19 字节，IPv4 值填充到该宽度 — 并在写入时验证输入。
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- IPv4 and IPv6 in the same column
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.5')),
+    (inet_from_string('10.0.0.1')),
+    (inet_from_string('2001:db8::1'));
+
+-- Read back as strings
+SELECT inet_to_string(ip_address), accessed_at FROM access_log;
+
+-- Sort by IP address numerically (not lexicographically)
+SELECT inet_to_string(ip_address) FROM access_log ORDER BY ip_address;
+```
+
+无效的字符串不会中止语句：`inet_from_string()` 返回 NULL 并附带 Warning 3200，因此该行以 NULL 值插入。如果您希望错误的输入导致插入失败，请把列声明为 `NOT NULL`。
+
+### 使用已存储的地址 {#working-with-stored-addresses}
+
+```sql
+-- Extract address family
+SELECT inet_to_string(ip_address),
+       inet_family(ip_address) AS family   -- 4 or 6
+FROM access_log;
+
+-- Check if an address is IPv6
+SELECT * FROM access_log
+WHERE inet_family(ip_address) = 6;
+
+-- Store with a netmask (INET allows host bits)
+INSERT INTO access_log (ip_address)
+VALUES (inet_from_string('192.168.1.5/24'));
+
+SELECT inet_host(ip_address)    AS host_part,
+       inet_masklen(ip_address) AS prefix_len
+FROM access_log WHERE id = 1;
+```
+
+### 索引 {#indexing}
+
+```sql
+CREATE INDEX idx_ip ON access_log(ip_address);
+
+-- Equality lookups use the index
+SELECT * FROM access_log
+WHERE ip_address = inet_from_string('192.168.1.5');
+```
+
+## 选择存储方法 {#choosing-a-storage-approach}
+
+| 方法 | IPv6 支持 | 插入时验证 | 排序正确 | 存储 |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(45)` | 是 | 否 | 否（字典序） | 15–45 字节 |
+| `INT UNSIGNED` + `INET_ATON` | 否 | 否 | 是（数值） | 4 字节 |
+| `VARBINARY(16)` + `INET6_ATON` | 是 | 否 | 是 | 4 或 16 字节 |
+| `INET`（VillageSQL） | 是 | 是 | 是 | 19 字节 |
+
+对于需要同时支持 IPv4 和 IPv6 并内置验证的新模式，`INET` 是最干净的选择。对于只有 IPv4 且不依赖 VillageSQL 的模式，`INT UNSIGNED` 配合 `INET_ATON` / `INET_NTOA` 是成熟的方法。
+
+有关对已存储地址的子网查询，请参阅 [在 MySQL 中按子网查询](/zh/guides/subnet-queries)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### INET 可以存储带网络掩码的地址吗，比如 192.168.1.5/24？ {#can-inet-store-addresses-with-a-netmask-like-1921681524}
+
+可以。`INET` 允许主机位 — `192.168.1.5/24` 是有效的。如果您想强制主机位为零（纯网络地址），请改用 `CIDR` 类型。
+
+#### INET 在插入时验证地址吗？ {#does-inet-validate-the-address-on-insert}
+
+是的。`inet_from_string('not-an-ip')` 返回 NULL，而不是存储垃圾数据。如果您把 NULL 传给带有 NOT NULL 约束的 INET 列，插入会失败。
+
+#### ORDER BY ip_address 如何对混合的 IPv4/IPv6 排序？ {#how-does-order-by-ip_address-sort-mixed-ipv4ipv6}
+
+IPv4 地址排在 IPv6 地址之前。在每个地址族内部，地址按数值排序。这与 PostgreSQL 的 INET 排序顺序一致。
+
+#### INET 与 PostgreSQL 的 inet 类型相同吗？ {#is-inet-the-same-as-postgresqls-inet-type}
+
+在功能上是的 — 相同的类型（INET、CIDR、MACADDR、MACADDR8）、相同的函数命名约定、相同的验证规则。主要区别在于 VillageSQL 为比较和子网检查提供的是函数而不是运算符。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.inet_from_string does not exist` | 运行 `INSTALL EXTENSION vsql_network_address` |
+| `inet_from_string()` 返回 NULL | 输入字符串不是有效的 IP 地址 |
+| IPv6 地址以展开形式显示 | 符合预期 — `2001:db8::1` 存储并读取为 `2001:0db8:0000:0000:0000:0000:0000:0001` |
+| `192.168.1.5/24` 报 `Incorrect CIDR value` | CIDR 要求主机位为零 — 使用 `192.168.1.0/24`，或改用 INET。把错误的值直接插入 CIDR 列时，在非严格 SQL 模式下存储 NULL 并附带警告；在严格 SQL 模式（默认）下会抛出错误并拒绝该语句。作为函数调用 `cidr_from_string('192.168.1.5/24')` 时，在测试过的每种 SQL 模式下都返回 NULL 并附带警告。 |
+| 按 IP 排序的结果不对 | 确保您排序的是 INET 列，而不是 `VARCHAR` 副本 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的 IPv6 存储](/zh/guides/ipv6-storage) — 用 INET 类型统一存储 IPv4 和 IPv6
+- [在 MySQL 中按子网查询](/zh/guides/subnet-queries) — 使用 INET 按网络范围过滤行
+- [在 MySQL 中按 IP 查询地理位置](/zh/guides/ip-geolocation) — 用地理数据丰富 IP 地址
+- [在 MySQL 中存储 MAC 地址](/zh/guides/storing-mac-addresses) — 对硬件地址采用同样的方法

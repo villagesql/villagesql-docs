@@ -1,0 +1,125 @@
+---
+title: "Consultas de Intervalo Multidimensionais no MySQL"
+sidebarTitle: "Consultas Multidimensionais"
+description: "Como armazenar e consultar dados multidimensionais no MySQL usando a extensão vsql_cube do VillageSQL — contenção, sobreposição e vizinho mais próximo em vários atributos numéricos."
+keywords: "mysql multi-dimensional range query, mysql geometric type, mysql cube extension, mysql nearest neighbor, mysql n-dimensional search, vsql_cube"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  Este guia requer o VillageSQL 0.0.4 ou posterior.
+</Note>
+
+O MySQL não tem uma forma nativa de representar um ponto ou uma região em um espaço n-dimensional. Você pode encadear condições AND em várias colunas numéricas, mas isso só cobre a contenção — não se estende a consultas de distância e não permite tratar os atributos de uma linha como um valor geométrico unificado. A extensão `vsql_cube` do VillageSQL adiciona um tipo personalizado `cube` que torna os dois tipos de consulta naturais.
+
+## O Problema {#the-problem}
+
+Suponha que você tenha um catálogo de produtos em que cada produto tem um preço, uma avaliação média e uma contagem de avaliações. Um comprador quer produtos com preço entre US$ 50 e US$ 200, avaliação de pelo menos 3,5 e pelo menos 50 avaliações. Isso é um AND de três partes:
+
+```sql
+-- Works for containment, but doesn't generalize
+SELECT name FROM products
+WHERE price BETWEEN 50 AND 200
+  AND rating BETWEEN 3.5 AND 5.0
+  AND reviews BETWEEN 50 AND 1000;
+```
+
+A cadeia de AND encontra as correspondências. Mas se você quiser os 5 produtos mais parecidos com um dado produto — os mais próximos em preço, avaliação e contagem de avaliações ao mesmo tempo — não há uma resposta natural em SQL. Você teria que trazer os candidatos para o código da aplicação e calcular as distâncias lá.
+
+## Com o VillageSQL: o tipo cube {#with-villagesql-the-cube-type}
+
+```sql
+INSTALL EXTENSION vsql_cube;
+```
+
+O tipo `cube` armazena um ponto ou uma caixa em um espaço n-dimensional. Um ponto é uma localização; uma caixa é uma região definida por duas coordenadas de canto. Os dois ficam em uma coluna comum.
+
+```sql
+CREATE TABLE products (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255),
+    attrs `cube`(3)
+);
+```
+
+`cube` é uma palavra reservada do MySQL, então coloque-a entre crases no DDL. O parâmetro de dimensão (`3`) é obrigatório — `cube` sem um número não é suportado.
+
+### Inserindo dados {#inserting-data}
+
+Insira a string de coordenadas diretamente e deixe a própria conversão da coluna
+interpretá-la. Não a envolva em `cube_point_nd()`: essa função retorna um `cube`
+sem parâmetro, que não pode ser convertido implicitamente em uma coluna `cube(3)`
+parametrizada por dimensão (`ERROR 3219`).
+
+```sql
+INSERT INTO products (name, attrs) VALUES
+    ('Budget Widget',   '29.99,4.1,320'),
+    ('Standard Widget', '79.99,4.4,1250'),
+    ('Premium Widget',  '149.99,4.7,890'),
+    ('Discount Widget', '19.99,3.2,45'),
+    ('Pro Widget',      '199.99,4.8,2100');
+```
+
+As coordenadas aqui são `(price, rating, review_count)` — um ponto por produto.
+
+### Consultas de intervalo com cube_contains {#range-queries-with-cube_contains}
+
+Defina a sua região de busca como uma caixa. `cube_box_nd()` recebe as coordenadas do canto inferior seguidas pelas do canto superior, então uma caixa tridimensional recebe seis números.
+
+```sql
+-- Products: $50–$200, rating 3.5–5.0, 50–2000 reviews
+SET @region = cube_box_nd(50.0, 3.5, 50, 200.0, 5.0, 2000);
+
+SELECT name FROM products
+WHERE cube_contains(@region, attrs);
+```
+
+`cube_contains(@region, attrs)` retorna 1 quando o ponto do produto está dentro da caixa — equivalente às três condições AND de uma vez, mas também combinável com consultas de distância.
+
+### Vizinho mais próximo com cube_distance {#nearest-neighbor-with-cube_distance}
+
+Para encontrar os produtos mais parecidos com um dado produto, meça a distância euclidiana no espaço de atributos:
+
+```sql
+-- 3 products most similar to Standard Widget (79.99, 4.4, 1250)
+SET @target = cube_point_nd(79.99, 4.4, 1250);
+
+SELECT name,
+       ROUND(cube_distance(attrs, @target), 2) AS distance
+FROM products
+WHERE name != 'Standard Widget'
+ORDER BY cube_distance(attrs, @target)
+LIMIT 3;
+```
+
+Uma observação sobre escala: o preço está na casa das centenas, a avaliação vai de 0 a 5 e a contagem de avaliações pode chegar aos milhares. A distância euclidiana bruta será dominada pela contagem de avaliações. Normalize as três dimensões para uma escala comum (por exemplo, 0–1) antes de inserir, se você quiser uma pontuação de similaridade equilibrada.
+
+### Verificando sobreposição {#checking-overlap}
+
+`cube_overlaps()` retorna 1 se duas caixas compartilham algum espaço — útil para verificar se um produto se qualifica para qualquer uma de várias faixas de promoção:
+
+```sql
+SET @promo_a = cube_box_nd(0.0, 4.5, 500, 100.0, 5.0, 9999);
+SET @promo_b = cube_box_nd(100.0, 4.0, 100, 300.0, 5.0, 9999);
+
+SELECT name FROM products
+WHERE cube_overlaps(@promo_a, attrs) OR cube_overlaps(@promo_b, attrs);
+```
+
+## Solução de Problemas {#troubleshooting}
+
+| Erro | Correção |
+|---|---|
+| `ERROR: Function 'cube_point_nd' does not exist` | Execute `INSTALL EXTENSION vsql_cube` |
+| Tipo de coluna `cube` não reconhecido | Confirme que você está executando o VillageSQL 0.0.4 ou posterior |
+| Declaração de coluna rejeitada | Coloque `cube` entre crases no DDL: `` `cube`(N) `` |
+| Os resultados de distância parecem errados | Normalize as coordenadas — a distância euclidiana bruta é distorcida pela dimensão de maior escala |
+
+## Veja também {#see-also}
+
+- [Gerando Embeddings Vetoriais no MySQL](/pt-BR/guides/vector-embeddings) — vetores gerados por IA como outra abordagem para similaridade multidimensional
+- [Como implementar busca de texto completo no MySQL](/pt-BR/guides/full-text-search) — busca por palavras-chave como alternativa para dados de texto
+- [Como escolher o tipo de coluna certo para os seus dados](/pt-BR/guides/choosing-data-types) — quando recorrer ao cube versus os tipos de coluna padrão

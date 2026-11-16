@@ -1,0 +1,156 @@
+---
+title: "Timestamps e Fusos Horários no MySQL"
+sidebarTitle: "Lidando com Fusos Horários"
+description: "Como o MySQL trata DATETIME vs TIMESTAMP, o armazenamento e a conversão de fusos horários, e como evitar bugs comuns quando sua aplicação abrange vários fusos horários."
+keywords: "mysql timestamp timezone, mysql datetime vs timestamp, mysql utc, mysql time_zone, mysql convert timezone, mysql current_timestamp, mysql daylight saving"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Bugs de fuso horário estão entre os mais difíceis de depurar — eles aparecem e desaparecem conforme a localização do servidor, se manifestam de forma diferente em desenvolvimento e em produção, e muitas vezes só surgem depois de uma transição de horário de verão. A causa raiz é quase sempre uma diferença entre como o MySQL armazena o tempo e como a aplicação espera lê-lo.
+
+## DATETIME vs TIMESTAMP {#datetime-vs-timestamp}
+
+Esses dois tipos parecem semelhantes, mas se comportam de forma diferente no momento crítico — a leitura.
+
+| Tipo | Armazenamento | Intervalo | Comportamento de fuso horário |
+|:-----|:--------|:------|:-------------------|
+| `DATETIME` | 8 bytes | 1000-01-01 a 9999-12-31 | Sem conversão — armazena e retorna o valor literal |
+| `TIMESTAMP` | 4 bytes | 1970-01-01 a 2038-01-19 | Armazena em UTC; converte para o `time_zone` da sessão na leitura |
+
+`TIMESTAMP` converte os valores automaticamente:
+- No **INSERT/UPDATE**: converte do `time_zone` da sessão para UTC para o armazenamento
+- No **SELECT**: converte de UTC de volta para o `time_zone` da sessão para a exibição
+
+`DATETIME` não faz conversão. O valor que você grava é o valor que você recebe de volta.
+
+Zonas nomeadas como `'America/New_York'` exigem que as tabelas de fuso horário estejam carregadas (consulte [Fusos Horários Nomeados](#named-time-zones) abaixo) — um servidor recém-inicializado não as tem. Verifique com `SELECT COUNT(*) FROM mysql.time_zone_name;` antes de executar o exemplo abaixo; se for `0`, carregue-as primeiro ou substitua por um deslocamento numérico como `'-05:00'`.
+
+```sql
+SET time_zone = 'America/New_York';
+
+CREATE TABLE events (
+    ts  TIMESTAMP,
+    dt  DATETIME
+);
+
+INSERT INTO events VALUES ('2024-03-15 12:00:00', '2024-03-15 12:00:00');
+
+-- Switch to a different timezone and re-read
+SET time_zone = 'America/Los_Angeles';
+SELECT ts, dt FROM events;
+-- ts: 2024-03-15 09:00:00  (converted: UTC-8 vs UTC-5 = 3 hours earlier)
+-- dt: 2024-03-15 12:00:00  (unchanged)
+```
+
+## O Problema de 2038 {#the-2038-problem}
+
+`TIMESTAMP` é armazenado como um timestamp Unix de 32 bits. Ele não consegue representar datas depois de `2038-01-19 03:14:07 UTC`. Qualquer aplicação que armazena datas futuras — reservas, assinaturas, eventos agendados — deve usar `DATETIME` para evitar esse limite.
+
+```sql
+-- This will fail or behave unexpectedly near or after 2038
+expiry_date TIMESTAMP   -- wrong
+
+-- Use DATETIME for dates beyond 2038
+expiry_date DATETIME    -- correct
+```
+
+## Fusos Horários do Servidor e da Sessão {#server-and-session-time-zones}
+
+O MySQL tem duas configurações independentes de fuso horário:
+
+```sql
+-- Server's global time zone (set at startup or in my.cnf)
+SELECT @@global.time_zone;
+
+-- Session time zone (can differ per connection)
+SELECT @@session.time_zone;
+```
+
+Se `time_zone` mostra `SYSTEM`, o MySQL está usando o fuso horário do sistema operacional. Isso funciona até o SO mudar (migração de servidor, transição de horário de verão) — então seus timestamps se deslocam.
+
+**Boa prática**: defina o servidor explicitamente em UTC e faça a conversão para exibição na aplicação.
+
+```ini
+# my.cnf
+[mysqld]
+default-time-zone = '+00:00'
+```
+
+Ou em tempo de execução:
+```sql
+SET GLOBAL time_zone = '+00:00';
+SET SESSION time_zone = '+00:00';
+```
+
+## Fusos Horários Nomeados {#named-time-zones}
+
+`'+00:00'` e `'UTC'` são ambos válidos, mas zonas nomeadas como `'America/New_York'` exigem que as tabelas de fuso horário estejam carregadas. Se `CONVERT_TZ()` retorna NULL ou as zonas nomeadas falham, as tabelas estão ausentes.
+
+```sql
+-- Check if named timezone tables are loaded
+SELECT COUNT(*) FROM mysql.time_zone_name;
+
+-- Load them (run from the OS shell)
+-- mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql
+```
+
+```sql
+-- Convert between time zones
+SELECT CONVERT_TZ('2024-03-15 12:00:00', 'America/New_York', 'UTC');
+-- Returns: 2024-03-15 16:00:00  (March 15 is EDT = UTC-4, so noon EDT = 16:00 UTC)
+```
+
+## Colunas AUTO_UPDATE {#auto_update-columns}
+
+Colunas `TIMESTAMP` oferecem suporte ao preenchimento automático na inserção e na atualização:
+
+```sql
+CREATE TABLE posts (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    title      VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+`CURRENT_TIMESTAMP` é avaliado em UTC se o fuso horário da sessão é UTC, então `created_at` e `updated_at` são armazenados de forma consistente, independentemente de quem se conecta e de qual fuso horário.
+
+Você pode fazer o mesmo com `DATETIME` e `NOW()`:
+
+```sql
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+```
+
+`NOW()` retorna a data e a hora atuais no fuso horário da sessão — mais um motivo para padronizar a sessão em UTC.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Devo armazenar timestamps em UTC em DATETIME ou usar TIMESTAMP? {#should-i-store-timestamps-as-utc-in-datetime-or-use-timestamp}
+
+Se suas datas ficam dentro do teto de 2038, `TIMESTAMP` é mais limpo — ele cuida da conversão para UTC automaticamente. Para datas futuras além de 2038, ou para aplicações que precisam armazenar datas históricas anteriores a 1970, use `DATETIME` e imponha UTC na camada de aplicação, sempre convertendo para UTC antes de inserir.
+
+#### Por que os timestamps se deslocam depois de uma migração de servidor? {#why-do-timestamps-shift-after-a-server-migration}
+
+O servidor antigo usava `time_zone = SYSTEM` apontando para um fuso horário do SO; o novo servidor aponta para outro (ou para UTC). Os valores `TIMESTAMP` armazenados em UTC são exibidos corretamente nos dois fusos horários, mas se algum valor foi armazenado assumindo o fuso horário do sistema em vez de UTC, ele vai se deslocar. Audite com `SELECT @@global.time_zone` nos dois servidores antes de migrar.
+
+#### Como armazeno apenas uma data, sem o componente de hora? {#how-do-i-store-just-a-date-with-no-time-component}
+
+Use `DATE`. Ele ocupa 3 bytes e não tem ambiguidade de hora do dia nem de fuso horário. Operações como `WHERE date_col = '2024-03-15'` não são ambíguas, independentemente do fuso horário da sessão.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| Os timestamps se deslocam em horas depois da implantação | O `time_zone` da sessão ou do servidor difere entre os ambientes — padronize em UTC |
+| `CONVERT_TZ()` retorna NULL | As tabelas de fuso horário nomeado não estão carregadas — execute `mysql_tzinfo_to_sql` |
+| Datas depois de 2038 não são armazenadas | Use `DATETIME` em vez de `TIMESTAMP` |
+| `TIMESTAMP` mostra a hora errada depois da mudança de horário de verão | Defina `time_zone = '+00:00'` em vez de `SYSTEM` para evitar a dependência do horário de verão do SO |
+| `updated_at` não é atualizado automaticamente | A coluna precisa da cláusula `ON UPDATE CURRENT_TIMESTAMP` |
+
+## Veja também {#see-also}
+
+- [Funções de Data e Hora do MySQL](/pt-BR/guides/date-time-functions) — funções para manipular valores DATETIME e TIMESTAMP

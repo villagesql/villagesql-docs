@@ -1,0 +1,135 @@
+---
+title: "MySQL 中的外键"
+sidebarTitle: "使用外键"
+description: "MySQL 外键的工作原理、如何定义外键、CASCADE 和 RESTRICT 选项，以及使用外键前需要了解的性能权衡。"
+keywords: "mysql foreign key, mysql foreign key constraint, mysql on delete cascade, mysql referential integrity, mysql innodb foreign key, mysql foreign key performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+外键是一种强制两张表之间关系的约束。它确保一张表某列中的值存在于另一张表中——并定义当被引用的行被删除或更新时会发生什么。
+
+## 定义外键 {#defining-a-foreign-key}
+
+```sql
+CREATE TABLE customers (
+    id   INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    CONSTRAINT fk_orders_customer
+        FOREIGN KEY (customer_id) REFERENCES customers (id)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE
+);
+```
+
+约束名称（`fk_orders_customer`）是可选的，但值得加上——它会出现在错误消息中，并使 `ALTER TABLE` 操作更容易。
+
+外键需要 InnoDB——MyISAM 会静默忽略它们。
+
+## 引用动作 {#referential-actions}
+
+`ON DELETE` 和 `ON UPDATE` 子句定义当被引用的父行被删除或更新时子行会发生什么。
+
+| 动作 | 删除时 | 更新时 |
+|:-------|:----------|:----------|
+| `RESTRICT` | 如果存在子行则阻止删除 | 如果存在子行则阻止更新 |
+| `NO ACTION` | 与 `RESTRICT` 相同（默认） | 与 `RESTRICT` 相同 |
+| `CASCADE` | 自动删除子行 | 更新子表的外键值以匹配 |
+| `SET NULL` | 将子表的外键列设为 NULL | 将子表的外键列设为 NULL |
+
+`SET DEFAULT` 是 SQL 标准的一部分。InnoDB 接受这个语法而不报错，但没有实现它——在运行时它的行为与 `RESTRICT` 完全相同（ERROR 1451）。不要使用它：它静默地做着与其名称含义相反的事。
+
+**DELETE 上的 `CASCADE`** 很方便但也很危险。删除一个客户会自动删除其所有订单——没有错误，没有警告。只有当依赖行离开父行后确实毫无意义时（例如没有订单的订单行项）才使用它。
+
+**`RESTRICT`** 是更安全的默认值——它迫使应用程序显式处理删除，防止意外的数据丢失。
+
+## 必需的索引 {#the-required-index}
+
+MySQL 要求外键列上有索引。如果不存在，InnoDB 会自动创建一个。
+
+```sql
+-- InnoDB creates this index automatically for the FK above
+-- But you can create it explicitly for control over the name
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+```
+
+这个索引是让外键检查快速的关键——没有它，每次 INSERT 或 DELETE 都需要全表扫描。它还能加速外键列上的 JOIN 查询，这就是为什么在一对多关系中您应该始终为外键列建立索引，即使您没有使用显式的外键约束。
+
+## 检查和禁用外键检查 {#checking-and-disabling-foreign-key-checks}
+
+在批量加载数据期间，外键检查会拖慢每次插入。临时禁用它们：
+
+```sql
+SET FOREIGN_KEY_CHECKS = 0;
+
+-- Bulk insert or LOAD DATA here
+
+SET FOREIGN_KEY_CHECKS = 1;
+```
+
+**重要**：禁用检查意味着您可以插入孤立行。重新启用检查不会追溯验证现有数据。如果您在检查关闭时加载数据，请在重新开启检查之前手动验证引用完整性。
+
+## 查看现有外键 {#viewing-existing-foreign-keys}
+
+```sql
+-- List all foreign keys in a database
+SELECT
+    TABLE_NAME,
+    CONSTRAINT_NAME,
+    COLUMN_NAME,
+    REFERENCED_TABLE_NAME,
+    REFERENCED_COLUMN_NAME
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
+ORDER BY TABLE_NAME;
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 外键会损害性能吗？ {#do-foreign-keys-hurt-performance}
+
+对子表的每次 INSERT 都会触发一次针对父表的检查（一次索引查找）。对父表的每次 DELETE 都会触发一次对子行的检查。在高吞吐量的表上，这些检查会累积起来。优先考虑写入吞吐量的团队通常改为在应用层强制引用完整性。两种选择都不是普遍正确的——权衡在于数据库级的安全性和写入性能之间。
+
+#### 我能给现有的表添加外键吗？ {#can-i-add-a-foreign-key-to-an-existing-table}
+
+可以，使用 `ALTER TABLE`：
+
+```sql
+ALTER TABLE orders
+    ADD CONSTRAINT fk_orders_customer
+    FOREIGN KEY (customer_id) REFERENCES customers (id)
+    ON DELETE RESTRICT;
+```
+
+如果 `orders` 中的现有行有 `customers` 中不存在的 `customer_id` 值，`ALTER TABLE` 会失败。请先修复数据。
+
+#### 为什么 MySQL 会为外键自动创建索引？ {#why-does-mysql-create-an-index-automatically-for-a-foreign-key}
+
+当父行被删除或更新时，InnoDB 需要快速检查子行。如果外键列上没有索引，这个检查就需要对子表进行全表扫描。自动创建的索引防止了这一点。如果您先创建了自己的索引（带有一个有意义的名称），InnoDB 会使用它，而不是再创建第二个。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 1452: Cannot add or update a child row` | 外键值在父表中不存在——先插入父行 |
+| `ERROR 1451: Cannot delete or update a parent row` | 存在子行且动作是 `RESTRICT`——先删除子行或使用 `CASCADE` |
+| 添加外键时 `ALTER TABLE` 失败 | 现有数据有孤立行——用 LEFT JOIN 检查找到并修复它们 |
+| 外键列上的 INSERT 很慢 | 外键列上缺少索引——InnoDB 应该会自动创建它，但请用 `SHOW INDEX` 验证 |
+| `SET FOREIGN_KEY_CHECKS = 0` 没有持久生效 | 它是会话变量——在批量加载之前在同一个会话中再次设置它 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的规范化](/zh/guides/normalization) — 外键所强制的模式设计
+- [MySQL 中的事务](/zh/guides/transactions) — 外键检查在事务内发生
+- [MySQL JOIN 性能与常见错误](/zh/guides/joins) — 为外键定义的关系建立索引
+- [MySQL 中的软删除](/zh/guides/soft-deletes) — 为什么级联会忽略软删除
+- [MySQL INNER JOIN](/zh/tutorial/inner-join) — 关于跨这些关系查询的教程课程
+- [MySQL 联接的工作原理](/zh/tutorial/joins) — 为什么数据一开始就被拆分到多张表中

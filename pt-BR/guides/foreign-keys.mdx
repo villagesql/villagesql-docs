@@ -1,0 +1,135 @@
+---
+title: "Chaves Estrangeiras no MySQL"
+sidebarTitle: "Usando Chaves Estrangeiras"
+description: "Como as chaves estrangeiras do MySQL funcionam, como defini-las, as opções CASCADE e RESTRICT e os trade-offs de desempenho a entender antes de usá-las."
+keywords: "mysql foreign key, mysql foreign key constraint, mysql on delete cascade, mysql referential integrity, mysql innodb foreign key, mysql foreign key performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma chave estrangeira é uma restrição que impõe um relacionamento entre duas tabelas. Ela garante que um valor na coluna de uma tabela exista em outra tabela — e define o que acontece quando a linha referenciada é excluída ou atualizada.
+
+## Definindo uma Chave Estrangeira {#defining-a-foreign-key}
+
+```sql
+CREATE TABLE customers (
+    id   INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    CONSTRAINT fk_orders_customer
+        FOREIGN KEY (customer_id) REFERENCES customers (id)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE
+);
+```
+
+O nome da restrição (`fk_orders_customer`) é opcional, mas vale a pena incluí-lo — ele aparece nas mensagens de erro e facilita as operações de `ALTER TABLE`.
+
+Chaves estrangeiras exigem InnoDB — o MyISAM as ignora silenciosamente.
+
+## Ações Referenciais {#referential-actions}
+
+As cláusulas `ON DELETE` e `ON UPDATE` definem o que acontece com as linhas filhas quando a linha pai referenciada é excluída ou atualizada.
+
+| Ação | No DELETE | No UPDATE |
+|:-------|:----------|:----------|
+| `RESTRICT` | Bloqueia a exclusão se existirem linhas filhas | Bloqueia a atualização se existirem linhas filhas |
+| `NO ACTION` | Igual a `RESTRICT` (padrão) | Igual a `RESTRICT` |
+| `CASCADE` | Exclui as linhas filhas automaticamente | Atualiza o valor da FK filha para corresponder |
+| `SET NULL` | Define a coluna FK filha como NULL | Define a coluna FK filha como NULL |
+
+`SET DEFAULT` faz parte do padrão SQL. O InnoDB aceita a sintaxe sem reclamar, mas não a implementa — em tempo de execução ele se comporta exatamente como `RESTRICT` (ERROR 1451). Não use: ele faz silenciosamente o oposto do que o nome sugere.
+
+**`CASCADE` no DELETE** é conveniente, mas perigoso. Excluir um cliente exclui todos os pedidos dele automaticamente — sem erro, sem aviso. Use apenas quando as linhas dependentes realmente não tiverem sentido sem o pai (por exemplo, itens de um pedido sem o pedido).
+
+**`RESTRICT`** é o padrão mais seguro — ele força a aplicação a tratar a exclusão explicitamente, evitando perda acidental de dados.
+
+## O Índice Obrigatório {#the-required-index}
+
+O MySQL exige um índice na coluna da chave estrangeira. O InnoDB o cria automaticamente se não existir um.
+
+```sql
+-- InnoDB creates this index automatically for the FK above
+-- But you can create it explicitly for control over the name
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+```
+
+Esse índice é o que torna as verificações de chave estrangeira rápidas — sem ele, todo INSERT ou DELETE exigiria uma varredura completa da tabela. Ele também acelera consultas JOIN na coluna da FK, e é por isso que você deve sempre indexar as colunas de chave estrangeira em relacionamentos um-para-muitos, mesmo que não esteja usando restrições de FK explícitas.
+
+## Verificando e Desativando as Verificações de Chave Estrangeira {#checking-and-disabling-foreign-key-checks}
+
+Durante cargas de dados em massa, as verificações de chave estrangeira deixam cada inserção mais lenta. Desative-as temporariamente:
+
+```sql
+SET FOREIGN_KEY_CHECKS = 0;
+
+-- Bulk insert or LOAD DATA here
+
+SET FOREIGN_KEY_CHECKS = 1;
+```
+
+**Importante**: desativar as verificações significa que você pode inserir linhas órfãs. Reativar as verificações não valida retroativamente os dados existentes. Se você carregar dados com as verificações desativadas, valide a integridade referencial manualmente antes de reativá-las.
+
+## Visualizando as Chaves Estrangeiras Existentes {#viewing-existing-foreign-keys}
+
+```sql
+-- List all foreign keys in a database
+SELECT
+    TABLE_NAME,
+    CONSTRAINT_NAME,
+    COLUMN_NAME,
+    REFERENCED_TABLE_NAME,
+    REFERENCED_COLUMN_NAME
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
+ORDER BY TABLE_NAME;
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Chaves estrangeiras prejudicam o desempenho? {#do-foreign-keys-hurt-performance}
+
+Todo INSERT na tabela filha dispara uma verificação na tabela pai (uma busca por índice). Todo DELETE na tabela pai dispara uma verificação de linhas filhas. Em tabelas de alto throughput, essas verificações se acumulam. Equipes que priorizam o throughput de escrita frequentemente impõem a integridade referencial na camada da aplicação em vez disso. Nenhuma das escolhas é universalmente certa — o trade-off é entre a segurança no nível do banco de dados e o desempenho de escrita.
+
+#### Posso adicionar uma chave estrangeira a uma tabela existente? {#can-i-add-a-foreign-key-to-an-existing-table}
+
+Sim, com `ALTER TABLE`:
+
+```sql
+ALTER TABLE orders
+    ADD CONSTRAINT fk_orders_customer
+    FOREIGN KEY (customer_id) REFERENCES customers (id)
+    ON DELETE RESTRICT;
+```
+
+Se as linhas existentes em `orders` tiverem valores de `customer_id` que não existem em `customers`, o `ALTER TABLE` falhará. Corrija os dados primeiro.
+
+#### Por que o MySQL cria um índice automaticamente para uma chave estrangeira? {#why-does-mysql-create-an-index-automatically-for-a-foreign-key}
+
+O InnoDB precisa verificar as linhas filhas rapidamente quando uma linha pai é excluída ou atualizada. Sem um índice na coluna da FK, essa verificação exige uma varredura completa da tabela filha. O índice criado automaticamente evita isso. Se você criar o seu próprio índice primeiro (com um nome significativo), o InnoDB o usa em vez de criar um segundo.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1452: Cannot add or update a child row` | O valor da FK não existe na tabela pai — insira a linha pai primeiro |
+| `ERROR 1451: Cannot delete or update a parent row` | Existem linhas filhas e a ação é `RESTRICT` — exclua as filhas primeiro ou use `CASCADE` |
+| `ALTER TABLE` falha ao adicionar a FK | Os dados existentes têm linhas órfãs — encontre-as e corrija-as com uma verificação por LEFT JOIN |
+| INSERTs lentos na coluna da FK | Falta o índice na coluna da FK — o InnoDB deveria criá-lo automaticamente, mas verifique com `SHOW INDEX` |
+| `SET FOREIGN_KEY_CHECKS = 0` não persistiu | É uma variável de sessão — defina-a novamente na mesma sessão antes da sua carga em massa |
+
+## Veja também {#see-also}
+
+- [Normalização no MySQL](/pt-BR/guides/normalization) — o projeto de esquema que as chaves estrangeiras impõem
+- [Transações no MySQL](/pt-BR/guides/transactions) — as verificações de chave estrangeira acontecem dentro de transações
+- [Desempenho de JOIN no MySQL e erros comuns](/pt-BR/guides/joins) — indexando os relacionamentos que as chaves estrangeiras definem
+- [Exclusões Lógicas no MySQL](/pt-BR/guides/soft-deletes) — por que os cascades ignoram as exclusões lógicas
+- [MySQL INNER JOIN](/pt-BR/tutorial/inner-join) — a lição do tutorial sobre consultar esses relacionamentos
+- [Como os joins do MySQL funcionam](/pt-BR/tutorial/joins) — por que os dados são divididos entre tabelas, para começo de conversa

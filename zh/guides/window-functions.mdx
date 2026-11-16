@@ -1,0 +1,190 @@
+---
+title: "MySQL 8.4 中的窗口函数"
+sidebarTitle: "使用窗口函数"
+description: "MySQL 8.4 窗口函数的工作原理：ROW_NUMBER、RANK、LAG、LEAD、累计总和，以及它们与 GROUP BY 聚合的区别。"
+keywords: "mysql window functions, mysql row_number, mysql rank, mysql over clause, mysql partition by, mysql lag lead, mysql running total, mysql 8.4 analytics"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+窗口函数在与当前行相关的一组行上计算值——而不像 `GROUP BY` 那样把这些行折叠成单个输出行。它们使得以前需要子查询或应用层处理的分析查询成为可能。
+
+## 窗口函数与 GROUP BY 的区别 {#how-window-functions-differ-from-group-by}
+
+```sql
+-- GROUP BY: collapses rows — you lose the individual order details
+SELECT customer_id, SUM(amount) AS total
+FROM orders
+GROUP BY customer_id;
+
+-- Window function: adds a column without collapsing rows
+SELECT
+    id,
+    customer_id,
+    amount,
+    SUM(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM orders;
+```
+
+第二条查询为每个订单返回一行，每一行还显示该客户的总额。`GROUP BY` 做不到这一点——它会移除单独的行。
+
+## OVER 子句 {#the-over-clause}
+
+每个窗口函数都使用一个 `OVER` 子句来定义窗口——即要在其上计算的行集合。
+
+```sql
+function() OVER (
+    PARTITION BY col    -- divide rows into groups (optional)
+    ORDER BY col        -- define row order within the window (required for ranking/offset functions)
+    ROWS BETWEEN ...    -- define the frame (optional)
+)
+```
+
+空的 `OVER()` 表示窗口是整个结果集。
+
+## 排名函数 {#ranking-functions}
+
+```sql
+SELECT
+    name,
+    score,
+    ROW_NUMBER() OVER (ORDER BY score DESC) AS row_num,
+    RANK()       OVER (ORDER BY score DESC) AS `rank`,
+    DENSE_RANK() OVER (ORDER BY score DESC) AS `dense_rank`
+FROM leaderboard;
+```
+
+| 函数 | 并列时的行为 |
+|:---------|:-----------------|
+| `ROW_NUMBER()` | 唯一的连续编号——并列的行得到不同的编号（顺序任意） |
+| `RANK()` | 并列的行共享一个排名；下一个排名跳号（1, 1, 3） |
+| `DENSE_RANK()` | 并列的行共享一个排名；下一个排名不跳号（1, 1, 2） |
+
+示例输出：
+
+```
+name   | score | row_num | rank | dense_rank
+-------+-------+---------+------+-----------
+Alice  |   100 |       1 |    1 |          1
+Bob    |    95 |       2 |    2 |          2
+Carol  |    95 |       3 |    2 |          2
+Dave   |    90 |       4 |    4 |          3
+```
+
+## PARTITION BY：按组排名 {#partition-by-per-group-rankings}
+
+添加 `PARTITION BY` 以在组内排名，而不是在整个结果集中排名：
+
+```sql
+-- Rank orders within each customer, newest first
+SELECT
+    customer_id,
+    id AS order_id,
+    created_at,
+    ROW_NUMBER() OVER (
+        PARTITION BY customer_id
+        ORDER BY created_at DESC
+    ) AS order_rank
+FROM orders;
+```
+
+要获取每个客户最近的订单：
+
+```sql
+SELECT customer_id, order_id, created_at
+FROM (
+    SELECT
+        customer_id,
+        id AS order_id,
+        created_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY created_at DESC
+        ) AS rn
+    FROM orders
+) ranked
+WHERE rn = 1;
+```
+
+## LAG 和 LEAD：访问相邻行 {#lag-and-lead-accessing-adjacent-rows}
+
+`LAG` 访问前一行；`LEAD` 访问后一行——无需自联接。
+
+```sql
+SELECT
+    date,
+    revenue,
+    LAG(revenue)  OVER (ORDER BY date) AS prev_day_revenue,
+    LEAD(revenue) OVER (ORDER BY date) AS next_day_revenue,
+    revenue - LAG(revenue) OVER (ORDER BY date) AS day_over_day_change
+FROM daily_revenue
+ORDER BY date;
+```
+
+这两个函数都接受一个可选的偏移量（默认为 1），以及在不存在相邻行时使用的默认值：
+
+```sql
+LAG(revenue, 1, 0) OVER (ORDER BY date)  -- use 0 when there's no previous row
+```
+
+## 累计总和与移动平均 {#running-totals-and-moving-averages}
+
+使用 `ROWS BETWEEN` 定义帧——即要纳入计算的行子集。
+
+```sql
+SELECT
+    date,
+    amount,
+    -- Running total (all rows from start to current)
+    SUM(amount) OVER (ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+    -- 7-day moving average
+    AVG(amount) OVER (ORDER BY date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving_avg_7d
+FROM daily_sales;
+```
+
+常见的帧规范：
+
+| 帧 | 含义 |
+|:------|:--------|
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | 从第一行到当前行（累计总和） |
+| `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` | 当前行加前面 6 行（7 行窗口） |
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` | 整个分区 |
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我可以在 WHERE 子句中按窗口函数的结果过滤吗？ {#can-i-filter-on-a-window-function-result-in-a-where-clause}
+
+不能——窗口函数在 `WHERE` 之后求值。要按窗口函数的结果过滤，请把查询包在子查询或 CTE 中：
+
+```sql
+SELECT * FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+    FROM orders
+) t
+WHERE rn = 1;
+```
+
+#### 帧子句中的 ROWS 和 RANGE 有什么区别？ {#whats-the-difference-between-rows-and-range-in-the-frame-clause}
+
+`ROWS` 按物理行计数。`RANGE` 把 `ORDER BY` 值相同的行归为一组。对于大多数用例（累计总和、移动平均），`ROWS` 给出预期的行为。当排序列中存在并列值时，`RANGE` 可能产生出人意料的结果。
+
+#### 窗口函数能利用索引吗？ {#do-window-functions-work-with-indexes}
+
+窗口函数在窗口计算本身中不使用索引，但查询仍然可以为 `WHERE` 子句使用索引，以减少要处理的行。复杂的窗口查询可以借助[在 MySQL 中阅读 EXPLAIN](/zh/guides/reading-explain)来理解执行计划。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 窗口函数语法报 `ERROR 1064` | 正在运行的 MySQL 版本太旧，早于窗口函数支持——用 `SELECT VERSION()` 检查 |
+| 在 WHERE 子句中使用窗口函数结果失败 | 把过滤条件移到外层查询或 CTE 中——WHERE 不能引用窗口函数 |
+| `RANK()` 意外地跳号 | 预期行为——如果您不想要空缺，请使用 `DENSE_RANK()` |
+| 窗口函数查询很慢 | 在 `PARTITION BY` 和 `ORDER BY` 的列上添加索引以加快排序 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL CTE 何时优于派生表](/zh/guides/ctes-in-mysql)——常与窗口函数搭配用于多步分析
+- [MySQL GROUP BY 性能](/zh/guides/group-by-having)——折叠式的聚合，以及它的代价
+- [MySQL GROUP BY](/zh/tutorial/group-by)——关于该子句本身的教程课程

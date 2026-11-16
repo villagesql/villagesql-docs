@@ -1,0 +1,156 @@
+---
+title: "从 MySQL 升级"
+sidebarTitle: "升级到 VillageSQL"
+description: "从上游 MySQL 升级到 VillageSQL 的分步指南。"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+VillageSQL Server 是 MySQL 的直接替代品。对于没有第三方插件的普通单实例 MySQL 8.4 安装，迁移到 VillageSQL 在功能上等同于一次小版本升级（例如从 8.4.5 到 8.4.6），并保留您现有的数据。任何依赖非标准插件的部分都应先在副本上测试。
+
+## 先决条件 {#prerequisites}
+
+- **VillageSQL 二进制文件**：确保您已准备好 VillageSQL 二进制文件（从源代码编译或下载）。
+- **MySQL 版本**：VillageSQL 基于 MySQL 8.4 LTS。从 MySQL 8.4 升级是受支持的路径。
+
+<Warning>
+  **执行升级前务必备份您的数据。**
+  虽然该过程在设计上是安全的，但数据库升级始终存在风险。
+</Warning>
+
+## 第 1 步：备份您的数据 {#step-1-backup-your-data}
+
+在改动任何系统文件或服务之前，请为您的数据库创建完整备份。
+
+### 选项 A：逻辑备份（mysqldump） {#option-a-logical-backup-mysqldump}
+为所有数据库创建一个 SQL 转储。这是最安全、最便于移植的方法。
+
+```bash
+mysqldump -u root -p --all-databases --events --routines --triggers > full_backup.sql
+```
+
+### 选项 B：物理备份（数据目录） {#option-b-physical-backup-data-directory}
+如果您的数据集很大，请停止服务器并复制数据目录。
+
+```bash
+# Stop the server first (see Step 2)
+cp -r /var/lib/mysql /var/lib/mysql-backup
+```
+
+## 第 2 步：停止 MySQL 服务器 {#step-2-stop-the-mysql-server}
+
+停止当前正在运行的 MySQL 服务器实例，以释放对数据文件的锁。
+
+**使用 Systemd（Linux）：**
+```bash
+sudo systemctl stop mysql
+# OR
+sudo systemctl stop mysqld
+```
+
+**使用 SysV Init：**
+```bash
+sudo service mysql stop
+```
+
+**手动安装：**
+```bash
+mysqladmin -u root -p shutdown
+```
+
+## 第 3 步：替换二进制文件 {#step-3-replace-binaries}
+
+升级的核心是把可执行文件（`mysqld`、`mysql` 等）从上游 MySQL 版本切换为 VillageSQL 版本。
+
+### 方法 A：切换安装目录（推荐） {#method-a-swapping-installation-directories-recommended}
+
+如果您是通过 tarball 安装 MySQL 的（例如安装到 `/usr/local/mysql`），最干净的方法是将 VillageSQL 安装到它旁边，然后切换符号链接。
+
+1.  **解压/安装 VillageSQL** 到一个新目录，例如 `/usr/local/villagesql-8.4`。
+2.  **更新符号链接**：
+    ```bash
+    # Remove link to old MySQL
+    sudo unlink /usr/local/mysql
+
+    # Link to VillageSQL
+    sudo ln -s /usr/local/villagesql-8.4 /usr/local/mysql
+    ```
+3.  **验证权限**：确保运行数据库的用户（通常是 `mysql`）对新的二进制文件拥有执行权限。
+
+### 方法 B：覆盖二进制文件 {#method-b-overwriting-binaries}
+
+如果您从源代码编译了 VillageSQL，并希望覆盖系统安装（例如 `/usr/bin` 或 `/usr/local/bin`）：
+
+```bash
+# Assuming you are in the VillageSQL build directory
+sudo make install
+```
+
+<Note>
+  如果您是通过包管理器（`apt`、`yum`）安装 MySQL 的，手动覆盖二进制文件有风险，因为包管理器可能在更新时把它们覆盖回去。建议卸载 `mysql-server` 包（保留数据文件！），或者在可用时使用 `update-alternatives`。
+</Note>
+
+## 第 4 步：配置检查 {#step-4-configuration-check}
+
+确保您的配置文件（通常是 `/etc/my.cnf` 或 `/etc/mysql/my.cnf`）指向您现有的数据目录。
+
+```ini
+[mysqld]
+datadir=/var/lib/mysql  # Should point to your EXISTING data
+socket=/var/run/mysqld/mysqld.sock
+```
+
+VillageSQL 使用标准的 MySQL 配置选项，因此您现有的 `my.cnf` 应该无需修改即可使用。
+
+## 第 5 步：启动 VillageSQL {#step-5-start-villagesql}
+
+使用您的服务管理器或手动启动服务器。
+
+**使用 Systemd：**
+```bash
+sudo systemctl start mysql
+```
+
+**手动启动：**
+```bash
+/usr/local/mysql/bin/mysqld_safe --user=mysql &
+```
+
+### 自动升级 {#automatic-upgrade}
+启动时，VillageSQL 会自动检测数据文件是否来自旧版本，并对系统表执行必要的升级。
+
+检查错误日志（通常位于 `/var/log/mysql/error.log` 或您的 `datadir` 中），以确认升级成功完成。查找：
+`[System] [MY-013381] [Server] Server upgrade from '...' to '...' completed.`
+
+## 第 6 步：验证安装 {#step-6-verify-installation}
+
+连接到服务器并验证您正在运行 VillageSQL。
+
+```bash
+mysql -u root -p
+```
+
+运行以下查询：
+
+```sql
+SELECT @@version, @@version_comment;
+```
+
+现在您可以验证数据是否完好，并开始使用 VillageSQL 独有的功能，例如 `INSTALL EXTENSION`。
+
+## 故障排除 {#troubleshooting}
+
+-   **"Data Dictionary Upgrade Failed"**：如果服务器拒绝启动，您可能正在尝试降级（例如从 8.4 到 8.0），或者数据文件已损坏。请检查错误日志。
+-   **权限错误**：确保 `mysql` 操作系统用户拥有 `datadir` 和新的 VillageSQL 安装目录的所有权。
+    ```bash
+    sudo chown -R mysql:mysql /var/lib/mysql
+    ```
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的模式迁移](/zh/guides/schema-migrations)——升级后安全地运行 DDL 变更
+- [MySQL 备份策略](/zh/guides/backup-strategies)——升级前进行备份
+- [Docker 上的 MySQL](/zh/guides/mysql-on-docker)——改为在容器中运行 MySQL 或 VillageSQL
+- [MySQL 8.0 生命周期结束后升级到 8.4](/zh/guides/mysql-80-eol-upgrade)——如果您仍在使用 8.0，先升级到 8.4

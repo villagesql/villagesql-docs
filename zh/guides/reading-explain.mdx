@@ -1,0 +1,159 @@
+---
+title: "读懂 MySQL 中的 EXPLAIN"
+sidebarTitle: "读懂 EXPLAIN"
+description: "如何读懂 MySQL 的 EXPLAIN 输出：每一列的含义、如何发现全表扫描，以及如何用 EXPLAIN 修复慢查询。"
+keywords: "mysql explain output, mysql explain type, mysql explain rows, mysql explain key, mysql query plan, mysql optimize query, mysql explain analyze"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+当查询变慢时，您的第一步是 `EXPLAIN`。它准确地展示 MySQL 计划如何执行该查询——使用哪些索引、预计扫描多少行，以及在哪里做了昂贵的工作。一旦您能读懂它，几乎任何慢查询都能修复。
+
+## 运行 EXPLAIN {#running-explain}
+
+在任何 `SELECT` 前面加上 `EXPLAIN`：
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+MySQL 为查询中的每个表返回一行。对于连接，您会得到多行——每个参与的表一行。
+
+## 重要的列 {#the-columns-that-matter}
+
+一个完整的 `EXPLAIN` 行看起来是这样：
+
+```
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |   100.00 | NULL        |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+```
+
+大多数列只在某些时候重要。以下几列几乎总是重要的：
+
+### `type`——MySQL 如何扫描表 {#type--how-mysql-scans-the-table}
+
+这是最重要的一列。它告诉您访问方法，从最快到最慢：
+
+| type | 含义 | 何时出现 |
+|:-----|:--------|:----------------|
+| `const` | 通过主键或唯一索引取单行 | `WHERE id = 5` |
+| `eq_ref` | 前一个表的每一行对应一行 | 在主键上 JOIN |
+| `ref` | 从非唯一索引取多行 | `WHERE user_id = 42` |
+| `range` | 索引范围扫描 | `BETWEEN`、`>`、`<`、`IN` |
+| `index` | 全索引扫描 | 从左到右扫描索引 |
+| `ALL` | 全表扫描 | 没有可用的索引 |
+
+**`ALL` 是需要修复的那个。** 它意味着 MySQL 正在读取表中的每一行。在有一百万行的表上，每次执行查询就是一百万次读取。
+
+### `key`——MySQL 选择了哪个索引 {#key--which-index-mysql-chose}
+
+`NULL` 表示没有使用索引。如果 `possible_keys` 列出了索引而 `key` 为 `NULL`，说明 MySQL 判定全表扫描更便宜——通常是因为表很小，或者查询的选择性不够高。
+
+### `rows`——预计检查的行数 {#rows--estimated-rows-examined}
+
+这是估计值，不是保证。MySQL 使用统计信息来产生这个数字。`rows: 1` 的查询很快；生产表上的 `rows: 5000000` 则是个问题。
+
+### `Extra`——额外的执行细节 {#extra--additional-execution-details}
+
+`Extra` 列包含重要的标志：
+
+| Extra 值 | 含义 |
+|:------------|:--------|
+| `Using index` | 覆盖索引——不需要回表查找行（快） |
+| `Using where` | MySQL 在读取行之后再过滤 |
+| `Using filesort` | 排序无法使用索引——额外的排序步骤 |
+| `Using temporary` | MySQL 创建了临时表（在大数据集上很昂贵） |
+| `Using index condition` | 索引条件下推——在存储层过滤 |
+
+在大表上同时出现 `Using filesort` 和 `Using temporary` 是危险信号。
+
+## 一个完整示例 {#a-worked-example}
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- No indexes yet
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key  | rows    | Extra                          |
+|------|------|---------|--------------------------------|
+| ALL  | NULL | 1000000 | Using where; Using filesort    |
+```
+
+两个问题：全表扫描（`ALL`）和 filesort。用一个复合索引同时修复两者（索引设计原则请参阅 [MySQL 索引的工作原理](/zh/guides/mysql-indexes)）：
+
+```sql
+CREATE INDEX idx_status_created ON orders (status, created_at);
+
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key                | rows | Extra |
+|------|--------------------|------|-------|
+| ref  | idx_status_created | 4200 | NULL  |
+```
+
+`rows` 从 1,000,000 降到了 4,200。`type` 现在是 `ref`——对 `status` 的等值查找。filesort 消失了，因为索引已经在每个 `status` 值内按 `created_at` 对行排好了序。
+
+## EXPLAIN ANALYZE {#explain-analyze}
+
+`EXPLAIN ANALYZE` 会实际执行查询，并在估计值旁边返回真实的计时：
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
+-> Index lookup on orders using idx_user_id (user_id=42)
+   (cost=4.50 rows=12) (actual time=0.045..0.112 rows=11 loops=1)
+```
+
+`cost` 和 `rows` 是优化器的估计值。`actual time` 和 `actual rows` 是真实发生的情况。估计行数与实际行数之间的巨大差距意味着统计信息过期——运行 `ANALYZE TABLE orders` 来更新它们。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### EXPLAIN 和覆盖索引之间有什么关系？ {#whats-the-relationship-between-explain-and-covering-indexes}
+`Extra: Using index` 表示 MySQL 正在使用覆盖索引——它可以完全从索引回答查询，而无需读取表行。这是读密集型表上最有效的优化之一。关于如何设计它们，请参阅 [MySQL 中的覆盖索引](/zh/guides/covering-indexes)。
+
+#### 我的查询显示 `type: index`——这没问题吗？ {#my-query-has-type-index--is-that-okay}
+不太好。`type: index` 表示 MySQL 扫描了整个索引（而不是表），这比 `ALL` 快，但仍然是全量扫描。当查询需要所有行但可以从索引满足时就会出现。如果您在大表上遇到这种情况，请检查覆盖索引或 `WHERE` 子句能否缩小扫描范围。
+
+#### 为什么 MySQL 忽略我创建的索引？ {#why-does-mysql-ignore-the-index-i-created}
+优化器根据统计信息选择索引。如果表很小，MySQL 可能判定全表扫描更便宜。如果统计信息过期，它可能低估您的索引的选择性。运行 `ANALYZE TABLE` 刷新统计信息，然后重新检查 `EXPLAIN`。
+
+#### 我可以对 INSERT、UPDATE 和 DELETE 使用 EXPLAIN 吗？ {#can-i-use-explain-on-insert-update-and-delete}
+可以——在 MySQL 8.0 及更高版本中，`EXPLAIN` 适用于所有 DML 语句。输出显示被修改行的访问方法，这在 UPDATE 或 DELETE 很慢时很有用。
+
+如果您需要先确定该对哪些查询执行 EXPLAIN，[MySQL 慢查询日志](/zh/guides/slow-query-log)会捕获服务器上最慢的查询，并按总耗时排序。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| 大表上出现 `type: ALL` | 在被过滤的列上添加索引 |
+| `Extra: Using filesort` | 添加一个同时覆盖 `WHERE` 和 `ORDER BY` 列的索引 |
+| `Extra: Using temporary` | 重写查询以避免对未建索引的列做 `GROUP BY`，或添加索引 |
+| 索引存在但 `key: NULL` | 运行 `ANALYZE TABLE` 更新统计信息；检查索引是否与查询的列顺序匹配 |
+| 预计的 `rows` 与实际相差很远 | 运行 `ANALYZE TABLE` 刷新统计信息 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 索引的工作原理](/zh/guides/mysql-indexes)——EXPLAIN 所报告的 B 树结构
+- [MySQL 中的覆盖索引](/zh/guides/covering-indexes)——Extra 中的 `Using index` 意味着什么，以及如何达到它
+- [MySQL 慢查询日志](/zh/guides/slow-query-log)——找出值得运行 EXPLAIN 的查询
+- [为什么我的 MySQL 查询慢？](/zh/guides/mysql-query-performance)——EXPLAIN 所服务的调优流程
+- [MySQL 中的分页：键集与 OFFSET](/zh/guides/pagination)——验证键集分页是定位而不是扫描
+- [MySQL LIMIT](/zh/tutorial/limit)——教程中对一行执行计划的讲解

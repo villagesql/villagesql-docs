@@ -1,0 +1,193 @@
+---
+title: "Como Autenticar Usuários do MySQL com um JWT"
+sidebarTitle: "Autenticação com JWT"
+description: "Como permitir que contas do MySQL façam login com um JSON Web Token usando a extensão vsql_oauth2 do VillageSQL — chaves de assinatura, mapeamento de claims, concessão de roles e por que um token rejeitado parece uma senha errada."
+keywords: "mysql jwt authentication, mysql oauth login, mysql oidc, jwks mysql, mysql token login, vsql_oauth2"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  Este guia usa uma capability Preview. Inicie o servidor com
+  `--vsql_allow_preview_extensions=ON`, ou o `INSTALL EXTENSION` é recusado.
+</Note>
+
+Senhas de banco de dados são incômodas de gerenciar quando já existe um provedor de identidade. Elas são emitidas separadamente, rotacionadas separadamente, e sobrevivem à pessoa que as recebeu. A extensão `vsql_oauth2` do VillageSQL permite que uma conta faça login com um JSON Web Token em vez disso: o provedor o emite, o servidor verifica a assinatura e a expiração, e uma claim dentro do token nomeia a conta.
+
+## Configure uma chave de assinatura {#set-up-a-signing-key}
+
+A extensão verifica as assinaturas contra chaves obtidas de um endpoint JWKS, que é o que você usa com um provedor real, ou contra uma única chave pública que você cola. A chave estática é a forma mais rápida de ver o caminho inteiro funcionando, então este guia começa por ela.
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt_private.pem
+openssl rsa -pubout -in jwt_private.pem -out jwt_public.pem
+```
+
+```sql
+INSTALL EXTENSION vsql_oauth2;
+
+SET GLOBAL vsql_oauth2.public_key = '-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----';
+SET GLOBAL vsql_oauth2.username_claim = 'sub';
+```
+
+`username_claim` nomeia a claim que carrega o nome da conta. O padrão é `sub`, que é o que o token de exemplo abaixo usa.
+
+Com um provedor real, você define `jwks_url` em vez disso. A extensão busca as chaves, as busca de novo no intervalo definido em `jwks_refresh_interval`, e as busca imediatamente quando um token nomeia um id de chave que o cache não contém. Defina `issuer` e `audience` também, para que um token emitido para algum outro sistema não seja aceito aqui.
+
+## Crie a conta {#create-the-account}
+
+A conta é uma conta comum do MySQL, definida na criação como uma que se autentica com a extensão. Ela carrega suas próprias concessões:
+
+```sql
+CREATE USER 'analyst'@'%' IDENTIFIED WITH vsql_oauth2;
+GRANT SELECT ON shop.* TO 'analyst'@'%';
+```
+
+Não há senha para definir, e nenhuma para rotacionar.
+
+A sessão é executada como a conta que o token nomeia, não como a conta que se conectou. Esse nome vem da claim em `username_claim`, `sub` por padrão. A instrução acima é suficiente enquanto essa claim diz `analyst`. Quando o seu provedor coloca outra coisa ali, um endereço de e-mail por exemplo, crie essa conta também e deixe a conta que se conecta atuar como proxy dela:
+
+```sql
+CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
+CREATE USER 'alice@example.com';
+GRANT SELECT ON shop.* TO 'alice@example.com';
+GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
+```
+
+Ninguém faz login como `alice@example.com` diretamente, então ela não precisa de uma senha própria. Um servidor executando `validate_password` se recusa a criar uma conta sem senha, respondendo `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`. Onde isso se aplica, dê à conta uma senha que ninguém possui, ou um plugin de autenticação que não permite login algum.
+
+Sem a concessão de proxy, o login é recusado com `ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing proxy privilege.`
+
+## Faça login {#log-in}
+
+O token viaja onde a senha normalmente vai, pelo plugin interno `mysql_clear_password`, que o cliente precisa ativar explicitamente:
+
+```bash
+MYSQL_PWD="$TOKEN" mysql -h 127.0.0.1 -u analyst --enable-cleartext-plugin
+```
+
+Passar o token com `--password=` o coloca na lista de processos, e é por isso que o token vai na variável de ambiente.
+
+Dentro da sessão, `CURRENT_USER()` é a conta do banco de dados e `@@external_user` guarda a identidade que o token carregava, que é o que você quer em uma trilha de auditoria:
+
+```sql
+SELECT CURRENT_USER() AS logged_in_as, @@external_user AS token_identity;
+```
+
+```
++--------------+----------------+
+| logged_in_as | token_identity |
++--------------+----------------+
+| analyst@%    | analyst        |
++--------------+----------------+
+```
+
+<Warning>
+  `mysql_clear_password` envia o token em texto claro no nível do protocolo. Use
+  TLS em toda conexão que se autentica dessa forma, ou o token fica legível
+  por qualquer coisa no caminho e pode ser reutilizado até expirar.
+</Warning>
+
+## Mapeando roles a partir do token {#mapping-roles-from-the-token}
+
+Uma conta também pode receber seus privilégios do token. Aponte a extensão para a claim que carrega as roles, e ative a concessão:
+
+```sql
+SET GLOBAL vsql_oauth2.roles_claim = 'roles';
+SET GLOBAL vsql_oauth2.auto_grant = ON;
+```
+
+Crie uma role e uma conta sem privilégios próprios:
+
+```sql
+CREATE ROLE 'shop_reader';
+GRANT SELECT ON shop.* TO 'shop_reader';
+
+CREATE USER 'dana'@'%' IDENTIFIED WITH vsql_oauth2;
+```
+
+Um token que carrega `"roles": ["shop_reader"]` faz login com essa role ativa:
+
+```sql
+SELECT CURRENT_USER() AS account, CURRENT_ROLE() AS roles_now;
+```
+
+```
++---------+-------------------+
+| account | roles_now         |
++---------+-------------------+
+| dana@%  | `shop_reader`@`%` |
++---------+-------------------+
+```
+
+`roles_filter` restringe quais nomes de role são considerados, e `roles_transform_pattern` com `roles_transform_replacement` reescreve um nome vindo do provedor em um nome de role do banco de dados, para provedores cujos nomes de grupo não se parecem com nomes de role.
+
+<Warning>
+  `auto_grant` grava uma concessão real, e ela sobrevive ao login. Depois do login
+  acima, a concessão está no servidor:
+
+```sql
+SELECT FROM_USER AS role_granted, TO_USER AS to_account
+FROM mysql.role_edges WHERE TO_USER = 'dana';
+```
+
+```
++--------------+------------+
+| role_granted | to_account |
++--------------+------------+
+| shop_reader  | dana       |
++--------------+------------+
+```
+
+  Desativar o `auto_grant` depois não a desfaz. Um token, visto
+  uma vez, amplia essa conta até que alguém revogue a role. Restrinja
+  `roles_filter` antes de ativá-lo, e trate a claim como algo que o seu
+  provedor precisa ser confiável para definir.
+</Warning>
+
+Com `auto_grant` desativado, o mesmo token faz login, a role é ignorada em vez de concedida, e `CURRENT_ROLE()` é `NONE`. Cada role ignorada é gravada no log de erros: `VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`. `auto_create` se comporta da mesma forma para contas, criando uma no primeiro login para um subject que o servidor nunca viu. Ambos vêm desativados por padrão, e ambos entregam ao seu provedor autoridade sobre este servidor.
+
+## Um token rejeitado parece uma senha errada {#a-rejected-token-looks-like-a-wrong-password}
+
+Toda falha produz um único erro, e é o erro comum:
+
+```
+ERROR 1045 (28000): Access denied for user 'analyst'@'localhost' (using password: NO)
+```
+
+Um token expirado, um token assinado pela chave errada e uma senha comum digitada por engano produzem exatamente isso, incluindo o `using password: NO` — que é enganoso, já que um token foi enviado. Nada que os diferencie aparece no log de erros do servidor também, mesmo com `log_error_verbosity=3`.
+
+Então depure a partir do token, e não do erro. Decodifique-o e verifique quatro coisas nesta ordem:
+
+1. **`exp`** está no futuro. A diferença de relógio entre o provedor e o servidor conta aqui.
+2. **A chave de assinatura corresponde.** Verifique se o `kid` do token é um que o documento JWKS ainda publica. Uma chave que o documento não carrega mais parece exatamente um token forjado.
+3. **`iss` e `aud`** correspondem aos valores que você configurou, se você os configurou.
+4. **A claim em `username_claim` nomeia uma conta que existe**, escrita da forma como a conta está escrita.
+
+Decodificar o payload não precisa de nenhuma ferramenta além de um shell:
+
+```bash
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null
+```
+
+## Solução de Problemas {#troubleshooting}
+
+| Sintoma | Correção |
+|---|---|
+| `ERROR 3219 ... requires preview capabilities` na instalação | Inicie o servidor com `--vsql_allow_preview_extensions=ON` |
+| `Access denied` em toda tentativa | Percorra as quatro verificações acima. A mensagem é a mesma para toda causa |
+| O cliente nunca envia o token | Passe `--enable-cleartext-plugin`. Outros clientes têm a sua própria opção para ativar `mysql_clear_password` |
+| Os logins funcionavam, e então pararam todos juntos | O provedor rotacionou as chaves. Verifique se `jwks_url` está acessível e se o `kid` do token aparece no documento que ela retorna |
+| Uma conta tem privilégios que ninguém concedeu | `auto_grant` os concedeu a partir de uma claim do token. Verifique `mysql.role_edges` e revogue |
+| As configurações sumiram depois de reinstalar a extensão | `UNINSTALL EXTENSION` apaga as configurações persistidas. Aplique-as de novo |
+
+## Veja também {#see-also}
+
+- [vsql_oauth2](/pt-BR/extensions/vsql-oauth2) — a página de referência da extensão, com toda configuração que ela adiciona
+- [Gerenciamento de Usuários no MySQL](/pt-BR/guides/user-management) — as concessões de que uma conta autenticada por token ainda precisa
+- [Fortalecimento de Segurança no MySQL](/pt-BR/guides/security-hardening) — TLS e o resto da superfície de conexão
+- [Assinando Dados com HMAC](/pt-BR/guides/hmac-mysql) — verificando uma assinatura dentro do SQL em vez de no login

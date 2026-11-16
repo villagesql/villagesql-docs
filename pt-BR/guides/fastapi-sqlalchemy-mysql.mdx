@@ -1,0 +1,350 @@
+---
+title: "FastAPI e SQLAlchemy 2.0 com MySQL"
+sidebarTitle: "FastAPI com SQLAlchemy"
+description: "Construindo uma aplicação FastAPI assíncrona sobre MySQL com o ORM tipado do SQLAlchemy 2.0, um driver assíncrono e migrações com Alembic, incluindo a dependência greenlet e outras armadilhas reais de configuração."
+keywords: "fastapi mysql, sqlalchemy 2.0 async, fastapi sqlalchemy, asyncmy, aiomysql, alembic async migration, sqlalchemy mapped_column, fastapi depends session, villagesql fastapi"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O tratamento assíncrono de requisições do FastAPI só compensa se as chamadas ao banco de dados por baixo dele também forem assíncronas. O SQLAlchemy 2.0 suporta isso com um estilo de ORM tipado e um engine assíncrono, mas conectar os dois com o MySQL tem alguns passos de configuração fáceis de errar na primeira tentativa.
+
+## Escolhendo um Driver Assíncrono {#choosing-an-async-driver}
+
+O SQLAlchemy 2.0 traz dialetos para dois drivers MySQL assíncronos: `asyncmy` e `aiomysql`. Nenhum dos dois é documentado como a recomendação oficial sobre o outro. O `asyncmy` é um driver compilado escrito em Cython e distribui wheels pré-compilados para as versões atuais do Python, e é por isso que ele é usado neste guia:
+
+```bash
+pip install "sqlalchemy[asyncio]" asyncmy cryptography
+```
+
+Instalar o `sqlalchemy` puro em vez de `sqlalchemy[asyncio]` é a primeira armadilha real. A camada ORM assíncrona do SQLAlchemy faz a ponte entre código assíncrono e síncrono com a biblioteca `greenlet`, e ela não é uma dependência do pacote base. Pular o extra `[asyncio]` produz este erro na primeira vez que você toca no engine assíncrono:
+
+```
+ValueError: the greenlet library is required to use this function. No module named 'greenlet'
+```
+
+A correção é `pip install greenlet` ou, melhor, sempre instalar o SQLAlchemy com o extra `[asyncio]`, para que ela seja incluída automaticamente.
+
+A segunda armadilha é o `cryptography`. O MySQL 8 e o VillageSQL usam por padrão o plugin de autenticação `caching_sha2_password` para contas novas, que precisa de uma troca de chaves RSA para enviar a senha na primeira vez que uma dada conta se autentica a partir de uma dada biblioteca cliente. O `asyncmy` não inclui uma implementação de RSA, então uma conexão que precisa fazer esse handshake completo falha com:
+
+```
+RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods
+```
+
+Depois que uma conta completa uma autenticação completa (a partir de qualquer cliente, incluindo a CLI `mysql`), o servidor armazena o resultado em cache e as conexões seguintes usam um caminho mais rápido que pula a etapa RSA, e é por isso que esse erro pode parecer ir e voltar dependendo de quem se conectou à conta mais recentemente. Instalar o `cryptography` desde o início remove por completo a dependência desse cache e é a correção confiável.
+
+## Criando o Banco de Dados e o Usuário {#creating-the-database-and-user}
+
+Crie um banco de dados dedicado e um usuário de aplicação em vez de se conectar como root:
+
+```sql
+CREATE DATABASE IF NOT EXISTS fastapi_guide CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS 'fastapi_app'@'127.0.0.1' IDENTIFIED BY 'fastapi_pw_123!';
+GRANT ALL PRIVILEGES ON fastapi_guide.* TO 'fastapi_app'@'127.0.0.1';
+```
+
+O usuário tem escopo em `127.0.0.1`, não em `localhost`. A string de conexão deste guia se conecta via TCP a `127.0.0.1`, então a concessão precisa corresponder a esse host; uma conexão por socket Unix é comparada com `localhost` em vez disso, independentemente das concessões baseadas em IP da conta.
+
+## Estrutura do Projeto {#project-layout}
+
+```
+fastapi-sqlalchemy-mysql/
+├── alembic/
+│   ├── env.py
+│   └── versions/
+├── alembic.ini
+├── app/
+│   ├── __init__.py
+│   ├── database.py
+│   ├── models.py
+│   ├── schemas.py
+│   └── main.py
+└── requirements.txt
+```
+
+`requirements.txt`:
+
+```
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]>=2.0
+asyncmy
+cryptography
+alembic
+pydantic
+```
+
+## O Engine Assíncrono e a Sessão {#the-async-engine-and-session}
+
+`app/database.py` cria o engine assíncrono, uma fábrica de sessões e a base declarativa usada por todos os modelos:
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+DATABASE_URL = "mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide"
+
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+
+`expire_on_commit=False` importa para o FastAPI. Com o padrão `expire_on_commit=True`, todo atributo de um objeto commitado é marcado como obsoleto, e a próxima leitura desse atributo emite um novo `SELECT` para atualizá-lo. Disparada fora de um `await`, essa atualização falha com:
+
+```
+sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() here. Was IO attempted in an unexpected place?
+```
+
+e, depois que a sessão foi totalmente fechada, a mesma leitura de atributo falha, em vez disso, com:
+
+```
+sqlalchemy.orm.exc.DetachedInstanceError: Instance <Post at 0x...> is not bound to a Session; attribute refresh operation cannot proceed
+```
+
+`expire_on_commit=False` mantém os valores já carregados no objeto utilizáveis após o commit, o que evita os dois.
+
+`get_session()` é uma função geradora, o que permite ao `Depends()` do FastAPI fechar a sessão automaticamente depois que a requisição termina, seja com sucesso ou com uma exceção.
+
+## O Modelo {#the-model}
+
+`app/models.py` define uma tabela `Post` usando o estilo declarativo tipado do SQLAlchemy 2.0, `Mapped` e `mapped_column`, em vez do estilo legado apenas com `Column`:
+
+```python
+import datetime
+
+from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database import Base
+
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+```
+
+`server_default=func.now()` delega o valor padrão do timestamp ao próprio MySQL, então ele é definido corretamente mesmo para linhas inseridas fora da aplicação.
+
+## Configurando o Alembic {#setting-up-alembic}
+
+Inicialize o Alembic com o template assíncrono, que gera um `env.py` já preparado para um engine assíncrono:
+
+```bash
+alembic init -t async alembic
+```
+
+Execute isso de dentro do diretório do projeto. O Alembic grava o `alembic.ini` no diretório de trabalho atual, independentemente do caminho passado ao `init`, embora a pasta de scripts `alembic/` em si seja criada no caminho informado. Executá-lo do diretório errado deixa um `alembic.ini` perdido em algum lugar inesperado.
+
+Aponte o `alembic.ini` para o banco de dados ativo:
+
+```ini
+sqlalchemy.url = mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide
+```
+
+Em seguida, edite `alembic/env.py` para importar os modelos, para que o autogenerate consiga vê-los:
+
+```python
+from app.database import Base
+from app.models import Post  # noqa: F401  (registers Post on Base.metadata)
+
+target_metadata = Base.metadata
+```
+
+Gere e execute a migração:
+
+```bash
+alembic revision --autogenerate -m "create posts table"
+alembic upgrade head
+```
+
+A etapa de autogenerate detectou a nova tabela e escreveu a migração:
+
+```
+INFO  [alembic.autogenerate.compare.tables] Detected added table 'posts'
+Generating alembic/versions/4f5ba2a8774a_create_posts_table.py ...  done
+```
+
+Aplicá-la no VillageSQL teve sucesso:
+
+```
+INFO  [alembic.runtime.migration] Running upgrade  -> 4f5ba2a8774a, create posts table
+```
+
+Confirmando diretamente no servidor ativo:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SHOW TABLES;"
+```
+
+```
+Tables_in_fastapi_guide
+alembic_version
+posts
+```
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "DESCRIBE posts;"
+```
+
+```
+Field       Type          Null    Key     Default    Extra
+id          int           NO      PRI     NULL       auto_increment
+title       varchar(200)  NO              NULL
+body        text          NO              NULL
+created_at  datetime      NO              now()      DEFAULT_GENERATED
+```
+
+## Os Esquemas Pydantic {#the-pydantic-schemas}
+
+`app/schemas.py` define as formas de requisição e resposta separadamente do modelo ORM:
+
+```python
+import datetime
+
+from pydantic import BaseModel, ConfigDict
+
+
+class PostCreate(BaseModel):
+    title: str
+    body: str
+
+
+class PostRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    body: str
+    created_at: datetime.datetime
+```
+
+`from_attributes=True` permite que `PostRead` construa a sua resposta diretamente a partir de uma instância ORM `Post`, em vez de um dicionário.
+
+## As Rotas do FastAPI {#the-fastapi-routes}
+
+`app/main.py` conecta a sessão a cada rota por meio de `Depends()`, de modo que cada requisição recebe a sua própria sessão em vez de compartilhar uma conexão global:
+
+```python
+from fastapi import Depends, FastAPI
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_session
+from app.models import Post
+from app.schemas import PostCreate, PostRead
+
+app = FastAPI(title="FastAPI + SQLAlchemy 2.0 + VillageSQL")
+
+
+@app.get("/posts", response_model=list[PostRead])
+async def list_posts(session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Post).order_by(Post.id))
+    return result.scalars().all()
+
+
+@app.post("/posts", response_model=PostRead, status_code=201)
+async def create_post(payload: PostCreate, session: AsyncSession = Depends(get_session)):
+    post = Post(title=payload.title, body=payload.body)
+    session.add(post)
+    await session.commit()
+    await session.refresh(post)
+    return post
+```
+
+Uma sessão global compartilhada entre requisições acaba levando a consultas intercaladas chegando fora de ordem na mesma conexão sob carga concorrente. Uma sessão criada por requisição por meio de `Depends()` evita isso, já que cada requisição recebe a sua própria sessão e a sua própria conexão retirada do pool.
+
+## Executando e Verificando {#running-and-verifying}
+
+Inicie a aplicação:
+
+```bash
+uvicorn app.main:app --host 127.0.0.1 --port 8010
+```
+
+Uma tabela vazia retorna uma lista vazia:
+
+```bash
+curl -s http://127.0.0.1:8010/posts
+```
+
+```json
+[]
+```
+
+Criando um post:
+
+```bash
+curl -s -X POST http://127.0.0.1:8010/posts \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Hello VillageSQL", "body": "First post via FastAPI + SQLAlchemy 2.0"}'
+```
+
+```json
+{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}
+```
+
+com um status HTTP 201. Listar novamente mostra a nova linha:
+
+```json
+[{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}]
+```
+
+Consultar o banco de dados diretamente confirma que a escrita chegou, e não apenas a resposta da API:
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SELECT * FROM posts;"
+```
+
+```
+id  title             body                                       created_at
+1   Hello VillageSQL  First post via FastAPI + SQLAlchemy 2.0     2026-08-28 12:04:36
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Por que o engine assíncrono precisa de uma string de conexão diferente de um engine síncrono? {#why-does-the-async-engine-need-a-different-connection-string-than-a-sync-one}
+
+O nome do driver na string de conexão informa ao SQLAlchemy qual DBAPI carregar. Uma configuração síncrona usa `mysql+pymysql://` ou `mysql+mysqldb://`; uma configuração assíncrona precisa de um driver construído sobre `asyncio`, então a string usa `mysql+asyncmy://` em vez disso. Usar o nome de um driver síncrono com `create_async_engine` falha imediatamente, já que esse driver não tem uma interface assíncrona que o SQLAlchemy possa chamar.
+
+#### Preciso de `expire_on_commit=False`? {#do-i-need-expire_on_commitfalse}
+
+Não estritamente, mas se você pular isso, todo acesso a atributo em um objeto commitado dispara uma nova ida ao banco de dados para recarregá-lo, e essa ida só funciona se acontecer dentro de um contexto assíncrono ativo. Dependendo de exatamente onde o atributo é lido, isso aparece como `MissingGreenlet` ou, depois que a sessão foi fechada, `DetachedInstanceError`. O padrão mais seguro para uma aplicação web é `expire_on_commit=False`.
+
+#### Ainda posso usar o fluxo síncrono de autogenerate do Alembic? {#can-i-still-use-alembics-synchronous-autogenerate-workflow}
+
+Sim. O `env.py` do template assíncrono ainda executa `revision --autogenerate` e `upgrade` pela linha de comando normal; a parte assíncrona afeta apenas como o `env.py` abre a sua própria conexão para inspecionar e modificar o esquema. Nada nos comandos da CLI do Alembic em si muda.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `ValueError: the greenlet library is required to use this function` | Instale `sqlalchemy[asyncio]` em vez do `sqlalchemy` puro, ou `pip install greenlet` diretamente |
+| `RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods` | Execute `pip install cryptography`; o `asyncmy` precisa dele para a etapa RSA da autenticação padrão `caching_sha2_password` do MySQL |
+| `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` | Um atributo ORM foi lido fora de uma chamada com `await`, geralmente porque a sessão expirou o objeto no commit; defina `expire_on_commit=False` na fábrica de sessões |
+| `sqlalchemy.orm.exc.DetachedInstanceError` | A sessão do objeto já fechou antes de um atributo ser lido; mantenha `expire_on_commit=False`, ou leia todos os atributos necessários antes de a requisição terminar |
+| `alembic.ini` aparece no diretório errado após `alembic init -t async <path>` | Execute `alembic init` de dentro do diretório do projeto; o arquivo ini segue o diretório de trabalho atual, não o argumento de caminho |
+| `alembic revision --autogenerate` produz uma migração vazia | `target_metadata` em `alembic/env.py` ainda é `None`, ou os modelos nunca foram importados e por isso nunca foram registrados em `Base.metadata` |
+| `Access denied for user 'fastapi_app'@'127.0.0.1'` | O usuário foi criado para um host diferente, como `localhost`; a string de conexão deste guia usa TCP para `127.0.0.1`, então a concessão precisa corresponder a esse host |
+| A resposta do FastAPI está sem campos presentes no modelo | `PostRead` precisa de `model_config = ConfigDict(from_attributes=True)` para ler de um objeto ORM em vez de um dicionário |
+
+## Veja também {#see-also}
+
+- [Usando MySQL com ORMs: Django, Rails e Prisma](/pt-BR/guides/mysql-with-orms) — a mesma configuração de charset e modo estrito se aplica ao SQLAlchemy
+- [Pool de Conexões no MySQL](/pt-BR/guides/connection-pooling) — ajustando o tamanho do pool para um engine assíncrono sob requisições FastAPI concorrentes

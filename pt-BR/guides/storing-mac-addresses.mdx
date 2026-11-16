@@ -1,0 +1,173 @@
+---
+title: "Armazenando Endereços MAC no MySQL"
+sidebarTitle: "Armazenando Endereços MAC"
+description: "Como armazenar endereços MAC no MySQL — por que VARCHAR fica aquém, e como os tipos MACADDR e MACADDR8 do VillageSQL oferecem armazenamento compacto, normalização de formato e extração de OUI."
+keywords: "mysql mac address storage, mysql macaddr type, mysql store mac address, mysql oui extraction, mysql network device table, mysql eui64"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Os endereços MAC no MySQL normalmente são armazenados como `VARCHAR(17)`. Isso os armazena, mas aceita qualquer string, não normaliza nada e custa 17 bytes quando 6 bastariam. O tipo `MACADDR` do VillageSQL valida o formato no insert, normaliza para uma representação consistente e oferece extração de OUI de graça.
+
+## O Padrão do MySQL: VARCHAR(17) {#the-mysql-default-varchar17}
+
+```sql
+CREATE TABLE devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address VARCHAR(17),
+    hostname    VARCHAR(255)
+);
+
+INSERT INTO devices (mac_address, hostname) VALUES
+    ('08:00:2b:01:02:03', 'server-01'),
+    ('08-00-2B-01-02-04', 'server-02');  -- different format, uppercase
+```
+
+As duas linhas são inseridas. Agora você tem duas representações do mesmo prefixo de fabricante na mesma coluna. As consultas de deduplicação viram problemas de normalização de strings. Não há nenhuma garantia de que a coluna realmente contém um endereço MAC válido.
+
+## A Solução Alternativa Padrão: BINARY(6) {#the-standard-workaround-binary6}
+
+Armazenamento compacto: converta para binário no insert e de volta para string na leitura.
+
+```sql
+CREATE TABLE devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address BINARY(6),
+    hostname    VARCHAR(255)
+);
+
+-- No built-in conversion — typically done in application code
+-- or manually with UNHEX after stripping colons
+INSERT INTO devices (mac_address, hostname)
+VALUES (UNHEX(REPLACE('08:00:2b:01:02:03', ':', '')), 'server-01');
+
+SELECT LOWER(INSERT(INSERT(INSERT(INSERT(INSERT(
+    HEX(mac_address), 3,0,':'), 6,0,':'), 9,0,':'), 12,0,':'), 15,0,':'))
+AS mac FROM devices;
+```
+
+Essa é a reconstrução manual. Funciona, mas é verbosa e frágil, e ainda não valida a entrada.
+
+## Com o VillageSQL: MACADDR e MACADDR8 {#with-villagesql-macaddr-and-macaddr8}
+
+A extensão `vsql_network_address` do VillageSQL adiciona os tipos `MACADDR` (formato IEEE 802 de 6 bytes) e `MACADDR8` (formato EUI-64 de 8 bytes), com normalização e validação automáticas de formato.
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address MACADDR,
+    hostname    VARCHAR(255)
+);
+
+-- All three formats parse to the same stored value
+INSERT INTO devices (mac_address, hostname) VALUES
+    (macaddr_from_string('08:00:2b:01:02:03'), 'server-01'),   -- colon notation
+    (macaddr_from_string('08-00-2b-01-02-04'), 'server-02'),   -- hyphen notation
+    (macaddr_from_string('0800.2b01.0206'),    'server-03');   -- Cisco dot notation
+
+-- Always returns normalized colon format
+SELECT macaddr_to_string(mac_address), hostname FROM devices;
+```
+
+Saída:
+```
+08:00:2b:01:02:03   server-01
+08:00:2b:01:02:04   server-02
+08:00:2b:01:02:06   server-03
+```
+
+### Extração de OUI {#oui-extraction}
+
+Os primeiros 3 bytes de um endereço MAC identificam o fabricante (OUI — Organizationally Unique Identifier). O `macaddr_trunc()` zera os últimos 3 bytes, deixando apenas o OUI:
+
+```sql
+-- Find all devices from the same manufacturer. CAST to CHAR here works
+-- around a known issue where GROUP BY truncates this expression's result
+-- to the underlying type's stored length instead of the full string.
+SELECT CAST(macaddr_to_string(macaddr_trunc(mac_address)) AS CHAR(20)) AS oui,
+       COUNT(*) AS device_count
+FROM devices
+GROUP BY CAST(macaddr_to_string(macaddr_trunc(mac_address)) AS CHAR(20))
+ORDER BY device_count DESC;
+
+-- Filter by manufacturer OUI
+SELECT hostname, macaddr_to_string(mac_address)
+FROM devices
+WHERE macaddr_trunc(mac_address) = macaddr_from_string('08:00:2b:00:00:00');
+```
+
+### Comparação e ordenação {#comparison-and-sorting}
+
+```sql
+-- Sort devices by MAC address
+SELECT hostname, macaddr_to_string(mac_address)
+FROM devices
+ORDER BY mac_address;
+
+-- Find a specific device
+SELECT hostname FROM devices
+WHERE mac_address = macaddr_from_string('08:00:2b:01:02:03');
+```
+
+### Endereços MAC EUI-64 (MACADDR8) {#eui-64-mac-addresses-macaddr8}
+
+O hardware moderno usa cada vez mais identificadores EUI-64 de 8 bytes. O tipo `MACADDR8` lida com eles:
+
+```sql
+CREATE TABLE modern_devices (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    mac_address MACADDR8
+);
+
+INSERT INTO modern_devices VALUES
+    (1, macaddr8_from_string('08:00:2b:01:02:03:04:05'));
+
+SELECT macaddr8_to_string(mac_address) FROM modern_devices;
+-- Returns: 08:00:2b:01:02:03:04:05
+```
+
+## Comparando as Abordagens {#comparing-approaches}
+
+| Abordagem | Armazenamento | Valida o formato | Normaliza a entrada | Extração de OUI |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(17)` | 17 bytes | Não | Não | Fatiamento manual de string |
+| `BINARY(6)` + UNHEX manual | 6 bytes | Não | Não | Máscara binária manual |
+| `MACADDR` (VillageSQL) | 6 bytes | Sim | Sim (formato com dois-pontos) | `macaddr_trunc()` |
+| `MACADDR8` (VillageSQL) | 8 bytes | Sim | Sim | — |
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### O MACADDR aceita hexadecimal em maiúsculas? {#does-macaddr-accept-uppercase-hex}
+
+Sim — `08:00:2B:01:02:03` e `08:00:2b:01:02:03` são interpretados corretamente e armazenados de forma idêntica.
+
+#### Posso usar MACADDR como chave primária? {#can-i-use-macaddr-as-a-primary-key}
+
+Sim. `MACADDR` suporta indexação e comparações de igualdade. Para tabelas de dispositivos de rede em que o MAC é o identificador natural, é uma chave primária razoável.
+
+#### Qual é a diferença entre MACADDR e MACADDR8? {#whats-the-difference-between-macaddr-and-macaddr8}
+
+`MACADDR` é o formato MAC-48 IEEE 802 de 6 bytes usado pela maioria do hardware de rede. `MACADDR8` é o formato EUI-64 de 8 bytes usado em algumas interfaces de rede modernas e na geração de endereços link-local IPv6. Use `MACADDR8` quando estiver armazenando identificadores EUI-64.
+
+#### Como converto entre MACADDR e MACADDR8? {#how-do-i-convert-between-macaddr-and-macaddr8}
+
+Não há função de conversão integrada. Se você precisar expandir um MAC-48 para EUI-64 (inserindo `ff:fe` no meio), faça isso no código da aplicação antes de chamar `macaddr8_from_string()`.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.macaddr_from_string does not exist` | Execute `INSTALL EXTENSION vsql_network_address` |
+| `macaddr_from_string()` retorna NULL | A entrada não está em um formato válido de endereço MAC |
+| A consulta de OUI não retorna resultados | Verifique se você está comparando com um MAC truncado completo de 6 bytes: `macaddr_from_string('xx:xx:xx:00:00:00')` |
+| Formatos de MAC misturados não correspondem no WHERE | Eles vão corresponder — `MACADDR` normaliza todos os formatos no insert |
+
+## Veja também {#see-also}
+
+- [Armazenando Endereços IP no MySQL](/pt-BR/guides/storing-ip-addresses) — o mesmo padrão de armazenamento de endereços de rede para IPs

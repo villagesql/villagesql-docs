@@ -1,0 +1,167 @@
+---
+title: "MySQL 中的 AI 摘要"
+sidebarTitle: "使用 AI 生成摘要"
+description: "如何使用 VillageSQL 的 ai_prompt() 总结存储在 MySQL 中的长文本——直接在 SQL 中为支持工单、文章和文档生成摘要。"
+keywords: "mysql ai summarization, mysql summarize text sql, mysql ai_prompt summarize, mysql text summary column, mysql document summary, mysql support ticket summary"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+摘要是将长文本转换为抓住要点的较短版本。支持工单、客户反馈、文章和日志条目都能从一个简短的摘要字段中受益，它让您可以快速浏览内容。MySQL 没有摘要函数。VillageSQL 的 `ai_prompt()` 添加了一个。
+
+## 使用 VillageSQL：SQL 中的摘要 {#with-villagesql-summaries-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+摘要提示需要指定期望的长度和要保留的内容：
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE support_tickets ADD COLUMN summary VARCHAR(500);
+
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE support_tickets
+SET summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Summarize this support ticket in one sentence. ',
+        'Include the main issue and any resolution mentioned.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE summary IS NULL
+LIMIT 100;
+```
+
+像查询其他列一样查询摘要——读取时不会调用 AI：
+
+```sql
+-- Recent tickets with AI summaries for quick triage
+SELECT id, created_at, summary
+FROM support_tickets
+WHERE created_at > NOW() - INTERVAL 24 HOUR
+ORDER BY created_at DESC;
+```
+
+### 结构化摘要 {#structured-summaries}
+
+对于需要提取特定字段的用例，请要求输出 JSON：
+
+```sql
+ALTER TABLE support_tickets ADD COLUMN ai_extract JSON;
+
+UPDATE support_tickets
+SET ai_extract = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Extract key information from this support ticket. ',
+        'Return JSON with keys: issue (string), urgency (low/medium/high), ',
+        'product_mentioned (string or null), resolution_needed (boolean). ',
+        'Return only valid JSON.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE ai_extract IS NULL
+LIMIT 100;
+
+-- Triage: high-urgency tickets with no resolution
+SELECT id, body,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.issue')) AS issue,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.product_mentioned')) AS product
+FROM support_tickets
+WHERE JSON_UNQUOTE(JSON_EXTRACT(ai_extract, '$.urgency')) = 'high'
+ORDER BY created_at DESC;
+```
+
+### 总结多列内容 {#summarizing-multi-column-content}
+
+通过拼接多个字段，为模型构建更丰富的上下文：
+
+```sql
+UPDATE articles
+SET summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Write a two-sentence summary of this article for a preview card.\n\n',
+        'Title: ', title, '\n',
+        'Author: ', author_name, '\n',
+        'Body: ', LEFT(body, 3000)   -- trim very long bodies
+    )
+)
+WHERE summary IS NULL
+LIMIT 50;
+```
+
+`LEFT(body, 3000)` 避免向模型发送过长的文本。大多数 AI 模型都有 token 限制；对于非常长的文档，请只总结前几千个字符，或者将内容分块。
+
+## 长度和风格控制 {#length-and-style-control}
+
+提示的措辞控制输出的长度和语气：
+
+| 目标 | 提示措辞 |
+|:---|:---|
+| 一句话 | "Summarize in one sentence." |
+| 推文长度 | "Summarize in 280 characters or fewer." |
+| 执行摘要 | "Write a 2–3 sentence executive summary." |
+| 要点列表 | "Summarize as 3 bullet points." |
+| 面向行动 | "What does this ticket ask us to do? One sentence." |
+
+对于用在 UI 预览中的摘要，请指定字符数上限以避免溢出。
+
+## 模型选择 {#model-selection}
+
+摘要任务通常由更快、更便宜的模型就能处理得很好。批量摘要请使用 `claude-haiku-4-5` 或 `gpt-4o-mini`。在以下情况下升级到 `claude-sonnet-5`：
+
+- 源文本长且复杂
+- 您需要对含义微妙的字段做结构化 JSON 提取
+- 提取事实的准确性比成本更重要
+
+有关安装设置和提供商选项，请参阅 [将 MySQL 连接到 AI API](/zh/guides/ai-api-setup)。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 源文本可以有多长？ {#how-long-can-the-source-text-be}
+
+实际上限是每次调用几千个单词。AI 模型有 token 限制（当前模型通常为 100K–200K 个 token），但非常长的输入成本更高、耗时更长。对于超过约 5000 个单词的文档，请只总结第一部分，或者分块后逐块总结。
+
+#### 我可以在全文搜索索引中使用摘要吗？ {#can-i-use-summaries-in-a-full-text-search-index}
+
+可以——在填充摘要列之后，在该列上添加 FULLTEXT 索引。摘要往往比原始内容更适合作为全文搜索的目标，因为它们更短且关键词更密集。
+
+#### 同一篇文档总是会生成相同的摘要吗？ {#will-the-same-document-always-produce-the-same-summary}
+
+不会——AI 模型是概率性的。同一个提示在不同的调用中可能产生略有不同的输出。如果一致性很重要，请只生成一次摘要并存储；不要在每次读取时重新生成。
+
+#### 如何处理已经生成过摘要的行？ {#how-do-i-summarize-rows-that-have-already-been-summarized}
+
+除非源内容发生了变化，否则不要重新生成摘要。使用 `WHERE summary IS NULL` 只处理新的或更新过的行。如果需要跟踪变化，请添加一个 `summary_updated_at` 列，并将其与内容的最后修改时间戳进行比较。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | 运行 `INSTALL EXTENSION vsql_ai` |
+| 返回 NULL | 运行 `SHOW WARNINGS` 查看真实原因，然后检查 API 密钥、`max_execution_time` 和模型名称 |
+| 摘要过长或过短 | 收紧提示：指定字符数或句子数上限 |
+| 模型重复源文本而不是总结 | 在提示中添加 "Do not copy sentences from the original" |
+| 结构化 JSON 提取缺少键 | 在提示中添加 "If a field is not mentioned, use null" |
+
+## 另请参阅 {#see-also}
+
+- [从 MySQL 查询运行 AI 模型](/zh/guides/ai-prompts-in-mysql)——本指南所基于的 ai_prompt() 函数
+- [对 MySQL 数据进行情感分析](/zh/guides/sentiment-analysis)——另一种使用 ai_prompt() 的文本分析模式
+- [使用 AI 在 MySQL 中分类文本](/zh/guides/text-classification)——用同样的方法对文本进行分类

@@ -1,0 +1,311 @@
+---
+title: "MySQL 中的存储过程"
+sidebarTitle: "编写存储过程"
+description: "MySQL 存储过程的工作方式：CREATE PROCEDURE 语法、IN/OUT/INOUT 参数、局部变量、控制流、游标，以及存储过程何时有益、何时有害。"
+keywords: "mysql stored procedure, mysql create procedure, mysql stored procedure example, mysql procedure parameters, mysql procedure vs function, mysql call procedure, mysql delimiter"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+存储过程是在服务器上运行的、具名的 SQL 代码块。您调用它一次，它就执行其中包含的所有语句。代码存放在数据库中，而不是在您的应用程序中。
+
+## 创建存储过程 {#creating-a-stored-procedure}
+
+MySQL 使用 `DELIMITER` 来更改语句终止符，这样过程体内的 `;` 就不会提前结束 `CREATE PROCEDURE` 语句。
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_active_users()
+BEGIN
+    SELECT id, name, email
+    FROM users
+    WHERE status = 'active'
+    ORDER BY name;
+END$$
+
+DELIMITER ;
+```
+
+用 `CALL` 调用它：
+
+```sql
+CALL get_active_users();
+```
+
+删除它：
+
+```sql
+DROP PROCEDURE IF EXISTS get_active_users;
+```
+
+查看它的定义：
+
+```sql
+SHOW CREATE PROCEDURE get_active_users\G
+```
+
+## 参数 {#parameters}
+
+过程支持三种参数模式：
+
+| 模式 | 方向 | 用例 |
+|:-----|:----------|:---------|
+| `IN` | 调用方 → 过程 | 传入一个值 |
+| `OUT` | 过程 → 调用方 | 返回一个值 |
+| `INOUT` | 双向 | 传入并修改 |
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_user_count(
+    IN  p_status  VARCHAR(20),
+    OUT p_count   INT
+)
+BEGIN
+    SELECT COUNT(*) INTO p_count
+    FROM users
+    WHERE status = p_status;
+END$$
+
+DELIMITER ;
+```
+
+对 `OUT` 参数使用用户定义变量来调用它：
+
+```sql
+CALL get_user_count('active', @count);
+SELECT @count;
+```
+
+## 局部变量 {#local-variables}
+
+在 `BEGIN...END` 块的顶部、任何其他语句之前，用 `DECLARE` 声明局部变量：
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE transfer_funds(
+    IN p_from_account INT,
+    IN p_to_account   INT,
+    IN p_amount       DECIMAL(10,2)
+)
+BEGIN
+    DECLARE v_balance DECIMAL(10,2);
+
+    SELECT balance INTO v_balance
+    FROM accounts
+    WHERE id = p_from_account;
+
+    IF v_balance < p_amount THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Insufficient funds';
+    END IF;
+
+    UPDATE accounts SET balance = balance - p_amount WHERE id = p_from_account;
+    UPDATE accounts SET balance = balance + p_amount WHERE id = p_to_account;
+END$$
+
+DELIMITER ;
+```
+
+## 控制流 {#control-flow}
+
+MySQL 过程支持标准的控制流结构：
+
+```sql
+-- IF...ELSEIF...ELSE
+IF v_count > 100 THEN
+    SET v_tier = 'high';
+ELSEIF v_count > 10 THEN
+    SET v_tier = 'medium';
+ELSE
+    SET v_tier = 'low';
+END IF;
+
+-- CASE
+CASE p_status
+    WHEN 'active'   THEN SET v_label = 'Active User';
+    WHEN 'inactive' THEN SET v_label = 'Inactive User';
+    ELSE                 SET v_label = 'Unknown';
+END CASE;
+
+-- WHILE loop
+WHILE v_i <= 10 DO
+    SET v_sum = v_sum + v_i;
+    SET v_i = v_i + 1;
+END WHILE;
+
+-- REPEAT...UNTIL
+REPEAT
+    SET v_i = v_i + 1;
+UNTIL v_i > 10
+END REPEAT;
+```
+
+## 错误处理 {#error-handling}
+
+使用 `DECLARE ... HANDLER` 捕获错误：
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE safe_insert(IN p_name VARCHAR(100))
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    INSERT INTO items (name) VALUES (p_name);
+    COMMIT;
+END$$
+
+DELIMITER ;
+```
+
+`EXIT HANDLER` 在条件触发时停止过程。`CONTINUE HANDLER` 让过程继续运行。`RESIGNAL` 把错误重新抛给调用方。
+
+用 `SIGNAL` 抛出您自己的错误：
+
+```sql
+SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT = 'Custom error message';
+```
+
+`45000` 是"未处理的用户定义异常"的 SQLSTATE。
+
+## 游标 {#cursors}
+
+游标在过程内部逐行遍历结果集。当您无法把逻辑表达为集合操作时，就使用它们。
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE process_orders()
+BEGIN
+    DECLARE v_done    INT DEFAULT FALSE;
+    DECLARE v_id      INT;
+    DECLARE v_amount  DECIMAL(10,2);
+
+    DECLARE order_cursor CURSOR FOR
+        SELECT id, amount FROM orders WHERE status = 'pending';
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+    OPEN order_cursor;
+
+    read_loop: LOOP
+        FETCH order_cursor INTO v_id, v_amount;
+        IF v_done THEN
+            LEAVE read_loop;
+        END IF;
+        -- process each row
+        UPDATE orders SET status = 'processed' WHERE id = v_id;
+    END LOOP;
+
+    CLOSE order_cursor;
+END$$
+
+DELIMITER ;
+```
+
+当游标的行用尽时，`NOT FOUND` 处理程序会设置 `v_done`。务必在过程结束前关闭游标。
+
+## 存储过程与函数的对比 {#stored-procedures-vs-functions}
+
+| | 存储过程 | 存储函数 |
+|:--|:-----------------|:----------------|
+| 返回值 | 通过 OUT 参数或结果集 | 单个返回值 |
+| 调用语法 | `CALL proc()` | `SELECT func()` — 在表达式中使用 |
+| 事务 | 可以 `START TRANSACTION`、`COMMIT`、`ROLLBACK` | 不能修改事务状态 |
+| 结果集 | 可以返回多个结果集 | 不能返回结果集 |
+| 在 SQL 中使用 | 不能在 SELECT 表达式中使用 | 可以在 SELECT、WHERE 等中使用 |
+
+当您需要把逻辑嵌入 SQL 表达式时，使用函数。其他所有情况使用过程 — 多步骤流程、条件逻辑、副作用。
+
+## 何时使用存储过程 {#when-to-use-stored-procedures}
+
+存储过程在以下情况下有意义：
+- 强制执行无论哪个应用程序或用户运行查询都必须适用的业务规则
+- 减少多步骤操作的往返次数（复杂的批处理作业、数据迁移）
+- 授予用户执行特定操作的权限，而不暴露底层表（`GRANT EXECUTE ON PROCEDURE`）
+
+它们在以下情况下有害：
+- 逻辑经常变化 — 部署需要 ALTER PROCEDURE 或 DROP/重新创建
+- 需要调试 — 没有调试器，只有基于 SIGNAL 的日志记录
+- 可移植性很重要 — 存储过程语法是 MySQL 特有的
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 存储过程可以返回结果集吗？ {#can-a-stored-procedure-return-a-result-set}
+
+可以。过程内部任何不使用 `INTO` 的 `SELECT` 都会把结果集发送给调用方：
+
+```sql
+CREATE PROCEDURE get_users()
+BEGIN
+    SELECT id, name FROM users;  -- this result set goes to the caller
+END;
+```
+
+一个过程内的多条 `SELECT` 语句会发送多个结果集。大多数客户端能处理这种情况，但有些 ORM 不能。
+
+#### 如何查看数据库中的所有存储过程？ {#how-do-i-see-all-stored-procedures-in-a-database}
+
+```sql
+SHOW PROCEDURE STATUS WHERE Db = 'mydb';
+-- or
+SELECT routine_name, created, last_altered
+FROM information_schema.routines
+WHERE routine_type = 'PROCEDURE' AND routine_schema = 'mydb';
+```
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| CREATE PROCEDURE 时报 `ERROR 1064` | 缺少 `DELIMITER` 更改 — 过程体内的 `;` 提前结束了语句；用 `DELIMITER $$ ... $$; DELIMITER ;` 包裹 |
+| `ERROR 1172: Result consisted of more than one row` | `SELECT ... INTO` 返回了多行 — 添加 `LIMIT 1` 或修改查询使其只返回一行 |
+| CALL 之后 `OUT` 参数为 NULL | 过程没有给它赋值 — 检查所有代码路径都能到达该参数的 `SET` 或 `SELECT INTO` |
+| `ERROR 1193: Unknown system variable` | 在需要 `DECLARE v_var`（局部变量）的地方使用了 `SET @var`（会话变量），或者反之 |
+| 过程运行了但没有返回数据 | 结果集 `SELECT` 正通过额外的一层（嵌套的 CALL）发送数据 — 把 SELECT 移到最外层的过程中 |
+
+## VillageSQL：存储过程中的自定义扩展类型 {#villagesql-custom-extension-types-in-stored-procedures}
+
+VillageSQL 的自定义扩展类型（例如 `COMPLEX`、`UUID`、`TVECTOR`）可以用作
+存储过程的参数类型和 `DECLARE` 变量类型。先安装扩展，
+然后在您的过程定义中引用它的类型：
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE add_impedances(
+    IN  p_a COMPLEX,
+    IN  p_b COMPLEX,
+    OUT p_sum COMPLEX
+)
+BEGIN
+    DECLARE v_result COMPLEX;
+    SET v_result = complex_add(p_a, p_b);
+    SET p_sum = v_result;
+END$$
+
+DELIMITER ;
+```
+
+<Warning>
+  只要有任何存储过程在使用该扩展的自定义类型，`UNINSTALL EXTENSION` 就会失败。
+  请先删除或修改该过程，再卸载扩展。详情请参阅
+  [卸载扩展](/zh/extensions/uninstall)。
+</Warning>
+
+## 另请参阅 {#see-also}
+
+- [MySQL 触发器](/zh/guides/triggers) — 触发器调用存储过程逻辑或内联 SQL
+- [MySQL 中的事务](/zh/guides/transactions) — 存储过程通常把工作包裹在事务中
+- [卸载扩展](/zh/extensions/uninstall) — 存储过程使用扩展类型时的限制

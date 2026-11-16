@@ -1,0 +1,164 @@
+---
+title: "Enviando Webhooks a partir de Triggers"
+sidebarTitle: "Webhooks HTTP"
+description: "Como enviar webhooks HTTP a partir de triggers do MySQL usando a extensão vsql_http do VillageSQL — envie mudanças de linhas para serviços externos automaticamente em INSERT, UPDATE ou DELETE."
+keywords: "mysql webhook trigger, mysql http trigger, mysql after insert webhook, mysql push notification, vsql_http trigger"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Manter sistemas externos sincronizados com o seu banco de dados geralmente significa polling — o serviço externo consulta periodicamente a sua API em busca de mudanças, ou o código da sua aplicação publica eventos após cada gravação. Com a extensão `vsql_http` do VillageSQL, os triggers podem enviar requisições HTTP diretamente, para que os sistemas externos sejam notificados no momento em que uma linha muda, sem necessidade de publicação de eventos na camada de aplicação.
+
+## Configuração {#setup}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+## Trigger de Webhook Básico {#basic-webhook-trigger}
+
+Um trigger `AFTER INSERT` que faz POST de um payload para um endpoint de webhook:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',     'order.created',
+    'id',        NEW.id,
+    'customer',  NEW.customer_id,
+    'total',     NEW.total,
+    'status',    NEW.status
+  );
+  SET @ignored = vsql_http.http_post(
+    'https://hooks.example.com/orders',
+    'application/json',
+    @payload
+  );
+END$$
+DELIMITER ;
+```
+
+O resultado é atribuído a `@ignored` — o trigger não usa a resposta, mas a atribuição suprime o warning de "resultado não utilizado". NULL significa que a conexão falhou; o trigger é concluído de qualquer forma e o INSERT é efetuado.
+
+## Controlando Timeouts {#controlling-timeouts}
+
+Por padrão, `vsql_http` usa um timeout de 30 segundos. Um endpoint de webhook lento ou indisponível bloqueia a gravação por todo esse tempo. Use `http_request()` com um JSON de opções para definir um prazo mais curto:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT(
+    'event',    'order.created',
+    'id',       NEW.id,
+    'customer', NEW.customer_id,
+    'total',    NEW.total
+  );
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    NULL,
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+Um timeout de 3 segundos limita por quanto tempo um atraso do webhook pode segurar uma gravação. A requisição é concluída ou desiste — o INSERT não é revertido.
+
+## Triggers de UPDATE e DELETE {#update-and-delete-triggers}
+
+O mesmo padrão funciona para atualizações e exclusões. Use `OLD` para incluir os valores anteriores:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_update
+  AFTER UPDATE ON orders
+  FOR EACH ROW
+BEGIN
+  IF NEW.status != OLD.status THEN
+    SET @payload = JSON_OBJECT(
+      'event',      'order.status_changed',
+      'id',         NEW.id,
+      'old_status', OLD.status,
+      'new_status', NEW.status
+    );
+    SET @ignored = vsql_http.http_request(
+      'POST',
+      'https://hooks.example.com/orders',
+      NULL,
+      @payload,
+      'application/json',
+      '{"timeout": 3}'
+    );
+  END IF;
+END$$
+DELIMITER ;
+```
+
+A guarda `IF NEW.status != OLD.status` evita disparar o webhook em instruções UPDATE que não mudam o status — mantendo o volume de webhooks proporcional às mudanças significativas.
+
+## Autenticação {#authentication}
+
+Passe chaves de API ou tokens bearer no argumento `headers_json` de `http_request()`:
+
+```sql
+DELIMITER $$
+CREATE TRIGGER after_order_insert
+  AFTER INSERT ON orders
+  FOR EACH ROW
+BEGIN
+  SET @payload = JSON_OBJECT('id', NEW.id, 'total', NEW.total);
+  SET @ignored = vsql_http.http_request(
+    'POST',
+    'https://hooks.example.com/orders',
+    '{"Authorization": "Bearer your-webhook-secret"}',
+    @payload,
+    'application/json',
+    '{"timeout": 3}'
+  );
+END$$
+DELIMITER ;
+```
+
+Armazene os segredos em uma tabela de configuração e recupere-os em uma variável no momento do trigger, em vez de fixá-los no corpo do trigger.
+
+## Ressalvas Importantes {#important-caveats}
+
+**Triggers são síncronos.** A chamada HTTP bloqueia até ser concluída ou atingir o timeout. Um endpoint de webhook lento ou fora do ar vai segurar cada gravação nessa tabela. Sempre defina um timeout curto (2–5 segundos) e projete o endpoint para responder imediatamente (enfileire o trabalho, não o processe inline).
+
+**As falhas são silenciosas por padrão.** Se a chamada HTTP retorna NULL (falha de conexão), o trigger não gera um erro e a gravação é bem-sucedida — um warning carrega a mensagem de erro do curl, mas nada no trigger o inspeciona. Uma resposta não-2xx também retorna silenciosamente — `http_post()` retorna JSON independentemente do código de status, e o trigger não o inspeciona. Se a entrega confiável importa, use o padrão de outbox transacional em vez disso: grave os eventos em uma tabela `outbox` na mesma transação e depois entregue-os com um processo separado.
+
+**Triggers disparam uma vez por linha.** `FOR EACH ROW` significa que um `UPDATE orders SET status = 'shipped'` em massa atinge 1000 linhas e envia 1000 chamadas de webhook. Isso pode sobrecarregar o endpoint e esgotar os limites de conexão. Para operações em massa, suprima o trigger ou use o padrão de outbox.
+
+**Sem lógica de retentativa.** Uma requisição que falhou permanece com falha. Construa o tratamento de retentativa e de dead-letter no sistema receptor ou no processo de outbox, não no trigger.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| As gravações ficam lentas | O endpoint de webhook está lento — defina um timeout curto nas opções de `http_request()` |
+| Erro no corpo do trigger na criação | Verifique se `DELIMITER $$` está definido antes de `CREATE TRIGGER` |
+| Nenhum webhook recebido | Retorno NULL significa que a conexão falhou — verifique `SHOW WARNINGS` para a mensagem de erro do curl e confira o acesso à rede a partir do host do servidor |
+| Chamadas de webhook demais em UPDATE em massa | Proteja com `IF NEW.col != OLD.col` ou suprima o trigger para operações em lote |
+
+## Próximos Passos {#next-steps}
+
+- [Fazendo requisições HTTP a partir do SQL](/pt-BR/guides/http-requests-in-mysql) — referência completa das funções, incluindo a análise de respostas
+- [Enriquecendo linhas com dados de API](/pt-BR/guides/rest-api-enrichment) — traga dados externos para as suas tabelas
+- [Triggers no MySQL](/pt-BR/guides/triggers) — padrões gerais de triggers e a semântica de BEFORE vs AFTER
+
+## Veja também {#see-also}
+
+- [Fazendo Requisições HTTP a partir do SQL](/pt-BR/guides/http-requests-in-mysql) — as funções do vsql_http usadas em triggers de webhook
+- [Triggers do MySQL](/pt-BR/guides/triggers) — a mecânica de triggers que dispara os webhooks
+- [Assinaturas HMAC no MySQL](/pt-BR/guides/hmac-mysql) — assinando payloads de webhook para verificação pelo destinatário

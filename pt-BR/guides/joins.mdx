@@ -1,0 +1,235 @@
+---
+title: "Desempenho de JOIN no MySQL e Erros Comuns"
+sidebarTitle: "Desempenho de JOIN"
+description: "Por que um JOIN do MySQL fica lento ou retorna as linhas erradas: índices ausentes, um WHERE que desfaz um LEFT JOIN, linhas duplicadas, chaves de junção NULL e a ausência de FULL OUTER JOIN."
+keywords: "mysql join performance, mysql slow join, mysql left join returns fewer rows, mysql join duplicate rows, mysql full outer join, mysql join index, mysql join explain"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Os JOINs funcionam na primeira vez e dão errado depois. A consulta é SQL correto, o
+servidor não reclama de nada, e a resposta é uma contagem de linhas que você não esperava ou
+um relatório que leva 40 segundos. Este guia cobre esses casos: o que torna um
+join lento, e as 4 formas pelas quais um join retorna silenciosamente as linhas erradas.
+
+Se você ainda está decidindo que tipo de join escrever, o tutorial ensina
+cada um deles com um banco de dados de exemplo:
+[como os joins funcionam](/pt-BR/tutorial/joins), [INNER JOIN](/pt-BR/tutorial/inner-join),
+[LEFT JOIN](/pt-BR/tutorial/left-join), [RIGHT JOIN](/pt-BR/tutorial/right-join),
+[CROSS JOIN](/pt-BR/tutorial/cross-join) e [self join](/pt-BR/tutorial/self-join).
+
+## As tabelas usadas neste guia {#the-tables-used-in-this-guide}
+
+```sql
+CREATE TABLE customers (
+    id    INT PRIMARY KEY AUTO_INCREMENT,
+    name  VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE orders (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id INT,    -- nullable: orders without a customer
+    amount      DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+INSERT INTO orders VALUES
+    (1, 1, 99.00),   -- Alice's order
+    (2, 1, 45.00),   -- Alice's second order
+    (3, 2, 120.00),  -- Bob's order
+    (4, NULL, 15.00); -- order with no customer
+```
+
+## Indexe a coluna de junção {#index-the-join-column}
+
+Sem um índice na coluna de junção, o servidor constrói uma tabela hash sobre um
+dos lados e varre o outro. `EXPLAIN FORMAT=TREE` mostra isso pelo nome:
+
+```sql
+EXPLAIN FORMAT=TREE SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id\G
+```
+
+```text
+*************************** 1. row ***************************
+EXPLAIN: -> Inner hash join (o.customer_id = c.id)  (cost=2 rows=3)
+    -> Table scan on o  (cost=0.117 rows=4)
+    -> Hash
+        -> Table scan on c  (cost=0.55 rows=3)
+```
+
+Um hash join lê cada tabela uma vez. Em 7 linhas isso não é nada. Em tabelas reais
+são 2 varreduras completas de tabela mais a memória para manter o hash, e quando o lado de construção
+não cabe em `join_buffer_size` o servidor o despeja em disco em lotes.
+Adicionar o índice substitui tudo isso por uma busca:
+
+```sql
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+```
+
+Peça o mesmo plano de novo e o hash desaparece:
+
+```sql
+EXPLAIN FORMAT=TREE SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id\G
+```
+
+```text
+*************************** 1. row ***************************
+EXPLAIN: -> Nested loop inner join  (cost=1.95 rows=4)
+    -> Table scan on c  (cost=0.55 rows=3)
+    -> Index lookup on o using idx_orders_customer (customer_id=c.id)  (cost=0.378 rows=1.33)
+```
+
+Indexe a coluna de chave estrangeira no lado "muitos" de uma relação um-para-muitos.
+A chave primária no lado "um" já está indexada, então essa metade não precisa de
+nada.
+
+Na saída padrão do `EXPLAIN`, os mesmos 2 planos aparecem como `Extra: Using join
+buffer (hash join)` e `type: ref`. Essa tabela também mostra a ordem em que o servidor
+escolheu fazer a junção, o que importa assim que uma consulta tem 3 ou mais tabelas: o
+servidor as lê de cima para baixo, e a estimativa de linhas da primeira
+se multiplica por tudo o que vem abaixo.
+[Lendo a saída do EXPLAIN](/pt-BR/guides/reading-explain) cobre o resto do plano.
+
+Uma condição de igualdade é o que um hash join consegue buscar. Faça a junção por um intervalo ou por uma
+desigualdade e o servidor ainda constrói o hash, mas não tem com o que
+buscar: o plano mostra `Inner hash join (no condition)` com o teste em um
+`Filter` acima dele, então cada par de linhas é formado e depois descartado. Esse é
+o custo que um join de igualdade indexado evita.
+
+## Uma cláusula WHERE transforma um LEFT JOIN de volta em um INNER JOIN {#a-where-clause-turns-a-left-join-back-into-an-inner-join}
+
+O bug de contagem de linhas errada mais comum, e nada avisa você.
+
+```sql
+-- Excludes customers with no orders, so this is an inner join now
+SELECT c.name, o.amount
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 50;
+
+-- Keeps customers with no orders
+SELECT c.name, o.amount
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id AND o.amount > 50;
+```
+
+O join é executado primeiro e dá aos clientes sem correspondência um `o.amount` NULL. O `WHERE`
+então testa cada linha, `NULL > 50` é NULL em vez de verdadeiro, e essas linhas são
+descartadas. Mover a condição para o `ON` faz dela parte do que conta como
+correspondência.
+
+A regra: em um outer join, uma condição sobre a tabela interna pertence ao `ON`, e
+uma condição sobre a tabela preservada pertence ao `WHERE`. A exceção é
+`WHERE <chave da tabela interna> IS NULL`, em que descartar as linhas correspondidas é o
+objetivo.
+
+## Um NULL na coluna de junção não corresponde a nada {#a-null-in-the-join-column-matches-nothing}
+
+`orders.customer_id` aceita NULL, e o pedido 4 não tem cliente. Um inner join
+o descarta, porque NULL não é igual a nada, nem mesmo a outro NULL.
+
+```sql
+SELECT c.name, o.amount
+FROM customers c
+INNER JOIN orders o ON o.customer_id = c.id
+ORDER BY c.name, o.amount;
+```
+
+```text
++-------+--------+
+| name  | amount |
++-------+--------+
+| Alice |  45.00 |
+| Alice |  99.00 |
+| Bob   | 120.00 |
++-------+--------+
+3 rows in set (0.00 sec)
+```
+
+3 linhas de 4 pedidos. Carol está ausente porque não tem pedidos, que é a
+metade esperada. O pedido 4 está ausente porque seu `customer_id` é NULL, que é
+a metade que surpreende as pessoas: a linha existe, seu valor é real, e nenhuma condição
+de junção consegue alcançá-la. Um total de receita construído sobre esse join fica 15.00 abaixo e
+nada avisa.
+
+Quando uma coluna de junção aceita NULL, decida o que uma linha órfã deve fazer antes de
+escrever o join. Um `LEFT JOIN` a partir de `orders` a mantém com um nome de cliente NULL.
+[NULL no MySQL](/pt-BR/guides/null-in-mysql) cobre a regra de comparação por trás disso.
+
+## Um join um-para-muitos multiplica suas linhas {#a-one-to-many-join-multiplies-your-rows}
+
+Um join retorna 1 linha por correspondência, então fazer a junção com uma tabela que contém várias
+linhas correspondentes repete a linha da esquerda uma vez por correspondência. Os totais calculados sobre esse
+resultado ficam então errados, normalmente altos demais, e a consulta continua parecendo certa.
+
+```sql
+-- Alice appears twice, because she has 2 orders
+SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON o.customer_id = c.id;
+```
+
+Antes de tratar as linhas duplicadas como um bug, confirme que a relação é mesmo
+um-para-um. Quando ela é um-para-muitos e você quer 1 linha por cliente,
+agregue: `GROUP BY c.id` com `SUM` ou `COUNT` sobre a coluna juntada. Consulte
+[Desempenho de GROUP BY no MySQL](/pt-BR/guides/group-by-having).
+
+A mesma aritmética dá errado mais rápido com 2 joins um-para-muitos em uma consulta,
+em que os 2 conjuntos de correspondências se multiplicam entre si. Agregue cada um em sua
+própria subconsulta em vez de juntar os dois de uma vez.
+
+## Um ON ausente dá a você todas as combinações {#a-missing-on-gives-you-every-combination}
+
+O MySQL aceita `INNER JOIN` sem cláusula `ON` e o interpreta como um cross join, então
+um erro de digitação produz o produto das duas tabelas em vez de um erro. 2 tabelas de
+10.000 linhas dão 100 milhões de linhas.
+
+Quando um join retorna um número suspeitosamente redondo e suspeitosamente grande, verifique
+se há um `ON` ausente antes de qualquer outra coisa. Uma vírgula entre as tabelas no `FROM` é
+a mesma coisa na sintaxe antiga, com a condição de correspondência normalmente mais
+abaixo, no `WHERE`.
+
+## O MySQL não tem FULL OUTER JOIN {#mysql-has-no-full-outer-join}
+
+Não existe `FULL OUTER JOIN` no MySQL. Combine as 2 metades com `UNION`:
+
+```sql
+SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+UNION
+SELECT c.name, o.amount FROM customers c RIGHT JOIN orders o ON o.customer_id = c.id;
+```
+
+O `UNION` remove as linhas duplicadas, que é o que faz as 2 metades se encaixarem
+de forma limpa. O `UNION ALL` não emula um full outer join de jeito nenhum: ele retorna cada
+linha correspondida duas vezes, uma de cada metade. Quando seus dados têm linhas duplicadas que você
+precisa manter, desduplique por uma coluna de chave em vez de recorrer ao `UNION ALL`.
+
+## JOIN ou subconsulta {#join-or-subquery}
+
+Um join e uma subconsulta `IN` frequentemente expressam o mesmo filtro, e qual deles o
+otimizador prefere depende dos dados. Quando você só precisa saber se uma
+linha relacionada existe e não quer nenhuma de suas colunas, `EXISTS` normalmente fica mais legível
+e deixa o servidor parar na primeira correspondência.
+[Subconsultas vs JOINs no MySQL](/pt-BR/guides/subqueries-vs-joins) os compara com
+planos.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Causa e correção |
+|:--------|:---------|
+| `LEFT JOIN` retorna menos linhas do que o esperado | Uma condição `WHERE` sobre a tabela da direita está descartando as linhas NULL. Mova-a para o `ON`. |
+| Um join em tabelas grandes é lento | A coluna de junção no lado "muitos" não tem índice. Procure `type: ALL` no `EXPLAIN`. |
+| Linhas duplicadas inesperadas | A relação é um-para-muitos. Agregue com `GROUP BY`, ou confirme que ela deveria ser um-para-um. |
+| Um total está alto demais | Mesma causa: o join repetiu a linha da esquerda, então a soma a conta várias vezes. |
+| Um join retorna um número enorme e redondo de linhas | A cláusula `ON` está ausente, então o join é um cross join. |
+| Faltam linhas que existem nas duas tabelas | A coluna de junção é NULL em um dos lados, então nada corresponde a ela. |
+| `RIGHT JOIN` é difícil de acompanhar | Reescreva como `LEFT JOIN` com as tabelas trocadas. Mesmo resultado. |
+
+## Veja também {#see-also}
+
+- [Lendo a saída do EXPLAIN](/pt-BR/guides/reading-explain) — o plano que mostra qual índice um join usou
+- [Chaves estrangeiras no MySQL](/pt-BR/guides/foreign-keys) — a restrição que decide qual coluna indexar
+- [Desempenho de GROUP BY no MySQL](/pt-BR/guides/group-by-having) — agregando um join um-para-muitos de volta a 1 linha
+- [Como os joins funcionam](/pt-BR/tutorial/joins) — o tutorial, se você quiser o básico primeiro

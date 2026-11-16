@@ -1,0 +1,98 @@
+---
+title: "MySQL 中的软删除"
+sidebarTitle: "软删除"
+description: "如何用 deleted_at 列实现软删除，让唯一约束在软删除的行上继续有效，以及判断何时硬删除是更好的选择。"
+keywords: "mysql soft delete, deleted_at column, soft delete unique constraint, mysql logical delete, restore deleted rows mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+软删除把一行标记为已删除，而不是真正移除它。该行仍留在表中，对应用程序不可见，一条语句就能恢复。它是"用户删了某样东西又想找回来"这一问题的标准答案，但在采用它之前，有两个问题值得先弄清楚：每条查询都必须记得加过滤条件，而唯一约束也不再是您以为的含义。
+
+## 基本模式 {#the-basic-pattern}
+
+添加一个可为空的时间戳。`NULL` 表示存活；时间戳表示已删除，并记录删除的时间：
+
+```sql
+CREATE TABLE customers (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  name VARCHAR(100),
+  deleted_at TIMESTAMP NULL DEFAULT NULL
+);
+
+-- Delete
+UPDATE customers SET deleted_at = NOW() WHERE id = 42;
+
+-- Restore
+UPDATE customers SET deleted_at = NULL WHERE id = 42;
+
+-- Every read now needs the filter
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+优先选择时间戳而不是 `deleted` 布尔值：成本相同，而且它免费回答了"什么时候"这个问题 — 支持工单一定会问。
+
+## 问题 1：唯一约束 {#problem-1-unique-constraints}
+
+`email` 上的唯一索引会永久阻止重新注册：软删除的行仍然占用着该值。
+
+```sql
+ALTER TABLE customers ADD UNIQUE KEY uq_email (email);
+UPDATE customers SET deleted_at = NOW() WHERE email = 'a@example.com';
+INSERT INTO customers (email, name) VALUES ('a@example.com', 'Again');
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'a@example.com' for key 'customers.uq_email'
+```
+
+修复方法是一个函数索引技巧：让唯一键覆盖一个对存活行恒定、对已删除行唯一的列。生成列可以干净地做到这一点：
+
+```sql
+ALTER TABLE customers DROP KEY uq_email;
+ALTER TABLE customers
+  ADD COLUMN email_live VARCHAR(255)
+    GENERATED ALWAYS AS (IF(deleted_at IS NULL, email, NULL)) VIRTUAL,
+  ADD UNIQUE KEY uq_email_live (email_live);
+```
+
+MySQL 的唯一索引允许任意数量的 `NULL`，因此已删除的行永远不会冲突，而两个电子邮件相同的存活行仍然会失败。有关其机制，请参阅 [生成列](/zh/guides/generated-columns)。
+
+## 问题 2：每条查询都必须记得 {#problem-2-every-query-must-remember}
+
+只要漏掉一次 `WHERE deleted_at IS NULL`，已删除的数据就会泄露到报表或 API 响应中。两种缓解措施：
+
+- **为存活子集建一个视图**。让读取路径指向该视图，过滤条件就不可能被遗忘：
+
+```sql
+CREATE VIEW live_customers AS
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+- **ORM 作用域**。大多数 ORM 可以全局应用该过滤条件（Rails 的 `default_scope`、Django 的 manager、Prisma 的中间件）。在一个地方打开它，而不是审计每一条查询。
+
+外键也需要考虑：软删除的父行仍然存在，因此 `ON DELETE CASCADE` 永远不会触发。如果子行应该随父行一起消失，应用程序（或触发器）必须自己级联 `deleted_at`。
+
+## 何时不要软删除 {#when-not-to-soft-delete}
+
+- **监管要求的擦除**。GDPR 的删除请求意味着数据必须消失，而不是隐藏。软删除的行仍然算作个人数据。
+- **高流转率的表**。按百万计删除的会话、队列作业和日志只会让表和表上的每个索引膨胀。
+- **没人会恢复的数据**。如果不存在撤销的场景，过滤条件的代价就什么也换不来。
+
+一种常见的折中方案：用户操作时软删除，然后由计划任务硬删除 `deleted_at` 已超过保留期的行：
+
+```sql
+DELETE FROM customers
+WHERE deleted_at IS NOT NULL
+  AND deleted_at < NOW() - INTERVAL 90 DAY;
+```
+
+## 另请参阅 {#see-also}
+
+- [生成列](/zh/guides/generated-columns) — 唯一约束修复方法背后的机制
+- [视图](/zh/guides/views) — 一个不会忘记过滤条件的存活行视图
+- [外键](/zh/guides/foreign-keys) — 为什么级联不会在软删除时触发
+- [MySQL DELETE](/zh/tutorial/delete) — 本模式所替代的硬删除

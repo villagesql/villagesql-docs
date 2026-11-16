@@ -1,0 +1,232 @@
+---
+title: "GROUP BY no MySQL"
+sidebarTitle: "GROUP BY"
+description: "Como GROUP BY divide as linhas do MySQL em grupos e retorna 1 linha por grupo, como agrupar por várias colunas, e o que o ERROR 1055 está dizendo a você."
+keywords: "mysql group by, group by mysql, mysql group by count, mysql group by multiple columns, mysql only_full_group_by, mysql group by clause"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma agregação sem `GROUP BY` trata a tabela inteira como 1 grupo e retorna 1
+linha. `GROUP BY` divide as linhas em grupos primeiro, então você recebe 1 linha para cada
+um. É assim que "quantos filmes" vira "quantos filmes de cada classificação".
+
+Abra o cliente com `mysql -u root -p sakila` antes de começar.
+
+## Como GROUP BY funciona {#how-group-by-works}
+
+```sql
+SELECT GROUPING_COLUMN, AGGREGATE_FUNCTION(COLUMN_NAME)
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN;
+```
+
+Substitua `GROUPING_COLUMN` pela coluna cujos valores definem os grupos,
+`TABLE_NAME` pela tabela, e `AGGREGATE_FUNCTION(COLUMN_NAME)` pelo que você
+quer calcular para cada grupo.
+
+O servidor separa as linhas em baldes, 1 por valor distinto da coluna de
+agrupamento, e executa a agregação sobre cada balde separadamente. O resultado tem tantas
+linhas quantos valores distintos havia.
+
+`GROUP BY` vem depois do `WHERE` e antes do `ORDER BY`, que é também a ordem
+em que o resultado é definido: filtre as linhas, agrupe o que sobrou, e então ordene os
+grupos.
+
+## Exemplos {#examples}
+
+### 1) Uma linha por valor {#1-one-row-per-value}
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
+| NC-17  |   210 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+5 grupos, porque `rating` tem 5 valores distintos, e as 5 contagens somam
+1.000. As linhas saem na ordem declarada do `ENUM` em vez de
+em ordem alfabética, o que a lição [SELECT DISTINCT](/pt-BR/tutorial/select-distinct)
+explica.
+
+### 2) Agrupar por 2 colunas {#2-group-on-2-columns}
+
+Nomeie 2 colunas e um grupo é um par distinto, não um valor de cada uma.
+
+```sql
+SELECT rating, rental_rate, COUNT(*) AS films
+FROM film
+GROUP BY rating, rental_rate
+ORDER BY rating, rental_rate;
+```
+
+```text
++--------+-------------+-------+
+| rating | rental_rate | films |
++--------+-------------+-------+
+| G      |        0.99 |    64 |
+| G      |        2.99 |    59 |
+| G      |        4.99 |    55 |
+| PG     |        0.99 |    62 |
+| PG     |        2.99 |    64 |
+| PG     |        4.99 |    68 |
+...
++--------+-------------+-------+
+15 rows in set (0.01 sec)
+```
+
+5 classificações vezes 3 tarifas são 15 grupos. Esta é a mesma forma que
+`SELECT DISTINCT rating, rental_rate` retorna, com uma contagem anexada a cada
+linha.
+
+### 3) Filtrar as linhas antes de agrupar {#3-filter-the-rows-before-grouping}
+
+`WHERE` executa primeiro, então as contagens são sobre as linhas que sobreviveram a ele.
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+WHERE length > 120
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |    72 |
+| PG     |    82 |
+| PG-13  |   118 |
+| R      |    90 |
+| NC-17  |    95 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+Ainda 5 grupos, todos menores. Um grupo desaparece por completo somente quando o `WHERE`
+remove todas as suas linhas.
+
+### 4) Agrupar por algo que você calculou {#4-group-on-something-you-computed}
+
+A coluna de agrupamento não precisa ser uma coluna. Qualquer expressão funciona, e você
+pode dar a ela um alias e agrupar por ele.
+
+```sql
+SELECT LEFT(title, 1) AS initial, COUNT(*) AS films
+FROM film
+GROUP BY initial
+ORDER BY initial
+LIMIT 5;
+```
+
+```text
++---------+-------+
+| initial | films |
++---------+-------+
+| A       |    46 |
+| B       |    63 |
+| C       |    92 |
+| D       |    65 |
+| E       |    32 |
++---------+-------+
+5 rows in set (0.00 sec)
+```
+
+`GROUP BY` aceita um alias da lista do select, o que o `WHERE` não aceita. É
+assim que um relatório fica agrupado por mês: calcule o mês, agrupe por ele.
+
+### 5) Agrupar sobre um join {#5-group-over-a-join}
+
+Agrupar é mais útil quando as linhas vêm de mais de 1 tabela. Isto conta
+os pagamentos de cada cliente.
+
+```sql
+SELECT c.last_name, COUNT(*) AS payments
+FROM customer AS c
+INNER JOIN payment AS p ON p.customer_id = c.customer_id
+GROUP BY c.customer_id, c.last_name
+ORDER BY payments DESC, c.last_name
+LIMIT 5;
+```
+
+```text
++-----------+----------+
+| last_name | payments |
++-----------+----------+
+| HUNT      |       46 |
+| SEAL      |       45 |
+| DEAN      |       42 |
+| SHAW      |       42 |
+| SANDERS   |       41 |
++-----------+----------+
+5 rows in set (0.01 sec)
+```
+
+O join executa primeiro e produz 1 linha por pagamento, e então o agrupamento colapsa
+essas linhas por cliente. `customer_id` está no `GROUP BY` junto com
+`last_name`, porque 2 clientes podem ter o mesmo sobrenome e você quer que sejam contados
+separadamente.
+
+## Toda coluna selecionada deve ser agrupada ou agregada {#every-selected-column-must-be-grouped-or-aggregated}
+
+Um grupo é muitas linhas. Pedir uma coluna que não é nem a coluna de agrupamento
+nem está dentro de uma agregação pergunta ao servidor qual dessas muitas linhas mostrar, e
+ele não tem resposta. A configuração `only_full_group_by`, que está ativada por padrão, é
+o que faz o servidor dizer isso em vez de adivinhar.
+
+```sql
+SELECT rating, title FROM film GROUP BY rating;
+```
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'sakila.film.title' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+`ERROR 1055` nomeia a coluna que ele não conseguiu resolver, aqui `title`. Há 3
+saídas, e qual é a certa depende do que você queria dizer:
+
+- Adicione a coluna ao `GROUP BY`, quando você queria grupos mais finos.
+- Envolva-a em uma agregação como `MIN(title)`, quando 1 valor qualquer serve.
+- Tire-a da lista do select, quando você não precisava dela.
+
+Com `only_full_group_by` desativado a mesma consulta executa e retorna um
+título arbitrário, escolhido pelo plano que o servidor tiver escolhido. O guia
+[Desempenho de GROUP BY no MySQL](/pt-BR/guides/group-by-having) cobre essa configuração e
+`ANY_VALUE()`, que é como você pede uma linha arbitrária de propósito.
+
+## GROUP BY não promete uma ordem {#group-by-does-not-promise-an-order}
+
+Os grupos voltam na ordem que o servidor achou conveniente. Todo
+exemplo aqui diz `ORDER BY` porque essa é a única forma de fixar a ordem, o
+mesmo que com [LIMIT](/pt-BR/tutorial/limit).
+
+## Resumo {#summary}
+
+- Use `GROUP BY` para obter 1 linha de resultado por valor distinto em vez de 1 no total.
+- Espere um grupo por combinação distinta quando você nomeia várias colunas.
+- Espere que o `WHERE` filtre as linhas antes de o agrupamento acontecer.
+- Leia `ERROR 1055` como uma coluna que não está nem agrupada nem agregada.
+- Adicione `ORDER BY` quando a ordem dos grupos importa.
+
+## Veja também {#see-also}
+
+- [Funções de agregação](/pt-BR/tutorial/aggregate-functions) — o que calcular por grupo
+- [HAVING](/pt-BR/tutorial/having) — filtrando os grupos depois de construídos
+- [WITH ROLLUP](/pt-BR/tutorial/with-rollup) — adicionando uma linha de total sob os grupos
+- [Desempenho de GROUP BY no MySQL](/pt-BR/guides/group-by-having) — a tabela temporária que isso pode construir

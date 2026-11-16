@@ -1,0 +1,244 @@
+---
+title: "Desempenho do GROUP BY no MySQL e agrupamento em escala"
+sidebarTitle: "Desempenho do GROUP BY"
+description: "Por que um GROUP BY do MySQL constrói uma tabela temporária, como um índice a elimina, quanto o mesmo filtro custa em WHERE em comparação com HAVING, e quando ANY_VALUE é seguro."
+keywords: "mysql group by performance, mysql group by slow, mysql group by using temporary, mysql group by index, mysql any_value, mysql group by temporary table, mysql tmp_table_size group by"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Um `GROUP BY` que retorna em milissegundos em uma tabela de teste pode levar
+minutos em uma tabela real, e o texto da consulta é idêntico. A diferença está em
+o servidor conseguir percorrer um índice na ordem dos grupos ou ter de construir
+uma tabela temporária primeiro. Este guia é sobre essa diferença, e sobre as
+escolhas que decidem qual das duas você obtém.
+
+Se você está aprendendo as próprias cláusulas, o tutorial as ensina com um
+banco de dados de exemplo: [funções de agregação](/pt-BR/tutorial/aggregate-functions),
+[GROUP BY](/pt-BR/tutorial/group-by), [HAVING](/pt-BR/tutorial/having),
+[COUNT DISTINCT](/pt-BR/tutorial/count-distinct),
+[GROUP_CONCAT](/pt-BR/tutorial/group-concat) e [WITH ROLLUP](/pt-BR/tutorial/with-rollup).
+
+Cada consulta e plano desta página veio de 1 servidor com o banco de dados de
+exemplo Sakila. Os custos e as estimativas de linhas vêm das estatísticas
+amostradas do InnoDB e das suas configurações de `optimizer_switch`, então os
+seus números serão diferentes. A forma de cada plano é a parte que se mantém.
+
+## Agrupar sem um índice constrói uma tabela temporária {#grouping-without-an-index-builds-a-temporary-table}
+
+Para agrupar linhas, o servidor precisa reunir as linhas de cada grupo. Sem um
+índice na coluna de agrupamento, ele faz isso construindo uma tabela temporária:
+
+```sql
+EXPLAIN SELECT rating, COUNT(*) FROM film GROUP BY rating\G
+```
+
+```text
+         type: ALL
+possible_keys: NULL
+          key: NULL
+         rows: 1000
+        Extra: Using temporary
+```
+
+`Using temporary` é a linha a procurar. Em 1.000 linhas, ela não custa nada. A
+tabela é mantida em memória enquanto cabe, e vai para o disco quando não cabe,
+que é quando um relatório agrupado deixa de ser rápido.
+
+Qual configuração limita essa memória depende do engine que o servidor usa para
+tabelas temporárias internas. Verifique a sua antes de mudar qualquer coisa:
+
+```sql
+SELECT @@internal_tmp_mem_storage_engine AS engine,
+       @@temptable_max_ram, @@temptable_max_mmap, @@tmp_table_size;
+```
+
+Elas fazem trabalhos diferentes e todas se aplicam com `TempTable`.
+`temptable_max_ram` e `temptable_max_mmap` limitam o que o engine pode manter em
+todas as sessões. `tmp_table_size` limita cada tabela temporária interna
+individualmente: em 1 KB, uma consulta agrupada sobre 1.000 linhas levou
+`Created_tmp_disk_tables` de 0 a 1, e em 64 MB a mesma consulta permaneceu em
+memória. Observe esse contador em vez de adivinhar:
+
+```sql
+SHOW SESSION STATUS LIKE 'Created_tmp_disk_tables';
+```
+
+Um índice na coluna de agrupamento elimina a etapa por completo, porque o índice
+já está nessa ordem:
+
+```sql
+EXPLAIN SELECT customer_id, COUNT(*) FROM payment GROUP BY customer_id\G
+```
+
+```text
+         type: index
+possible_keys: idx_fk_customer_id
+          key: idx_fk_customer_id
+         rows: 16500
+        Extra: Using index
+```
+
+Sem `Using temporary` e sem `Using filesort`. O servidor lê o índice em ordem,
+conta cada sequência de valores iguais e emite uma linha. `Using index` significa
+que ele nunca tocou na tabela em si.
+
+Portanto, a primeira coisa a verificar em um `GROUP BY` lento é se um índice
+começa com as colunas de agrupamento, na mesma ordem em que você as agrupou. Um
+índice composto em `(a, b)` atende a `GROUP BY a` e a `GROUP BY a, b`. Para
+`GROUP BY b`, o servidor ainda pode percorrê-lo como um índice de cobertura,
+reportado como `type: index` com `Using index`, mas as linhas chegam fora da
+ordem dos grupos, então `Using temporary` volta com elas.
+
+## WHERE e HAVING não são uma escolha de estilo {#where-and-having-are-not-a-style-choice}
+
+Ambos podem expressar um filtro. Eles custam de forma diferente, porque `WHERE`
+executa antes do agrupamento e `HAVING` executa depois dele.
+
+Uma condição sobre a própria coluna de agrupamento pode ser escrita de qualquer
+uma das duas formas e significa a mesma coisa, o que faz dela a comparação
+honesta. Em `WHERE`, o servidor estreita o intervalo do índice primeiro e agrupa
+somente o que leu:
+
+```sql
+EXPLAIN FORMAT=TREE SELECT customer_id, COUNT(*) FROM payment WHERE customer_id <= 100 GROUP BY customer_id\G
+```
+
+```text
+-> Group aggregate: count(0)  (cost=814 rows=599)
+    -> Filter: (payment.customer_id <= 100)  (cost=543 rows=2710)
+        -> Covering index range scan on payment using idx_fk_customer_id over (customer_id <= 100)  (cost=543 rows=2710)
+```
+
+Em `HAVING`, a mesma restrição chega tarde demais para estreitar qualquer coisa:
+
+```sql
+EXPLAIN FORMAT=TREE SELECT customer_id, COUNT(*) FROM payment GROUP BY customer_id HAVING customer_id <= 100\G
+```
+
+```text
+-> Filter: (payment.customer_id <= 100)  (cost=3324 rows=599)
+    -> Group aggregate: count(0)  (cost=3324 rows=599)
+        -> Covering index scan on payment using idx_fk_customer_id  (cost=1674 rows=16500)
+```
+
+As mesmas linhas na saída, 4 vezes o custo estimado. A versão com `WHERE` lê
+uma estimativa de 2.710 entradas de índice; a versão com `HAVING` lê o índice
+inteiro e descarta a maioria dos grupos depois.
+
+Essas estimativas vêm das estatísticas amostradas do InnoDB e das constantes de
+custo em `mysql.server_cost`, então os seus números serão diferentes destes. A
+forma dos 2 planos é a parte que se mantém.
+
+A regra: coloque uma condição em `WHERE` sempre que ela testar uma linha. Use
+`HAVING` somente para o que testa um grupo, o que na prática significa qualquer
+coisa que contenha uma agregação. Uma cláusula `HAVING` sem agregação é quase
+sempre uma cláusula `WHERE` no lugar errado, e `WHERE` com uma agregação é
+`ERROR 1111 (HY000): Invalid use of group function`.
+
+## ONLY_FULL_GROUP_BY, e a válvula de escape {#only_full_group_by-and-the-escape-hatch}
+
+`only_full_group_by` está ativado por padrão e rejeita uma consulta que seleciona
+uma coluna que não é nem agrupada nem agregada, com `ERROR 1055`. O motivo é que
+tal consulta não tem resposta definida: o grupo contém muitas linhas e nada diz
+qual delas mostrar.
+
+`ANY_VALUE()` diz ao servidor que você aceita uma linha arbitrária, e a consulta
+então executa:
+
+```sql
+SELECT rating, ANY_VALUE(title) AS a_title, COUNT(*) AS films
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+Nenhuma saída é mostrada aqui de propósito. Qual título volta não está definido,
+então qualquer resultado impresso nesta página seria um valor que você não
+consegue reproduzir.
+
+Use `ANY_VALUE()` quando a coluna for funcionalmente dependente da coluna de
+agrupamento e o servidor não conseguir provar isso, que é o caso legítimo. Não o
+use para silenciar o erro em uma coluna que de fato varia dentro do grupo: o
+valor que você obtém não é o primeiro, o menor, nem qualquer outra coisa em que
+você possa confiar, e ele pode mudar quando o plano muda. `MIN()` ou `MAX()` diz
+o que você quis dizer e custa o mesmo.
+
+Desativar `only_full_group_by` globalmente converte cada um desses erros em uma
+resposta errada que ninguém vê. É a correção errada.
+
+A verificação enxerga através de uma expressão construída sobre uma **coluna**
+agrupada, então `SELECT COALESCE(rating, 'unrated') ... GROUP BY rating` é
+aceito. Ela não enxerga através de uma expressão construída sobre uma
+**expressão** agrupada. Agrupe por `DATE_FORMAT(payment_date, '%Y-%m')` e
+selecione `COALESCE(DATE_FORMAT(payment_date, '%Y-%m'), 'ALL')`, e o mesmo
+`ERROR 1055` nomeia `payment_date`, porque o servidor compara as 2 expressões em
+vez das colunas dentro delas. Esse é o caso comum em relatórios, e a saída é
+agrupar em uma tabela derivada e envolver o resultado fora dela:
+
+```sql
+SELECT COALESCE(month, 'ALL') AS month, payments
+FROM (SELECT DATE_FORMAT(payment_date, '%Y-%m') AS month, COUNT(*) AS payments
+      FROM payment GROUP BY DATE_FORMAT(payment_date, '%Y-%m')) AS m
+ORDER BY month;
+```
+
+## Agregando um join um-para-muitos {#aggregating-a-one-to-many-join}
+
+Fazer o join antes de agrupar multiplica as linhas, então um `SUM` sobre o
+resultado conta em dobro. O sintoma é um total alto demais por um fator que
+ninguém consegue explicar.
+
+Agregue cada lado em sua própria subconsulta e faça o join dos resultados, em vez
+de fazer o join primeiro e agrupar depois:
+
+```sql
+SELECT c.last_name, p.payments, r.rentals
+FROM customer AS c
+JOIN (SELECT customer_id, COUNT(*) AS payments FROM payment GROUP BY customer_id) AS p
+  ON p.customer_id = c.customer_id
+JOIN (SELECT customer_id, COUNT(*) AS rentals FROM rental GROUP BY customer_id) AS r
+  ON r.customer_id = c.customer_id
+ORDER BY c.last_name
+LIMIT 5;
+```
+
+A agregação de cada subconsulta é sobre as linhas às quais ela pertence. Fazer o
+join das duas tabelas primeiro e agrupar depois multiplica pagamentos por
+locações e infla ambas as contagens. [Desempenho de JOIN no MySQL e erros
+comuns](/pt-BR/guides/joins) cobre a multiplicação em si.
+
+## Quando você não quer as linhas colapsadas {#when-you-do-not-want-the-rows-collapsed}
+
+`GROUP BY` substitui as linhas por 1 linha por grupo. Quando você quer a
+agregação *ao lado* de cada linha, uma função de janela faz isso sem colapsar
+nada, e geralmente sem a tabela temporária:
+
+```sql
+SELECT customer_id, amount, SUM(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM payment;
+```
+
+[Funções de janela no MySQL 8.4](/pt-BR/guides/window-functions) as cobre em detalhe.
+
+## Solução de problemas {#troubleshooting}
+
+| Problema | Causa e correção |
+|:--------|:---------|
+| `GROUP BY` está lento | Nenhum índice começa com as colunas de agrupamento. Verifique `Using temporary` no `EXPLAIN`. |
+| Lento, e o disco está ocupado | A tabela temporária ultrapassou seu orçamento de memória e foi para o disco. Restrinja as linhas primeiro, depois aumente `tmp_table_size` para a tabela individual ou `temptable_max_ram` para o total do servidor. |
+| `ERROR 1055` | Uma coluna selecionada não é nem agrupada nem agregada. Agrupe-a, agregue-a ou remova-a. |
+| Um filtro `HAVING` está lento | Ele não tem agregação, então pertence a `WHERE`. |
+| Um total está alto demais | Um join um-para-muitos multiplicou as linhas antes do agrupamento. |
+| Resultado de `GROUP_CONCAT` cortado | Ele atingiu `group_concat_max_len`, que avisa em vez de gerar erro. |
+| Os grupos voltam em uma ordem surpreendente | `GROUP BY` não promete ordem. Adicione `ORDER BY`. |
+
+## Veja também {#see-also}
+
+- [Funções de janela no MySQL 8.4](/pt-BR/guides/window-functions) — agregar sem colapsar as linhas
+- [Desempenho de JOIN no MySQL e erros comuns](/pt-BR/guides/joins) — por que um join um-para-muitos infla um total
+- [Quando uma CTE do MySQL supera uma tabela derivada](/pt-BR/guides/ctes-in-mysql) — pré-agregar antes da consulta principal
+- [Erros comuns do MySQL](/pt-BR/guides/common-mysql-errors) — ERROR 1055 e ERROR 1111 em contexto
+- [GROUP BY](/pt-BR/tutorial/group-by) — o tutorial, se você quiser a cláusula em si primeiro

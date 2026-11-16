@@ -1,0 +1,170 @@
+---
+title: "MySQL 中的全文搜索"
+sidebarTitle: "使用全文搜索"
+description: "MySQL 全文搜索的工作原理：FULLTEXT 索引、MATCH...AGAINST 语法、自然语言模式与布尔模式与查询扩展的对比，以及何时使用全文搜索而非 LIKE。"
+keywords: "mysql full-text search, mysql fulltext index, mysql match against, mysql boolean mode search, mysql natural language search, mysql full text search example, mysql search text"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 的 `LIKE '%keyword%'` 对小表有效，但无法使用索引——每一行都会被扫描。全文搜索为搜索文本列提供了一种带索引、带排名的替代方案。
+
+## 创建 FULLTEXT 索引 {#creating-a-fulltext-index}
+
+`FULLTEXT` 索引适用于 `InnoDB`（默认存储引擎）和 `MyISAM` 表上的 `CHAR`、`VARCHAR` 和 `TEXT` 列。
+
+```sql
+CREATE TABLE articles (
+    id    INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(200),
+    body  TEXT,
+    FULLTEXT idx_ft (title, body)
+);
+```
+
+为现有的表添加 `FULLTEXT` 索引：
+
+```sql
+ALTER TABLE articles ADD FULLTEXT INDEX idx_ft (title, body);
+```
+
+单个 `FULLTEXT` 索引可以跨越多列。针对该索引的查询会同时搜索所有被索引的列。
+
+## 使用 MATCH...AGAINST 查询 {#querying-with-matchagainst}
+
+全文查询使用 `MATCH(columns) AGAINST(expression)` 语法。`MATCH` 的列列表必须与 `FULLTEXT` 索引中的列完全匹配。
+
+```sql
+SELECT id, title,
+       MATCH(title, body) AGAINST('database performance') AS relevance
+FROM articles
+WHERE MATCH(title, body) AGAINST('database performance');
+```
+
+当 `MATCH...AGAINST` 出现在 `WHERE` 子句中时，MySQL 按相关性降序返回行。`AGAINST` 表达式返回一个相关性分数——0 表示不匹配。
+
+## 搜索模式 {#search-modes}
+
+MySQL 支持三种搜索模式：
+
+| 模式 | 语法 | 行为 |
+|:-----|:-------|:---------|
+| 自然语言（默认） | `AGAINST('phrase')` 或 `AGAINST('phrase' IN NATURAL LANGUAGE MODE)` | 按相关性对结果排名；忽略常见词 |
+| 布尔模式 | `AGAINST('phrase' IN BOOLEAN MODE)` | 支持运算符（`+`、`-`、`*`、`""`）；相关性评分可用但不自动——添加 `ORDER BY MATCH...AGAINST` 以排名 |
+| 查询扩展 | `AGAINST('phrase' WITH QUERY EXPANSION)` | 两遍搜索：先找到匹配项，再用这些结果中的相关词扩展 |
+
+### 自然语言模式 {#natural-language-mode}
+
+默认模式。MySQL 使用一种加权方案，实际上会忽略极其常见的词——出现在几乎所有行中的词对相关性分数的贡献很小。常见的英文停用词（`the`、`is`、`at`）会被直接过滤掉。当没有显式的 `ORDER BY` 时，结果按相关性降序返回。
+
+```sql
+-- Returns rows matching 'index' or 'query', ranked by relevance
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('index query');
+```
+
+### 布尔模式 {#boolean-mode}
+
+布尔模式支持用于精确控制的运算符：
+
+```sql
+-- Must contain 'index', must not contain 'slow', 'performance' is optional
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('+index -slow performance' IN BOOLEAN MODE);
+```
+
+常见的布尔运算符：
+
+| 运算符 | 含义 | 示例 |
+|:---------|:--------|:--------|
+| `+` | 词必须出现 | `+index` |
+| `-` | 词必须不出现 | `-slow` |
+| `*` | 前缀通配符 | `perform*` |
+| `""` | 短语匹配 | `"query optimizer"` |
+| `>` `<` | 提高/降低相关性 | `>fast <slow` |
+| `()` | 分组 | `+(index query) -slow` |
+
+InnoDB 表要求 `MATCH()` 表达式中的所有列上都有 `FULLTEXT` 索引——没有它，InnoDB 上的布尔模式查询会返回错误。（MyISAM 允许在没有 FULLTEXT 索引的情况下使用布尔模式，但会扫描每一行。）
+
+### 查询扩展 {#query-expansion}
+
+两遍搜索。MySQL 运行初始查询，取出最匹配的结果，从中提取额外的词，然后加上这些词重新运行搜索。
+
+```sql
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('database' WITH QUERY EXPANSION);
+```
+
+当用户用单个或含糊的词搜索时很有用。如果第一遍的最匹配结果偏离主题，可能返回令人意外的结果。
+
+## 全文搜索与 LIKE 的对比 {#full-text-search-vs-like}
+
+| | FULLTEXT + MATCH...AGAINST | LIKE '%keyword%' |
+|:--|:--------------------------|:-----------------|
+| 使用索引 | 是——在大表上很快 | 否——全表扫描 |
+| 相关性排名 | 是（自然语言模式） | 否 |
+| 部分词匹配 | 使用 `*` 运算符 | 是（LIKE '%word%'） |
+| 多列 | 每个索引一个 MATCH | 需要 OR 条件 |
+| 需要 FULLTEXT 索引 | 是（InnoDB 要求；MyISAM 没有它时会扫描） | 否 |
+| 最小词长 | 有（`innodb_ft_min_token_size` = 3） | 无 |
+| 短词（2 个字符） | 默认被过滤 | 可匹配 |
+
+需要在小表上做简单的模式匹配、需要前缀搜索（带索引的 `LIKE 'prefix%'`）或需要任意模式匹配时，使用 `LIKE`。当您在文本列中搜索词或短语，并需要相关性排名或大规模下更好的性能时，使用全文搜索。
+
+## 最小词长 {#minimum-word-length}
+
+InnoDB 的默认最小词元长度是 3 个字符（`innodb_ft_min_token_size`）。短于 3 个字符的词不会被索引。对于两个字符的词，请降低该最小值：
+
+```sql
+-- In my.cnf / my.ini
+[mysqld]
+innodb_ft_min_token_size = 2
+```
+
+`innodb_ft_min_token_size` 不是动态变量——它需要重启服务器才能生效。重启后，重建所有 `FULLTEXT` 索引：
+
+```sql
+OPTIMIZE TABLE articles;
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 为什么表中明明有这个词，我的 MATCH...AGAINST 却没有返回任何行？ {#why-does-my-matchagainst-return-no-rows-even-though-the-word-is-in-the-table}
+
+三个常见原因：(1) 该词短于 `innodb_ft_min_token_size`（默认 3）。(2) 该词在停用词列表中。(3) 在 MyISAM 表上，该词出现在 50% 或更多的行中——MyISAM 上的自然语言模式把这样的词视为过于常见而无用。InnoDB 没有这样的阈值。使用布尔模式可以绕过 MyISAM 的 50% 阈值。
+
+#### 我能把全文搜索与 WHERE 条件一起使用吗？ {#can-i-use-full-text-search-with-where-conditions}
+
+可以。像平常一样把 `MATCH...AGAINST` 与其他 `WHERE` 条件组合：
+
+```sql
+SELECT title FROM articles
+WHERE status = 'published'
+  AND MATCH(title, body) AGAINST('performance' IN BOOLEAN MODE);
+```
+
+MySQL 可以为全文部分使用 `FULLTEXT` 索引，并单独对其他带索引的列进行过滤。
+
+#### MySQL 全文搜索支持多种语言吗？ {#does-mysql-full-text-search-support-multiple-languages}
+
+MySQL 为多种语言内置了停用词列表。对于生产环境的多语言搜索，您通常需要配置 `innodb_ft_enable_stopword = OFF` 并通过 `innodb_ft_server_stopword_table` 提供自己的停用词表，或者使用外部搜索引擎（Elasticsearch、MeiliSearch）。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 1214: The used table type doesn't support FULLTEXT indexes` | 只有 InnoDB 和 MyISAM 支持 FULLTEXT——用 `SHOW CREATE TABLE` 检查存储引擎 |
+| `MATCH` 列列表不匹配错误 | `MATCH(...)` 中的列必须与 FULLTEXT 索引中列出的列完全匹配，顺序也要相同 |
+| 常见词没有返回结果 | 该词可能在停用词列表中，或者在 MyISAM 表上出现在 50% 或更多的行中——尝试布尔模式：`AGAINST('word' IN BOOLEAN MODE)` |
+| 找不到短词 | 该词短于 `innodb_ft_min_token_size`（默认 3）——降低该设置，重启 MySQL，然后运行 `OPTIMIZE TABLE` 重建索引 |
+| `INSERT` 之后的结果没有出现 | InnoDB 会缓冲 FULLTEXT 更新——运行 `SET GLOBAL innodb_optimize_fulltext_only=1; OPTIMIZE TABLE articles;` 来刷新 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 索引的工作原理](/zh/guides/mysql-indexes) — FULLTEXT 是与 B 树并列的一种专用索引类型
+- [MySQL 中的 JSON](/zh/guides/json-in-mysql) — 与结构化数据一起搜索 JSON 文本字段
+- [多维范围查询](/zh/guides/cube-queries) — 当文本搜索不合适时，跨多个数值维度进行搜索
+- [MySQL LIKE](/zh/tutorial/like) — 全文索引在大规模下所替代的模式运算符
+- [MySQL REGEXP](/zh/tutorial/regexp) — 读取每一行的模式匹配

@@ -1,0 +1,212 @@
+---
+title: "MySQL 复制基础"
+sidebarTitle: "搭建复制"
+description: "MySQL 复制的工作原理：源和副本的搭建、基于二进制日志的复制、GTID 复制、复制延迟、使用 SHOW REPLICA STATUS 监控，以及常见的复制问题。"
+keywords: "mysql replication, mysql replica setup, mysql gtid replication, mysql replication lag, mysql show replica status, mysql source replica, mysql binlog replication, mysql replication tutorial"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 复制把变更从一台服务器（源）复制到一台或多台服务器（副本）。源把每一次变更写入二进制日志；每个副本读取该日志并重放这些变更。复制是读取扩展、高可用和地理分布的基础。
+
+## 复制的工作原理 {#how-replication-works}
+
+1. 源提交一个事务，并把它写入二进制日志。
+2. 副本的 I/O 线程连接到源，读取新的 binlog 事件，并把它们写入本地中继日志。
+3. 副本的 SQL 线程从中继日志读取并执行每个事件。
+
+这默认是异步的——源不会等待副本确认收到。副本可能落后于源。
+
+## 搭建副本 {#setting-up-a-replica}
+
+**在源上**——在 `my.cnf` 中启用二进制日志并设置唯一的服务器 ID：
+
+```ini
+[mysqld]
+server_id = 1
+log_bin = /var/log/mysql/mysql-bin
+binlog_format = ROW
+```
+
+创建复制用户：
+
+```sql
+CREATE USER 'repl'@'%' IDENTIFIED BY 'repl_password';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+```
+
+使用带 `--source-data` 的 mysqldump 获取一致的快照：
+
+```bash
+mysqldump --single-transaction --source-data=1 --all-databases \
+  -u root -p > source_snapshot.sql
+```
+
+**在副本上**——设置一个不同的服务器 ID：
+
+```ini
+[mysqld]
+server_id = 2
+```
+
+恢复快照并启动复制：
+
+```bash
+mysql -u root -p < source_snapshot.sql
+```
+
+```sql
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = '192.168.1.10',
+    SOURCE_USER = 'repl',
+    SOURCE_PASSWORD = 'repl_password',
+    SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;
+```
+
+`SOURCE_AUTO_POSITION = 1` 启用基于 GTID 的复制。如果您不使用 GTID，请改为指定 `SOURCE_LOG_FILE` 和 `SOURCE_LOG_POS`（值来自快照文件的头部）。
+
+## GTID 复制 {#gtid-replication}
+
+全局事务标识符（GTID）为每个已提交的事务分配一个唯一 ID。它们让故障转移和副本搭建更简单——MySQL 不再跟踪 binlog 文件名和位置，而是跟踪每台服务器已经应用了哪些事务。
+
+在源和副本上都启用 GTID：
+
+```ini
+[mysqld]
+gtid_mode = ON
+enforce_gtid_consistency = ON
+```
+
+启用 GTID 后，`SOURCE_AUTO_POSITION = 1` 就是您所需的全部——MySQL 会自行找出副本缺少哪些事务并自动重放它们。
+
+## 监控复制 {#monitoring-replication}
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+需要关注的关键字段：
+
+| 字段 | 含义 |
+|:------|:--------------|
+| `Replica_IO_Running` | `Yes` = I/O 线程已连接并正在从源读取 |
+| `Replica_SQL_Running` | `Yes` = SQL 线程正在应用事件 |
+| `Seconds_Behind_Source` | 复制延迟秒数（0 = 已追上） |
+| `Last_SQL_Error` | 导致 SQL 线程停止的最后一个错误 |
+| `Executed_Gtid_Set` | 此副本已应用的 GTID（GTID 模式） |
+
+`Replica_IO_Running` 和 `Replica_SQL_Running` 都必须为 `Yes`，复制才算正常工作。
+
+## 复制延迟 {#replication-lag}
+
+当副本的 SQL 线程跟不上源的写入速率时，就会出现复制延迟。常见原因：
+
+- **应用器并行度**：MySQL 8.4 默认已经并行应用事件——`replica_parallel_workers` 为 4，`replica_parallel_type` 为 `LOGICAL_CLOCK`。如果副本仍然落后，请提高工作线程数：
+
+```sql
+SET GLOBAL replica_parallel_workers = 4;
+SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+```
+
+- **副本上的长时间查询**：锁定行的查询会阻塞 SQL 线程。
+- **网络延迟**：I/O 线程慢会导致 SQL 线程无事可做。
+- **副本上的磁盘 I/O**：同步中继日志或数据文件成为瓶颈。
+
+## 复制架构 {#replication-architectures}
+
+默认的搭建方式——一个源，一个或多个异步副本——并不是唯一的选择。MySQL 提供了几种复制架构，各有不同的一致性和可用性取舍。
+
+| 架构 | 一致性保证 | 故障转移 | 写入开销 | 复杂度 |
+|:-------------|:---------------------|:---------|:--------------|:-----------|
+| **异步复制**（默认） | 无——副本可能任意落后 | 手动；可能丢失一些事务 | 最小——源不等待 | 低 |
+| **半同步复制** | 源提交前至少有一个副本已收到事件 | 手动；最多丢失一个事务 | 每次写入增加约 1 个 RTT | 低–中 |
+| **组复制** | 提交前所有成员达成一致（多主或单主） | 组内自动 | 较高——每个事务一轮共识 | 高 |
+| **InnoDB Cluster** | 与组复制相同（基于它构建） | 自动，由 MySQL Router 负责客户端故障转移 | 与组复制相同 | 高 |
+
+**各自的适用场景：**
+
+- **异步复制**——用于读取扩展和灾难恢复副本的正确默认选择，适合可以接受一定延迟的场景。
+- **半同步**——当您需要针对源故障的持久性保障，但无法承受组复制的运维复杂度时。每次写入提交增加约 1 次网络往返。
+- **组复制 / InnoDB Cluster**——当您需要自动故障转移并且能承受写入延迟的增加时。InnoDB Cluster 在组复制之上封装了 MySQL Router 和 MySQL Shell，便于管理。
+
+注意：组复制要求所有表都使用 InnoDB 并且有主键。通过 `group_replication` 插件启用它；其配置超出了本指南的范围。
+
+## 使用副本扩展读取 {#read-scaling-with-replicas}
+
+把读密集型查询引导到副本，以减轻源的负载：
+
+```sql
+-- Application connects to replica for reads
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Connect to source for writes
+INSERT INTO orders (customer_id, total) VALUES (42, 99.99);
+```
+
+应用必须容忍复制延迟。几毫秒前在源上插入的行，副本可能还没有。对于必须反映最新写入的读取，请连接到源。
+
+## 复制与替代方案 {#replication-vs-alternatives}
+
+复制能很好地解决特定问题，而对另一些问题则是错误的工具。在采用它之前，请先检查它是否真的合适。
+
+| 场景 | 复制 | 分片 | 仅只读副本 | 分布式数据库（例如 Vitess、TiDB） |
+|:---------|:-----------|:---------|:-------------------|:-------------------------------------|
+| 读密集型负载，写入一台服务器能承受 | 很合适 | 过度设计 | 更简单——只需添加副本 | 过度设计 |
+| 写入量超过一台服务器 | 没有帮助——所有副本都重放每次写入 | 很合适 | 没有帮助 | 很合适 |
+| 高可用 / 自动故障转移 | 需要组复制或 InnoDB Cluster | 没有直接帮助 | 没有直接帮助 | 内置 |
+| 地理分布 / 多区域低延迟读取 | 配合延迟副本或区域副本效果良好 | 可行但复杂 | 效果良好 | 部分产品内置 |
+| 时间点恢复 | 良好——binlog 支持 PITR | 使 PITR 复杂化 | 良好 | 视情况而定 |
+| 模式按租户/键高度可分区 | 可行但浪费副本的写入带宽 | 更合适 | 可行但同样浪费 | 很合适 |
+| 要求严格的读己之写一致性 | 这类读取使用源 | 不适用 | 这类读取使用源 | 取决于产品 |
+
+**简而言之：** 当一台服务器处理您的所有写入，而您需要读取扩展、高可用或温备机时，复制是正确的选择。如果写入吞吐量是瓶颈，复制只会把问题复制到每个副本——分片或分布式数据库才能在源头解决它。
+
+## 停止和启动复制 {#stopping-and-starting-replication}
+
+```sql
+STOP REPLICA;           -- stop both threads
+STOP REPLICA IO_THREAD; -- stop only the I/O thread
+STOP REPLICA SQL_THREAD; -- stop only the SQL thread
+
+START REPLICA;
+```
+
+跳过单个失败的事件（请谨慎使用——跳过事件会导致副本产生偏差）：
+
+```sql
+-- GTID mode: inject an empty transaction for the failed GTID
+SET GTID_NEXT = 'source_uuid:N';
+BEGIN; COMMIT;
+SET GTID_NEXT = 'AUTOMATIC';
+START REPLICA;
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 复制可以跨 MySQL 主版本工作吗？ {#does-replication-work-across-mysql-major-versions}
+
+MySQL 支持从较旧的源复制到较新的副本，但不支持反过来。请始终先升级副本，再升级源。
+
+#### 半同步复制和异步复制有什么区别？ {#whats-the-difference-between-semi-synchronous-and-asynchronous-replication}
+
+在异步复制（默认）中，源提交时不等待任何副本确认收到。在半同步复制中，源会等待至少一个副本确认已收到事件，然后才返回给客户端。半同步降低了源故障时丢失数据的风险，代价是写入延迟略有增加。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `Replica_IO_Running: No` | 检查 `Last_IO_Error`——通常是连接或认证失败；核实 SOURCE_HOST、用户、密码和 REPLICATION SLAVE 授权 |
+| `Replica_SQL_Running: No` | 检查 `Last_SQL_Error`——通常是数据冲突；决定是跳过该事件还是修复根本原因 |
+| 复制延迟持续增长 | 把 `replica_parallel_workers` 提高到默认值 4 以上；检查副本上是否有长时间查询阻塞了应用器 |
+| 副本上出现 `ERROR 1062: Duplicate entry` | 副本上有源没有的行——说明有人手动写入了副本；谨慎使用 `replica_skip_errors` 或重新同步 |
+| 故障转移后出现 GTID 缺口 | 新源缺少旧源已应用的 GTID——在故障转移期间谨慎使用 `SET GTID_PURGED` |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 二进制日志](/zh/guides/binary-logging)——复制从源流向副本所依赖的二进制日志
+- [MySQL 备份策略](/zh/guides/backup-strategies)——与复制互补的持久性策略
+- [MySQL 中的只读副本](/zh/guides/read-replicas)——使用本指南搭建的副本

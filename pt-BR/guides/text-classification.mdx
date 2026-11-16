@@ -1,0 +1,180 @@
+---
+title: "Classificando Texto no MySQL com IA"
+sidebarTitle: "Classificando Texto"
+description: "Como classificar texto no MySQL usando a função ai_prompt() do VillageSQL — rotulando linhas por categoria, intenção ou tópico sem sair do SQL."
+keywords: "mysql text classification, mysql ai classify, mysql label rows ai, mysql spam detection sql, mysql topic classification, mysql ai_prompt classification"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A classificação de texto — atribuir linhas a categorias com base no conteúdo — geralmente significa exportar dados para um script Python, chamar um modelo de IA e importar os resultados de volta. O `ai_prompt()` do VillageSQL permite fazer a classificação diretamente em SQL, mantendo a lógica perto dos dados e eliminando o ciclo de exportação/importação.
+
+## O Problema: Classificação Fora do SQL {#the-problem-classification-outside-sql}
+
+O fluxo de trabalho típico sem o VillageSQL:
+
+```python
+rows = db.query("SELECT id, body FROM support_tickets WHERE category IS NULL")
+for row in rows:
+    category = llm.classify(row["body"], labels=["billing", "technical", "shipping", "other"])
+    db.execute("UPDATE support_tickets SET category = ? WHERE id = ?", category, row["id"])
+```
+
+Isso funciona, mas a lógica de classificação fica no código da aplicação. Migrações, preenchimentos retroativos e rerrotulagens pontuais exigem executar um script em vez de uma consulta SQL.
+
+## Com o VillageSQL: ai_prompt() como Classificador {#with-villagesql-ai_prompt-as-a-classifier}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+A chave para uma classificação confiável é um prompt preciso: enumere as categorias exatas, diga ao modelo para retornar apenas uma delas e, opcionalmente, dê um exemplo.
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE support_tickets ADD COLUMN category VARCHAR(20);
+
+-- max_execution_time only bounds SELECT statements in MySQL/VillageSQL —
+-- it has no effect on INSERT/UPDATE/DELETE, including this UPDATE. To
+-- bound how long a batch UPDATE can run, use KILL QUERY against the
+-- connection's own id from a timer, not a session variable set beforehand.
+
+UPDATE support_tickets
+SET category = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Classify this support ticket into exactly one of these categories: ',
+        'billing, technical, shipping, other. ',
+        'Reply with the category name only, lowercase, no punctuation.\n\n',
+        'Ticket: ', body
+    )
+)
+WHERE category IS NULL
+LIMIT 100;
+```
+
+### Validando a saída da classificação {#validating-classification-output}
+
+Os modelos ocasionalmente retornam uma saída inesperada. Armazene os resultados como vêm e valide separadamente:
+
+```sql
+-- Check what labels the model returned
+SELECT DISTINCT category, COUNT(*) AS cnt
+FROM support_tickets
+GROUP BY category
+ORDER BY cnt DESC;
+
+-- Fix off-label results
+UPDATE support_tickets
+SET category = 'other'
+WHERE category NOT IN ('billing', 'technical', 'shipping', 'other');
+```
+
+### Classificação multirrótulo {#multi-label-classification}
+
+Quando uma linha pode pertencer a mais de uma categoria, peça um array JSON e armazene-o em uma coluna `JSON`:
+
+```sql
+ALTER TABLE articles ADD COLUMN topics JSON;
+
+UPDATE articles
+SET topics = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Return a JSON array of topics that apply to this article. ',
+        'Choose from: ["technology", "business", "health", "science", "politics"]. ',
+        'Return only the JSON array, no other text.\n\n',
+        'Article: ', content
+    )
+)
+WHERE topics IS NULL
+LIMIT 50;
+
+-- Query rows tagged with a specific topic
+SELECT title FROM articles
+WHERE JSON_CONTAINS(topics, '"technology"');
+```
+
+### Construindo uma pontuação de confiança {#building-a-confidence-score}
+
+Peça ao modelo para retornar um JSON estruturado com um rótulo e um nível de confiança:
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_result JSON;
+
+UPDATE reviews
+SET ai_result = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Classify this review. Return JSON with keys "label" (positive/negative/neutral) ',
+        'and "confidence" (high/medium/low). Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE ai_result IS NULL
+LIMIT 100;
+
+-- Query by label and confidence
+SELECT review_text,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) AS label,
+       JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) AS confidence
+FROM reviews
+WHERE JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.label')) = 'negative'
+  AND JSON_UNQUOTE(JSON_EXTRACT(ai_result, '$.confidence')) = 'high';
+```
+
+## Padrões de Prompt que Funcionam {#prompt-patterns-that-work}
+
+| Objetivo | Padrão de prompt |
+|:---|:---|
+| Rótulo único | "Classify as X, Y, or Z. Reply with one word only." |
+| Pontuação de confiança | `{"label": "X", "confidence": "high/medium/low"}` |
+| Multirrótulo | "Return a JSON array of applicable labels from [X, Y, Z]." |
+| Decisão binária | "Does this text contain X? Reply yes or no." |
+
+Dê ao modelo menos categorias para escolher, para obter mais precisão. Mais de 5–6 opções degrada a confiabilidade em modelos rápidos/baratos.
+
+Para configuração e opções de provedor, consulte [Conectando o MySQL a APIs de IA](/pt-BR/guides/ai-api-setup). Para padrões de uso mais amplos do ai_prompt(), consulte [Executando Modelos de IA a partir de Consultas MySQL](/pt-BR/guides/ai-prompts-in-mysql).
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Qual é a precisão da classificação por IA em comparação com um modelo treinado? {#how-accurate-is-ai-classification-compared-to-a-trained-model}
+
+Um modelo capaz como o Claude Haiku alcança alta precisão em tarefas de classificação diretas sem nenhum dado de treinamento. Para categorias específicas de um domínio, com distinções sutis, pode ser necessário fornecer exemplos no prompt ou usar um modelo maior.
+
+#### Posso classificar as linhas no momento da inserção usando um trigger? {#can-i-classify-rows-as-theyre-inserted-using-a-trigger}
+
+Sim, mas tenha cuidado — um trigger que chama `ai_prompt()` em cada INSERT faz cada escrita levar de 5 a 30 segundos. É melhor classificar em um job periódico em lote e aceitar um pequeno atraso até que os rótulos estejam disponíveis.
+
+#### Como trato as linhas em que o modelo retorna NULL? {#how-do-i-handle-rows-where-the-model-returns-null}
+
+`ai_prompt()` retorna NULL quando a chamada à API falha. No seu loop em lote, continue executando o UPDATE até que não restem NULLs, com lógica de nova tentativa para falhas transitórias.
+
+#### Qual modelo devo usar para classificação? {#what-model-should-i-use-for-classification}
+
+Comece com `claude-haiku-4-5` ou `gpt-4o-mini` — os dois são rápidos e baratos. Passe para um modelo mais capaz somente se a precisão for inaceitável.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | Execute `INSTALL EXTENSION vsql_ai` |
+| Retorna NULL | Verifique a chave de API e `max_execution_time`; confira o nome do modelo |
+| Rótulos fora do conjunto permitido | Adicione uma consulta após o UPDATE para normalizar valores inesperados |
+| Erros de parse de JSON na saída estruturada | Adicione "Return only valid JSON, no other text" ao prompt |
+| Baixa precisão | Adicione 2–3 exemplos ao prompt; tente um modelo mais capaz |
+
+## Veja também {#see-also}
+
+- [Executando Modelos de IA a partir de Consultas MySQL](/pt-BR/guides/ai-prompts-in-mysql) — a função ai_prompt() usada para classificação
+- [Análise de Sentimento em Dados do MySQL](/pt-BR/guides/sentiment-analysis) — uma tarefa relacionada de análise de texto
+- [Sumarização com IA no MySQL](/pt-BR/guides/ai-summarization) — outra aplicação do ai_prompt() em texto armazenado

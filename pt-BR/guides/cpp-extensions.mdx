@@ -1,0 +1,184 @@
+---
+title: "Escrevendo Extensões em C++"
+sidebarTitle: "Escrevendo Extensões em C++"
+description: "Como escrever uma extensão do VillageSQL em C++ — quando escolher C++, configuração do CMake, wrappers tipados, compilação e testes."
+keywords: "villagesql extension c++, vef sdk, vdf c++, custom sql function c++, vsql extension template"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+As extensões do VillageSQL são bibliotecas compartilhadas que o servidor carrega em tempo de execução. O VEF SDK fornece wrappers C++ tipados para que você possa escrever funções de extensão sem tocar em FFI bruto. Este guia percorre a construção de uma extensão mínima do zero.
+
+## Quando Escolher C++ {#when-to-choose-c}
+
+C++ é a escolha certa quando:
+
+- Sua equipe já tem uma base de código em C++ e quer manter a extensão na mesma linguagem
+- Você precisa de tipos personalizados com layouts binários precisos (o type builder em C++ é a API mais completa)
+- Você está trabalhando com bibliotecas C++ existentes que quer expor como funções SQL
+
+Se você prefere Rust e não tem requisitos de C++, consulte [Escrevendo Extensões em Rust](/pt-BR/guides/rust-extensions).
+
+## Pré-requisitos {#prerequisites}
+
+Antes de escrever o código da extensão, você precisa de um build do VillageSQL — as extensões são vinculadas aos headers do SDK e à árvore de build do servidor.
+
+Você também precisa de:
+
+- **Compilador C++17** — GCC 8+, Clang 8+ ou MSVC 2019+
+- **CMake 3.18+** — o template de extensão usa CMake
+
+Siga primeiro o guia [Compilar a partir do Código-fonte](/pt-BR/8.4/stable/source) se você ainda não compilou o servidor.
+
+## Configuração do CMake {#cmake-setup}
+
+A forma mais rápida de começar é com o [vsql-extension-template](https://github.com/villagesql/vsql-extension-template). Faça um fork ou clone-o:
+
+```bash
+git clone https://github.com/villagesql/vsql-extension-template my-extension
+cd my-extension
+```
+
+O `CMakeLists.txt` do template cuida da configuração de build do VEF para você — copie o template e adapte-o em vez de escrever o CMake do zero. Configure o diretório de build com `-DVillageSQL_BUILD_DIR`:
+
+```bash
+mkdir build && cd build
+cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
+make
+```
+
+`-DVillageSQL_BUILD_DIR` informa ao CMake onde fica o seu build do VillageSQL para que ele encontre os headers do SDK. Isso produz um arquivo `.veb` na saída do build. Consulte [Criando Extensões](/pt-BR/extensions/build/create) e o [vsql-extension-template](https://github.com/villagesql/vsql-extension-template) para a configuração completa do CMake.
+
+## Uma VDF Mínima em C++ {#a-minimal-vdf-in-c}
+
+Inclua o header do VEF SDK e use a API de builder para registrar a sua função. Aqui está uma extensão completa que implementa uma função de inversão de string:
+
+```cpp
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+void my_reverse_impl(StringArg input, StringResult out) {
+    if (input.is_null()) {
+        out.set_null();
+        return;
+    }
+
+    auto sv = input.value();   // std::string_view
+    auto buf = out.buffer();   // Span<char>
+
+    if (sv.size() > buf.size()) {
+        out.error("my_reverse: input exceeds buffer size");
+        return;
+    }
+
+    for (size_t i = 0; i < sv.size(); i++) {
+        buf.data()[i] = sv[sv.size() - 1 - i];
+    }
+    out.set_length(sv.size());
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&my_reverse_impl>("my_reverse")
+            .returns(STRING)
+            .param(STRING)
+            .build())
+)
+```
+
+Alguns pontos a observar:
+
+- Inclua `<villagesql/vsql.h>`, não `<villagesql/extension.h>` (esse é o header antigo da V1)
+- Os wrappers de argumento tipados (`StringArg`, `IntArg`, `RealArg`) verificam nulos e expõem valores tipados — sem aritmética de pointer bruta
+- `out.set_null()`, `out.warning(msg)` e `out.error(msg)` são os três retornos que não são de sucesso
+- `VEF_GENERATE_ENTRY_POINTS` recebe um builder `make_extension()`, não uma struct bruta
+
+Para funções que retornam inteiros ou reais:
+
+```cpp
+void count_vowels_impl(StringArg input, IntResult out) {
+    if (input.is_null()) { out.set_null(); return; }
+
+    long long count = 0;
+    for (char c : input.value()) {
+        char lower = std::tolower(c);
+        if (lower == 'a' || lower == 'e' || lower == 'i' ||
+            lower == 'o' || lower == 'u') {
+            count++;
+        }
+    }
+    out.set(count);
+}
+```
+
+Para declarar uma função como determinística — as mesmas entradas sempre produzem a mesma saída — adicione `.deterministic()` à cadeia do builder:
+
+```cpp
+.func(make_func<&my_reverse_impl>("my_reverse")
+    .returns(STRING)
+    .param(STRING)
+    .deterministic()
+    .build())
+```
+
+Funções determinísticas podem ser usadas em colunas geradas e índices funcionais. Adicione `.deterministic()` apenas quando isso for realmente verdade.
+
+## Compilando {#building}
+
+Após a etapa de configuração do cmake da seção de configuração do CMake acima, compile e instale:
+
+```bash
+make
+make install
+```
+
+`make install` copia o arquivo `.veb` para o diretório de extensões do seu VillageSQL.
+
+## Instalando e Testando {#installing-and-testing}
+
+Conecte-se ao VillageSQL e instale a extensão:
+
+```sql
+INSTALL EXTENSION my_extension;
+```
+
+Verifique se ela foi carregada:
+
+```sql
+SELECT * FROM INFORMATION_SCHEMA.EXTENSIONS WHERE EXTENSION_NAME = 'my_extension';
+```
+
+Chame a sua função:
+
+```sql
+SELECT my_reverse('Hello, World!');
+-- → !dlroW ,olleH
+```
+
+Para testes automatizados, escreva uma suíte do MySQL Test Framework em `mysql-test/t/`:
+
+```sql
+-- mysql-test/t/basic.test
+INSTALL EXTENSION my_extension;
+SELECT my_reverse('abc');
+SELECT my_reverse('');
+SELECT my_reverse(NULL);
+UNINSTALL EXTENSION my_extension;
+```
+
+Gere os resultados esperados e execute:
+
+```bash
+cd /path/to/villagesql/build/mysql-test
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test --record
+perl mysql-test-run.pl --suite=/path/to/my-extension/mysql-test
+```
+
+## Veja também {#see-also}
+
+- [Criando Extensões](/pt-BR/extensions/build/create) — referência completa do SDK C++: wrappers tipados, tipos personalizados, agregados, variáveis de sistema
+- [Referência da API de Extensão](/pt-BR/sdk/cpp/extension-api-reference) — contratos de VDF, tratamento de nulos, dimensionamento de buffer, semântica de erros
+- [Escrevendo Extensões em Rust](/pt-BR/guides/rust-extensions) — o caminho em Rust para a mesma tarefa

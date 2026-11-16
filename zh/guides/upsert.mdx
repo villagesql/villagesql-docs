@@ -1,0 +1,142 @@
+---
+title: "MySQL 中的 UPSERT"
+sidebarTitle: "使用 UPSERT"
+description: "如何在 MySQL 中执行 UPSERT：INSERT ... ON DUPLICATE KEY UPDATE、REPLACE INTO、INSERT IGNORE，各自的适用场景，以及需要了解的 AUTO_INCREMENT 副作用。"
+keywords: "mysql upsert, mysql replace into, mysql insert ignore, mysql replace vs on duplicate key update, mysql upsert auto_increment, mysql upsert concurrency"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 没有 `UPSERT` 关键字，但它有三种方式来插入行或处理冲突：`INSERT ... ON DUPLICATE KEY UPDATE`、`REPLACE INTO` 和 `INSERT IGNORE`。它们的行为差异很大——选错了可能会悄无声息地损坏数据。
+
+## INSERT ... ON DUPLICATE KEY UPDATE {#insert--on-duplicate-key-update}
+
+当插入会违反唯一约束（主键或唯一索引）时，MySQL 改为运行 `UPDATE`：
+
+```sql
+CREATE TABLE page_views (
+    page    VARCHAR(255) PRIMARY KEY,
+    views   INT NOT NULL DEFAULT 0,
+    last_at DATETIME
+);
+
+-- First call: inserts the row
+-- Subsequent calls: increments the counter
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW())
+ON DUPLICATE KEY UPDATE
+    views   = views + 1,
+    last_at = NOW();
+```
+
+要引用尝试插入的值（而不是现有行的值），请使用行别名：
+
+```sql
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW()) AS new
+ON DUPLICATE KEY UPDATE
+    page_views.views   = page_views.views + new.views,
+    page_views.last_at = new.last_at;
+```
+
+较旧的 `VALUES(col)` 语法也可以使用，但已被弃用——请改用行别名：
+
+```sql
+-- Deprecated — use row aliases instead
+ON DUPLICATE KEY UPDATE views = views + VALUES(views)
+```
+
+## REPLACE INTO {#replace-into}
+
+`REPLACE` 删除冲突的行并插入一个新行。它看起来像 upsert，但行为像删除 + 插入：
+
+```sql
+REPLACE INTO page_views (page, views, last_at)
+VALUES ('/home', 100, NOW());
+```
+
+这会触发目标表上的 `BEFORE DELETE` 和 `AFTER DELETE` 触发器，并为新行重置 `AUTO_INCREMENT` 计数器。由于该删除是真正的行删除，引用表上的 `ON DELETE CASCADE` 和其他外键动作**会**触发。`REPLACE` 中未列出的任何列都会取其默认值——而不是前一行的值。
+
+只有当您确实想完全丢弃旧行时，才使用 `REPLACE`。
+
+## INSERT IGNORE {#insert-ignore}
+
+`INSERT IGNORE` 将错误降级为警告。遇到键冲突时它跳过该行；遇到类型不匹配或截断时，它改为写入一个强制转换后的值：
+
+```sql
+INSERT IGNORE INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW());
+```
+
+`INSERT IGNORE` 的问题在于它抑制*所有*错误，而不仅仅是重复项——而且非重复的情况比跳过一行更糟糕。`INSERT IGNORE INTO page_views (page, views) VALUES ('/new', 'not_a_number')` 会插入 `('/new', 0)`，只给出一个警告：这是一次悄无声息的损坏写入，而不是空操作。只有当您确实不关心结果时才使用它。
+
+## 比较 {#comparison}
+
+| | `ON DUPLICATE KEY UPDATE` | `REPLACE INTO` | `INSERT IGNORE` |
+|:--|:--------------------------|:---------------|:----------------|
+| 冲突时 | 更新指定的列 | 删除 + 插入 | 丢弃该行 |
+| 保留现有值 | 是（由您控制更新哪些列） | 否——未指定的列重置为默认值 | 不适用（不更新） |
+| 触发的触发器 | UPDATE 触发器 | 目标表上的 DELETE + INSERT 触发器 | 冲突时不触发任何触发器 |
+| 外键级联 | 否 | 是——内部的 DELETE 会触发它们 | 否 |
+| AUTO_INCREMENT | 冲突时递增 | 为插入的行分配新的自增值 | 不递增 |
+| 适用场景 | 您需要更新特定字段 | 您想完全替换该行 | 您想悄悄跳过重复项 |
+
+## AUTO_INCREMENT 副作用 {#auto_increment-side-effect}
+
+`ON DUPLICATE KEY UPDATE` 即使走的是更新路径而不是插入路径，也会递增 `AUTO_INCREMENT` 计数器。随着时间推移，这会在序列中产生空洞。`page_views` 使用 `page` 作为主键，没有 `AUTO_INCREMENT` 列，因此要看到这个效果，请使用一个带代理键的表：
+
+```sql
+CREATE TABLE page_views_by_id (
+    id    INT AUTO_INCREMENT PRIMARY KEY,
+    page  VARCHAR(255) UNIQUE,
+    views INT DEFAULT 0
+);
+INSERT INTO page_views_by_id (page, views) VALUES ('/home', 1);
+INSERT INTO page_views_by_id (page, views) VALUES ('/home', 2) AS new
+    ON DUPLICATE KEY UPDATE views = new.views;  -- updates the existing row
+
+SHOW CREATE TABLE page_views_by_id;  -- AUTO_INCREMENT has advanced anyway
+```
+
+这是预期的行为。如果您的应用程序依赖无空洞的序列，请使用单独的计数器表，或在应用程序中处理序列生成。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### ON DUPLICATE KEY UPDATE 是原子的吗？ {#is-on-duplicate-key-update-atomic}
+
+是的——插入尝试和更新在一个原子操作中完成。您无需将其包在事务中来避免检查存在性和插入之间的竞争条件。
+
+#### 如果多个唯一索引同时冲突会怎样？ {#what-if-multiple-unique-indexes-conflict}
+
+如果一次插入同时违反多个唯一约束，MySQL 只更新一行——具体是哪一行是未定义的。请避免让单条 INSERT 可能在多个唯一索引上冲突的设计。如果您的模式有重叠的唯一约束，请仔细测试其行为。
+
+#### 我可以在多行插入中使用 ON DUPLICATE KEY UPDATE 吗？ {#can-i-use-on-duplicate-key-update-with-multi-row-inserts}
+
+可以：
+
+```sql
+INSERT INTO page_views (page, views)
+VALUES ('/home', 1), ('/about', 1), ('/contact', 1)
+ON DUPLICATE KEY UPDATE views = views + 1;
+```
+
+每个冲突的行都会触发自己的更新。使用行别名时，多行的情况用 `VALUES`，别名用 `AS new`。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ON DUPLICATE KEY UPDATE` 没有触发 | 冲突列必须是 PRIMARY KEY 或 UNIQUE 索引——普通索引不会触发它 |
+| `REPLACE` 清空了您未指定的列 | 预期行为——REPLACE 是删除 + 插入；请指定所有列或改用 ON DUPLICATE KEY UPDATE |
+| `INSERT IGNORE` 隐藏了真正的错误 | 去掉 IGNORE，重现错误，并修复根本原因——IGNORE 会掩盖所有错误，而不仅仅是重复项 |
+| AUTO_INCREMENT 空洞越来越大 | ON DUPLICATE KEY UPDATE 的正常副作用；AUTO_INCREMENT 中的空洞只是表面现象，不影响正确性 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的事务](/zh/guides/transactions)——何时将 UPSERT 包在事务中
+- [MySQL 中的死锁](/zh/guides/deadlocks)——INSERT ... ON DUPLICATE KEY UPDATE 在并发下可能导致死锁
+- [MySQL 中的批量插入](/zh/guides/bulk-inserts)——快速加载大量行，带或不带冲突处理
+- [常见 MySQL 错误及其修复方法](/zh/guides/common-mysql-errors)——重复键错误及其含义
+- [MySQL INSERT ON DUPLICATE KEY UPDATE](/zh/tutorial/upsert)——该语句本身，附带实例

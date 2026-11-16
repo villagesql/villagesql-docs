@@ -1,0 +1,159 @@
+---
+title: "Lendo o EXPLAIN no MySQL"
+sidebarTitle: "Lendo o EXPLAIN"
+description: "Como ler a saída do EXPLAIN do MySQL: o que cada coluna significa, como identificar varreduras completas de tabela e como usar o EXPLAIN para corrigir consultas lentas."
+keywords: "mysql explain output, mysql explain type, mysql explain rows, mysql explain key, mysql query plan, mysql optimize query, mysql explain analyze"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Quando uma consulta está lenta, o seu primeiro passo é o `EXPLAIN`. Ele mostra exatamente como o MySQL planeja executar a consulta — quais índices ele usa, quantas linhas espera varrer e onde está fazendo trabalho caro. Depois que você sabe lê-lo, consegue corrigir quase qualquer consulta lenta.
+
+## Executando o EXPLAIN {#running-explain}
+
+Coloque `EXPLAIN` na frente de qualquer `SELECT`:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+O MySQL retorna uma linha por tabela na consulta. Para joins, você recebe várias linhas — uma por tabela envolvida.
+
+## As Colunas Que Importam {#the-columns-that-matter}
+
+Uma linha completa do `EXPLAIN` se parece com isto:
+
+```
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |   100.00 | NULL        |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+-------------+
+```
+
+A maioria das colunas importa em alguns momentos. Estas importam quase sempre:
+
+### `type` — Como o MySQL varre a tabela {#type--how-mysql-scans-the-table}
+
+Esta é a coluna mais importante. Ela informa o método de acesso, do mais rápido ao mais lento:
+
+| type | Significado | Quando você o vê |
+|:-----|:--------|:----------------|
+| `const` | Uma única linha pela chave primária ou por um índice único | `WHERE id = 5` |
+| `eq_ref` | Uma linha para cada linha da tabela anterior | JOIN na chave primária |
+| `ref` | Várias linhas de um índice não único | `WHERE user_id = 42` |
+| `range` | Varredura de intervalo no índice | `BETWEEN`, `>`, `<`, `IN` |
+| `index` | Varredura completa do índice | Varrendo o índice da esquerda para a direita |
+| `ALL` | Varredura completa da tabela | Nenhum índice utilizável |
+
+**`ALL` é o que precisa ser corrigido.** Significa que o MySQL está lendo todas as linhas da tabela. Em uma tabela com um milhão de linhas, isso é um milhão de leituras a cada execução da consulta.
+
+### `key` — Qual índice o MySQL escolheu {#key--which-index-mysql-chose}
+
+`NULL` significa que nenhum índice foi usado. Se `possible_keys` lista índices, mas `key` é `NULL`, o MySQL decidiu que uma varredura completa era mais barata — geralmente porque a tabela é pequena ou a consulta não é seletiva o suficiente.
+
+### `rows` — Estimativa de linhas examinadas {#rows--estimated-rows-examined}
+
+Uma estimativa, não uma garantia. O MySQL usa estatísticas para produzir esse número. Uma consulta com `rows: 1` é rápida; `rows: 5000000` em uma tabela de produção é um problema.
+
+### `Extra` — Detalhes adicionais de execução {#extra--additional-execution-details}
+
+A coluna `Extra` contém flags importantes:
+
+| Valor em Extra | Significado |
+|:------------|:--------|
+| `Using index` | Índice de cobertura — nenhuma busca de linha necessária (rápido) |
+| `Using where` | O MySQL filtra as linhas depois de lê-las |
+| `Using filesort` | A ordenação não pode usar um índice — etapa extra de ordenação |
+| `Using temporary` | O MySQL criou uma tabela temporária (caro em conjuntos grandes) |
+| `Using index condition` | Index Condition Pushdown — filtragem na camada de armazenamento |
+
+`Using filesort` e `Using temporary` juntos em tabelas grandes são sinais de alerta.
+
+## Um Exemplo Completo {#a-worked-example}
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- No indexes yet
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key  | rows    | Extra                          |
+|------|------|---------|--------------------------------|
+| ALL  | NULL | 1000000 | Using where; Using filesort    |
+```
+
+Dois problemas: varredura completa da tabela (`ALL`) e um filesort. Corrija os dois com um índice composto (consulte [Como os Índices do MySQL Funcionam](/pt-BR/guides/mysql-indexes) para os princípios de projeto de índices):
+
+```sql
+CREATE INDEX idx_status_created ON orders (status, created_at);
+
+EXPLAIN SELECT * FROM orders WHERE status = 'shipped' ORDER BY created_at;
+```
+
+```
+| type | key                | rows | Extra |
+|------|--------------------|------|-------|
+| ref  | idx_status_created | 4200 | NULL  |
+```
+
+`rows` caiu de 1.000.000 para 4.200. `type` agora é `ref` — uma busca por igualdade em `status`. O filesort sumiu porque o índice já ordena as linhas por `created_at` dentro de cada valor de `status`.
+
+## EXPLAIN ANALYZE {#explain-analyze}
+
+`EXPLAIN ANALYZE` de fato executa a consulta e retorna os tempos reais ao lado das estimativas:
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
+-> Index lookup on orders using idx_user_id (user_id=42)
+   (cost=4.50 rows=12) (actual time=0.045..0.112 rows=11 loops=1)
+```
+
+`cost` e `rows` são as estimativas do otimizador. `actual time` e `actual rows` são o que realmente aconteceu. Uma diferença grande entre as linhas estimadas e as reais indica estatísticas desatualizadas — execute `ANALYZE TABLE orders` para atualizá-las.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Qual é a relação entre o EXPLAIN e os índices de cobertura? {#whats-the-relationship-between-explain-and-covering-indexes}
+`Extra: Using index` significa que o MySQL está usando um índice de cobertura — ele consegue responder à consulta inteiramente a partir do índice, sem ler as linhas da tabela. Essa é uma das otimizações de maior impacto disponíveis em tabelas com muitas leituras. Consulte [Índices de Cobertura no MySQL](/pt-BR/guides/covering-indexes) para saber como projetá-los.
+
+#### Minha consulta tem `type: index` — isso é aceitável? {#my-query-has-type-index--is-that-okay}
+Não muito. `type: index` significa que o MySQL varreu o índice inteiro (em vez da tabela), o que é mais rápido que `ALL`, mas ainda é uma varredura completa. Ele aparece quando uma consulta precisa de todas as linhas, mas consegue satisfazê-la a partir do índice. Se você está vendo isso em tabelas grandes, verifique se um índice de cobertura ou uma cláusula `WHERE` poderia estreitar a varredura.
+
+#### Por que o MySQL ignora o índice que criei? {#why-does-mysql-ignore-the-index-i-created}
+O otimizador escolhe os índices com base em estatísticas. Se a tabela é pequena, o MySQL pode decidir que uma varredura completa é mais barata. Se as estatísticas estão desatualizadas, ele pode subestimar quão seletivo é o seu índice. Execute `ANALYZE TABLE` para atualizar as estatísticas e depois verifique o `EXPLAIN` de novo.
+
+#### Posso usar o EXPLAIN em INSERT, UPDATE e DELETE? {#can-i-use-explain-on-insert-update-and-delete}
+Sim — o `EXPLAIN` funciona em todas as instruções DML no MySQL 8.0+. A saída mostra o método de acesso para as linhas que estão sendo modificadas, o que é útil quando um UPDATE ou DELETE está lento.
+
+Se você precisa identificar quais consultas examinar com o EXPLAIN primeiro, o [Log de Consultas Lentas do MySQL](/pt-BR/guides/slow-query-log) captura as consultas mais lentas no seu servidor e as classifica por tempo total.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `type: ALL` em uma tabela grande | Adicione um índice na coluna filtrada |
+| `Extra: Using filesort` | Adicione um índice que cubra as colunas do `WHERE` e do `ORDER BY` |
+| `Extra: Using temporary` | Reescreva a consulta para evitar `GROUP BY` em colunas não indexadas, ou adicione um índice |
+| `key: NULL` apesar de existir um índice | Execute `ANALYZE TABLE` para atualizar as estatísticas; verifique se o índice corresponde à ordem das colunas da consulta |
+| `rows` estimado muito distante do real | Execute `ANALYZE TABLE` para atualizar as estatísticas |
+
+## Veja também {#see-also}
+
+- [Como os Índices do MySQL Funcionam](/pt-BR/guides/mysql-indexes) — as estruturas B-tree sobre as quais o EXPLAIN reporta
+- [Índices de Cobertura no MySQL](/pt-BR/guides/covering-indexes) — o que `Using index` em Extra significa e como chegar lá
+- [O Log de Consultas Lentas do MySQL](/pt-BR/guides/slow-query-log) — encontre as consultas que valem a pena examinar com o EXPLAIN
+- [Por Que Minha Consulta MySQL Está Lenta?](/pt-BR/guides/mysql-query-performance) — o fluxo de ajuste que o EXPLAIN alimenta
+- [Paginação no MySQL: Keyset vs OFFSET](/pt-BR/guides/pagination) — verificando que a paginação por keyset faz buscas em vez de varreduras
+- [MySQL LIMIT](/pt-BR/tutorial/limit) — uma linha de plano explicada, no tutorial

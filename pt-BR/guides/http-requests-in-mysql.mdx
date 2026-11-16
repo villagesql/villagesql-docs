@@ -1,0 +1,179 @@
+---
+title: "Fazendo Requisições HTTP a partir do SQL"
+sidebarTitle: "Requisições HTTP"
+description: "Como chamar APIs HTTP externas diretamente de consultas MySQL usando a extensão vsql_http do VillageSQL — GET, POST e análise de respostas JSON."
+keywords: "mysql http request, mysql call api, mysql http_get, mysql http_post, mysql rest api, vsql_http"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O MySQL não tem uma forma embutida de fazer requisições de rede. Se você quer chamar uma API HTTP, você tira os dados do banco de dados, faz a requisição no código da aplicação e envia os resultados de volta. A extensão `vsql_http` do VillageSQL adiciona `http_get()`, `http_post()` e toda a gama de métodos HTTP diretamente ao SQL — para que você possa chamar APIs externas do mesmo lugar onde os dados estão.
+
+## O Problema: Sair do Banco de Dados a Cada Chamada de API {#the-problem-leaving-the-database-for-every-api-call}
+
+Um padrão típico sem o VillageSQL:
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, tracking_number FROM shipments WHERE status IS NULL")
+
+# Call a shipping API for each row
+for row in rows:
+    resp = requests.get(f"https://api.shipping.com/track/{row['tracking_number']}")
+    status = resp.json()["status"]
+    db.execute("UPDATE shipments SET status = ? WHERE id = ?", status, row["id"])
+```
+
+Isso funciona, mas cada linha são três idas e voltas: SELECT, chamada de API, UPDATE. A lógica de enriquecimento vive no código da aplicação em vez de no schema, onde os dados estão.
+
+## Com o VillageSQL: HTTP a partir do SQL {#with-villagesql-http-from-sql}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+`http_get(url)` faz uma requisição GET e retorna uma string JSON com a resposta completa.
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_get('https://httpbin.org/get') USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status')       AS status,
+  JSON_VALUE(@resp, '$.content_type') AS content_type,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+Toda função em `vsql_http` retorna a mesma forma de JSON:
+
+| Campo | Descrição |
+|:---|:---|
+| `status` | Código de status HTTP como um número JSON (`200`, `404` etc.) |
+| `content_type` | Valor do cabeçalho de resposta `Content-Type` |
+| `headers` | Array de pares `[name, value]` para todos os cabeçalhos de resposta |
+| `content` | Corpo da resposta |
+
+### A conversão de charset {#the-charset-conversion}
+
+No VillageSQL 0.0.6 e anteriores, as funções STRING do VEF retornam o charset binary. Antes de passar o resultado para `JSON_VALUE` ou `JSON_EXTRACT`, envolva-o com `CONVERT(... USING utf8mb4)`:
+
+```sql
+-- On 0.0.6 and earlier, this throws an error — JSON_VALUE rejects binary charset
+-- ERROR 3144: Cannot create a JSON value from a string with CHARACTER SET 'binary'
+SELECT JSON_VALUE(vsql_http.http_get('https://httpbin.org/get'), '$.status');
+
+-- This works on every version
+SELECT JSON_VALUE(
+  CONVERT(vsql_http.http_get('https://httpbin.org/get') USING utf8mb4),
+  '$.status'
+);
+```
+
+O VillageSQL 0.0.7 e posteriores retornam o charset correto diretamente, então `CONVERT` não é mais necessário neles — mas é inofensivo mantê-lo, e todos os exemplos abaixo ainda o usam para compatibilidade com o 0.0.6 e anteriores. Atribua a uma variável com `CONVERT` uma vez e reutilize a variável para evitar repetir a conversão.
+
+## Requisições POST {#post-requests}
+
+`http_post(url, content_type, body)` envia um POST com um corpo:
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_post(
+    'https://httpbin.org/post',
+    'application/json',
+    '{"name": "widget", "qty": 3}'
+  ) USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status') AS status,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+## Cabeçalhos Personalizados e Outros Métodos {#custom-headers-and-other-methods}
+
+`http_request(method, url, headers_json, body, content_type, options_json)` trata qualquer método com cabeçalhos personalizados:
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_request(
+    'GET',
+    'https://api.example.com/secure',
+    '{"Authorization": "Bearer mytoken", "Accept": "application/json"}',
+    NULL,
+    NULL,
+    NULL
+  ) USING utf8mb4
+);
+```
+
+O argumento `headers_json` é um objeto JSON em que as chaves são nomes de cabeçalho e os valores são valores de cabeçalho.
+
+### Todas as funções disponíveis {#all-available-functions}
+
+| Função | Descrição |
+|:---|:---|
+| `http_get(url)` | Requisição GET |
+| `http_post(url, content_type, body)` | POST com corpo |
+| `http_put(url, content_type, body)` | PUT com corpo |
+| `http_delete(url)` | Requisição DELETE |
+| `http_patch(url, content_type, body)` | PATCH com corpo |
+| `http_request(method, url, headers_json, body, content_type, options_json)` | Qualquer método, cabeçalhos personalizados, opções |
+| `url_encode(text)` | Codifica uma string com percent-encoding |
+| `url_decode(text)` | Decodifica uma string com percent-encoding |
+
+Todas as funções retornam NULL para entrada NULL. Em caso de falha de conexão
+(conexão recusada, falha de DNS, timeout), as funções HTTP também retornam NULL e
+emitem um warning com a mensagem de erro do curl — verifique-o com `SHOW WARNINGS`
+quando uma requisição parecer desaparecer.
+
+## Codificação de URL {#url-encoding}
+
+`url_encode()` e `url_decode()` tratam o percent-encoding para parâmetros de consulta:
+
+```sql
+SELECT vsql_http.url_encode('hello world & more');
+-- → hello%20world%20%26%20more
+
+-- Build a URL with encoded parameters
+SET @q = vsql_http.url_encode('SELECT * FROM users');
+SET @url = CONCAT('https://api.example.com/search?q=', @q);
+SET @resp = CONVERT(vsql_http.http_get(@url) USING utf8mb4);
+```
+
+## Limitações Conhecidas {#known-limitations}
+
+**Limite de resposta de 256KB** — Respostas maiores que 256KB são truncadas. Isso cobre os payloads de API típicos usados em consultas SQL; não é adequado para download de arquivos grandes. Uma resposta cortada por esse limite não é mais um JSON válido: `JSON_EXTRACT`/`JSON_UNQUOTE` geram `ERROR 3141` sobre ela, enquanto `JSON_VALUE` retorna NULL com um `Warning 3141` em vez de gerar erro, sob seu comportamento padrão `NULL ON ERROR`.
+
+**Limite de tamanho de `JSON_VALUE`** — `JSON_VALUE` retorna NULL quando o valor extraído excede o limite de tamanho interno do MySQL. Para corpos de resposta grandes, use `JSON_UNQUOTE(JSON_EXTRACT(...))` em vez disso:
+
+```sql
+-- Use JSON_UNQUOTE + JSON_EXTRACT for large content fields
+SELECT JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+**Síncrono** — Toda chamada HTTP bloqueia até ser concluída ou atingir o timeout. `max_execution_time` não limita nem interrompe uma chamada bloqueante de `vsql_http` — um endpoint lento ou inacessível segura a instrução pelo seu próprio timeout de conexão/leitura, independentemente disso. `http_get`/`http_post`/`http_put`/`http_delete`/`http_patch` não recebem opções; somente `http_request(method, url, headers_json, body, content_type, options_json)` aceita um timeout, como `{"timeout": N}` em segundos no seu argumento `options_json` (padrão 30). Use `http_request` em vez das funções abreviadas quando precisar encurtá-lo (consulte [Webhooks HTTP](/pt-BR/guides/http-webhooks)).
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.http_get does not exist` | Execute `INSTALL EXTENSION vsql_http` |
+| Retorna NULL | A conexão falhou ou a entrada é NULL — verifique `SHOW WARNINGS` para a mensagem de erro do curl, confira a URL e verifique o acesso à rede a partir do host do servidor |
+| `JSON_VALUE` retorna NULL | Corpo da resposta grande demais — use `JSON_UNQUOTE(JSON_EXTRACT(...))` |
+| Análise de JSON com resultado ilegível | Esqueceu o `CONVERT(... USING utf8mb4)` — envolva a chamada da função |
+| A consulta atinge o timeout | Defina uma opção `{"timeout": N}` na própria requisição — `max_execution_time` não tem efeito sobre uma chamada bloqueante de `vsql_http` |
+
+## Próximos Passos {#next-steps}
+
+- [Enriquecendo linhas com dados de API](/pt-BR/guides/rest-api-enrichment) — traga dados externos ao vivo para os resultados das consultas
+- [Enviando webhooks a partir de triggers](/pt-BR/guides/http-webhooks) — envie mudanças de linhas para serviços externos automaticamente
+
+## Veja também {#see-also}
+
+- [Enriquecendo Linhas com Dados de APIs Externas](/pt-BR/guides/rest-api-enrichment) — um padrão prático para enriquecimento de dados via HTTP
+- [Enviando Webhooks a partir de Triggers](/pt-BR/guides/http-webhooks) — chamadas HTTP orientadas a eventos a partir de triggers
+- [JSON no MySQL](/pt-BR/guides/json-in-mysql) — analisando as respostas JSON que as requisições HTTP retornam
+- [Servindo Tabelas como uma API REST](/pt-BR/guides/rest-api-from-tables) — o mesmo servidor respondendo HTTP em vez de fazer requisições

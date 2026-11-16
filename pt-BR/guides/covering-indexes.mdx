@@ -1,0 +1,133 @@
+---
+title: "Índices de Cobertura no MySQL"
+sidebarTitle: "Usando Índices de Cobertura"
+description: "O que são índices de cobertura no MySQL, como eles eliminam as buscas de linha e como projetá-los para as suas consultas mais importantes."
+keywords: "mysql covering index, mysql using index, mysql index only scan, mysql composite index performance, mysql explain using index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Um índice de cobertura é um índice que contém todas as colunas de que uma consulta precisa. Entender primeiro o básico de como os índices funcionam ajuda — [Como Funcionam os Índices do MySQL](/pt-BR/guides/mysql-indexes) cobre a estrutura B-tree, o comprimento da chave e as regras de seletividade que também se aplicam aqui. Quando o MySQL consegue responder a uma consulta inteiramente a partir do índice — sem tocar nas linhas reais da tabela — isso se chama varredura somente de índice. Em tabelas grandes, essa é uma das maiores otimizações de consulta única disponíveis.
+
+## Como Funcionam as Buscas de Linha (e Por Que São Caras) {#how-row-lookups-work-and-why-theyre-expensive}
+
+Uma busca comum por índice tem duas etapas:
+
+1. O MySQL pesquisa o índice para descobrir quais linhas correspondem
+2. Para cada linha correspondente, o MySQL busca a linha completa na tabela (uma "busca de linha" ou "retorno à tabela")
+
+A etapa 2 é a parte cara. O índice clusterizado do InnoDB significa que os dados da tabela são fisicamente ordenados pela chave primária. Quando você busca linhas por um índice secundário, os valores da chave primária estão espalhados — cada busca de linha provavelmente é um I/O aleatório em uma página de disco diferente. Em escala, essas leituras aleatórias dominam o tempo da consulta.
+
+Um índice de cobertura elimina a etapa 2 por completo.
+
+## Identificando um Índice de Cobertura no EXPLAIN {#identifying-a-covering-index-in-explain}
+
+O `EXPLAIN` informa quando um índice de cobertura está em uso: procure por `Extra: Using index`. Se você ainda não conhece a saída do EXPLAIN, [Lendo o EXPLAIN no MySQL](/pt-BR/guides/reading-explain) cobre todas as colunas principais.
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+CREATE INDEX idx_user_status_created ON orders (user_id, status, created_at);
+
+-- All three columns in the SELECT are in the index
+EXPLAIN SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------------+
+| type  | key                       | rows | Extra       |
++-------+---------------------------+------+-------------+
+| ref   | idx_user_status_created   |   12 | Using index |
++-------+---------------------------+------+-------------+
+```
+
+`Using index` — o MySQL leu apenas o índice. Nenhuma busca de linha.
+
+Agora adicione uma coluna que não está no índice:
+
+```sql
+-- order_total is not in the index
+EXPLAIN SELECT user_id, status, created_at, order_total FROM orders WHERE user_id = 42;
+```
+
+```
++-------+---------------------------+------+-------+
+| type  | key                       | rows | Extra |
++-------+---------------------------+------+-------+
+| ref   | idx_user_status_created   |   12 | NULL  |
++-------+---------------------------+------+-------+
+```
+
+`Extra` agora está vazio — o MySQL usa o índice para encontrar as linhas e depois busca a linha completa para obter `order_total`. A busca de linha voltou.
+
+## Projetando um Índice de Cobertura {#designing-a-covering-index}
+
+O objetivo é incluir todas as colunas que a consulta toca — no `WHERE`, no `ORDER BY`, no `GROUP BY` e na lista do `SELECT`. A ordem das colunas ainda segue a regra do prefixo mais à esquerda para a filtragem do `WHERE` e do `ORDER BY`:
+
+```sql
+-- Query pattern:
+SELECT status, created_at FROM orders
+WHERE user_id = 42
+ORDER BY created_at;
+
+-- Covering index: equality column first, then sort column, then SELECT columns
+CREATE INDEX idx_covering ON orders (user_id, created_at, status);
+```
+
+- `user_id` primeiro — o filtro de igualdade
+- `created_at` em segundo — a coluna de ordenação (o índice já está ordenado, sem filesort)
+- `status` por último — apenas no `SELECT`, não na filtragem nem na ordenação
+
+As colunas do `SELECT` vêm por último porque não afetam quais linhas são encontradas nem em que ordem — elas só vão de carona.
+
+## Quando Índices de Cobertura Valem a Pena {#when-covering-indexes-are-worth-it}
+
+| Cenário | Vale a pena? |
+|:---------|:----------|
+| Consulta de alto tráfego em uma tabela grande | Sim |
+| Lista `SELECT` estreita (poucas colunas) | Sim |
+| Carga de trabalho com muitas leituras | Sim |
+| Tabela pequena | Não — as buscas de linha são rápidas de qualquer forma |
+| Consulta `SELECT *` | Não — você não consegue cobrir todas as colunas sem indexar a tabela inteira |
+| Tabela com muitas escritas | Avalie — todo `INSERT`/`UPDATE`/`DELETE` atualiza o índice |
+
+```sql
+-- Not a candidate: SELECT * means no index can cover this
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Good candidate: narrow SELECT, high-traffic query
+SELECT id, status FROM orders WHERE user_id = 42 AND created_at > '2024-01-01';
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Um índice de cobertura ajuda com `SELECT *`? {#does-a-covering-index-help-with-select-}
+Não. Um índice só pode cobrir uma consulta se contiver todas as colunas da lista do `SELECT`. `SELECT *` seleciona todas as colunas, então você precisaria indexar todas as colunas — nesse ponto você essencialmente duplicou a tabela como um índice, o que não é útil.
+
+#### Um índice de cobertura ainda pode acelerar consultas `SELECT *`? {#can-a-covering-index-still-speed-up-select--queries}
+Sim, parcialmente. Mesmo que o MySQL precise fazer buscas de linha, o índice restringe quais linhas buscar. A melhoria vem da filtragem do `WHERE`, não da eliminação das buscas de linha.
+
+#### Como sei se um índice de cobertura ajudaria? {#how-do-i-know-if-a-covering-index-would-help}
+Execute `EXPLAIN` e verifique `Extra`. Se você vir `Using index condition` ou nada (sem `Using index`), e `rows` for grande, um índice de cobertura pode ajudar. `EXPLAIN ANALYZE` mostra as contagens de linhas reais versus estimadas, o que é útil para confirmar as escolhas do otimizador.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `Extra` não mostra nada em vez de `Using index` | Uma coluna do `SELECT` não está no índice — adicione-a, ou remova-a da consulta |
+| `Extra: Using index condition` em vez de `Using index` | O índice é usado para filtragem, mas não cobre tudo — adicione as colunas restantes do `SELECT` |
+| O índice existe, mas `key` é `NULL` | Execute `ANALYZE TABLE` para atualizar as estatísticas; verifique se o `WHERE` da consulta usa a coluna mais à esquerda do índice |
+| Índice de cobertura deixando as escritas lentas | Trade-off esperado — avalie se o benefício de leitura supera o custo de escrita para a sua carga de trabalho |
+
+## Veja também {#see-also}
+
+- [Como Funcionam os Índices do MySQL](/pt-BR/guides/mysql-indexes) — fundamentos de B-tree sobre os quais os índices de cobertura se apoiam
+- [Lendo o EXPLAIN no MySQL](/pt-BR/guides/reading-explain) — como confirmar `Using index` na saída do EXPLAIN
+- [Como o InnoDB Armazena Dados](/pt-BR/guides/innodb-storage) — por que as buscas de linha são caras e por que a cobertura as evita

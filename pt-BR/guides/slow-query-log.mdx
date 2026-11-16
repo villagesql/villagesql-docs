@@ -1,0 +1,145 @@
+---
+title: "O Log de Consultas Lentas do MySQL"
+sidebarTitle: "Usando o Log de Consultas Lentas"
+description: "Como habilitar e usar o log de consultas lentas do MySQL para encontrar consultas que precisam de otimização, incluindo o formato do log, os campos principais e o mysqldumpslow."
+keywords: "mysql slow query log, mysql long_query_time, mysql enable slow query log, mysqldumpslow, mysql find slow queries, mysql query optimization"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O log de consultas lentas é a ferramenta integrada do MySQL para encontrar consultas que precisam de atenção. Ele captura qualquer consulta que leve mais tempo do que um limite configurável e a grava em um arquivo de log. Se você não sabe quais consultas otimizar, comece por aqui.
+
+## Habilitando o Log de Consultas Lentas {#enabling-the-slow-query-log}
+
+Você pode habilitá-lo em tempo de execução, sem reiniciar o servidor:
+
+```sql
+-- Enable the log
+SET GLOBAL slow_query_log = 'ON';
+
+-- Log queries that take longer than 1 second
+SET GLOBAL long_query_time = 1;
+
+-- Check where the log file is being written
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+Essas configurações têm efeito imediato, mas são redefinidas quando o servidor reinicia. Para torná-las permanentes, adicione-as ao seu `my.cnf` ou `my.ini`:
+
+```ini
+[mysqld]
+slow_query_log = ON
+long_query_time = 1
+slow_query_log_file = /var/log/mysql/slow.log
+```
+
+## O Que É Registrado {#what-gets-logged}
+
+Uma entrada típica se parece com isto:
+
+```
+# Time: 2024-03-15T14:23:01.234567Z
+# User@Host: app_user[app_user] @ localhost []  Id: 142
+# Query_time: 4.521893  Lock_time: 0.000123  Rows_sent: 1  Rows_examined: 847293
+SET timestamp=1710509381;
+SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+Os campos do cabeçalho que mais importam:
+
+| Campo | O que ele informa |
+|:------|:-----------------|
+| `Query_time` | Tempo total de execução em segundos |
+| `Lock_time` | Tempo gasto esperando por bloqueios (separado da execução) |
+| `Rows_sent` | Linhas retornadas ao cliente |
+| `Rows_examined` | Linhas que o MySQL leu para produzir o resultado |
+
+**A razão `Rows_examined` / `Rows_sent` é o sinal principal.** Se o MySQL examinou 847.293 linhas para retornar 1, ele está varrendo quase a tabela inteira para encontrar um resultado. Essa é a consulta que precisa de um índice.
+
+## Registrando Consultas Sem Índices {#logging-queries-without-indexes}
+
+Uma variante de menor sobrecarga: registrar apenas as consultas que não usam nenhum índice, independentemente do tempo de execução.
+
+```sql
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+```
+
+Isso é útil para capturar problemas óbvios de índices ausentes antes que se tornem problemas de desempenho. Em um servidor ocupado, isso pode gerar muitas entradas de log, então combine com `log_throttle_queries_not_using_indexes` para limitar a taxa:
+
+```sql
+-- Log at most 10 no-index queries per minute
+SET GLOBAL log_throttle_queries_not_using_indexes = 10;
+```
+
+## Analisando o Log com o mysqldumpslow {#analyzing-the-log-with-mysqldumpslow}
+
+Em um servidor ocupado, o log de consultas lentas cresce rápido. O `mysqldumpslow` agrega consultas semelhantes e as classifica pelo tempo total, o que facilita encontrar o que corrigir primeiro:
+
+```bash
+# Top 10 queries by total execution time
+mysqldumpslow -s t -t 10 /var/log/mysql/slow.log
+
+# Top 10 by average execution time
+mysqldumpslow -s at -t 10 /var/log/mysql/slow.log
+
+# Top 10 queries that examined the most rows
+mysqldumpslow -s r -t 10 /var/log/mysql/slow.log
+```
+
+A saída agrupa as consultas pela estrutura, substituindo os valores literais por `N` e `S`:
+
+```
+Count: 523  Time=4.52s (2364s)  Lock=0.00s (0s)  Rows=1.0 (523), app_user@localhost
+  SELECT * FROM orders WHERE status = 'S' ORDER BY created_at LIMIT N
+```
+
+Esta consulta foi executada 523 vezes, com média de 4,52 segundos, totalizando 2.364 segundos de tempo de servidor. É por aí que se deve começar.
+
+## Transformando Consultas Lentas em EXPLAIN {#turning-slow-queries-into-explain}
+
+Depois de identificar as consultas caras, execute `EXPLAIN` nelas para ver o plano de execução:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at LIMIT 10;
+```
+
+Procure por `type: ALL` (varredura completa da tabela) e `Extra: Using filesort`. Ambos podem ser corrigidos com índices — consulte [Como os Índices do MySQL Funcionam](/pt-BR/guides/mysql-indexes) e [Lendo o EXPLAIN no MySQL](/pt-BR/guides/reading-explain).
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Em quanto devo definir `long_query_time`? {#what-should-i-set-long_query_time-to}
+Comece com `1` segundo. Depois de resolver as piores consultas, reduza para `0.1` para capturar problemas de gravidade média. Para aplicações críticas em desempenho, `0.05` ou menos é comum. Defini-lo como `0` registra todas as consultas — útil para fazer o profiling de uma operação específica, não para monitoramento em produção.
+
+#### Habilitar o log de consultas lentas afeta o desempenho? {#does-enabling-the-slow-query-log-affect-performance}
+Minimamente. A sobrecarga é uma pequena quantidade de I/O por consulta registrada. Em um servidor de produção ocupado com `long_query_time = 1`, somente as consultas realmente lentas são gravadas — a sobrecarga típica é insignificante. Registrar todas as consultas (`long_query_time = 0`) tem sobrecarga mensurável e deve ser usado apenas temporariamente.
+
+#### Posso consultar o log de consultas lentas em SQL em vez de ler o arquivo? {#can-i-query-the-slow-log-from-sql-instead-of-reading-the-file}
+Sim, usando a tabela `mysql.slow_log` se você configurou `log_output = TABLE` — não existe uma tabela de log de consultas lentas no `performance_schema`:
+
+```sql
+SET GLOBAL log_output = 'TABLE';
+SELECT * FROM mysql.slow_log ORDER BY start_time DESC LIMIT 10;
+```
+
+A saída em arquivo é geralmente preferida para produção — a abordagem com tabela adiciona sobrecarga de gravação em cada consulta registrada.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| O arquivo de log não está sendo criado | Verifique se o MySQL tem permissão de gravação no diretório do log |
+| Nenhuma entrada apesar de consultas lentas | Confirme `slow_query_log = ON` com `SHOW VARIABLES LIKE 'slow_query_log'` |
+| O log cresce rápido demais | Aumente `long_query_time` ou habilite `log_throttle_queries_not_using_indexes` |
+| `mysqldumpslow` não encontrado | Ele é distribuído com o MySQL — verifique o diretório bin do seu MySQL (`which mysqldumpslow` ou procure em `/usr/bin`) |
+
+O log de consultas lentas e o `mysqldumpslow` funcionam de forma idêntica no [VillageSQL](https://villagesql.com/install), um substituto direto do MySQL com extensões.
+
+## Veja também {#see-also}
+
+- [Lendo o EXPLAIN no MySQL](/pt-BR/guides/reading-explain) — analise as consultas lentas que você encontrar
+- [Como os Índices do MySQL Funcionam](/pt-BR/guides/mysql-indexes) — a correção mais comum para consultas lentas
+- [Pooling de Conexões no MySQL](/pt-BR/guides/connection-pooling) — outra fonte de latência que o log de consultas lentas não captura
+- [Por Que Minha Consulta MySQL Está Lenta?](/pt-BR/guides/mysql-query-performance) — o que fazer com as consultas que o log revela
+- [Usando MySQL com ORMs: Django, Rails e Prisma](/pt-BR/guides/mysql-with-orms) — capturando o que os ORMs geram

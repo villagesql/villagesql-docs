@@ -1,0 +1,203 @@
+---
+title: "MySQL GROUP BY"
+sidebarTitle: "GROUP BY"
+description: "GROUP BY 如何把 MySQL 的行拆分成组并为每个组返回 1 行，如何按多个列分组，以及 ERROR 1055 在告诉您什么。"
+keywords: "mysql group by, group by mysql, mysql group by count, mysql group by multiple columns, mysql only_full_group_by, mysql group by clause"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+没有 `GROUP BY` 的聚合把整个表当作 1 个组并返回 1 行。`GROUP BY` 先把行拆分成组，所以每个组得到 1 行。这就是"有多少部电影"变成"每个分级有多少部电影"的方法。
+
+开始之前，请用 `mysql -u root -p sakila` 打开客户端。
+
+## GROUP BY 的工作原理 {#how-group-by-works}
+
+```sql
+SELECT GROUPING_COLUMN, AGGREGATE_FUNCTION(COLUMN_NAME)
+FROM TABLE_NAME
+GROUP BY GROUPING_COLUMN;
+```
+
+把 `GROUPING_COLUMN` 换成其值定义各个组的列，把 `TABLE_NAME` 换成表，把 `AGGREGATE_FUNCTION(COLUMN_NAME)` 换成您想为每个组计算的东西。
+
+服务器把行分到各个桶中，分组列的每个不同值 1 个桶，然后分别对每个桶运行聚合。结果的行数与不同值的个数相同。
+
+`GROUP BY` 在 `WHERE` 之后、`ORDER BY` 之前，这也是结果被定义的顺序：筛选行，对留下的行分组，然后对组排序。
+
+## 示例 {#examples}
+
+### 1) 每个值一行 {#1-one-row-per-value}
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |   178 |
+| PG     |   194 |
+| PG-13  |   223 |
+| R      |   195 |
+| NC-17  |   210 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+5 个组，因为 `rating` 有 5 个不同的值，而这 5 个计数加起来是 1,000。行按 `ENUM` 的声明顺序而不是字母顺序输出，[SELECT DISTINCT](/zh/tutorial/select-distinct) 课程解释了这一点。
+
+### 2) 按 2 列分组 {#2-group-on-2-columns}
+
+写出 2 列，一个组就是一个不同的配对，而不是每一列各自的值。
+
+```sql
+SELECT rating, rental_rate, COUNT(*) AS films
+FROM film
+GROUP BY rating, rental_rate
+ORDER BY rating, rental_rate;
+```
+
+```text
++--------+-------------+-------+
+| rating | rental_rate | films |
++--------+-------------+-------+
+| G      |        0.99 |    64 |
+| G      |        2.99 |    59 |
+| G      |        4.99 |    55 |
+| PG     |        0.99 |    62 |
+| PG     |        2.99 |    64 |
+| PG     |        4.99 |    68 |
+...
++--------+-------------+-------+
+15 rows in set (0.01 sec)
+```
+
+5 个分级乘以 3 种租金是 15 个组。这与 `SELECT DISTINCT rating, rental_rate` 返回的形状相同，只是每一行附带了一个计数。
+
+### 3) 在分组之前筛选行 {#3-filter-the-rows-before-grouping}
+
+`WHERE` 先运行，所以计数是对通过了它的行进行的。
+
+```sql
+SELECT rating, COUNT(*) AS films
+FROM film
+WHERE length > 120
+GROUP BY rating
+ORDER BY rating;
+```
+
+```text
++--------+-------+
+| rating | films |
++--------+-------+
+| G      |    72 |
+| PG     |    82 |
+| PG-13  |   118 |
+| R      |    90 |
+| NC-17  |    95 |
++--------+-------+
+5 rows in set (0.00 sec)
+```
+
+仍然是 5 个组，全都变小了。只有当 `WHERE` 过滤掉了一个组的每一行时，这个组才会完全消失。
+
+### 4) 按您计算出的东西分组 {#4-group-on-something-you-computed}
+
+分组列不一定要是一个列。任何表达式都可以，您可以用别名给它命名，然后按那个别名分组。
+
+```sql
+SELECT LEFT(title, 1) AS initial, COUNT(*) AS films
+FROM film
+GROUP BY initial
+ORDER BY initial
+LIMIT 5;
+```
+
+```text
++---------+-------+
+| initial | films |
++---------+-------+
+| A       |    46 |
+| B       |    63 |
+| C       |    92 |
+| D       |    65 |
+| E       |    32 |
++---------+-------+
+5 rows in set (0.00 sec)
+```
+
+`GROUP BY` 接受选择列表中的别名，而 `WHERE` 不接受。这就是报表按月分组的方法：计算出月份，然后按它分组。
+
+### 5) 对连接分组 {#5-group-over-a-join}
+
+一旦行来自多于 1 个表，分组就最有用了。这个查询统计每位客户的付款次数。
+
+```sql
+SELECT c.last_name, COUNT(*) AS payments
+FROM customer AS c
+INNER JOIN payment AS p ON p.customer_id = c.customer_id
+GROUP BY c.customer_id, c.last_name
+ORDER BY payments DESC, c.last_name
+LIMIT 5;
+```
+
+```text
++-----------+----------+
+| last_name | payments |
++-----------+----------+
+| HUNT      |       46 |
+| SEAL      |       45 |
+| DEAN      |       42 |
+| SHAW      |       42 |
+| SANDERS   |       41 |
++-----------+----------+
+5 rows in set (0.01 sec)
+```
+
+连接先运行，为每笔付款产生 1 行，然后分组把这些行按客户折叠起来。`GROUP BY` 中除了 `last_name` 还有 `customer_id`，因为 2 位客户可能同姓，而您想把他们分开统计。
+
+## 每个选中的列都必须被分组或聚合 {#every-selected-column-must-be-grouped-or-aggregated}
+
+一个组是许多行。请求一个既不是分组列也不在聚合之内的列，是在问服务器该显示这许多行中的哪一行，而它没有答案。默认打开的 `only_full_group_by` 设置让服务器把这一点说出来，而不是去猜。
+
+```sql
+SELECT rating, title FROM film GROUP BY rating;
+```
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'sakila.film.title' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+`ERROR 1055` 指出了它无法解析的列，这里是 `title`。有 3 条出路，哪一条正确取决于您的本意：
+
+- 当您想要更细的组时，把该列加入 `GROUP BY`。
+- 当任意 1 个值都可以时，把它包在聚合里，例如 `MIN(title)`。
+- 当您不需要它时，把它从选择列表中移走。
+
+关闭 `only_full_group_by` 后，同一个查询会运行并返回一个任意的标题，由服务器选择的执行计划决定。[MySQL GROUP BY 性能](/zh/guides/group-by-having)指南介绍了这个设置和 `ANY_VALUE()`，后者是您有意要求任意一行的方法。
+
+## GROUP BY 不保证顺序 {#group-by-does-not-promise-an-order}
+
+组按服务器认为方便的任何顺序返回。这里的每个示例都写了 `ORDER BY`，因为这是固定顺序的唯一方法，与 [LIMIT](/zh/tutorial/limit) 的情况相同。
+
+## 总结 {#summary}
+
+- 用 `GROUP BY` 为每个不同的值得到 1 行结果，而不是总共 1 行。
+- 当您写出多个列时，预期每个不同的组合是一个组。
+- 预期 `WHERE` 在分组发生之前筛选行。
+- 把 `ERROR 1055` 读作一个既没有被分组也没有被聚合的列。
+- 当组的顺序重要时，加上 `ORDER BY`。
+
+## 另请参阅 {#see-also}
+
+- [聚合函数](/zh/tutorial/aggregate-functions) — 每个组要计算的东西
+- [HAVING](/zh/tutorial/having) — 在分组完成之后筛选组
+- [WITH ROLLUP](/zh/tutorial/with-rollup) — 在组的下面加一个合计行
+- [MySQL GROUP BY 性能](/zh/guides/group-by-having) — 它可能构建的临时表

@@ -1,0 +1,187 @@
+---
+title: "为什么我的 MySQL 查询很慢？"
+sidebarTitle: "查询性能"
+description: "结合 EXPLAIN、慢查询日志以及最常见的原因（缺少索引、索引选择不当和 N+1 模式）来诊断并修复慢 MySQL 查询。"
+keywords: "mysql slow query, mysql query optimization, mysql explain, mysql missing index, mysql performance tuning, mysql query slow"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+慢查询几乎总是归结为少数几个常见原因：缺少索引、用错索引、查询的写法导致无法使用索引、对索引列应用了函数、N+1 模式，或者来自同时运行的其他查询的争用。其中大多数都可以用两个命令诊断出来：`EXPLAIN` 和慢查询日志。从这里开始。
+
+## 第 1 步：阅读 EXPLAIN {#step-1-read-explain}
+
+在您要调查的查询前面加上 `EXPLAIN` 运行：
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE customer_id = 42;
+```
+
+您会得到类似这样的输出：
+
+```
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 843201 |    10.00 | Using where |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+```
+
+五个列承担了大部分诊断工作：
+
+**`possible_keys`** — MySQL 为这个查询考虑过的索引。`NULL` 表示您的 `WHERE` 子句中的列上不存在相关索引。
+
+**`key`** — MySQL 实际选择的索引。如果 `possible_keys` 列出了候选项但 `key` 为 `NULL`，说明 MySQL 认为全表扫描更便宜——这通常意味着统计信息过时，或者表小到优化器跳过了索引。
+
+**`type`** — MySQL 使用的访问方法。这是最重要的列。`ALL` 表示全表扫描：MySQL 读取了每一行来找出匹配的行。在一张 800,000 行的表上，这意味着为一个可能只返回 1 行的查询读取 800,000 行。`ref` 或 `eq_ref` 表示 MySQL 使用了索引查找，这正是您想要的。
+
+**`key`** — MySQL 选择了哪个索引。`NULL` 表示没有使用索引（参见上面的 `possible_keys`）。
+
+**`rows`** — MySQL 对它将检查多少行的估计。如果这个数字相对于您预期返回的行数而言很高，就是出了问题的信号。
+
+**`Extra`** — 补充信息。`Using filesort` 表示 MySQL 不得不在内存或磁盘上对结果集排序，因为没有索引覆盖 `ORDER BY`。`Using temporary` 表示 MySQL 构建了一张临时表，这在某些 `GROUP BY` 和 `DISTINCT` 查询中会发生。在大表上，两者都是警告信号。
+
+读完估计值之后，使用 `EXPLAIN ANALYZE` 查看执行时实际发生了什么：
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 42;
+```
+
+`EXPLAIN ANALYZE` 会运行查询，并在估计值旁边报告实际的行数和耗时。如果估计是 800,000 行而实际也是 800,000 行，那么估计是对的，扫描是真实存在的。如果实际值低得多，优化器可能基于过时的统计信息做出了糟糕的选择。
+
+## 第 2 步：最常见的原因 {#step-2-the-most-common-causes}
+
+### 缺少索引 {#missing-index}
+
+上面示例中的查询会扫描整张 `orders` 表，因为 `customer_id` 上没有索引。修复方法很直接：
+
+```sql
+ALTER TABLE orders ADD INDEX idx_customer_id (customer_id);
+```
+
+添加索引后，重新运行 `EXPLAIN`。`type` 列应该从 `ALL` 变为 `ref`，`key` 应该显示您的新索引名称。
+
+### 索引选错 {#wrong-index}
+
+MySQL 有时会选择一个并非最佳的索引。`EXPLAIN` 会告诉您它选了哪一个。要测试另一个索引是否表现更好，请使用 `FORCE INDEX`：
+
+```sql
+EXPLAIN SELECT * FROM orders FORCE INDEX (idx_created_at) WHERE customer_id = 42;
+```
+
+如果强制使用的索引得到了更低的 `rows` 估计值，请考虑原索引上的统计信息是否已经过时。`ANALYZE TABLE orders` 会重新计算它们。如果 MySQL 一直选错索引，您可能还有一个不再有用的索引——删除它就能把它排除在考虑范围之外。
+
+### 前导列问题 {#leading-column-problem}
+
+`(customer_id, status, created_at)` 上的复合索引在您的查询按 `customer_id` 过滤，或者同时按 `customer_id` 和 `status` 过滤时是高效的。如果您的查询只按 `status` 或只按 `created_at` 过滤，它就无法被高效使用，因为索引首先按 `customer_id` 排序。
+
+```sql
+-- Uses the composite index efficiently
+SELECT * FROM orders WHERE customer_id = 42 AND status = 'pending';
+
+-- Can't use the composite index — status isn't the leading column
+SELECT * FROM orders WHERE status = 'pending';
+```
+
+如果您需要单独按 `status` 过滤，请在 `status` 上添加一个单独的索引。
+
+### SELECT * {#select-}
+
+只列出您需要的列不仅仅是好的风格——它会影响性能。当 MySQL 可以完全从索引（覆盖索引）满足一个查询时，它根本不会触碰实际的表行。`SELECT *` 打破了这一点：它迫使 MySQL 在表中查找每一个匹配的行，以获取不在索引中的列。
+
+```sql
+-- May require a table row lookup for each match
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Can use a covering index on (customer_id, status, total)
+SELECT status, total FROM orders WHERE customer_id = 42;
+```
+
+### 索引列上的函数 {#functions-on-indexed-columns}
+
+把索引列包在函数里通常会阻止索引的使用。MySQL 无法用 B 树索引回答"哪些行的 `created_at` 经 `YEAR()` 计算后返回 2024"，因为索引存储的是原始时间戳，而不是计算出来的年份。
+
+```sql
+-- Can't use an index on created_at
+WHERE YEAR(created_at) = 2024
+
+-- Can use an index on created_at
+WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31 23:59:59'
+```
+
+同样的问题也适用于 `LOWER()`、`DATE()`、对列的算术运算，以及任何在比较前转换值的操作。
+
+### N+1 查询 {#n1-queries}
+
+有时问题不是某一个慢查询——而是数百个快查询。一种常见模式：获取订单列表，然后对每个订单单独运行一个查询来获取客户名称。有 200 个订单，就是 201 个查询。每个都很快，但加在一起就是几秒钟。
+
+修复方法是用一个 `JOIN` 在一个查询中取出数据：
+
+```sql
+SELECT o.id, o.total, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE o.created_at > '2024-01-01';
+```
+
+## 第 3 步：启用慢查询日志 {#step-3-enable-the-slow-query-log}
+
+设置一次并让它一直运行——它会在后台捕获超过时间阈值的查询，暴露出您不知道存在的问题。在运行时启用它：
+
+```sql
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 1;  -- log queries taking more than 1 second
+```
+
+检查日志文件写到了哪里：
+
+```sql
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+要汇总日志并查看哪些查询出现得最频繁或总耗时最多，请使用 `mysqldumpslow`：
+
+```bash
+mysqldumpslow -s t /path/to/slow-query.log
+```
+
+把 `long_query_time` 降到 0.1 或 0.5 可以捕获那些单次很快但在大量调用中累积起来的查询。
+
+## 第 4 步：检查 SHOW PROCESSLIST {#step-4-check-show-processlist}
+
+当某个东西此刻就很慢时使用它——一个已经运行太久的查询，或者一个此刻正在挂起的应用程序。`SHOW PROCESSLIST` 显示每个活动连接以及每个查询已运行了多长时间：
+
+```sql
+SHOW PROCESSLIST;
+```
+
+卡在 `Waiting for table metadata lock` 或 `Waiting for lock` 状态的查询并不是因为执行计划糟糕而慢——它被另一个持有锁的查询阻塞了。要了解锁争用的更多细节，请检查：
+
+```sql
+SHOW ENGINE INNODB STATUS;
+```
+
+`TRANSACTIONS` 部分显示哪些事务在等待，哪些事务持有锁。
+
+## 快速参考 {#quick-reference}
+
+| 症状 | 可能原因 | 修复方法 |
+|:--------|:------------|:----|
+| `EXPLAIN` 显示 `type: ALL` | 缺少索引 | 在 `WHERE` 列上添加索引 |
+| `Extra: Using filesort` | `ORDER BY` 没有索引 | 添加覆盖排序列的索引 |
+| `Extra: Using temporary` | 复杂的 `GROUP BY` 或 `DISTINCT` | 审查查询或添加索引 |
+| 查询在小表上快，在大表上慢 | 全表扫描 | 添加索引 |
+| 许多快查询累积起来 | N+1 模式 | 用 `JOIN` 重写 |
+| 查询只是偶尔慢 | 锁争用 | 检查 `SHOW PROCESSLIST` 和 `INNODB STATUS` |
+
+本页的每一种诊断方法都适用于 [VillageSQL](https://villagesql.com/install)——带扩展的 MySQL 直接替代品，因此您无需重新学习调优工作流就可以采用它。
+
+## 另请参阅 {#see-also}
+
+- [MySQL 索引的工作原理](/zh/guides/mysql-indexes) — 索引选择与 B 树结构背后的思维模型
+- [覆盖索引](/zh/guides/covering-indexes) — 如何编写永远不离开索引的查询
+- [阅读 EXPLAIN 输出](/zh/guides/reading-explain) — 更深入地了解 EXPLAIN 计划中的每一列
+- [使用慢查询日志](/zh/guides/slow-query-log) — 配置、轮转，以及用 `mysqldumpslow` 分析
+- [MySQL CROSS JOIN](/zh/tutorial/cross-join) — 意外产生的交叉连接，以及它会变得多大

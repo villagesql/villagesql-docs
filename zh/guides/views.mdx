@@ -1,0 +1,146 @@
+---
+title: "MySQL 视图"
+sidebarTitle: "创建视图"
+description: "MySQL 视图的工作原理：创建和查询视图、可更新视图、WITH CHECK OPTION、视图算法（MERGE 与 TEMPTABLE），以及视图何时有益何时有害。"
+keywords: "mysql views, mysql create view, mysql updatable view, mysql view with check option, mysql view algorithm, mysql view vs table, mysql view performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+视图是存储在数据库中的具名查询。查询视图看起来与查询表完全相同，但视图的 SELECT 在查询时运行——没有单独存储的数据。
+
+## 创建和查询视图 {#creating-and-querying-views}
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Query it like a table
+SELECT * FROM active_customers WHERE email LIKE '%@example.com';
+```
+
+要查看底层定义：
+
+```sql
+SHOW CREATE VIEW active_customers\G
+```
+
+要修改视图，请使用 `CREATE OR REPLACE VIEW`：
+
+```sql
+CREATE OR REPLACE VIEW active_customers AS
+SELECT id, name, email, created_at
+FROM customers
+WHERE status = 'active';
+```
+
+要删除视图：
+
+```sql
+DROP VIEW active_customers;
+```
+
+## 可更新视图 {#updatable-views}
+
+有些视图支持通过视图进行 `INSERT`、`UPDATE` 和 `DELETE`。当视图能干净地映射到单个底层表时，它是可更新的：
+
+- 您写入的每一列都属于同一个底层表。基于 JOIN 的视图在这条规则下仍然是可更新的，但通过它进行的 `INSERT` 只会悄悄地触及一个表，而完全不会向另一个表插入任何行。不过，在一条 `INSERT` 中写入两个底层表的列就不是悄无声息的了——它会引发 `ERROR 1393: Can not modify more than one base table through a join view`
+- 没有 `DISTINCT`
+- 没有聚合函数（`SUM`、`COUNT` 等）
+- 没有 `GROUP BY` 或 `HAVING`
+- `WHERE` 子句中没有引用同一个表的子查询
+- 没有 `UNION`
+
+```sql
+-- This view is updatable
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Update through the view
+UPDATE active_customers SET email = 'new@example.com' WHERE id = 42;
+```
+
+MySQL 更新底层的 `customers` 表。如果视图过滤了行，您可以把某一行 `UPDATE` 成一个让它在视图中不可见的值——该行仍然存在于基表中，但从视图中消失了。
+
+## WITH CHECK OPTION {#with-check-option}
+
+`WITH CHECK OPTION` 阻止通过视图进行的、会让该行在视图中不可见的插入和更新：
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email, status
+FROM customers
+WHERE status = 'active'
+WITH CHECK OPTION;
+
+-- Fails: setting status = 'inactive' would hide the row from the view
+UPDATE active_customers SET status = 'inactive' WHERE id = 42;
+-- ERROR 1369: CHECK OPTION failed 'mydb.active_customers'
+```
+
+当视图代表数据的一个有意义的子集，并且您想确保通过它进行的插入和更新都留在该子集内时，请使用 `WITH CHECK OPTION`。
+
+## 视图算法 {#view-algorithms}
+
+MySQL 使用两种算法之一来执行视图：
+
+| 算法 | 行为 | MySQL 何时选择它 |
+|:----------|:---------|:----------------------|
+| `MERGE` | 重写外部查询，把视图的 SELECT 内联进去——没有临时表 | 没有聚合、DISTINCT、GROUP BY、UNION 的简单视图 |
+| `TEMPTABLE` | 先把视图物化到临时表中，然后运行外部查询 | 带有聚合、DISTINCT、GROUP BY、UNION 的视图 |
+
+`TEMPTABLE` 意味着整个视图结果在外部查询运行之前就被计算出来——优化器无法把外部查询的 `WHERE` 条件下推到视图中。要让 `TEMPTABLE` 视图上的过滤高效地工作，过滤条件必须在视图自身的定义内部。
+
+显式指定算法以避免意外：
+
+```sql
+CREATE ALGORITHM=MERGE VIEW active_customers AS
+SELECT id, name, email FROM customers WHERE status = 'active';
+```
+
+如果 MySQL 无法满足请求的算法，它会引发 Warning 1354，并把视图存储为 `ALGORITHM=UNDEFINED`——这是 `SHOW CREATE VIEW` 报告的内容，而不是 `TEMPTABLE`。优化器随后会在执行时物化这类视图。
+
+## 视图没有索引 {#views-are-not-indexed}
+
+视图没有自己的索引。针对 `MERGE` 视图的查询可以使用底层表的索引。针对 `TEMPTABLE` 视图的查询则不能——临时表没有索引。
+
+对于一个频繁查询且需要建索引的视图结果，可选的做法有：
+- 确保视图使用 `MERGE` 算法，并为底层表的列建索引
+- 用一个由作业或触发器填充的真实表替换该视图
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我应该在什么时候使用视图？ {#when-should-i-use-a-view}
+
+视图适合用于访问控制（向用户暴露列或行的子集）、简化多个查询都要用的复杂联接，以及在底层模式可能变化时提供一个稳定的接口。它们不是性能工具——它们不缓存或存储数据。
+
+#### 我可以联接视图吗？ {#can-i-join-views}
+
+可以。联接两个 `MERGE` 视图实际上就是联接两个底层查询——MySQL 会重写整个语句。联接 `TEMPTABLE` 视图较慢，因为每个视图都先独立物化。对于复杂的联接，[公用表表达式](/zh/tutorial/cte)通常能对执行提供更多控制。
+
+#### 底层表变化时，视图会自动更新吗？ {#do-views-update-automatically-when-the-underlying-table-changes}
+
+视图定义以 SQL 文本的形式存储。如果您向基表添加一列，从视图 `SELECT *` 不会包含它——您需要 `CREATE OR REPLACE VIEW`。如果您重命名或删除了视图引用的列，视图就会失效，针对它的查询会报错，直到您重新创建它。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 1369: CHECK OPTION failed` | 该更新会把行从视图中隐藏——检查视图的 WHERE 条件 |
+| 基表有索引但视图查询仍然很慢 | 视图可能在使用 TEMPTABLE 算法——在 `EXPLAIN` 中查找 "DERIVED"；重构或改用 CTE |
+| 通过视图 `UPDATE` 更新了错误的行 | 由于 JOIN 或聚合，视图不可更新——直接更新基表 |
+| `ERROR 1356: View references invalid table` | 底层表已被重命名或删除——重新创建视图 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的规范化](/zh/guides/normalization)——视图可以简化针对规范化模式的查询
+- [MySQL JOIN 性能和常见错误](/zh/guides/joins)——视图经常封装联接逻辑
+- [MySQL 联接的工作原理](/zh/tutorial/joins)——视图定义所使用的联接语法
+- [MySQL 中的子查询与 JOIN](/zh/guides/subqueries-vs-joins)——视图包装的查询形态
+- [MySQL 中的软删除](/zh/guides/soft-deletes)——把已删除的行隐藏在一个只含活动行的视图后面

@@ -1,0 +1,173 @@
+---
+title: "从 MariaDB 迁移到 MySQL"
+sidebarTitle: "从 MariaDB 迁移"
+description: "如何把 MariaDB 数据库迁移到 MySQL：真正会让加载失败的架构和转储差异，包括 JSON 列、序列、INET6 和外键约束名。"
+keywords: "mariadb to mysql migration, migrate mariadb to mysql, mariadb vs mysql differences, mariadb dump mysql, mariadb json vs mysql json, mariadb sequence mysql, mysqldump mariadb"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MariaDB 和 MySQL 共用同一个线路协议和大部分相同的 SQL 语法，所以迁移看起来简单得有迷惑性：转储，然后加载。实际上，少数 MariaDB 特有的类型、对象和转储行为会让一次普通的加载中途停下，其中一个还会在完全不报错的情况下改变列的存储类型。本指南基于一份从 MariaDB 12.3.3 取得并加载到 MySQL 的真实转储，介绍真正会出问题的地方以及修复方法。
+
+## 数据类型和默认值的差异 {#data-type-and-default-differences}
+
+| MariaDB 特性 | MySQL 情况 | 说明 |
+|:-----------------|:-----------------|:------|
+| `JSON` 列类型 | 在 MariaDB 一侧是带 `CHECK (json_valid(...))` 约束的 `LONGTEXT` | MariaDB 的 `JSON` 是别名，不是原生类型。在 MariaDB 上执行 `SHOW CREATE TABLE` 会把真实的列显示为 `longtext ... CHECK (json_valid(...))`。MySQL 有原生 `JSON` 类型，但在 MariaDB 上以这种方式创建的列加载到 MySQL 后是 `LONGTEXT` 而不是 `JSON`，因为转储携带的是字面的列定义。 |
+| `INET6` 列类型 | 不支持 | MySQL 和 VillageSQL 都没有 `INET6` 类型。加载含有 `INET6` 列的表会直接失败；请把值存为 `VARCHAR(45)`，或使用 INET 扩展。 |
+| `SEQUENCE` 对象和 `NEXTVAL()` | 不支持 | MariaDB 的 `CREATE SEQUENCE` 和 `NEXTVAL()` 列默认值在 MySQL 中没有对应物。请改用 `AUTO_INCREMENT`。 |
+| `INSERT ... RETURNING` | 不支持 | MariaDB 接受 `INSERT` 上的 `RETURNING`；MySQL 不接受。请在插入之后改用 `SELECT LAST_INSERT_ID()`。 |
+| 默认排序规则 | `utf8mb4_general_ci`（MariaDB 12.3.3）与 `utf8mb4_0900_ai_ci`（MySQL 8.4 和 VillageSQL） | 在两台服务器上用 `SHOW VARIABLES LIKE 'collation_server'` 验证过。转储出来的表保留其创建时的排序规则，因为 `mysqldump` 会把它显式写进 `CREATE TABLE`。默认值只影响您在目标上新建且未指定排序规则的表。 |
+| `SHOW CREATE TABLE` 中的整数显示宽度 | 已去除 | MariaDB 显示 `int(11)` 和 `bigint(20)`。MySQL 8.4 和 VillageSQL 显示不带宽度的 `int` 和 `bigint`。这只是外观差异，不影响存储的数据，但这意味着 MariaDB 和 MySQL 的 `SHOW CREATE TABLE` 之间的差异并不能证明表被修改过。 |
+
+## MariaDB 独有的架构对象会让加载失败 {#mariadb-only-schema-objects-break-the-load}
+
+使用 `CREATE SEQUENCE` 的架构在加载到 MySQL 时会立即失败，发生在任何表创建之前，因为 `mysqldump` 把序列定义写在表的前面。加载一份含有序列的未修改转储会产生如下输出，其中 `at line N` 的值对应该语句在您自己的转储中的位置，不会与这里显示的数字一致：
+
+```
+ERROR 1064 (42000) at line 23: You have an error in your SQL syntax; check the manual
+that corresponds to your MySQL server version for the right syntax to use near
+'SEQUENCE IF EXISTS `invoice_seq`' at line 1
+```
+
+从转储中删除 `DROP SEQUENCE` / `CREATE SEQUENCE` / `DO SETVAL(...)` 块，并把任何写作 `DEFAULT nextval(...)` 的列默认值替换为普通的 `AUTO_INCREMENT` 列或由应用赋值。
+
+类型为 `INET6` 的列会以同样的方式失败，发生在同一次加载的更后面，当加载器到达声明它的表时。这是本指南中唯一一个错误措辞取决于您加载到哪台服务器的错误。VillageSQL 会指明类型名，因为它的语法在该位置接受自定义类型名，并报告它无法解析的那一个：
+
+```
+ERROR 1064 (42000) at line 26: Expected a type or a custom type instead of "inet6"
+near 'inet6 DEFAULT NULL, `created_at` timestamp NULL DEFAULT current_timestamp(), '
+at line 5
+```
+
+原版 MySQL 8.4 则用通用的语法错误拒绝同一条语句：
+
+```
+ERROR 1064 (42000) at line 26: You have an error in your SQL syntax; check the manual
+that corresponds to your MySQL server version for the right syntax to use
+near 'inet6 DEFAULT NULL, `created_at` timestamp NULL DEFAULT current_timestamp(), '
+at line 5
+```
+
+两者都是 `ERROR 1064`，都指明了出错的行，所以无论哪种情况修复方法都相同。在加载之前把列类型改为 `VARCHAR(45)`（足以容纳文本形式的 IPv6 地址），或者如果目标上安装了提供 INET 类型的扩展，就改为该 INET 类型。
+
+## 外键约束名在表之间冲突 {#foreign-key-constraint-names-collide-across-tables}
+
+MariaDB 上的 `mysqldump` 会用一个普通整数为未命名的外键约束自动命名，并且每个表都从 `1` 重新开始。同一架构中的两个表最终可能都有一个名字就叫 `1` 的约束：
+
+```sql
+CREATE TABLE `order_items` (
+  ...
+  CONSTRAINT `1` FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`),
+  CONSTRAINT `2` FOREIGN KEY (`product_id`) REFERENCES `products` (`id`)
+) ENGINE=InnoDB ...;
+
+CREATE TABLE `orders` (
+  ...
+  CONSTRAINT `1` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`)
+) ENGINE=InnoDB ...;
+```
+
+MySQL 要求外键约束名在整个架构内唯一，而不只是在一个表内唯一。加载第二个 `CONSTRAINT `1`` 时会失败，报：
+
+```
+ERROR 1826 (HY000) at line 96: Duplicate foreign key constraint name '1'
+```
+
+这只在原始表依赖 MariaDB 的自动命名（`CREATE TABLE` 中没有给出 `CONSTRAINT name`）时发生。请在加载之前把每个冲突的约束改为唯一的名字，例如 `order_items_ibfk_1` 和 `orders_ibfk_1`。
+
+## JSON 列加载时不报错，但类型不同 {#the-json-column-loads-without-error-as-a-different-type}
+
+与上面三个问题不同，`JSON` 列加载到 MySQL 时没有错误也没有警告。MariaDB `JSON` 列转储出来的 `CREATE TABLE` 看起来像这样：
+
+```sql
+CREATE TABLE `products` (
+  ...
+  `attributes` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+    DEFAULT NULL CHECK (json_valid(`attributes`))
+) ENGINE=InnoDB ...;
+```
+
+MySQL 支持 `CHECK` 约束和 `JSON_VALID()` 函数，所以这条语句原样运行。在 MySQL 一侧，该列最终是带 `CHECK` 约束的 `LONGTEXT`，而不是 MySQL 的原生 `JSON` 类型。用 `JSON_EXTRACT()` 和 `JSON_LENGTH()` 读回它得到的结果与源数据完全相同，所以没有任何丢失，但该列声明的类型与全新 MySQL 架构会使用的类型不同。如果您想在目标上使用原生 `JSON` 类型，请在加载之后修改该列：
+
+```sql
+ALTER TABLE products MODIFY attributes JSON;
+```
+
+这会让原来的 `CHECK (json_valid(...))` 约束仍然附着在该列上。转储没有为该约束命名，所以服务器在运行 `CREATE TABLE` 时为它起了名字，类似 `products_chk_1`；在 `ALTER` 之前它就已经在那里了。在原生 `JSON` 列上它是无害的，因为 MySQL 已经在类型层面拒绝无效的 JSON，但它是 LONGTEXT 定义遗留下来的累赘。如果您想要干净的架构，请删除它：
+
+```sql
+ALTER TABLE products DROP CHECK products_chk_1;
+```
+
+## 认证差异 {#authentication-differences}
+
+MariaDB 和 MySQL 客户端使用同一个线路协议，从一方到另一方的普通密码认证连接可以正常工作。无法带过去的是账户定义本身。`mysqldump` 默认不转储 `mysql.user` 表，所以账户和授权必须在目标上手动重建，而重建的语法在两者之间有差异。
+
+在 MariaDB 上用密码创建的账户显示如下：
+
+```sql
+-- MariaDB
+SHOW CREATE USER 'appuser'@'%';
+-- CREATE USER `appuser`@`%` IDENTIFIED BY PASSWORD '*E6867A710B62E46C7948C1936692C0E9EAB160C5'
+```
+
+在 MySQL 或 VillageSQL 上，使用默认的 `caching_sha2_password` 插件，同一条语句则显示如下：
+
+```sql
+-- MySQL / VillageSQL
+SHOW CREATE USER 'appuser'@'%';
+-- CREATE USER `appuser`@`%` IDENTIFIED WITH 'caching_sha2_password' AS '...'
+--   REQUIRE NONE PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK ...
+```
+
+请不要把 MariaDB 的 `SHOW CREATE USER` 语句复制到 MySQL 中。请在目标上用 `CREATE USER ... IDENTIFIED BY '<password>'` 重新创建账户，让它选择自己的默认插件，然后重新执行 `GRANT` 语句。
+
+如果您正在针对一个刚刚搭建的 MariaDB 安装（例如一个全新的 Homebrew 安装）测试迁移，而一个带密码的具名账户在密码正确的情况下仍被拒绝并报 "Access denied"，请先检查匿名账户：
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = '';
+```
+
+未加固的 MariaDB 安装可能会留下 `''@'localhost'` 和 `''@'<hostname>'`。因为主机匹配比用户名匹配更具体，解析为 `localhost` 的连接会先匹配到匿名账户，然后才轮到您的具名账户，并因为匿名账户不期望密码而被拒绝。这是 MariaDB 源端安装的问题，不会随数据进入 MySQL，但在匿名账户被删除之前，它会让源端测试令人困惑。
+
+## 迁移方法 {#migration-approach}
+
+1. **用 `mysqldump` 转储架构和数据**（在 MariaDB 主机上，它通常是指向 MariaDB 自带的 `mariadb-dump` 的符号链接；运行 `mysqldump --version` 确认您用的是哪一个）。
+2. **在尝试加载之前，扫描转储中的 `CREATE SEQUENCE`、`INET6` 和 `RETURNING`。** 这三者在加载进行到中途之前都不会产生有用的错误。
+3. **先尝试加载到一个临时数据库。** `CREATE SEQUENCE` 或 `INET6` 的失败会在该语句处中止整个脚本，所以文件中定义在前面的表已经加载，定义在后面的表则没有。请修复转储并重新加载到一个全新的数据库，而不是修补一个加载了一半的数据库。
+4. **如果源架构依赖未命名的外键，请检查外键约束名冲突。** `grep -o 'CONSTRAINT \`[0-9]*\`' dump.sql` 可以找到它们。
+5. **手动重建账户和授权。** `mysqldump` 不携带它们，而且 `CREATE USER` / `SHOW CREATE USER` 的语法在两台服务器之间有差异。
+6. **验证行数并抽查所有 JSON 列。** `JSON` 列会静默地以 `LONGTEXT` 加载；请先用 `JSON_EXTRACT()` 确认数据能够往返，再决定是否把它转换为原生 `JSON` 列。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 对于同一版本族的 MySQL 目标，MariaDB 的 `mysqldump` 文件需要任何修改吗？ {#does-a-mariadb-mysqldump-file-need-any-edits-for-a-same-version-family-mysql-target}
+
+如果架构不使用序列、`INET6`、`RETURNING` 或未命名的外键，同一份转储通常无需修改即可加载。请先针对一个临时数据库测试加载，而不是因为架构"只是表和数据"就假定它会成功。
+
+#### 原生 MySQL `JSON` 列能通过 MariaDB 转储正确往返吗？ {#will-a-native-mysql-json-column-round-trip-through-a-mariadb-dump-correctly}
+
+值能够正确往返。列类型则不能：MariaDB 把它的 `JSON` 列转储为带 `CHECK` 约束的 `LONGTEXT`，加载到 MySQL 中的也正是这个，除非您之后显式地 `ALTER TABLE ... MODIFY` 把该列改为 `JSON`。
+
+#### 我可以用 MySQL 客户端连接 MariaDB 服务器，或者反过来吗？ {#can-i-connect-to-a-mariadb-server-with-a-mysql-client-or-the-reverse}
+
+可以，对于普通的密码认证连接是可以的。两者使用同一个线路协议，针对其中一个库构建的客户端可以对另一台服务器上的账户进行认证，只要该账户本身已经存在并有密码。两者的分歧在于各自接受的 SQL，而不在连接。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 1064 ... near 'SEQUENCE IF EXISTS ...'` | 删除 `CREATE SEQUENCE`/`DROP SEQUENCE`/`DO SETVAL(...)` 语句以及任何 `DEFAULT nextval(...)` 列默认值；改用 `AUTO_INCREMENT` |
+| 指明 `inet6` 的 `ERROR 1064`（VillageSQL 报 `Expected a type or a custom type instead of "inet6"`；原版 MySQL 给出通用的语法错误） | 在加载之前把该列改为 `VARCHAR(45)` 或受支持的 INET 类型 |
+| `ERROR 1064 ... near 'RETURNING id'` | 从语句中删除 `RETURNING`，之后使用 `SELECT LAST_INSERT_ID()` |
+| `ERROR 1826 (HY000) ... Duplicate foreign key constraint name '1'` | 重命名转储中冲突的 `CONSTRAINT` 名称，使每一个在整个架构内唯一 |
+| `JSON` 列加载时没有错误，但目标架构显示为 `LONGTEXT` | 符合预期：MariaDB 的 `JSON` 就是带 `CHECK` 约束的 `LONGTEXT`。如果您想在目标上使用原生类型，请运行 `ALTER TABLE ... MODIFY <col> JSON` |
+| 密码应当正确的具名账户报 "Access denied" | 检查 MariaDB 源端 `mysql.user` 中是否有可能截获连接的匿名账户（`user = ''`） |
+
+## 另请参阅 {#see-also}
+
+- [从 PostgreSQL 迁移到 MySQL](/zh/guides/postgres-to-mysql) — 针对 PostgreSQL 源的对应指南
+- [MySQL 中的模式迁移](/zh/guides/schema-migrations) — 运行迁移所需的 DDL 变更

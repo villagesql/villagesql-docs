@@ -1,0 +1,167 @@
+---
+title: "MySQL 中的批量插入"
+sidebarTitle: "批量插入"
+description: "如何高效地向 MySQL 插入大量数据：多行 INSERT、LOAD DATA INFILE、INSERT...SELECT、禁用键，以及为提升性能而进行事务批处理。"
+keywords: "mysql bulk insert, mysql load data infile, mysql batch insert, mysql fast insert, mysql import csv, mysql bulk load performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+逐行插入是让大型导入变慢的最快方法。MySQL 把每条单行 `INSERT` 都作为一次完整的事务提交来处理——解析、规划、执行、fsync。在大规模下，这种每行开销占据主导。下面介绍如何避免它。
+
+## 多行 INSERT {#multi-row-insert}
+
+最简单的优化：把多行合并到一条语句中。
+
+```sql
+-- Slow: one round trip and one transaction per row
+INSERT INTO products (name, price) VALUES ('Widget A', 9.99);
+INSERT INTO products (name, price) VALUES ('Widget B', 14.99);
+INSERT INTO products (name, price) VALUES ('Widget C', 19.99);
+
+-- Fast: one round trip, one transaction for all three
+INSERT INTO products (name, price) VALUES
+    ('Widget A',  9.99),
+    ('Widget B', 14.99),
+    ('Widget C', 19.99);
+```
+
+批次大小很重要。每条语句几百到几千行通常是最优的——更大的批次会增加内存压力并延长事务持续时间。请通过基准测试找到适合您工作负载的最佳值；每批 500–2000 行是常见的起点。
+
+## 事务批处理 {#transaction-batching}
+
+将多条 INSERT 包在一个事务中可以避免每条语句的提交开销：
+
+```sql
+START TRANSACTION;
+INSERT INTO products (name, price) VALUES ('Widget A',  9.99);
+INSERT INTO products (name, price) VALUES ('Widget B', 14.99);
+-- ... hundreds more ...
+INSERT INTO products (name, price) VALUES ('Widget Z', 99.99);
+COMMIT;
+```
+
+如果没有显式事务，每条 INSERT 都会自动提交。自动提交意味着每一行都单独刷到磁盘。把 500 条插入包在一个事务中只做一次刷盘。
+
+将它与多行 INSERT 结合使用：把行分成每条语句 500–1000 行的组，再把每个批次包在一个事务中。
+
+## LOAD DATA INFILE {#load-data-infile}
+
+对于大型 CSV 导入，`LOAD DATA INFILE` 是最快的 MySQL 原生选项——比批量 INSERT 快得多，因为它跳过了对每一行的 SQL 解析。
+
+```sql
+LOAD DATA INFILE '/var/lib/mysql-files/products.csv'
+INTO TABLE products
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES  -- skip header row
+(name, price, category);
+```
+
+该文件必须可被 MySQL 服务器进程读取。默认情况下，文件路径被限制在 `secure_file_priv` 指定的目录中：
+
+```sql
+SHOW VARIABLES LIKE 'secure_file_priv';
+```
+
+要从客户端机器而不是服务器加载文件：
+
+```sql
+LOAD DATA LOCAL INFILE '/path/on/client/products.csv'
+INTO TABLE products
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n';
+```
+
+`LOCAL INFILE` 要求服务器上 `local_infile = ON`，并且客户端启用了 `--local-infile` 选项。
+
+## INSERT ... SELECT {#insert--select}
+
+对于在表之间复制数据（ETL 模式、暂存表），`INSERT...SELECT` 比把行读入应用程序再插回去更快：
+
+```sql
+-- Load staging table, validate, then move to production
+INSERT INTO products (name, price, category)
+SELECT name, price, category
+FROM products_staging
+WHERE price > 0 AND name IS NOT NULL;
+```
+
+## 批量加载期间禁用索引 {#disabling-indexes-during-bulk-load}
+
+对于 MyISAM 表，在批量插入期间禁用非唯一索引的更新可以显著提速：
+
+```sql
+ALTER TABLE products DISABLE KEYS;
+-- ... bulk INSERT ...
+ALTER TABLE products ENABLE KEYS;  -- rebuilds indexes in one pass
+```
+
+对于 InnoDB，这样做没有同样的效果。InnoDB 会自动使用"变更缓冲区"来处理二级索引更新。要获得最大的 InnoDB 批量加载性能：
+
+```sql
+-- Temporarily increase the buffer pool if possible
+SET GLOBAL innodb_buffer_pool_size = 4 * 1024 * 1024 * 1024;  -- 4GB example
+
+-- Disable foreign key checks
+SET foreign_key_checks = 0;
+-- ... bulk load ...
+SET foreign_key_checks = 1;
+
+-- Disable unique checks for known-clean data
+SET unique_checks = 0;
+-- ... bulk load ...
+SET unique_checks = 1;
+```
+
+加载完成后请立即重新启用这些设置。对实际存在重复的数据禁用 `unique_checks` 会产生损坏的索引。
+
+## 性能比较 {#performance-comparison}
+
+| 方法 | 相对速度 | 最适合 |
+|:-------|:--------------|:---------|
+| 单行 INSERT（自动提交） | 最慢 | 小数据量、交互式 |
+| 单行 INSERT（在事务中批处理） | 快 2–5 倍 | 中等数据量 |
+| 多行 INSERT | 快 5–20 倍 | 大多数批量加载 |
+| LOAD DATA INFILE | 最快（通常比单行快 10–100 倍） | 大型 CSV 导入 |
+| INSERT...SELECT | 快（服务器端复制） | 表到表的复制 |
+
+具体数字在很大程度上取决于行大小、索引、硬件和配置。请对您的具体情况进行基准测试。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 每个 INSERT 批次应该多大？ {#how-large-should-each-insert-batch-be}
+
+从 500–1000 行开始并进行基准测试。更大的批次减少每次提交的开销，但会增加内存用量和事务持续时间（持有锁的时间更长）。如果一个批次失败，整个批次都会回滚——更小的批次意味着更少的回滚工作。大多数应用程序发现最佳批次大小在 500 到 5000 行之间。
+
+#### 我可以将 LOAD DATA INFILE 与 ON DUPLICATE KEY UPDATE 一起使用吗？ {#can-i-use-load-data-infile-with-on-duplicate-key-update}
+
+`LOAD DATA` 支持用 `REPLACE` 或 `IGNORE` 处理重复，但不支持 `ON DUPLICATE KEY UPDATE`。要在批量加载期间获得 upsert 语义，请先加载到暂存表，然后从暂存表向目标表使用 `INSERT...SELECT...ON DUPLICATE KEY UPDATE`。
+
+#### 批量插入会绕过触发器吗？ {#does-bulk-inserting-bypass-triggers}
+
+不会。触发器会对每个受影响的行触发，包括由 `LOAD DATA INFILE` 和 `INSERT...SELECT` 加载的行。如果您的触发器做大量工作，它会按比例拖慢批量加载。对于纯数据迁移，您可能需要临时禁用触发器。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:--------|:---------|
+| `ERROR 1290: The MySQL server is running with the --secure-file-priv option` | 把文件移到 `SHOW VARIABLES LIKE 'secure_file_priv'` 显示的目录中，或使用 `LOAD DATA LOCAL INFILE` |
+| `ERROR 3948: Loading local data is disabled` | 在服务器上用 `SET GLOBAL local_infile = 1` 启用，在客户端上用 `--local-infile=1` 启用 |
+| 批处理后批量插入仍然很慢 | 检查 `autocommit` 是否为 ON——每条语句单独提交；请包在显式的 `BEGIN...COMMIT` 块中 |
+| 禁用 `unique_checks` 后，已知干净的数据出现重复键错误 | `unique_checks = 0` 在加载期间不验证唯一性，但如果存在重复，它会损坏索引——务必先验证 |
+| `LOAD DATA` 错误解析行 | 检查 `FIELDS TERMINATED BY`、`ENCLOSED BY` 和 `LINES TERMINATED BY` 是否与实际文件格式一致；加载后使用 `SHOW WARNINGS` |
+
+这些加载技术在 [VillageSQL](https://villagesql.com/install) 上无需改动即可使用，它是带扩展的 MySQL 直接替代品。
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的事务](/zh/guides/transactions)——在事务中批处理批量插入以兼顾安全和速度
+- [MySQL 中的模式迁移](/zh/guides/schema-migrations)——批量插入常常是数据迁移工作的一部分
+- [MySQL 中的 UPSERT](/zh/guides/upsert)——处理加载期间的重复键
+- [MySQL 插入多行](/zh/tutorial/insert-multiple-rows)——多行语句本身
+- [MySQL INSERT SELECT](/zh/tutorial/insert-select)——复制查询返回的行

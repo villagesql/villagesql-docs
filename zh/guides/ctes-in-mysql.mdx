@@ -1,0 +1,185 @@
+---
+title: "MySQL CTE 何时胜过派生表"
+sidebarTitle: "CTE 性能"
+description: "MySQL 优化器是内联 CTE 还是物化 CTE、如何从 EXPLAIN 中判断，以及 CTE 何时不适合您正在编写的查询。"
+keywords: "mysql cte performance, mysql cte vs derived table, mysql materialize cte, mysql cte slow, mysql cte optimizer, mysql recursive cte cycles, cte_max_recursion_depth"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+CTE 和派生表返回相同的行，所以两者之间的选择通常只关乎可读性。当优化器物化其中一个时，它就不再只关乎可读性了，而优化器这样做的频率比大多数文章所说的要高。本指南讲的是如何判断您得到了哪一种，以及 CTE 不适合的那些情况。
+
+教程讲授语法本身：[公共表表达式](/zh/tutorial/cte)、[递归 CTE](/zh/tutorial/recursive-cte) 和[派生表](/zh/tutorial/derived-tables)。
+
+本页的每个执行计划都来自 1 台针对 Sakila 示例数据库运行的服务器。成本和行数估计来自 InnoDB 的抽样统计信息和您的 `optimizer_switch` 设置，所以您的数字会有所不同。可以沿用的是每个计划的形状。
+
+## 规则：可合并或不可合并 {#the-rule-mergeable-or-not}
+
+CTE 要么被折叠进外层查询，要么先被构建为临时表，而您得到哪一种取决于 CTE 包含什么，而不是您引用它多少次。
+
+主体是带 `WHERE` 和 `JOIN` 的普通 `SELECT` 的 CTE 会被合并，并从计划中完全消失：
+
+```sql
+EXPLAIN FORMAT=TREE WITH g AS (SELECT film_id, title, rating FROM film WHERE rating = 'G')
+SELECT title FROM g WHERE film_id < 50\G
+```
+
+```text
+-> Filter: ((film.rating = 'G') and (film.film_id < 50))  (cost=10.1 rows=9.8)
+    -> Index range scan on film using PRIMARY over (film_id < 50)  (cost=10.1 rows=49)
+```
+
+没有 CTE 节点，而且外层条件到达了索引。包含 `GROUP BY`、`DISTINCT`、`LIMIT`、`UNION` 或窗口函数的 CTE 无法合并，因为外层查询的条件在这些操作之前应用时并不等价。这样的 CTE 会被物化。
+
+下面的计划展示第二种情况。请把它们理解为关乎 CTE 的内容，而不是关乎 `WITH` 这个词。
+
+## 检查您得到了哪一种 {#check-which-one-you-got}
+
+`EXPLAIN FORMAT=TREE` 会直接写出 `Materialize` 这个词。默认的 `EXPLAIN` 则不会：对本页的查询，它的 `Extra` 列不带这个词。
+
+```sql
+EXPLAIN FORMAT=TREE WITH counts AS (SELECT rating, COUNT(*) AS films FROM film GROUP BY rating)
+SELECT rating, films FROM counts WHERE films > 200\G
+```
+
+```text
+-> Table scan on counts  (cost=2.5..2.5 rows=0)
+    -> Materialize CTE counts  (cost=0..0 rows=0)
+        -> Filter: (count(0) > 200)
+            -> Table scan on <temporary>
+                -> Aggregate using temporary table
+                    -> Table scan on film  (cost=103 rows=1000)
+```
+
+`Materialize CTE counts`，尽管这个 CTE 只被引用了一次。是其中的 `GROUP BY` 强制了这一点，服务器把行写入临时表再读回来。
+
+**包含相同 `GROUP BY` 的派生表得到相同的计划。** 写成 `FROM (SELECT rating, COUNT(*) ... GROUP BY rating) AS counts`，除了节点名称之外，树完全相同，成本也相同。所以在单次引用的查询上，CTE 并不比派生表强：这 2 种形式只在可读性上不同，优化器对它们一视同仁。
+
+两次引用同一个 CTE，措辞就会变成 `if needed`，第二次引用复用同一个物化结果：
+
+```sql
+EXPLAIN FORMAT=TREE WITH counts AS (SELECT rating, COUNT(*) AS films FROM film GROUP BY rating)
+SELECT a.rating, a.films FROM counts AS a JOIN counts AS b ON a.films = b.films\G
+```
+
+```text
+-> Nested loop inner join  (cost=2502 rows=0)
+    -> Table scan on a  (cost=2.5..2.5 rows=0)
+        -> Materialize CTE counts if needed  (cost=0..0 rows=0)
+            -> Table scan on <temporary>
+                -> Aggregate using temporary table
+                    -> Table scan on film  (cost=103 rows=1000)
+    -> Index lookup on b using <auto_key0> (films=a.films)  (cost=0.25..2.5 rows=10)
+        -> Materialize CTE counts if needed (query plan printed elsewhere)  (cost=0..0 rows=0)
+```
+
+这才是这 2 种形式真正分道扬镳的地方。开销大的内层查询只运行一次，两处引用都读取其结果。写成派生表时，同一个查询会两次写出该子查询，并计算两次。
+
+## 物化让您付出什么代价 {#what-materializing-costs-you}
+
+物化的 CTE 是一张临时表，这意味着 2 件值得了解的事。
+
+它放弃了基表的索引。一旦行位于临时表中，外层查询扫描的就是那张表。服务器可能会即时构建一个 `auto_key`，就像上面的联接那样，但那不是您在真实表上的索引。对比本页顶部的合并计划，那里外层条件到达了 `PRIMARY`。
+
+下推缓解了这一点。`derived_condition_pushdown` 默认开启，它把能移动的条件移到内部，这就是为什么上面的 `Filter: (count(0) > 200)` 出现在 `Materialize` 节点*内部*而不是外部。它无法移动所有条件，所以当计划显示 CTE 产生的行数远多于结果保留的行数时，请自己把限制条件写进 CTE 内部。
+
+## CTE 何时不合适 {#when-a-cte-is-the-wrong-shape}
+
+- **单个简短的步骤。** 派生表把它留在使用它的地方。给一个只有 1 行代码的子查询命名，只会给读者增加一次跳转。
+- **优化器没有下推的过滤条件。** 如果计划显示 CTE 物化了每一行而外层查询丢弃了其中大部分，请把过滤条件写进内部。
+- **针对索引的逐行工作。** 相关子查询或联接可以在每次查找时使用索引。物化的 CTE 已经放弃了这一点。
+
+当查询有 2 个或更多命名阶段、同一结果需要使用两次，或者替代方案是嵌套深到没人能看清它在哪里结束的子查询时，CTE 是合适的形式。
+
+它也是这 2 种形式中更容易调试的一种。CTE 定义可以通过对它执行 `SELECT` 来单独运行，这能在您查看第二阶段之前告诉您第一阶段是否正确。把派生表从 `FROM` 子句中间抽出来手动运行，是每次都要手工做一遍的同样工作。
+
+## 真实层级结构上的递归 CTE {#recursive-ctes-on-real-hierarchies}
+
+Sakila 没有层级结构，所以本节使用自己的一张表。在示例数据旁边创建它，用完后运行 `DROP TABLE employees;`：
+
+```sql
+CREATE TABLE employees (
+    id         INT PRIMARY KEY,
+    name       VARCHAR(50) NOT NULL,
+    manager_id INT NULL
+);
+
+INSERT INTO employees VALUES
+    (1,'Ada',NULL), (2,'Brem',1), (3,'Chi',1), (4,'Dov',2), (5,'Eze',4);
+```
+
+种子部分选出根节点，递归成员把表与已产生的行联接起来。`depth` 列既是答案也是守卫。
+
+```sql
+WITH RECURSIVE org_chart AS (
+    SELECT id, name, manager_id, 0 AS depth
+    FROM employees
+    WHERE manager_id IS NULL
+  UNION ALL
+    SELECT e.id, e.name, e.manager_id, oc.depth + 1
+    FROM employees AS e
+    INNER JOIN org_chart AS oc ON e.manager_id = oc.id
+    WHERE oc.depth < 100
+)
+SELECT depth, name FROM org_chart ORDER BY depth, name;
+```
+
+```text
++-------+------+
+| depth | name |
++-------+------+
+|     0 | Ada  |
+|     1 | Brem |
+|     1 | Chi  |
+|     2 | Dov  |
+|     3 | Eze  |
++-------+------+
+5 rows in set (0.00 sec)
+```
+
+**环是失败模式。** 如果 A 向 B 汇报而 B 向 A 汇报，查询中没有任何东西会停下来，它会一直运行直到触及深度限制：
+
+```text
+ERROR 3636 (HY000): Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.
+```
+
+上面查询中的 `WHERE oc.depth < 100` 就是防止这种情况的东西。它把无界的遍历变成有界的，而且无论数据是否干净都有效。
+
+错误消息建议提高 `cte_max_recursion_depth`，这只有在递归确实会终止、只是需要比默认的 1,000 更多轮次时才正确。一个合法的 1,500 步序列会遇到同样的错误，此时 `SET SESSION cte_max_recursion_depth = 5000` 是正确的答案。对于有环的数据，这是错误的答案：查询仍然永远不会结束，只是失败得更晚。
+
+## 可用性与术语 {#availability-and-terminology}
+
+CTE 在 MySQL 8.0 中引入，并存在于此后的每个版本中，包括 8.4 和 9.x。对 `WITH` 子句回应 `ERROR 1064` 的服务器早于 CTE 的引入；请用 `SELECT VERSION()` 检查。
+
+标准把递归 CTE 的第一部分称为**锚成员**，第二部分称为**递归成员**。教程把第一部分称为种子，两者是同一回事，而 MySQL 自己的消息使用标准术语。
+
+## CTE 可用于 INSERT、UPDATE 和 DELETE {#ctes-work-in-insert-update-and-delete}
+
+```sql
+WITH stale_orders AS (
+    SELECT id FROM orders WHERE created_at < NOW() - INTERVAL 1 YEAR
+)
+DELETE FROM orders WHERE id IN (SELECT id FROM stale_orders);
+```
+
+CTE 先被求值，所以它指定的行在语句更改任何内容之前就已确定。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 原因与修复 |
+|:--------|:---------|
+| CTE 比它替换的子查询更慢 | 它被物化了。在 `EXPLAIN FORMAT=TREE` 中查找 `Materialize CTE`。 |
+| CTE 读取的行数远多于结果所需 | 外层过滤条件没有被下推。把它移到 CTE 内部。 |
+| `ERROR 1146: Table '<database>.cte_name' doesn't exist` | CTE 在没有 `RECURSIVE` 的情况下引用了自身。请写 `WITH RECURSIVE`。 |
+| 在您预期会终止的数据上出现 `ERROR 3636` | 数据中有环。添加一个深度列和 `WHERE depth < N` 守卫。 |
+| 在确实很深的序列上出现 `ERROR 3636` | 为会话提高 `cte_max_recursion_depth`。 |
+| `WITH` 上出现 `ERROR 1064` | 服务器早于 CTE 支持。请检查 `SELECT VERSION()`。 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 中的子查询与 JOIN](/zh/guides/subqueries-vs-joins) — 与之竞争的另一种形式
+- [MySQL GROUP BY 性能](/zh/guides/group-by-having) — CTE 可以帮您避免的临时表
+- [MySQL 视图](/zh/guides/views) — 改为把命名查询持久化为模式对象
+- [公共表表达式](/zh/tutorial/cte) — 教程，如果您想先学语法

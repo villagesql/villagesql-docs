@@ -1,0 +1,155 @@
+---
+title: "Normalização no MySQL"
+sidebarTitle: "Normalizando Schemas"
+description: "Como normalizar o schema de um banco de dados MySQL: primeira, segunda e terceira formas normais explicadas com exemplos, e quando a desnormalização faz sentido."
+keywords: "mysql normalization, database normalization mysql, mysql normal forms, 1nf 2nf 3nf mysql, mysql schema design, mysql denormalization, mysql third normal form"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A normalização de banco de dados é o processo de organizar tabelas para reduzir redundância e evitar anomalias de atualização. A maioria das aplicações deve chegar à terceira forma normal (3NF). Além da 3NF, os ganhos são em grande parte teóricos e a complexidade dos joins é real.
+
+## Primeira Forma Normal (1NF) {#first-normal-form-1nf}
+
+Uma tabela está na 1NF quando toda coluna contém valores atômicos — um valor por célula — e não há grupos repetidos.
+
+**Viola a 1NF** — vários valores empacotados em uma coluna:
+
+```sql
+CREATE TABLE orders (
+    id          INT PRIMARY KEY,
+    customer    VARCHAR(100),
+    product_ids VARCHAR(255)  -- "1,4,7" — not atomic
+);
+```
+
+**Satisfaz a 1NF** — um valor por célula, grupo repetido extraído para uma tabela filha:
+
+```sql
+CREATE TABLE orders (
+    id       INT PRIMARY KEY,
+    customer VARCHAR(100)
+);
+
+CREATE TABLE order_items (
+    order_id   INT,
+    product_id INT,
+    PRIMARY KEY (order_id, product_id)
+);
+```
+
+## Segunda Forma Normal (2NF) {#second-normal-form-2nf}
+
+Uma tabela está na 2NF quando está na 1NF e toda coluna que não é chave depende da chave primária **inteira** — não só de parte dela. Isso só se aplica a tabelas com chaves primárias compostas.
+
+**Viola a 2NF** — `product_name` depende apenas de `product_id`, não da chave completa `(order_id, product_id)`:
+
+```sql
+CREATE TABLE order_items (
+    order_id     INT,
+    product_id   INT,
+    product_name VARCHAR(100),  -- partial dependency: only needs product_id
+    quantity     INT,
+    PRIMARY KEY (order_id, product_id)
+);
+```
+
+**Satisfaz a 2NF** — mova `product_name` para sua própria tabela:
+
+```sql
+CREATE TABLE products (
+    id   INT PRIMARY KEY,
+    name VARCHAR(100)
+);
+
+CREATE TABLE order_items (
+    order_id   INT,
+    product_id INT,
+    quantity   INT,
+    PRIMARY KEY (order_id, product_id),
+    FOREIGN KEY (product_id) REFERENCES products (id)
+);
+```
+
+## Terceira Forma Normal (3NF) {#third-normal-form-3nf}
+
+Uma tabela está na 3NF quando está na 2NF e nenhuma coluna que não é chave depende de outra coluna que não é chave. Isso se chama dependência transitiva.
+
+**Viola a 3NF** — `city` e `state` dependem de `zip_code`, não diretamente de `customer_id`:
+
+```sql
+CREATE TABLE customers (
+    id       INT PRIMARY KEY,
+    name     VARCHAR(100),
+    zip_code VARCHAR(10),
+    city     VARCHAR(100),  -- transitively depends on zip_code
+    state    CHAR(2)        -- transitively depends on zip_code
+);
+```
+
+**Satisfaz a 3NF** — extraia a dependência transitiva:
+
+```sql
+CREATE TABLE zip_codes (
+    zip_code VARCHAR(10) PRIMARY KEY,
+    city     VARCHAR(100),
+    state    CHAR(2)
+);
+
+CREATE TABLE customers (
+    id       INT PRIMARY KEY,
+    name     VARCHAR(100),
+    zip_code VARCHAR(10),
+    FOREIGN KEY (zip_code) REFERENCES zip_codes (zip_code)
+);
+```
+
+Na prática, extrair CEPs para uma tabela separada é exagero para a maioria das aplicações. O princípio importa mais do que a conformidade mecânica em cada caso limítrofe.
+
+## Quando Desnormalizar {#when-to-denormalize}
+
+A normalização melhora a integridade das escritas e reduz a redundância, mas adiciona o custo dos joins nas leituras. Cargas de trabalho pesadas em leitura ou de analytics às vezes justificam uma desnormalização deliberada.
+
+| Cenário | Normalizar | Desnormalizar |
+|:---------|:----------|:------------|
+| Escritas frequentes, integridade dos dados crítica | Sim | — |
+| Consultas de relatório que unem 6 ou mais tabelas | — | Considere |
+| Conjunto de dados pequeno (< 100 mil linhas) | Sim | Desnecessário |
+| Data warehouse ou réplica de analytics | — | Sim |
+| Aplicação OLTP com leitura e escrita mistas | Sim | Apenas os caminhos mais acessados (hot paths) |
+
+Verifique os índices antes de desnormalizar — a maioria dos problemas de join lento é problema de índice ausente. Adicionar um índice de cobertura nas colunas do join costuma ser tudo de que você precisa; consulte [Como Funcionam os Índices do MySQL](/pt-BR/guides/mysql-indexes).
+
+A desnormalização funciona melhor em réplicas de leitura ou em armazenamentos OLAP — não nas mesmas tabelas em que sua aplicação escreve.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Preciso ir além da 3NF? {#do-i-need-to-go-beyond-3nf}
+
+Para a maioria das aplicações, a 3NF é suficiente. A Forma Normal de Boyce-Codd (BCNF) trata de casos limítrofes em que chaves candidatas sobrepostas ainda permitem anomalias na 3NF — situações que raramente surgem fora de exercícios acadêmicos. Pare na 3NF, a menos que tenha uma anomalia específica que esteja tentando eliminar.
+
+#### Devo desnormalizar por desempenho? {#should-i-denormalize-for-performance}
+
+Meça antes de reestruturar. A maioria das consultas lentas é causada por índices ausentes, não por joins. Adicione o índice primeiro. Se consultas bem indexadas continuam lentas em tabelas grandes, considere a desnormalização em uma réplica de leitura ou em uma tabela de resumo materializada, em vez de no banco de dados transacional.
+
+#### Qual é a diferença entre uma violação da 2NF e uma violação da 3NF? {#whats-the-difference-between-a-2nf-violation-and-a-3nf-violation}
+
+Uma violação da 2NF é uma coluna que depende de *parte* da chave primária (só possível com chaves primárias compostas). Uma violação da 3NF é uma coluna que depende de *outra coluna que não é chave*. A 2NF trata de dependências parciais da chave; a 3NF trata de dependências transitivas por meio de colunas que não são chave.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| Dados duplicados aparecendo em várias linhas | Provável violação da 2NF ou da 3NF — mova os dados repetidos para sua própria tabela |
+| Anomalias de atualização (altera uma linha, outras ficam desatualizadas) | Dependência transitiva — extraia para uma tabela de consulta |
+| Consultas que unem 5 ou mais tabelas estão lentas | Verifique primeiro os índices nas colunas de FK; desnormalize só se os índices não ajudarem |
+| Schema normalizado complexo demais para consultar | Considere uma view otimizada para leitura ou uma réplica de analytics desnormalizada |
+
+## Veja também {#see-also}
+
+- [Escolhendo Tipos de Dados do MySQL](/pt-BR/guides/choosing-data-types) — escolhendo os tipos certos depois que seu schema está normalizado
+- [Chaves Estrangeiras no MySQL](/pt-BR/guides/foreign-keys) — aplicando os relacionamentos que a normalização cria
+- [Restrições CHECK no MySQL](/pt-BR/guides/check-constraints) — regras adicionais além da integridade de chaves estrangeiras
+- [O banco de dados de exemplo Sakila](/pt-BR/tutorial/sakila-database) — um schema normalizado para praticar

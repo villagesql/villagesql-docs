@@ -1,0 +1,97 @@
+---
+title: "MySQL 中的分页：键集与 OFFSET"
+sidebarTitle: "结果分页"
+description: "为什么 OFFSET 分页在深层页面上会变慢，以及键集（游标）分页如何让第 10,000 页和第 1 页一样快。"
+keywords: "mysql pagination, keyset pagination, cursor pagination mysql, limit offset slow, mysql offset performance, seek method"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+`LIMIT 20 OFFSET 200000` 读取 200,020 行并丢弃其中的 200,000 行。这不是缺陷；这正是 OFFSET 的含义。服务器没有办法在任意排序中直接跳到第 200,001 行，所以它一路走到那里。第 1 页很快，第 10,000 页很慢，而且变慢的程度随页面深度线性增长。键集分页通过记住上一页在哪里结束而不是从头计数来解决这个问题。
+
+## OFFSET 分页：在出问题之前都挺好 {#offset-pagination-fine-until-it-isnt}
+
+熟悉的模式：
+
+```sql
+SELECT id, title, created_at
+FROM articles
+ORDER BY id
+LIMIT 20 OFFSET 40;   -- page 3
+```
+
+对于浅层分页来说这没有问题：管理界面、人类永远不会翻到第 20 页之后的结果集。问题出现在深处：
+
+- **成本随页码增长。** `OFFSET 200000` 在返回任何内容之前要扫描并丢弃 200,000 个索引条目。
+- **行在请求之间移动。** 如果在用户翻页时插入了一行，页面边界就会移动，用户会看到重复的行或漏掉一行。
+
+## 键集分页：记住您停在哪里 {#keyset-pagination-remember-where-you-stopped}
+
+不是计数行，而是按客户端看到的最后一个值过滤：
+
+```sql
+-- First page
+SELECT id, title, created_at
+FROM articles
+ORDER BY id
+LIMIT 20;
+
+-- Next page: the client sends back the last id it received (say, 20)
+SELECT id, title, created_at
+FROM articles
+WHERE id > 20
+ORDER BY id
+LIMIT 20;
+```
+
+`WHERE id > 20` 子句让服务器直接定位到索引中的位置并恰好读取 20 行，无论页面有多深。第 10,000 页的成本与第 1 页相同。插入的行不会移动页面边界，因为边界是一个值，而不是一个位置。
+
+代价是：键集分页给您的是"下一页"和"上一页"，而不是"跳到第 47 页"。对于无限滚动和 API 来说，这通常正是您想要的交互方式。
+
+## 根据键以外的列排序 {#sorting-by-something-other-than-the-key}
+
+真实的列表很少按 `id` 排序。按非唯一列排序时您需要一个决胜列，否则值相等的行会在页面之间被跳过或重复。客户端把它看到的最后一行的两个值都发回来，查询在两个值上进行比较：
+
+```sql
+-- Sorted by created_at, with id as the tiebreaker
+SELECT id, title, created_at
+FROM articles
+WHERE created_at > '2026-08-01 12:00:00'
+   OR (created_at = '2026-08-01 12:00:00' AND id > 143)
+ORDER BY created_at, id
+LIMIT 20;
+```
+
+SQL 还有一种更短的行构造器写法，`WHERE (created_at, id) > ('2026-08-01 12:00:00', 143)`。它返回相同的行，但 MySQL 的优化器不会把它转换为索引范围定位：对于行构造器，`EXPLAIN` 显示全扫描（`type: ALL` 或 `type: index`，取决于查询是否被索引覆盖），而对于上面展开的形式则显示定位（`type: range`）。请使用展开的形式。
+
+无论哪种方式，索引都必须与 ORDER BY 匹配：
+
+```sql
+CREATE INDEX idx_articles_created_id ON articles (created_at, id);
+```
+
+用 `EXPLAIN` 检查执行计划：您希望在该索引上看到 `type: range` 并且没有 filesort。请参阅[阅读 EXPLAIN](/zh/guides/reading-explain) 了解要看什么。
+
+## 您需要总数吗？ {#do-you-need-a-total-count}
+
+对大型过滤集合执行 `SELECT COUNT(*)` 的成本可能比分页查询本身还高。建立在键集分页之上的界面通常放弃精确计数，转而提供"加载更多"的交互。如果产品确实需要计数，请缓存它或在汇总表中维护它，而不是每次请求都计数。
+
+## 该用哪一个 {#which-one-to-use}
+
+| 情形 | 使用 |
+|---|---|
+| 管理表格，几百行 | OFFSET，它更简单 |
+| 用户可以在其间跳转的带编号页面链接 | OFFSET，键集不能跳转 |
+| API 结果分页 | 键集，返回一个不透明的游标 |
+| 无限滚动 | 键集 |
+| 任何可能增长到约 10 万行以上的列表 | 键集 |
+
+## 另请参阅 {#see-also}
+
+- [MySQL 索引](/zh/guides/mysql-indexes) — 键集分页所依赖的索引设计
+- [阅读 EXPLAIN](/zh/guides/reading-explain) — 确认是定位而不是扫描
+- [主键策略](/zh/guides/primary-key-strategies) — 可排序的键（如 UUIDv7）是很好的游标
+- [MySQL LIMIT](/zh/tutorial/limit) — 关于 LIMIT 和 OFFSET 的教程课程
+- [MySQL ORDER BY](/zh/tutorial/order-by) — 分页所依赖的排序

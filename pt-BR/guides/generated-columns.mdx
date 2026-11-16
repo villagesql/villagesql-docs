@@ -1,0 +1,172 @@
+---
+title: "Colunas Geradas no MySQL"
+sidebarTitle: "Usando Colunas Geradas"
+description: "Como funcionam as colunas geradas do MySQL: VIRTUAL vs STORED, expressões e indexação, padrões de índice funcional, e quando colunas geradas substituem a computação na camada de aplicação."
+keywords: "mysql generated column, mysql virtual column, mysql stored generated column, mysql computed column, mysql generated column index, mysql functional index, mysql as generated"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma coluna gerada é uma coluna cujo valor é derivado de uma expressão, em vez de armazenado pela aplicação. O MySQL a calcula automaticamente — você define a fórmula uma vez no schema, e o MySQL a mantém consistente.
+
+## Sintaxe {#syntax}
+
+```sql
+column_name data_type [GENERATED ALWAYS] AS (expression) [VIRTUAL | STORED]
+```
+
+```sql
+CREATE TABLE orders (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    subtotal    DECIMAL(10,2) NOT NULL,
+    tax_rate    DECIMAL(5,4) NOT NULL,
+    tax_amount  DECIMAL(10,2) AS (subtotal * tax_rate) VIRTUAL,
+    total       DECIMAL(10,2) AS (subtotal + subtotal * tax_rate) STORED
+);
+```
+
+## VIRTUAL vs STORED {#virtual-vs-stored}
+
+| | VIRTUAL | STORED |
+|:--|:--------|:-------|
+| Armazenamento | Sem armazenamento em disco — calculada na leitura | Gravada em disco no INSERT/UPDATE |
+| Momento do cálculo | Em cada SELECT | Em cada INSERT/UPDATE |
+| Espaço em disco | Economiza espaço | Usa espaço como uma coluna comum |
+| Pode ser indexada | Sim (o índice armazena os valores calculados) | Sim |
+| Pode ser destino de chave estrangeira | Não | Não |
+| Padrão | Sim — VIRTUAL é o padrão se omitido | Só se especificado explicitamente |
+
+Use `STORED` quando o cálculo for caro e você ler a coluna muito mais do que a grava. Use `VIRTUAL` (o padrão) quando o armazenamento for uma preocupação ou as gravações forem frequentes.
+
+## Expressões {#expressions}
+
+As expressões de colunas geradas podem referenciar outras colunas da mesma linha. Elas não podem referenciar outras colunas geradas nem chamar funções não determinísticas.
+
+```sql
+CREATE TABLE users (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    first_name VARCHAR(50),
+    last_name  VARCHAR(50),
+    full_name  VARCHAR(101) AS (CONCAT(first_name, ' ', last_name)) VIRTUAL,
+    email      VARCHAR(100),
+    email_lower VARCHAR(100) AS (LOWER(email)) STORED
+);
+```
+
+As funções permitidas em colunas geradas devem ser determinísticas — as mesmas entradas sempre produzem a mesma saída. Não permitidos: `NOW()`, `RAND()`, `UUID()`, subconsultas, funções armazenadas.
+
+Extrair campos de JSON é um caso de uso comum:
+
+```sql
+CREATE TABLE events (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    payload JSON,
+    user_id INT AS (payload->>'$.user_id') STORED,
+    action  VARCHAR(50) AS (payload->>'$.action') VIRTUAL
+);
+```
+
+## Indexando Colunas Geradas {#indexing-generated-columns}
+
+Você pode adicionar um índice em uma coluna gerada. Para colunas `VIRTUAL`, o MySQL materializa o valor calculado no índice.
+
+```sql
+CREATE TABLE events (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    occurred_at DATETIME NOT NULL,
+    ym          VARCHAR(7) AS (DATE_FORMAT(occurred_at, '%Y-%m')) VIRTUAL
+);
+
+-- Index the computed ym. (Note: YEAR_MONTH is a reserved word — the
+-- INTERVAL unit in INTERVAL '1-2' YEAR_MONTH — so an unquoted column
+-- can't be named year_month.)
+ALTER TABLE events ADD INDEX idx_ym (ym);
+
+-- This query now uses the index
+SELECT * FROM events WHERE ym = '2024-06';
+```
+
+É assim também que se constrói um **índice funcional** — um índice sobre uma função de uma coluna, em vez do valor bruto da coluna. O MySQL 8.0.13+ suporta índices funcionais diretamente (`INDEX (LOWER(email))`), o que internamente cria uma coluna gerada oculta:
+
+```sql
+-- Functional index syntax (MySQL 8.0.13+)
+CREATE TABLE users (
+    id    INT PRIMARY KEY,
+    email VARCHAR(100),
+    INDEX idx_email_lower ((LOWER(email)))  -- note the double parentheses
+);
+
+-- Equivalent to:
+CREATE TABLE users (
+    id          INT PRIMARY KEY,
+    email       VARCHAR(100),
+    email_lower VARCHAR(100) AS (LOWER(email)) VIRTUAL,
+    INDEX idx_email_lower (email_lower)
+);
+```
+
+## Inserindo e Atualizando {#inserting-and-updating}
+
+Você não pode atribuir um valor a uma coluna gerada em um `INSERT` ou `UPDATE`. O valor da coluna é sempre derivado da expressão. Você pode escrever `DEFAULT` explicitamente, mas é só isso:
+
+```sql
+-- Correct: omit the generated column entirely
+INSERT INTO orders (subtotal, tax_rate) VALUES (100.00, 0.08);
+
+-- Correct: DEFAULT is allowed
+INSERT INTO orders (subtotal, tax_rate, total) VALUES (100.00, 0.08, DEFAULT);
+
+-- Error: cannot assign a value to a generated column
+INSERT INTO orders (subtotal, tax_rate, total) VALUES (100.00, 0.08, 108.00);
+```
+
+## ALTER TABLE {#alter-table}
+
+Adicione uma coluna gerada a uma tabela existente:
+
+```sql
+ALTER TABLE orders
+ADD COLUMN discount_pct DECIMAL(5,2)
+    AS (CASE WHEN subtotal > 1000 THEN 0.10 ELSE 0.00 END) VIRTUAL;
+```
+
+Altere a expressão de uma coluna gerada. A classe de armazenamento `VIRTUAL`/`STORED` precisa permanecer a mesma — trocá-la gera `ERROR 3106: 'Changing the STORED status' is not supported for generated columns`, então mudar o armazenamento significa remover e adicionar a coluna novamente:
+
+```sql
+ALTER TABLE orders
+MODIFY COLUMN tax_amount DECIMAL(10,2)
+    AS (ROUND(subtotal * tax_rate, 2)) VIRTUAL;
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Posso usar uma coluna gerada em uma cláusula WHERE? {#can-i-use-a-generated-column-in-a-where-clause}
+
+Sim. Para colunas `VIRTUAL` sem índice, o MySQL calcula a expressão durante a varredura. Para colunas `STORED` ou colunas `VIRTUAL` indexadas, o valor já está materializado. Use `EXPLAIN` para verificar se o índice está sendo usado.
+
+#### Uma coluna gerada é atualizada automaticamente quando as colunas de origem mudam? {#does-a-generated-column-update-automatically-when-the-source-columns-change}
+
+Sim. O MySQL recalcula as colunas geradas `VIRTUAL` em cada leitura. As colunas geradas `STORED` são recalculadas e gravadas em cada `INSERT` ou `UPDATE` que afeta as colunas da expressão.
+
+#### Posso usar uma coluna gerada como chave de partição? {#can-i-use-a-generated-column-as-a-partition-key}
+
+Sim, tanto para colunas geradas `STORED` quanto `VIRTUAL`.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 3105: The value specified for generated column is not allowed` | Você atribuiu um valor explícito a uma coluna gerada em INSERT/UPDATE — omita-o ou use DEFAULT |
+| `ERROR 3763: Expression of generated column '<col>' contains a disallowed function: <name>` | A expressão usa `NOW()`, `RAND()`, `UUID()` ou uma subconsulta — substitua por alternativas determinísticas |
+| Coluna gerada não usa o índice | Verifique com `EXPLAIN` — a expressão da cláusula WHERE deve corresponder exatamente à expressão da coluna gerada; `WHERE LOWER(email)` usa um índice de coluna gerada `LOWER(email)`, mas `WHERE LOWER(TRIM(email))` não |
+| Coluna `STORED` deixando as gravações lentas | Cada INSERT/UPDATE recalcula e armazena a expressão — mude para `VIRTUAL` se o desempenho de leitura não for a prioridade |
+| `ALTER TABLE` adicionando coluna gerada é lento | O MySQL reconstrói a tabela para colunas geradas `STORED`; adicionar colunas `VIRTUAL` é muito mais rápido (somente metadados em muitos casos) |
+
+## Veja também {#see-also}
+
+- [JSON no MySQL](/pt-BR/guides/json-in-mysql) — o principal caso de uso: indexar campos JSON com colunas geradas
+- [Como Funcionam os Índices do MySQL](/pt-BR/guides/mysql-indexes) — índices em colunas geradas funcionam como índices comuns
+- [Escolhendo Tipos de Dados do MySQL](/pt-BR/guides/choosing-data-types) — quando colunas geradas são melhores do que armazenar valores derivados
+- [Exclusões Lógicas no MySQL](/pt-BR/guides/soft-deletes) — a solução de restrição única para linhas excluídas logicamente

@@ -1,0 +1,350 @@
+---
+title: "FastAPI 与 SQLAlchemy 2.0 配合 MySQL"
+sidebarTitle: "FastAPI 与 SQLAlchemy"
+description: "使用 SQLAlchemy 2.0 的类型化 ORM、异步驱动和 Alembic 迁移，在 MySQL 上构建异步 FastAPI 应用，包括 greenlet 依赖和其他真实的设置陷阱。"
+keywords: "fastapi mysql, sqlalchemy 2.0 async, fastapi sqlalchemy, asyncmy, aiomysql, alembic async migration, sqlalchemy mapped_column, fastapi depends session, villagesql fastapi"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+只有当底层的数据库调用也是异步的，FastAPI 的异步请求处理才有回报。SQLAlchemy 2.0 通过类型化的 ORM 风格和异步引擎支持这一点，但把两者针对 MySQL 接起来有几个设置步骤，第一次尝试时很容易出错。
+
+## 选择异步驱动 {#choosing-an-async-driver}
+
+SQLAlchemy 2.0 为两个异步 MySQL 驱动提供方言：`asyncmy` 和 `aiomysql`。文档没有把其中任何一个列为相对另一个的官方推荐。`asyncmy` 是用 Cython 编写的编译型驱动，为当前的 Python 版本提供预构建的 wheel，这就是本指南使用它的原因：
+
+```bash
+pip install "sqlalchemy[asyncio]" asyncmy cryptography
+```
+
+安装普通的 `sqlalchemy` 而不是 `sqlalchemy[asyncio]` 是第一个真正的陷阱。SQLAlchemy 的异步 ORM 层用 `greenlet` 库桥接异步和同步代码，而它不是基础包的依赖。跳过 `[asyncio]` 附加项，在您第一次使用异步引擎时就会产生这个错误：
+
+```
+ValueError: the greenlet library is required to use this function. No module named 'greenlet'
+```
+
+修复方法是 `pip install greenlet`，或者更好的做法是，始终带 `[asyncio]` 附加项安装 SQLAlchemy，这样它会被自动拉入。
+
+第二个陷阱是 `cryptography`。MySQL 8 和 VillageSQL 的新账户默认使用 `caching_sha2_password` 身份验证插件，它需要 RSA 密钥交换，以便在给定账户第一次从给定客户端库进行身份验证时发送密码。`asyncmy` 不捆绑 RSA 实现，所以必须完成这次完整握手的连接会失败并报错：
+
+```
+RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods
+```
+
+一旦某个账户完成了一次完整的身份验证（从任何客户端，包括 `mysql` CLI），服务器就会缓存结果，之后的连接会走跳过 RSA 步骤的更快路径，这就是为什么这个错误看起来时有时无，取决于最近是什么连接了该账户。预先安装 `cryptography` 完全消除了对该缓存的依赖，是可靠的修复方法。
+
+## 创建数据库和用户 {#creating-the-database-and-user}
+
+创建专用的数据库和应用用户，而不是以 root 身份连接：
+
+```sql
+CREATE DATABASE IF NOT EXISTS fastapi_guide CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS 'fastapi_app'@'127.0.0.1' IDENTIFIED BY 'fastapi_pw_123!';
+GRANT ALL PRIVILEGES ON fastapi_guide.* TO 'fastapi_app'@'127.0.0.1';
+```
+
+该用户的范围是 `127.0.0.1`，而不是 `localhost`。本指南中的连接字符串通过 TCP 连接到 `127.0.0.1`，所以授权必须与该主机匹配；Unix 套接字连接则匹配 `localhost`，与账户基于 IP 的授权无关。
+
+## 项目布局 {#project-layout}
+
+```
+fastapi-sqlalchemy-mysql/
+├── alembic/
+│   ├── env.py
+│   └── versions/
+├── alembic.ini
+├── app/
+│   ├── __init__.py
+│   ├── database.py
+│   ├── models.py
+│   ├── schemas.py
+│   └── main.py
+└── requirements.txt
+```
+
+`requirements.txt`：
+
+```
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]>=2.0
+asyncmy
+cryptography
+alembic
+pydantic
+```
+
+## 异步引擎与会话 {#the-async-engine-and-session}
+
+`app/database.py` 创建异步引擎、会话工厂，以及每个模型使用的声明式基类：
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+DATABASE_URL = "mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide"
+
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+
+`expire_on_commit=False` 对 FastAPI 很重要。使用默认的 `expire_on_commit=True` 时，已提交对象上的每个属性都会被标记为过期，下一次读取该属性会发出一条新的 `SELECT` 来刷新它。如果这次刷新是在 `await` 之外触发的，它会失败并报错：
+
+```
+sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() here. Was IO attempted in an unexpected place?
+```
+
+而一旦会话已完全关闭，同样的属性读取则会失败并报错：
+
+```
+sqlalchemy.orm.exc.DetachedInstanceError: Instance <Post at 0x...> is not bound to a Session; attribute refresh operation cannot proceed
+```
+
+`expire_on_commit=False` 使对象上已加载的值在提交后仍然可用，从而避免了这两种情况。
+
+`get_session()` 是一个生成器函数，这让 FastAPI 的 `Depends()` 能在请求结束后自动关闭会话，无论请求成功还是抛出异常。
+
+## 模型 {#the-model}
+
+`app/models.py` 使用 SQLAlchemy 2.0 的类型化声明式风格（`Mapped` 和 `mapped_column`）而不是旧的仅 `Column` 风格来定义 `Post` 表：
+
+```python
+import datetime
+
+from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database import Base
+
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+```
+
+`server_default=func.now()` 把时间戳默认值交给 MySQL 本身，所以即使是在应用程序之外插入的行，它也能被正确设置。
+
+## 设置 Alembic {#setting-up-alembic}
+
+使用异步模板初始化 Alembic，它会生成一个已经为异步引擎接好线的 `env.py`：
+
+```bash
+alembic init -t async alembic
+```
+
+请在项目目录内运行此命令。无论传给 `init` 的路径是什么，Alembic 都会把 `alembic.ini` 写到当前工作目录，尽管 `alembic/` 脚本文件夹本身是在给定路径创建的。在错误的目录中运行它会在意想不到的地方留下一个多余的 `alembic.ini`。
+
+把 `alembic.ini` 指向实际的数据库：
+
+```ini
+sqlalchemy.url = mysql+asyncmy://fastapi_app:fastapi_pw_123!@127.0.0.1:3306/fastapi_guide
+```
+
+然后编辑 `alembic/env.py` 以导入模型，让 autogenerate 能看到它们：
+
+```python
+from app.database import Base
+from app.models import Post  # noqa: F401  (registers Post on Base.metadata)
+
+target_metadata = Base.metadata
+```
+
+生成并运行迁移：
+
+```bash
+alembic revision --autogenerate -m "create posts table"
+alembic upgrade head
+```
+
+autogenerate 步骤检测到了新表并写出了迁移：
+
+```
+INFO  [alembic.autogenerate.compare.tables] Detected added table 'posts'
+Generating alembic/versions/4f5ba2a8774a_create_posts_table.py ...  done
+```
+
+针对 VillageSQL 应用它成功了：
+
+```
+INFO  [alembic.runtime.migration] Running upgrade  -> 4f5ba2a8774a, create posts table
+```
+
+直接在运行中的服务器上确认：
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SHOW TABLES;"
+```
+
+```
+Tables_in_fastapi_guide
+alembic_version
+posts
+```
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "DESCRIBE posts;"
+```
+
+```
+Field       Type          Null    Key     Default    Extra
+id          int           NO      PRI     NULL       auto_increment
+title       varchar(200)  NO              NULL
+body        text          NO              NULL
+created_at  datetime      NO              now()      DEFAULT_GENERATED
+```
+
+## Pydantic 模式 {#the-pydantic-schemas}
+
+`app/schemas.py` 独立于 ORM 模型定义请求和响应的形状：
+
+```python
+import datetime
+
+from pydantic import BaseModel, ConfigDict
+
+
+class PostCreate(BaseModel):
+    title: str
+    body: str
+
+
+class PostRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    body: str
+    created_at: datetime.datetime
+```
+
+`from_attributes=True` 让 `PostRead` 直接从 `Post` ORM 实例而不是字典构建响应。
+
+## FastAPI 路由 {#the-fastapi-routes}
+
+`app/main.py` 通过 `Depends()` 把会话接入每个路由，所以每个请求都获得自己的会话，而不是共享一个全局连接：
+
+```python
+from fastapi import Depends, FastAPI
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_session
+from app.models import Post
+from app.schemas import PostCreate, PostRead
+
+app = FastAPI(title="FastAPI + SQLAlchemy 2.0 + VillageSQL")
+
+
+@app.get("/posts", response_model=list[PostRead])
+async def list_posts(session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Post).order_by(Post.id))
+    return result.scalars().all()
+
+
+@app.post("/posts", response_model=PostRead, status_code=201)
+async def create_post(payload: PostCreate, session: AsyncSession = Depends(get_session)):
+    post = Post(title=payload.title, body=payload.body)
+    session.add(post)
+    await session.commit()
+    await session.refresh(post)
+    return post
+```
+
+跨请求共享的全局会话，在并发负载下最终会导致交错的查询以错误的顺序打到同一个连接上。通过 `Depends()` 为每个请求创建的会话避免了这一点，因为每个请求都获得自己的会话和自己从池中取出的连接。
+
+## 运行与验证 {#running-and-verifying}
+
+启动应用：
+
+```bash
+uvicorn app.main:app --host 127.0.0.1 --port 8010
+```
+
+空表返回空列表：
+
+```bash
+curl -s http://127.0.0.1:8010/posts
+```
+
+```json
+[]
+```
+
+创建一篇文章：
+
+```bash
+curl -s -X POST http://127.0.0.1:8010/posts \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Hello VillageSQL", "body": "First post via FastAPI + SQLAlchemy 2.0"}'
+```
+
+```json
+{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}
+```
+
+并返回 HTTP 201 状态。再次列出会显示新行：
+
+```json
+[{"id":1,"title":"Hello VillageSQL","body":"First post via FastAPI + SQLAlchemy 2.0","created_at":"2026-08-28T12:04:36"}]
+```
+
+直接查询数据库可以确认写入确实落地，而不只是 API 的响应：
+
+```bash
+mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SELECT * FROM posts;"
+```
+
+```
+id  title             body                                       created_at
+1   Hello VillageSQL  First post via FastAPI + SQLAlchemy 2.0     2026-08-28 12:04:36
+```
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 为什么异步引擎需要与同步引擎不同的连接字符串？ {#why-does-the-async-engine-need-a-different-connection-string-than-a-sync-one}
+
+连接字符串中的驱动名称告诉 SQLAlchemy 加载哪个 DBAPI。同步设置使用 `mysql+pymysql://` 或 `mysql+mysqldb://`；异步设置需要基于 `asyncio` 构建的驱动，所以字符串改用 `mysql+asyncmy://`。把同步驱动名称用于 `create_async_engine` 会立即失败，因为该驱动没有可供 SQLAlchemy 调用的异步接口。
+
+#### 我需要 `expire_on_commit=False` 吗？ {#do-i-need-expire_on_commitfalse}
+
+不是严格必需，但如果跳过它，对已提交对象的每次属性访问都会触发一次新的数据库往返来重新加载它，而这次往返只有在活动的异步上下文内发生时才有效。取决于属性具体在哪里被读取，这会表现为 `MissingGreenlet`，或者在会话关闭后表现为 `DetachedInstanceError`。对 Web 应用来说，更安全的默认值是 `expire_on_commit=False`。
+
+#### 我还能使用 Alembic 的同步 autogenerate 工作流吗？ {#can-i-still-use-alembics-synchronous-autogenerate-workflow}
+
+可以。异步模板的 `env.py` 仍然从常规命令行运行 `revision --autogenerate` 和 `upgrade`；异步部分只影响 `env.py` 如何打开自己的连接来检查和修改模式。Alembic CLI 命令本身没有任何变化。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `ValueError: the greenlet library is required to use this function` | 安装 `sqlalchemy[asyncio]` 而不是普通的 `sqlalchemy`，或直接 `pip install greenlet` |
+| `RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods` | 运行 `pip install cryptography`；`asyncmy` 需要它来完成 MySQL 默认 `caching_sha2_password` 身份验证中的 RSA 步骤 |
+| `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` | 某个 ORM 属性在 `await` 调用之外被读取，通常是因为会话在提交时使对象过期了；在会话工厂上设置 `expire_on_commit=False` |
+| `sqlalchemy.orm.exc.DetachedInstanceError` | 在读取属性之前对象的会话已经关闭；保留 `expire_on_commit=False`，或在请求结束前读取每个需要的属性 |
+| `alembic init -t async <path>` 之后 `alembic.ini` 出现在错误的目录中 | 在项目目录内运行 `alembic init`；ini 文件跟随当前工作目录，而不是路径参数 |
+| `alembic revision --autogenerate` 生成空迁移 | `alembic/env.py` 中的 `target_metadata` 仍然是 `None`，或者模型从未被导入，所以它们从未在 `Base.metadata` 上注册 |
+| `Access denied for user 'fastapi_app'@'127.0.0.1'` | 该用户是为另一个主机（如 `localhost`）创建的；本指南的连接字符串通过 TCP 连接到 `127.0.0.1`，所以授权必须与该主机匹配 |
+| FastAPI 响应缺少模型上存在的字段 | `PostRead` 需要 `model_config = ConfigDict(from_attributes=True)` 才能从 ORM 对象而不是字典读取 |
+
+## 另请参阅 {#see-also}
+
+- [在 ORM 中使用 MySQL：Django、Rails 和 Prisma](/zh/guides/mysql-with-orms) — 同样的字符集和严格模式配置也适用于 SQLAlchemy
+- [MySQL 连接池](/zh/guides/connection-pooling) — 为并发 FastAPI 请求下的异步引擎调整池大小

@@ -1,0 +1,142 @@
+---
+title: "UPSERT no MySQL"
+sidebarTitle: "Usando UPSERT"
+description: "Como fazer UPSERT no MySQL: INSERT ... ON DUPLICATE KEY UPDATE, REPLACE INTO, INSERT IGNORE, quando usar cada um e os efeitos colaterais de AUTO_INCREMENT que você precisa conhecer."
+keywords: "mysql upsert, mysql replace into, mysql insert ignore, mysql replace vs on duplicate key update, mysql upsert auto_increment, mysql upsert concurrency"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O MySQL não tem a palavra-chave `UPSERT`, mas tem três maneiras de inserir uma linha ou tratar um conflito: `INSERT ... ON DUPLICATE KEY UPDATE`, `REPLACE INTO` e `INSERT IGNORE`. Elas se comportam de formas muito diferentes — escolher a errada pode corromper dados silenciosamente.
+
+## INSERT ... ON DUPLICATE KEY UPDATE {#insert--on-duplicate-key-update}
+
+Quando a inserção violaria uma restrição de unicidade (chave primária ou índice único), o MySQL executa o `UPDATE` em vez disso:
+
+```sql
+CREATE TABLE page_views (
+    page    VARCHAR(255) PRIMARY KEY,
+    views   INT NOT NULL DEFAULT 0,
+    last_at DATETIME
+);
+
+-- First call: inserts the row
+-- Subsequent calls: increments the counter
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW())
+ON DUPLICATE KEY UPDATE
+    views   = views + 1,
+    last_at = NOW();
+```
+
+Para referenciar o valor da inserção tentada (em vez da linha existente), use aliases de linha:
+
+```sql
+INSERT INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW()) AS new
+ON DUPLICATE KEY UPDATE
+    page_views.views   = page_views.views + new.views,
+    page_views.last_at = new.last_at;
+```
+
+A sintaxe mais antiga `VALUES(col)` também funciona, mas está obsoleta — use aliases de linha em vez dela:
+
+```sql
+-- Deprecated — use row aliases instead
+ON DUPLICATE KEY UPDATE views = views + VALUES(views)
+```
+
+## REPLACE INTO {#replace-into}
+
+O `REPLACE` exclui a linha em conflito e insere uma nova. Parece um upsert, mas se comporta como uma exclusão + inserção:
+
+```sql
+REPLACE INTO page_views (page, views, last_at)
+VALUES ('/home', 100, NOW());
+```
+
+Isso dispara os gatilhos `BEFORE DELETE` e `AFTER DELETE` na tabela de destino e reinicia o contador `AUTO_INCREMENT` para a nova linha. Como a exclusão é uma exclusão real de linha, `ON DELETE CASCADE` e as outras ações de chave estrangeira nas tabelas que a referenciam SÃO disparadas. Todas as colunas não listadas no `REPLACE` recebem seus valores padrão — não os valores da linha anterior.
+
+Use `REPLACE` somente quando você realmente quiser descartar a linha antiga por completo.
+
+## INSERT IGNORE {#insert-ignore}
+
+O `INSERT IGNORE` rebaixa erros a avisos. Em um conflito de chave, ele ignora a linha; em uma incompatibilidade de tipo ou truncamento, ele grava um valor convertido em vez disso:
+
+```sql
+INSERT IGNORE INTO page_views (page, views, last_at)
+VALUES ('/home', 1, NOW());
+```
+
+O problema do `INSERT IGNORE` é que ele suprime *todos* os erros, não apenas os de duplicidade — e os casos que não são de duplicidade são piores do que uma linha ignorada. `INSERT IGNORE INTO page_views (page, views) VALUES ('/new', 'not_a_number')` insere `('/new', 0)` com apenas um aviso: uma gravação silenciosa e corrompida, em vez de nenhuma operação. Use-o somente quando você realmente não se importar com o resultado.
+
+## Comparação {#comparison}
+
+| | `ON DUPLICATE KEY UPDATE` | `REPLACE INTO` | `INSERT IGNORE` |
+|:--|:--------------------------|:---------------|:----------------|
+| Em caso de conflito | Atualiza as colunas especificadas | Exclui + insere | Descarta a linha |
+| Preserva os valores existentes | Sim (você controla o que é atualizado) | Não — as colunas não especificadas voltam aos padrões | N/A (sem atualização) |
+| Gatilhos disparados | Gatilhos de UPDATE | Gatilhos de DELETE + INSERT na tabela de destino | Nenhum gatilho em caso de conflito |
+| Cascatas de chave estrangeira | Não | Sim — o DELETE interno as dispara | Não |
+| AUTO_INCREMENT | Incrementa em caso de conflito | Novo incremento para a linha inserida | Sem incremento |
+| Use quando | Você precisa atualizar campos específicos | Você quer substituir a linha por completo | Você quer ignorar duplicatas silenciosamente |
+
+## Efeito Colateral do AUTO_INCREMENT {#auto_increment-side-effect}
+
+O `ON DUPLICATE KEY UPDATE` incrementa o contador `AUTO_INCREMENT` mesmo quando segue o caminho de atualização, e não o de inserção. Com o tempo, isso cria lacunas na sequência. A `page_views` usa `page` como chave primária e não tem uma coluna `AUTO_INCREMENT`, então, para ver o efeito, use uma tabela com uma chave substituta:
+
+```sql
+CREATE TABLE page_views_by_id (
+    id    INT AUTO_INCREMENT PRIMARY KEY,
+    page  VARCHAR(255) UNIQUE,
+    views INT DEFAULT 0
+);
+INSERT INTO page_views_by_id (page, views) VALUES ('/home', 1);
+INSERT INTO page_views_by_id (page, views) VALUES ('/home', 2) AS new
+    ON DUPLICATE KEY UPDATE views = new.views;  -- updates the existing row
+
+SHOW CREATE TABLE page_views_by_id;  -- AUTO_INCREMENT has advanced anyway
+```
+
+Este é o comportamento esperado. Se a sua aplicação depende de uma sequência sem lacunas, use uma tabela de contador separada ou trate a geração da sequência na aplicação.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### O ON DUPLICATE KEY UPDATE é atômico? {#is-on-duplicate-key-update-atomic}
+
+Sim — a tentativa de inserção e a atualização acontecem em uma única operação atômica. Você não precisa envolvê-lo em uma transação para evitar uma condição de corrida entre verificar a existência e inserir.
+
+#### E se vários índices únicos entrarem em conflito? {#what-if-multiple-unique-indexes-conflict}
+
+Se uma inserção violar mais de uma restrição de unicidade ao mesmo tempo, o MySQL atualiza apenas uma linha — qual delas é indefinido. Evite projetos em que um único INSERT possa entrar em conflito em vários índices únicos. Se o seu esquema tiver restrições de unicidade sobrepostas, teste o comportamento com cuidado.
+
+#### Posso usar ON DUPLICATE KEY UPDATE com inserções de várias linhas? {#can-i-use-on-duplicate-key-update-with-multi-row-inserts}
+
+Sim:
+
+```sql
+INSERT INTO page_views (page, views)
+VALUES ('/home', 1), ('/about', 1), ('/contact', 1)
+ON DUPLICATE KEY UPDATE views = views + 1;
+```
+
+Cada linha em conflito dispara a sua própria atualização. Com aliases de linha, use `VALUES` para o caso de várias linhas e `AS new` para o alias.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ON DUPLICATE KEY UPDATE` não é disparado | A coluna de conflito deve ser uma PRIMARY KEY ou um índice UNIQUE — índices comuns não o disparam |
+| `REPLACE` limpando colunas que você não especificou | Comportamento esperado — REPLACE é exclusão + inserção; especifique todas as colunas ou use ON DUPLICATE KEY UPDATE |
+| `INSERT IGNORE` escondendo erros reais | Remova o IGNORE, reproduza o erro e corrija a causa raiz — o IGNORE mascara todos os erros, não apenas os de duplicidade |
+| Lacunas de AUTO_INCREMENT crescendo muito | Efeito colateral normal do ON DUPLICATE KEY UPDATE; as lacunas no AUTO_INCREMENT são cosméticas e não afetam a correção |
+
+## Veja também {#see-also}
+
+- [Transações no MySQL](/pt-BR/guides/transactions) — quando envolver um UPSERT em uma transação
+- [Deadlocks no MySQL](/pt-BR/guides/deadlocks) — INSERT ... ON DUPLICATE KEY UPDATE pode causar deadlocks sob concorrência
+- [Inserções em Massa no MySQL](/pt-BR/guides/bulk-inserts) — carregando muitas linhas rapidamente, com ou sem tratamento de conflitos
+- [Erros Comuns do MySQL e Como Corrigi-los](/pt-BR/guides/common-mysql-errors) — erros de chave duplicada e o que eles significam
+- [MySQL INSERT ON DUPLICATE KEY UPDATE](/pt-BR/tutorial/upsert) — a instrução por si só, com exemplos resolvidos

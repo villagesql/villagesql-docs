@@ -1,0 +1,169 @@
+---
+title: "MySQL 中的 UUID"
+sidebarTitle: "使用 UUID"
+description: "如何在 MySQL 中使用 UUID 作为主键——存储策略、性能权衡，以及 UUID 版本详解。"
+keywords: "MySQL UUID primary key, uuid vs auto increment, uuid binary mysql, uuid v7 mysql, mysql uuid performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+自增整数很简单，直到它们不再简单：它们会泄露行数，在分布式系统中失效，并在您合并数据库或进行分片时出问题。UUID 解决了所有这些问题，但 MySQL 的默认处理方式使它们在大规模插入时很慢。下面说明为什么会这样以及如何修复。
+
+## MySQL 的默认方式：UUID() 作为 CHAR(36) {#the-mysql-default-uuid-as-char36}
+
+MySQL 内置的 `UUID()` 函数返回一个 v1 UUID，形式为 36 个字符的字符串，例如 `550e8400-e29b-41d4-a716-446655440000`。将它存入 `CHAR(36)` 列可以工作，但效率不高：
+
+- 相同的数据占用 36 字节而不是 16 字节
+- 字符串比较比二进制比较慢
+- 随机 UUID 在每次插入时都会导致 B 树页分裂（下文详述）
+
+```sql
+-- This works but has problems at scale
+CREATE TABLE orders (
+    order_id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+    user_id  INT NOT NULL
+);
+```
+
+## 标准变通方法：BINARY(16) {#the-standard-workaround-binary16}
+
+MySQL 提供了 `UUID_TO_BIN()` 和 `BIN_TO_UUID()`，用于在字符串和紧凑的二进制形式之间转换。使用 `BINARY(16)` 可将存储减半并加快比较速度：
+
+```sql
+CREATE TABLE orders (
+    order_id BINARY(16) PRIMARY KEY,
+    user_id  INT NOT NULL
+);
+
+-- Store: convert string UUID to binary
+INSERT INTO orders (order_id, user_id)
+VALUES (UUID_TO_BIN(UUID()), 101);
+
+-- Retrieve: convert back to readable format
+SELECT BIN_TO_UUID(order_id), user_id FROM orders;
+```
+
+`UUID_TO_BIN()` 接受一个可选的第二个参数（`1`），它会重新排列时间戳位，使 v1 UUID 按时间顺序排序——这是对插入性能问题的部分修复。
+
+## 剩下的问题：随机插入使索引碎片化 {#the-remaining-problem-random-inserts-fragment-indexes}
+
+MySQL 的 InnoDB 使用聚簇索引，这意味着行按主键顺序物理存储。当您插入一个带有随机 UUID 的行时，InnoDB 必须找到它在索引中间的位置，并可能分裂一个页来腾出空间。在持续负载下，这会导致写放大和索引碎片化。
+
+UUID v7 通过在标识符的高位嵌入 Unix 时间戳来解决这个问题。新的 UUID 总是大于现有的 UUID，因此插入总是追加到索引最右边的叶子——不会分裂。
+
+## 使用 VillageSQL：原生 UUID 类型和所有版本 {#with-villagesql-native-uuid-type-and-all-versions}
+
+VillageSQL 的 `vsql_uuid` 扩展增加了一个原生 `UUID` 列类型，采用 16 字节二进制存储且无需手动转换，并提供了 UUID v1 到 v7 的生成函数。
+
+```sql
+INSTALL EXTENSION vsql_uuid;
+```
+
+```sql
+-- Native UUID type — no UUID_TO_BIN/BIN_TO_UUID needed
+CREATE TABLE orders (
+    order_id UUID PRIMARY KEY,
+    user_id  INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- UUID_V7 inserts always append to the index — no page splits
+INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 101);
+INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 102);
+
+-- Sorts chronologically by creation order
+SELECT user_id, created_at FROM orders ORDER BY order_id;
+
+-- Inspect the timestamp embedded in a v7 UUID (as datetime or Unix epoch)
+SELECT UUID_TIMESTAMP(order_id), UUID_EPOCH(order_id) FROM orders LIMIT 1;
+```
+
+### 选择 UUID 版本 {#choosing-a-uuid-version}
+
+| 版本 | 适用场景 |
+|:---|:---|
+| `UUID_V4()` | 您需要随机 ID 且不关心插入性能 |
+| `UUID_V7()` | 新行、主键、高插入量——推荐的默认选择 |
+| `UUID_V6()` | 需要可排序输出的旧版 v1 系统 |
+| `UUID_V1()` | 与期望 v1 格式的系统兼容 |
+| `UUID_V3()` / `UUID_V5()` | 从名称派生的确定性 ID（v3 = MD5，v5 = SHA-1） |
+
+`UUID_VERSION(uuid)` 返回存储的 UUID 的版本号——对于按版本路由 ID 很有用。它接受 `UUID` 值或字符串字面量，后者会被隐式转换——但无效字符串会引发 `ERROR 1525`，而不是返回 0 或 NULL，因此它不适合用来筛查不可信的文本；请使用下面的 `UUID_IS_VALID()`。`UUID_COMPARE(uuid1, uuid2)` 返回 -1、0 或 1，用于显式的排序逻辑。要更全面地了解何时使用 UUID 而不是其他主键方案，请参阅[选择主键策略](/zh/guides/primary-key-strategies)。
+
+### 基于名称的 UUID 和 RFC 命名空间 {#name-based-uuids-and-the-rfc-namespaces}
+
+`UUID_V3()` 和 `UUID_V5()` 从一个命名空间加一个名称派生出 UUID，因此同一对输入总是产生相同的 UUID。`UUID_NS_DNS()`、`UUID_NS_URL()`、`UUID_NS_OID()` 和 `UUID_NS_X500()` 返回 RFC 9562 定义的四个命名空间。它们返回文本，而这正是命名空间参数所接受的类型，因此可以直接组合使用：
+
+```sql
+SELECT UUID_V5(UUID_NS_DNS(), 'example.com');
+-- cfbff0d1-9375-5685-968c-48ce8b15ae17
+```
+
+`UUID_NIL()` 和 `UUID_MAX()` 返回同一 RFC 保留的全零和全一 UUID，可用作哨兵值。
+
+### 验证来自数据库外部的 UUID {#validating-uuids-from-outside-the-database}
+
+当字符串会被 `UUID` 列接受时，`UUID_IS_VALID(string)` 返回 1，否则返回 0。无论传入什么，它都不会引发错误，因此可以在值到达类型化列之前对其进行筛查：
+
+```sql
+SELECT UUID_IS_VALID('550e8400-e29b-41d4-a716-446655440000');  -- 1
+SELECT UUID_IS_VALID('nope');                                  -- 0
+
+-- Reject malformed IDs at the schema level
+CREATE TABLE staging (
+  raw VARCHAR(40),
+  CHECK (UUID_IS_VALID(raw) = 1)
+);
+```
+
+### 在生成列和约束中使用 UUID 函数 {#using-uuid-functions-in-generated-columns-and-constraints}
+
+内省、验证和常量函数是确定性的，基于名称的生成器 `UUID_V3()` 和 `UUID_V5()` 也是。它们都可以出现在生成列和 CHECK 约束中。随机和基于时间的生成器——`UUID_V4()`、`UUID_V7()` 及其同类——则不能，因为它们的输出每次调用都会变化。这让您可以在模式级别从 UUID 派生或验证存储的值：
+
+```sql
+CREATE TABLE audit_log (
+  id uuid NOT NULL,
+  ver INT AS (UUID_VERSION(id)) STORED,  -- derive the version into a column
+  CHECK (UUID_VERSION(id) IN (4, 7))     -- accept only v4 or v7 IDs
+);
+```
+
+## UUID 与自增的对比 {#uuid-vs-auto-increment}
+
+| | AUTO_INCREMENT | UUID（BINARY/原生） |
+|:---|:---|:---|
+| **分布式安全** | 否——需要协调 | 是 |
+| **泄露行数** | 是 | 否 |
+| **存储** | 4–8 字节 | 16 字节 |
+| **插入性能** | 快（总是追加） | v7 快，v4 慢 |
+| **人类可读** | 是 | 否（二进制） |
+| **合并安全** | 否 | 是 |
+
+对于大多数单数据库应用程序，`AUTO_INCREMENT` 就足够了。当您需要跨系统的全局唯一 ID、合并来自多个来源的数据，或者不想暴露顺序行数时，再选择 UUID。
+
+## 常见问题 {#frequently-asked-questions}
+
+#### 我可以把 UUID_V7 用作 DEFAULT 吗？ {#can-i-use-uuid_v7-as-a-default}
+目前不行。在 MySQL 中，非确定性函数不能用于 DEFAULT 表达式。请在 INSERT 语句中生成 UUID。
+
+#### 我可以用 UUID 回填现有行吗？ {#can-i-backfill-existing-rows-with-uuids}
+可以。添加一个 `UUID` 列，用 UPDATE 中的 `UUID_V7()` 填充它，然后将其设为主键。
+
+#### UUID_V7 是标准吗？ {#is-uuid_v7-a-standard}
+是的——定义于 RFC 9562，它取代了 RFC 4122。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.UUID_V7 does not exist` | 运行 `INSTALL EXTENSION vsql_uuid` |
+| `DEFAULT (UUID_V7())` 被拒绝 | 去掉 `DEFAULT`；在每条 INSERT 中调用 `UUID_V7()` |
+| `Extension 'vsql_uuid' is already installed` | 已经安装——无需操作 |
+
+## 另请参阅 {#see-also}
+
+- [在 MySQL 中选择主键策略](/zh/guides/primary-key-strategies)——比较 UUID 与 AUTO_INCREMENT 及其他策略
+- [在 MySQL 中生成随机数据](/zh/guides/random-data-mysql)——UUID v4 背后的随机性
+- [InnoDB 如何存储数据](/zh/guides/innodb-storage)——为什么随机 UUID 主键会导致页碎片化

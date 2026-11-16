@@ -1,0 +1,167 @@
+---
+title: "Inserções em Massa no MySQL"
+sidebarTitle: "Inserindo em Massa"
+description: "Como inserir grandes quantidades de dados no MySQL com eficiência: INSERT de várias linhas, LOAD DATA INFILE, INSERT...SELECT, desabilitação de chaves e agrupamento em transações para desempenho."
+keywords: "mysql bulk insert, mysql load data infile, mysql batch insert, mysql fast insert, mysql import csv, mysql bulk load performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Inserir linhas uma de cada vez é a forma mais rápida de deixar uma importação grande lenta. O MySQL processa cada `INSERT` de uma única linha como um commit de transação completo — analisar, planejar, executar, fsync. Em escala, essa sobrecarga por linha domina. Veja como evitá-la.
+
+## INSERT de Várias Linhas {#multi-row-insert}
+
+A otimização mais simples: agrupe várias linhas em uma única instrução.
+
+```sql
+-- Slow: one round trip and one transaction per row
+INSERT INTO products (name, price) VALUES ('Widget A', 9.99);
+INSERT INTO products (name, price) VALUES ('Widget B', 14.99);
+INSERT INTO products (name, price) VALUES ('Widget C', 19.99);
+
+-- Fast: one round trip, one transaction for all three
+INSERT INTO products (name, price) VALUES
+    ('Widget A',  9.99),
+    ('Widget B', 14.99),
+    ('Widget C', 19.99);
+```
+
+O tamanho do lote importa. De algumas centenas a alguns milhares de linhas por instrução costuma ser o ideal — lotes maiores aumentam a pressão sobre a memória e estendem a duração da transação. Faça benchmarks para encontrar o ponto ideal para a sua carga de trabalho; 500 a 2000 linhas por lote é um ponto de partida comum.
+
+## Agrupamento em Transações {#transaction-batching}
+
+Envolver muitos INSERTs em uma única transação evita a sobrecarga de commit por instrução:
+
+```sql
+START TRANSACTION;
+INSERT INTO products (name, price) VALUES ('Widget A',  9.99);
+INSERT INTO products (name, price) VALUES ('Widget B', 14.99);
+-- ... hundreds more ...
+INSERT INTO products (name, price) VALUES ('Widget Z', 99.99);
+COMMIT;
+```
+
+Sem transações explícitas, cada INSERT faz auto-commit. Auto-commit significa que cada linha é gravada individualmente no disco. Envolver 500 inserções em uma transação faz uma única gravação.
+
+Combine isso com o INSERT de várias linhas: agrupe as linhas em grupos de 500 a 1000 por instrução e envolva cada lote em uma transação.
+
+## LOAD DATA INFILE {#load-data-infile}
+
+Para importações grandes de CSV, `LOAD DATA INFILE` é a opção nativa mais rápida do MySQL — significativamente mais rápida do que INSERTs agrupados, porque evita a análise do SQL para cada linha.
+
+```sql
+LOAD DATA INFILE '/var/lib/mysql-files/products.csv'
+INTO TABLE products
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES  -- skip header row
+(name, price, category);
+```
+
+O arquivo deve ser legível pelo processo do servidor MySQL. Por padrão, o caminho do arquivo é restrito ao diretório especificado por `secure_file_priv`:
+
+```sql
+SHOW VARIABLES LIKE 'secure_file_priv';
+```
+
+Para carregar um arquivo da máquina cliente em vez do servidor:
+
+```sql
+LOAD DATA LOCAL INFILE '/path/on/client/products.csv'
+INTO TABLE products
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n';
+```
+
+`LOCAL INFILE` requer `local_infile = ON` no servidor e a flag `--local-infile` habilitada no cliente.
+
+## INSERT ... SELECT {#insert--select}
+
+Para copiar dados entre tabelas (padrões de ETL, tabelas de preparação), `INSERT...SELECT` é mais rápido do que ler as linhas na aplicação e inseri-las de volta:
+
+```sql
+-- Load staging table, validate, then move to production
+INSERT INTO products (name, price, category)
+SELECT name, price, category
+FROM products_staging
+WHERE price > 0 AND name IS NOT NULL;
+```
+
+## Desabilitando Índices Durante a Carga em Massa {#disabling-indexes-during-bulk-load}
+
+Para tabelas MyISAM, desabilitar a atualização de índices não únicos durante uma inserção em massa acelera bastante as coisas:
+
+```sql
+ALTER TABLE products DISABLE KEYS;
+-- ... bulk INSERT ...
+ALTER TABLE products ENABLE KEYS;  -- rebuilds indexes in one pass
+```
+
+Para InnoDB, isso não tem o mesmo efeito. Em vez disso, o InnoDB usa automaticamente um "change buffer" para atualizações de índices secundários. Para o máximo desempenho de carga em massa no InnoDB:
+
+```sql
+-- Temporarily increase the buffer pool if possible
+SET GLOBAL innodb_buffer_pool_size = 4 * 1024 * 1024 * 1024;  -- 4GB example
+
+-- Disable foreign key checks
+SET foreign_key_checks = 0;
+-- ... bulk load ...
+SET foreign_key_checks = 1;
+
+-- Disable unique checks for known-clean data
+SET unique_checks = 0;
+-- ... bulk load ...
+SET unique_checks = 1;
+```
+
+Reabilite essas opções imediatamente após a carga. Desabilitar `unique_checks` em dados que de fato têm duplicatas produz um índice corrompido.
+
+## Comparação de Desempenho {#performance-comparison}
+
+| Método | Velocidade relativa | Melhor para |
+|:-------|:--------------|:---------|
+| INSERT de uma linha (auto-commit) | O mais lento | Volumes pequenos, uso interativo |
+| INSERT de uma linha (agrupado em transação) | 2 a 5× mais rápido | Volumes moderados |
+| INSERT de várias linhas | 5 a 20× mais rápido | A maioria das cargas em massa |
+| LOAD DATA INFILE | O mais rápido (muitas vezes 10 a 100× mais rápido do que uma linha por vez) | Importações grandes de CSV |
+| INSERT...SELECT | Rápido (cópia no lado do servidor) | Cópias de tabela para tabela |
+
+Os números exatos dependem muito do tamanho das linhas, dos índices, do hardware e da configuração. Faça benchmarks do seu caso específico.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Qual deve ser o tamanho de cada lote de INSERT? {#how-large-should-each-insert-batch-be}
+
+Comece com 500 a 1000 linhas e faça benchmarks. Lotes maiores reduzem a sobrecarga por commit, mas aumentam o uso de memória e a duração da transação (que mantém os bloqueios por mais tempo). Se um lote falha, o lote inteiro é revertido — lotes menores significam menos trabalho de reversão. A maioria das aplicações encontra o tamanho ideal de lote entre 500 e 5000 linhas.
+
+#### Posso usar LOAD DATA INFILE com ON DUPLICATE KEY UPDATE? {#can-i-use-load-data-infile-with-on-duplicate-key-update}
+
+`LOAD DATA` suporta `REPLACE` ou `IGNORE` para o tratamento de duplicatas, mas não `ON DUPLICATE KEY UPDATE`. Para semântica de upsert durante a carga em massa, carregue em uma tabela de preparação e depois use `INSERT...SELECT...ON DUPLICATE KEY UPDATE` da tabela de preparação para a tabela de destino.
+
+#### A inserção em massa ignora os triggers? {#does-bulk-inserting-bypass-triggers}
+
+Não. Os triggers disparam para cada linha afetada, incluindo as carregadas por `LOAD DATA INFILE` e `INSERT...SELECT`. Se o seu trigger faz um trabalho significativo, ele deixará as cargas em massa proporcionalmente mais lentas. Para migrações de dados puras, você pode querer desabilitar os triggers temporariamente.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1290: The MySQL server is running with the --secure-file-priv option` | Mova o arquivo para o diretório mostrado por `SHOW VARIABLES LIKE 'secure_file_priv'`, ou use `LOAD DATA LOCAL INFILE` |
+| `ERROR 3948: Loading local data is disabled` | Habilite com `SET GLOBAL local_infile = 1` no servidor e `--local-infile=1` no cliente |
+| A inserção em massa continua lenta depois de agrupar | Verifique se `autocommit` está ON — cada instrução faz commit individualmente; envolva em blocos explícitos `BEGIN...COMMIT` |
+| Erros de chave duplicada em dados sabidamente limpos depois de desabilitar `unique_checks` | `unique_checks = 0` não valida a unicidade durante a carga, mas corrompe o índice se existirem duplicatas — sempre valide antes |
+| `LOAD DATA` analisa as linhas incorretamente | Verifique se `FIELDS TERMINATED BY`, `ENCLOSED BY` e `LINES TERMINATED BY` correspondem ao formato real do seu arquivo; use `SHOW WARNINGS` depois da carga |
+
+Essas técnicas de carga funcionam sem alterações no [VillageSQL](https://villagesql.com/install), um substituto direto do MySQL com extensões.
+
+## Veja também {#see-also}
+
+- [Transações no MySQL](/pt-BR/guides/transactions) — agrupando inserções em massa em transações para segurança e velocidade
+- [Migrações de Esquema no MySQL](/pt-BR/guides/schema-migrations) — inserções em massa costumam fazer parte do trabalho de migração de dados
+- [UPSERT no MySQL](/pt-BR/guides/upsert) — tratando chaves duplicadas durante uma carga
+- [Inserir várias linhas no MySQL](/pt-BR/tutorial/insert-multiple-rows) — a própria instrução de várias linhas
+- [MySQL INSERT SELECT](/pt-BR/tutorial/insert-select) — copiando as linhas que uma consulta retorna

@@ -1,0 +1,176 @@
+---
+title: "从 SQL 发起 HTTP 请求"
+sidebarTitle: "HTTP 请求"
+description: "如何使用 VillageSQL 的 vsql_http 扩展直接从 MySQL 查询调用外部 HTTP API——GET、POST 以及解析 JSON 响应。"
+keywords: "mysql http request, mysql call api, mysql http_get, mysql http_post, mysql rest api, vsql_http"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+MySQL 没有内置的发起网络请求的方式。如果您想调用一个 HTTP API，您需要把数据从数据库中取出来，在应用程序代码中发起请求，再把结果推回去。VillageSQL 的 `vsql_http` 扩展把 `http_get()`、`http_post()` 以及全部的 HTTP 方法直接添加到 SQL 中——这样您就可以在数据所在的地方调用外部 API。
+
+## 问题：每次 API 调用都要离开数据库 {#the-problem-leaving-the-database-for-every-api-call}
+
+没有 VillageSQL 时的典型模式：
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, tracking_number FROM shipments WHERE status IS NULL")
+
+# Call a shipping API for each row
+for row in rows:
+    resp = requests.get(f"https://api.shipping.com/track/{row['tracking_number']}")
+    status = resp.json()["status"]
+    db.execute("UPDATE shipments SET status = ? WHERE id = ?", status, row["id"])
+```
+
+这可以工作，但每一行都是三次往返：SELECT、API 调用、UPDATE。数据补充逻辑存在于应用程序代码中，而不是在数据所在的 schema 中。
+
+## 使用 VillageSQL：从 SQL 发起 HTTP {#with-villagesql-http-from-sql}
+
+```sql
+INSTALL EXTENSION vsql_http;
+```
+
+`http_get(url)` 发起一个 GET 请求，并返回一个包含完整响应的 JSON 字符串。
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_get('https://httpbin.org/get') USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status')       AS status,
+  JSON_VALUE(@resp, '$.content_type') AS content_type,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+`vsql_http` 中的每个函数都返回相同的 JSON 结构：
+
+| 字段 | 说明 |
+|:---|:---|
+| `status` | 作为 JSON 数字的 HTTP 状态码（`200`、`404` 等） |
+| `content_type` | `Content-Type` 响应头的值 |
+| `headers` | 所有响应头的 `[name, value]` 对数组 |
+| `content` | 响应正文 |
+
+### 字符集转换 {#the-charset-conversion}
+
+在 VillageSQL 0.0.6 及更早版本上，VEF STRING 函数返回 binary 字符集。在把结果传给 `JSON_VALUE` 或 `JSON_EXTRACT` 之前，请用 `CONVERT(... USING utf8mb4)` 包装它：
+
+```sql
+-- On 0.0.6 and earlier, this throws an error — JSON_VALUE rejects binary charset
+-- ERROR 3144: Cannot create a JSON value from a string with CHARACTER SET 'binary'
+SELECT JSON_VALUE(vsql_http.http_get('https://httpbin.org/get'), '$.status');
+
+-- This works on every version
+SELECT JSON_VALUE(
+  CONVERT(vsql_http.http_get('https://httpbin.org/get') USING utf8mb4),
+  '$.status'
+);
+```
+
+VillageSQL 0.0.7 及更高版本直接返回正确的字符集，因此那里不再需要 `CONVERT`——但保留它没有坏处，下面的每个示例仍然使用它，以兼容 0.0.6 及更早版本。用 `CONVERT` 赋值给变量一次，然后重用该变量，以避免重复转换。
+
+## POST 请求 {#post-requests}
+
+`http_post(url, content_type, body)` 发送一个带正文的 POST：
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_post(
+    'https://httpbin.org/post',
+    'application/json',
+    '{"name": "widget", "qty": 3}'
+  ) USING utf8mb4
+);
+
+SELECT
+  JSON_VALUE(@resp, '$.status') AS status,
+  JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+## 自定义请求头和其他方法 {#custom-headers-and-other-methods}
+
+`http_request(method, url, headers_json, body, content_type, options_json)` 处理带自定义请求头的任意方法：
+
+```sql
+SET @resp = CONVERT(
+  vsql_http.http_request(
+    'GET',
+    'https://api.example.com/secure',
+    '{"Authorization": "Bearer mytoken", "Accept": "application/json"}',
+    NULL,
+    NULL,
+    NULL
+  ) USING utf8mb4
+);
+```
+
+`headers_json` 参数是一个 JSON 对象，其键是请求头名称，值是请求头的值。
+
+### 所有可用的函数 {#all-available-functions}
+
+| 函数 | 说明 |
+|:---|:---|
+| `http_get(url)` | GET 请求 |
+| `http_post(url, content_type, body)` | 带正文的 POST |
+| `http_put(url, content_type, body)` | 带正文的 PUT |
+| `http_delete(url)` | DELETE 请求 |
+| `http_patch(url, content_type, body)` | 带正文的 PATCH |
+| `http_request(method, url, headers_json, body, content_type, options_json)` | 任意方法、自定义请求头、选项 |
+| `url_encode(text)` | 对字符串进行百分号编码 |
+| `url_decode(text)` | 解码百分号编码的字符串 |
+
+所有函数对 NULL 输入都返回 NULL。在连接失败时（连接被拒绝、DNS 失败、超时），HTTP 函数同样返回 NULL，并发出一条携带 curl 错误消息的警告——当请求似乎消失时，用 `SHOW WARNINGS` 检查它。
+
+## URL 编码 {#url-encoding}
+
+`url_encode()` 和 `url_decode()` 处理查询参数的百分号编码：
+
+```sql
+SELECT vsql_http.url_encode('hello world & more');
+-- → hello%20world%20%26%20more
+
+-- Build a URL with encoded parameters
+SET @q = vsql_http.url_encode('SELECT * FROM users');
+SET @url = CONCAT('https://api.example.com/search?q=', @q);
+SET @resp = CONVERT(vsql_http.http_get(@url) USING utf8mb4);
+```
+
+## 已知限制 {#known-limitations}
+
+**256KB 响应上限**——大于 256KB 的响应会被截断。这覆盖了 SQL 查询中使用的典型 API 负载；它不适合大文件下载。被此上限截断的响应不再是有效的 JSON：`JSON_EXTRACT`/`JSON_UNQUOTE` 对它会引发 `ERROR 3141`，而 `JSON_VALUE` 在其默认的 `NULL ON ERROR` 行为下返回 NULL 并给出 `Warning 3141`，而不是报错。
+
+**`JSON_VALUE` 大小限制**——当提取的值超过 MySQL 的内部大小限制时，`JSON_VALUE` 返回 NULL。对于大的响应正文，请改用 `JSON_UNQUOTE(JSON_EXTRACT(...))`：
+
+```sql
+-- Use JSON_UNQUOTE + JSON_EXTRACT for large content fields
+SELECT JSON_UNQUOTE(JSON_EXTRACT(@resp, '$.content')) AS body;
+```
+
+**同步**——每次 HTTP 调用都会阻塞，直到完成或超时。`max_execution_time` 不会限制或中断阻塞中的 `vsql_http` 调用——一个缓慢或无法访问的端点会让语句一直等到它自己的连接/读取超时为止。`http_get`/`http_post`/`http_put`/`http_delete`/`http_patch` 不接受选项；只有 `http_request(method, url, headers_json, body, content_type, options_json)` 接受超时，形式是其 `options_json` 参数中以秒为单位的 `{"timeout": N}`（默认 30）。当您需要缩短超时时，请使用 `http_request` 而不是简写函数（请参阅 [HTTP Webhook](/zh/guides/http-webhooks)）。
+
+## 故障排除 {#troubleshooting}
+
+| 问题 | 解决方案 |
+|:---|:---|
+| `FUNCTION <database>.http_get does not exist` | 运行 `INSTALL EXTENSION vsql_http` |
+| 返回 NULL | 连接失败或输入为 NULL——用 `SHOW WARNINGS` 查看 curl 的错误消息，验证 URL，并检查从服务器主机的网络访问 |
+| `JSON_VALUE` 返回 NULL | 响应正文过大——使用 `JSON_UNQUOTE(JSON_EXTRACT(...))` |
+| JSON 解析结果乱码 | 忘记了 `CONVERT(... USING utf8mb4)`——包装函数调用 |
+| 查询超时 | 在请求本身上设置 `{"timeout": N}` 选项——`max_execution_time` 对阻塞中的 `vsql_http` 调用没有作用 |
+
+## 后续步骤 {#next-steps}
+
+- [用 API 数据补充行](/zh/guides/rest-api-enrichment)——把实时外部数据拉入查询结果
+- [从触发器发送 webhook](/zh/guides/http-webhooks)——自动把行变更推送到外部服务
+
+## 另请参阅 {#see-also}
+
+- [用外部 API 数据补充行](/zh/guides/rest-api-enrichment)——基于 HTTP 的数据补充的实用模式
+- [从触发器发送 Webhook](/zh/guides/http-webhooks)——由触发器驱动的事件式 HTTP 调用
+- [MySQL 中的 JSON](/zh/guides/json-in-mysql)——解析 HTTP 请求返回的 JSON 响应
+- [将表作为 REST API 提供](/zh/guides/rest-api-from-tables)——同一台服务器应答 HTTP 而不是发起请求

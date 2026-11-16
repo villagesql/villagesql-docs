@@ -1,0 +1,103 @@
+---
+title: "MySQL 8.0 停止支持后升级到 8.4"
+sidebarTitle: "MySQL 8.0 EOL：升级到 8.4"
+description: "MySQL 8.0 已于 2026 年 4 月 30 日停止支持。如何升级到 MySQL 8.4 LTS：会让客户端失效的认证变更、被移除的配置变量、升级前检查，以及作为唯一回退手段的备份。"
+keywords: "mysql 8.0 eol, mysql 8.0 end of life, upgrade mysql 8.0 to 8.4, mysql 8.4 upgrade, mysql_native_password 8.4, mysql lts upgrade"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+import AiNote from '/snippets/ai-note.mdx';
+
+<VillagesqlBanner />
+
+<AiNote />
+
+MySQL 8.0 已于 2026 年 4 月 30 日停止支持，不再接收安全补丁。升级目标是 MySQL 8.4 LTS，其首要支持约到 2029 年 4 月，延长支持到 2032 年 4 月。Oracle 把 8.0 到 8.4 的路径设计得很平滑，但有两项变更会让真实系统失效：默认认证插件，以及被移除的配置变量。本指南涵盖这两项，以及开始之前要运行的检查。
+
+## 8.4 中有哪些变化 {#what-changes-in-84}
+
+升级是就地进行的：安装 8.4 的二进制文件并沿用 8.0 的数据目录，服务器会在第一次启动时自行升级数据字典。大多数架构和查询原样沿用。真正会造成影响的变更：
+
+| 变更 | 影响谁 |
+|---|---|
+| `mysql_native_password` 默认被禁用 | 旧的客户端库，以及仍在使用 8.0 之前认证插件的任何账户 |
+| 已弃用的 8.0 系统变量被移除 | 设置了它们的配置文件和脚本；服务器遇到未知变量会拒绝启动 |
+| 已弃用的语法被移除 | 在 float/double 列上使用 `AUTO_INCREMENT` 以及使用非标准外键约束的架构 |
+
+## 步骤 1：找出使用旧认证插件的账户 {#step-1-find-accounts-on-the-old-auth-plugin}
+
+升级之前，列出仍在使用 `mysql_native_password` 的每一个账户：
+
+```sql
+SELECT user, host, plugin
+FROM mysql.user
+WHERE plugin = 'mysql_native_password';
+```
+
+把每一个迁移到 `caching_sha2_password`，并更新应用中保存的密码：
+
+```sql
+ALTER USER 'app'@'%' IDENTIFIED WITH caching_sha2_password BY 'new-password';
+```
+
+在 8.4 上，用旧插件创建账户会失败，因为该插件没有加载：
+
+```sql
+CREATE USER 'legacy'@'%' IDENTIFIED WITH mysql_native_password BY 'pw';
+```
+
+```text
+ERROR 1524 (HY000): Plugin 'mysql_native_password' is not loaded
+```
+
+如果您无法在升级前迁移某个账户，8.4 可以通过配置中的 `--mysql-native-password=ON` 显式加载该插件。请把它当作过渡手段，而不是终点：该插件已被弃用，并计划移除。
+
+## 步骤 2：清理配置文件 {#step-2-clean-your-configuration-file}
+
+MySQL 8.4 移除了在 8.0 中已弃用的系统变量。如果您的 `my.cnf` 设置了其中一个，8.4 服务器会以未知变量错误拒绝启动。最常见的两个：
+
+```sql
+-- Both fail on 8.4: the variables no longer exist
+SELECT @@default_authentication_plugin;
+SELECT @@expire_logs_days;
+```
+
+```text
+ERROR 1193 (HY000): Unknown system variable 'default_authentication_plugin'
+```
+
+把 `expire_logs_days` 替换为 `binlog_expire_logs_seconds`，并删除 `default_authentication_plugin`（8.4 的替代项 `authentication_policy` 已经默认为 `caching_sha2_password`）。请 grep 您的配置中设置的每一个变量，并在升级之前而不是在停机窗口期间逐一对照 8.4 的参考文档检查。
+
+## 步骤 3：检查架构中已移除的语法 {#step-3-check-the-schema-for-removed-syntax}
+
+对所有数据库运行 `mysqlcheck` 并审阅输出：
+
+```bash
+mysqlcheck -u root -p --all-databases --check-upgrade
+```
+
+请特别注意 FLOAT 或 DOUBLE 列上的 `AUTO_INCREMENT` 以及非标准的外键约束，两者都在 8.4 中被移除。
+
+## 步骤 4：备份，然后就地升级 {#step-4-back-up-then-upgrade-in-place}
+
+不存在受支持的从 8.4 到 8.0 的就地降级。一旦数据字典被升级，唯一的回退方式就是恢复备份。所以备份不是走形式：
+
+```bash
+mysqldump -u root -p --all-databases --events --routines --triggers > pre84_backup.sql
+```
+
+然后是升级本身：停止 8.0 服务器，安装 8.4 的二进制文件，在同一个数据目录上启动服务器。服务器会在第一次启动时自动运行它的升级步骤；请观察错误日志，直到它报告已准备好接受连接。确认结果：
+
+```sql
+SELECT VERSION();
+```
+
+## VillageSQL 的角度 {#the-villagesql-angle}
+
+VillageSQL Server 是 MySQL 8.4 的直接替代品。一旦您升级到 8.4，技术栈中所有与 MySQL 8.4 配合的东西也都能与 VillageSQL 配合，之后的切换在功能上就是同一个数据目录上的一次小版本替换。如果您对扩展框架感兴趣，那么您本来就要做的 8.4 升级就是入口。相关步骤请参阅 [升级到 VillageSQL](/zh/guides/upgrade)。
+
+## 另请参阅 {#see-also}
+
+- [升级到 VillageSQL](/zh/guides/upgrade) — 升级到 8.4 之后的直接替换
+- [备份策略](/zh/guides/backup-strategies) — 本次升级所依赖的备份
+- [常见 MySQL 错误](/zh/guides/common-mysql-errors) — 解读升级出错时产生的错误
