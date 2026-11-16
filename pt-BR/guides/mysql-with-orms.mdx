@@ -1,0 +1,107 @@
+---
+title: "Usando MySQL com ORMs: Django, Rails e Prisma"
+sidebarTitle: "MySQL com ORMs"
+description: "Configurando Django, Rails e Prisma corretamente para o MySQL: configurações de charset e modo estrito, o problema N+1 e quando descer para SQL puro."
+keywords: "django mysql settings, rails mysql config, prisma mysql, orm n+1 queries, mysql strict mode orm, activerecord mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+ORMs são a forma como a maioria das aplicações realmente fala com o MySQL, e a maioria dos problemas de ORM remonta a um punhado de linhas de configuração e a um padrão de consulta. Este guia cobre as configurações do lado do MySQL para Django, Rails e Prisma, e os hábitos que impedem que o SQL gerado pelo ORM se torne a parte lenta do seu produto. Como o VillageSQL é um substituto direto do MySQL, toda configuração aqui funciona com ele sem alteração: o ORM não consegue notar a diferença.
+
+## As Configurações Que Importam em Todo Lugar {#the-settings-that-matter-everywhere}
+
+Seja qual for o framework, três coisas precisam ser verdadeiras:
+
+- **A conexão usa `utf8mb4`**, ou os emojis quebram no caminho. Consulte [utf8mb4 e emoji](/pt-BR/guides/utf8mb4).
+- **O modo SQL estrito está ligado** (é o padrão do MySQL 8.x), para que dados ruins gerem erro em vez de serem truncados silenciosamente.
+- **O tamanho do pool é deliberado.** Todo framework abre um pool por processo; multiplique pela sua contagem de processos antes de escolher um número. Consulte [Pool de conexões](/pt-BR/guides/connection-pooling).
+
+## Django {#django}
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.mysql",
+        "NAME": "myapp",
+        "USER": "app",
+        "PASSWORD": environ["DB_PASSWORD"],
+        "HOST": "127.0.0.1",
+        "PORT": "3306",
+        "OPTIONS": {
+            "charset": "utf8mb4",
+            "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
+    }
+}
+```
+
+Observações específicas do Django:
+
+- Use `mysqlclient`, o driver em C mantido que a documentação do Django recomenda.
+- O Django emula algumas restrições em Python; adicione restrições reais no banco de dados também (`unique=True` vira um índice único real, mas restrições check precisam de `CheckConstraint` em `Meta`).
+- `select_related()` (JOIN) e `prefetch_related()` (segunda consulta) são as ferramentas contra N+1; veja abaixo quando usar cada uma.
+
+## Rails {#rails}
+
+```yaml
+# config/database.yml
+production:
+  adapter: mysql2
+  database: myapp
+  username: app
+  password: <%= ENV["DB_PASSWORD"] %>
+  host: 127.0.0.1
+  encoding: utf8mb4
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+```
+
+Observações específicas do Rails:
+
+- `encoding: utf8mb4` em `database.yml` define tanto o charset da conexão quanto o padrão para `rails db:create`.
+- As validações do ActiveRecord (`validates_uniqueness_of`) sofrem condições de corrida sob concorrência; sustente toda validação de unicidade com um índice único real, e deixe o [erro 1062 de chave duplicada](/pt-BR/guides/common-mysql-errors) ser a última linha de defesa.
+- `includes` é a ferramenta contra N+1; o modo `strict_loading` transforma o carregamento preguiçoso em erro, para que os N+1 falhem em desenvolvimento em vez de irem para produção.
+- O Rails 8.1 gera `max_connections` em `database.yml` onde versões anteriores geravam `pool`. Uma chave `pool:` ainda funciona, silenciosamente, como o valor de fallback que `max_connections` lê; definir as duas com valores diferentes lança erro na inicialização. Consulte [Rails 8 com MySQL](/pt-BR/guides/rails-mysql) para uma aplicação completa, incluindo a flag `--database=mysql` de que o Rails 8 precisa, já que ele não usa mais o MySQL por padrão.
+
+## Prisma {#prisma}
+
+```prisma
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+```
+
+```text
+DATABASE_URL="mysql://app:password@127.0.0.1:3306/myapp?connection_limit=10"
+```
+
+Observações específicas do Prisma:
+
+- O Prisma fala utf8mb4 por padrão; a configuração a observar é `connection_limit` na URL, cujo padrão é baixo.
+- `prisma migrate` gera DDL a partir da diferença de schema. Leia o SQL gerado antes de aplicá-lo em produção, exatamente como faria com uma migração escrita à mão. Consulte [Migrações de schema](/pt-BR/guides/schema-migrations).
+- Consultas de relação usam `include`; o formato N+1 aparece quando você itera sobre os resultados e acessa as relações uma a uma.
+- O Prisma 7 move a URL de conexão acima para fora de `schema.prisma`, para um arquivo de configuração separado, e exige um driver adapter para conectar. Consulte [Next.js e Prisma com MySQL](/pt-BR/guides/mysql-with-prisma) para uma aplicação completa com Prisma 7.
+
+## O Problema N+1, de Uma Vez {#the-n1-problem-once}
+
+O bug de desempenho universal dos ORMs: carregue 100 pedidos, depois carregue preguiçosamente o cliente de cada pedido, e o ORM emite 101 consultas. A correção é a mesma ideia em todos os frameworks — declare de antemão as relações de que você precisa para que o ORM as busque em uma ou duas consultas (`select_related` / `includes` / `include`). A ferramenta de detecção também é universal: ligue o log de consultas em desenvolvimento e leia o que o ORM realmente envia, ou observe o [slow query log](/pt-BR/guides/slow-query-log) em produção.
+
+## Quando Descer para SQL {#when-to-drop-to-sql}
+
+ORMs valem o que custam em CRUD e deixam de valer em analytics. Funções de janela, CTEs, upserts em massa e consultas de relatório com várias tabelas são mais claras em SQL do que em uma cadeia de query builder tentando expressá-las. Todo ORM tem uma válvula de escape (`raw()` no Django, `find_by_sql` no Rails, `$queryRaw` no Prisma); usá-la para os 5 por cento de consultas que a merecem é boa engenharia, não derrota. É também assim que as funções de extensão do VillageSQL chegam a uma aplicação com ORM: `SELECT UUID_V7()` ou `ai_prompt(...)` funcionam por qualquer uma dessas válvulas de escape, já que o ORM apenas repassa o SQL.
+
+## Veja também {#see-also}
+
+- [Next.js e Prisma com MySQL](/pt-BR/guides/mysql-with-prisma) — uma aplicação completa com Prisma 7, não só a configuração
+- [Next.js e Drizzle com MySQL](/pt-BR/guides/mysql-with-drizzle) — uma aplicação completa com Drizzle, uma alternativa mais leve e orientada a SQL não coberta acima
+- [Next.js com MySQL](/pt-BR/guides/nextjs-mysql) — configuração de conexão e padrões de consulta sem nenhum ORM
+- [Rails 8 com MySQL](/pt-BR/guides/rails-mysql) — uma aplicação completa, incluindo a flag de scaffold de que o Rails 8 precisa para sequer escolher o MySQL
+- [Laravel 12 com MySQL](/pt-BR/guides/laravel-mysql) — uma aplicação completa com o ORM Eloquent do Laravel, não coberto acima
+- [Go e sqlc com MySQL](/pt-BR/guides/go-sqlc-mysql) — consultas geradas e com tipagem segura em vez de um ORM em tempo de execução
+- [Pool de conexões](/pt-BR/guides/connection-pooling) — dimensionando pools entre processos
+- [utf8mb4 e emoji](/pt-BR/guides/utf8mb4) — a configuração de charset que toda configuração acima define
+- [Slow query log](/pt-BR/guides/slow-query-log) — capturando o que o ORM gera
+- [Migrações de schema](/pt-BR/guides/schema-migrations) — aplicando DDL gerado pelo ORM com segurança

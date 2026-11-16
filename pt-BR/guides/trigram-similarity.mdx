@@ -1,0 +1,149 @@
+---
+title: "Busca por Similaridade de Trigramas no MySQL"
+sidebarTitle: "Similaridade de Trigramas"
+description: "Como encontrar strings semelhantes no MySQL usando a extensão vsql_trgm do VillageSQL — pontuação de similaridade, correspondência aproximada e similaridade em nível de palavra com base no modelo de trigramas."
+keywords: "mysql trigram similarity, mysql fuzzy search, mysql similar strings, mysql pg_trgm, vsql_trgm, mysql text similarity"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+<Note>
+  Este guia requer o VillageSQL 0.0.4 ou posterior.
+</Note>
+
+As funções de string internas do MySQL — `LIKE`, `SOUNDEX`, `LEVENSHTEIN` — cobrem a correspondência básica, mas nenhuma delas fornece uma pontuação contínua de similaridade que você possa usar para ordenar ou aplicar um limiar. A extensão `vsql_trgm` do VillageSQL adiciona similaridade baseada em trigramas: um número entre 0 e 1 que mede o quanto duas strings se parecem, para que você possa classificar resultados e filtrar por similaridade em uma única consulta.
+
+## Como os trigramas funcionam {#how-trigrams-work}
+
+Um trigrama é um grupo de 3 caracteres consecutivos. A `vsql_trgm` converte a entrada para minúsculas, divide-a nos caracteres não alfanuméricos, preenche cada palavra com dois espaços à esquerda e um espaço à direita e, em seguida, desliza uma janela de 3 caracteres por cada palavra preenchida. A similaridade é o número de trigramas que as duas entradas compartilham, dividido pelo número de trigramas distintos entre ambas — o tamanho da união, não o tamanho do conjunto maior.
+
+```
+"cat" → pad to "  cat " → ["  c", " ca", "cat", "at "]
+"car" → pad to "  car " → ["  c", " ca", "car", "ar "]
+shared: 2, union: 4 + 4 − 2 = 6 → similarity 0.333
+```
+
+Duas coisas a saber sobre strings com várias palavras: elas são **convertidas para minúsculas** antes do processamento, portanto `"Cat"` e `"cat"` produzem os mesmos trigramas. Elas também são **divididas nos caracteres não alfanuméricos**, portanto cada palavra é preenchida e dividida em trigramas de forma independente — `"hello world"` produz trigramas a partir de `"  hello "` e `"  world "` separadamente, não a partir de uma única string preenchida. Não existe o trigrama `"o w"` nem `" wo"`.
+
+A similaridade varia de 0 (nada em comum) a 1 (idênticas).
+
+## Primeiros passos {#getting-started}
+
+```sql
+INSTALL EXTENSION vsql_trgm;
+```
+
+## Funções principais {#core-functions}
+
+### trgm_similarity — pontuação contínua {#trgm_similarity--continuous-score}
+
+```sql
+SELECT vsql_trgm.trgm_similarity('adidas', 'adidos');   -- 0.4
+SELECT vsql_trgm.trgm_similarity('cat', 'dog');          -- 0
+SELECT vsql_trgm.trgm_similarity('mysql', 'mysql');      -- 1
+```
+
+Todas as funções retornam NULL quando qualquer argumento é NULL.
+
+### trgm_similar — verificação de limiar {#trgm_similar--threshold-check}
+
+Retorna 1 se a similaridade for igual ou superior a 0.3 (o padrão do PostgreSQL), e 0 caso contrário:
+
+```sql
+SELECT vsql_trgm.trgm_similar('cat', 'car');   -- 1
+SELECT vsql_trgm.trgm_similar('cat', 'dog');   -- 0
+```
+
+Para um limiar personalizado:
+
+```sql
+SELECT vsql_trgm.trgm_similar_threshold('cat', 'car', 0.6);  -- 0
+SELECT vsql_trgm.trgm_similar_threshold('cat', 'car', 0.3);  -- 1
+```
+
+### trgm_distance — complemento da similaridade {#trgm_distance--complement-of-similarity}
+
+`1 - similaridade`. Útil em ORDER BY quando você quer os mais próximos primeiro:
+
+```sql
+SELECT vsql_trgm.trgm_distance('mysql', 'mysqk');  -- 0.5
+```
+
+## Encontrando correspondências aproximadas em uma tabela {#finding-near-matches-in-a-table}
+
+O uso mais comum: encontrar linhas que se assemelham a um termo de busca.
+
+```sql
+SELECT
+    name,
+    vsql_trgm.trgm_similarity(name, 'adidas') AS score
+FROM products
+WHERE vsql_trgm.trgm_similarity(name, 'adidas') > 0.3
+ORDER BY score DESC
+LIMIT 10;
+```
+
+Isso lida com erros de digitação, grafias alternativas e correspondências parciais — casos em que `LIKE '%adidas%'` falharia.
+
+## Similaridade de palavras {#word-similarity}
+
+A `trgm_word_similarity` encontra a melhor correspondência entre uma string de consulta e qualquer substring contígua do alvo. Isso é útil quando o termo de busca pode ser uma palavra dentro de uma string mais longa.
+
+```sql
+-- Find products whose name contains something close to "widget"
+SELECT name, vsql_trgm.trgm_word_similarity('widget', name) AS score
+FROM products
+WHERE vsql_trgm.trgm_word_similar('widget', name) = 1
+ORDER BY score DESC;
+```
+
+A `trgm_strict_word_similarity` é uma variante mais rigorosa que exige que a correspondência se alinhe com os limites das palavras.
+
+| Função | Limiar |
+|---|---|
+| `trgm_word_similar(a, b)` | 0.6 |
+| `trgm_strict_word_similar(a, b)` | 0.5 |
+
+## Inspecionando trigramas {#inspecting-trigrams}
+
+A `trgm_show` retorna o conjunto ordenado de trigramas de uma string como um array JSON:
+
+```sql
+SELECT vsql_trgm.trgm_show('cat');
+-- '["  c"," ca","at ","cat"]'
+```
+
+Isso é útil para depurar por que duas strings recebem a pontuação que recebem.
+
+## Referência de funções {#function-reference}
+
+| Função | Retorna | Observações |
+|---|---|---|
+| `trgm_similarity(a, b)` | REAL | pontuação de similaridade de 0 a 1 |
+| `trgm_distance(a, b)` | REAL | 1 − similaridade |
+| `trgm_similar(a, b)` | INT | 1 se similaridade ≥ 0.3 |
+| `trgm_similar_threshold(a, b, t)` | INT | 1 se similaridade ≥ t |
+| `trgm_word_similarity(a, b)` | REAL | pontuação da melhor correspondência de substring |
+| `trgm_word_distance(a, b)` | REAL | 1 − word_similarity |
+| `trgm_word_similar(a, b)` | INT | 1 se word_similarity ≥ 0.6 |
+| `trgm_strict_word_similarity(a, b)` | REAL | pontuação alinhada aos limites das palavras |
+| `trgm_strict_word_distance(a, b)` | REAL | 1 − strict_word_similarity |
+| `trgm_strict_word_similar(a, b)` | INT | 1 se strict_word_similarity ≥ 0.5 |
+| `trgm_show(text)` | TEXT | array JSON de trigramas |
+
+## Limitações conhecidas {#known-limitations}
+
+**Sem aceleração por índice.** Uma capability Preview para tipos de índice personalizados é distribuída com o SDK de extensões, mas o DDL que anexaria um índice é recusado em todas as compilações (`ERROR 3219: Extended Index feature not yet implemented`), portanto `WHERE trgm_similarity(col, 'term') > 0.3` requer uma varredura completa da tabela. Para tabelas grandes, faça uma pré-filtragem com `LIKE` ou com busca de texto completo para reduzir o conjunto de candidatos e, em seguida, recalcule a pontuação com `trgm_similarity`.
+
+**Sem limiar em nível de sessão.** As funções `set_limit()` / `show_limit()` do PostgreSQL não podem ser implementadas no VEF (as funções do VEF não mantêm estado). Use `trgm_similar_threshold(a, b, t)` para passar o limiar explicitamente.
+
+**Sem retorno de array.** A `trgm_show` retorna uma string JSON em vez de um tipo de array nativo.
+
+## Veja também {#see-also}
+
+- [Como implementar busca de texto completo no MySQL](/pt-BR/guides/full-text-search)
+- [Como comparar nomes foneticamente e por distância de edição no MySQL](/pt-BR/guides/fuzzy-string-matching)
+- [Como manipular e transformar strings em SQL](/pt-BR/guides/string-functions)
+- [Como corresponder a um padrão com LIKE no MySQL](/pt-BR/tutorial/like)

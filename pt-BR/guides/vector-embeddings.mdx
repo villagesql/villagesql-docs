@@ -1,0 +1,186 @@
+---
+title: "Gerando Embeddings Vetoriais no MySQL"
+sidebarTitle: "Gerando Embeddings"
+description: "Como gerar e armazenar embeddings vetoriais no MySQL usando a função ai_embedding() do VillageSQL — para busca semântica, correspondência por similaridade e sistemas de recomendação."
+keywords: "mysql vector embeddings, mysql ai_embedding, mysql semantic search, mysql text embeddings, mysql openai embeddings, mysql similarity search"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Embeddings vetoriais representam texto como arrays de números que capturam o significado semântico. Dois trechos de texto sobre o mesmo assunto têm vetores semelhantes, mesmo que não compartilhem nenhuma palavra. O MySQL não tem uma forma interna de gerar embeddings. A extensão `vsql_ai` do VillageSQL adiciona a `ai_embedding()`, que chama um modelo de embedding e retorna o vetor como um array JSON que você pode armazenar e consultar.
+
+## Para Que Servem os Embeddings {#what-embeddings-are-for}
+
+Um modelo de embedding converte texto em um vetor de floats de comprimento fixo. A distância entre dois vetores reflete a similaridade semântica:
+
+- `"dog"` e `"puppy"` → vetores semelhantes
+- `"dog"` e `"database index"` → vetores distantes
+
+Isso possibilita a busca semântica (encontrar linhas que *significam* o mesmo que uma consulta), o agrupamento e a recomendação — nenhum dos quais a busca por palavras-chave trata bem.
+
+## Com o VillageSQL: ai_embedding() {#with-villagesql-ai_embedding}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+A `ai_embedding(provider, model, api_key, text)` chama um modelo de embedding e retorna uma string de array JSON.
+
+```sql
+SET @key = 'your-openai-api-key';
+
+SELECT ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning is fascinating');
+-- Returns: [0.02646778, 0.019067757, -0.05332306, ...]
+```
+
+### A conversão de charset {#the-charset-conversion}
+
+No VillageSQL 0.0.6 e anteriores, a `ai_embedding()` retorna o charset binário, e o analisador de JSON do MySQL rejeita uma string binária — o resultado precisa passar por `CONVERT(... USING utf8mb4)` antes de chegar a uma coluna `JSON` ou a uma função JSON:
+
+```sql
+-- On 0.0.6 and earlier, this throws an error — JSON_LENGTH rejects binary charset
+-- ERROR 3144 (22032): Cannot create a JSON value from a string with CHARACTER SET 'binary'
+SELECT JSON_LENGTH(ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning'));
+
+-- This works on every version
+SELECT JSON_LENGTH(
+  CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, 'Machine learning')
+          USING utf8mb4)
+);
+```
+
+O VillageSQL 0.0.7 e posteriores retornam o charset correto diretamente, portanto o `CONVERT` não é mais necessário neles — mas é inofensivo mantê-lo, por isso todos os exemplos abaixo ainda o usam, para compatibilidade com o 0.0.6 e anteriores.
+
+### Armazenando embeddings {#storing-embeddings}
+
+Armazene o array JSON em uma coluna `JSON`:
+
+```sql
+CREATE TABLE documents (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    title    VARCHAR(255),
+    content  TEXT,
+    embedding JSON
+);
+
+SET @key = 'your-openai-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this INSERT.
+
+INSERT INTO documents (title, content, embedding) VALUES
+    ('Intro to ML',
+     'Machine learning is a subset of artificial intelligence',
+     CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                          'Machine learning is a subset of artificial intelligence')
+             USING utf8mb4)),
+    ('Neural Networks',
+     'Deep learning uses multi-layer neural networks',
+     CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                          'Deep learning uses multi-layer neural networks')
+             USING utf8mb4));
+
+-- Confirm the vectors parsed as JSON
+SELECT id, JSON_LENGTH(embedding) AS dimensions FROM documents;
+```
+
+### Preenchendo embeddings em linhas existentes {#backfilling-embeddings-on-existing-rows}
+
+```sql
+ALTER TABLE documents ADD COLUMN embedding JSON;
+
+SET @key = 'your-openai-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE documents
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, content)
+                        USING utf8mb4)
+WHERE embedding IS NULL
+LIMIT 50;  -- Process in batches
+```
+
+## Escolhendo um Modelo {#choosing-a-model}
+
+| Provedor | Modelo | Dimensões | Use quando |
+|:---|:---|:---|:---|
+| `'openai'` | `text-embedding-3-small` | 1536 | Melhor custo-benefício — boa precisão, custo mais baixo |
+| `'openai'` | `text-embedding-3-large` | 3072 | Precisa de mais precisão |
+| `'google'` | `gemini-embedding-001` | 3072 | Ecossistema Google |
+| `'local'` | qualquer modelo do Ollama (por exemplo, `nomic-embed-text`) | varia | Dados privados; não requer chave de API |
+
+Use o mesmo modelo para todos os embeddings de uma tabela. Embeddings de modelos diferentes não são comparáveis — misturá-los produz pontuações de similaridade sem sentido.
+
+A Anthropic não fornece atualmente uma API de embedding.
+
+## Busca Semântica {#semantic-search}
+
+Nem o MySQL nem o VillageSQL fornecem uma função nativa de distância vetorial. A busca completa por similaridade — encontrar os vetores mais próximos em uma tabela grande — é executada no código da aplicação. A arquitetura típica: armazene os embeddings no MySQL, busque-os, calcule a similaridade de cosseno na sua aplicação e retorne as melhores correspondências.
+
+```sql
+-- Generate a query embedding
+SET @query_embedding = ai_embedding('openai', 'text-embedding-3-small', @key, 'neural networks');
+
+-- Retrieve stored embeddings to process in application code
+SELECT id, title, embedding FROM documents;
+```
+
+Passe os resultados a uma biblioteca de similaridade vetorial (NumPy, scikit-learn, Faiss) para encontrar os vizinhos mais próximos. Para busca em escala de produção, considere um banco de dados vetorial dedicado ao lado do MySQL.
+
+## O Que Incluir no Embedding {#what-to-embed}
+
+A qualidade dos seus embeddings depende do que você inclui neles. Alguns padrões:
+
+```sql
+-- Embed the full content for document search
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, content)
+                        USING utf8mb4);
+
+-- Embed a specific field for product search
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key, product_description)
+                        USING utf8mb4);
+
+-- Embed concatenated fields for richer context
+SET embedding = CONVERT(ai_embedding('openai', 'text-embedding-3-small', @key,
+                            CONCAT(product_name, '. ', category, '. ', product_description))
+                        USING utf8mb4);
+```
+
+Mantenha o texto que você inclui no embedding abaixo de alguns milhares de tokens. Um texto mais longo é truncado pelo modelo de embedding.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Posso comparar embeddings de modelos diferentes? {#can-i-compare-embeddings-from-different-models}
+
+Não. Os embeddings de `text-embedding-3-small` e de `gemini-embedding-001` vivem em espaços vetoriais diferentes — as suas pontuações de similaridade não têm sentido quando comparadas entre si. Padronize um modelo por coluna.
+
+#### Quanto espaço os embeddings ocupam? {#how-much-storage-do-embeddings-take}
+
+Um array JSON de 1536 floats ocupa cerca de 10–15 KB por linha como string de texto. Em tabelas grandes, isso se acumula. Avalie se você precisa armazenar todos os embeddings ou apenas aqueles contra os quais vai consultar.
+
+#### A ai_embedding() aceita entrada em lote? {#does-ai_embedding-support-batch-input}
+
+Não — cada chamada processa uma única entrada de texto. Para gerar embeddings em massa, percorra as linhas na sua aplicação e chame `UPDATE` em lotes.
+
+#### O que acontece se o texto for longo demais? {#what-happens-if-the-text-is-too-long}
+
+O modelo de embedding trunca a entrada no seu limite de tokens (normalmente 8191 tokens para os modelos da OpenAI). O embedding é calculado sobre o texto truncado. Para documentos longos, inclua no embedding um resumo ou os primeiros parágrafos, em vez do texto completo.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.ai_embedding does not exist` | Execute `INSTALL EXTENSION vsql_ai` |
+| `ERROR 3144: Cannot create a JSON value from a string with CHARACTER SET 'binary'` | Envolva a chamada em `CONVERT(... USING utf8mb4)` — consulte [A conversão de charset](#the-charset-conversion) |
+| A `ai_embedding()` retorna NULL | Verifique a chave de API; confira o nome do modelo; verifique o `max_execution_time` |
+| A busca por similaridade retorna resultados errados | Confirme que todos os embeddings usam o mesmo modelo; verifique se os embeddings não foram gerados com um conteúdo diferente daquele que você está buscando |
+| Os embeddings demoram demais para serem gerados | Use lotes com LIMIT; cada embedding leva cerca de 1–3 segundos por chamada de API |
+
+## Veja também {#see-also}
+
+- [Conectando o MySQL a APIs de IA](/pt-BR/guides/ai-api-setup) — instalando e configurando a extensão vsql_ai
+- [Executando Modelos de IA a partir de Consultas MySQL](/pt-BR/guides/ai-prompts-in-mysql) — geração de texto como complemento aos embeddings
+- [UUIDs no MySQL](/pt-BR/guides/uuids) — identificadores de linha estáveis para tabelas de consulta de embeddings
+- [Consultas de intervalo multidimensionais](/pt-BR/guides/cube-queries) — consultas geométricas de contenção e distância sem vetores de IA

@@ -1,0 +1,212 @@
+---
+title: "Noções Básicas de Replicação no MySQL"
+sidebarTitle: "Configurando a Replicação"
+description: "Como a replicação do MySQL funciona: configuração de origem e réplica, replicação baseada no log binário, replicação com GTID, atraso de replicação, monitoramento com SHOW REPLICA STATUS e problemas comuns de replicação."
+keywords: "mysql replication, mysql replica setup, mysql gtid replication, mysql replication lag, mysql show replica status, mysql source replica, mysql binlog replication, mysql replication tutorial"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A replicação do MySQL copia mudanças de um servidor (a origem) para um ou mais servidores (as réplicas). A origem grava cada mudança no log binário; cada réplica lê esse log e reproduz as mudanças. A replicação é a base para escalar leituras, para alta disponibilidade e para distribuição geográfica.
+
+## Como a Replicação Funciona {#how-replication-works}
+
+1. A origem faz o commit de uma transação e a grava no log binário.
+2. A thread de I/O da réplica se conecta à origem, lê os eventos novos do binlog e os grava em um relay log local.
+3. A thread SQL da réplica lê do relay log e executa cada evento.
+
+Isso é assíncrono por padrão — a origem não espera as réplicas confirmarem o recebimento. A réplica pode ficar atrasada em relação à origem.
+
+## Configurando uma Réplica {#setting-up-a-replica}
+
+**Na origem** — habilite o log binário e defina um ID de servidor único no `my.cnf`:
+
+```ini
+[mysqld]
+server_id = 1
+log_bin = /var/log/mysql/mysql-bin
+binlog_format = ROW
+```
+
+Crie um usuário de replicação:
+
+```sql
+CREATE USER 'repl'@'%' IDENTIFIED BY 'repl_password';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+```
+
+Tire um snapshot consistente usando o mysqldump com `--source-data`:
+
+```bash
+mysqldump --single-transaction --source-data=1 --all-databases \
+  -u root -p > source_snapshot.sql
+```
+
+**Na réplica** — defina um ID de servidor diferente:
+
+```ini
+[mysqld]
+server_id = 2
+```
+
+Restaure o snapshot e inicie a replicação:
+
+```bash
+mysql -u root -p < source_snapshot.sql
+```
+
+```sql
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = '192.168.1.10',
+    SOURCE_USER = 'repl',
+    SOURCE_PASSWORD = 'repl_password',
+    SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;
+```
+
+`SOURCE_AUTO_POSITION = 1` habilita a replicação baseada em GTID. Se você não usa GTIDs, especifique `SOURCE_LOG_FILE` e `SOURCE_LOG_POS` em vez disso (valores do cabeçalho do arquivo de snapshot).
+
+## Replicação com GTID {#gtid-replication}
+
+Os Global Transaction Identifiers (GTIDs) atribuem um ID único a cada transação com commit. Eles tornam o failover e a configuração de réplicas mais simples — em vez de rastrear nomes de arquivo e posições do binlog, o MySQL rastreia quais transações cada servidor aplicou.
+
+Habilite os GTIDs na origem e na réplica:
+
+```ini
+[mysqld]
+gtid_mode = ON
+enforce_gtid_consistency = ON
+```
+
+Com os GTIDs habilitados, `SOURCE_AUTO_POSITION = 1` é tudo o que você precisa — o MySQL descobre quais transações faltam na réplica e as reproduz automaticamente.
+
+## Monitorando a Replicação {#monitoring-replication}
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+Campos principais a observar:
+
+| Campo | O que significa |
+|:------|:--------------|
+| `Replica_IO_Running` | `Yes` = thread de I/O conectada e lendo da origem |
+| `Replica_SQL_Running` | `Yes` = thread SQL aplicando eventos |
+| `Seconds_Behind_Source` | Atraso de replicação em segundos (0 = em dia) |
+| `Last_SQL_Error` | Último erro que parou a thread SQL |
+| `Executed_Gtid_Set` | GTIDs que esta réplica aplicou (modo GTID) |
+
+Tanto `Replica_IO_Running` quanto `Replica_SQL_Running` precisam ser `Yes` para a replicação estar funcionando.
+
+## Atraso de Replicação {#replication-lag}
+
+O atraso de replicação acontece quando a thread SQL da réplica não consegue acompanhar a taxa de gravação da origem. Causas comuns:
+
+- **Paralelismo do aplicador**: o MySQL 8.4 já aplica eventos em paralelo por padrão — `replica_parallel_workers` é 4 e `replica_parallel_type` é `LOGICAL_CLOCK`. Aumente a contagem de workers se a réplica ainda ficar para trás:
+
+```sql
+SET GLOBAL replica_parallel_workers = 4;
+SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+```
+
+- **Consultas de longa duração na réplica**: consultas que bloqueiam linhas bloqueiam a thread SQL.
+- **Latência de rede**: uma thread de I/O lenta faz a thread SQL ficar sem trabalho.
+- **I/O de disco na réplica**: a sincronização do relay log ou dos arquivos de dados é o gargalo.
+
+## Arquiteturas de Replicação {#replication-architectures}
+
+A configuração padrão — uma origem, uma ou mais réplicas assíncronas — não é a única opção. O MySQL oferece várias arquiteturas de replicação com diferentes trade-offs de consistência e disponibilidade.
+
+| Arquitetura | Garantia de consistência | Failover | Sobrecarga de gravação | Complexidade |
+|:-------------|:---------------------|:---------|:--------------|:-----------|
+| **Replicação assíncrona** (padrão) | Nenhuma — a réplica pode atrasar arbitrariamente | Manual; algumas transações podem ser perdidas | Mínima — a origem não espera | Baixa |
+| **Replicação semissíncrona** | Pelo menos uma réplica recebeu o evento antes de a origem fazer o commit | Manual; no máximo uma transação perdida | ~1 RTT adicionado a cada gravação | Baixa–Média |
+| **Group Replication** | Todos os membros concordam antes do commit (multi-primary ou single-primary) | Automático dentro do grupo | Maior — rodada de consenso por transação | Alta |
+| **InnoDB Cluster** | Igual ao Group Replication (construído sobre ele) | Automático, com o MySQL Router para failover dos clientes | Igual ao Group Replication | Alta |
+
+**Quando usar cada uma:**
+
+- **Replicação assíncrona** — o padrão certo para escalar leituras e para réplicas de recuperação de desastres em que algum atraso é aceitável.
+- **Semissíncrona** — quando você precisa de garantia de durabilidade contra falha da origem, mas não tolera a complexidade operacional do Group Replication. Adiciona ~1 ida e volta de rede por commit de gravação.
+- **Group Replication / InnoDB Cluster** — quando você precisa de failover automático e pode arcar com o aumento da latência de gravação. O InnoDB Cluster envolve o Group Replication com o MySQL Router e o MySQL Shell para facilitar o gerenciamento.
+
+Observação: o Group Replication exige que todas as tabelas usem InnoDB e tenham uma chave primária. Habilite-o com o plugin `group_replication`; a configuração está fora do escopo deste guia.
+
+## Escalando Leituras com Réplicas {#read-scaling-with-replicas}
+
+Direcione consultas com muitas leituras para as réplicas para reduzir a carga na origem:
+
+```sql
+-- Application connects to replica for reads
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Connect to source for writes
+INSERT INTO orders (customer_id, total) VALUES (42, 99.99);
+```
+
+A aplicação precisa tolerar o atraso de replicação. Uma réplica pode não ter a linha inserida alguns milissegundos atrás na origem. Para leituras que precisam refletir a gravação mais recente, conecte-se à origem.
+
+## Replicação vs. Alternativas {#replication-vs-alternatives}
+
+A replicação resolve bem problemas específicos e é a ferramenta errada para outros. Antes de recorrer a ela, verifique se ela realmente se encaixa.
+
+| Cenário | Replicação | Sharding | Somente réplicas de leitura | BD distribuído (ex.: Vitess, TiDB) |
+|:---------|:-----------|:---------|:-------------------|:-------------------------------------|
+| Carga com muitas leituras, gravações cabem em um servidor | Boa opção | Exagero | Mais simples — basta adicionar réplicas | Exagero |
+| Volume de gravação excede um servidor | Não ajuda — todas as réplicas reproduzem todas as gravações | Boa opção | Não ajuda | Boa opção |
+| HA / failover automático | Precisa de Group Replication ou InnoDB Cluster | Não ajuda diretamente | Não ajuda diretamente | Embutido |
+| Distribuição geográfica / leituras de baixa latência em várias regiões | Funciona bem com réplicas atrasadas ou regionais | Possível, mas complexo | Funciona bem | Embutido em alguns |
+| Recuperação em um ponto no tempo | Boa — o binlog permite PITR | Complica o PITR | Boa | Varia |
+| Esquema altamente particionável por tenant/chave | Funciona, mas desperdiça largura de banda de gravação das réplicas | Melhor opção | Funciona, mas com o mesmo desperdício | Boa opção |
+| Consistência estrita de ler as próprias gravações exigida | Use a origem para essas leituras | N/A | Use a origem para essas leituras | Depende do produto |
+
+**A versão curta:** a replicação é a escolha certa quando um servidor lida com todas as suas gravações e você precisa de escala de leitura, HA ou um warm standby. Se a sua vazão de gravação é o gargalo, a replicação copia o problema para todas as réplicas — o sharding ou um banco de dados distribuído o resolve na origem.
+
+## Parando e Iniciando a Replicação {#stopping-and-starting-replication}
+
+```sql
+STOP REPLICA;           -- stop both threads
+STOP REPLICA IO_THREAD; -- stop only the I/O thread
+STOP REPLICA SQL_THREAD; -- stop only the SQL thread
+
+START REPLICA;
+```
+
+Para pular um único evento com falha (use com cuidado — pular eventos faz a réplica divergir):
+
+```sql
+-- GTID mode: inject an empty transaction for the failed GTID
+SET GTID_NEXT = 'source_uuid:N';
+BEGIN; COMMIT;
+SET GTID_NEXT = 'AUTOMATIC';
+START REPLICA;
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### A replicação funciona entre versões principais do MySQL? {#does-replication-work-across-mysql-major-versions}
+
+O MySQL suporta replicar de uma origem mais antiga para uma réplica mais nova, mas não o inverso. Sempre atualize as réplicas antes de atualizar a origem.
+
+#### Qual é a diferença entre replicação semissíncrona e assíncrona? {#whats-the-difference-between-semi-synchronous-and-asynchronous-replication}
+
+Na replicação assíncrona (o padrão), a origem faz o commit sem esperar que qualquer réplica confirme o recebimento. Na replicação semissíncrona, a origem espera pelo menos uma réplica confirmar que recebeu o evento antes de retornar ao cliente. A semissíncrona reduz o risco de perda de dados em uma falha da origem, ao custo de uma latência de gravação um pouco maior.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `Replica_IO_Running: No` | Verifique `Last_IO_Error` — normalmente uma falha de conexão ou autenticação; confira SOURCE_HOST, usuário, senha e o grant REPLICATION SLAVE |
+| `Replica_SQL_Running: No` | Verifique `Last_SQL_Error` — geralmente um conflito de dados; decida entre pular o evento ou corrigir a causa raiz |
+| Atraso de replicação crescendo | Aumente `replica_parallel_workers` acima do padrão de 4; verifique se há consultas de longa duração na réplica bloqueando o aplicador |
+| `ERROR 1062: Duplicate entry` na réplica | A réplica tem uma linha que a origem não tem — indica gravações manuais na réplica; use `replica_skip_errors` com cautela ou ressincronize |
+| Lacuna de GTID após o failover | A nova origem não tem GTIDs que a origem antiga tinha aplicado — use `SET GTID_PURGED` com cuidado durante o failover |
+
+## Veja também {#see-also}
+
+- [Log Binário do MySQL](/pt-BR/guides/binary-logging) — o log binário que a replicação transmite da origem para a réplica
+- [Estratégias de Backup no MySQL](/pt-BR/guides/backup-strategies) — estratégia complementar à replicação para durabilidade
+- [Réplicas de Leitura no MySQL](/pt-BR/guides/read-replicas) — usando as réplicas que este guia configura

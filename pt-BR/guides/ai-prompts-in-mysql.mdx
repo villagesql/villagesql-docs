@@ -1,0 +1,178 @@
+---
+title: "Executando Modelos de IA a partir de Consultas MySQL"
+sidebarTitle: "Executando Prompts de IA"
+description: "Como chamar modelos de linguagem de IA diretamente de consultas MySQL usando a função ai_prompt() do VillageSQL — enriquecendo linhas, classificando dados e processando texto em lote."
+keywords: "mysql ai prompt, mysql call ai model, mysql ai_prompt function, mysql llm query, mysql anthropic openai, mysql ai text generation"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O MySQL não tem uma forma de chamar um modelo de IA. Você processa seus dados em SQL, depois os move para o código da aplicação para qualquer etapa de IA, e então traz os resultados de volta. A extensão `vsql_ai` do VillageSQL adiciona `ai_prompt()` — uma função que chama um modelo de IA diretamente de uma consulta, para que enriquecimento, classificação e geração aconteçam onde os dados já estão.
+
+## O Problema: Troca de Contexto Entre SQL e IA {#the-problem-context-switching-between-sql-and-ai}
+
+Um padrão típico sem o VillageSQL:
+
+```python
+# Pull rows from MySQL
+rows = db.query("SELECT id, review_text FROM reviews WHERE ai_label IS NULL")
+
+# Call AI for each row
+for row in rows:
+    label = openai.chat(model="gpt-4o-mini", prompt=row["review_text"])
+    db.execute("UPDATE reviews SET ai_label = ? WHERE id = ?", label, row["id"])
+```
+
+Isso funciona, mas são três idas e voltas por linha: SELECT, chamada de IA, UPDATE. Para tabelas grandes, a sobrecarga de coordenação se acumula, e a lógica de enriquecimento fica no código da aplicação em vez de no esquema onde os dados estão.
+
+## Com o VillageSQL: ai_prompt() em SQL {#with-villagesql-ai_prompt-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+`ai_prompt(provider, model, api_key, prompt)` faz uma chamada à API e retorna a resposta como uma string. Use-a em qualquer lugar onde uma função escalar funcione.
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+-- Enrich a single row
+SELECT review_text,
+       ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+                 CONCAT('Classify this review as positive, negative, or neutral: ', review_text)
+       ) AS sentiment
+FROM reviews
+WHERE id = 1;
+```
+
+### Atualizando linhas em massa {#updating-rows-in-bulk}
+
+O uso mais comum: preencher uma coluna de enriquecimento nas linhas existentes.
+
+```sql
+ALTER TABLE reviews ADD COLUMN ai_label VARCHAR(50);
+
+SET @key = 'sk-ant-your-api-key';
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE reviews
+SET ai_label = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT('Classify as positive, negative, or neutral. Reply with one word only: ', review_text)
+)
+WHERE ai_label IS NULL
+LIMIT 100;  -- Process in batches to stay within rate limits
+```
+
+Execute o UPDATE em um loop a partir da sua aplicação até que não restem mais linhas com NULL.
+
+### Usando resultados de prompt em WHERE {#using-prompt-results-in-where}
+
+Você pode filtrar pela saída da IA, embora isso chame o modelo para cada linha da varredura:
+
+```sql
+-- Flag reviews that need human review
+SELECT id, review_text FROM reviews
+WHERE ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+    CONCAT('Does this review mention a refund request? Reply yes or no: ', review_text)
+) = 'yes'
+LIMIT 20;
+```
+
+Para desempenho, prefira atualizar uma coluna armazenada e consultá-la em vez de chamar `ai_prompt()` em uma cláusula WHERE.
+
+### Construindo prompts a partir de várias colunas {#building-prompts-from-multiple-columns}
+
+Concatene colunas no prompt para dar ao modelo o contexto completo:
+
+```sql
+UPDATE support_tickets
+SET ai_summary = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Summarize this support ticket in one sentence.\n',
+        'Subject: ', subject, '\n',
+        'Body: ', body
+    )
+)
+WHERE ai_summary IS NULL
+LIMIT 50;
+```
+
+## Desempenho e Limites de Taxa {#performance-and-rate-limits}
+
+Cada chamada a `ai_prompt()` é uma requisição HTTPS independente. Para operações em massa:
+
+- **Use LIMIT no UPDATE** — as chamadas de IA levam de 5 a 30 segundos cada, então um `UPDATE` em lote sobre 100 linhas leva minutos; processe em lotes de 50 a 100 linhas para ficar dentro dos limites de taxa do provedor. `max_execution_time` só limita `SELECT` e não faz nada aqui — para interromper um `UPDATE` em execução, use `KILL QUERY <connection_id>` a partir de outra sessão.
+- **Armazene os resultados** — Nunca chame `ai_prompt()` em um SELECT sem armazenar o resultado. SELECTs repetidos executam a chamada à API novamente a cada vez.
+
+```sql
+-- Batch loop pattern (run repeatedly until done)
+UPDATE reviews
+SET ai_label = ai_prompt('anthropic', 'claude-haiku-4-5', @key,
+    CONCAT('Label as positive, negative, or neutral. One word: ', review_text))
+WHERE ai_label IS NULL
+LIMIT 100;
+
+-- Check progress
+SELECT COUNT(*) AS remaining FROM reviews WHERE ai_label IS NULL;
+```
+
+## Escolhendo um Modelo {#choosing-a-model}
+
+| Modelo | Velocidade | Custo | Use quando |
+|:---|:---|:---|:---|
+| `claude-haiku-4-5` | Rápido | Baixo | Classificação em massa, rotulagem simples |
+| `claude-sonnet-5` | Médio | Médio | Raciocínio complexo, saída com nuances |
+| `claude-opus-5` | Lento | Alto | Padrão recomendado — trabalho agêntico e corporativo |
+| `claude-fable-5` | Lento | Alto | O mais capaz — raciocínio exigente, trabalho de longo horizonte |
+| `gpt-4o-mini` | Rápido | Baixo | Ecossistema OpenAI, tarefas simples |
+| `gemini-2.5-flash` | Rápido | Baixo | Ecossistema Google, tarefas equilibradas |
+
+Para tarefas de classificação e rotulagem, use o modelo mais rápido e barato que dê uma precisão aceitável. Reserve os modelos mais capazes para tarefas em que a qualidade da saída importa mais do que a vazão.
+
+Para configuração e opções de provedor, consulte [Conectando o MySQL a APIs de IA](/pt-BR/guides/ai-api-setup).
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Posso usar ai_prompt() em uma expressão DEFAULT? {#can-i-use-ai_prompt-in-a-default-expression}
+
+Não — funções não determinísticas (e `ai_prompt()` é uma delas) não podem ser usadas em expressões DEFAULT nem em colunas geradas no MySQL.
+
+#### Posso usar ai_prompt() em uma stored procedure? {#can-i-use-ai_prompt-in-a-stored-procedure}
+
+Sim. Stored procedures, triggers e funções podem todos chamar `ai_prompt()`, sujeitos às mesmas restrições de timeout. Tenha cuidado com triggers — uma chamada de IA a cada INSERT deixará cada escrita lenta.
+
+#### Como controlo o formato da resposta? {#how-do-i-control-the-response-format}
+
+Pelo prompt. "Reply with one word: positive, negative, or neutral" produz uma saída previsível para classificação. "Return valid JSON with keys: category, confidence" produz uma saída estruturada. O modelo segue instruções de forma confiável quando elas são específicas.
+
+#### ai_prompt() tenta novamente em caso de falha? {#does-ai_prompt-retry-on-failure}
+
+Não. Se a chamada à API falhar, ela retorna NULL. Execute `SHOW WARNINGS` para ver o motivo — a `vsql_ai` gera um `Warning 3200` com o motivo real da falha — antes de implementar uma lógica de repetição no loop de lote da sua aplicação.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | Execute `INSTALL EXTENSION vsql_ai` |
+| Retorna NULL | Chave de API incorreta, limite de taxa atingido ou timeout — verifique `max_execution_time` |
+| A resposta para no meio de uma frase | Execute `SHOW WARNINGS` — um aviso "Prompt response truncated to fit the result buffer" significa que a resposta não coube no resultado; peça ao modelo uma resposta mais curta |
+| O UPDATE demora demais | Use lotes menores com `LIMIT`; `max_execution_time` não se aplica a `UPDATE`, use `KILL QUERY <connection_id>` a partir de outra sessão |
+| O modelo retorna um formato inesperado | Torne o prompt mais restrito: especifique o formato exato de saída e dê exemplos |
+| Erros de limite de taxa | Reduza o tamanho do lote; adicione `SELECT SLEEP(1);` entre os lotes de UPDATE, ou adicione uma pausa no loop da sua aplicação |
+
+## Veja também {#see-also}
+
+- [Conectando o MySQL a APIs de IA](/pt-BR/guides/ai-api-setup) — instalando e configurando a extensão vsql_ai primeiro
+- [Resumo com IA no MySQL](/pt-BR/guides/ai-summarization) — resumindo textos longos com ai_prompt()
+- [Classificando Texto no MySQL com IA](/pt-BR/guides/text-classification) — rotulando linhas por categoria usando ai_prompt()
+- [Análise de Sentimento em Dados do MySQL](/pt-BR/guides/sentiment-analysis) — pontuando texto por tom e sentimento

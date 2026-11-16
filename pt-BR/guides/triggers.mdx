@@ -1,0 +1,184 @@
+---
+title: "Triggers no MySQL"
+sidebarTitle: "Escrevendo Triggers"
+description: "Como funcionam os triggers no MySQL: a sintaxe de CREATE TRIGGER, BEFORE vs AFTER, as referências de linha NEW e OLD, vários triggers por evento, e quando os triggers ajudam ou prejudicam a manutenibilidade."
+keywords: "mysql triggers, mysql create trigger, mysql before after trigger, mysql trigger example, mysql NEW OLD trigger, mysql trigger insert update delete, mysql audit trigger"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Um trigger é SQL que roda automaticamente quando uma linha é inserida, atualizada ou excluída. O MySQL dispara os triggers antes ou depois da alteração dos dados, dando acesso aos valores da linha que está sendo gravada.
+
+## Criando um Trigger {#creating-a-trigger}
+
+```sql
+CREATE TRIGGER trigger_name
+    {BEFORE | AFTER} {INSERT | UPDATE | DELETE}
+    ON table_name
+    FOR EACH ROW
+BEGIN
+    -- trigger body
+END;
+```
+
+Um exemplo prático — registrar toda alteração de preço:
+
+```sql
+CREATE TABLE price_history (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    product_id  INT,
+    old_price   DECIMAL(10,2),
+    new_price   DECIMAL(10,2),
+    changed_at  DATETIME DEFAULT NOW()
+);
+
+DELIMITER $$
+
+CREATE TRIGGER log_price_change
+    AFTER UPDATE ON products
+    FOR EACH ROW
+BEGIN
+    IF OLD.price <> NEW.price THEN
+        INSERT INTO price_history (product_id, old_price, new_price)
+        VALUES (NEW.id, OLD.price, NEW.price);
+    END IF;
+END$$
+
+DELIMITER ;
+```
+
+Excluir um trigger:
+
+```sql
+DROP TRIGGER IF EXISTS log_price_change;
+```
+
+Listar todos os triggers do banco de dados atual:
+
+```sql
+SHOW TRIGGERS\G
+-- or
+SELECT trigger_name, event_manipulation, event_object_table, action_timing
+FROM information_schema.triggers
+WHERE trigger_schema = DATABASE();
+```
+
+## BEFORE vs AFTER {#before-vs-after}
+
+| | Trigger BEFORE | Trigger AFTER |
+|:--|:--------------|:-------------|
+| Roda | Antes de a linha ser gravada | Depois de a linha ser gravada |
+| Pode modificar os valores de `NEW` | Sim — as alterações se aplicam à linha | Não — a linha já foi gravada |
+| Pode ver os valores de `OLD` | Sim (UPDATE/DELETE) | Sim (UPDATE/DELETE) |
+| Use para | Validação, valores padrão, normalização de dados | Log de auditoria, propagação para outras tabelas, notificações |
+
+Um trigger `BEFORE INSERT` pode definir valores padrão ou rejeitar dados ruins. Um trigger `AFTER INSERT` pode gravar registros de auditoria depois que a inserção tem sucesso.
+
+## Referências NEW e OLD {#new-and-old-references}
+
+| Tipo de trigger | `NEW` | `OLD` |
+|:-------------|:------|:------|
+| `INSERT` | Valores da nova linha | Não disponível |
+| `UPDATE` | Novos valores depois da atualização | Valores originais antes da atualização |
+| `DELETE` | Não disponível | Valores da linha excluída |
+
+Modifique os valores de `NEW` em um trigger `BEFORE` para alterar o que é gravado:
+
+```sql
+CREATE TRIGGER normalize_email
+    BEFORE INSERT ON users
+    FOR EACH ROW
+BEGIN
+    SET NEW.email = LOWER(TRIM(NEW.email));
+END;
+```
+
+## Vários Triggers por Evento {#multiple-triggers-per-event}
+
+O MySQL oferece suporte a vários triggers na mesma tabela e no mesmo evento. As palavras-chave `FOLLOWS` e `PRECEDES` controlam a ordem de execução:
+
+```sql
+CREATE TRIGGER audit_insert
+    AFTER INSERT ON orders
+    FOR EACH ROW
+    FOLLOWS another_trigger
+BEGIN
+    INSERT INTO audit_log (action, table_name, row_id, happened_at)
+    VALUES ('INSERT', 'orders', NEW.id, NOW());
+END;
+```
+
+Sem `FOLLOWS`/`PRECEDES`, o MySQL define a ordem de execução pela hora de criação.
+
+## Gerando Erros em Triggers {#raising-errors-in-triggers}
+
+Use `SIGNAL` para abortar a operação e retornar um erro a quem chamou:
+
+```sql
+CREATE TRIGGER enforce_minimum_price
+    BEFORE INSERT ON products
+    FOR EACH ROW
+BEGIN
+    IF NEW.price < 0.01 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Price must be at least $0.01';
+    END IF;
+END;
+```
+
+Quando um trigger `BEFORE` sinaliza um erro, a inserção/atualização/exclusão é abortada — nada é gravado.
+
+## Limitações dos Triggers {#trigger-limitations}
+
+Os triggers do MySQL têm várias restrições que vale a pena conhecer:
+- Triggers não podem chamar stored procedures que retornam conjuntos de resultados
+- Triggers não podem usar `COMMIT`, `ROLLBACK` ou `SAVEPOINT` diretamente (eles participam da transação ao redor)
+- Triggers não podem referenciar a tabela em que estão definidos (sem chamadas recursivas de trigger por meio de consultas diretas à mesma tabela na maioria dos contextos)
+- Triggers `AFTER` não podem modificar os valores de `NEW` — a linha já foi gravada
+- O MySQL não oferece suporte a triggers no nível de instrução (todo trigger é `FOR EACH ROW`)
+
+## Quando Usar Triggers {#when-to-use-triggers}
+
+Os triggers funcionam bem para:
+- Log de auditoria — capturar quem alterou o quê e quando, independentemente da aplicação
+- Impor restrições complexas que as restrições CHECK não conseguem expressar
+- Manter dados derivados sincronizados (colunas de resumo desnormalizadas, timestamps de auditoria)
+
+Evite triggers quando:
+- A lógica é complexa o bastante para que depurá-la exija rastrear efeitos colaterais ocultos
+- O desempenho é crítico — todo trigger dispara por linha, em toda instrução afetada
+- O trigger modifica dados de um jeito que surpreende os desenvolvedores da aplicação que não sabem da existência dele
+
+Triggers ocultos são uma fonte comum da confusão "por que essa linha mudou?". Se um trigger existe, documente-o com destaque no nível da aplicação, não só no banco de dados.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Os triggers disparam durante LOAD DATA INFILE? {#do-triggers-fire-during-load-data-infile}
+
+Sim. Os triggers `INSERT` disparam para cada linha carregada por `LOAD DATA INFILE`. Se o seu trigger faz um trabalho significativo, a carga em massa por LOAD DATA vai ser muito mais lenta do que carregar primeiro em uma tabela de preparação e depois copiar com INSERT...SELECT (que também dispara triggers, mas você pode desabilitá-los temporariamente com `SET @disable_trigger = TRUE` e uma verificação condicional dentro do trigger).
+
+#### Os triggers podem chamar stored procedures? {#can-triggers-call-stored-procedures}
+
+Sim, com uma exceção: a procedure chamada não pode retornar um conjunto de resultados (um `SELECT` sem `INTO`). Se retornar, o MySQL gera um erro. As procedures chamadas a partir de triggers podem usar parâmetros `OUT` e `SELECT...INTO`.
+
+#### Os triggers disparam em REPLACE INTO? {#do-triggers-fire-on-replace-into}
+
+`REPLACE` é executado como um DELETE + INSERT quando há conflito. Em caso de conflito, os quatro disparam na tabela alvo, nesta ordem: `BEFORE INSERT` (a verificação de chave duplicada), depois `BEFORE DELETE` e `AFTER DELETE` para a linha conflitante, e então `AFTER INSERT`. Como a exclusão é uma exclusão real de linha, as regras `ON DELETE CASCADE` nas tabelas que a referenciam DISPARAM.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| O trigger não dispara | Confirme que o trigger existe: `SHOW TRIGGERS LIKE 'table_name'` — verifique também se o evento (INSERT/UPDATE/DELETE) e o momento (BEFORE/AFTER) correspondem ao que você espera |
+| `ERROR 1442: Can't update table in stored function/trigger` | Um trigger não pode fazer INSERT/UPDATE/DELETE diretamente na mesma tabela em que está definido, na maioria dos contextos — grave em outra tabela ou use uma stored procedure chamada depois do DML |
+| As alterações do trigger AFTER não persistem | Triggers `AFTER` não podem modificar `NEW` — troque para `BEFORE` se precisar alterar a linha que está sendo gravada |
+| O trigger deixa a inserção em massa lenta | Os triggers disparam por linha — para cargas em massa, considere desabilitar o trigger temporariamente ou carregar em uma tabela de preparação |
+| O `SIGNAL` no trigger não chega à aplicação | Alguns drivers engolem os erros de triggers — verifique `SHOW WARNINGS` e confira a configuração de tratamento de erros do seu driver |
+
+## Veja também {#see-also}
+
+- [Stored Procedures no MySQL](/pt-BR/guides/stored-procedures) — lógica que os triggers podem chamar
+- [Enviando Webhooks a partir de Triggers](/pt-BR/guides/http-webhooks) — chamadas HTTP a partir do corpo de triggers
+- [Restrições CHECK no MySQL](/pt-BR/guides/check-constraints) — uma alternativa mais simples para as regras de validação que os triggers costumam implementar

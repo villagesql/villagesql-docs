@@ -1,0 +1,166 @@
+---
+title: "Análise de Sentimento em Dados do MySQL"
+sidebarTitle: "Analisando Sentimento"
+description: "Como executar análise de sentimento em texto armazenado no MySQL usando o ai_prompt() do VillageSQL — pontuando avaliações, tickets de suporte e feedback sem sair do SQL."
+keywords: "mysql sentiment analysis, mysql ai sentiment, mysql review sentiment, mysql positive negative neutral, mysql text sentiment score, mysql ai_prompt sentiment"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A análise de sentimento diz se um texto expressa um sentimento positivo, negativo ou neutro. O caso de uso mais comum são avaliações de produtos e tickets de suporte — saber de relance se um cliente está satisfeito ou frustrado sem ler cada linha. O MySQL não tem uma função de sentimento integrada. O `ai_prompt()` do VillageSQL adiciona uma.
+
+## Abordagem Padrão: Sentimento na Camada de Aplicação {#standard-approach-application-layer-sentiment}
+
+A configuração típica executa a pontuação de sentimento fora do MySQL — puxando linhas para um script Python que chama uma biblioteca de sentimento ou uma API de IA, e depois gravando as pontuações de volta. Isso funciona, mas divide seu pipeline de dados: parte da lógica fica no SQL, parte no Python, e uma repontuação em massa exige a execução de um script.
+
+## Com o VillageSQL: Sentimento em SQL {#with-villagesql-sentiment-in-sql}
+
+```sql
+INSTALL EXTENSION vsql_ai;
+```
+
+A análise de sentimento é uma tarefa de classificação. O prompt especifica a escala e pede um resultado de uma única palavra:
+
+```sql
+SET @key = 'sk-ant-your-api-key';
+
+ALTER TABLE reviews ADD COLUMN sentiment VARCHAR(10);
+
+-- max_execution_time only bounds SELECT statements — it has no effect on
+-- this UPDATE. To cap how long it runs, get SELECT CONNECTION_ID() beforehand
+-- and run KILL QUERY <id> from another session if it runs too long.
+
+UPDATE reviews
+SET sentiment = ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'What is the sentiment of this review? ',
+        'Reply with exactly one word: positive, negative, or neutral.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment IS NULL
+LIMIT 100;
+```
+
+Depois de rotuladas, consulte o sentimento como qualquer outra coluna:
+
+```sql
+-- Sentiment distribution
+SELECT sentiment, COUNT(*) AS count
+FROM reviews
+GROUP BY sentiment
+ORDER BY count DESC;
+
+-- Recent negative reviews that need attention
+SELECT id, review_text, created_at
+FROM reviews
+WHERE sentiment = 'negative'
+  AND created_at > NOW() - INTERVAL 7 DAY
+ORDER BY created_at DESC;
+```
+
+### Adicionando uma pontuação numérica {#adding-a-numeric-score}
+
+Para análise de tendências e cálculo de médias, peça uma pontuação de 1 a 5 em vez de um rótulo:
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_score TINYINT;
+
+UPDATE reviews
+SET sentiment_score = CAST(ai_prompt(
+    'anthropic',
+    'claude-haiku-4-5',
+    @key,
+    CONCAT(
+        'Rate the sentiment of this review from 1 (very negative) to 5 (very positive). ',
+        'Reply with a single digit only.\n\n',
+        'Review: ', review_text
+    )
+) AS SIGNED)
+WHERE sentiment_score IS NULL
+LIMIT 100;
+
+-- Average sentiment over time
+SELECT DATE(created_at) AS day,
+       ROUND(AVG(sentiment_score), 2) AS avg_score,
+       COUNT(*) AS review_count
+FROM reviews
+WHERE sentiment_score IS NOT NULL
+GROUP BY DATE(created_at)
+ORDER BY day DESC;
+```
+
+### Sentimento por aspecto {#aspect-based-sentiment}
+
+Se você quer o sentimento separado por tópico — qualidade do produto versus entrega versus atendimento ao cliente — peça uma saída JSON estruturada:
+
+```sql
+ALTER TABLE reviews ADD COLUMN sentiment_detail JSON;
+
+UPDATE reviews
+SET sentiment_detail = ai_prompt(
+    'anthropic',
+    'claude-sonnet-5',  -- better model for nuanced structured output
+    @key,
+    CONCAT(
+        'Analyze this review and return JSON with sentiment scores for each aspect. ',
+        'Keys: product_quality, shipping, customer_service. ',
+        'Values: positive, negative, neutral, or null if not mentioned. ',
+        'Return only valid JSON.\n\n',
+        'Review: ', review_text
+    )
+)
+WHERE sentiment_detail IS NULL
+LIMIT 50;
+
+SELECT
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.product_quality')) AS product,
+    JSON_UNQUOTE(JSON_EXTRACT(sentiment_detail, '$.shipping')) AS shipping,
+    review_text
+FROM reviews
+WHERE JSON_EXTRACT(sentiment_detail, '$.shipping') = '"negative"';
+```
+
+## Notas sobre Precisão {#accuracy-notes}
+
+Modelos rápidos e baratos (Claude Haiku, GPT-4o mini) são confiáveis para a classificação direta em positivo/negativo/neutro. Casos com nuances — sarcasmo, avaliações mistas, linguagem específica de um domínio — se beneficiam de um modelo mais capaz. Se a precisão importa, valide uma amostra das saídas do modelo contra rótulos humanos antes de executar um backfill completo.
+
+Para configuração e opções de provedores, consulte [Conectando o MySQL a APIs de IA](/pt-BR/guides/ai-api-setup).
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Qual é a diferença em relação à classificação de texto? {#how-is-this-different-from-text-classification}
+
+A análise de sentimento é uma tarefa de classificação específica, focada no tom emocional. [Classificando Texto no MySQL com IA](/pt-BR/guides/text-classification) cobre o padrão geral; este guia mostra prompts específicos de sentimento e saída baseada em pontuação.
+
+#### Posso executar a análise de sentimento conforme as linhas são inseridas? {#can-i-run-sentiment-analysis-as-rows-are-inserted}
+
+Sim, por meio de um trigger, mas cada INSERT vai levar de 5 a 30 segundos enquanto a chamada à API é executada. É melhor executar a pontuação de sentimento em um job em lote agendado.
+
+#### E quanto a texto que não está em inglês? {#what-about-non-english-text}
+
+Modelos de IA capazes lidam bem com muitos idiomas. Especifique o idioma esperado no prompt se a precisão cair: "Rate the sentiment of this French review..."
+
+#### Como lido com resultados NULL? {#how-do-i-handle-null-results}
+
+O `ai_prompt()` retorna NULL em caso de falha. Execute o loop de lotes do UPDATE até que não restem linhas NULL, com um ritmo que respeite os limites de taxa na sua aplicação.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.ai_prompt does not exist` | Execute `INSTALL EXTENSION vsql_ai` |
+| Retorna NULL | Verifique a chave da API, `max_execution_time` e o nome do modelo |
+| A coluna de pontuação é preenchida com 0 em vez de NULL | `CAST('positive' AS SIGNED)` retorna 0 — o modelo retornou texto não numérico. Restrinja o prompt: "Reply with a single digit only, no other text." |
+| Rótulos inconsistentes | Adicione "Reply with exactly one word" ao prompt; normalize com uma consulta após o UPDATE |
+
+## Veja também {#see-also}
+
+- [Executando Modelos de IA a partir de Consultas MySQL](/pt-BR/guides/ai-prompts-in-mysql) — a função ai_prompt() por trás da pontuação de sentimento
+- [Classificando Texto no MySQL com IA](/pt-BR/guides/text-classification) — rotulando texto por categoria junto com o sentimento
+- [Sumarização com IA no MySQL](/pt-BR/guides/ai-summarization) — resumindo o texto que você está pontuando

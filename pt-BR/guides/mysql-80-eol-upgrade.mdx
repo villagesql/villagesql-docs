@@ -1,0 +1,103 @@
+---
+title: "Atualizando do MySQL 8.0 para o 8.4 Após o Fim do Suporte"
+sidebarTitle: "Fim do suporte do MySQL 8.0: Atualize para o 8.4"
+description: "O MySQL 8.0 chegou ao fim do suporte em 30 de abril de 2026. Como atualizar para o MySQL 8.4 LTS: a mudança de autenticação que quebra clientes, as variáveis de configuração removidas, as verificações pré-atualização e o backup que é o seu único caminho de volta."
+keywords: "mysql 8.0 eol, mysql 8.0 end of life, upgrade mysql 8.0 to 8.4, mysql 8.4 upgrade, mysql_native_password 8.4, mysql lts upgrade"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+import AiNote from '/snippets/ai-note.mdx';
+
+<VillagesqlBanner />
+
+<AiNote />
+
+O MySQL 8.0 chegou ao fim do suporte em 30 de abril de 2026, e não recebe mais correções de segurança. O destino da atualização é o MySQL 8.4 LTS, com suporte premier até aproximadamente abril de 2029 e suporte estendido até abril de 2032. A Oracle projetou o caminho do 8.0 para o 8.4 para ser suave, mas duas mudanças quebram sistemas reais: o plugin de autenticação padrão e as variáveis de configuração removidas. Este guia cobre as duas, mais as verificações a executar antes de começar.
+
+## O que Muda no 8.4 {#what-changes-in-84}
+
+A atualização é no local: instale os binários do 8.4 sobre um diretório de dados do 8.0 e o servidor atualiza o dicionário de dados sozinho na primeira inicialização. A maioria dos esquemas e das consultas passa sem alteração. As mudanças que de fato causam problema:
+
+| Mudança | Quem ela quebra |
+|---|---|
+| `mysql_native_password` vem desativado por padrão | Bibliotecas de cliente antigas e qualquer conta que ainda usa o plugin de autenticação anterior ao 8.0 |
+| As variáveis de sistema descontinuadas no 8.0 foram removidas | Arquivos de configuração e scripts que as definem; o servidor se recusa a iniciar com variáveis desconhecidas |
+| Sintaxe descontinuada removida | Esquemas que usam `AUTO_INCREMENT` em colunas float/double e restrições de chave estrangeira fora do padrão |
+
+## Passo 1: Encontre as Contas no Plugin de Autenticação Antigo {#step-1-find-accounts-on-the-old-auth-plugin}
+
+Antes de atualizar, liste toda conta que ainda usa `mysql_native_password`:
+
+```sql
+SELECT user, host, plugin
+FROM mysql.user
+WHERE plugin = 'mysql_native_password';
+```
+
+Migre cada uma para `caching_sha2_password` e atualize a senha armazenada da aplicação:
+
+```sql
+ALTER USER 'app'@'%' IDENTIFIED WITH caching_sha2_password BY 'new-password';
+```
+
+No 8.4, criar uma conta com o plugin antigo falha porque o plugin não está carregado:
+
+```sql
+CREATE USER 'legacy'@'%' IDENTIFIED WITH mysql_native_password BY 'pw';
+```
+
+```text
+ERROR 1524 (HY000): Plugin 'mysql_native_password' is not loaded
+```
+
+Se você não consegue migrar uma conta antes da atualização, o 8.4 pode carregar o plugin explicitamente com `--mysql-native-password=ON` na sua configuração. Trate isso como uma ponte, e não como um destino: o plugin está descontinuado e tem remoção programada.
+
+## Passo 2: Limpe o seu Arquivo de Configuração {#step-2-clean-your-configuration-file}
+
+O MySQL 8.4 remove as variáveis de sistema que foram descontinuadas no 8.0. Se o seu `my.cnf` define uma delas, o servidor 8.4 se recusa a iniciar com um erro de variável desconhecida. As duas mais comuns:
+
+```sql
+-- Both fail on 8.4: the variables no longer exist
+SELECT @@default_authentication_plugin;
+SELECT @@expire_logs_days;
+```
+
+```text
+ERROR 1193 (HY000): Unknown system variable 'default_authentication_plugin'
+```
+
+Substitua `expire_logs_days` por `binlog_expire_logs_seconds`, e apague `default_authentication_plugin` (a substituta no 8.4, `authentication_policy`, já tem `caching_sha2_password` como padrão). Procure na sua configuração cada variável que você define, e confira cada uma na referência do 8.4 antes da atualização, e não durante a janela de indisponibilidade.
+
+## Passo 3: Verifique o Esquema em Busca de Sintaxe Removida {#step-3-check-the-schema-for-removed-syntax}
+
+Execute `mysqlcheck` em todos os bancos de dados e revise a saída:
+
+```bash
+mysqlcheck -u root -p --all-databases --check-upgrade
+```
+
+Preste atenção especial a `AUTO_INCREMENT` em colunas FLOAT ou DOUBLE e a restrições de chave estrangeira fora do padrão, ambos removidos no 8.4.
+
+## Passo 4: Faça o Backup, e Então Atualize no Local {#step-4-back-up-then-upgrade-in-place}
+
+Não existe suporte para downgrade no local do 8.4 para o 8.0. Depois que o dicionário de dados é atualizado, o único caminho de volta é restaurar um backup. Então o backup não é uma formalidade:
+
+```bash
+mysqldump -u root -p --all-databases --events --routines --triggers > pre84_backup.sql
+```
+
+Então a atualização em si: pare o servidor 8.0, instale os binários do 8.4 e inicie o servidor no mesmo diretório de dados. O servidor executa os seus passos de atualização automaticamente na primeira inicialização; acompanhe o log de erros até que ele informe que está pronto para conexões. Confirme o resultado:
+
+```sql
+SELECT VERSION();
+```
+
+## O Ângulo do VillageSQL {#the-villagesql-angle}
+
+O VillageSQL Server é um substituto direto para o MySQL 8.4. Depois que você estiver no 8.4, tudo na sua pilha que funciona com o MySQL 8.4 também funciona com o VillageSQL, e trocar mais tarde é, na prática, uma troca de versão menor no mesmo diretório de dados. Se o framework de extensões interessa a você, a atualização para o 8.4 que você está fazendo de qualquer forma é a porta de entrada. Consulte [Atualizando para o VillageSQL](/pt-BR/guides/upgrade) para esse procedimento.
+
+## Veja também {#see-also}
+
+- [Atualizando para o VillageSQL](/pt-BR/guides/upgrade) — a troca direta depois que você estiver no 8.4
+- [Estratégias de backup](/pt-BR/guides/backup-strategies) — o backup do qual esta atualização depende
+- [Erros comuns do MySQL](/pt-BR/guides/common-mysql-errors) — decodificando os erros que uma atualização malfeita produz

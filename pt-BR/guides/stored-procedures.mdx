@@ -1,0 +1,311 @@
+---
+title: "Stored Procedures no MySQL"
+sidebarTitle: "Escrevendo Stored Procedures"
+description: "Como funcionam as stored procedures do MySQL: sintaxe do CREATE PROCEDURE, parâmetros IN/OUT/INOUT, variáveis locais, fluxo de controle, cursores e quando as stored procedures ajudam ou atrapalham."
+keywords: "mysql stored procedure, mysql create procedure, mysql stored procedure example, mysql procedure parameters, mysql procedure vs function, mysql call procedure, mysql delimiter"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma stored procedure é um bloco nomeado de SQL que é executado no servidor. Você a chama uma vez e ela executa quantas instruções estiverem dentro dela. O código fica no banco de dados, não na sua aplicação.
+
+## Criando uma Stored Procedure {#creating-a-stored-procedure}
+
+O MySQL usa `DELIMITER` para mudar o terminador de instrução, de modo que o `;` dentro do corpo da procedure não encerre a instrução `CREATE PROCEDURE` antes da hora.
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_active_users()
+BEGIN
+    SELECT id, name, email
+    FROM users
+    WHERE status = 'active'
+    ORDER BY name;
+END$$
+
+DELIMITER ;
+```
+
+Chame-a com `CALL`:
+
+```sql
+CALL get_active_users();
+```
+
+Descarte-a:
+
+```sql
+DROP PROCEDURE IF EXISTS get_active_users;
+```
+
+Veja sua definição:
+
+```sql
+SHOW CREATE PROCEDURE get_active_users\G
+```
+
+## Parâmetros {#parameters}
+
+As procedures suportam três modos de parâmetro:
+
+| Modo | Direção | Caso de uso |
+|:-----|:----------|:---------|
+| `IN` | Chamador → procedure | Passar um valor para dentro |
+| `OUT` | Procedure → chamador | Retornar um valor para fora |
+| `INOUT` | Ambas | Passar para dentro e modificar |
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE get_user_count(
+    IN  p_status  VARCHAR(20),
+    OUT p_count   INT
+)
+BEGIN
+    SELECT COUNT(*) INTO p_count
+    FROM users
+    WHERE status = p_status;
+END$$
+
+DELIMITER ;
+```
+
+Chame-a com uma variável definida pelo usuário para os parâmetros `OUT`:
+
+```sql
+CALL get_user_count('active', @count);
+SELECT @count;
+```
+
+## Variáveis Locais {#local-variables}
+
+Declare variáveis locais com `DECLARE` no início do bloco `BEGIN...END`, antes de qualquer outra instrução:
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE transfer_funds(
+    IN p_from_account INT,
+    IN p_to_account   INT,
+    IN p_amount       DECIMAL(10,2)
+)
+BEGIN
+    DECLARE v_balance DECIMAL(10,2);
+
+    SELECT balance INTO v_balance
+    FROM accounts
+    WHERE id = p_from_account;
+
+    IF v_balance < p_amount THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Insufficient funds';
+    END IF;
+
+    UPDATE accounts SET balance = balance - p_amount WHERE id = p_from_account;
+    UPDATE accounts SET balance = balance + p_amount WHERE id = p_to_account;
+END$$
+
+DELIMITER ;
+```
+
+## Fluxo de Controle {#control-flow}
+
+As procedures do MySQL suportam as construções padrão de fluxo de controle:
+
+```sql
+-- IF...ELSEIF...ELSE
+IF v_count > 100 THEN
+    SET v_tier = 'high';
+ELSEIF v_count > 10 THEN
+    SET v_tier = 'medium';
+ELSE
+    SET v_tier = 'low';
+END IF;
+
+-- CASE
+CASE p_status
+    WHEN 'active'   THEN SET v_label = 'Active User';
+    WHEN 'inactive' THEN SET v_label = 'Inactive User';
+    ELSE                 SET v_label = 'Unknown';
+END CASE;
+
+-- WHILE loop
+WHILE v_i <= 10 DO
+    SET v_sum = v_sum + v_i;
+    SET v_i = v_i + 1;
+END WHILE;
+
+-- REPEAT...UNTIL
+REPEAT
+    SET v_i = v_i + 1;
+UNTIL v_i > 10
+END REPEAT;
+```
+
+## Tratamento de Erros {#error-handling}
+
+Use `DECLARE ... HANDLER` para capturar erros:
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE safe_insert(IN p_name VARCHAR(100))
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    INSERT INTO items (name) VALUES (p_name);
+    COMMIT;
+END$$
+
+DELIMITER ;
+```
+
+`EXIT HANDLER` interrompe a procedure quando a condição é disparada. `CONTINUE HANDLER` deixa a procedure continuar em execução. `RESIGNAL` relança o erro para o chamador.
+
+Lance seus próprios erros com `SIGNAL`:
+
+```sql
+SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT = 'Custom error message';
+```
+
+`45000` é o SQLSTATE para "exceção definida pelo usuário não tratada".
+
+## Cursores {#cursors}
+
+Os cursores iteram sobre um conjunto de resultados linha por linha dentro de uma procedure. Use-os quando você não consegue expressar a lógica como uma operação de conjunto.
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE process_orders()
+BEGIN
+    DECLARE v_done    INT DEFAULT FALSE;
+    DECLARE v_id      INT;
+    DECLARE v_amount  DECIMAL(10,2);
+
+    DECLARE order_cursor CURSOR FOR
+        SELECT id, amount FROM orders WHERE status = 'pending';
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+    OPEN order_cursor;
+
+    read_loop: LOOP
+        FETCH order_cursor INTO v_id, v_amount;
+        IF v_done THEN
+            LEAVE read_loop;
+        END IF;
+        -- process each row
+        UPDATE orders SET status = 'processed' WHERE id = v_id;
+    END LOOP;
+
+    CLOSE order_cursor;
+END$$
+
+DELIMITER ;
+```
+
+O handler `NOT FOUND` define `v_done` como `TRUE` quando o cursor fica sem linhas. Sempre feche os cursores antes de a procedure terminar.
+
+## Stored Procedures vs Funções {#stored-procedures-vs-functions}
+
+| | Stored Procedure | Stored Function |
+|:--|:-----------------|:----------------|
+| Valor de retorno | Por parâmetros OUT ou conjuntos de resultados | Um único valor de retorno |
+| Sintaxe de chamada | `CALL proc()` | `SELECT func()` — usada em expressões |
+| Transações | Pode executar `START TRANSACTION`, `COMMIT`, `ROLLBACK` | Não pode modificar o estado da transação |
+| Conjuntos de resultados | Pode retornar vários conjuntos de resultados | Não pode retornar conjuntos de resultados |
+| Uso em SQL | Não pode ser usada em expressões SELECT | Pode ser usada em SELECT, WHERE etc. |
+
+Use uma função quando precisar incorporar a lógica em uma expressão SQL. Use uma procedure para todo o resto — processos de várias etapas, lógica condicional, efeitos colaterais.
+
+## Quando Usar Stored Procedures {#when-to-use-stored-procedures}
+
+As stored procedures fazem sentido quando:
+- Impõem regras de negócio que devem valer independentemente de qual aplicação ou usuário executa a consulta
+- Reduzem idas e vindas em operações de várias etapas (jobs em lote complexos, migrações de dados)
+- Concedem aos usuários acesso a operações específicas sem expor as tabelas subjacentes (`GRANT EXECUTE ON PROCEDURE`)
+
+Elas atrapalham quando:
+- A lógica muda com frequência — as implantações exigem ALTER PROCEDURE ou DROP/recriação
+- A depuração é necessária — não há depurador, apenas logging baseado em SIGNAL
+- A portabilidade importa — a sintaxe de stored procedures é específica do MySQL
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Uma stored procedure pode retornar um conjunto de resultados? {#can-a-stored-procedure-return-a-result-set}
+
+Sim. Qualquer `SELECT` dentro de uma procedure que não usa `INTO` envia um conjunto de resultados ao chamador:
+
+```sql
+CREATE PROCEDURE get_users()
+BEGIN
+    SELECT id, name FROM users;  -- this result set goes to the caller
+END;
+```
+
+Várias instruções `SELECT` dentro de uma procedure enviam vários conjuntos de resultados. A maioria dos clientes lida com isso, mas alguns ORMs não.
+
+#### Como vejo todas as stored procedures de um banco de dados? {#how-do-i-see-all-stored-procedures-in-a-database}
+
+```sql
+SHOW PROCEDURE STATUS WHERE Db = 'mydb';
+-- or
+SELECT routine_name, created, last_altered
+FROM information_schema.routines
+WHERE routine_type = 'PROCEDURE' AND routine_schema = 'mydb';
+```
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1064` no CREATE PROCEDURE | Faltou a troca de `DELIMITER` — o `;` dentro do corpo encerrou a instrução antes da hora; envolva com `DELIMITER $$ ... $$; DELIMITER ;` |
+| `ERROR 1172: Result consisted of more than one row` | Um `SELECT ... INTO` retornou várias linhas — adicione um `LIMIT 1` ou corrija a consulta para retornar uma única linha |
+| O parâmetro `OUT` é NULL depois do CALL | A procedure não atribuiu um valor a ele — verifique se todos os caminhos do código chegam ao `SET` ou ao `SELECT INTO` daquele parâmetro |
+| `ERROR 1193: Unknown system variable` | Usou `SET @var` (variável de sessão) onde `DECLARE v_var` (variável local) era necessário, ou vice-versa |
+| A procedure é executada, mas não retorna dados | O `SELECT` do conjunto de resultados está enviando os dados por uma camada extra (CALL aninhado) — traga o SELECT para a procedure mais externa |
+
+## VillageSQL: Tipos Personalizados de Extensão em Stored Procedures {#villagesql-custom-extension-types-in-stored-procedures}
+
+Os tipos personalizados de extensão do VillageSQL (por exemplo, `COMPLEX`, `UUID`, `TVECTOR`) podem ser usados como
+tipos de parâmetro de stored procedure e como tipos de variável em `DECLARE`. Instale a extensão
+primeiro e depois referencie seus tipos na definição da procedure:
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE add_impedances(
+    IN  p_a COMPLEX,
+    IN  p_b COMPLEX,
+    OUT p_sum COMPLEX
+)
+BEGIN
+    DECLARE v_result COMPLEX;
+    SET v_result = complex_add(p_a, p_b);
+    SET p_sum = v_result;
+END$$
+
+DELIMITER ;
+```
+
+<Warning>
+  `UNINSTALL EXTENSION` vai falhar enquanto qualquer stored procedure usar os tipos personalizados daquela extensão.
+  Descarte ou altere a procedure antes de desinstalar a extensão. Consulte
+  [Desinstalando Extensões](/pt-BR/extensions/uninstall) para mais detalhes.
+</Warning>
+
+## Veja também {#see-also}
+
+- [Triggers no MySQL](/pt-BR/guides/triggers) — os triggers chamam a lógica de stored procedures ou SQL inline
+- [Transações no MySQL](/pt-BR/guides/transactions) — as stored procedures frequentemente envolvem o trabalho em transações
+- [Desinstalando Extensões](/pt-BR/extensions/uninstall) — restrições quando stored procedures usam tipos de extensão

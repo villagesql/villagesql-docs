@@ -1,0 +1,190 @@
+---
+title: "Funções de Janela no MySQL 8.4"
+sidebarTitle: "Usando Funções de Janela"
+description: "Como as funções de janela do MySQL 8.4 funcionam: ROW_NUMBER, RANK, LAG, LEAD, totais acumulados e como elas diferem das agregações com GROUP BY."
+keywords: "mysql window functions, mysql row_number, mysql rank, mysql over clause, mysql partition by, mysql lag lead, mysql running total, mysql 8.4 analytics"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+As funções de janela calculam valores sobre um conjunto de linhas relacionadas à linha atual — sem colapsar essas linhas em uma única linha de saída, como o `GROUP BY` faz. Elas possibilitam consultas analíticas que antes exigiam subconsultas ou processamento na camada da aplicação.
+
+## Como as Funções de Janela Diferem do GROUP BY {#how-window-functions-differ-from-group-by}
+
+```sql
+-- GROUP BY: collapses rows — you lose the individual order details
+SELECT customer_id, SUM(amount) AS total
+FROM orders
+GROUP BY customer_id;
+
+-- Window function: adds a column without collapsing rows
+SELECT
+    id,
+    customer_id,
+    amount,
+    SUM(amount) OVER (PARTITION BY customer_id) AS customer_total
+FROM orders;
+```
+
+A segunda consulta retorna uma linha por pedido, com cada linha mostrando também o total daquele cliente. O `GROUP BY` não consegue fazer isso — ele remove as linhas individuais.
+
+## A Cláusula OVER {#the-over-clause}
+
+Toda função de janela usa uma cláusula `OVER` que define a janela — o conjunto de linhas sobre o qual calcular.
+
+```sql
+function() OVER (
+    PARTITION BY col    -- divide rows into groups (optional)
+    ORDER BY col        -- define row order within the window (required for ranking/offset functions)
+    ROWS BETWEEN ...    -- define the frame (optional)
+)
+```
+
+Um `OVER()` vazio significa que a janela é o conjunto de resultados inteiro.
+
+## Funções de Classificação {#ranking-functions}
+
+```sql
+SELECT
+    name,
+    score,
+    ROW_NUMBER() OVER (ORDER BY score DESC) AS row_num,
+    RANK()       OVER (ORDER BY score DESC) AS `rank`,
+    DENSE_RANK() OVER (ORDER BY score DESC) AS `dense_rank`
+FROM leaderboard;
+```
+
+| Função | Comportamento em caso de empate |
+|:---------|:-----------------|
+| `ROW_NUMBER()` | Número sequencial único — empates recebem números diferentes (ordem arbitrária) |
+| `RANK()` | Linhas empatadas compartilham uma posição; a próxima posição é pulada (1, 1, 3) |
+| `DENSE_RANK()` | Linhas empatadas compartilham uma posição; a próxima posição não é pulada (1, 1, 2) |
+
+Exemplo de saída:
+
+```
+name   | score | row_num | rank | dense_rank
+-------+-------+---------+------+-----------
+Alice  |   100 |       1 |    1 |          1
+Bob    |    95 |       2 |    2 |          2
+Carol  |    95 |       3 |    2 |          2
+Dave   |    90 |       4 |    4 |          3
+```
+
+## PARTITION BY: Classificações por Grupo {#partition-by-per-group-rankings}
+
+Adicione `PARTITION BY` para classificar dentro de grupos, em vez de em todo o conjunto de resultados:
+
+```sql
+-- Rank orders within each customer, newest first
+SELECT
+    customer_id,
+    id AS order_id,
+    created_at,
+    ROW_NUMBER() OVER (
+        PARTITION BY customer_id
+        ORDER BY created_at DESC
+    ) AS order_rank
+FROM orders;
+```
+
+Para obter o pedido mais recente de cada cliente:
+
+```sql
+SELECT customer_id, order_id, created_at
+FROM (
+    SELECT
+        customer_id,
+        id AS order_id,
+        created_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY created_at DESC
+        ) AS rn
+    FROM orders
+) ranked
+WHERE rn = 1;
+```
+
+## LAG e LEAD: Acessando Linhas Adjacentes {#lag-and-lead-accessing-adjacent-rows}
+
+O `LAG` acessa uma linha anterior; o `LEAD` acessa uma linha seguinte — sem um self-join.
+
+```sql
+SELECT
+    date,
+    revenue,
+    LAG(revenue)  OVER (ORDER BY date) AS prev_day_revenue,
+    LEAD(revenue) OVER (ORDER BY date) AS next_day_revenue,
+    revenue - LAG(revenue) OVER (ORDER BY date) AS day_over_day_change
+FROM daily_revenue
+ORDER BY date;
+```
+
+Ambas as funções aceitam um deslocamento opcional (padrão 1) e um valor padrão para quando não existe uma linha adjacente:
+
+```sql
+LAG(revenue, 1, 0) OVER (ORDER BY date)  -- use 0 when there's no previous row
+```
+
+## Totais Acumulados e Médias Móveis {#running-totals-and-moving-averages}
+
+Use `ROWS BETWEEN` para definir um quadro — o subconjunto de linhas a incluir no cálculo.
+
+```sql
+SELECT
+    date,
+    amount,
+    -- Running total (all rows from start to current)
+    SUM(amount) OVER (ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+    -- 7-day moving average
+    AVG(amount) OVER (ORDER BY date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving_avg_7d
+FROM daily_sales;
+```
+
+Especificações de quadro comuns:
+
+| Quadro | Significado |
+|:------|:--------|
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | Da primeira linha até a atual (total acumulado) |
+| `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` | A linha atual mais as 6 anteriores (janela de 7 linhas) |
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` | A partição inteira |
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Posso filtrar pelo resultado de uma função de janela em uma cláusula WHERE? {#can-i-filter-on-a-window-function-result-in-a-where-clause}
+
+Não — as funções de janela são avaliadas depois do `WHERE`. Para filtrar pelo resultado de uma função de janela, envolva a consulta em uma subconsulta ou CTE:
+
+```sql
+SELECT * FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+    FROM orders
+) t
+WHERE rn = 1;
+```
+
+#### Qual é a diferença entre ROWS e RANGE na cláusula de quadro? {#whats-the-difference-between-rows-and-range-in-the-frame-clause}
+
+`ROWS` conta linhas físicas. `RANGE` agrupa as linhas com o mesmo valor de `ORDER BY`. Para a maioria dos casos de uso (totais acumulados, médias móveis), `ROWS` dá o comportamento esperado. `RANGE` pode produzir resultados surpreendentes quando há empates na coluna de ordenação.
+
+#### As funções de janela funcionam com índices? {#do-window-functions-work-with-indexes}
+
+As funções de janela não usam índices para o cálculo da janela em si, mas a consulta ainda pode usar índices para a cláusula `WHERE`, reduzindo as linhas processadas. Consultas de janela complexas se beneficiam de [Lendo o EXPLAIN no MySQL](/pt-BR/guides/reading-explain) para entender o plano de execução.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1064` na sintaxe de função de janela | Você está executando uma versão antiga do MySQL, anterior ao suporte a funções de janela — verifique com `SELECT VERSION()` |
+| Resultado de função de janela na cláusula WHERE falhando | Mova o filtro para uma consulta externa ou CTE — o WHERE não pode referenciar funções de janela |
+| `RANK()` pulando números inesperadamente | Comportamento esperado — use `DENSE_RANK()` se você não quiser lacunas |
+| Consulta com função de janela lenta | Adicione um índice nas colunas de `PARTITION BY` e `ORDER BY` para acelerar a ordenação |
+
+## Veja também {#see-also}
+
+- [Quando uma CTE do MySQL supera uma tabela derivada](/pt-BR/guides/ctes-in-mysql) — comumente combinada com funções de janela para análises em várias etapas
+- [Desempenho do GROUP BY no MySQL](/pt-BR/guides/group-by-having) — o tipo de agregação que colapsa linhas, e o que ele custa
+- [GROUP BY no MySQL](/pt-BR/tutorial/group-by) — a lição do tutorial sobre a cláusula em si

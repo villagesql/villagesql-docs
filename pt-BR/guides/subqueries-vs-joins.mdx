@@ -1,0 +1,152 @@
+---
+title: "Subconsultas vs JOINs no MySQL"
+sidebarTitle: "Comparando Subconsultas e JOINs"
+description: "Quando usar subconsultas vs JOINs no MySQL: subconsultas correlacionadas vs não correlacionadas, EXISTS vs IN, diferenças de desempenho e como o otimizador do MySQL trata cada abordagem."
+keywords: "mysql subquery vs join, mysql subquery performance, mysql semi join, mysql rewrite subquery as join, mysql subquery optimizer, mysql join or subquery faster"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Subconsultas e JOINs muitas vezes produzem o mesmo resultado. A escolha entre eles importa para a legibilidade, para a corretude com NULLs e — em alguns casos — para o desempenho.
+
+## Tipos de Subconsultas {#types-of-subqueries}
+
+Uma **subconsulta não correlacionada** é executada uma vez, e seu resultado é usado pela consulta externa:
+
+```sql
+-- Runs once: find all orders over the average amount
+SELECT id, amount
+FROM orders
+WHERE amount > (SELECT AVG(amount) FROM orders);
+```
+
+Uma **subconsulta correlacionada** referencia uma coluna da consulta externa, então ela é executada uma vez por linha:
+
+```sql
+-- Runs once per customer: find customers who have at least one order over $500
+SELECT c.name
+FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+```
+
+Subconsultas correlacionadas podem ser lentas em tabelas grandes — a subconsulta é executada para cada linha da consulta externa. Verifique o `EXPLAIN` para ver como o MySQL as executa.
+
+## IN vs EXISTS vs JOIN {#in-vs-exists-vs-join}
+
+Esses três padrões muitas vezes resolvem o mesmo problema:
+
+```sql
+-- IN subquery
+SELECT name FROM customers
+WHERE id IN (SELECT customer_id FROM orders WHERE amount > 500);
+
+-- EXISTS
+SELECT name FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id AND o.amount > 500
+);
+
+-- JOIN (with DISTINCT to avoid duplicates)
+SELECT DISTINCT c.name
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 500;
+```
+
+| Abordagem | Quando usar |
+|:---------|:------------|
+| `IN (subconsulta)` | A subconsulta retorna uma lista pequena e estática; legível em casos simples |
+| `EXISTS` | Verifica apenas a existência; para na primeira correspondência; seguro com NULLs |
+| `JOIN` | Você precisa de colunas das duas tabelas; o otimizador do MySQL tem mais flexibilidade |
+
+O otimizador do MySQL muitas vezes reescreve `IN (subconsulta)` internamente como um semi-join, então a diferença de desempenho é frequentemente desprezível. Para conjuntos de resultados grandes na subconsulta, `EXISTS` ou um `JOIN` é mais confiável.
+
+## O Problema do NULL com NOT IN {#the-null-problem-with-not-in}
+
+`NOT IN` se comporta de forma inesperada quando a subconsulta retorna qualquer NULL:
+
+```sql
+-- This returns zero rows if ANY customer_id in orders is NULL
+SELECT name FROM customers
+WHERE id NOT IN (SELECT customer_id FROM orders);
+```
+
+Se `orders.customer_id` tem uma única linha NULL, o `NOT IN` inteiro retorna vazio. Esse é o comportamento correto do SQL — `NULL` é desconhecido, então `NOT IN (NULL, 1, 2)` é UNKNOWN para toda comparação. Use `NOT EXISTS` em vez disso:
+
+```sql
+-- Safe: returns customers with no orders, even if some order rows have NULL customer_id
+SELECT name FROM customers c
+WHERE NOT EXISTS (
+    SELECT 1 FROM orders o
+    WHERE o.customer_id = c.id
+);
+```
+
+Para mais sobre o comportamento do NULL no MySQL, consulte [NULL no MySQL](/pt-BR/guides/null-in-mysql).
+
+## Subconsultas em FROM (Tabelas Derivadas) {#subqueries-in-from-derived-tables}
+
+Uma subconsulta na cláusula `FROM` cria uma tabela derivada:
+
+```sql
+SELECT dept, avg_salary
+FROM (
+    SELECT department AS dept, AVG(salary) AS avg_salary
+    FROM employees
+    GROUP BY department
+) dept_stats
+WHERE avg_salary > 80000;
+```
+
+Uma CTE costuma ser mais clara para esse padrão — a lógica recebe um nome e é definida no topo, em vez de aninhada inline. Consulte [Quando uma CTE do MySQL supera uma tabela derivada](/pt-BR/guides/ctes-in-mysql).
+
+## Considerações de Desempenho {#performance-considerations}
+
+O otimizador do MySQL reescreve muitos padrões de subconsulta. Antes de otimizar manualmente:
+
+1. Execute `EXPLAIN` nas versões com subconsulta e com JOIN para ver o que o MySQL realmente executa
+2. Garanta que existam índices nas colunas de junção/correlação — esse costuma ser o gargalo
+3. Reescreva somente se o `EXPLAIN` mostrar uma diferença significativa no plano de execução
+
+| Padrão | Fique atento a |
+|:--------|:----------|
+| Subconsulta correlacionada no SELECT | Executa por linha — pode ser O(n²) em tabelas grandes |
+| `IN (subconsulta)` que retorna um conjunto de resultados grande | Geralmente otimizado pela reescrita em semi-join; verifique o `EXPLAIN` |
+| `NOT IN` com possíveis NULLs | Resultados errados — use `NOT EXISTS` |
+| Tabela derivada no FROM | O otimizador pode ou não mesclá-la; verifique o `EXPLAIN` |
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### JOIN é sempre mais rápido que uma subconsulta? {#is-join-always-faster-than-a-subquery}
+
+Não necessariamente. O otimizador do MySQL 8.0 reescreve `IN (subconsulta)` como semi-joins em muitos casos, produzindo o mesmo plano de execução de um JOIN explícito. Meça com `EXPLAIN` em vez de supor que uma forma é sempre mais rápida.
+
+#### Quando devo usar EXISTS em vez de IN? {#when-should-i-use-exists-instead-of-in}
+
+Use `EXISTS` quando só importa se existe uma correspondência (não quais são os dados correspondentes), quando a subconsulta pode retornar NULLs, ou quando a subconsulta retorna um conjunto de resultados grande. `EXISTS` para na primeira correspondência; `IN` precisa montar a lista completa.
+
+#### O que é um semi-join? {#whats-a-semi-join}
+
+Um semi-join retorna as linhas da tabela da esquerda que têm pelo menos uma linha correspondente na direita — sem produzir linhas duplicadas da tabela da esquerda para várias correspondências. O otimizador do MySQL usa semi-joins internamente para executar `IN (subconsulta)` e `EXISTS` de forma eficiente. Não é possível escrever um semi-join diretamente em SQL, mas tanto `EXISTS` quanto `IN (subconsulta)` levam o otimizador a considerá-lo.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `NOT IN` retorna resultados vazios inesperadamente | NULL no resultado da subconsulta — troque para `NOT EXISTS` |
+| Subconsulta correlacionada muito lenta | Adicione um índice na coluna correlacionada; considere reescrever como JOIN |
+| A mesma consulta é mais rápida como JOIN do que como subconsulta IN | O otimizador pode não reescrever a subconsulta IN — tente reescrever como JOIN |
+| Consulta com tabela derivada lenta | Verifique se o MySQL materializou a tabela derivada — tente reescrever como CTE ou como JOIN. Não recorra a `SQL_NO_CACHE`: o cache de consultas que ele controlava foi removido no MySQL 8.0, então a dica só gera um aviso de descontinuação |
+
+## Veja também {#see-also}
+
+- [Desempenho de JOIN no MySQL e erros comuns](/pt-BR/guides/joins) — o que torna lenta a parte do JOIN nessa comparação
+- [Quando uma CTE do MySQL supera uma tabela derivada](/pt-BR/guides/ctes-in-mysql) — uma alternativa mais limpa a subconsultas profundamente aninhadas
+- [Subconsultas no MySQL](/pt-BR/tutorial/subqueries) e [subconsultas correlacionadas](/pt-BR/tutorial/correlated-subqueries) — as lições do tutorial sobre como escrevê-las
+- [MySQL EXISTS](/pt-BR/tutorial/exists) — a forma que nunca multiplica linhas

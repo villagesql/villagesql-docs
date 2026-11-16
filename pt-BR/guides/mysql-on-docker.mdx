@@ -1,0 +1,243 @@
+---
+title: "MySQL no Docker"
+sidebarTitle: "Executando no Docker"
+description: "Como executar o MySQL 8.4 ou o VillageSQL no Docker — configuração da imagem oficial, volumes nomeados persistentes, configuração de vários serviços com Docker Compose, rede entre contêineres e quando o Docker é a escolha certa de implantação em vez da instalação nativa ou da nuvem gerenciada."
+keywords: "mysql docker, mysql docker container, mysql docker compose, mysql official image, mysql docker volume, docker run mysql, mysql container environment variables, mysql docker connect, mysql docker network, mysql docker persistent data, villagesql docker, mysql docker compose volume"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A imagem oficial do MySQL para Docker permite executar um servidor MySQL totalmente configurado em um contêiner. Ela cuida da inicialização, da criação de usuários e da configuração do diretório de dados automaticamente por meio de variáveis de ambiente.
+
+## Início Rápido {#quick-start}
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -e MYSQL_DATABASE=myapp \
+  -e MYSQL_USER=appuser \
+  -e MYSQL_PASSWORD=apppass \
+  -p 3306:3306 \
+  -d mysql:8.4
+```
+
+Conecte-se a partir da máquina host:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u appuser -p myapp
+```
+
+Ou conecte-se dentro do contêiner:
+
+```bash
+docker exec -it mysql-dev mysql -u root -p
+```
+
+## Variáveis de Ambiente {#environment-variables}
+
+| Variável | Obrigatória | Descrição |
+|:---------|:---------|:------------|
+| `MYSQL_ROOT_PASSWORD` | Sim (ou use `ALLOW_EMPTY_PASSWORD`) | Senha do usuário root |
+| `MYSQL_DATABASE` | Não | Banco de dados a criar na inicialização |
+| `MYSQL_USER` | Não | Usuário não root a criar |
+| `MYSQL_PASSWORD` | Não | Senha de `MYSQL_USER` |
+| `MYSQL_ALLOW_EMPTY_PASSWORD` | Não | Defina como `yes` para permitir senha de root vazia (somente desenvolvimento) |
+| `MYSQL_RANDOM_ROOT_PASSWORD` | Não | Defina como `yes` para gerar uma senha de root aleatória (registrada no stdout) |
+| `MYSQL_ONETIME_PASSWORD` | Não | Defina como `yes` para exigir a troca de senha no primeiro login |
+
+`MYSQL_USER` e `MYSQL_PASSWORD` precisam ser definidos juntos. O usuário criado recebe acesso total a `MYSQL_DATABASE`.
+
+## Dados Persistentes com Volumes {#persistent-data-with-volumes}
+
+Sem um volume, todos os dados são perdidos quando o contêiner é removido. Monte um volume para persistir o diretório de dados:
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v mysql-data:/var/lib/mysql \
+  -p 3306:3306 \
+  -d mysql:8.4
+```
+
+O volume nomeado (`mysql-data`) persiste entre reinicializações e remoções do contêiner. Para usar um diretório do host em vez disso:
+
+```bash
+-v /path/on/host:/var/lib/mysql
+```
+
+O diretório de dados é dono dos dados e dos logs do MySQL. Nunca compartilhe um volume entre dois contêineres MySQL em execução.
+
+## Escolhendo uma Imagem e uma Estratégia de Volume {#choosing-an-image-and-volume-strategy}
+
+| | `mysql:8.4` oficial | `villagesql/server:latest` |
+|:---|:---|:---|
+| Base | MySQL 8.4 | Fork que acompanha o MySQL 8.4 |
+| Extensões | Nenhuma embutida | Framework VEF; instale bundles `.veb` |
+| Substituto direto | — | Sim — mesmo protocolo de rede, mesmas ferramentas de cliente |
+| Disponibilidade da imagem | Docker Hub | Docker Hub (`villagesql/server`) |
+| Use quando | Carga de trabalho MySQL padrão | Precisa de tipos personalizados, funções VDF ou extensões VEF |
+
+| Tipo de volume | Persistência | Desempenho | Portabilidade |
+|:---|:---|:---|:---|
+| Volume nomeado (`-v mysql-data:/var/lib/mysql`) | Sobrevive a `docker rm` | Gerenciado pelo Docker; bom em todas as plataformas | Fácil de fazer backup com os comandos `docker volume` |
+| Bind mount (`-v /host/path:/var/lib/mysql`) | Sobrevive à remoção do contêiner | Mais lento no macOS/Windows (tradução de sistema de arquivos) | Acesso direto pelo host; mais fácil de inspecionar os arquivos |
+| Sem volume (camada do contêiner) | Perdido em `docker rm` | Gravações mais rápidas (efêmero) | Somente dev/teste — nunca para dados que você quer manter |
+
+Para a maioria das cargas de trabalho, os volumes nomeados são o padrão certo. Os bind mounts são úteis quando você precisa inspecionar ou editar o diretório de dados diretamente a partir do host, mas o custo de desempenho importa no macOS e no Windows.
+
+## Docker Compose {#docker-compose}
+
+Para ambientes de desenvolvimento com vários serviços, o Docker Compose é a abordagem padrão:
+
+```yaml
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: myapp
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppass
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: myapp
+      DB_USER: appuser
+      DB_PASSWORD: apppass
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+```
+
+O `healthcheck` com `depends_on: condition: service_healthy` garante que o contêiner da aplicação não inicie até que o MySQL esteja pronto para aceitar conexões — e não apenas iniciado.
+
+## Configuração Personalizada {#custom-configuration}
+
+Passe um `my.cnf` personalizado montando-o:
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v /path/to/my.cnf:/etc/mysql/conf.d/custom.cnf:ro \
+  -d mysql:8.4
+```
+
+Ou defina as opções diretamente por argumentos de comando:
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -d mysql:8.4 \
+  --innodb-buffer-pool-size=512M \
+  --max-connections=200
+```
+
+## Scripts de Inicialização {#initialization-scripts}
+
+O contêiner executa qualquer arquivo `.sql` ou `.sh` colocado em `/docker-entrypoint-initdb.d/` na primeira inicialização (quando o diretório de dados está vazio):
+
+```bash
+docker run --name mysql-dev \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -v /path/to/init-scripts:/docker-entrypoint-initdb.d:ro \
+  -d mysql:8.4
+```
+
+Os arquivos SQL são executados como root. Os scripts de shell rodam no ambiente do contêiner. Esses scripts só rodam na primeira inicialização — e não nas inicializações seguintes do contêiner.
+
+## Conectando a partir de Aplicações {#connecting-from-applications}
+
+Dentro de uma rede do Docker Compose, os contêineres se conectam ao MySQL pelo nome do serviço:
+
+```
+DB_HOST=db   # service name in docker-compose.yml
+DB_PORT=3306
+```
+
+A partir da máquina host, conecte-se por `127.0.0.1` (e não `localhost` — o socket do MySQL não está disponível no host):
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=3306
+```
+
+## Quando Executar o MySQL no Docker {#when-to-run-mysql-in-docker}
+
+| Cenário | Docker | Instalação nativa | Nuvem gerenciada (RDS, Cloud SQL) |
+|:---|:---|:---|:---|
+| Desenvolvimento local | Melhor escolha — isolado, reproduzível, fácil de desmontar | Funciona, mas é mais difícil de reiniciar do zero | Exagero; adiciona custo e latência de rede |
+| Pipelines de CI/CD | Melhor escolha — sobe uma instância nova a cada execução | Possível, mas mais lento de provisionar | Possível; adiciona custo por execução |
+| Ambiente de staging | Bom — espelha a topologia de produção no Compose | Bom se o host for dedicado | Bom se a produção também for gerenciada |
+| Produção (servidor único) | Bom com volumes nomeados + backups adequados | Bom; operação um pouco mais simples | Adiciona backups gerenciados, HA, failover |
+| Produção (alta disponibilidade) | Precisa de orquestração (Kubernetes, Swarm) | Configuração manual de replicação | Melhor escolha — HA embutida |
+| Extensões do VillageSQL necessárias | Use a imagem `villagesql/server` | Compile a partir do código-fonte | Não disponível em serviços gerenciados |
+| Conformidade / residência de dados | Verifique a sua política — os dados ficam no host | Sem ambiguidade — os dados ficam no host | Depende da configuração de região do provedor |
+
+## Considerações para Produção {#production-considerations}
+
+O Docker funciona bem para o MySQL em produção, com algumas ressalvas:
+
+- **Persistência de dados**: Use volumes nomeados ou bind mounts. Nunca deixe os dados do MySQL na camada do contêiner.
+- **Limites de memória**: Defina `--memory` no Docker para impedir que o MySQL esgote a memória do host, e ajuste `innodb_buffer_pool_size` para corresponder.
+- **Backups**: `mysqldump` funciona dentro do contêiner: `docker exec mysql-dev mysqldump -u root -p myapp > backup.sql`
+- **Logs**: Os logs do MySQL vão para stdout/stderr no Docker. Use `docker logs mysql-dev` ou configure o seu driver de logs.
+- **Atualizações**: Baixe a nova tag da imagem, pare o contêiner antigo e inicie o novo com o mesmo volume. O processo de atualização do MySQL roda automaticamente na primeira inicialização com uma versão mais nova.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Por que não consigo me conectar com `mysql -h localhost` a partir do host? {#why-cant-i-connect-with-mysql--h-localhost-from-the-host}
+
+No Linux e no macOS, `localhost` faz o cliente MySQL tentar se conectar pelo socket Unix, que não está disponível no host. Use `127.0.0.1` explicitamente: `mysql -h 127.0.0.1 -P 3306`.
+
+#### Como faço os dados do MySQL persistirem no Docker? {#how-do-i-make-mysql-data-persist-in-docker}
+
+Monte um volume nomeado em `/var/lib/mysql` ao iniciar o contêiner: `-v mysql-data:/var/lib/mysql`. Sem isso, todos os dados são armazenados na camada gravável do contêiner e perdidos quando você executa `docker rm`. Os volumes nomeados sobrevivem à remoção do contêiner e são gerenciados pelo Docker — use `docker volume ls` para listá-los e `docker volume inspect mysql-data` para encontrar o local de armazenamento. No Docker Compose, declare o volume sob a chave `volumes:` de nível superior e referencie-o na lista `volumes:` do serviço (o exemplo na seção Docker Compose acima mostra esse padrão).
+
+#### Como os contêineres no Docker Compose se conectam ao MySQL? {#how-do-containers-in-docker-compose-connect-to-mysql}
+
+Os contêineres no mesmo projeto Compose compartilham uma rede padrão. O contêiner da sua aplicação se conecta ao MySQL usando o nome do serviço como hostname — se o seu serviço de banco de dados se chama `db`, a string de conexão é `host=db port=3306`. Você não precisa expor portas entre os contêineres; o mapeamento de portas (`-p 3306:3306`) só é necessário para conexões a partir da máquina host. Use `depends_on: condition: service_healthy` com um `healthcheck` no serviço do MySQL para impedir que a aplicação inicie antes que o MySQL esteja pronto.
+
+#### Como executo um arquivo SQL em um contêiner em execução? {#how-do-i-run-a-sql-file-against-a-running-container}
+
+```bash
+docker exec -i mysql-dev mysql -u root -p myapp < /path/to/script.sql
+# or from within the container:
+docker exec -it mysql-dev mysql -u root -p myapp -e "SOURCE /tmp/script.sql"
+```
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| O contêiner sai imediatamente | Verifique `docker logs mysql-dev` — `MYSQL_ROOT_PASSWORD` ausente ou problema de permissão no volume |
+| `ERROR 2002: Can't connect to local MySQL server through socket` | Conecte-se por TCP (`-h 127.0.0.1`), e não pelo socket — o socket Unix não está no host |
+| A aplicação inicia antes de o MySQL estar pronto | Adicione um `healthcheck` e use `depends_on: condition: service_healthy` no Compose |
+| Dados perdidos depois de `docker rm` | O volume não foi montado — recrie o contêiner com `-v mysql-data:/var/lib/mysql` |
+| Os scripts de inicialização não rodaram | Eles só rodam quando o diretório de dados está vazio (configuração inicial) — remova o volume e reinicie para reinicializar |
+
+Tudo nesta página também funciona com a imagem `villagesql/server`. O VillageSQL é um substituto direto para o MySQL com extensões, então os arquivos compose, os volumes e as verificações de integridade acima se transferem com uma única mudança de nome de imagem. [Experimente no Docker](https://villagesql.com/install).
+
+## Veja também {#see-also}
+
+- [Fundamentos de Replicação no MySQL](/pt-BR/guides/replication-basics) — executando pares origem/réplica no Docker Compose
+- [Estratégias de Backup no MySQL](/pt-BR/guides/backup-strategies) — fazendo backup dos volumes de dados em um MySQL em contêiner
+- [Atualizando a partir do MySQL](/pt-BR/guides/upgrade) — movendo um contêiner do MySQL para o VillageSQL
+- [Executando o MySQL no Kubernetes](/pt-BR/guides/mysql-on-kubernetes) — o próximo passo na orquestração de contêineres
+- [Instale um servidor para o tutorial de MySQL](/pt-BR/tutorial/install-mysql) — preparando um servidor para aprender SQL

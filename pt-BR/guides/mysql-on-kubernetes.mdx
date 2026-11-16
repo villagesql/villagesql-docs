@@ -1,0 +1,62 @@
+---
+title: "Executando MySQL no Kubernetes"
+sidebarTitle: "MySQL no Kubernetes"
+description: "O que é preciso para executar o MySQL no Kubernetes: StatefulSets versus operators, decisões de armazenamento e uma análise honesta de quando um banco de dados gerenciado é a melhor resposta."
+keywords: "mysql kubernetes, mysql statefulset, mysql operator kubernetes, mysql k8s persistent volume, run database on kubernetes"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O Kubernetes foi construído para cargas de trabalho sem estado, e o MySQL é o oposto disso. Executá-lo lá é totalmente possível e amplamente feito; só significa que o Kubernetes não dá de graça nenhuma das partes difíceis do banco de dados. Este guia cobre os três níveis de comprometimento, as decisões de armazenamento que importam e os casos em que você não deveria fazer isso de jeito nenhum.
+
+## Três Caminhos de Entrada {#three-ways-in}
+
+**Um StatefulSet de instância única.** Um pod MySQL com um PersistentVolumeClaim. Este é o formato certo para ambientes de desenvolvimento, CI e ferramentas internas em que alguns minutos de indisponibilidade na falha de um nó são aceitáveis. É aproximadamente o equivalente no Kubernetes de um contêiner Docker com um volume, e o [guia de Docker](/pt-BR/guides/mysql-on-docker) cobre a configuração do lado do MySQL que se aplica igualmente aqui.
+
+Os pontos essenciais que confundem as pessoas, como aparecem no manifesto:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+spec:
+  replicas: 1            # one writer; MySQL doesn't scale writes by replica count
+  volumeClaimTemplates:  # storage that survives the pod
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+```
+
+Defina a requisição e o limite de memória do pod com o mesmo valor, e dimensione `innodb_buffer_pool_size` dentro dele (50 a 70 por cento do limite). Um pod MySQL que ultrapassa seu limite de memória é morto por OOM no meio de uma escrita; o mesmo modo de falha do Docker, a mesma correção.
+
+**Um operator.** Para qualquer coisa com formato de produção, use um operator em vez de StatefulSets feitos à mão: o MySQL Operator da Oracle, o da Percona, ou o Vitess para escala com sharding. Os operators codificam os runbooks — provisionar réplicas, orquestrar failover, coordenar backups — como controllers. O custo é uma nova dependência com sua própria cadência de atualização e seus próprios modos de falha, que você precisa entender antes de um incidente, não durante.
+
+**Um banco de dados gerenciado ao lado do cluster.** Execute a aplicação no Kubernetes e aponte-a para o RDS, o Cloud SQL ou outro MySQL gerenciado. Esta é a resposta padrão para equipes pequenas: outra pessoa cuida dos backups, do failover e das atualizações, e seu cluster permanece sem estado.
+
+## O Armazenamento É a Decisão Que Importa {#storage-is-the-decision-that-matters}
+
+- **Sempre um PVC, nunca `emptyDir`.** Um volume `emptyDir` morre com o pod, e pods MySQL são reagendados por motivos que não têm nada a ver com você.
+- **Prefira uma storage class baseada em armazenamento de bloco em rede** (EBS, PD e equivalentes). `ReadWriteOnce` é exatamente o que um banco de dados quer; um sistema de arquivos em rede (`ReadWriteMany` no estilo NFS) é exatamente o que ele não quer.
+- **NVMe local é mais rápido e mais arriscado.** Volumes locais prendem o pod a um nó; a perda de um nó é uma perda de dados, a menos que a replicação a cubra. Combine armazenamento local apenas com um conjunto de réplicas gerenciado por um operator.
+- **Faça benchmark de IOPS antes de se comprometer.** As storage classes padrão nas grandes nuvens costumam ser provisionadas por capacidade, não por IOPS, e um banco de dados que funcionava bem em um laptop se arrasta em um volume subprovisionado.
+
+## Probes Sem Armadilhas {#probes-without-foot-guns}
+
+Um liveness probe que executa uma consulta pode matar um servidor saudável que está momentaneamente lento (buffer pool frio, DDL longo), e o Kubernetes reiniciar o MySQL no meio de uma recuperação faz a recuperação demorar mais. Mantenha o liveness mínimo (o processo está aceitando TCP?) e coloque a verificação de saúde real (`mysqladmin ping`, atraso de réplica) no readiness probe, que só afeta o roteamento de tráfego.
+
+## Quando Não Fazer Isso {#when-not-to-do-this}
+
+Evite MySQL no Kubernetes quando o banco de dados é a única fonte de verdade do seu produto, quando a equipe não tem ninguém de plantão que conheça os dois sistemas, ou quando existe uma oferta gerenciada na sua nuvem a um custo aceitável. O cálculo honesto: o Kubernetes adiciona superfície operacional exatamente ao componente em que os erros operacionais são menos recuperáveis.
+
+O VillageSQL roda em qualquer lugar em que o MySQL roda, e a imagem `villagesql/server` é um substituto direto de `mysql` em qualquer um dos manifestos acima: mesmo layout de diretório de dados, mesma porta, mesmos clientes.
+
+## Veja também {#see-also}
+
+- [MySQL no Docker](/pt-BR/guides/mysql-on-docker) — os fundamentos de contêineres sobre os quais o Kubernetes se apoia
+- [Fundamentos de replicação](/pt-BR/guides/replication-basics) — o que um operator automatiza para você
+- [Estratégias de backup](/pt-BR/guides/backup-strategies) — backups continuam existindo; um snapshot de PVC não é uma política de backup

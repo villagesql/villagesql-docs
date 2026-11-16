@@ -1,0 +1,204 @@
+---
+title: "Estratégias de Backup do MySQL"
+sidebarTitle: "Planejando Backups"
+description: "Como fazer backup de bancos de dados MySQL: mysqldump para backups lógicos, os utilitários de dump do MySQL Shell, recuperação pontual baseada em logs binários e boas práticas de backup para sistemas de produção."
+keywords: "mysql backup, mysqldump, mysql backup strategy, mysql point in time recovery, mysql backup restore, mysql dump database, mysql incremental backup, mysql backup best practices, mysql backup automation, mysql backup compression, mysql point in time recovery binlog, mysqlpump, mysql shell dump, percona xtrabackup"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma estratégia de backup do MySQL tem duas partes: tirar um snapshot consistente dos seus dados (o backup completo) e ter uma forma de reproduzir as mudanças feitas depois desse snapshot (recuperação pontual). As ferramentas certas dependem do tamanho do banco de dados, do tempo de recuperação aceitável e de quantos dados você pode se permitir perder.
+
+## mysqldump — Backups Lógicos {#mysqldump--logical-backups}
+
+O `mysqldump` exporta os dados como instruções SQL. É o formato mais portátil e funciona para bancos de dados de qualquer tamanho, embora seja mais lento para restaurar do que os backups binários em conjuntos de dados grandes.
+
+**Fazer backup de um único banco de dados:**
+
+```bash
+mysqldump -u root -p myapp > myapp_backup.sql
+```
+
+**Fazer backup de todos os bancos de dados:**
+
+```bash
+mysqldump -u root -p --all-databases > all_databases.sql
+```
+
+**Flags recomendadas para InnoDB:**
+
+```bash
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --routines \
+  --triggers \
+  --events \
+  -u root -p myapp > myapp_backup.sql
+```
+
+| Flag | Finalidade |
+|:-----|:--------|
+| `--single-transaction` | Snapshot consistente sem bloquear tabelas (somente InnoDB) |
+| `--source-data=2` | Registra a posição do binlog como comentário — necessário para PITR |
+| `--routines` | Inclui stored procedures e funções |
+| `--triggers` | Inclui triggers (ativo por padrão, mas explícito é mais claro) |
+| `--events` | Inclui eventos agendados |
+
+Sem `--single-transaction`, o mysqldump bloqueia as tabelas com `LOCK TABLES`, o que bloqueia escritas durante todo o dump.
+
+**Restaurar a partir de um dump:**
+
+```bash
+mysql -u root -p myapp < myapp_backup.sql
+```
+
+Para restaurar todos os bancos de dados: `mysql -u root -p < all_databases.sql`
+
+## Recuperação Pontual com Logs Binários {#point-in-time-recovery-with-binary-logs}
+
+Os backups completos só protegem você até o momento do último backup. O log binário permite reproduzir cada mudança feita depois que o backup foi tirado.
+
+**Requisitos:**
+- Log binário habilitado (`log_bin = ON`)
+- `--source-data=2` usado ao tirar o backup (registra a posição inicial do binlog)
+
+**Fluxo de trabalho:**
+
+1. Restaure o backup completo:
+```bash
+mysql -u root -p < myapp_backup.sql
+```
+
+2. Encontre a posição inicial do binlog no arquivo de dump:
+```bash
+head -50 myapp_backup.sql | grep "SOURCE_LOG_FILE"
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='mysql-bin.000003', SOURCE_LOG_POS=154;
+```
+
+3. Reproduza os logs binários até o ponto imediatamente anterior ao evento que você quer desfazer:
+```bash
+mysqlbinlog \
+  --start-position=154 \
+  --stop-datetime="2024-06-15 11:59:00" \
+  mysql-bin.000003 mysql-bin.000004 | mysql -u root -p
+```
+
+Consulte [Log Binário do MySQL](/pt-BR/guides/binary-logging) para todos os detalhes sobre as opções do mysqlbinlog.
+
+## Utilitários de Dump do MySQL Shell {#mysql-shell-dump-utilities}
+
+O MySQL Shell (`mysqlsh`) oferece utilitários de dump e carga mais rápidos do que o `mysqldump`. Eles usam threads paralelas e produzem uma saída comprimida, o que os torna práticos para bancos de dados grandes.
+
+```bash
+# Dump a single schema
+mysqlsh root@localhost -- util dump-schemas '["myapp"]' --outputUrl=/backups/myapp
+
+# Load it back
+mysqlsh root@localhost -- util load-dump /backups/myapp
+```
+
+Os utilitários de dump do MySQL Shell comprimem a saída por padrão (zstd) e podem paralelizar tanto o dump quanto a carga entre vários núcleos de CPU. Para bancos de dados maiores do que alguns GB, a diferença de velocidade em relação ao `mysqldump` é significativa.
+
+## Comparação dos Métodos de Backup {#backup-methods-compared}
+
+| Método | Tamanho do backup | Velocidade do backup | Velocidade da restauração | Consistência | Compatibilidade com MySQL |
+|:-------|:-----------|:-------------|:-------------|:------------|:-------------------|
+| `mysqldump` | Grande (SQL puro) | Lento | Lenta (executa o SQL novamente) | Snapshot consistente (`--single-transaction`) | Qualquer versão do MySQL |
+| `mysqlpump` | Grande (SQL puro) | Mais rápido (dump paralelo) | Lenta (executa o SQL novamente) | Consistência somente por tabela | Removido no 8.4 — o binário não é distribuído |
+| Dump do MySQL Shell | Pequeno (comprimido com zstd) | Rápido (paralelo, comprimido) | Rápida (carga paralela) | Snapshot consistente | MySQL 8.0+ |
+| Percona XtraBackup | Grande (cópia física) | Rápido (cópia a quente, ciente do InnoDB) | Muito rápida (cópia de arquivos) | Consistência completa do InnoDB | Mesma versão principal |
+| Cópia de arquivos a frio | Grande (cópia física) | Rápido | Muito rápida (cópia de arquivos) | Consistente somente se o servidor estiver parado | Mesma versão do MySQL |
+
+O `mysqldump` continua sendo a escolha padrão para portabilidade e simplicidade. O dump do MySQL Shell substituiu na prática o `mysqlpump` para bancos de dados grandes — é mais rápido, produz arquivos menores e suporta MySQL 8.0+. O `mysqlpump` foi removido no MySQL 8.4 — o binário não está na build, então qualquer script que o chame falha de imediato.
+
+Para bancos de dados de produção com mais de ~50 GB em que o tempo de restauração importa, o Percona XtraBackup ou o dump do MySQL Shell são as escolhas práticas.
+
+### Quando usar cada método {#when-to-use-each-method}
+
+| Método | Use quando | Evite quando |
+|:-------|:---------|:-----------|
+| `mysqldump` | A portabilidade é necessária; migração entre versões do MySQL; o banco de dados tem menos de ~10 GB; você quer um backup legível por humanos | O banco de dados é grande e o tempo de restauração é crítico; você precisa de janelas de backup de menos de um minuto |
+| Dump do MySQL Shell | O banco de dados é grande (10 GB+); você quer carga paralela com compressão | O MySQL Shell não está instalado ou não é permitido |
+| `mysqlpump` | (Removido no MySQL 8.4 — o binário não é distribuído. Use o dump do MySQL Shell em vez dele.) | — |
+| Percona XtraBackup | Bancos de dados InnoDB muito grandes; você precisa de backups físicos a quente com impacto mínimo no desempenho; a velocidade de restauração é crítica | Mecanismos de armazenamento mistos (MyISAM); você não pode instalar ferramentas de terceiros; bancos de dados menores em que a complexidade não se justifica |
+| Cópia de arquivos a frio | Ambientes de desenvolvimento/teste; servidores offline; um snapshot rápido antes de uma migração arriscada | Servidores de produção que não toleram tempo de inatividade; qualquer situação em que o servidor precisa continuar no ar |
+
+## Agendando Backups {#scheduling-backups}
+
+Um cron job que executa um dump noturno é a configuração de produção mais comum:
+
+```bash
+# /etc/cron.d/mysql-backup
+0 2 * * * mysql_user /usr/local/bin/mysql-backup.sh
+```
+
+```bash
+#!/bin/bash
+# mysql-backup.sh
+DATE=$(date +%Y-%m-%d)
+BACKUP_DIR=/backups/mysql
+
+mysqldump \
+  --single-transaction \
+  --source-data=2 \
+  --all-databases \
+  -u backup_user -p"$MYSQL_BACKUP_PASSWORD" \
+  | gzip > "$BACKUP_DIR/all_databases_$DATE.sql.gz"
+
+# Keep 14 days of backups
+find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
+```
+
+O usuário de backup precisa apenas dos privilégios `SELECT`, `LOCK TABLES`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `RELOAD` e `PROCESS` — não de `ALL PRIVILEGES`. Sem `PROCESS`, o `mysqldump` ainda conclui, mas imprime um erro "Access denied ... PROCESS privilege" no stderr a cada execução enquanto tenta fazer o dump dos metadados de tablespace.
+
+## Verificando Backups {#verifying-backups}
+
+Um backup que você não testou não é um backup. Verifique regularmente:
+
+```bash
+# Test restore to a separate instance
+mysql -u root -p --host=test-server < all_databases.sql
+
+# Quick sanity check — verify row counts
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
+mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+```
+
+Testes de restauração automatizados pelo menos uma vez por mês detectam corrupção, problemas de permissão e problemas de espaço em disco antes que eles tenham consequências.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### `--single-transaction` funciona com todos os mecanismos de armazenamento? {#does---single-transaction-work-with-all-storage-engines}
+
+Não. `--single-transaction` usa um snapshot de leitura consistente, que só o InnoDB suporta. As tabelas MyISAM no mesmo banco de dados ainda são bloqueadas com `LOCK TABLES` durante o dump. Se você tem mecanismos mistos, `--single-transaction` sozinho não é suficiente para um dump totalmente consistente.
+
+#### Por quanto tempo devo reter os backups? {#how-long-should-i-retain-backups}
+
+No mínimo: backups diários por 7 a 14 dias, backups semanais por 4 semanas, backups mensais por um ano. A retenção depende dos requisitos regulatórios e de até quando no passado você pode precisar recuperar. Os logs binários devem ser retidos por tempo suficiente para cobrir o intervalo entre o backup retido mais antigo e agora.
+
+#### Copiar o diretório de dados é um backup válido? {#is-copying-the-data-directory-a-valid-backup}
+
+Somente se o servidor for desligado antes (cópia a frio). Um servidor MySQL em execução grava os arquivos de dados de uma forma que não é segura para cópia direta — você obterá um backup corrompido. Para backups a quente sem parar o servidor, use o utilitário de dump do MySQL Shell ou o Percona XtraBackup.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| O `mysqldump` trava em tabelas grandes | Adicione `--quick` para transmitir as linhas uma de cada vez em vez de armazenar a tabela inteira em memória |
+| A restauração falha com `ERROR 1824: Failed to open the referenced table` (ou `ERROR 1452` em uma linha) | O `mysqldump` já envolve sua saída em `SET FOREIGN_KEY_CHECKS=0` por padrão, então um dump completo restaurado como está não atinge esse erro. Ele aparece ao restaurar um dump editado à mão ou parcial (somente algumas tabelas extraídas, ou as linhas de verificação de FK removidas) — nesse caso, adicione `SET FOREIGN_KEY_CHECKS=0;` no início |
+| O arquivo de dump é grande demais | Use compressão: `mysqldump ... \| gzip > backup.sql.gz`; restaure com `zcat backup.sql.gz \| mysql ...` |
+| A recuperação pontual deixou mudanças de fora | Os arquivos de log binário têm uma lacuna — confirme que todos os arquivos de log do intervalo foram reproduzidos em sequência |
+| O usuário de backup não consegue fazer dump dos triggers | Conceda o privilégio `TRIGGER`: `GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |
+
+Seus scripts de backup sobrevivem intactos a uma troca para o [VillageSQL](https://villagesql.com/install). Ele é um substituto direto do MySQL, então os comandos mysqldump, as configurações de log binário e os runbooks de restauração deste guia funcionam como estão.
+
+## Veja também {#see-also}
+
+- [Log Binário do MySQL](/pt-BR/guides/binary-logging) — os logs binários alimentam a recuperação pontual
+- [Fundamentos de Replicação do MySQL](/pt-BR/guides/replication-basics) — a replicação depende da mesma infraestrutura de log binário
+- [MySQL no Docker](/pt-BR/guides/mysql-on-docker) — backups e volumes para MySQL em contêineres
+- [Atualizando a partir do MySQL](/pt-BR/guides/upgrade) — tirando o backup com o qual uma atualização para o VillageSQL começa
+- [Atualizando do MySQL 8.0 para o 8.4 Após o Fim da Vida Útil](/pt-BR/guides/mysql-80-eol-upgrade) — a atualização do 8.0 para o 8.4 que esses backups protegem

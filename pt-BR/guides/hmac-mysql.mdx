@@ -1,0 +1,158 @@
+---
+title: "Assinaturas HMAC no MySQL"
+sidebarTitle: "Criando Assinaturas HMAC"
+description: "Como calcular e verificar assinaturas HMAC no MySQL usando a função hmac() do VillageSQL — para verificação de webhooks, integridade de dados e detecção de adulteração."
+keywords: "mysql hmac, mysql hmac sha256, mysql data integrity signature, mysql webhook verification, mysql tamper detection, mysql hmac function"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Um hash diz como os dados se parecem. Um HMAC diz que os dados vieram de alguém que conhece a chave secreta. A diferença importa quando você está verificando que uma linha não foi adulterada, que um payload de webhook é autêntico, ou que um token foi gerado pelo seu sistema e não forjado. O MySQL não tem uma função HMAC embutida — a resposta padrão é calculá-lo no código da aplicação. A `hmac()` do VillageSQL permite fazer isso em SQL.
+
+## O Problema: Sem HMAC Embutido {#the-problem-no-built-in-hmac}
+
+O MySQL tem `SHA2()` e `MD5()` para hashing, mas nada que receba uma chave. O HMAC (Hash-based Message Authentication Code) usa um segredo compartilhado para produzir um código de autenticação — ele é fundamentalmente diferente de um hash simples porque alguém sem a chave não consegue reproduzi-lo.
+
+A abordagem típica é calcular os HMACs na aplicação antes de gravar no banco de dados:
+
+```python
+# Python: compute HMAC in app code before writing
+import hmac, hashlib
+sig = hmac.new(b'secret_key', row_data.encode(), hashlib.sha256).hexdigest()
+db.execute("INSERT INTO audit_log (data, signature) VALUES (?, ?)", (row_data, sig))
+```
+
+Isso funciona, mas significa que cada caminho de gravação — cada linguagem, serviço e carregador em massa — precisa replicar a lógica de assinatura. Um script de migração que contorna a aplicação vai gravar linhas sem assinatura.
+
+## Com o VillageSQL: hmac() em SQL {#with-villagesql-hmac-in-sql}
+
+A extensão `vsql_crypto` do VillageSQL adiciona `hmac(data, key, algorithm)`, que retorna um código de autenticação `VARBINARY` calculado inteiramente no MySQL.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+### Assinando linhas em um trigger {#signing-rows-in-a-trigger}
+
+Use um trigger para assinar cada linha no momento da gravação, independentemente de qual caminho da aplicação a criou:
+
+```sql
+CREATE TABLE audit_log (
+    id        INT AUTO_INCREMENT PRIMARY KEY,
+    event     VARCHAR(255),
+    payload   TEXT,
+    signature VARBINARY(32),   -- 32 bytes for HMAC-SHA256
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Sign every insert automatically
+DELIMITER $$
+CREATE TRIGGER sign_audit_log
+BEFORE INSERT ON audit_log
+FOR EACH ROW
+BEGIN
+    SET NEW.signature = hmac(
+        CONCAT(NEW.event, '|', COALESCE(NEW.payload, '')),
+        'your-hmac-secret-key',
+        'sha256'
+    );
+END$$
+DELIMITER ;
+```
+
+```sql
+INSERT INTO audit_log (event, payload)
+VALUES ('user.login', '{"user_id": 42, "ip": "10.0.1.5"}');
+
+-- Verify a row hasn't been tampered with
+SELECT
+    event,
+    payload,
+    signature = hmac(
+        CONCAT(event, '|', COALESCE(payload, '')),
+        'your-hmac-secret-key',
+        'sha256'
+    ) AS valid
+FROM audit_log;
+```
+
+### Verificando payloads de webhook {#verifying-webhook-payloads}
+
+Se a sua aplicação armazena os payloads de webhook recebidos, você pode verificar as assinaturas diretamente em SQL antes de processá-los:
+
+```sql
+-- Webhook arrives with header X-Signature: <hex>
+-- Store the raw payload and verify before processing
+SELECT
+    payload,
+    HEX(hmac(payload, 'webhook-secret', 'sha256')) AS expected_sig,
+    incoming_sig = HEX(hmac(payload, 'webhook-secret', 'sha256')) AS valid
+FROM webhook_queue
+WHERE id = 1;
+```
+
+### Algoritmos suportados {#supported-algorithms}
+
+| Algoritmo | Chamada | Use quando |
+|:---|:---|:---|
+| HMAC-SHA256 | `hmac(data, key, 'sha256')` | Uso geral — padrão recomendado |
+| HMAC-SHA512 | `hmac(data, key, 'sha512')` | Margem de segurança maior necessária |
+| HMAC-SHA1 | `hmac(data, key, 'sha1')` | Somente compatibilidade com sistemas legados |
+| HMAC-MD5 | `hmac(data, key, 'md5')` | Somente compatibilidade com sistemas legados |
+
+Use HMAC-SHA256 para código novo. A construção HMAC não herda as vulnerabilidades de colisão do hash subjacente, então o HMAC-SHA1 não está quebrado da forma que o SHA-1 simples está — mas o SHA-1 está obsoleto e os reguladores o tratam como legado. Não o use em código novo.
+
+## HMAC vs. Hash Simples {#hmac-vs-plain-hash}
+
+| | Hash simples (`digest()`) | HMAC (`hmac()`) |
+|:---|:---|:---|
+| **Recebe uma chave** | Não | Sim |
+| **Forjável sem a chave** | Sim — qualquer um pode gerar o hash dos mesmos dados | Não |
+| **Use para** | Checksums, deduplicação, fingerprinting | Autenticação, detecção de adulteração, assinaturas |
+| **Verificável por** | Qualquer um | Somente quem possui a chave |
+
+Se os dados que você está protegendo são públicos, um hash simples não prova nada. Use HMAC quando precisar provar que os dados foram produzidos por alguém que conhece o segredo. Para hashing sem chave, consulte [Gerando Hash de Dados no MySQL](/pt-BR/guides/hashing-data).
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Armazenar a chave HMAC no trigger é seguro? {#is-storing-the-hmac-key-in-the-trigger-safe}
+
+Não — ela fica fixa na definição do trigger, visível para qualquer pessoa com acesso a `SHOW CREATE TRIGGER`. Em produção, obtenha a chave de um caminho de configuração seguro ou passe-a como uma variável de sessão definida pela aplicação na conexão. Trate a chave como uma credencial.
+
+#### Posso usar HMAC para verificar que os resultados de consultas não foram alterados em trânsito? {#can-i-use-hmac-to-verify-query-results-havent-been-altered-in-transit}
+
+O HMAC protege contra modificações não autorizadas, não contra espionagem. Para proteção em trânsito, use TLS na sua conexão MySQL. O HMAC é útil para detectar adulteração depois que os dados chegam ao banco de dados.
+
+#### Como faço para rotacionar a chave HMAC? {#how-do-i-rotate-the-hmac-key}
+
+Assine novamente todas as linhas existentes com a nova chave antes de trocar:
+
+```sql
+UPDATE audit_log
+SET signature = hmac(
+    CONCAT(event, '|', COALESCE(payload, '')),
+    'new-hmac-key',
+    'sha256'
+);
+-- Then update the key in your application/trigger
+```
+
+#### hmac() retorna a mesma saída para as mesmas entradas? {#does-hmac-return-the-same-output-for-the-same-inputs}
+
+Sim — o HMAC é determinístico. Os mesmos dados + a mesma chave + o mesmo algoritmo sempre produzem o mesmo resultado. É isso que faz a verificação funcionar.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.hmac does not exist` | Execute `INSTALL EXTENSION vsql_crypto` |
+| `hmac()` retorna NULL | Verifique se há NULL no argumento de dados ou de chave, ou um nome de algoritmo não suportado |
+| A verificação sempre retorna 0 | Verifique se a string de dados é idêntica byte a byte ao que foi assinado — espaços em branco, codificação e tratamento de NULL importam |
+| A coluna de assinatura fica cheia de NULLs | O trigger está em execução, mas a chave ou os dados são NULL — adicione `COALESCE` em torno dos campos anuláveis |
+
+## Veja também {#see-also}
+
+- [Gerando Hash de Dados no MySQL](/pt-BR/guides/hashing-data) — hashing sem chave para fingerprints e deduplicação
+- [Enviando Webhooks a partir de Triggers](/pt-BR/guides/http-webhooks) — o HMAC é a forma padrão de assinar payloads de webhook

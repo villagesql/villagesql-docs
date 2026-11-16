@@ -1,0 +1,190 @@
+---
+title: "Deadlocks no MySQL"
+sidebarTitle: "Evitando Deadlocks"
+description: "Como os deadlocks acontecem no MySQL, como o InnoDB os detecta e resolve, como ler o log de deadlock e padrões para prevenir deadlocks na sua aplicação."
+keywords: "mysql deadlock, mysql innodb deadlock, mysql deadlock error 1213, mysql deadlock detection, mysql show engine innodb status, mysql deadlock prevention, mysql lock wait timeout"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Um deadlock acontece quando duas transações seguram, cada uma, um bloqueio de que a outra precisa, e nenhuma delas consegue prosseguir. O InnoDB detecta isso automaticamente e encerra uma das transações — a "vítima" — com `ERROR 1213: Deadlock found when trying to get lock; try restarting transaction`.
+
+## Como os Deadlocks Acontecem {#how-deadlocks-happen}
+
+O padrão clássico: duas transações bloqueiam linhas em ordem oposta.
+
+```sql
+-- Transaction A: locks row 1, then tries to lock row 2
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- locks row 1
+-- (Transaction B runs here and locks row 2)
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- waits for B's lock on row 2
+
+-- Transaction B: locks row 2, then tries to lock row 1
+BEGIN;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- locks row 2
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- waits for A's lock on row 1
+-- Deadlock: A waits for B, B waits for A
+```
+
+O detector de deadlock do InnoDB encontra o ciclo e reverte a transação com menos recursos bloqueados (ou a que fez menos trabalho).
+
+## Lendo o Log de Deadlock {#reading-the-deadlock-log}
+
+O deadlock mais recente está sempre disponível na saída de status do InnoDB:
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+```
+
+Procure a seção `LATEST DETECTED DEADLOCK`. Ela mostra as duas transações, quais bloqueios elas seguravam, quais bloqueios estavam esperando e qual transação foi revertida.
+
+```
+------------------------
+LATEST DETECTED DEADLOCK
+------------------------
+*** (1) TRANSACTION:
+TRANSACTION 12345, ACTIVE 0 sec starting index read
+MySQL thread id 10, query: UPDATE accounts SET balance = balance + 100 WHERE id = 2
+*** (1) HOLDS THE LOCK(S):
+RECORD LOCKS space id 87 page no 3 n bits 72 index PRIMARY of table accounts trx id 12345 lock_mode X locks rec but not gap
+Record lock, heap no 3 PHYSICAL RECORD: ...
+
+*** (2) TRANSACTION:
+TRANSACTION 12346, ACTIVE 0 sec starting index read
+MySQL thread id 11, query: UPDATE accounts SET balance = balance - 100 WHERE id = 1
+*** (2) HOLDS THE LOCK(S): ...
+*** (2) WAITING FOR THIS LOCK TO BE GRANTED: ...
+*** WE ROLL BACK TRANSACTION (1)
+```
+
+Os pontos principais a extrair:
+- Quais são as duas consultas em conflito
+- Qual tabela e índice estão envolvidos
+- Qual transação foi a vítima (revertida)
+
+## Padrões de Prevenção de Deadlocks {#deadlock-prevention-patterns}
+
+### Bloqueie as linhas em ordem consistente {#lock-rows-in-consistent-order}
+
+O deadlock acima acontece porque A bloqueia a linha 1 e depois a linha 2, enquanto B bloqueia a linha 2 e depois a linha 1. Se as duas transações sempre bloquearem em ordem crescente de ID, o ciclo não consegue se formar:
+
+```sql
+-- Both transactions lock in order: lower ID first
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- lower ID first
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- then higher ID
+COMMIT;
+```
+
+Quando você controla o código da aplicação, imponha uma ordem de bloqueio consistente para operações que tocam várias linhas.
+
+### Mantenha as transações curtas {#keep-transactions-short}
+
+Transações mais longas seguram bloqueios por mais tempo, dando mais tempo para que conflitos surjam. Faça o mínimo de trabalho dentro de uma transação:
+
+```sql
+-- Fetch data outside the transaction, compute, then write in one short transaction
+BEGIN;
+UPDATE orders SET status = 'shipped', shipped_at = NOW() WHERE id = ?;
+COMMIT;
+-- Don't: read+compute+write all inside one long-running transaction
+```
+
+### Use SELECT ... FOR UPDATE para bloquear antes {#use-select--for-update-to-pre-lock}
+
+Se a sua transação vai atualizar uma linha, bloqueie-a no SELECT em vez de descobrir a colisão de bloqueio no UPDATE:
+
+```sql
+BEGIN;
+SELECT * FROM orders WHERE id = 42 FOR UPDATE;  -- acquires write lock now
+-- ... application logic ...
+UPDATE orders SET status = 'processed' WHERE id = 42;
+COMMIT;
+```
+
+Isso não elimina os deadlocks, mas torna a ordem de bloqueio explícita e previsível.
+
+### Tente novamente em caso de deadlock {#retry-on-deadlock}
+
+Deadlocks são esperados em sistemas concorrentes. A resposta correta da aplicação é capturar o `ERROR 1213` e tentar novamente a transação inteira:
+
+```python
+MAX_RETRIES = 3
+for attempt in range(MAX_RETRIES):
+    try:
+        with connection.transaction():
+            do_work()
+        break
+    except DeadlockError:
+        if attempt == MAX_RETRIES - 1:
+            raise
+        time.sleep(0.1 * (attempt + 1))  # brief backoff
+```
+
+Não tente novamente instruções individuais — tente novamente a transação inteira desde o início, porque o InnoDB já a reverteu.
+
+## Gap Locks e Next-Key Locks {#gap-locks-and-next-key-locks}
+
+O InnoDB usa gap locks e next-key locks para evitar leituras fantasmas no nível de isolamento padrão `REPEATABLE READ`. Esses bloqueios mais amplos aumentam a chance de deadlocks.
+
+```sql
+-- Locking a non-existent id doesn't just lock a gap -- it locks up to
+-- the next existing row too (a gap lock, not a plain row lock).
+-- Locking an id that DOES exist takes only a record lock, no gap.
+SELECT * FROM orders WHERE id = 6 FOR UPDATE;
+
+-- Switching to READ COMMITTED reduces gap locking
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+`READ COMMITTED` usa apenas bloqueios de linha (sem gap locks), o que reduz a frequência de deadlocks. O trade-off é que ele permite leituras fantasmas. Para a maioria das cargas de trabalho OLTP, `READ COMMITTED` é uma escolha razoável para operações sensíveis a deadlocks.
+
+## Tempo Limite de Espera por Bloqueio {#lock-wait-timeout}
+
+Nem todo conflito de bloqueio é um deadlock. Se a transação B simplesmente espera pelo bloqueio de A e A é lenta, B atinge o tempo limite após `innodb_lock_wait_timeout` segundos (padrão: 50). O erro é `ERROR 1205: Lock wait timeout exceeded`.
+
+```sql
+SHOW VARIABLES LIKE 'innodb_lock_wait_timeout';
+-- 50 seconds by default
+
+SET SESSION innodb_lock_wait_timeout = 10;
+```
+
+Um tempo limite não é um deadlock — o InnoDB não reverteu a transação que bloqueia, apenas a que esperava.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Como vejo todos os bloqueios atuais e quem está esperando? {#how-do-i-see-all-current-locks-and-whos-waiting}
+
+```sql
+SELECT * FROM performance_schema.data_locks\G
+SELECT * FROM performance_schema.data_lock_waits\G
+```
+
+`data_locks` mostra todos os bloqueios atualmente mantidos ou solicitados. `data_lock_waits` mostra qual thread está bloqueando qual.
+
+#### O InnoDB sempre detecta deadlocks imediatamente? {#does-innodb-always-detect-deadlocks-immediately}
+
+O detector de deadlock do InnoDB executa de forma síncrona quando ocorre um conflito de bloqueio. A detecção é quase instantânea. Você pode desativá-lo com `innodb_deadlock_detect = OFF` e depender apenas de `innodb_lock_wait_timeout`, o que algumas cargas de trabalho de alta concorrência fazem por desempenho, mas isso é incomum.
+
+#### Posso evitar todos os deadlocks? {#can-i-prevent-all-deadlocks}
+
+Não. Deadlocks são uma propriedade fundamental do bloqueio de transações concorrentes. Você pode reduzir a frequência deles com ordem de bloqueio consistente e transações curtas, e deve sempre escrever lógica de nova tentativa para eles.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1213: Deadlock found` | Tente novamente a transação; inspecione `SHOW ENGINE INNODB STATUS` para ver o padrão do conflito de bloqueio |
+| `ERROR 1205: Lock wait timeout exceeded` | Uma transação está segurando um bloqueio por tempo demais; encontre a consulta que bloqueia em `performance_schema.data_lock_waits` |
+| Deadlocks em INSERT, não em UPDATE | Provavelmente conflitos de gap lock em um intervalo de índice; tente o isolamento `READ COMMITTED` ou insira as linhas em uma ordem consistente |
+| O mesmo padrão de deadlock se repete | A ordem de bloqueio na aplicação é inconsistente — encontre os dois caminhos de código e imponha uma ordem canônica |
+| `SHOW ENGINE INNODB STATUS` não mostra nenhum deadlock | O status retém apenas o deadlock mais recente; ative o registro persistente de deadlocks no log de erros: `SET GLOBAL innodb_print_all_deadlocks = ON` |
+
+## Veja também {#see-also}
+
+- [Transações no MySQL](/pt-BR/guides/transactions) — o modelo de transações que torna os deadlocks possíveis
+- [Como o InnoDB Armazena Dados](/pt-BR/guides/innodb-storage) — como o bloqueio em nível de linha do InnoDB funciona por baixo dos panos

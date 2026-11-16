@@ -1,0 +1,229 @@
+---
+title: "Next.js e Prisma com MySQL"
+sidebarTitle: "Next.js com Prisma"
+description: "Construa uma aplicação Next.js App Router com Prisma 7 e MySQL de ponta a ponta: schema, migrações, o driver adapter que o Prisma 7 agora exige e uma página funcional de leitura e escrita. Todo comando deste guia executa sem alteração contra o VillageSQL."
+keywords: "nextjs prisma mysql, prisma driver adapter mysql, prisma 7 mysql, prisma migrate mysql, prisma server action, villagesql prisma"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O Prisma é um dos ORMs TypeScript mais usados, e o App Router do Next.js é uma forma comum de novos projetos chegarem a um banco de dados. Este guia constrói uma pequena aplicação Next.js que lista e cria linhas no MySQL por meio do Prisma 7, cobrindo as partes que mudaram desde os tutoriais mais antigos do Prisma: as URLs de conexão saíram do arquivo de schema, e um driver adapter não é mais opcional. Como o VillageSQL é um substituto direto do MySQL, todo comando aqui funciona contra ele sem alteração.
+
+## Crie o banco de dados {#create-the-database}
+
+O Prisma precisa de dois bancos de dados: o que sua aplicação usa, e um segundo banco "shadow" que ele usa internamente para calcular migrações. Crie os dois, e um usuário dedicado com direitos sobre cada um:
+
+```sql
+CREATE DATABASE prisma_guide CHARACTER SET utf8mb4;
+CREATE DATABASE prisma_guide_shadow CHARACTER SET utf8mb4;
+CREATE USER 'prisma_app'@'127.0.0.1' IDENTIFIED BY 'change-me';
+GRANT ALL PRIVILEGES ON prisma_guide.* TO 'prisma_app'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON prisma_guide_shadow.* TO 'prisma_app'@'127.0.0.1';
+```
+
+O banco shadow só precisa existir. O Prisma cria e remove tabelas nele automaticamente. Criá-lo de antemão e conceder ao usuário da aplicação direitos sobre esse único banco, em vez de conceder privilégios mais amplos de `CREATE`/`DROP` em `*.*` para que o Prisma possa criar um banco shadow por conta própria, mantém o raio de dano de uma senha vazada em dois bancos de dados em vez do servidor inteiro.
+
+## Crie a estrutura da aplicação {#scaffold-the-app}
+
+```bash
+npx create-next-app@latest my-app --typescript --app --src-dir
+cd my-app
+npm install prisma@7 @prisma/client@7
+```
+
+Fixe a versão principal. No momento em que escrevemos, a tag `latest` do npm para `prisma` aponta para um release candidate da 8.0: bom para experimentar, mas o padrão errado para um guia que precisa continuar funcionando.
+
+## Inicialize o Prisma {#initialize-prisma}
+
+```bash
+npx prisma init --datasource-provider mysql --no-skills
+```
+
+`prisma init` executa por padrão uma etapa de postinstall que cria no seu repositório skills de agente para Claude Code, Cursor e Windsurf (`.claude/`, `.windsurf/`, `.agents/`, mais um `skills-lock.json`). `--no-skills` pula essa etapa. É um recurso genuinamente útil se você usa um agente de codificação com IA junto com o Prisma, só não faz parte do escopo deste guia.
+
+Isso cria `prisma/schema.prisma`, um arquivo `.env` e `prisma7.config.ts` (o nome do arquivo de configuração tem sufixo de versão no Prisma 7). Defina as strings de conexão:
+
+```bash .env
+DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide"
+SHADOW_DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide_shadow"
+```
+
+Tutoriais mais antigos do Prisma colocavam a URL do datasource diretamente em `schema.prisma`. A partir do Prisma 7, as URLs de conexão, incluindo a URL do banco shadow, ficam em `prisma7.config.ts`, não no arquivo de schema:
+
+```ts prisma7.config.ts
+import "dotenv/config";
+import { defineConfig } from "prisma/config";
+
+export default defineConfig({
+  schema: "prisma/schema.prisma",
+  migrations: { path: "prisma/migrations" },
+  datasource: {
+    url: process.env["DATABASE_URL"],
+    shadowDatabaseUrl: process.env["SHADOW_DATABASE_URL"],
+  },
+});
+```
+
+O `schema.prisma` mantém o bloco `generator` que o `prisma init` criou e agora só declara o provider no datasource, sem URL de conexão:
+
+```prisma prisma/schema.prisma
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String   @db.VarChar(255)
+  body      String   @db.Text
+  createdAt DateTime @default(now())
+}
+```
+
+## Execute a migração {#run-the-migration}
+
+```bash
+npx prisma migrate dev --name init
+```
+
+Isso aplica o schema, gera `prisma/migrations/<timestamp>_init/migration.sql` e chama `prisma generate` para você. Confirme que a tabela existe:
+
+```sql
+SHOW TABLES FROM prisma_guide;
+-- _prisma_migrations, Post
+```
+
+## Conecte com um driver adapter {#connect-with-a-driver-adapter}
+
+O cliente gerado pelo Prisma 7 não conecta mais por conta própria: `new PrismaClient()` sem argumentos agora falha na verificação de tipos. Você passa a ele um driver adapter, um pacote por banco de dados:
+
+```bash
+npm install @prisma/adapter-mariadb mariadb
+```
+
+`@prisma/adapter-mariadb` é o adapter tanto para MariaDB quanto para MySQL: o protocolo de rede é compartilhado, então ele funciona contra o VillageSQL da mesma forma que funciona contra o MySQL padrão. Configure um singleton para que o hot reload do modo de desenvolvimento do Next.js não abra um novo pool de conexões a cada salvamento de arquivo:
+
+```ts src/lib/prisma.ts
+import { PrismaClient } from "@/generated/prisma/client";
+import { PrismaMariaDb } from "@prisma/adapter-mariadb";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+const adapter = new PrismaMariaDb(process.env.DATABASE_URL!);
+
+export const prisma = globalForPrisma.prisma ?? new PrismaClient({ adapter });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+### A Primeira Conexão a uma Conta Nova {#the-first-connection-to-a-new-account}
+
+O MySQL 8 e o VillageSQL criam contas com o plugin `caching_sha2_password`. Na primeira vez que uma determinada conta se autentica, o cliente precisa completar uma troca de chaves RSA; depois disso o servidor armazena o resultado em cache e as conexões seguintes tomam um caminho mais rápido que a dispensa. O `@prisma/adapter-mariadb` se recusa a fazer essa troca em uma conexão não criptografada, então em um servidor que nunca autenticou essa conta, o build falha:
+
+```
+Database error. Code: `45028`. Message: `pool timeout: failed to retrieve a connection
+from pool after 10000ms (pool connections: active=0 idle=0 limit=10)`
+```
+
+Nada nessa mensagem menciona autenticação, e `active=0 idle=0` faz parecer que o servidor está inacessível. O erro subjacente do driver é mais específico:
+
+```
+RSA public key is not available client side. Either set option `cachingRsaPublicKey`
+to indicate public key path, or allow public key retrieval with option
+`allowPublicKeyRetrieval`
+```
+
+Para desenvolvimento local, adicione a opção à URL de conexão:
+
+```bash .env
+DATABASE_URL="mysql://prisma_app:change-me@127.0.0.1:3306/prisma_guide?allowPublicKeyRetrieval=true"
+```
+
+Recuperar a chave por uma conexão não criptografada expõe a senha a qualquer um capaz de interceptar esse primeiro handshake, então use TLS em vez dessa opção contra qualquer coisa que não seja um servidor local.
+
+Esta é a mesma armadilha que o [guia de FastAPI](/pt-BR/guides/fastapi-sqlalchemy-mysql) documenta para o `asyncmy`, e ela é intermitente pelo mesmo motivo: depois que qualquer cliente completa uma autenticação completa para a conta, incluindo a CLI `mysql`, o resultado em cache esconde o problema até que o cache seja limpo por `FLUSH PRIVILEGES` ou por uma reinicialização do servidor.
+
+O caminho de importação do cliente gerado tem duas peculiaridades. Ele não tem `index.ts`, então você importa `@/generated/prisma/client` (o arquivo), não `@/generated/prisma` (o diretório). E toda exportação nesse arquivo é tipada com `@ts-nocheck`, já que é código gerado que você deve importar, não ler.
+
+## Leia e escreva a partir de um Server Component {#read-and-write-from-a-server-component}
+
+```tsx src/app/page.tsx
+import { prisma } from "@/lib/prisma";
+import { revalidatePath } from "next/cache";
+
+async function createPost(formData: FormData) {
+  "use server";
+  const title = formData.get("title") as string;
+  const body = formData.get("body") as string;
+  await prisma.post.create({ data: { title, body } });
+  revalidatePath("/");
+}
+
+export default async function Home() {
+  const posts = await prisma.post.findMany({ orderBy: { createdAt: "desc" } });
+
+  return (
+    <main>
+      <form action={createPost}>
+        <input name="title" placeholder="Title" required />
+        <textarea name="body" placeholder="Body" required />
+        <button type="submit">Create post</button>
+      </form>
+      <ul>
+        {posts.map((post) => (
+          <li key={post.id}>
+            <strong>{post.title}</strong>
+            <p>{post.body}</p>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+`prisma.post.findMany()` executa como um Server Component, então a lista é renderizada com os dados já no HTML, sem busca no lado do cliente. O formulário envia para uma Server Action (`"use server"`), que escreve por meio do mesmo cliente Prisma e chama `revalidatePath("/")` para que o novo post apareça sem atualização no lado do cliente.
+
+Executar `npm run build` neste ponto realmente consulta o banco de dados: como a página inicial não usa APIs dinâmicas, o Next.js a pré-renderiza como conteúdo estático no momento do build, o que significa que `findMany()` executa durante o build, não só no momento da requisição. Se seu banco de dados não está acessível durante `npm run build`, o build falha ali, então um pipeline de CI para esta aplicação precisa de um banco de dados acessível no momento do build, não só em tempo de execução.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Preciso do banco shadow em produção? {#do-i-need-the-shadow-database-in-production}
+
+Não. `prisma migrate dev` o usa para detectar divergência de schema enquanto você desenvolve. Em produção, use `prisma migrate deploy`, que aplica os arquivos de migração existentes sem tocar em nenhum banco shadow.
+
+#### Por que meu script independente falha com "Cannot read properties of undefined (reading 'prepareCacheLength')"? {#why-does-my-standalone-script-fail-with-cannot-read-properties-of-undefined-reading-preparecachelength}
+
+`process.env.DATABASE_URL` é `undefined` no ambiente desse script. O Next.js carrega o `.env` automaticamente para `next dev` e `next build`, mas um script `node` ou `tsx` comum não. Adicione `import "dotenv/config"` no topo do script.
+
+#### Posso usar o equivalente MySQL de `@prisma/adapter-pg` em vez disso? {#can-i-use-prismaadapter-pgs-mysql-equivalent-instead}
+
+Não existe um nome de adapter específico para MySQL. `@prisma/adapter-mariadb` é o que o Prisma fornece tanto para MariaDB quanto para MySQL, incluindo o VillageSQL.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `Error: P3014` / "User was denied access on the database `prisma_migrate_shadow_db_...`" | Seu usuário da aplicação não pode criar bancos de dados. Crie um banco shadow dedicado de antemão e conceda direitos sobre ele, ou conceda privilégios mais amplos de `CREATE`/`DROP` se aceitar o custo. |
+| `error: The datasource property 'shadowDatabaseUrl' is no longer supported in schema files` | Você está usando um `schema.prisma` no estilo do Prisma 5/6, com URLs de conexão inline. Mova tanto `url` quanto `shadowDatabaseUrl` para o bloco `datasource` de `prisma7.config.ts`. |
+| `pool timeout: failed to retrieve a connection from pool` com `active=0 idle=0` | A conta nunca completou uma autenticação completa com `caching_sha2_password` neste servidor, e o adapter não faz a troca RSA sem criptografia. Adicione `?allowPublicKeyRetrieval=true` a `DATABASE_URL` para desenvolvimento local, ou conecte por TLS. |
+| `Expected 1 arguments, but got 0` em `new PrismaClient()` | O Prisma 7 exige um driver adapter. Instale `@prisma/adapter-mariadb` e passe `new PrismaClient({ adapter })`. |
+| `info You don't have any generators defined in your schema.prisma, so nothing will be generated.` | Seu `schema.prisma` está sem o bloco `generator client`. Adicione-o de volta; removê-lo (mesmo por acidente, ao enxugar o arquivo) faz com que `prisma generate` não produza nada. |
+| `Module not found: Can't resolve '@/generated/prisma'` | Importe `@/generated/prisma/client` em vez disso. A saída gerada não tem um arquivo barrel `index.ts`. |
+
+## Veja também {#see-also}
+
+- [Next.js e Drizzle com MySQL](/pt-BR/guides/mysql-with-drizzle) — a mesma aplicação construída com um ORM mais leve e orientado a SQL em vez do Prisma
+- [Next.js com MySQL](/pt-BR/guides/nextjs-mysql) — configuração de conexão, Server Actions e padrões de Route Handler sem nenhum ORM
+- [Usando MySQL com ORMs](/pt-BR/guides/mysql-with-orms) — as configurações que importam em todo ORM, não só no Prisma
+- [Pool de conexões](/pt-BR/guides/connection-pooling) — como o tamanho do pool de um driver adapter interage com sua contagem de processos

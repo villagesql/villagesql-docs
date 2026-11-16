@@ -1,0 +1,207 @@
+---
+title: "Log Binário do MySQL"
+sidebarTitle: "Usando Logs Binários"
+description: "Como funciona o log binário do MySQL: habilitando-o, escolhendo o formato ROW, STATEMENT ou MIXED para replicação e captura de dados de mudança, lendo logs com mysqlbinlog, recuperação pontual e limpeza de logs antigos."
+keywords: "mysql binary log, mysql binlog, mysql enable binary logging, mysql mysqlbinlog, mysql point in time recovery, mysql binlog format, mysql replication log, mysql binlog row format, mysql binary log position, mysql binlog row vs statement, mysql point in time recovery binlog, mysql change data capture, mysql cdc binlog, mysql replication setup"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O log binário do MySQL registra cada mudança feita no banco de dados — inserções, atualizações, exclusões, mudanças de esquema. Ele é a base da replicação e da recuperação pontual. A maioria dos servidores MySQL de produção roda com o log binário habilitado.
+
+## Habilitando o Log Binário {#enabling-binary-logging}
+
+O log binário é habilitado por padrão no MySQL 8.0. Para verificar:
+
+```sql
+SHOW VARIABLES LIKE 'log_bin';
+-- log_bin  ON
+```
+
+Configure-o em `my.cnf` / `my.ini`:
+
+```ini
+[mysqld]
+log_bin = /var/log/mysql/mysql-bin
+binlog_format = ROW
+server_id = 1          -- required for replication; good practice to set always
+binlog_expire_logs_seconds = 604800  -- auto-purge logs older than 7 days
+max_binlog_size = 100M -- rotate to a new file when this size is reached
+```
+
+Depois que `log_bin` é definido, o MySQL nomeia os arquivos de binlog como `mysql-bin.000001`, `mysql-bin.000002` etc., com um arquivo de índice (`mysql-bin.index`) que lista todos eles.
+
+## Formatos do Log Binário {#binary-log-formats}
+
+O MySQL suporta três formatos de binlog:
+
+| Formato | O que é registrado | Segurança da replicação | Tamanho do log | Impacto no desempenho | Melhor para |
+|:-------|:-------------|:------------------|:---------|:------------------|:---------|
+| `ROW` | Os dados reais de antes/depois de cada linha afetada | O mais seguro — determinístico independentemente do estado da réplica | O maior (cresce com o volume de dados, especialmente em atualizações em massa) | Maior sobrecarga de escrita na origem | Replicação em produção; PITR; CDC/captura de dados de mudança |
+| `STATEMENT` | A instrução SQL que causou a mudança | Inseguro para funções não determinísticas por chamada (`RAND()`, `UUID()`); `NOW()` é seguro, pois o timestamp da instrução viaja no evento do binlog | O menor | Menor sobrecarga | Cargas de trabalho com muitas leituras em que o tamanho do log importa e todas as instruções são determinísticas |
+| `MIXED` | STATEMENT por padrão; muda para ROW em instruções inseguras | Seguro (ROW é usado quando necessário) | Médio | Médio | Configurações legadas migrando de STATEMENT; não recomendado para novas implantações |
+
+O formato `ROW` é o padrão recomendado. Ele replica corretamente mesmo quando funções não determinísticas como `RAND()` ou `UUID()` estão envolvidas. A desvantagem são arquivos de log maiores — um único `UPDATE` que toca milhões de linhas produz uma instrução no formato STATEMENT, mas um evento de linha por linha afetada no formato ROW.
+
+### Quando habilitar o log binário e qual formato escolher {#when-to-enable-binary-logging-and-which-format-to-choose}
+
+O log binário é habilitado por padrão no MySQL 8.0+. A questão costuma ser qual formato usar e se deve deixá-lo ligado.
+
+| Cenário | Recomendação |
+|:---------|:---------------|
+| Executando qualquer réplica | Habilite o log binário, use o formato `ROW` — é obrigatório para Group Replication e recomendado para a replicação padrão |
+| Recuperação pontual necessária | Habilite o log binário; o formato não afeta a capacidade de PITR, mas `ROW` dá a reprodução mais precisa |
+| Captura de dados de mudança (CDC) com Debezium, Kafka Connect etc. | Habilite o log binário, formato `ROW` obrigatório — as ferramentas de CDC leem os eventos de linha diretamente |
+| Instância autônoma de desenvolvimento/teste, sem replicação, sem PITR | Desabilitar o log binário (`--skip-log-bin`) reduz a sobrecarga de escrita e o uso de disco |
+| Vazão de escrita muito alta, o tamanho do log é uma preocupação | Considere `binlog_row_image = MINIMAL` (registra somente as colunas alteradas) em vez de mudar para STATEMENT |
+| Auditoria ou conformidade | O formato `ROW` com `binlog_row_image = FULL` (o padrão) dá um registro completo de antes/depois |
+
+Verifique e altere o formato:
+
+```sql
+SHOW VARIABLES LIKE 'binlog_format';
+SET SESSION binlog_format = 'ROW';  -- change for current session
+```
+
+## Listando e Visualizando Logs Binários {#listing-and-viewing-binary-logs}
+
+Liste todos os arquivos de log binário:
+
+```sql
+SHOW BINARY LOGS;
+```
+
+Verifique o arquivo e a posição atuais do binlog:
+
+```sql
+SHOW BINARY LOG STATUS;
+```
+
+Visualize os eventos de um binlog a partir do SQL:
+
+```sql
+SHOW BINLOG EVENTS IN 'mysql-bin.000003' LIMIT 20;
+SHOW BINLOG EVENTS IN 'mysql-bin.000003' FROM 154 LIMIT 10;
+```
+
+## mysqlbinlog {#mysqlbinlog}
+
+A ferramenta `mysqlbinlog` decodifica os arquivos de log binário em SQL legível por humanos. Ela é usada para recuperação pontual e auditoria:
+
+```bash
+# Read a local binlog file
+mysqlbinlog /var/log/mysql/mysql-bin.000003
+
+# Filter by time range
+mysqlbinlog --start-datetime="2024-06-15 10:00:00" \
+            --stop-datetime="2024-06-15 12:00:00" \
+            /var/log/mysql/mysql-bin.000003
+
+# Decode ROW format events (shows actual data changes)
+mysqlbinlog --verbose /var/log/mysql/mysql-bin.000003
+
+# Read directly from a running server
+mysqlbinlog --read-from-remote-server \
+            --host=127.0.0.1 --user=root --password \
+            mysql-bin.000003
+```
+
+## Recuperação Pontual {#point-in-time-recovery}
+
+Combinar um backup completo com os logs binários permite restaurar para qualquer ponto no tempo depois que o backup foi tirado.
+
+**Fluxo de trabalho típico:**
+
+1. Tire um backup completo com `mysqldump --single-transaction --source-data`:
+
+```bash
+mysqldump --single-transaction --source-data=2 --all-databases \
+  -u root -p > backup.sql
+```
+
+`--source-data=2` grava o nome do arquivo e a posição do binlog como um comentário no dump. Esse é o seu ponto de partida para a recuperação.
+
+2. Restaure o backup completo:
+
+```bash
+mysql -u root -p < backup.sql
+```
+
+3. Encontre o arquivo e a posição do binlog no dump:
+
+```bash
+head -50 backup.sql | grep "SOURCE_LOG_FILE"
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='mysql-bin.000003', SOURCE_LOG_POS=154;
+```
+
+4. Reproduza os binlogs a partir dessa posição até imediatamente antes do evento que você quer desfazer:
+
+```bash
+mysqlbinlog --start-position=154 \
+            --stop-datetime="2024-06-15 11:59:00" \
+            mysql-bin.000003 mysql-bin.000004 | mysql -u root -p
+```
+
+## Gerenciando Logs Binários {#managing-binary-logs}
+
+Limpe manualmente os logs binários antigos:
+
+```sql
+-- Purge all logs before a specific log file
+PURGE BINARY LOGS TO 'mysql-bin.000010';
+
+-- Purge all logs older than a date
+PURGE BINARY LOGS BEFORE '2024-06-01 00:00:00';
+```
+
+Limpeza automática com `binlog_expire_logs_seconds` (MySQL 8.0+; `expire_logs_days` foi removido):
+
+```sql
+SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';
+SET GLOBAL binlog_expire_logs_seconds = 604800;  -- 7 days in seconds
+```
+
+Nunca exclua arquivos de binlog diretamente com `rm` — use `PURGE BINARY LOGS` para que o arquivo de índice continue consistente.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### O log binário afeta o desempenho de escrita? {#does-binary-logging-affect-write-performance}
+
+Sim, moderadamente. O log no formato ROW adiciona uma sobrecarga proporcional à quantidade de dados alterados. Para cargas de trabalho com muitas escritas, a sobrecarga normalmente fica entre 5 e 15%. Quase sempre vale a pena pelas capacidades de recuperação e replicação que ele habilita.
+
+#### Posso pular o log binário em uma sessão específica? {#can-i-skip-binary-logging-for-a-specific-session}
+
+```sql
+SET SESSION sql_log_bin = 0;
+-- ... operations that won't be logged ...
+SET SESSION sql_log_bin = 1;
+```
+
+Isso é útil para carregar dados em uma réplica que não precisa propagá-los adiante, ou para operações em massa que você quer excluir do escopo da recuperação pontual. Requer `SUPER`, `SYSTEM_VARIABLES_ADMIN` ou `SESSION_VARIABLES_ADMIN` — `BINLOG_ADMIN` sozinho não basta, e a tentativa falha com ERROR 1227.
+
+#### Como sei quanto espaço em disco meus logs binários estão usando? {#how-do-i-know-how-much-disk-space-my-binary-logs-are-using}
+
+```sql
+SHOW BINARY LOGS;
+-- Sum the File_size column
+```
+
+Ou no disco: `du -sh /var/log/mysql/mysql-bin.*`
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| Os arquivos de log binário estão enchendo o disco | Defina `binlog_expire_logs_seconds` ou execute `PURGE BINARY LOGS BEFORE` — nunca use `rm` nos arquivos diretamente |
+| A saída do `mysqlbinlog` é ilegível no formato ROW | Adicione `--verbose` (ou `-v`) para decodificar os eventos de linha em pseudo-SQL |
+| A recuperação pontual deixou algumas mudanças de fora | Verifique se todos os arquivos de binlog do intervalo foram incluídos — lacunas na lista de arquivos deixam buracos na reprodução |
+| `ERROR: Binary logging not possible` na replicação | A réplica pode precisar de `log_bin` habilitado e de um `server_id` único — ambos são obrigatórios |
+| Atraso de replicação alto | O formato ROW produz mais dados — verifique o atraso das threads de I/O e SQL da réplica com `SHOW REPLICA STATUS\G` |
+
+## Veja também {#see-also}
+
+- [Estratégias de Backup do MySQL](/pt-BR/guides/backup-strategies) — como os logs binários habilitam a recuperação pontual
+- [Fundamentos de Replicação do MySQL](/pt-BR/guides/replication-basics) — a replicação usa o log binário como seu fluxo de dados
+- [Réplicas de Leitura no MySQL](/pt-BR/guides/read-replicas) — escalando leituras com o fluxo de log que as réplicas reproduzem

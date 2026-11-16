@@ -1,0 +1,232 @@
+---
+title: "Alterações de Esquema Sem Tempo de Inatividade no MySQL"
+sidebarTitle: "Alterações de Esquema Sem Inatividade"
+description: "Como executar ALTER TABLE em uma tabela MySQL em produção sem bloquear leituras ou gravações, quando o DDL online não pode ajudar e como o gh-ost preenche essa lacuna."
+keywords: "mysql zero downtime, mysql online ddl, alter table lock none, algorithm inplace, algorithm instant, gh-ost, mysql alter table blocking, mysql schema change production"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Executar `ALTER TABLE` em uma tabela com tráfego ativo levanta uma pergunta: esta instrução vai bloquear a aplicação enquanto é executada? Este guia mede isso diretamente, em uma tabela real, com uma conexão concorrente observando o tempo todo. [Migrações de Esquema no MySQL](/pt-BR/guides/schema-migrations) cobre como organizar e versionar os arquivos de migração. Este guia cobre o que uma tabela ativa realmente faz enquanto um desses arquivos de migração é executado contra ela.
+
+## Configuração do Teste {#test-setup}
+
+Todos os números deste guia vieram da mesma tabela: uma tabela `orders` carregada com 3.276.802 linhas (168,7 MB de dados) em um servidor VillageSQL local.
+
+```sql
+CREATE TABLE orders (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  amount_cents INT NOT NULL,
+  created_at DATETIME NOT NULL
+) ENGINE=InnoDB;
+```
+
+As linhas foram geradas com um cross join de uma tabela de números e, em seguida, duplicadas algumas vezes com `INSERT ... SELECT` a partir da própria tabela, até chegar a alguns milhões de linhas. O tamanho exato não importa para as conclusões abaixo, mas a tabela precisa ser grande o suficiente para que uma reconstrução completa leve mais do que uma fração de segundo, ou você não consegue observar nada sendo executado de forma concorrente a ela.
+
+## Um ALTER Online Não Bloqueia o Tráfego {#an-online-alter-does-not-block-traffic}
+
+Adicionar um índice secundário com `ALGORITHM=INPLACE, LOCK=NONE` na tabela de 3,27 milhões de linhas acima:
+
+```sql
+ALTER TABLE orders ADD INDEX idx_customer_id (customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+levou 1,003 segundo de ponta a ponta. Enquanto estava em execução, o `SHOW PROCESSLIST` em uma segunda conexão o mostrou como uma operação real, em andamento:
+
+```
+Id   User  Host       db        Command  Time  State           Info
+325  root  localhost  zdt_demo  Query    0     altering table  ALTER TABLE orders ADD INDEX idx_customer_id (customer_id), ALGORITHM=INPLACE, LOCK=NONE
+```
+
+A `information_schema.INNODB_TRX` mostra a mesma instrução como uma transação em execução, a partir de um `ADD INDEX` separado na mesma tabela:
+
+```
+trx_id: 6472
+trx_state: RUNNING
+trx_query: ALTER TABLE orders ADD INDEX idx_status (status), ALGORITHM=INPLACE, LOCK=NONE
+```
+
+A partir de uma terceira conexão, aberta e executada enquanto o `ALTER` acima ainda estava no estado `altering table`, um `INSERT` e um `SELECT` na mesma tabela foram ambos concluídos imediatamente:
+
+```sql
+INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
+VALUES (999999, 'pending', 500, NOW(), 0, 0);
+-- 0.009s
+SELECT COUNT(*) FROM orders WHERE status='paid';
+-- 0.271s
+```
+
+Nenhuma das instruções esperou o `ALTER` terminar. Esse é todo o sentido do `LOCK=NONE`: a reconstrução da tabela acontece em segundo plano, usando o log de DDL online do InnoDB para capturar as alterações concorrentes, e o DML na tabela prossegue sobre as estruturas de dados originais até que a reconstrução alcance as alterações e seja colocada no lugar.
+
+## ALGORITHM=INSTANT vs. ALGORITHM=INPLACE {#algorithminstant-vs-algorithminplace}
+
+Nem toda operação online custa o mesmo. Adicionar uma coluna no final da tabela com `ALGORITHM=INSTANT` altera somente os metadados da tabela; nunca lê nem reescreve uma única linha:
+
+```sql
+ALTER TABLE orders ADD COLUMN priority TINYINT NOT NULL DEFAULT 0, ALGORITHM=INSTANT;
+-- 0.011s
+```
+
+Forçando o mesmo tipo de alteração, a adição de uma coluna com valor padrão, por meio de `ALGORITHM=INPLACE` em vez disso:
+
+```sql
+ALTER TABLE orders ADD COLUMN priority2 TINYINT NOT NULL DEFAULT 0, ALGORITHM=INPLACE, LOCK=NONE;
+-- 0.244s
+```
+
+Nesta tabela de 3,27 milhões de linhas, o `INSTANT` foi cerca de 20 vezes mais rápido do que o `INPLACE` para o que é, funcionalmente, a mesma adição de coluna. O `INPLACE` ainda precisa tocar nas entradas do dicionário de dados da tabela e se coordenar com qualquer DML concorrente; o `INSTANT` não faz nenhuma das duas coisas. A diferença cresce com o tamanho da tabela: o `INSTANT` permanece constante, independentemente do número de linhas, enquanto o `INPLACE` cresce com ele.
+
+O `INSTANT` não está disponível para todas as operações. Adicionar uma coluna com um valor padrão `BLOB`/`TEXT`, ou alterar o tipo de uma coluna existente, recai em `INPLACE` ou `COPY`. Adicionar uma coluna em qualquer posição, inclusive no meio de uma tabela, também usa `INSTANT` (MySQL 8.0.29+).
+
+## Quando o DDL Online Não Pode Ajudar: Uma Alteração de Tipo de Coluna {#when-online-ddl-cannot-help-a-column-type-change}
+
+Nem todo `ALTER TABLE` consegue evitar um bloqueio. Alterar o tipo de dados de uma coluna exige que o MySQL reescreva todas as linhas, e o `INPLACE` não consegue fazer isso:
+
+```sql
+ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+```
+ERROR 1846 (0A000) at line 2: ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.
+```
+
+Solicitar `ALGORITHM=INSTANT` para a mesma alteração falha da mesma forma, com um motivo diferente:
+
+```
+ERROR 1846 (0A000) at line 2: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table to change column type. Try ALGORITHM=COPY/INPLACE.
+```
+
+O único algoritmo que o MySQL aceita para esta instrução é o `COPY`, que reconstrói a tabela inteira e mantém um bloqueio exclusivo durante todo o processo. Executá-lo na mesma tabela e inserir uma linha a partir de uma segunda conexão durante a reconstrução demonstra a diferença diretamente:
+
+```sql
+ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=COPY;
+-- 6.776s
+```
+
+O `INSERT` concorrente, emitido 0,3 segundo depois do início do `ALTER`, só retornou quando o `ALTER` estava quase concluído:
+
+```sql
+INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
+VALUES (1, 'pending', 1, NOW(), 0, 0);
+-- 6.466s
+```
+
+O `SHOW PROCESSLIST` durante essa janela mostrou o `ALTER` no estado `copy to tmp table` e o `INSERT` bloqueado ao lado dele, no estado `Waiting for table metadata lock`. Esse estado é o diagnóstico: ele nomeia a instrução que está travada e diz que ela está na fila atrás de um bloqueio, e não sendo executada lentamente. Tentar falhar rápido com `LOCK=NONE` nessa mesma instrução é exatamente como você descobre, antes de executá-la em uma tabela de produção, que ela vai bloquear os gravadores por todo o tempo que a reescrita levar.
+
+## Chaves Estrangeiras e DDL Online {#foreign-keys-and-online-ddl}
+
+As chaves estrangeiras adicionam restrições que são independentes de `ALGORITHM` e `LOCK`. Em uma tabela filha `order_items` com `FOREIGN KEY (order_id) REFERENCES orders(id)`, um `ADD COLUMN` comum ainda é concluído com `ALGORITHM=INSTANT` em milissegundos, chaves estrangeiras incluídas. Mas duas operações falham de imediato, independentemente do algoritmo:
+
+Excluir a chave primária da tabela pai da qual a chave estrangeira depende:
+
+```sql
+ALTER TABLE orders DROP PRIMARY KEY, ADD PRIMARY KEY (id, customer_id), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+```
+ERROR 1553 (HY000) at line 2: Cannot drop index 'PRIMARY': needed in a foreign key constraint
+```
+
+Alterar o tipo da coluna filha independentemente da coluna pai que ela referencia:
+
+```sql
+ALTER TABLE order_items MODIFY COLUMN order_id INT NOT NULL, ALGORITHM=COPY;
+```
+
+```
+ERROR 3780 (HY000) at line 2: Referencing column 'order_id' and referenced column 'id' in foreign key constraint 'fk_order' are incompatible.
+```
+
+Ambos os erros acontecem no momento da análise e da validação, antes de o MySQL escolher um algoritmo. Se uma migração precisa alterar uma coluna envolvida em uma chave estrangeira, a chave estrangeira precisa ser excluída e recriada como parte da mesma migração, e os tipos das colunas pai e filha precisam permanecer compatíveis em ambos os lados a cada etapa.
+
+## gh-ost para Alterações que o DDL Online Não Consegue Fazer com Segurança {#gh-ost-for-changes-online-ddl-cannot-do-safely}
+
+O caso `MODIFY COLUMN ... ALGORITHM=COPY` acima é aquele em que o DDL online não pode ajudar: ele precisa da reescrita completa das linhas, mas você não quer manter um bloqueio durante todo o processo em uma tabela ativa. O `gh-ost` lida com isso construindo uma cópia da tabela (uma tabela "fantasma") com o novo esquema e, em seguida, copiando as linhas existentes para ela em segundo plano, enquanto transmite o log binário, em vez de usar gatilhos, para reproduzir todas as gravações feitas na tabela original durante a cópia. Ele termina com uma breve renomeação atômica para fazer a troca.
+
+O `gh-ost` se recusa a migrar uma tabela que outra tabela referencia com uma chave estrangeira: a tabela `order_items` da seção anterior tem uma `FOREIGN KEY (order_id) REFERENCES orders(id)`, e executar o `gh-ost` contra `orders` com essa restrição ainda em vigor falha imediatamente com `FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out`. Exclua essa chave estrangeira primeiro (ou passe `--discard-foreign-keys`, que a exclui para você e não a recria) antes de executar o `gh-ost` contra uma tabela que outras tabelas referenciam.
+
+Ele foi instalado e executado, com a chave estrangeira de `order_items` excluída, contra a mesma tabela de 3.276.802 linhas, exatamente para esse tipo de alteração:
+
+```bash
+# macOS
+brew install gh-ost
+
+# Linux (Debian/Ubuntu)
+curl -LO https://github.com/github/gh-ost/releases/latest/download/gh-ost.amd64.deb
+sudo dpkg -i gh-ost.amd64.deb
+```
+
+```bash
+gh-ost \
+  --user=root --password= \
+  --host=127.0.0.1 --port=3306 \
+  --database=zdt_demo --table=orders \
+  --alter="MODIFY COLUMN customer_id BIGINT NOT NULL" \
+  --allow-on-master \
+  --initially-drop-ghost-table \
+  --exact-rowcount \
+  --chunk-size=2000 \
+  --default-retries=5 \
+  --execute
+```
+
+Com uma senha real, passe-a por meio de um arquivo `-conf` em vez de `--password`
+na linha de comando — uma senha na linha de comando fica visível a qualquer outro usuário
+do host por meio do `ps` e acaba no histórico do shell.
+
+Sem `--execute`, o `gh-ost` é executado em modo de simulação: ele se conecta, transmite o binlog e imprime a instrução `CREATE TABLE` que usaria para a tabela fantasma, mas não faz nenhuma alteração. Com `--execute`, ele executou a migração completa em 13,112 segundos, imprimindo o progresso ao longo do caminho:
+
+```
+Copy: 596000/3276802 18.2%; Applied: 0; Backlog: 1/1000; Time: 3s(total), 3s(copy); ...; ETA: 8s
+Copy: 1762000/3276802 53.8%; Applied: 0; Backlog: 0/1000; Time: 7s(total), 7s(copy); ...; ETA: 5s
+Copy: 3276802/3276802 100.0%; Applied: 0; Backlog: 0/1000; Time: 12s(total), 12s(copy); ...; ETA: due
+```
+
+Três segundos depois do início de uma segunda execução da mesma migração, um `INSERT` concorrente na tabela `orders` ativa retornou em 0,007 segundo, e a própria linha de progresso do `gh-ost` confirmou que ele havia capturado a gravação e a reproduzido (`Applied: 1`):
+
+```
+Copy: 1812000/3276803 55.3%; Applied: 1; Backlog: 1/1000; Time: 7s(total), 7s(copy); ...
+```
+
+Depois da troca, o `SHOW CREATE TABLE orders` mostrou `customer_id` como `bigint`, a contagem de linhas correspondeu exatamente (3.276.803, a contagem original mais a única linha inserida durante a migração), e a linha inserida no meio da migração estava presente com o seu valor correto. O `gh-ost` renomeou a tabela original para `_orders_del` em vez de excluí-la, portanto a tabela anterior à migração ainda está lá para comparação, ou para exclusão manual depois que você confirmar a troca.
+
+Isso foi executado em um servidor autônomo com `binlog_format=ROW` e `log_bin=ON` já definidos, que o `gh-ost` exige para transmitir as alterações; ele não funciona com replicação baseada em instruções. Ele também exige que a tabela tenha uma chave primária ou uma chave única. Nenhum dos dois precisou de configuração extra aqui, porque são padrões comuns, mas confirme ambos antes de confiar no `gh-ost` em uma tabela que você não verificou.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Como sei de antemão se um ALTER TABLE vai bloquear a minha tabela? {#how-do-i-know-in-advance-whether-an-alter-table-will-block-my-table}
+
+Adicione `ALGORITHM=INPLACE, LOCK=NONE` (ou apenas `LOCK=NONE`) à instrução antes de executá-la. Se o MySQL conseguir fazer a alteração sem bloquear, ela é executada. Se não conseguir, ele retorna um erro imediatamente, em vez de executar e bloquear. De qualquer forma, você obtém uma resposta definitiva sem adivinhar nem ler o código-fonte.
+
+#### Por que o ALGORITHM=INSTANT falhou para uma alteração de tipo de coluna? {#why-did-algorithminstant-fail-for-a-column-type-change}
+
+O `INSTANT` só funciona quando o MySQL consegue expressar a alteração apenas como uma atualização de metadados. Alterar o tipo armazenado de uma coluna significa que a representação em disco de cada linha existente está errada para o novo tipo, o que exige ler e reescrever as linhas. Isso descarta o `INSTANT` e, especificamente para uma alteração de tipo, também descarta o `INPLACE`; somente o `COPY` consegue fazê-lo.
+
+#### O gh-ost precisa de replicação configurada? {#does-gh-ost-need-replication-set-up}
+
+Não. Ele lê o log binário do servidor que está migrando, que qualquer servidor com `binlog_format=ROW` já produz, independentemente de ter réplicas. O `gh-ost` também permite executar contra uma réplica e fazer a troca no servidor principal, que é o padrão mais seguro para tabelas muito grandes ou muito ativas, mas isso é uma escolha de implantação, não um requisito para que ele funcione.
+
+#### O que acontece com a tabela antiga depois que o gh-ost termina? {#what-happens-to-the-old-table-after-gh-ost-finishes}
+
+Por padrão, o `gh-ost` renomeia a tabela original com um sufixo (`_del` na execução capturada acima), em vez de excluí-la. Ela permanece no esquema, sem uso, até que você mesmo a exclua.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `ERROR 1846: ALGORITHM=INPLACE is not supported` | A operação exige uma reescrita completa. Use `ALGORITHM=COPY` em uma janela de manutenção, ou `gh-ost`/`pt-online-schema-change` em uma tabela ativa. |
+| `ERROR 1846: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table...` | A alteração não é somente de metadados. Tente `ALGORITHM=INPLACE, LOCK=NONE` primeiro e, em seguida, recorra ao `COPY` se isso também falhar. |
+| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | Exclua primeiro a chave estrangeira que faz a referência, faça a alteração do índice e, em seguida, recrie a chave estrangeira. |
+| `ERROR 3780: Referencing column ... and referenced column ... are incompatible` | As colunas filha e pai de uma chave estrangeira precisam permanecer com tipos compatíveis. Altere os dois lados juntos, ou exclua a chave estrangeira durante a migração. |
+| Um `ALTER` com algoritmo `COPY` está segurando os gravadores sem fim à vista | Verifique o estado dele no `SHOW PROCESSLIST` e há quanto tempo ele está em execução na `information_schema.INNODB_TRX`. Se não for aceitável esperar até o fim, encerre-o e mude para o `gh-ost`. |
+| O `gh-ost` se recusa a iniciar | Confirme `binlog_format=ROW` e que a tabela de destino tem uma chave primária ou uma chave única; ambos são obrigatórios. |
+
+## Veja também {#see-also}
+
+- [Migrações de Esquema no MySQL](/pt-BR/guides/schema-migrations) — organizando e versionando os arquivos de migração que produzem as instruções `ALTER TABLE` que este guia executa
+- [Entendendo os Índices do MySQL](/pt-BR/guides/mysql-indexes) — como o índice que o MySQL constrói durante um `ADD INDEX` online afeta o desempenho das consultas depois
+- [Lendo a Saída do EXPLAIN no MySQL](/pt-BR/guides/reading-explain) — verificando se um índice recém-adicionado está realmente sendo usado depois que a migração é concluída

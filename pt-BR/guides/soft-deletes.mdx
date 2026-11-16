@@ -1,0 +1,98 @@
+---
+title: "Soft Deletes no MySQL"
+sidebarTitle: "Soft Deletes"
+description: "Como implementar soft deletes com uma coluna deleted_at, manter as restrições de unicidade funcionando em linhas com soft delete e decidir quando um hard delete é a melhor opção."
+keywords: "mysql soft delete, deleted_at column, soft delete unique constraint, mysql logical delete, restore deleted rows mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Um soft delete marca uma linha como excluída em vez de removê-la. A linha permanece na tabela, invisível para a aplicação, restaurável com uma única instrução. É a resposta padrão para "um usuário excluiu algo e quer de volta", e ele cria dois problemas que vale a pena entender antes de adotá-lo: toda consulta precisa lembrar do filtro, e as restrições de unicidade deixam de significar o que você pensa.
+
+## O Padrão Básico {#the-basic-pattern}
+
+Adicione um timestamp anulável. `NULL` significa ativa; um timestamp significa excluída, e registra quando:
+
+```sql
+CREATE TABLE customers (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  name VARCHAR(100),
+  deleted_at TIMESTAMP NULL DEFAULT NULL
+);
+
+-- Delete
+UPDATE customers SET deleted_at = NOW() WHERE id = 42;
+
+-- Restore
+UPDATE customers SET deleted_at = NULL WHERE id = 42;
+
+-- Every read now needs the filter
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+Prefira um timestamp a um booleano `deleted`: custa o mesmo e responde "quando" de graça, que é o que o ticket de suporte vai perguntar.
+
+## Problema 1: Restrições de Unicidade {#problem-1-unique-constraints}
+
+Um índice único em `email` bloqueia um novo cadastro para sempre: a linha com soft delete ainda ocupa o valor.
+
+```sql
+ALTER TABLE customers ADD UNIQUE KEY uq_email (email);
+UPDATE customers SET deleted_at = NOW() WHERE email = 'a@example.com';
+INSERT INTO customers (email, name) VALUES ('a@example.com', 'Again');
+```
+
+```text
+ERROR 1062 (23000): Duplicate entry 'a@example.com' for key 'customers.uq_email'
+```
+
+A correção é um truque de índice funcional: faça a chave única cobrir uma coluna que é constante para as linhas ativas e única para as excluídas. Uma coluna gerada faz isso de forma limpa:
+
+```sql
+ALTER TABLE customers DROP KEY uq_email;
+ALTER TABLE customers
+  ADD COLUMN email_live VARCHAR(255)
+    GENERATED ALWAYS AS (IF(deleted_at IS NULL, email, NULL)) VIRTUAL,
+  ADD UNIQUE KEY uq_email_live (email_live);
+```
+
+Os índices únicos do MySQL permitem qualquer número de `NULL`s, então as linhas excluídas nunca colidem, enquanto duas linhas ativas com o mesmo email ainda falham. Consulte [Colunas geradas](/pt-BR/guides/generated-columns) para o mecanismo.
+
+## Problema 2: Toda Consulta Precisa Lembrar {#problem-2-every-query-must-remember}
+
+Um `WHERE deleted_at IS NULL` esquecido e dados excluídos vazam para um relatório ou para uma resposta de API. Duas mitigações:
+
+- **Uma view para o subconjunto ativo.** Aponte os caminhos de leitura para a view e o filtro não pode ser esquecido:
+
+```sql
+CREATE VIEW live_customers AS
+SELECT id, email, name FROM customers WHERE deleted_at IS NULL;
+```
+
+- **Escopos de ORM.** A maioria dos ORMs consegue aplicar o filtro globalmente (`default_scope` no Rails, managers no Django, middleware no Prisma). Ative-o em um só lugar em vez de auditar cada consulta.
+
+As chaves estrangeiras também precisam de atenção: um registro pai com soft delete ainda existe, então `ON DELETE CASCADE` nunca dispara. Se os filhos devem desaparecer junto com o pai, a aplicação (ou um trigger) precisa propagar o `deleted_at` por conta própria.
+
+## Quando Não Usar Soft Delete {#when-not-to-soft-delete}
+
+- **Exclusão regulatória.** Um pedido de exclusão sob o GDPR significa que os dados se foram, não que estão ocultos. Linhas com soft delete ainda contam como dados pessoais.
+- **Tabelas de alta rotatividade.** Sessões, jobs de fila e logs excluídos aos milhões apenas incham a tabela e todos os índices dela.
+- **Dados que ninguém vai restaurar.** Se não existe um caso de uso para desfazer, o custo do filtro não traz nenhum benefício.
+
+Um meio-termo comum: soft delete na ação do usuário, e depois um job agendado faz o hard delete das linhas em que `deleted_at` é mais antigo do que a janela de retenção:
+
+```sql
+DELETE FROM customers
+WHERE deleted_at IS NOT NULL
+  AND deleted_at < NOW() - INTERVAL 90 DAY;
+```
+
+## Veja também {#see-also}
+
+- [Colunas geradas](/pt-BR/guides/generated-columns) — o mecanismo por trás da correção da restrição de unicidade
+- [Views](/pt-BR/guides/views) — uma view de linhas ativas que não pode esquecer o filtro
+- [Chaves estrangeiras](/pt-BR/guides/foreign-keys) — por que as cascatas não disparam em soft deletes
+- [DELETE no MySQL](/pt-BR/tutorial/delete) — o hard delete que este padrão substitui

@@ -1,0 +1,189 @@
+---
+title: "Como Funcionam os Índices do MySQL"
+sidebarTitle: "Usando Índices"
+description: "Um guia prático sobre índices do MySQL: como funcionam os índices B-tree, quando o MySQL os usa, a ordem das colunas em índices compostos, índices de cobertura e erros comuns."
+keywords: "mysql index explained, mysql how indexes work, mysql b-tree index, mysql composite index, mysql covering index, mysql explain index"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Os índices são a ferramenta de desempenho de maior impacto no MySQL — e a mais mal compreendida. Os desenvolvedores os adicionam quando as consultas estão lentas, os removem quando o espaço em disco está apertado, e muitas vezes não entendem por que eles ajudam ou atrapalham. Este guia explica a mecânica para que você tome boas decisões em vez de adivinhar.
+
+## O Modelo Mental {#the-mental-model}
+
+Pense em um livro com 800 páginas. Para encontrar toda menção a "TCP/IP", você poderia ler cada página — isso é uma varredura completa da tabela. Ou poderia consultar o índice no final, encontrar "TCP/IP — páginas 42, 107, 391" e ir direto a essas páginas. É isso que um índice de banco de dados faz.
+
+A estrutura de índice padrão do MySQL é uma **B-tree** (árvore balanceada). Ela mantém os valores ordenados, o que permite buscas rápidas (busca binária), varreduras de intervalo (`BETWEEN`, `>`, `<`) e saída ordenada (`ORDER BY`) — tudo sem ler a tabela inteira.
+
+## Como o MySQL Usa um Índice {#how-mysql-uses-an-index}
+
+Quando você executa uma consulta, o otimizador do MySQL verifica se um índice pode reduzir as linhas que ele precisa ler. Ele usa um índice quando a sua consulta filtra ou ordena por uma coluna indexada.
+
+```sql
+CREATE TABLE orders (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    user_id    INT NOT NULL,
+    status     VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+-- Without an index, this scans every row
+SELECT * FROM orders WHERE user_id = 42;
+
+-- Add an index on user_id
+CREATE INDEX idx_user_id ON orders (user_id);
+
+-- Now MySQL jumps directly to user_id = 42 rows
+SELECT * FROM orders WHERE user_id = 42;
+```
+
+### EXPLAIN: Veja o que o MySQL está realmente fazendo {#explain-see-what-mysql-is-actually-doing}
+
+`EXPLAIN` mostra como o MySQL planeja executar uma consulta. A coluna `key` diz qual índice ele usou (ou NULL se nenhum), e `rows` estima quantas linhas ele precisou examinar.
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+```
+
+```
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+| id | select_type | table  | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra          |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+|  1 | SIMPLE      | orders | NULL       | ref  | idx_user_id   | idx_user_id | 4       | const |   12 |   100.00 | NULL           |
++----+-------------+--------+------------+------+---------------+-------------+---------+-------+------+----------+----------------+
+```
+
+`type: ref` significa que o MySQL usou uma busca por índice. `type: ALL` significa uma varredura completa da tabela — normalmente o que você está tentando evitar.
+
+## Índices Compostos: A Ordem das Colunas Importa {#composite-indexes-column-order-matters}
+
+Um índice composto cobre várias colunas. A ordem das colunas determina quando o índice pode ser usado.
+
+```sql
+-- Index on (user_id, status)
+CREATE INDEX idx_user_status ON orders (user_id, status);
+```
+
+O MySQL pode usar esse índice para:
+- `WHERE user_id = 42` — sim, coluna mais à esquerda
+- `WHERE user_id = 42 AND status = 'shipped'` — sim, as duas colunas
+- `WHERE status = 'shipped'` — **não**, pula a coluna mais à esquerda
+
+A regra: o MySQL usa um índice composto a partir da esquerda. As consultas precisam incluir a(s) coluna(s) inicial(is) para se beneficiar.
+
+Isso significa que `(user_id, status)` e `(status, user_id)` são índices diferentes com usos diferentes. Projete os índices compostos em torno dos seus padrões de consulta mais comuns.
+
+## Índices de Cobertura: Atendendo Consultas Somente pelo Índice {#covering-indexes-serving-queries-from-the-index-alone}
+
+Um índice de cobertura inclui todas as colunas de que uma consulta precisa. O MySQL consegue responder à consulta inteiramente a partir do índice, sem ler os dados da linha em si — um ganho de velocidade significativo em tabelas grandes.
+
+```sql
+-- Query only needs user_id, status, created_at
+SELECT user_id, status, created_at FROM orders WHERE user_id = 42;
+
+-- A covering index for this query
+CREATE INDEX idx_covering ON orders (user_id, status, created_at);
+```
+
+Quando o MySQL usa um índice de cobertura, o `EXPLAIN` mostra `Extra: Using index`. Nenhuma busca de linha é necessária.
+
+## Quando NÃO Adicionar um Índice {#when-not-to-add-an-index}
+
+Mais índices nem sempre é melhor. Todo índice tem um custo:
+
+- **Sobrecarga de gravação** — todo INSERT, UPDATE e DELETE precisa atualizar todos os índices da tabela
+- **Armazenamento** — os índices podem ficar tão grandes quanto a própria tabela em dados com muitas gravações
+- **Complexidade do otimizador** — com índices demais, o otimizador às vezes escolhe o errado
+
+Os índices ajudam mais quando:
+- A coluna tem alta cardinalidade (muitos valores distintos) — `user_id`, `email`, `order_id`
+- A consulta filtra uma pequena fração da tabela
+
+Os índices ajudam menos quando:
+- Baixa cardinalidade — `status` com 3 valores possíveis, `is_active` booleano
+- A tabela é pequena o suficiente para que uma varredura completa seja rápida de qualquer forma
+- A coluna recebe muitas gravações e raramente é consultada
+
+```sql
+-- Probably not worth indexing: 'active' and 'inactive' split the table ~50/50
+CREATE INDEX idx_active ON users (is_active);  -- likely unused by optimizer
+
+-- Worth indexing: email is unique, commonly queried
+CREATE INDEX idx_email ON users (email);
+```
+
+## A Chave Primária É Sempre um Índice {#primary-key-is-always-an-index}
+
+As tabelas InnoDB são organizadas em torno da chave primária — ela não é um índice separado, é a ordem física de armazenamento das linhas. Isso significa que:
+
+- As buscas por chave primária são a consulta mais rápida possível
+- As linhas ficam fisicamente adjacentes quando os valores da chave primária são sequenciais
+- Chaves primárias aleatórias (como UUID v4) causam fragmentação na inserção — consulte [UUIDs no MySQL](/pt-BR/guides/uuids)
+
+## Erros Comuns com Índices {#common-index-mistakes}
+
+**Usar uma função em uma coluna indexada** — o MySQL não consegue usar um índice quando você envolve a coluna em uma função:
+
+```sql
+-- Index on created_at exists, but this skips it
+SELECT * FROM orders WHERE YEAR(created_at) = 2024;
+
+-- Use a range instead — index is used
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31';
+```
+
+**Curinga no início do LIKE** — um índice não ajuda quando o padrão começa com `%`:
+
+```sql
+-- Can't use index
+SELECT * FROM users WHERE email LIKE '%@example.com';
+
+-- Can use index (no leading wildcard)
+SELECT * FROM users WHERE email LIKE 'alice%';
+```
+
+**OR entre colunas diferentes** — o otimizador do MySQL às vezes consegue mesclar vários índices de coluna única para tratar condições `OR`, mas isso não é confiável. Em tabelas grandes, `UNION` é mais previsível:
+
+```sql
+-- Index merge may or may not kick in depending on table size and selectivity
+SELECT * FROM orders WHERE user_id = 42 OR status = 'urgent';
+
+-- UNION gives the optimizer a cleaner path
+SELECT * FROM orders WHERE user_id = 42
+UNION
+SELECT * FROM orders WHERE status = 'urgent';
+```
+
+## Encontrando Índices Ausentes {#finding-missing-indexes}
+
+O log de consultas lentas captura as consultas que excedem um limite de tempo — um bom ponto de partida para descobrir o que indexar:
+
+```sql
+-- Enable slow query log (in MySQL config or at runtime)
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 1;  -- log queries over 1 second
+```
+
+Depois execute `EXPLAIN` nas consultas lentas. Procure `type: ALL` e `rows` na casa dos milhões.
+
+## Resumo {#summary}
+
+- Os índices B-tree mantêm os valores ordenados para buscas rápidas e varreduras de intervalo
+- O MySQL usa um índice quando a sua consulta filtra ou ordena pela(s) coluna(s) indexada(s) inicial(is)
+- A ordem das colunas em um índice composto importa — projete em torno das suas consultas mais comuns
+- Os índices de cobertura são os mais rápidos — a consulta é respondida inteiramente a partir do índice
+- Os índices têm custo nas gravações; adicione-os somente onde o benefício de leitura justifica
+- Envolva uma coluna em uma função e você desativou o índice dela — use condições de intervalo em vez disso
+
+Os índices se comportam de forma idêntica no [VillageSQL](https://villagesql.com/install), um substituto direto para o MySQL com extensões, então este guia de estratégia se aplica sem alteração.
+
+## Veja também {#see-also}
+
+- [Lendo o EXPLAIN no MySQL](/pt-BR/guides/reading-explain) — verifique se os seus índices estão sendo usados e entenda por que o MySQL os escolhe
+- [Índices de Cobertura no MySQL](/pt-BR/guides/covering-indexes) — índices que respondem consultas sem nenhuma busca de linha
+- [O Log de Consultas Lentas do MySQL](/pt-BR/guides/slow-query-log) — descubra quais consultas precisam de índices primeiro
+- [INFORMATION_SCHEMA do MySQL](/pt-BR/guides/information-schema) — encontrando metadados de índices e índices não usados com consultas
+- [Por que Minha Consulta MySQL Está Lenta?](/pt-BR/guides/mysql-query-performance) — o fluxo de trabalho de ajuste mais amplo ao qual os índices pertencem
+- [Paginação no MySQL: Keyset vs OFFSET](/pt-BR/guides/pagination) — a forma orientada por índice de paginar tabelas grandes

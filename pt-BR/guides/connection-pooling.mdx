@@ -1,0 +1,149 @@
+---
+title: "Pool de Conexões no MySQL"
+sidebarTitle: "Pool de Conexões"
+description: "Como funciona o pool de conexões no MySQL, por que conexões persistentes importam para o desempenho e como configurar o ProxySQL e os poolers no nível da aplicação."
+keywords: "mysql connection pooling, mysql persistent connections, mysql max_connections, proxysql mysql, mysql connection limit, mysql too many connections, mysql pooler"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Abrir uma conexão MySQL leva tempo — handshake TCP, autenticação, inicialização da sessão. Sob carga, aplicações que abrem e fecham conexões a cada requisição gastam mais tempo conectando do que consultando. O pool de conexões reutiliza conexões existentes em vez de criar novas para cada requisição.
+
+## Por Que Conexões São Caras {#why-connections-are-expensive}
+
+Cada conexão MySQL é uma thread no servidor. O custo no momento da conexão:
+
+- Handshake TCP/TLS
+- Autenticação (verificação de credenciais, resolução de privilégios)
+- Inicialização das variáveis de sessão
+
+Em um servidor de aplicação movimentado, essa sobrecarga se acumula rápido. Uma consulta que leva 1 ms para executar pode levar 10 ms no total se o estabelecimento da conexão for incluído.
+
+```sql
+-- See how many connections are currently active
+SHOW STATUS LIKE 'Threads_connected';
+
+-- See the server's connection limit
+SHOW VARIABLES LIKE 'max_connections';
+
+-- See peak connections since last restart
+SHOW STATUS LIKE 'Max_used_connections';
+```
+
+## Pool no Nível da Aplicação {#application-level-pooling}
+
+A maioria dos frameworks de aplicação e drivers de banco de dados inclui pools de conexões integrados. Eles mantêm um conjunto de conexões abertas e as emprestam às threads da aplicação sob demanda.
+
+**Node.js (mysql2):**
+```javascript
+import mysql from 'mysql2/promise';
+
+const pool = mysql.createPool({
+  host: 'localhost',
+  user: 'app',
+  database: 'mydb',
+  waitForConnections: true,
+  connectionLimit: 10,       // max simultaneous connections
+  queueLimit: 0              // unlimited queue (0 = no limit)
+});
+
+// connection is returned to the pool automatically
+const [rows] = await pool.execute('SELECT * FROM orders WHERE id = ?', [42]);
+```
+
+**Python (SQLAlchemy):**
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    'mysql+mysqlconnector://user:pass@localhost/mydb',
+    pool_size=10,        # persistent connections to keep open
+    max_overflow=5,      # extra connections allowed under peak load
+    pool_timeout=30,     # seconds to wait for a connection from the pool
+    pool_recycle=3600    # recycle connections after 1 hour (avoids stale connections)
+)
+```
+
+As configurações principais em qualquer pool:
+- **tamanho do pool**: quantas conexões persistentes manter
+- **max overflow / fila**: quantas conexões extras são permitidas sob picos de carga
+- **reciclagem / timeout**: quando fechar e reabrir conexões (evita conexões obsoletas por causa do `wait_timeout` do MySQL)
+
+## O wait_timeout do MySQL e Conexões Obsoletas {#mysqls-wait_timeout-and-stale-connections}
+
+O MySQL fecha conexões ociosas após `wait_timeout` segundos (padrão: 28800 segundos / 8 horas). Isso se aplica a conexões não interativas — o tipo que os pools de aplicação usam. Se o seu pool mantiver conexões por mais tempo do que isso, elas ficam obsoletas e a próxima consulta falha com `MySQL server has gone away`.
+
+```sql
+-- Check the server's idle connection timeout
+SHOW VARIABLES LIKE 'wait_timeout';
+```
+
+Corrija isso na configuração do seu pool: defina `pool_recycle` (ou o equivalente) para um valor menor que `wait_timeout`. 3600 segundos (1 hora) é um padrão seguro.
+
+## ProxySQL para Configurações com Vários Servidores {#proxysql-for-multi-server-setups}
+
+Os pools no nível da aplicação funcionam bem para um único servidor. Quando você tem réplicas ou vários servidores de aplicação, um proxy dedicado como o ProxySQL fica entre a aplicação e o MySQL e cuida do pool no nível da infraestrutura.
+
+Benefícios do ProxySQL:
+- **Roteamento de consultas**: envie leituras para as réplicas e escritas para o primário
+- **Multiplexação de conexões**: muitas conexões da aplicação compartilham menos conexões MySQL
+- **Failover**: redirecione o tráfego se um servidor cair
+
+Uma configuração básica do ProxySQL roteia leituras e escritas pelo prefixo da consulta:
+
+```sql
+-- In ProxySQL admin interface
+-- Route SELECT queries to read hostgroup (replicas)
+INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup)
+VALUES (1, 1, '^SELECT', 2);
+
+-- All other queries go to write hostgroup (primary)
+INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup)
+VALUES (2, 1, '.*', 1);
+
+LOAD MYSQL QUERY RULES TO RUNTIME;
+SAVE MYSQL QUERY RULES TO DISK;
+```
+
+## Ajustando max_connections {#tuning-max_connections}
+
+`max_connections` define o teto do lado do servidor. Cada conexão consome memória — uma base de aproximadamente 1 MB, que é o `thread_stack` padrão, mais os outros buffers estáticos da sessão, mais memória adicional alocada sob demanda durante a execução da consulta (buffers de ordenação, buffers de leitura, tabelas temporárias). Sob carga pesada de consultas, o custo por conexão pode chegar a vários MB. Definir `max_connections` alto demais desperdiça memória; baixo demais causa `ERROR 1040 (08004): Too many connections`.
+
+```sql
+-- Increase max connections (requires SUPER privilege)
+SET GLOBAL max_connections = 500;
+```
+
+Uma fórmula aproximada de dimensionamento: `max_connections = (RAM disponível para conexões) / (memória por conexão)`. Monitore `Max_used_connections` para entender o seu pico real e então defina `max_connections` 20–30% acima dele.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Quantas conexões meu pool deve ter? {#how-many-connections-should-my-pool-have}
+
+Comece com o número de núcleos de CPU do servidor de banco de dados e depois aumente com base na carga. Uma carga de trabalho fortemente limitada por I/O pode se beneficiar de mais conexões do que núcleos de CPU; uma carga limitada por CPU, não. A conhecida fórmula do HikariCP `connections = (core_count * 2) + effective_spindle_count` foi projetada para discos giratórios — ela não se aplica a SSDs. Em infraestrutura moderna, meça a sua concorrência real com `Threads_running` sob carga de pico e use isso como referência.
+
+#### Qual é a diferença entre `Threads_connected` e `Threads_running`? {#whats-the-difference-between-threads_connected-and-threads_running}
+
+`Threads_connected` conta todas as conexões abertas — incluindo as ociosas paradas em um pool. `Threads_running` conta as conexões que estão executando uma consulta neste momento. A diferença entre as duas é a sua contagem de conexões ociosas. Um `Threads_connected` grande com um `Threads_running` pequeno é normal para um pool saudável.
+
+#### Devo usar conexões persistentes em PHP? {#should-i-use-persistent-connections-in-php}
+
+Evite-as. O PHP não tem um mecanismo para redefinir uma conexão reutilizada — transações deixadas abertas, bloqueios de tabela, tabelas temporárias e variáveis de sessão alteradas passam para a próxima requisição. Isso pode causar deadlocks, corrupção de dados e bugs difíceis de reproduzir. Use um pool de conexões de verdade (PDO com pool, ou um proxy como o ProxySQL) em vez disso.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1040 (08004): Too many connections` | Aumente `max_connections`, reduza o tamanho do pool ou adicione o ProxySQL |
+| `MySQL server has gone away` | Conexão obsoleta — defina `pool_recycle` menor que `wait_timeout` |
+| `Threads_connected` alto, mas throughput baixo | O pool está superdimensionado — conexões ociosas consomem memória; reduza o tamanho do pool |
+| Picos de latência de conexão sob carga | O pool está subdimensionado — as requisições entram em fila esperando conexões; aumente o tamanho do pool ou adicione um proxy |
+
+## Veja também {#see-also}
+
+- [O Log de Consultas Lentas do MySQL](/pt-BR/guides/slow-query-log) — distinga a latência da consulta da sobrecarga de conexão
+- [Fundamentos de Replicação no MySQL](/pt-BR/guides/replication-basics) — pool entre um primário e réplicas
+- [Réplicas de Leitura no MySQL](/pt-BR/guides/read-replicas) — pool por função quando leituras e escritas se separam
+- [Usando MySQL com ORMs: Django, Rails e Prisma](/pt-BR/guides/mysql-with-orms) — os pools que todo ORM abre

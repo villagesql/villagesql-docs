@@ -1,0 +1,156 @@
+---
+title: "Armazenando Endereços IP no MySQL"
+sidebarTitle: "Armazenando Endereços IP"
+description: "Como armazenar endereços IP no MySQL de forma eficiente — por que VARCHAR e INT ficam aquém, e como o tipo INET do VillageSQL lida com IPv4 e IPv6 em uma única coluna."
+keywords: "mysql store ip address, mysql inet type, mysql ip address column, mysql ipv4 storage, mysql ip validation, mysql ip address best practice"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A maioria dos esquemas MySQL armazena endereços IP como `VARCHAR(45)`. Funciona, mas desperdiça espaço, não faz nada para validar o formato e ordena lexicograficamente em vez de numericamente — então `192.168.1.10` vem antes de `192.168.1.9`. O tipo `INET` do VillageSQL corrige tudo isso e lida com IPv4 e IPv6 na mesma coluna.
+
+## O Padrão do MySQL: VARCHAR {#the-mysql-default-varchar}
+
+A abordagem direta:
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address VARCHAR(45),    -- fits IPv4 (15 chars) and IPv6 (39 chars)
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES ('192.168.1.5');
+```
+
+`VARCHAR(45)` armazena qualquer string que você fornecer. Não há validação — `'not-an-ip'` é inserido sem erro. A ordenação não segue a ordem numérica, e comparar com uma sub-rede exige manipulação de strings ou funções de conversão.
+
+## A Solução Alternativa Padrão: INT UNSIGNED + INET_ATON {#the-standard-workaround-int-unsigned--inet_aton}
+
+Para IPv4, o `INET_ATON()` do MySQL converte uma string em notação decimal pontuada para um inteiro de 4 bytes. Isso é compacto e ordena corretamente:
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INT UNSIGNED,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address)
+VALUES (INET_ATON('192.168.1.5'));
+
+SELECT INET_NTOA(ip_address) AS ip FROM access_log;
+```
+
+Isso funciona bem para esquemas somente IPv4. O problema é o IPv6: `INT UNSIGNED` não consegue conter um endereço de 128 bits. Você precisaria de `VARBINARY(16)` e `INET6_ATON()` / `INET6_NTOA()` para IPv6, o que significa uma mudança de esquema quando o suporte a IPv6 for necessário.
+
+## Com o VillageSQL: O Tipo INET {#with-villagesql-the-inet-type}
+
+A extensão `vsql_network_address` do VillageSQL adiciona um tipo nativo `INET` que armazena endereços IPv4 e IPv6 em um formato binário compacto — 19 bytes fixos por linha para ambas as famílias, com os valores IPv4 preenchidos até essa largura — e valida a entrada no momento da inserção.
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- IPv4 and IPv6 in the same column
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.5')),
+    (inet_from_string('10.0.0.1')),
+    (inet_from_string('2001:db8::1'));
+
+-- Read back as strings
+SELECT inet_to_string(ip_address), accessed_at FROM access_log;
+
+-- Sort by IP address numerically (not lexicographically)
+SELECT inet_to_string(ip_address) FROM access_log ORDER BY ip_address;
+```
+
+Uma string inválida não aborta a instrução: `inet_from_string()` retorna NULL com o Warning 3200, então a linha é inserida com um valor NULL. Declare a coluna como `NOT NULL` se você quiser que uma entrada inválida faça o insert falhar.
+
+### Trabalhando com endereços armazenados {#working-with-stored-addresses}
+
+```sql
+-- Extract address family
+SELECT inet_to_string(ip_address),
+       inet_family(ip_address) AS family   -- 4 or 6
+FROM access_log;
+
+-- Check if an address is IPv6
+SELECT * FROM access_log
+WHERE inet_family(ip_address) = 6;
+
+-- Store with a netmask (INET allows host bits)
+INSERT INTO access_log (ip_address)
+VALUES (inet_from_string('192.168.1.5/24'));
+
+SELECT inet_host(ip_address)    AS host_part,
+       inet_masklen(ip_address) AS prefix_len
+FROM access_log WHERE id = 1;
+```
+
+### Indexação {#indexing}
+
+```sql
+CREATE INDEX idx_ip ON access_log(ip_address);
+
+-- Equality lookups use the index
+SELECT * FROM access_log
+WHERE ip_address = inet_from_string('192.168.1.5');
+```
+
+## Escolhendo uma Abordagem de Armazenamento {#choosing-a-storage-approach}
+
+| Abordagem | Suporte a IPv6 | Valida no insert | Ordena corretamente | Armazenamento |
+|:---|:---|:---|:---|:---|
+| `VARCHAR(45)` | Sim | Não | Não (lexicográfica) | 15–45 bytes |
+| `INT UNSIGNED` + `INET_ATON` | Não | Não | Sim (numérica) | 4 bytes |
+| `VARBINARY(16)` + `INET6_ATON` | Sim | Não | Sim | 4 ou 16 bytes |
+| `INET` (VillageSQL) | Sim | Sim | Sim | 19 bytes |
+
+Para esquemas novos que precisam de IPv4 e IPv6 com validação integrada, `INET` é a opção mais limpa. Para esquemas somente IPv4 sem dependência do VillageSQL, `INT UNSIGNED` com `INET_ATON` / `INET_NTOA` é a abordagem consolidada.
+
+Para consultas por sub-rede em endereços armazenados, consulte [Consultando por Sub-rede no MySQL](/pt-BR/guides/subnet-queries).
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### O INET pode armazenar endereços com máscara de rede, como 192.168.1.5/24? {#can-inet-store-addresses-with-a-netmask-like-1921681524}
+
+Sim. `INET` permite bits de host — `192.168.1.5/24` é válido. Se você quiser impor que os bits de host sejam zero (endereços de rede puros), use o tipo `CIDR` em vez disso.
+
+#### O INET valida o endereço no insert? {#does-inet-validate-the-address-on-insert}
+
+Sim. `inet_from_string('not-an-ip')` retorna NULL em vez de armazenar lixo. Se você passar NULL para uma coluna INET com uma restrição NOT NULL, o insert falha.
+
+#### Como o ORDER BY ip_address ordena IPv4/IPv6 misturados? {#how-does-order-by-ip_address-sort-mixed-ipv4ipv6}
+
+Os endereços IPv4 vêm antes dos endereços IPv6. Dentro de cada família, os endereços são ordenados numericamente. Isso corresponde à ordem de classificação do INET do PostgreSQL.
+
+#### O INET é o mesmo que o tipo inet do PostgreSQL? {#is-inet-the-same-as-postgresqls-inet-type}
+
+Funcionalmente, sim — os mesmos tipos (INET, CIDR, MACADDR, MACADDR8), as mesmas convenções de nomenclatura de funções, as mesmas regras de validação. A principal diferença é que o VillageSQL fornece funções em vez de operadores para comparações e verificações de sub-rede.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.inet_from_string does not exist` | Execute `INSTALL EXTENSION vsql_network_address` |
+| `inet_from_string()` retorna NULL | A string de entrada não é um endereço IP válido |
+| Os endereços IPv6 aparecem na forma expandida | Esperado — `2001:db8::1` é armazenado e recuperado como `2001:0db8:0000:0000:0000:0000:0000:0001` |
+| `Incorrect CIDR value` para `192.168.1.5/24` | CIDR exige que os bits de host sejam zero — use `192.168.1.0/24`, ou use INET em vez disso. Inserir o valor inválido diretamente em uma coluna CIDR armazena NULL com um warning no modo SQL não estrito; no modo SQL estrito (o padrão), ele gera um erro e a instrução é rejeitada. Chamar `cidr_from_string('192.168.1.5/24')` como função retorna NULL com um warning em todos os modos SQL testados. |
+| A ordenação por IP está errada | Verifique se você está ordenando pela coluna INET, não por uma cópia em `VARCHAR` |
+
+## Veja também {#see-also}
+
+- [Armazenamento de IPv6 no MySQL](/pt-BR/guides/ipv6-storage) — armazenamento unificado de IPv4 e IPv6 com o tipo INET
+- [Consultando por Sub-rede no MySQL](/pt-BR/guides/subnet-queries) — filtrando linhas por faixa de rede usando INET
+- [Consultas de Geolocalização por IP no MySQL](/pt-BR/guides/ip-geolocation) — enriquecendo endereços IP com dados geográficos
+- [Armazenando Endereços MAC no MySQL](/pt-BR/guides/storing-mac-addresses) — a mesma abordagem para endereços de hardware

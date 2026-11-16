@@ -1,0 +1,319 @@
+---
+title: "MySQL em um Runtime Serverless com Drizzle"
+sidebarTitle: "Serverless com Drizzle"
+description: "Por que o pooling de conexões funciona de forma diferente em um runtime serverless e em um servidor Node de longa duração, e como uma conexão nova por invocação de função esgota o limite de conexões do MySQL sob carga concorrente."
+keywords: "mysql serverless, drizzle orm serverless, mysql connection pooling serverless, hono mysql, mysql2 serverless, mysql too many connections, serverless cold start database, max_user_connections mysql, mysql lambda connections"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Um servidor Node de longa duração abre um pool de conexões quando o processo inicia e o reutiliza em cada requisição até o processo ser encerrado. Uma função serverless não tem essa garantia: cada invocação pode ser executada em um ambiente de execução novo, sem memória da anterior, então um código que cria um pool "do jeito normal" pode acabar criando um pool totalmente novo, ou uma conexão totalmente nova, em cada requisição. Este guia constrói uma pequena aplicação Hono com Drizzle ORM e `mysql2`, e então mede o que acontece com a contagem de conexões do MySQL sob carga concorrente com cada padrão.
+
+## O Que Este Guia Testou, e O Que Não Testou {#what-this-guide-tested-and-what-it-did-not}
+
+Tudo abaixo foi executado contra um servidor VillageSQL local real e um processo Node real. A aplicação é um app Hono construído com o template `nodejs` (`npm create hono@latest`), que roda como um processo Node comum de longa duração durante os testes deste guia, sem ser implantado no Cloudflare Workers, no AWS Lambda ou no edge runtime da Vercel.
+
+Isso importa para uma afirmação específica que este guia faz e para uma que ele não faz:
+
+- **O que foi testado de verdade**: um handler de requisição que abre uma conexão MySQL nova toda vez que é executado, em comparação com um handler que reutiliza um pool de conexões criado uma vez no carregamento do módulo. Disparar requisições HTTP concorrentes contra cada versão e observar a contagem de conexões do MySQL é uma reprodução fiel do que acontece dentro de uma única instância de função serverless que processa invocações concorrentes, ou de uma instância em cold start cujo código de nível de módulo é executado novamente.
+- **O que não foi testado**: o efeito de multiplicação de muitos ambientes de execução separados fazendo cold start ao mesmo tempo, cada um rodando sua própria cópia deste processo e abrindo seu próprio pool. Um pico real de tráfego no AWS Lambda ou no Cloudflare Workers pode iniciar dezenas de instâncias isoladas simultaneamente, e um pool de 10 conexões em cada uma delas se acumula rápido, mesmo com a correção deste guia aplicada. A seção "Além de uma Única Instância" abaixo cobre o que fazer a respeito, mas isso não era algo que o processo Node deste guia, que é uma única instância por definição, pudesse reproduzir.
+
+## Configure o Banco de Dados {#set-up-the-database}
+
+Crie um banco de dados dedicado e um usuário restrito a ele:
+
+```sql
+CREATE DATABASE serverless_guide;
+CREATE USER 'serverless_app'@'127.0.0.1' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON serverless_guide.* TO 'serverless_app'@'127.0.0.1';
+```
+
+## Crie a Estrutura da Aplicação {#scaffold-the-application}
+
+Este guia usa o template `nodejs` do Hono, que roda sobre `@hono/node-server` e não exige uma plataforma de nuvem específica para o desenvolvimento:
+
+```bash
+npm create hono@latest serverless-mysql-drizzle -- --template nodejs
+```
+
+Instale o Drizzle, o driver `mysql2` e o `drizzle-kit`:
+
+```bash
+npm install drizzle-orm mysql2 dotenv
+npm install -D drizzle-kit tsx
+```
+
+`drizzle-orm` e `drizzle-kit` publicam tags de pré-lançamento (`beta`, `rc`) em `dist-tags` ao lado de `latest`. Verifique antes de instalar:
+
+```bash
+npm view drizzle-orm dist-tags
+npm view drizzle-kit dist-tags
+```
+
+No momento da escrita, `latest` para `drizzle-orm` resolve para `0.45.2` e para `drizzle-kit` resolve para `0.31.10`, ambas versões estáveis, não release candidates.
+
+Defina a string de conexão em `.env`:
+
+```bash
+DATABASE_URL="mysql://serverless_app:your_password@127.0.0.1:3306/serverless_guide"
+```
+
+## Defina o Esquema e Execute a Migração {#define-the-schema-and-run-the-migration}
+
+```typescript src/db/schema.ts
+import { int, mysqlTable, text, timestamp, varchar } from "drizzle-orm/mysql-core";
+
+export const posts = mysqlTable("posts", {
+  id: int("id").autoincrement().primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+```
+
+```typescript drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+export default defineConfig({
+  out: "./drizzle",
+  schema: "./src/db/schema.ts",
+  dialect: "mysql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL,
+  },
+});
+```
+
+Gere e aplique a migração:
+
+```bash
+npx drizzle-kit generate
+npx drizzle-kit migrate
+```
+
+```
+Reading config file 'drizzle.config.ts'
+Reading schema files:
+src/db/schema.ts
+
+1 tables
+posts 4 columns 0 indexes 0 fks
+
+[✓] Your SQL migration file ➜ drizzle/0000_eminent_corsair.sql 🚀
+```
+
+Confirme que a tabela existe:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u serverless_app -p serverless_guide -e "SHOW TABLES; DESCRIBE posts;"
+```
+
+```
+Tables_in_serverless_guide
+__drizzle_migrations
+posts
+Field	Type	Null	Key	Default	Extra
+id	int	NO	PRI	NULL	auto_increment
+title	varchar(255)	NO		NULL	
+body	text	NO		NULL	
+created_at	timestamp	NO		now()	DEFAULT_GENERATED
+```
+
+## O Antipadrão: Uma Conexão por Requisição {#the-anti-pattern-a-connection-per-request}
+
+A forma mais comum em que esse problema aparece é um código que parece razoável isoladamente. Ele abre uma conexão `mysql2`, executa uma consulta e fecha a conexão, tudo dentro do handler da requisição:
+
+```typescript src/index.bad.ts
+import "dotenv/config";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import { desc } from "drizzle-orm";
+import { posts } from "./db/schema.js";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+const app = new Hono();
+
+// Anti-pattern: a fresh connection is opened inside the handler, on every
+// request. This is what naively porting a "just create a pool" snippet
+// into a function-per-invocation runtime produces.
+app.get("/posts", async (c) => {
+  try {
+    const connection = await mysql.createConnection(process.env.DATABASE_URL as string);
+    const db = drizzle(connection, { schema: { posts }, mode: "default" });
+
+    const rows = await db.select().from(posts).orderBy(desc(posts.createdAt)).limit(5);
+
+    await connection.end();
+    return c.json(rows);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) }, 503);
+  }
+});
+
+serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
+  console.log(`[bad] listening on http://localhost:${info.port}`);
+});
+```
+
+Com baixa concorrência, isso funciona. Cinco clientes concorrentes acessando o endpoint por três segundos retornaram zero respostas com falha. O problema só aparece quando as invocações concorrentes ultrapassam o que o banco de dados permite para aquele usuário.
+
+## Demonstrando o Esgotamento {#demonstrating-the-exhaustion}
+
+O `max_connections` do MySQL é um teto para o servidor inteiro, e reduzi-lo em um servidor compartilhado para forçar uma falha afetaria todas as outras conexões daquela instância. Uma forma mais direcionada de reproduzir um teto de conexões para uma única aplicação, e que os provedores de MySQL em nuvem usam exatamente por essa razão, é o `MAX_USER_CONNECTIONS` na própria conta:
+
+```sql
+ALTER USER 'serverless_app'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 15;
+```
+
+```sql
+SELECT user, host, max_user_connections FROM mysql.user WHERE user = 'serverless_app';
+```
+
+```
+user	host	max_user_connections
+serverless_app	127.0.0.1	15
+```
+
+Com o servidor do antipadrão em execução e `serverless_app` limitado a 15 conexões, uma rajada de 30 requisições concorrentes por 5 segundos (usando o [autocannon](https://github.com/mcollina/autocannon)) produziu isto:
+
+```bash
+npx autocannon -c 30 -d 5 http://localhost:3000/posts
+```
+
+```
+20916 2xx responses, 3614 non 2xx responses
+25k requests in 5.01s, 6.6 MB read
+```
+
+Amostrar o número de conexões ativas de `serverless_app` durante a rajada, a cada 150 ms com `SELECT COUNT(*) FROM information_schema.processlist WHERE user = 'serverless_app'`, mostrou a contagem subindo até o limite de 15 conexões e passando dele (15, 15, 16, 17, 17, 17, 17, 25 nas amostras mais altas). Essas `3614` respostas não 2xx são esse limite sendo atingido. O handler acima captura o erro e o retorna no corpo de cada `503`, então isto é o que as respostas com falha carregavam:
+
+```
+Error: User 'serverless_app' has exceeded the 'max_user_connections' resource (current value: 15)
+    code: 'ER_USER_LIMIT_REACHED',
+    errno: 1226,
+    sqlState: '42000',
+```
+
+Nada disso é específico do `MAX_USER_CONNECTIONS`. Um servidor sem nenhum limite por usuário mostraria a mesma contagem crescente contra o `max_connections`, e o mesmo erro com outro nome (`ERROR 1040 (08004): Too many connections`) assim que o teto do servidor inteiro fosse atingido. O limite por usuário é o que torna isso reproduzível sem perturbar qualquer outra coisa em execução no mesmo servidor.
+
+## A Correção: Crie o Pool Uma Vez, Fora do Handler {#the-fix-create-the-pool-once-outside-the-handler}
+
+A correção não é parar de usar pool. É garantir que o pool seja criado exatamente uma vez, no carregamento do módulo, em vez de dentro da função que trata cada requisição:
+
+```typescript src/db/index.ts
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
+import * as schema from "./schema.js";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+// Module-level pool: created once when this module is first loaded, not
+// inside a request handler. A warm serverless invocation reuses the same
+// module instance and therefore the same pool; only a cold start re-runs
+// this file and opens a fresh one.
+const poolConnection = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  connectionLimit: 10,
+  waitForConnections: true,
+  queueLimit: 0,
+});
+
+export const db = drizzle(poolConnection, { schema, mode: "default" });
+```
+
+```typescript src/index.ts
+import "dotenv/config";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { desc } from "drizzle-orm";
+import { db } from "./db/index.js";
+import { posts } from "./db/schema.js";
+
+const app = new Hono();
+
+app.get("/posts", async (c) => {
+  const rows = await db.select().from(posts).orderBy(desc(posts.createdAt)).limit(20);
+  return c.json(rows);
+});
+
+app.post("/posts", async (c) => {
+  const body = await c.req.json();
+  if (typeof body.title !== "string" || body.title.trim() === "") {
+    return c.json({ error: "title is required" }, 400);
+  }
+  if (typeof body.body !== "string" || body.body.trim() === "") {
+    return c.json({ error: "body is required" }, 400);
+  }
+  const [result] = await db.insert(posts).values({ title: body.title, body: body.body });
+  return c.json({ insertId: result.insertId }, 201);
+});
+
+serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
+  console.log(`Server is running on http://localhost:${info.port}`);
+});
+```
+
+`db/index.ts` executa sua chamada `mysql.createPool()` de nível superior exatamente uma vez, sempre que o módulo é importado pela primeira vez. Em um servidor Node de longa duração, isso significa uma vez na inicialização do processo. Em um runtime serverless cujo provedor reutiliza o ambiente de execução para uma requisição posterior sem cold start, o módulo importado ainda está na memória, então o pool da primeira invocação é reutilizado em vez de recriado. Somente um cold start genuíno, que recarrega o módulo do zero, abre um novo pool.
+
+Executando a mesma rajada de 30 requisições concorrentes por 5 segundos contra esta versão, ainda com `serverless_app` limitado a 15 conexões:
+
+```
+77k requests in 5.01s, 20.7 MB read
+```
+
+Nenhuma resposta não 2xx. A amostragem da mesma contagem de conexões por usuário durante esta rajada se manteve estável em exatamente 10, o próprio `connectionLimit` do pool, em todas as amostras coletadas. O pool nunca pediu ao MySQL mais conexões do que foi configurado para manter abertas, independentemente de quantas requisições concorrentes chegaram. A vazão total também foi cerca de três vezes maior na mesma janela de 5 segundos (77.000 requisições contra 25.000). Parte dessa diferença é a versão com pool pulando um handshake TCP completo e uma rodada de autenticação em cada requisição; outra parte é que muitas das 25.000 requisições da versão do antipadrão foram falhas `503` rápidas depois que o limite de conexões foi atingido, em vez de uma consulta concluída, o que infla sua contagem de requisições sem fazer trabalho real.
+
+## Além de uma Única Instância {#beyond-a-single-instance}
+
+A correção acima resolve o problema que este guia pôde reproduzir: requisições concorrentes dentro de uma instância em execução. Ela não resolve um segundo problema que só aparece em uma plataforma serverless real: muitas instâncias separadas fazendo cold start ao mesmo tempo durante um pico de tráfego, cada uma rodando sua própria cópia deste código e, portanto, abrindo seu próprio pool. Um pool abre conexões de forma preguiçosa, somente conforme as requisições concorrentes realmente precisam delas, então dez instâncias ociosas não abrem 100 conexões só por existirem. Mas, assim que cada instância está processando um tráfego modesto e comum, dez instâncias com um `connectionLimit` de 10 cada podem somar 100 conexões bem antes de a carga de trabalho parecer algo fora do normal. O processo Node deste guia não pôde reproduzir isso, porque é um processo, não muitos.
+
+Duas abordagens tratam disso, e nenhuma delas substitui a correção acima; elas são aditivas:
+
+- **Defina um `connectionLimit` muito menor por instância**, frequentemente 1 ou 2 em vez de 10, já que cada instância em execução concorrente processa um número pequeno de requisições por vez na maioria das plataformas serverless.
+- **Coloque um proxy de pooling de conexões na frente do MySQL**, como o ProxySQL, para que muitas instâncias serverless separadas compartilhem um número muito menor de conexões MySQL reais. Consulte [Pooling de Conexões no MySQL](/pt-BR/guides/connection-pooling) para ver como o ProxySQL se encaixa nisso.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Por que não simplesmente aumentar `max_connections`? {#why-not-just-increase-max_connections}
+
+Isso eleva o teto, mas não o remove, e cada conexão tem um custo real de memória no servidor (consulte [Pooling de Conexões no MySQL](/pt-BR/guides/connection-pooling) para o detalhamento do custo por conexão). Uma carga de trabalho serverless que pode escalar para centenas de instâncias concorrentes vai acabar atingindo qualquer teto fixo; a correção é impedir que cada instância abra mais conexões do que precisa, não elevar o número que essas instâncias podem esgotar.
+
+#### Isso se aplica ao Express tanto quanto ao Hono? {#does-this-apply-to-express-as-well-as-hono}
+
+Sim. O modo de falha diz respeito a onde o pool ou a conexão é criado em relação ao handler da requisição, não a qual framework web roteia a requisição. Um app Express com `mysql.createConnection()` chamado dentro de um handler de rota tem o problema idêntico, e `mysql.createPool()` chamado uma vez no escopo do módulo tem a correção idêntica.
+
+#### O pool integrado do `mysql2` é suficiente, ou preciso de algo como o ProxySQL? {#is-mysql2s-built-in-pool-enough-or-do-i-need-something-like-proxysql}
+
+Para um único servidor de longa duração, o pool do `mysql2` é suficiente por si só; é isso que [Pooling de Conexões no MySQL](/pt-BR/guides/connection-pooling) cobre. Em uma plataforma serverless, o padrão de pool em nível de módulo deste guia impede que uma instância abra mais conexões do que seu `connectionLimit`, mas ele não consegue coordenar entre instâncias separadas em execução concorrente. Um proxy como o ProxySQL é o que coordena entre instâncias.
+
+#### Por que a contagem de conexões da versão corrigida ficou exatamente em 10 em vez de subir até 30, acompanhando a concorrência do teste? {#why-did-the-fixed-versions-connection-count-sit-exactly-at-10-instead-of-climbing-to-30-matching-the-concurrency-of-the-test}
+
+Porque o pool tem `waitForConnections: true` e um `connectionLimit` de 10. Assim que 10 conexões estão em uso, a décima primeira requisição concorrente espera que uma delas seja devolvida ao pool em vez de abrir uma nova. As requisições entram em fila brevemente em vez de o pool crescer sem limite.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `ERROR 1226 (42000): User '<user>' has exceeded the 'max_user_connections' resource` | A conta atingiu seu limite de `MAX_USER_CONNECTIONS`. Mova a criação da conexão ou do pool para fora do handler da requisição, ou eleve o limite com `ALTER USER ... WITH MAX_USER_CONNECTIONS n` se a carga de trabalho realmente precisar de mais. |
+| `ERROR 1040 (08004): Too many connections` | O teto de `max_connections` do servidor inteiro foi atingido. Mesma causa subjacente do erro por usuário acima quando nenhum limite por usuário está definido; corrija o padrão de conexão antes de elevar o limite. |
+| As conexões sobem constantemente e nunca voltam a cair depois que uma rajada termina | Uma conexão ou um pool está sendo criado, mas nunca fechado em algum caminho do código. Todo caminho do código no handler, incluindo os caminhos de erro, deve fechar a conexão ou deixar que um pool limitado gerencie seu próprio ciclo de vida. |
+| O pool funciona localmente, mas as instâncias ainda acumulam conexões em produção | A correção de instância única deste guia não coordena entre instâncias serverless separadas em execução concorrente. Consulte "Além de uma Única Instância" acima. |
+
+## Veja também {#see-also}
+
+- [Pooling de Conexões no MySQL](/pt-BR/guides/connection-pooling) — como o pooling funciona em um servidor de longa duração, e como o ProxySQL coordena o pooling entre vários servidores de aplicação
+- [Next.js e Drizzle com MySQL](/pt-BR/guides/mysql-with-drizzle) — o mesmo esquema e a mesma configuração do Drizzle em um servidor Next.js de longa duração, sem o ciclo de vida de conexão serverless
+- [Usando MySQL com ORMs: Django, Rails e Prisma](/pt-BR/guides/mysql-with-orms) — configurando as opções de pool específicas do MySQL em ORMs além do Drizzle

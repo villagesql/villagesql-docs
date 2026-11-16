@@ -1,0 +1,142 @@
+---
+title: "Gerando Dados Aleatórios no MySQL"
+sidebarTitle: "Gerando Dados Aleatórios"
+description: "Como gerar dados aleatórios no MySQL — bytes criptograficamente seguros, UUIDs aleatórios e dados de teste — usando RAND(), RANDOM_BYTES() e a gen_random_bytes() do VillageSQL."
+keywords: "mysql random data, mysql generate random bytes, mysql random uuid, mysql random token, mysql random test data, mysql gen_random_bytes"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+A `RAND()` do MySQL gera números pseudoaleatórios para coisas como embaralhar resultados de consultas. Ela não é criptograficamente segura, o que importa quando você está gerando tokens, salts ou nonces. `RANDOM_BYTES()` preenche essa lacuna, e a extensão `vsql_crypto` do VillageSQL adiciona `gen_random_bytes()` e `gen_random_uuid()` como parte de uma API de criptografia unificada.
+
+## As Funções Aleatórias do MySQL {#mysqls-random-functions}
+
+O MySQL fornece duas funções aleatórias embutidas com propósitos muito diferentes:
+
+**`RAND()`** — Retorna um float pseudoaleatório entre 0 e 1. Rápida e adequada para aplicações sem exigência de segurança: resultados de consulta aleatorizados, amostragem ponderada, seleção aleatória de linhas. Não é criptograficamente segura.
+
+```sql
+-- Shuffle query results
+SELECT * FROM products ORDER BY RAND() LIMIT 10;
+
+-- Random integer in a range
+SELECT FLOOR(RAND() * 100) AS random_0_to_99;
+```
+
+**`RANDOM_BYTES(n)`** — Retorna `n` bytes aleatórios criptograficamente seguros como `VARBINARY`. Use-a para tokens, salts, nonces e chaves.
+
+```sql
+-- 16-byte cryptographic token
+SELECT HEX(RANDOM_BYTES(16)) AS token;
+
+-- Use as a session token
+INSERT INTO sessions (token, user_id, expires_at)
+VALUES (RANDOM_BYTES(32), 42, NOW() + INTERVAL 7 DAY);
+```
+
+## Com o VillageSQL: gen_random_bytes() e gen_random_uuid() {#with-villagesql-gen_random_bytes-and-gen_random_uuid}
+
+A extensão `vsql_crypto` do VillageSQL adiciona `gen_random_bytes()` e `gen_random_uuid()`, que usam a `RAND_bytes()` do OpenSSL — a mesma fonte de entropia de `RANDOM_BYTES()`.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+O principal motivo para usá-las no lugar das funções embutidas é a consistência: quando você já usa `digest()`, `hmac()` ou `encrypt()` da `vsql_crypto`, manter todas as operações de criptografia em uma única extensão simplifica atualizações e auditoria.
+
+```sql
+-- Cryptographically secure random bytes
+SELECT HEX(gen_random_bytes(16)) AS token_hex;
+SELECT HEX(gen_random_bytes(32)) AS session_key;
+
+-- Verify length
+SELECT LENGTH(gen_random_bytes(24));  -- Returns 24
+
+-- Random UUID v4
+SELECT gen_random_uuid();
+-- Returns: 'de2ae351-fc1b-4182-b6a5-72d11a341dc3' (different every call)
+```
+
+### Gerando dados de teste {#generating-test-data}
+
+Funções aleatórias são úteis para popular tabelas de teste:
+
+```sql
+-- Insert 1000 rows of test data. WITH RECURSIVE must immediately precede
+-- the SELECT it attaches to, so it goes after the INSERT's column list.
+INSERT INTO test_users (username, email, score, token)
+WITH RECURSIVE n AS (
+    SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 1000
+)
+SELECT
+    CONCAT('user_', i),
+    CONCAT('user', i, '@example.com'),
+    FLOOR(RAND() * 100),
+    gen_random_bytes(16)
+FROM n;
+```
+
+### Tokens de uso único e códigos de convite {#one-time-tokens-and-invite-codes}
+
+```sql
+CREATE TABLE invites (
+    token     VARBINARY(32) PRIMARY KEY,
+    email     VARCHAR(255),
+    used      TINYINT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO invites (token, email)
+VALUES (gen_random_bytes(32), 'newuser@example.com');
+
+-- Return token as hex for use in a URL
+SELECT HEX(token) AS invite_link, email FROM invites WHERE used = 0;
+```
+
+## Escolhendo a Função Certa {#choosing-the-right-function}
+
+| Função | Saída | Criptograficamente segura | Use quando |
+|:---|:---|:---|:---|
+| `RAND()` | Float 0–1 | Não | Embaralhar, amostrar, seleção ponderada |
+| `FLOOR(RAND() * n)` | Inteiro 0–(n-1) | Não | Inteiros aleatórios para dados de teste |
+| `RANDOM_BYTES(n)` | VARBINARY | Sim | Tokens, nonces, salts — embutida no MySQL |
+| `gen_random_bytes(n)` | VARBINARY | Sim | O mesmo que RANDOM_BYTES, unificada com a API da vsql_crypto |
+| `gen_random_uuid()` | VARCHAR (string UUID) | Sim | UUID v4 como string — não exige a vsql_uuid |
+
+`RANDOM_BYTES()` e `gen_random_bytes()` são funcionalmente equivalentes — as duas retornam a mesma qualidade de aleatoriedade. Se você já usa a `vsql_crypto`, use `gen_random_bytes()` para manter a sua superfície de criptografia em um só lugar. Se você só precisa de bytes aleatórios e nada mais, a `RANDOM_BYTES()` do MySQL funciona bem.
+
+Se você precisa de um tipo UUID com variantes ordenáveis (v7) e armazenamento binário, use a extensão `vsql_uuid` em vez de `gen_random_uuid()`. Consulte [UUIDs no MySQL](/pt-BR/guides/uuids) para a comparação completa.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### A RAND() é segura para gerar tokens? {#is-rand-safe-for-generating-tokens}
+
+Não. `RAND()` é um gerador de números pseudoaleatórios semeado a partir de um estado previsível. Ela serve para `ORDER BY RAND()` e usos semelhantes sem exigência de segurança, mas tokens gerados com `RAND()` podem, em teoria, ser previstos. Use `RANDOM_BYTES()` ou `gen_random_bytes()` para qualquer coisa sensível à segurança.
+
+#### De quantos bytes preciso para um token seguro? {#how-many-bytes-do-i-need-for-a-secure-token}
+
+32 bytes (256 bits) é o padrão para tokens de sessão e chaves de API. 16 bytes (128 bits) é o mínimo para segurança prática. Use 32 para ficar seguro.
+
+#### Posso usar gen_random_bytes() como DEFAULT? {#can-i-use-gen_random_bytes-as-a-default}
+
+Não. O MySQL em si permite funções não determinísticas em expressões DEFAULT — `UUID()`, `RAND()` e `NOW()` funcionam ali. `gen_random_bytes()` é rejeitada especificamente porque é uma função de extensão do VillageSQL registrada como não determinística, e o VEF bloqueia essas funções em expressões DEFAULT independentemente do que o MySQL em si permite. Em vez disso, gere o valor em cada instrução INSERT.
+
+#### Qual é a diferença entre gen_random_uuid() e a UUID_V4() da vsql_uuid? {#whats-the-difference-between-gen_random_uuid-and-uuid_v4-from-vsql_uuid}
+
+`gen_random_uuid()` retorna uma string UUID em `VARCHAR`. A `UUID_V4()` da extensão `vsql_uuid` retorna um tipo `UUID` nativo com armazenamento binário de 16 bytes. Se você usa UUIDs como chaves primárias, prefira `UUID_V4()` ou `UUID_V7()` da `vsql_uuid`. Use `gen_random_uuid()` quando precisar de uma string UUID e não quiser instalar uma extensão separada.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.gen_random_bytes does not exist` | Execute `INSTALL EXTENSION vsql_crypto` |
+| Os tokens parecem sequenciais ou previsíveis | Você pode estar usando `RAND()` em vez de `gen_random_bytes()` |
+| `gen_random_bytes()` retorna NULL | Verifique se o argumento é um inteiro positivo |
+| `DEFAULT (gen_random_bytes(32))` rejeitado | O MySQL não permite defaults não determinísticos — gere em cada INSERT |
+
+## Veja também {#see-also}
+
+- [Hashing de Senhas no MySQL](/pt-BR/guides/password-hashing) — usando bytes aleatórios como salt para armazenamento de credenciais
+- [UUIDs no MySQL](/pt-BR/guides/uuids) — o UUID v4 é um uso comum de aleatoriedade criptográfica

@@ -1,0 +1,219 @@
+---
+title: "Consultando por Sub-rede no MySQL"
+sidebarTitle: "Consultando por Sub-rede"
+description: "Como consultar linhas por sub-rede IP no MySQL — verificações de intervalo bit a bit com INET_ATON, e consultas de sub-rede mais limpas usando o tipo INET e as funções de rede do VillageSQL."
+keywords: "mysql subnet query, mysql ip range query, mysql cidr query, mysql inet subnet filter, mysql ip in subnet, mysql network address query"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Encontrar todas as linhas em que um endereço IP está dentro de uma sub-rede exige comparar valores numéricos de IP com um intervalo. A abordagem padrão do MySQL usa aritmética bit a bit com `INET_ATON()`. O tipo `INET` do VillageSQL fornece funções de rede que tornam a mesma consulta mais legível e funcionam tanto para IPv4 quanto para IPv6.
+
+## A Abordagem Padrão: Verificações de Intervalo Bit a Bit {#the-standard-approach-bitwise-range-checks}
+
+Para IPv4, `INET_ATON()` converte um endereço em um inteiro sem sinal de 32 bits. Uma verificação de pertencimento a uma sub-rede é um AND bit a bit: se `(ip & netmask) == network_address`, o IP está na sub-rede.
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INT UNSIGNED,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (INET_ATON('192.168.1.10')),
+    (INET_ATON('192.168.1.50')),
+    (INET_ATON('192.168.2.1')),
+    (INET_ATON('10.0.0.5'));
+
+-- Find all IPs in 192.168.1.0/24
+SELECT INET_NTOA(ip_address) FROM access_log
+WHERE ip_address BETWEEN INET_ATON('192.168.1.0')
+                     AND INET_ATON('192.168.1.255');
+
+-- Or using bitwise AND with the netmask
+SELECT INET_NTOA(ip_address) FROM access_log
+WHERE (ip_address & 0xFFFFFF00) = INET_ATON('192.168.1.0');
+```
+
+As duas formas funcionam para IPv4. A abordagem com `BETWEEN` é legível. A forma bit a bit é mais fácil de compor quando os parâmetros da sub-rede são variáveis.
+
+Nenhuma das duas abordagens funciona para IPv6 — `INET_ATON()` só trata IPv4.
+
+## Com o VillageSQL: Funções de Rede em Colunas INET {#with-villagesql-network-functions-on-inet-columns}
+
+A extensão `vsql_network_address` do VillageSQL fornece predicados de contenção que respondem diretamente "este endereço está dentro daquela sub-rede" — `inet_contained_by()`, `inet_contains()` e `inet_overlaps()` — além de `inet_network()`, `inet_set_masklen()` e `inet_compare()` para montar a verificação à mão. Todas elas funcionam em colunas `INET` tanto IPv4 quanto IPv6.
+
+```sql
+INSTALL EXTENSION vsql_network_address;
+```
+
+```sql
+CREATE TABLE access_log (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    ip_address INET,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO access_log (ip_address) VALUES
+    (inet_from_string('192.168.1.10')),
+    (inet_from_string('192.168.1.50')),
+    (inet_from_string('192.168.2.1')),
+    (inet_from_string('10.0.0.5')),
+    (inet_from_string('192.168.1.200'));
+```
+
+### Consulta de contenção em sub-rede {#subnet-containment-query}
+
+Para verificar se um IP armazenado pertence a uma sub-rede, aplique a máscara do comprimento de prefixo da sub-rede ao endereço e compare o resultado com a rede alvo:
+
+```sql
+-- All IPs in 192.168.1.0/24
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip_address, 24)))
+    = '192.168.1.0/24';
+```
+
+Para uma versão parametrizada em que a sub-rede vem de uma variável:
+
+```sql
+SET @subnet     = '192.168.1.0/24';
+SET @prefix_len = inet_masklen(inet_from_string(@subnet));
+SET @network    = cidr_to_string(cidr_from_string(@subnet));
+
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip_address, @prefix_len)))
+    = @network;
+```
+
+### Predicados de contenção {#containment-predicates}
+
+A extensão inclui os cinco predicados de contenção do PostgreSQL como funções. Elas
+recebem dois valores `INET` e retornam `1`, `0` ou `NULL`:
+
+| Função | Operador do PostgreSQL | Verdadeiro quando |
+|:---|:---|:---|
+| `inet_contained_by(a, b)` | `a << b` | `a` está dentro de `b`, e `b` é a rede mais ampla |
+| `inet_contained_by_or_equals(a, b)` | `a <<= b` | `a` está dentro de `b`, ou as duas redes são iguais |
+| `inet_contains(a, b)` | `a >> b` | `a` é a rede mais ampla e `b` está dentro dela |
+| `inet_contains_or_equals(a, b)` | `a >>= b` | `b` está dentro de `a`, ou as duas redes são iguais |
+| `inet_overlaps(a, b)` | `a && b` | uma das redes contém a outra, ou elas são iguais |
+
+A consulta de sub-rede acima se torna uma única chamada:
+
+```sql
+-- All IPs in 192.168.1.0/24
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE inet_contained_by(ip_address, inet_from_string('192.168.1.0/24'));
+```
+
+Apenas a parte de rede de cada valor é comparada, até o menor dos dois comprimentos
+de prefixo — então `192.168.1.5/24` e `192.168.1.9/24` são a mesma rede,
+e as formas estritas retornam `0` para elas, enquanto as formas `_or_equals` retornam `1`.
+Dois endereços de famílias diferentes nunca correspondem: comparar um valor IPv4 com um
+IPv6 retorna `0` em vez de gerar um erro, como no PostgreSQL.
+
+Os dois argumentos devem ser `INET`. Um valor `CIDR` não é convertido implicitamente:
+
+```text
+ERROR 3219 (HY000): Cannot initialize function 'inet_contains': argument 1 type mismatch (expected vsql_network_address.INET, got vsql_network_address.CIDR)
+```
+
+Em vez disso, passe `inet_from_string()` na sub-rede, como faz o exemplo acima. Essas
+funções foram adicionadas na versão 0.0.5 do `vsql_network_address`.
+
+### Contenção por intervalo com inet_compare {#range-based-containment-with-inet_compare}
+
+Uma alternativa que evita recalcular a rede em cada linha — útil quando você tem o endereço de broadcast disponível:
+
+```sql
+-- IPs in 192.168.1.0/24: from .0 to .255
+SELECT inet_to_string(ip_address) FROM access_log
+WHERE inet_compare(ip_address, inet_from_string('192.168.1.0'))   >= 0
+  AND inet_compare(ip_address, inet_from_string('192.168.1.255')) <= 0;
+```
+
+### Consultas de sub-rede IPv6 (mesmo padrão) {#ipv6-subnet-queries-same-pattern}
+
+A mesma abordagem com `inet_network()` funciona para IPv6 sem nenhuma alteração:
+
+```sql
+CREATE TABLE ipv6_log (id INT, ip INET);
+INSERT INTO ipv6_log VALUES
+    (1, inet_from_string('2001:db8::1')),
+    (2, inet_from_string('2001:db8::100')),
+    (3, inet_from_string('2001:db9::1'));
+
+-- Find all IPs in 2001:db8::/32
+SET @v6_prefix = 32;
+SET @v6_network = '2001:0db8:0000:0000:0000:0000:0000:0000/32';
+
+SELECT inet_to_string(ip) FROM ipv6_log
+WHERE cidr_to_string(inet_network(inet_set_masklen(ip, @v6_prefix)))
+    = @v6_network;
+```
+
+### Padrão de tabela de redes {#networks-table-pattern}
+
+Um caso de uso comum: uma tabela `networks` com CIDRs autorizados, e verificar se um IP de entrada está em algum deles.
+
+```sql
+CREATE TABLE networks (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    network CIDR,
+    label   VARCHAR(100)
+);
+
+INSERT INTO networks (network, label) VALUES
+    (cidr_from_string('192.168.1.0/24'), 'office-lan'),
+    (cidr_from_string('10.0.0.0/8'),     'vpn-range'),
+    (cidr_from_string('172.16.0.0/12'),  'docker-range');
+
+-- Is an incoming IP in any authorized network?
+-- inet_masklen() takes INET, not CIDR — convert via string to get the prefix length
+SELECT label FROM networks
+WHERE cidr_to_string(inet_network(inet_set_masklen(
+    inet_from_string('192.168.1.42'),
+    inet_masklen(inet_from_string(cidr_to_string(network)))
+))) = cidr_to_string(network);
+```
+
+## Padrão vs VillageSQL {#standard-vs-villagesql}
+
+| Abordagem | IPv6 | Legível | Sem cálculo manual |
+|:---|:---|:---|:---|
+| `BETWEEN INET_ATON()` | Não | Moderada | Exige calcular o broadcast manualmente |
+| AND bit a bit com `INET_ATON()` | Não | Baixa | Exige calcular a máscara de rede manualmente |
+| `inet_network()` + `inet_set_masklen()` | Sim | Alta | As funções cuidam da matemática |
+| `inet_contained_by()` | Sim | Alta | Uma chamada, sem cálculo manual |
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### O VillageSQL tem o operador de contenção `<<` do PostgreSQL? {#does-villagesql-have-postgresqls--containment-operator}
+
+O comportamento está lá, como funções em vez de operadores: `inet_contained_by()` para `<<`, `inet_contains()` para `>>`, as variantes `_or_equals` para `<<=` e `>>=`, e `inet_overlaps()` para `&&`. Consulte [Predicados de contenção](#containment-predicates).
+
+#### A consulta de sub-rede usa o índice? {#does-the-subnet-query-use-the-index}
+
+O padrão `cidr_to_string(inet_network(inet_set_masklen(...)))` não usa uma varredura de índice — ele recalcula o endereço de rede para cada linha. Para tabelas grandes, a abordagem de intervalo com `inet_compare` é mais amigável ao índice, porque expressa a consulta como um intervalo na coluna `ip_address`.
+
+#### Posso armazenar sub-redes e consultar contenção ao mesmo tempo? {#can-i-store-subnets-and-query-containment-at-the-same-time}
+
+Sim. Armazene tanto o endereço do host quanto a sub-rede em colunas `INET` e compare-os com `inet_contained_by(host_ip, subnet)`. Se a sub-rede está em uma coluna `CIDR`, converta-a primeiro — os predicados de contenção recebem `INET` dos dois lados e não convertem `CIDR` implicitamente.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.inet_network does not exist` | Execute `INSTALL EXTENSION vsql_network_address` |
+| A consulta de sub-rede não retorna linhas | Verifique se `@network` corresponde à string CIDR expandida — CIDRs IPv6 usam a notação expandida |
+| A consulta por intervalo inclui endereços fora da sub-rede | Verifique o endereço de broadcast; para /24 o intervalo vai de `.0` a `.255` |
+| Uma coluna mista IPv4/IPv6 retorna resultados errados | Endereços IPv4 e IPv6 não se sobrepõem — a consulta retorna resultados corretos por família |
+
+## Veja também {#see-also}
+
+- [Armazenando Endereços IP no MySQL](/pt-BR/guides/storing-ip-addresses) — o tipo INET usado nas consultas de sub-rede
+- [Armazenamento de IPv6 no MySQL](/pt-BR/guides/ipv6-storage) — as consultas de sub-rede funcionam da mesma forma para IPv6 com INET
+- [Consultas de Geolocalização por IP no MySQL](/pt-BR/guides/ip-geolocation) — indo além das sub-redes com dados de IP

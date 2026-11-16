@@ -1,0 +1,85 @@
+---
+title: "utf8mb4 no MySQL: Armazenando Emoji e Unicode Completo"
+sidebarTitle: "utf8mb4 e Emoji"
+description: "Por que o charset utf8 do MySQL rejeita emoji, como converter tabelas para utf8mb4 com segurança e o limite de comprimento de índice que costumava fazer as conversões falharem."
+keywords: "mysql utf8mb4, mysql emoji, incorrect string value mysql, convert utf8 to utf8mb4, utf8mb4 vs utf8, mysql unicode"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O charset do MySQL chamado `utf8` não é UTF-8. É um subconjunto de três bytes por caractere (`utf8mb3`), congelado no tempo antes dos emoji, e qualquer caractere de quatro bytes — emoji, muitos ideogramas CJK, símbolos matemáticos — não pode ser armazenado nele. `utf8mb4` é o UTF-8 de verdade. No MySQL 8.0 e posteriores, ele é o padrão para novas tabelas, mas as tabelas criadas em versões mais antigas, ou com `utf8` explícito no seu DDL, ainda carregam a armadilha.
+
+## A Falha {#the-failure}
+
+```sql
+CREATE TABLE notes_mb3 (
+  body VARCHAR(100)
+) CHARACTER SET utf8mb3;
+
+INSERT INTO notes_mb3 (body) VALUES ('launch day 🚀');
+```
+
+```text
+ERROR 1366 (HY000): Incorrect string value: '\xF0\x9F\x9A\x80' for column 'body' at row 1
+```
+
+`\xF0\x9F\x9A\x80` são os quatro bytes do emoji de foguete. Com o modo SQL estrito desligado, isso chega como um aviso, e o caractere problemático é substituído silenciosamente por `?` enquanto o restante da string é mantido — o que é pior: você descobre semanas depois, a partir dos dados.
+
+## Encontre o Que Precisa de Conversão {#find-what-needs-converting}
+
+Pergunte aos metadados quais tabelas e colunas ainda usam o utf8 de três bytes:
+
+```sql
+SELECT table_schema, table_name, column_name, character_set_name
+FROM information_schema.columns
+WHERE character_set_name = 'utf8mb3'
+  AND table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys');
+```
+
+Verifique também os padrões do esquema e da tabela, ou as novas colunas nascerão erradas:
+
+```sql
+SELECT schema_name, default_character_set_name
+FROM information_schema.schemata;
+```
+
+## Converta {#convert}
+
+O `CONVERT TO CHARACTER SET` reescreve a tabela, convertendo tanto as definições das colunas quanto os dados armazenados:
+
+```sql
+ALTER TABLE notes_mb3 CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+Em seguida, corrija os padrões para que os objetos futuros herdem o charset correto:
+
+```sql
+ALTER DATABASE myapp CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+Em uma tabela grande, isso é uma reescrita completa; trate-a como qualquer outro `ALTER` bloqueante e execute-a com as suas ferramentas normais de migração online. Consulte [Migrações de esquema](/pt-BR/guides/schema-migrations).
+
+Duas coisas a verificar antes de converter:
+
+- **Comprimento do índice.** Um índice único em `VARCHAR(255)` precisava de 765 bytes em utf8mb3, mas de 1.020 em utf8mb4. Os padrões modernos do InnoDB (formato de linha `DYNAMIC`) permitem 3.072 bytes, portanto isso afeta principalmente tabelas herdadas com os formatos de linha `REDUNDANT` ou `COMPACT` de servidores muito antigos. Se o `ALTER` falhar com um erro de comprimento máximo de chave, verifique primeiro o formato de linha da tabela.
+- **O charset da conexão.** O armazenamento é só metade do caminho. Se a conexão do cliente negociar `utf8mb3`, os emoji morrem em trânsito, mesmo que a coluna pudesse armazená-los. Verifique o que a sua sessão realmente usa:
+
+```sql
+SHOW VARIABLES LIKE 'character_set_c%';
+```
+
+Você quer que `character_set_client` e `character_set_connection` mostrem ambos `utf8mb4`. A maioria dos drivers modernos faz isso por padrão; configurações mais antigas de JDBC e PHP podem fixar `utf8`.
+
+## Collation, em Resumo {#collation-briefly}
+
+O charset é o que os bytes significam; a collation é como eles se comparam. Para utf8mb4 no MySQL 8.x, `utf8mb4_0900_ai_ci` é o padrão e a resposta geral correta: insensível a acentos, insensível a maiúsculas e minúsculas, ordenação correta do Unicode 9.0. Misturar collations entre tabelas que são unidas por colunas de string força conversões e pode deixar de usar índices, portanto escolha uma e use-a em todos os lugares. [Conjuntos de caracteres e collations](/pt-BR/guides/character-sets) cobre as regras de comparação em profundidade.
+
+## Veja também {#see-also}
+
+- [Conjuntos de caracteres e collations](/pt-BR/guides/character-sets) — o modelo mais amplo de charset do qual este guia é um caso especial
+- [Migrações de esquema](/pt-BR/guides/schema-migrations) — executando o ALTER de conversão com segurança em produção
+- [Escolhendo tipos de dados](/pt-BR/guides/choosing-data-types) — dimensionamento de colunas quando cada caractere pode ter quatro bytes
+- [Usando o MySQL com ORMs: Django, Rails e Prisma](/pt-BR/guides/mysql-with-orms) — as configurações de conexão de ORM que usam este charset
+- [Sensibilidade a maiúsculas e minúsculas no MySQL](/pt-BR/tutorial/case-sensitivity) — entendendo a collation que acompanha este charset

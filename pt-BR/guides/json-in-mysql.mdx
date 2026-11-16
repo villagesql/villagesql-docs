@@ -1,0 +1,154 @@
+---
+title: "JSON no MySQL"
+sidebarTitle: "Armazenando Dados JSON"
+description: "Como armazenar, consultar e indexar dados JSON no MySQL: o tipo de coluna JSON, expressões de caminho, funções JSON e como indexar campos JSON com colunas geradas."
+keywords: "mysql json, mysql json column, mysql json_extract, mysql json path, mysql json functions, mysql json index, mysql json generated column"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O tipo de coluna `JSON` nativo do MySQL valida o JSON na inserção, o armazena em um formato binário para acesso eficiente e fornece um conjunto de funções para ler e modificar campos individuais sem analisar o documento inteiro.
+
+## Armazenando JSON {#storing-json}
+
+```sql
+CREATE TABLE products (
+    id         INT PRIMARY KEY AUTO_INCREMENT,
+    name       VARCHAR(100) NOT NULL,
+    attributes JSON
+);
+
+INSERT INTO products (name, attributes) VALUES (
+    'Laptop',
+    '{"brand": "Acme", "ram_gb": 16, "tags": ["portable", "pro"]}'
+);
+```
+
+O MySQL valida o JSON na inserção. Inserir JSON malformado gera um erro.
+
+## Lendo Campos JSON {#reading-json-fields}
+
+Use `JSON_EXTRACT(column, path)` ou a abreviação `->`:
+
+```sql
+-- These are equivalent
+SELECT JSON_EXTRACT(attributes, '$.brand') FROM products;
+SELECT attributes -> '$.brand' FROM products;
+```
+
+Ambos retornam um valor JSON — a string `"Acme"` com aspas. Para obter uma string simples sem aspas, use `->>` (que é a abreviação de `JSON_UNQUOTE(JSON_EXTRACT(...))`):
+
+```sql
+SELECT attributes ->> '$.brand' FROM products;  -- returns: Acme
+```
+
+Sintaxe de caminho:
+- `$.key` — acessa um campo de objeto
+- `$.array[0]` — acessa um elemento de array pelo índice
+- `$.array[*]` — todos os elementos de um array
+- `$.**` — curinga recursivo (todos os valores em qualquer profundidade)
+
+## Filtrando por Campos JSON {#filtering-on-json-fields}
+
+```sql
+-- Find all 16GB RAM products
+SELECT name FROM products
+WHERE attributes ->> '$.ram_gb' = '16';
+
+-- Check if a key exists
+SELECT name FROM products
+WHERE JSON_EXTRACT(attributes, '$.brand') IS NOT NULL;
+
+-- Check if an array contains a value
+SELECT name FROM products
+WHERE JSON_CONTAINS(attributes -> '$.tags', '"portable"');
+```
+
+Observe que `->>` retorna uma string, então comparar com `'16'` (e não `16`) é o correto, a menos que você faça a conversão explicitamente: `CAST(attributes ->> '$.ram_gb' AS UNSIGNED)`.
+
+## Modificando JSON {#modifying-json}
+
+```sql
+-- Add or update a field
+UPDATE products
+SET attributes = JSON_SET(attributes, '$.color', 'silver')
+WHERE id = 1;
+
+-- Remove a field
+UPDATE products
+SET attributes = JSON_REMOVE(attributes, '$.tags')
+WHERE id = 1;
+
+-- Insert only if the key doesn't exist
+UPDATE products
+SET attributes = JSON_INSERT(attributes, '$.warranty_years', 2)
+WHERE id = 1;
+```
+
+As funções principais:
+
+| Função | Comportamento |
+|:---------|:---------|
+| `JSON_SET(doc, path, val)` | Define o valor — insere ou substitui |
+| `JSON_INSERT(doc, path, val)` | Insere somente se o caminho não existir |
+| `JSON_REPLACE(doc, path, val)` | Substitui somente se o caminho existir |
+| `JSON_REMOVE(doc, path)` | Remove o valor no caminho |
+
+## Indexando Campos JSON {#indexing-json-fields}
+
+A coluna JSON em si não pode ser indexada diretamente. Para indexar um campo JSON específico, crie uma coluna gerada e indexe essa coluna:
+
+```sql
+ALTER TABLE products
+    ADD COLUMN brand VARCHAR(100) GENERATED ALWAYS AS (attributes ->> '$.brand') VIRTUAL;
+
+CREATE INDEX idx_brand ON products (brand);
+```
+
+Agora `WHERE attributes ->> '$.brand' = 'Acme'` pode usar `idx_brand`. O MySQL reconhece que a expressão da coluna gerada corresponde à condição da consulta.
+
+Isso é tratado com mais detalhes em [Escolhendo Tipos de Dados no MySQL](/pt-BR/guides/choosing-data-types) — é o padrão recomendado sempre que você consulta um campo JSON com frequência suficiente para precisar de um índice.
+
+## JSON vs Colunas Normalizadas {#json-vs-normalized-columns}
+
+| | Coluna JSON | Colunas normalizadas |
+|:--|:------------|:-------------------|
+| Flexibilidade de esquema | Qualquer estrutura, sem necessidade de migração | Estrutura fixa, migração necessária |
+| Indexação | Somente por colunas geradas | Indexa qualquer coluna diretamente |
+| Complexidade da consulta | Expressões de caminho, funções JSON | SQL padrão |
+| Joins | Impossíveis em chaves JSON | Suporte completo a JOIN |
+| Armazenamento | Maior (sobrecarga do JSON binário) | Mais compacto |
+| Integridade dos dados | Sem restrições no nível da coluna | `NOT NULL`, `DEFAULT`, chaves estrangeiras |
+
+Use JSON quando a estrutura é genuinamente variável (atributos configuráveis pelo usuário, metadados de eventos, payloads de APIs de terceiros). Use colunas normalizadas quando a estrutura é fixa e você precisa filtrar, juntar ou agregar pelos campos.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Posso indexar um array JSON para consultas de contenção? {#can-i-index-a-json-array-for-containment-queries}
+
+Não diretamente com um índice padrão. Para consultas `JSON_CONTAINS`, a única opção é uma varredura completa da tabela, a menos que você extraia o array para uma tabela filha separada (normalizada) ou use um índice full-text em uma coluna gerada que achata o array. Para consultas de contenção de alto volume, a normalização é o melhor caminho.
+
+#### Qual é a diferença entre `->` e `->>`? {#whats-the-difference-between---and--}
+
+`->` retorna um valor JSON (as strings incluem as aspas ao redor). `->>` retorna a string sem aspas. Para exibição, concatenação e qualquer coisa que consuma o texto, `->>` é o que você quer. A igualdade ainda funciona com `->`, porém: o MySQL converte o outro operando para JSON primeiro, então `attributes -> '$.brand' = 'Acme'` corresponde.
+
+#### Armazenar JSON prejudica o desempenho? {#does-storing-json-hurt-performance}
+
+Ler um único campo de um documento JSON grande exige analisar a estrutura binária, o que é mais rápido do que analisar texto, mas mais lento do que ler uma coluna nativa. Para campos acessados com frequência, o padrão coluna gerada + índice coloca o desempenho de leitura no mesmo nível das colunas nativas.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 3140: Invalid JSON` na inserção | Corrija a sintaxe do JSON — o MySQL valida na inserção |
+| `WHERE attributes -> '$.key' = 'value'` não retorna linhas | As aspas não são a causa — essa comparação entende JSON e corresponde. Verifique o caminho em si, e se o valor é uma string JSON e não um número |
+| A consulta por campo JSON não usa um índice | Adicione uma coluna gerada sobre a expressão de caminho e indexe essa coluna |
+| `JSON_CONTAINS` com array aninhado não corresponde | Verifique o caminho e as aspas — valores de string dentro de `JSON_CONTAINS` devem ser JSON com aspas: `'"value"'`, e não `'value'` |
+
+## Veja também {#see-also}
+
+- [Escolhendo Tipos de Dados no MySQL](/pt-BR/guides/choosing-data-types) — quando usar JSON vs colunas normalizadas
+- [Colunas Geradas no MySQL](/pt-BR/guides/generated-columns) — indexando campos JSON com colunas geradas virtuais
+- [Fazendo Requisições HTTP a partir do SQL](/pt-BR/guides/http-requests-in-mysql) — analisando JSON de respostas de APIs HTTP

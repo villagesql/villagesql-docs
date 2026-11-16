@@ -1,0 +1,141 @@
+---
+title: "Criptografando Colunas no MySQL"
+sidebarTitle: "Criptografando Colunas"
+description: "Como criptografar dados sensíveis de colunas no MySQL — por que o AES_ENCRYPT do MySQL usa um modo padrão inseguro e como o encrypt() do VillageSQL corrige isso automaticamente."
+keywords: "mysql encrypt column, mysql AES_ENCRYPT secure, mysql column encryption, mysql encrypt PII, mysql aes cbc iv, mysql encrypt decrypt data"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O MySQL tem `AES_ENCRYPT()` nativo. O problema é que o modo padrão dele — `aes-128-ecb` — é inseguro. A criptografia ECB é determinística: o mesmo texto em claro criptografado com a mesma chave sempre produz o mesmo texto cifrado. Um atacante que vê a sua coluna criptografada consegue identificar valores repetidos sem nunca conhecer a chave. O `encrypt()` do VillageSQL usa o modo CBC com um IV aleatório automaticamente, então entradas idênticas produzem saídas diferentes a cada vez.
+
+## O Padrão do MySQL: Modo ECB {#the-mysql-default-ecb-mode}
+
+O `AES_ENCRYPT(data, key)` do MySQL usa por padrão `aes-128-ecb` (`block_encryption_mode`). ECB — Electronic Codebook — criptografa cada bloco de forma independente, sem aleatoriedade. Duas linhas com o mesmo valor produzem o mesmo texto cifrado:
+
+```sql
+-- These two rows will have identical encrypted values
+INSERT INTO users (email, ssn_enc)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'secretkey')),
+       ('bob@example.com',   AES_ENCRYPT('123-45-6789', 'secretkey'));
+
+-- An attacker can see that Alice and Bob have the same SSN
+-- without knowing the key or the plaintext
+SELECT HEX(ssn_enc) FROM users;
+```
+
+O MySQL 8.0 permite alterar `block_encryption_mode` para usar CBC, mas então você precisa gerenciar o IV por conta própria: gerá-lo, armazená-lo ao lado do texto cifrado e passá-lo de volta para `AES_DECRYPT()` todas as vezes.
+
+## A Solução Alternativa Padrão: IV Manual com AES-CBC {#the-standard-workaround-manual-iv-with-aes-cbc}
+
+Usar o modo CBC corretamente no MySQL exige armazenar e passar o IV explicitamente:
+
+```sql
+SET @@block_encryption_mode = 'aes-256-cbc';
+
+-- Must generate and store IV alongside ciphertext
+SET @iv = RANDOM_BYTES(16);
+INSERT INTO users (email, ssn_enc, ssn_iv)
+VALUES ('alice@example.com', AES_ENCRYPT('123-45-6789', 'key', @iv), @iv);
+
+-- Must retrieve IV to decrypt
+SELECT AES_DECRYPT(ssn_enc, 'key', ssn_iv) AS ssn
+FROM users WHERE email = 'alice@example.com';
+```
+
+Isso é correto, mas verboso — toda tabela precisa de uma coluna extra para o IV, e toda consulta que toca em dados criptografados precisa passar o IV.
+
+## Com o VillageSQL: Gerenciamento Automático do IV {#with-villagesql-automatic-iv-management}
+
+A extensão `vsql_crypto` do VillageSQL adiciona `encrypt()` e `decrypt()`, que cuidam do IV automaticamente. O IV é gerado do zero a cada chamada e prefixado ao texto cifrado no valor armazenado. `decrypt()` o extrai sem que você precise pensar nisso.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+CREATE TABLE users (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    email   VARCHAR(255),
+    ssn_enc VARBINARY(255)   -- IV + ciphertext stored together
+);
+
+SET @key = 'my-32-byte-key-for-aes-256-here!';  -- 32 bytes → AES-256
+
+-- Same plaintext encrypts to different ciphertext every time
+INSERT INTO users (email, ssn_enc) VALUES
+    ('alice@example.com', encrypt('123-45-6789', @key, 'aes-256')),
+    ('bob@example.com',   encrypt('123-45-6789', @key, 'aes-256'));
+
+-- Decrypt in a SELECT
+SELECT email, CONVERT(decrypt(ssn_enc, @key, 'aes-256') USING utf8mb4) AS ssn FROM users;
+```
+
+Sem coluna de IV, sem parâmetro de IV nas consultas. Duas linhas com o mesmo SSN produzem textos cifrados diferentes — sem vazamento de padrões.
+
+### Tamanhos de chave {#key-sizes}
+
+| Tipo de cifra | Comprimento da chave | Quando usar |
+|:---|:---|:---|
+| `'aes'` ou `'aes-128'` | 16 bytes | Dados de menor sensibilidade, cargas de trabalho sensíveis a desempenho |
+| `'aes-192'` | 24 bytes | Segurança intermediária |
+| `'aes-256'` | 32 bytes | PII, dados financeiros, qualquer coisa regulamentada — padrão recomendado |
+
+Uma chave mais curta do que a cifra exige gera `ERROR 3200: VDF error in function 'encrypt': key too short for <cipher>: need N bytes, got M` — ela não é preenchida com zeros. Uma chave mais longa é truncada silenciosamente. Use exatamente 16, 24 ou 32 bytes.
+
+### O que armazenar {#what-to-store}
+
+A coluna `VARBINARY` guarda o IV (16 bytes) prefixado ao texto cifrado. O preenchimento PKCS7 sempre adiciona um bloco AES extra completo (16 bytes) quando o comprimento do texto em claro já é um múltiplo exato de 16 — nunca são zero bytes de preenchimento. Então a fórmula segura é comprimento do texto em claro + 32 bytes no total (16 para o IV, até 16 para o preenchimento). Dimensione a coluna com folga:
+
+```sql
+-- For strings up to ~200 chars: VARBINARY(255) is sufficient
+-- For longer text: VARBINARY(500) or BLOB
+ssn_enc   VARBINARY(64),    -- SSNs, short codes
+addr_enc  VARBINARY(512),   -- Addresses, longer strings
+notes_enc BLOB              -- Free-form text
+```
+
+## O Que Isto Não Cobre {#what-this-doesnt-cover}
+
+A criptografia em nível de coluna no SQL protege os dados em repouso contra alguém que tem acesso ao banco de dados, mas não à chave. Ela não protege contra:
+
+- Código da aplicação que guarda a chave e consulta dados descriptografados — um atacante que compromete a aplicação obtém os dois
+- Consultas que filtram ou ordenam por colunas criptografadas (você não pode fazer `WHERE ssn = ?` sem descriptografar)
+
+Para criptografia pesquisável ou gerenciamento de chaves por envelope (rotacionar chaves sem recriptografar todos os dados), você precisa de infraestrutura adicional na camada da aplicação.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Onde devo armazenar a chave de criptografia? {#where-should-i-store-the-encryption-key}
+
+Não no banco de dados. A chave deve ficar em um gerenciador de segredos (AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager) ou em uma variável de ambiente, carregada pela aplicação em tempo de execução. Uma chave armazenada no mesmo banco de dados que ela criptografa não oferece proteção nenhuma.
+
+#### Posso pesquisar em colunas criptografadas? {#can-i-search-on-encrypted-columns}
+
+Não diretamente. Descriptografar todas as linhas para encontrar uma correspondência é uma varredura completa da tabela. Padrões comuns: armazenar um hash determinístico do valor ao lado da coluna criptografada para buscas por igualdade (`sha256(ssn)` para busca por SSN), ou descriptografar na camada da aplicação e construir um índice de busca criptografado.
+
+#### O que acontece se eu perder a chave? {#what-happens-if-i-lose-the-key}
+
+Os dados ficam irrecuperáveis. Faça backup das chaves separadamente do banco de dados. Considere a criptografia por envelope — envolver a chave de dados com uma chave mestra — para que você possa rotacionar a chave mestra sem recriptografar tudo.
+
+#### Posso criptografar uma coluna com uma expressão DEFAULT? {#can-i-encrypt-a-column-with-a-default-expression}
+
+Não atualmente. Funções não determinísticas (o que `encrypt()` é, por causa do IV aleatório) não podem ser usadas em expressões DEFAULT. Gere o valor criptografado em cada INSERT.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.encrypt does not exist` | Execute `INSTALL EXTENSION vsql_crypto` |
+| `decrypt()` retorna NULL | O texto cifrado está corrompido, a chave está errada ou o tipo de cifra especificado está errado |
+| Os valores criptografados são idênticos para o mesmo texto em claro | Você está usando o `AES_ENCRYPT` do MySQL em modo ECB — mude para `encrypt()` |
+| Coluna pequena demais para o texto cifrado | Adicione 32 bytes ao tamanho do seu VARBINARY (16 para o IV + até 16 para o preenchimento) |
+| A chave tem o comprimento errado | AES-128 precisa de 16 bytes, AES-192 precisa de 24, AES-256 precisa de 32 — verifique com `LENGTH(@key)` |
+
+## Veja também {#see-also}
+
+- [Criptografia Simétrica no MySQL](/pt-BR/guides/symmetric-encryption) — o algoritmo de criptografia e o gerenciamento de chaves por trás disto
+- [Hashing de Senhas no MySQL](/pt-BR/guides/password-hashing) — para credenciais, hashing é melhor do que criptografia
+- [Hashing de Dados no MySQL](/pt-BR/guides/hashing-data) — impressão digital unidirecional quando você não precisa descriptografar

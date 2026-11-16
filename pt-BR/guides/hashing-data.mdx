@@ -1,0 +1,138 @@
+---
+title: "Gerando Hash de Dados no MySQL"
+sidebarTitle: "Gerando Hash de Dados"
+description: "Como gerar hash de dados no MySQL para verificações de integridade, deduplicação e fingerprinting — usando SHA-256 e outros algoritmos por meio da função digest() do VillageSQL."
+keywords: "mysql sha256 hash, mysql digest function, mysql data integrity hash, mysql checksum column, mysql hash binary, mysql sha2 vs digest"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O MySQL tem `MD5()`, `SHA1()` e `SHA2()` embutidas. Elas funcionam, mas retornam strings hexadecimais — 64 caracteres para um hash SHA-256, quando os dados subjacentes têm 32 bytes. Armazenar hashes em binário reduz isso pela metade e é mais eficiente de indexar. A `digest()` da extensão `vsql_crypto` do VillageSQL retorna binário bruto e oferece uma única função para todos os algoritmos.
+
+## O Padrão do MySQL: Funções Dispersas, Saída em Hexadecimal {#the-mysql-default-scattered-functions-hex-output}
+
+O MySQL oferece três funções separadas para hashing:
+
+```sql
+SELECT MD5('hello');                 -- 32-char hex string
+SELECT SHA1('hello');                -- 40-char hex string
+SELECT SHA2('hello', 256);          -- 64-char hex string (SHA-256)
+SELECT SHA2('hello', 512);          -- 128-char hex string (SHA-512)
+```
+
+Elas funcionam, mas o armazenamento é desperdiçado. SHA2 com 256 bits retorna um VARCHAR de 64 caracteres — o dobro dos bytes necessários, já que cada byte do hash é codificado como dois dígitos hexadecimais. Para obter saída binária você escreveria `UNHEX(SHA2('hello', 256))`, o que funciona, mas é incômodo de digitar de forma consistente.
+
+Também não existe a opção `sha224` nem `sha384` — você fica limitado ao que o MySQL expõe.
+
+## A Solução Alternativa Padrão: UNHEX + SHA2 {#the-standard-workaround-unhex--sha2}
+
+Para um armazenamento binário compacto, os desenvolvedores envolvem `SHA2()` em `UNHEX()`:
+
+```sql
+CREATE TABLE files (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    path     VARCHAR(500),
+    sha256   BINARY(32)
+);
+
+INSERT INTO files (path, sha256)
+VALUES ('/data/report.pdf', UNHEX(SHA2(LOAD_FILE('/data/report.pdf'), 256)));
+
+-- Find duplicate files by hash
+SELECT sha256, COUNT(*) AS count
+FROM files
+GROUP BY sha256
+HAVING count > 1;
+```
+
+Isso dá a você um armazenamento compacto. É um pouco verboso, mas é a abordagem padrão e funciona bem para SHA-256 e SHA-512.
+
+## Com o VillageSQL: digest() {#with-villagesql-digest}
+
+A extensão `vsql_crypto` do VillageSQL adiciona `digest(data, algorithm)`, que retorna um hash `VARBINARY` diretamente — sem necessidade de envolver em `UNHEX()`.
+
+```sql
+INSTALL EXTENSION vsql_crypto;
+```
+
+```sql
+-- digest() returns VARBINARY — no UNHEX wrapper
+CREATE TABLE files (
+    id      INT AUTO_INCREMENT PRIMARY KEY,
+    path    VARCHAR(500),
+    sha256  VARBINARY(32)
+);
+
+INSERT INTO files (path, sha256)
+VALUES ('/data/report.pdf', digest(LOAD_FILE('/data/report.pdf'), 'sha256'));
+
+-- Compare hashes for duplicate detection
+SELECT path FROM files
+WHERE sha256 = digest(LOAD_FILE('/data/incoming.pdf'), 'sha256');
+```
+
+Use `HEX()` quando precisar de uma string legível para registro em log ou exibição:
+
+```sql
+SELECT path, HEX(sha256) AS hash_hex FROM files;
+```
+
+### Algoritmos suportados {#supported-algorithms}
+
+| Algoritmo | Chamada de digest() | Tamanho da saída | Use quando |
+|:---|:---|:---|:---|
+| SHA-256 | `digest(data, 'sha256')` | 32 bytes | Verificações de integridade de uso geral |
+| SHA-512 | `digest(data, 'sha512')` | 64 bytes | Maior resistência a colisões necessária |
+| SHA-224 | `digest(data, 'sha224')` | 28 bytes | Espaço limitado, dentro da família SHA-2 |
+| SHA-384 | `digest(data, 'sha384')` | 48 bytes | Entre 256 e 512 |
+| SHA-1 | `digest(data, 'sha1')` | 20 bytes | Somente compatibilidade com sistemas legados |
+| MD5 | `digest(data, 'md5')` | 16 bytes | Somente compatibilidade com sistemas legados |
+
+Não use MD5 nem SHA-1 em novas aplicações — ambos têm vulnerabilidades de colisão conhecidas. SHA-256 é o padrão prático para a maioria dos usos.
+
+Especificamente para o armazenamento de senhas, `digest()` é a ferramenta errada — consulte [Hash de Senhas no MySQL](/pt-BR/guides/password-hashing) para `crypt()` e `gen_salt()`.
+
+## Quando Usar Cada Abordagem {#when-to-use-each-approach}
+
+| Abordagem | Quando usar |
+|:---|:---|
+| `SHA2(data, 256)` | Você só precisa de saída hexadecimal; stack somente MySQL |
+| `UNHEX(SHA2(data, 256))` | Armazenamento binário, sem dependência do VillageSQL |
+| `digest(data, 'sha256')` | Saída binária limpa com flexibilidade de algoritmo |
+
+Para novos projetos no VillageSQL, `digest()` é a escolha mais limpa. Para aplicações existentes somente MySQL, `UNHEX(SHA2())` é igualmente correto.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Qual é a diferença entre digest() e SHA2()? {#whats-the-difference-between-digest-and-sha2}
+
+`SHA2('hello', 256)` retorna uma string hexadecimal de 64 caracteres. `digest('hello', 'sha256')` retorna um `VARBINARY` de 32 bytes. Elas calculam o mesmo hash — a diferença é a codificação. O armazenamento binário é mais compacto e mais rápido de indexar.
+
+#### Posso usar digest() para detectar linhas duplicadas? {#can-i-use-digest-to-detect-duplicate-rows}
+
+Sim. Armazene `digest(content, 'sha256')` em uma coluna indexada e depois consulte com `WHERE sha256 = digest(incoming_content, 'sha256')`. Esse é um padrão comum para deduplicar arquivos enviados, detectar registros alterados ou construir consultas endereçáveis por conteúdo.
+
+#### digest() é seguro para senhas? {#is-digest-safe-for-passwords}
+
+Não. `digest()` é um hash rápido — ele é calculado em microssegundos. O hash de senhas exige um algoritmo lento e iterado. Use `crypt()` e `gen_salt()` da mesma extensão. Consulte [Hash de Senhas no MySQL](/pt-BR/guides/password-hashing).
+
+#### digest() suporta HMAC? {#does-digest-support-hmac}
+
+Não — `digest()` é um hash simples, sem chave. Para códigos de autenticação com chave, use `hmac()`. Consulte [Assinaturas HMAC no MySQL](/pt-BR/guides/hmac-mysql).
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.digest does not exist` | Execute `INSTALL EXTENSION vsql_crypto` |
+| `digest()` retorna NULL | Verifique se há entrada NULL ou um nome de algoritmo realmente não reconhecido. Maiúsculas e minúsculas não são o problema — o nome é comparado sem distinção entre elas, então `'SHA256'` e `'sha256'` retornam saída idêntica |
+| Hash armazenado como hexadecimal parece ter o dobro do tamanho | A coluna é VARCHAR, não VARBINARY — mude para `VARBINARY(32)` para SHA-256 |
+| Duas strings idênticas geram hashes diferentes | Verifique a codificação e a collation — o hash diferencia maiúsculas de minúsculas e é exato byte a byte |
+
+## Veja também {#see-also}
+
+- [Hash de Senhas no MySQL](/pt-BR/guides/password-hashing) — hash lento e adaptativo projetado especificamente para credenciais
+- [Assinaturas HMAC no MySQL](/pt-BR/guides/hmac-mysql) — hash com chave para verificação de integridade e validação de webhooks
+- [Criptografia Simétrica no MySQL](/pt-BR/guides/symmetric-encryption) — quando você precisa dos dados de volta, não apenas de um fingerprint

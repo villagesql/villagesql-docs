@@ -1,0 +1,151 @@
+---
+title: "Restrições CHECK no MySQL"
+sidebarTitle: "Usando Restrições CHECK"
+description: "Como funcionam as restrições CHECK do MySQL: sintaxe, comportamento de aplicação, restrições nomeadas, desabilitação de restrições e como CHECK se compara a triggers e à validação no nível da aplicação."
+keywords: "mysql check constraint, mysql check constraint example, mysql add check constraint, mysql constraint validation, mysql 8 check constraint, mysql create table check, mysql enforce data rules"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O MySQL aplica restrições `CHECK`. A sintaxe era aceita em versões mais antigas, mas ignorada silenciosamente — um comportamento que surpreendeu muitos desenvolvedores que migraram do PostgreSQL.
+
+## Definindo Restrições CHECK {#defining-check-constraints}
+
+Adicione uma restrição `CHECK` junto com a coluna ou como uma restrição no nível da tabela:
+
+```sql
+CREATE TABLE products (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    name     VARCHAR(100) NOT NULL,
+    price    DECIMAL(10,2) NOT NULL,
+    quantity INT NOT NULL,
+
+    -- Inline constraints
+    CONSTRAINT chk_price    CHECK (price > 0),
+    CONSTRAINT chk_quantity CHECK (quantity >= 0)
+);
+```
+
+Ou junto com a definição da coluna:
+
+```sql
+CREATE TABLE orders (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    status     VARCHAR(20) CHECK (status IN ('pending', 'shipped', 'delivered', 'cancelled')),
+    discount   DECIMAL(5,2) CHECK (discount BETWEEN 0 AND 100)
+);
+```
+
+Restrições no nível da tabela são necessárias quando a expressão de verificação abrange várias colunas:
+
+```sql
+CREATE TABLE shipments (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    shipped_at   DATE,
+    delivered_at DATE,
+    CONSTRAINT chk_dates CHECK (delivered_at IS NULL OR delivered_at >= shipped_at)
+);
+```
+
+## Aplicação {#enforcement}
+
+O MySQL aplica restrições `CHECK` em `INSERT` e `UPDATE`. Uma violação retorna `ERROR 3819 (HY000): Check constraint 'name' is violated.`:
+
+```sql
+INSERT INTO products (name, price, quantity) VALUES ('Widget', -5.00, 10);
+-- ERROR 3819 (HY000): Check constraint 'chk_price' is violated.
+```
+
+A mensagem de erro inclui o nome da restrição, e é por isso que nomear as restrições vale a digitação extra.
+
+Restrições `CHECK` **não** são avaliadas em `DELETE`. Elas também não são reavaliadas quando a própria restrição é adicionada a uma tabela existente — adicionar uma restrição a uma tabela com dados existentes que a violam falha imediatamente.
+
+## Adicionando e Removendo Restrições {#adding-and-removing-constraints}
+
+Adicione uma restrição a uma tabela existente:
+
+```sql
+ALTER TABLE products
+ADD CONSTRAINT chk_name_length CHECK (CHAR_LENGTH(name) >= 2);
+```
+
+Remova uma restrição nomeada:
+
+```sql
+ALTER TABLE products DROP CHECK chk_price;
+-- or the SQL standard syntax:
+ALTER TABLE products DROP CONSTRAINT chk_price;
+```
+
+Liste todas as restrições de uma tabela:
+
+```sql
+SELECT cc.constraint_name, cc.check_clause
+FROM information_schema.check_constraints cc
+JOIN information_schema.table_constraints tc
+    ON tc.constraint_schema = cc.constraint_schema
+   AND tc.constraint_name   = cc.constraint_name
+WHERE cc.constraint_schema = DATABASE()
+  AND tc.table_name = 'products';
+```
+
+## Desabilitando a Aplicação {#disabling-enforcement}
+
+Desabilite uma restrição específica sem removê-la:
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price NOT ENFORCED;
+```
+
+Reabilite-a:
+
+```sql
+ALTER TABLE products ALTER CHECK chk_price ENFORCED;
+```
+
+`NOT ENFORCED` é útil durante migrações de dados, quando você precisa contornar a validação temporariamente. Reabilite a aplicação da restrição quando a migração estiver concluída.
+
+## CHECK vs Triggers vs Validação na Aplicação {#check-vs-triggers-vs-application-validation}
+
+| | Restrição CHECK | Trigger | Código da aplicação |
+|:--|:----------------|:--------|:-----------------|
+| Aplicado por | MySQL (sempre) | MySQL (sempre) | Aplicação (somente quando a aplicação roda) |
+| Desempenho | Sobrecarga muito baixa | Sobrecarga de execução por linha | Custo de ida e volta |
+| Visibilidade do erro | Erro SQL com o nome da restrição | SIGNAL necessário para expor o erro | Definida pela aplicação |
+| Verificações entre colunas | Sim | Sim | Sim |
+| Verificações entre tabelas | Não | Sim (pode consultar outras tabelas) | Sim |
+| Complexidade | Somente expressões simples | Lógica SQL arbitrária | Código arbitrário |
+
+Use `CHECK` para regras simples e autocontidas: faixas válidas, valores permitidos, números não negativos, ordem de datas. Use um trigger quando a regra exige consultar outras tabelas. Use a validação na aplicação para regras que envolvem estado externo (limites de taxa, verificações de disponibilidade).
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### As restrições CHECK funcionam em todos os mecanismos de armazenamento? {#do-check-constraints-work-on-all-storage-engines}
+
+Sim. Ao contrário de alguns recursos do MySQL, as restrições `CHECK` funcionam no InnoDB, no MyISAM e em outros mecanismos de armazenamento. Porém, tabelas MyISAM podem ter restrições definidas que são sintaticamente válidas, mas esse mecanismo de armazenamento não tem rollback, então uma restrição que falha no MyISAM pode deixar dados parciais. O InnoDB trata as violações de forma limpa, com rollback completo.
+
+#### As restrições CHECK podem referenciar outras tabelas? {#can-check-constraints-reference-other-tables}
+
+Não. As expressões `CHECK` são limitadas à linha atual da tabela atual. Subconsultas, stored functions e referências a outras tabelas não são permitidas em expressões `CHECK`. Use um trigger para validação entre tabelas.
+
+#### As restrições CHECK sempre existiram no MySQL? {#were-check-constraints-always-in-mysql}
+
+A sintaxe era aceita em versões mais antigas do MySQL, mas as restrições eram ignoradas silenciosamente. Se você está migrando de um esquema mais antigo, verifique se as cláusulas `CHECK` existentes são válidas e contêm regras que você quer aplicadas.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 3819: Check constraint violated` | O valor do INSERT ou UPDATE falha na restrição — verifique o nome da restrição no erro para identificar qual regra foi violada |
+| `ALTER TABLE ADD CONSTRAINT` falha imediatamente | As linhas existentes na tabela violam a restrição — corrija os dados primeiro ou use `NOT ENFORCED` durante a migração |
+| Restrição CHECK definida, mas não está sendo aplicada | Execução de uma versão antiga do MySQL anterior à aplicação de restrições — atualize ou use triggers |
+| Não é possível remover uma restrição | Use o nome da restrição (não o nome da coluna) com `DROP CHECK` ou `DROP CONSTRAINT` |
+| Nome da restrição desconhecido | Consulte `information_schema.check_constraints` para encontrar os nomes das restrições da tabela |
+
+## Veja também {#see-also}
+
+- [Normalização no MySQL](/pt-BR/guides/normalization) — o design de esquema que as restrições CHECK complementam
+- [Triggers do MySQL](/pt-BR/guides/triggers) — uma alternativa às restrições CHECK para validação complexa
+- [NULL no MySQL](/pt-BR/guides/null-in-mysql) — restrições CHECK e NULL interagem de formas não óbvias

@@ -1,0 +1,99 @@
+---
+title: "Erros Comuns do MySQL e Como Corrigi-los"
+sidebarTitle: "Erros Comuns"
+description: "Decodificando os erros do MySQL que todo mundo encontra: acesso negado (1045), não é possível conectar (2002), ONLY_FULL_GROUP_BY (1055), erros de sintaxe (1064) e chaves duplicadas (1062)."
+keywords: "mysql error 1045 access denied, mysql error 2002 can't connect, only_full_group_by error, mysql error 1055, mysql error 1064, mysql duplicate entry 1062"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Cinco erros respondem pela maioria das perguntas de suporte do MySQL. Cada um abaixo é mostrado exatamente como o servidor o emite, com o que ele realmente significa e a correção. Todos se comportam de forma idêntica no VillageSQL.
+
+## ERROR 2002: Não É Possível Conectar pelo Socket {#error-2002-cant-connect-through-socket}
+
+```text
+ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/tmp/nosuch.sock' (2)
+```
+
+O cliente nunca alcançou um servidor. Este é um problema de conexão, não de autenticação: ou o servidor não está em execução, ou o cliente está procurando no lugar errado. O `(2)` é o errno 2, "no such file".
+
+- Verifique se o servidor está no ar: `pgrep mysqld` ou o seu gerenciador de serviços.
+- `mysql -h localhost` usa um socket Unix. Se o servidor escuta em um caminho de socket diferente, informe-o: `mysql -S /path/to/mysql.sock`.
+- Para forçar TCP em vez do socket, use `-h 127.0.0.1`, não `-h localhost`.
+
+## ERROR 1045: Acesso Negado {#error-1045-access-denied}
+
+```text
+ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)
+```
+
+O oposto do 2002: o servidor foi alcançado e rejeitou as credenciais. Leia a mensagem com precisão. Ela nomeia três fatos:
+
+- **O usuário** que o servidor acha que você é.
+- **O host** de onde você conectou. As contas do MySQL são pares `user@host`: `'app'@'localhost'` e `'app'@'%'` são contas diferentes, com senhas e permissões diferentes.
+- **`using password: YES/NO`** — se uma senha foi enviada. `NO` muitas vezes significa que o cliente não encontrou senha no ambiente ou no arquivo de configuração que ele leu.
+
+Corrija confirmando qual conta existe para o seu host (`SELECT user, host FROM mysql.user;` como administrador) e redefinindo a senha dela com `ALTER USER`. Consulte [Gerenciamento de usuários](/pt-BR/guides/user-management).
+
+## ERROR 1055: ONLY_FULL_GROUP_BY {#error-1055-only_full_group_by}
+
+```text
+ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'myapp.orders.total' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+```
+
+A consulta que o produziu:
+
+```sql
+SELECT customer_id, total
+FROM orders
+GROUP BY customer_id;
+```
+
+Cada grupo tem um `customer_id`, mas muitos valores de `total`, e a consulta nunca diz qual deles quer. As versões antigas do MySQL escolhiam um arbitrariamente; desde a 5.7, o modo padrão `ONLY_FULL_GROUP_BY` torna isso um erro, e ele está protegendo você de uma consulta que sempre esteve errada. Três correções de verdade:
+
+```sql
+-- Say what you meant with an aggregate
+SELECT customer_id, SUM(total) FROM orders GROUP BY customer_id;
+
+-- Or group by every selected column
+SELECT customer_id, total FROM orders GROUP BY customer_id, total;
+
+-- Or, if any value from the group is genuinely fine, say so explicitly
+SELECT customer_id, ANY_VALUE(total) FROM orders GROUP BY customer_id;
+```
+
+Desabilitar `ONLY_FULL_GROUP_BY` no `sql_mode` também funciona e é a resposta errada: isso transforma o erro de volta em resultados silenciosamente arbitrários. Consulte [Desempenho do GROUP BY no MySQL](/pt-BR/guides/group-by-having) para saber o que `ANY_VALUE()` promete e o que não promete.
+
+## ERROR 1064: Erro de Sintaxe {#error-1064-syntax-error}
+
+```text
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'SELEC 1' at line 1
+```
+
+O trecho entre aspas começa no primeiro token que o analisador não conseguiu aceitar, então o erro real está no início do trecho ou logo antes dele. Os suspeitos de sempre: um erro de digitação em uma palavra-chave, uma vírgula faltando em uma lista de colunas, uma palavra reservada usada como identificador sem crases, ou uma aspa perdida que transformou metade da instrução em uma string.
+
+## ERROR 1062: Entrada Duplicada {#error-1062-duplicate-entry}
+
+```text
+ERROR 1062 (23000): Duplicate entry '1' for key 'orders.PRIMARY'
+```
+
+Uma restrição de unicidade fez o seu trabalho. A mensagem nomeia o valor e o índice, então o diagnóstico está feito; a decisão é o que o insert deve significar:
+
+- A linha nunca deveria existir duas vezes: corrija o gerador da chave duplicada.
+- O insert deveria atualizar a linha existente: use `INSERT ... ON DUPLICATE KEY UPDATE`. Consulte [Upsert](/pt-BR/guides/upsert).
+- O insert deveria ser ignorado silenciosamente: `INSERT IGNORE`, usado com moderação, pois ele também silencia outros erros.
+
+## Lendo Qualquer Erro do MySQL {#reading-any-mysql-error}
+
+O padrão `ERROR <number> (<SQLSTATE>): <message>` carrega três sinais. O número é específico do MySQL e é a melhor chave de busca. A classe SQLSTATE é portátil: `28000` é autenticação, `42000` é um problema na consulta, `23000` é uma violação de restrição, `HY000` é a categoria geral. Os erros do lado do cliente (2xxx, como o 2002) nunca alcançaram o servidor; os erros do lado do servidor (1xxx) significam que a conexão funciona.
+
+## Veja também {#see-also}
+
+- [Gerenciamento de usuários](/pt-BR/guides/user-management) — o modelo de contas por trás dos erros de acesso negado
+- [Desempenho do GROUP BY no MySQL](/pt-BR/guides/group-by-having) — ONLY_FULL_GROUP_BY, e por que desabilitá-lo é a correção errada
+- [MySQL GROUP BY](/pt-BR/tutorial/group-by) — a lição do tutorial sobre como escrever a cláusula
+- [Upsert](/pt-BR/guides/upsert) — transformando erros de chave duplicada em atualizações
+- [Instale um servidor para o tutorial do MySQL](/pt-BR/tutorial/install-mysql) — os erros de conexão, com comandos que os reproduzem

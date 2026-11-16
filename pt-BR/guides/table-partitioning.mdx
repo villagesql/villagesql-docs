@@ -1,0 +1,190 @@
+---
+title: "Particionamento de Tabelas no MySQL"
+sidebarTitle: "Particionando Tabelas"
+description: "Como funciona o particionamento de tabelas no MySQL: os tipos de particionamento RANGE, LIST, HASH e KEY, a poda de partições, quando o particionamento melhora o desempenho e armadilhas comuns."
+keywords: "mysql table partitioning, mysql partition by range, mysql partition pruning, mysql partitioning example, mysql range partition, mysql list partition, mysql partition performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O particionamento divide uma tabela lógica em vários segmentos físicos. O MySQL encaminha as linhas para as partições com base em uma expressão de particionamento, e as consultas que filtram pela chave de partição podem pular partições inteiras — uma otimização chamada poda de partições (partition pruning). O particionamento exige o mecanismo de armazenamento InnoDB ou NDB.
+
+## Quando o Particionamento Ajuda {#when-partitioning-helps}
+
+A poda de partições traz ganhos reais quando:
+- A tabela é grande demais para caber no buffer pool e as consultas filtram de forma consistente pela chave de partição
+- Você descarta dados antigos com regularidade — `ALTER TABLE t DROP PARTITION p_old` é instantâneo, contra um DELETE lento
+
+O particionamento NÃO ajuda quando:
+- As consultas não filtram pela chave de partição (todas as partições precisam ser varridas)
+- A tabela cabe confortavelmente na memória
+- Você está tentando substituir uma indexação adequada — um bom índice em uma tabela não particionada muitas vezes supera uma tabela particionada sem índices correspondentes
+
+## Particionamento RANGE {#range-partitioning}
+
+As linhas são atribuídas às partições com base em a chave de partição cair ou não dentro de um intervalo. O caso de uso mais comum é o arquivamento por data.
+
+```sql
+CREATE TABLE orders (
+    id          INT NOT NULL,
+    customer_id INT,
+    amount      DECIMAL(10,2),
+    created_at  DATE NOT NULL
+)
+PARTITION BY RANGE COLUMNS (created_at) (
+    PARTITION p2022 VALUES LESS THAN ('2023-01-01'),
+    PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+    PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+Inclua sempre uma partição `MAXVALUE` para capturar as linhas que não cabem em nenhum intervalo definido. Sem ela, as inserções fora dos intervalos definidos falham com um erro.
+
+Adicionar uma nova partição:
+
+```sql
+-- Only works if the last partition is not MAXVALUE
+ALTER TABLE orders ADD PARTITION (
+    PARTITION p2025 VALUES LESS THAN ('2026-01-01')
+);
+
+-- If MAXVALUE exists, reorganize it:
+ALTER TABLE orders REORGANIZE PARTITION p_future INTO (
+    PARTITION p2025 VALUES LESS THAN ('2026-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+Descartar dados antigos instantaneamente:
+
+```sql
+ALTER TABLE orders DROP PARTITION p2022;
+```
+
+## Particionamento LIST {#list-partitioning}
+
+As linhas são atribuídas com base em valores exatos da chave de partição.
+
+```sql
+CREATE TABLE customers (
+    id     INT NOT NULL,
+    name   VARCHAR(100),
+    region VARCHAR(20) NOT NULL
+)
+PARTITION BY LIST COLUMNS (region) (
+    PARTITION p_north VALUES IN ('WA', 'OR', 'ID', 'MT'),
+    PARTITION p_south VALUES IN ('CA', 'NV', 'AZ', 'NM'),
+    PARTITION p_east  VALUES IN ('NY', 'NJ', 'CT', 'MA')
+);
+```
+
+Inserções com uma região que não está listada em nenhuma partição falham. Use `LIST COLUMNS` para colunas de string — `LIST` sozinho só oferece suporte a expressões inteiras.
+
+## Particionamento HASH e KEY {#hash-and-key-partitioning}
+
+`HASH` e `KEY` distribuem as linhas de forma uniforme por um número fixo de partições. Eles não oferecem suporte à poda de partições por valor, mas podem melhorar a vazão de escritas concorrentes ao espalhar as linhas pelas partições.
+
+```sql
+-- HASH: you define the expression
+CREATE TABLE sessions (
+    id         INT NOT NULL,
+    user_id    INT NOT NULL,
+    data       TEXT
+)
+PARTITION BY HASH (user_id)
+PARTITIONS 8;
+
+-- KEY: MySQL uses the primary key automatically
+CREATE TABLE logs (
+    id         BIGINT AUTO_INCREMENT,
+    message    TEXT,
+    PRIMARY KEY (id)
+)
+PARTITION BY KEY ()
+PARTITIONS 4;
+```
+
+## Poda de Partições {#partition-pruning}
+
+A poda só é ativada quando a cláusula `WHERE` filtra diretamente pela expressão de partição. Com `RANGE COLUMNS (created_at)`, filtrar por `created_at` poda corretamente:
+
+```sql
+-- Pruned: MySQL scans only p2024
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31';
+
+-- NOT pruned: wrapping the column in YEAR() defeats pruning
+-- MySQL can't map YEAR(created_at) = 2024 back to the RANGE COLUMNS expression
+SELECT * FROM orders WHERE YEAR(created_at) = 2024;
+```
+
+Para verificar a poda, execute `EXPLAIN` e confira a coluna `partitions`:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE created_at = '2024-06-15'\G
+```
+
+Se `partitions` mostra apenas um ou alguns nomes de partição, a poda está funcionando. Se mostra todas as partições, o filtro não está sendo aplicado.
+
+## Restrições do Particionamento {#partitioning-constraints}
+
+- **Toda chave única (incluindo a chave primária) deve incluir todas as colunas da expressão de particionamento.** Se você quer particionar por `created_at`, toda chave única deve conter `created_at` — não é possível adicionar uma partição a uma tabela com uma `PRIMARY KEY (id)` isolada sem antes alterá-la para `PRIMARY KEY (id, created_at)`.
+- Restrições `FOREIGN KEY` não têm suporte em tabelas particionadas no MySQL.
+- Uma tabela pode ter no máximo 8192 partições (MySQL 8.0+).
+
+## Particionamento vs Indexação {#partitioning-vs-indexing}
+
+| | Particionamento | Indexação |
+|:--|:------------|:---------|
+| Melhor para | Poda de dados por intervalo, descarte para arquivamento | Consultas pontuais, varreduras de intervalo em qualquer coluna |
+| Exige alteração de esquema | Sim | Sim (ALTER TABLE ADD INDEX) |
+| Acelera qualquer consulta | Apenas consultas que filtram pela chave de partição | Qualquer consulta que use colunas indexadas |
+| Descarta dados antigos | Instantâneo (`DROP PARTITION`) | Exige DELETE + manutenção do índice |
+| Chaves estrangeiras | Sem suporte | Com suporte |
+
+Comece pela indexação. Adicione o particionamento somente quando tiver um problema de desempenho demonstrado em uma tabela grande e uma chave de partição clara que corresponda aos seus padrões de consulta.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Posso particionar uma tabela existente? {#can-i-partition-an-existing-table}
+
+Sim, com `ALTER TABLE`:
+
+```sql
+ALTER TABLE orders
+PARTITION BY RANGE COLUMNS (created_at) (
+    PARTITION p2023 VALUES LESS THAN ('2024-01-01'),
+    PARTITION p2024 VALUES LESS THAN ('2025-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+Isso reescreve a tabela, o que pode levar um tempo e um espaço em disco significativos em tabelas grandes.
+
+#### Como verifico em qual partição uma linha está? {#how-do-i-check-which-partition-a-row-is-in}
+
+```sql
+SELECT PARTITION_NAME, TABLE_ROWS
+FROM information_schema.partitions
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'orders';
+```
+
+Para ver em qual partição uma linha específica iria, use `EXPLAIN PARTITIONS` com uma cláusula WHERE que corresponda a essa linha.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1526: Table has no partition for value` | RANGE ou LIST não tem uma partição correspondente — adicione uma partição `MAXVALUE` para RANGE ou trate o valor ausente em LIST |
+| `ERROR 1503: A PRIMARY KEY must include all columns in the table's partitioning function` | Adicione a coluna da chave de partição à definição da chave primária |
+| A poda de partições não acontece | Verifique a coluna partitions do `EXPLAIN`; garanta que a cláusula WHERE use a coluna de partição diretamente, sem envolvê-la em uma função |
+| `ALTER TABLE DROP PARTITION` retorna um erro | A tabela deve ser particionada por RANGE ou LIST — partições HASH e KEY não podem ser descartadas individualmente |
+| Desempenho pior depois do particionamento | As consultas podem não estar podando — verifique com EXPLAIN e confira se existem índices em cada partição para as colunas usadas no WHERE |
+
+## Veja também {#see-also}
+
+- [Como o InnoDB Armazena Dados](/pt-BR/guides/innodb-storage) — o mecanismo de armazenamento sobre o qual o particionamento opera
+- [Como Funcionam os Índices do MySQL](/pt-BR/guides/mysql-indexes) — índices dentro das partições e poda de partições
+- [Migrações de Esquema no MySQL](/pt-BR/guides/schema-migrations) — como adicionar ou alterar o particionamento em tabelas existentes

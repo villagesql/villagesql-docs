@@ -1,0 +1,170 @@
+---
+title: "Busca de Texto Completo no MySQL"
+sidebarTitle: "Usando Busca de Texto Completo"
+description: "Como funciona a busca de texto completo no MySQL: índices FULLTEXT, sintaxe MATCH...AGAINST, modo de linguagem natural vs modo booleano vs expansão de consulta, e quando usar texto completo vs LIKE."
+keywords: "mysql full-text search, mysql fulltext index, mysql match against, mysql boolean mode search, mysql natural language search, mysql full text search example, mysql search text"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+O `LIKE '%keyword%'` do MySQL funciona para tabelas pequenas, mas não consegue usar índices — todas as linhas são varridas. A busca de texto completo oferece uma alternativa indexada e classificada por relevância para pesquisar colunas de texto.
+
+## Criando um Índice FULLTEXT {#creating-a-fulltext-index}
+
+Índices `FULLTEXT` funcionam em colunas `CHAR`, `VARCHAR` e `TEXT` em tabelas `InnoDB` (o mecanismo de armazenamento padrão) e `MyISAM`.
+
+```sql
+CREATE TABLE articles (
+    id    INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(200),
+    body  TEXT,
+    FULLTEXT idx_ft (title, body)
+);
+```
+
+Adicione um índice `FULLTEXT` a uma tabela existente:
+
+```sql
+ALTER TABLE articles ADD FULLTEXT INDEX idx_ft (title, body);
+```
+
+Um único índice `FULLTEXT` pode abranger várias colunas. As consultas contra esse índice pesquisam todas as colunas indexadas ao mesmo tempo.
+
+## Consultando com MATCH...AGAINST {#querying-with-matchagainst}
+
+As consultas de texto completo usam a sintaxe `MATCH(columns) AGAINST(expression)`. A lista de colunas do `MATCH` deve corresponder exatamente às colunas do índice `FULLTEXT`.
+
+```sql
+SELECT id, title,
+       MATCH(title, body) AGAINST('database performance') AS relevance
+FROM articles
+WHERE MATCH(title, body) AGAINST('database performance');
+```
+
+O MySQL retorna as linhas em ordem decrescente de relevância quando `MATCH...AGAINST` aparece na cláusula `WHERE`. A expressão `AGAINST` retorna uma pontuação de relevância — 0 significa nenhuma correspondência.
+
+## Modos de Busca {#search-modes}
+
+O MySQL suporta três modos de busca:
+
+| Modo | Sintaxe | Comportamento |
+|:-----|:-------|:---------|
+| Linguagem natural (padrão) | `AGAINST('phrase')` ou `AGAINST('phrase' IN NATURAL LANGUAGE MODE)` | Classifica os resultados por relevância; palavras comuns são ignoradas |
+| Modo booleano | `AGAINST('phrase' IN BOOLEAN MODE)` | Suporta operadores (`+`, `-`, `*`, `""`); a pontuação de relevância está disponível, mas não é automática — adicione `ORDER BY MATCH...AGAINST` para classificar |
+| Expansão de consulta | `AGAINST('phrase' WITH QUERY EXPANSION)` | Duas passagens: primeiro encontra as correspondências, depois expande com termos relacionados desses resultados |
+
+### Modo de Linguagem Natural {#natural-language-mode}
+
+O padrão. O MySQL usa um esquema de ponderação que efetivamente ignora palavras extremamente comuns — termos que aparecem em quase todas as linhas contribuem pouco para as pontuações de relevância. Stopwords comuns do inglês (`the`, `is`, `at`) são filtradas por completo. Os resultados são retornados em ordem decrescente de relevância quando não há um `ORDER BY` explícito.
+
+```sql
+-- Returns rows matching 'index' or 'query', ranked by relevance
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('index query');
+```
+
+### Modo Booleano {#boolean-mode}
+
+O modo booleano suporta operadores para controle preciso:
+
+```sql
+-- Must contain 'index', must not contain 'slow', 'performance' is optional
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('+index -slow performance' IN BOOLEAN MODE);
+```
+
+Operadores booleanos comuns:
+
+| Operador | Significado | Exemplo |
+|:---------|:--------|:--------|
+| `+` | A palavra deve estar presente | `+index` |
+| `-` | A palavra não deve estar presente | `-slow` |
+| `*` | Curinga de prefixo | `perform*` |
+| `""` | Correspondência de frase | `"query optimizer"` |
+| `>` `<` | Aumenta/diminui a relevância | `>fast <slow` |
+| `()` | Agrupamento | `+(index query) -slow` |
+
+Tabelas InnoDB exigem um índice `FULLTEXT` em todas as colunas da expressão `MATCH()` — sem ele, consultas em modo booleano no InnoDB retornam um erro. (O MyISAM permite o modo booleano sem um índice FULLTEXT, mas varre todas as linhas.)
+
+### Expansão de Consulta {#query-expansion}
+
+Busca em duas passagens. O MySQL executa a consulta inicial, pega as melhores correspondências, extrai termos adicionais delas e então executa a busca novamente com esses termos adicionados.
+
+```sql
+SELECT title FROM articles
+WHERE MATCH(title, body) AGAINST('database' WITH QUERY EXPANSION);
+```
+
+Útil quando os usuários pesquisam com um único termo ou com termos vagos. Pode retornar resultados surpreendentes se as melhores correspondências da primeira passagem estiverem fora do assunto.
+
+## Busca de Texto Completo vs LIKE {#full-text-search-vs-like}
+
+| | FULLTEXT + MATCH...AGAINST | LIKE '%keyword%' |
+|:--|:--------------------------|:-----------------|
+| Usa índice | Sim — rápido em tabelas grandes | Não — varredura completa |
+| Classificação por relevância | Sim (modo de linguagem natural) | Não |
+| Correspondência parcial de palavras | Com o operador `*` | Sim (LIKE '%word%') |
+| Várias colunas | Um MATCH por índice | Requer condições OR |
+| Requer índice FULLTEXT | Sim (o InnoDB exige; o MyISAM varre sem ele) | Não |
+| Comprimento mínimo de palavra | Sim (`innodb_ft_min_token_size` = 3) | Nenhum |
+| Palavras curtas (2 caracteres) | Filtradas por padrão | Correspondidas |
+
+Use `LIKE` para correspondência de padrões simples em tabelas pequenas, buscas por prefixo (`LIKE 'prefix%'` com um índice) ou quando você precisa de correspondência de padrões arbitrários. Use texto completo quando estiver pesquisando palavras ou frases em colunas de texto e precisar de classificação por relevância ou melhor desempenho em escala.
+
+## Comprimento Mínimo de Palavra {#minimum-word-length}
+
+O tamanho mínimo de token padrão do InnoDB é 3 caracteres (`innodb_ft_min_token_size`). Palavras com menos de 3 caracteres não são indexadas. Para palavras de dois caracteres, reduza o mínimo:
+
+```sql
+-- In my.cnf / my.ini
+[mysqld]
+innodb_ft_min_token_size = 2
+```
+
+`innodb_ft_min_token_size` não é uma variável dinâmica — é preciso reiniciar o servidor para que tenha efeito. Após reiniciar, reconstrua todos os índices `FULLTEXT`:
+
+```sql
+OPTIMIZE TABLE articles;
+```
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Por que meu MATCH...AGAINST não retorna nenhuma linha, mesmo com a palavra na tabela? {#why-does-my-matchagainst-return-no-rows-even-though-the-word-is-in-the-table}
+
+Três motivos comuns: (1) A palavra é mais curta do que `innodb_ft_min_token_size` (padrão 3). (2) A palavra está na lista de stopwords. (3) Em uma tabela MyISAM, a palavra aparece em 50% ou mais das linhas — o modo de linguagem natural no MyISAM trata essas palavras como comuns demais para serem úteis. O InnoDB não tem esse corte. Use o modo booleano para contornar o limite de 50% do MyISAM.
+
+#### Posso usar busca de texto completo com condições WHERE? {#can-i-use-full-text-search-with-where-conditions}
+
+Sim. Combine `MATCH...AGAINST` com outras condições `WHERE` normalmente:
+
+```sql
+SELECT title FROM articles
+WHERE status = 'published'
+  AND MATCH(title, body) AGAINST('performance' IN BOOLEAN MODE);
+```
+
+O MySQL pode usar o índice `FULLTEXT` para a parte de texto completo e filtrar separadamente por outras colunas indexadas.
+
+#### A busca de texto completo do MySQL suporta vários idiomas? {#does-mysql-full-text-search-support-multiple-languages}
+
+O MySQL tem listas de stopwords nativas para vários idiomas. Para busca multilíngue em produção, normalmente você precisará configurar `innodb_ft_enable_stopword = OFF` e fornecer a sua própria tabela de stopwords via `innodb_ft_server_stopword_table`, ou usar um mecanismo de busca externo (Elasticsearch, MeiliSearch).
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1214: The used table type doesn't support FULLTEXT indexes` | Apenas InnoDB e MyISAM suportam FULLTEXT — verifique o mecanismo de armazenamento com `SHOW CREATE TABLE` |
+| Erro de incompatibilidade na lista de colunas do `MATCH` | As colunas em `MATCH(...)` devem corresponder exatamente às colunas listadas no índice FULLTEXT, na mesma ordem |
+| Palavra comum não retorna resultados | A palavra pode estar na lista de stopwords ou, em uma tabela MyISAM, aparecer em 50% ou mais das linhas — tente o modo booleano: `AGAINST('word' IN BOOLEAN MODE)` |
+| Palavras curtas não são encontradas | A palavra está abaixo de `innodb_ft_min_token_size` (padrão 3) — reduza a configuração, reinicie o MySQL e execute `OPTIMIZE TABLE` para reconstruir os índices |
+| Resultados após `INSERT` não aparecem | O InnoDB armazena em buffer as atualizações FULLTEXT — execute `SET GLOBAL innodb_optimize_fulltext_only=1; OPTIMIZE TABLE articles;` para descarregar |
+
+## Veja também {#see-also}
+
+- [Como Funcionam os Índices do MySQL](/pt-BR/guides/mysql-indexes) — FULLTEXT é um tipo de índice especializado ao lado da B-tree
+- [JSON no MySQL](/pt-BR/guides/json-in-mysql) — pesquisando campos de texto JSON ao lado de dados estruturados
+- [Consultas de intervalo multidimensionais](/pt-BR/guides/cube-queries) — pesquisando em várias dimensões numéricas quando a busca de texto não é a opção certa
+- [MySQL LIKE](/pt-BR/tutorial/like) — o operador de padrão que um índice de texto completo substitui em escala
+- [MySQL REGEXP](/pt-BR/tutorial/regexp) — correspondência de padrões que lê todas as linhas

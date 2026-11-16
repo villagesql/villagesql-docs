@@ -1,0 +1,222 @@
+---
+title: "Converter PostgreSQL para MySQL: Guia de Migração"
+sidebarTitle: "Migrando do PostgreSQL"
+description: "Como migrar um banco de dados PostgreSQL para o MySQL: mapeamento de tipos de dados, AUTO_INCREMENT vs sequences, diferenças de dialeto SQL e armadilhas de migração a evitar."
+keywords: "postgresql to mysql migration, postgres to mysql, mysql vs postgresql differences, mysql auto_increment vs sequence, mysql migration guide, convert postgresql schema to mysql, mysql dialect differences, convert postgresql to mysql, postgresql to mysql converter, convert postgres to mysql, migrate data from postgres to mysql, migrate postgres database to mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+PostgreSQL e MySQL compartilham a sintaxe ANSI SQL, mas divergem de maneiras suficientes para que uma migração exija atenção cuidadosa aos tipos de dados, aos comportamentos padrão e às diferenças de dialeto SQL. A maior parte do trabalho é a tradução do esquema e a correção de consultas que dependem de recursos específicos do PostgreSQL.
+
+Este guia cobre a migração do PostgreSQL para o MySQL, a direção comum ao mover para um servidor compatível com MySQL como o [VillageSQL](https://villagesql.com/install) — um substituto direto e de código aberto para o MySQL que adiciona um framework de extensões no estilo PostgreSQL por cima. Esse framework é o motivo de este guia ter um lugar para as suas extensões PostgreSQL pousarem, e não só o seu esquema e os seus dados; consulte [Trazendo as Suas Extensões](#bringing-your-extensions) abaixo. Se você estiver movendo dados na direção contrária, o mapeamento de tipos e as diferenças de dialeto abaixo ainda se aplicam ao contrário, mas a seção de ferramentas de migração não.
+
+## Qual Abordagem Devo Usar {#which-approach-should-i-use}
+
+- **Cutover único** — dump/restore com `pg_dump` e `LOAD DATA INFILE`. Consulte [Ferramentas de Migração](#migration-tools) e [Abordagem de Migração](#migration-approach) abaixo.
+- **Precisa que o banco de dados de origem continue ativo e gravável durante a migração, ou uma sincronização contínua** — configure o Debezium com um conector JDBC sink para replicação contínua em vez de um dump único.
+
+## Ferramentas de Migração {#migration-tools}
+
+**`pg_dump` + conversão manual do esquema** é o caminho principal e não precisa de nada além das ferramentas de cliente padrão do PostgreSQL e do MySQL:
+
+```bash
+# Schema only, plain SQL text
+pg_dump -s -f schema.sql mydb
+
+# Data only, as INSERT statements (portable, but slower to load than COPY)
+pg_dump -a --inserts -f data.sql mydb
+```
+
+A saída de esquema do `pg_dump` usa a sintaxe do PostgreSQL (`SERIAL`, `BOOLEAN`, cláusulas de `CREATE TABLE` específicas do PostgreSQL), então o arquivo de esquema precisa de tradução manual usando a tabela de mapeamento de tipos abaixo antes de rodar no MySQL. Não existe uma ferramenta que faça essa tradução automaticamente e corretamente para todos os casos — trate este como o caminho padrão para a maioria das migrações.
+
+**Debezium com um conector JDBC sink** ([debezium.io](https://debezium.io), licença Apache-2.0, mantido ativamente) lê o write-ahead log do PostgreSQL e transmite as mudanças para o MySQL através do Kafka Connect, oferecendo replicação contínua em vez de uma cópia única. É a ferramenta certa quando o banco de dados de origem precisa continuar ativo e gravável durante a migração, ou quando você precisa de sincronização contínua em vez de um cutover. Ele exige um cluster Kafka e Kafka Connect em execução, o que é mais infraestrutura do que uma migração única precisa — para um cutover único, use `pg_dump`.
+
+## Mapeamento de Tipos de Dados {#data-type-mapping}
+
+| Tipo PostgreSQL | Equivalente MySQL | Observações |
+|:----------------|:----------------|:------|
+| `SERIAL` / `BIGSERIAL` | `INT AUTO_INCREMENT` / `BIGINT AUTO_INCREMENT` | O MySQL usa AUTO_INCREMENT, não sequences |
+| `TEXT` | `TEXT` ou `LONGTEXT` | O TEXT do MySQL é limitado a 65.535 bytes; use LONGTEXT para valores maiores |
+| `VARCHAR` (sem limite) | Não suportado | O VARCHAR do MySQL exige um comprimento; use TEXT em vez disso |
+| `BOOLEAN` | `TINYINT(1)` | O MySQL não tem um booleano verdadeiro; convenção 0/1 |
+| `BYTEA` | `BLOB` ou `LONGBLOB` | Dados binários |
+| `JSONB` | `JSON` | O JSON do MySQL é armazenado como texto com validação; não há formato binário JSONB |
+| `UUID` | `CHAR(36)` ou `BINARY(16)` | Não há tipo UUID nativo; consulte [UUIDs no MySQL](/pt-BR/guides/uuids) |
+| `TIMESTAMP WITH TIME ZONE` | `DATETIME` + tratamento explícito de fuso horário | O DATETIME do MySQL não tem fuso horário; consulte [Timestamps e Fusos Horários](/pt-BR/guides/timestamps-timezones) |
+| `NUMERIC` / `DECIMAL` | `DECIMAL(p,s)` | Precisão e escala são obrigatórias no MySQL |
+| `ARRAY` | Não suportado | Normalize em uma tabela filha |
+| `HSTORE` | `JSON` | Pares chave-valor; use JSON no MySQL |
+| `INTERVAL` | Não suportado como tipo de coluna | Armazene como INT em segundos ou use lógica no lado da aplicação |
+
+## Sequences vs AUTO_INCREMENT {#sequences-vs-auto_increment}
+
+O PostgreSQL usa sequences (objetos independentes) para valores de auto-incremento. O MySQL usa `AUTO_INCREMENT` como um atributo de coluna:
+
+**PostgreSQL:**
+```sql
+CREATE SEQUENCE orders_id_seq;
+CREATE TABLE orders (
+    id INTEGER DEFAULT nextval('orders_id_seq') PRIMARY KEY
+);
+```
+
+**Equivalente MySQL:**
+```sql
+CREATE TABLE orders (
+    id INT AUTO_INCREMENT PRIMARY KEY
+);
+```
+
+Para obter o último ID inserido no MySQL: `SELECT LAST_INSERT_ID();` (equivalente ao `currval()` ou ao `RETURNING id` do PostgreSQL).
+
+## Diferenças de Dialeto SQL {#sql-dialect-differences}
+
+**Concatenação de strings:**
+```sql
+-- PostgreSQL
+SELECT first_name || ' ' || last_name FROM users;
+
+-- MySQL
+SELECT CONCAT(first_name, ' ', last_name) FROM users;
+```
+
+**Aspas em strings:**
+```sql
+-- PostgreSQL: double quotes for identifiers, single quotes for strings
+SELECT "first_name" FROM users WHERE status = 'active';
+
+-- MySQL: backticks for identifiers, single quotes for strings
+SELECT `first_name` FROM users WHERE status = 'active';
+```
+
+O MySQL aceita aspas duplas para identificadores somente quando o modo SQL `ANSI_QUOTES` está habilitado.
+
+**ILIKE (LIKE sem distinção de maiúsculas e minúsculas):**
+```sql
+-- PostgreSQL
+SELECT * FROM users WHERE name ILIKE '%alice%';
+
+-- MySQL (case-insensitive by default with ci collations)
+SELECT * FROM users WHERE name LIKE '%alice%';
+```
+
+As comparações de strings no MySQL não distinguem maiúsculas de minúsculas por padrão com `utf8mb4_0900_ai_ci` (o padrão do MySQL 8.x) ou collations `_ci` semelhantes. Se você precisar de correspondência com distinção de maiúsculas e minúsculas, use uma collation `_bin`.
+
+**Cláusula RETURNING:**
+```sql
+-- PostgreSQL
+INSERT INTO users (name) VALUES ('Alice') RETURNING id;
+
+-- MySQL (no RETURNING)
+INSERT INTO users (name) VALUES ('Alice');
+SELECT LAST_INSERT_ID();
+```
+
+**LIMIT / OFFSET:**
+```sql
+-- PostgreSQL
+SELECT * FROM orders LIMIT 10 OFFSET 20;
+
+-- MySQL (same syntax)
+SELECT * FROM orders LIMIT 10 OFFSET 20;
+-- or shorthand:
+SELECT * FROM orders LIMIT 20, 10;  -- LIMIT offset, count
+```
+
+**Schemas vs bancos de dados:**
+O PostgreSQL usa schemas dentro de um banco de dados (`mydb.public.orders`). O MySQL usa "schemas" e "bancos de dados" de forma intercambiável — não existe o conceito de um schema dentro de um banco de dados. O que o PostgreSQL chama de schema, o MySQL chama de banco de dados.
+
+**Tratamento de NULL em índices UNIQUE:**
+O PostgreSQL permite vários valores NULL em uma coluna com restrição UNIQUE (NULLs não são iguais entre si). O MySQL (InnoDB) também permite vários NULLs em índices únicos — o comportamento é o mesmo.
+
+**CTEs:**
+O MySQL suporta CTEs, incluindo CTEs recursivas. Consulte [Expressões de tabela comuns no MySQL](/pt-BR/tutorial/cte).
+
+**Funções de janela:**
+O MySQL suporta funções de janela. Consulte [Funções de Janela no MySQL](/pt-BR/guides/window-functions).
+
+**Stored procedures e funções:**
+O PostgreSQL escreve lógica procedural em PL/pgSQL, com tratamento de exceções e controle de fluxo rico. O MySQL usa o seu próprio dialeto SQL procedural, não tem suporte a PL/pgSQL e exige uma mudança de `DELIMITER` nas ferramentas de cliente para que os pontos e vírgulas dentro do corpo da procedure não sejam interpretados como o fim da instrução:
+
+```sql
+-- MySQL: a stored procedure with an OUT parameter
+DELIMITER ;;
+CREATE PROCEDURE total_orders(IN cust_id INT, OUT total INT)
+BEGIN
+    SELECT COUNT(*) INTO total FROM orders WHERE customer_id = cust_id;
+END;;
+DELIMITER ;
+
+CALL total_orders(1, @t);
+SELECT @t;
+```
+
+Não existe tradução automatizada de PL/pgSQL para a sintaxe procedural do MySQL — reescreva cada procedure à mão, e espere que a lógica de tratamento de exceções (blocos `EXCEPTION WHEN ...`) precise do maior retrabalho, já que o `DECLARE ... HANDLER` do MySQL funciona de forma diferente. Consulte [Stored Procedures no MySQL](/pt-BR/guides/stored-procedures).
+
+**Distinção de maiúsculas e minúsculas em identificadores:**
+O PostgreSQL converte identificadores sem aspas para minúsculas e trata identificadores com aspas (`"MyTable"`) com distinção de maiúsculas e minúsculas. A regra do MySQL é diferente: se os nomes de bancos de dados e tabelas distinguem maiúsculas de minúsculas depende da variável de sistema `lower_case_table_names` e do sistema de arquivos subjacente, não das aspas. Nomes de colunas, índices e rotinas armazenadas nunca distinguem maiúsculas de minúsculas para fins de busca, independentemente da plataforma. Não presuma que um esquema que dependia de nomes de tabela do PostgreSQL com distinção de maiúsculas e minúsculas vai se comportar de forma idêntica após a migração — verifique `lower_case_table_names` no servidor de destino.
+
+## Recursos Sem Equivalente no MySQL {#features-without-mysql-equivalents}
+
+Alguns recursos do PostgreSQL não têm equivalente direto:
+
+| Recurso PostgreSQL | Situação no MySQL |
+|:-------------------|:----------------|
+| Arrays como tipos de coluna | Normalize em uma tabela filha |
+| Herança de tabelas | Não suportada; use tabelas separadas |
+| Operadores personalizados | Não suportados |
+| `LISTEN`/`NOTIFY` completos | Não suportados; use polling no lado da aplicação ou uma fila de mensagens |
+| Índices parciais (cláusula `WHERE` no índice) | Não suportados; use colunas geradas para indexar um subconjunto |
+| Views materializadas | Não suportadas nativamente; aproxime com tabelas + stored procedures |
+| Comando `COPY` para carga em massa | Use `LOAD DATA INFILE` ou o `loadDump` do MySQL Shell |
+
+## Trazendo as Suas Extensões {#bringing-your-extensions}
+
+O PostgreSQL depende de extensões como `pgcrypto`, `pg_trgm` e `uuid-ossp` para funcionalidades que ele não traz nativamente. O MySQL padrão não tem um mecanismo equivalente para adicionar esse tipo de funcionalidade — mas o VillageSQL tem: o VillageSQL Extension Framework (VEF) permite instalar funções e tipos SQL personalizados no servidor com `INSTALL EXTENSION`. Algumas das extensões do VillageSQL são ports diretos das extensões PostgreSQL acima:
+
+| Extensão PostgreSQL | Extensão VillageSQL | Cobre |
+|:----------------------|:----------------------|:-------|
+| `pgcrypto` | `vsql_crypto` | Hashing, HMAC, criptografia AES, hashing de senhas (somente PBKDF2 — hashes bcrypt não são transferidos). Consulte [Hashing de Dados no MySQL](/pt-BR/guides/hashing-data). |
+| `uuid-ossp` | `vsql_uuid` | Um tipo de coluna UUID nativo mais funções de geração v1–v7. Consulte [UUIDs no MySQL](/pt-BR/guides/uuids). |
+| — (tipos embutidos `inet`/`cidr`/`macaddr`) | `vsql_network_address` | Tipos de endereço IPv4, IPv6 e MAC. Consulte [Armazenando Endereços IP no MySQL](/pt-BR/guides/storing-ip-addresses). |
+| `pg_trgm` | `vsql_trgm` | Busca de similaridade de strings baseada em trigramas. Consulte [Similaridade por Trigramas no MySQL](/pt-BR/guides/trigram-similarity). |
+
+Se o seu banco de dados PostgreSQL depende de uma extensão que não está listada aqui, ela pode ainda não ter um equivalente no VillageSQL — verifique o catálogo de extensões na documentação do VillageSQL antes de presumir que a funcionalidade se foi de vez. E se a dependência for uma extensão PostgreSQL personalizada que a sua própria equipe escreveu, o VEF também é a ferramenta para portá-la: a skill [`vsql-extension-builder`](https://github.com/villagesql/villagesql-skills/tree/main/skills/vsql-extension-builder) conduz um agente de codificação com IA pela reconstrução de uma extensão personalizada no VillageSQL, dos requisitos até um pacote `.veb` testado e documentado.
+
+## Abordagem de Migração {#migration-approach}
+
+1. **Exporte o esquema** do PostgreSQL (`pg_dump --schema-only`) e traduza cada tabela manualmente, usando o mapeamento de tipos acima.
+2. **Exporte os dados** do PostgreSQL como CSV (`COPY table TO '/tmp/table.csv' CSV HEADER`).
+3. **Carregue os dados** no MySQL com `LOAD DATA INFILE` ou `mysqlimport`.
+4. **Teste as consultas** — encontre toda a sintaxe específica do PostgreSQL e reescreva-a.
+5. **Verifique contagens e checksums** — `SELECT COUNT(*)` em todas as tabelas; confira por amostragem as linhas principais.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### O MySQL suporta `UPSERT` como o `ON CONFLICT` do PostgreSQL? {#does-mysql-support-upsert-like-postgresqls-on-conflict}
+
+Sim, usando uma sintaxe diferente. Consulte [UPSERT no MySQL](/pt-BR/guides/upsert). O `INSERT ... ON DUPLICATE KEY UPDATE` e o `REPLACE INTO` do MySQL cobrem o mesmo caso de uso que o `ON CONFLICT DO UPDATE` e o `ON CONFLICT DO NOTHING` do PostgreSQL.
+
+#### Como lidar com as colunas `BOOLEAN` do PostgreSQL no MySQL? {#how-do-i-handle-postgresqls-boolean-columns-in-mysql}
+
+Use `TINYINT(1)`. Armazene 1 para verdadeiro e 0 para falso. A maioria das bibliotecas de cliente e ORMs do MySQL lida com isso automaticamente e apresenta colunas TINYINT(1) como booleanos. Você também pode usar `BIT(1)`, mas TINYINT(1) tem suporte mais amplo nas ferramentas.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| Erros de sintaxe na concatenação com `||` | Substitua por `CONCAT()` |
+| `ILIKE` não reconhecido | Use `LIKE` (sem distinção de maiúsculas e minúsculas por padrão com collations ci) |
+| Identificadores com aspas duplas não funcionam | Habilite o modo SQL `ANSI_QUOTES` ou mude para aspas com backticks |
+| Cláusula `RETURNING` não funciona | Use `LAST_INSERT_ID()` após o INSERT; não existe equivalente no MySQL |
+| `SERIAL` se comporta de forma diferente do Postgres | O MySQL aceita `SERIAL` — é um alias para `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE`, mais largo que o `SERIAL` do Postgres e com uma chave única implícita. Use `INT AUTO_INCREMENT` explícito para o equivalente mais estreito do Postgres |
+| Colunas de array falhando | Normalize em uma tabela filha com uma chave estrangeira |
+
+## Veja também {#see-also}
+
+- [Migrações de Esquema no MySQL](/pt-BR/guides/schema-migrations) — executando as mudanças de DDL que uma migração exige
+- [Escolhendo Tipos de Dados no MySQL](/pt-BR/guides/choosing-data-types) — mapeando tipos do PostgreSQL para equivalentes do MySQL
+- [MySQL vs PostgreSQL: Qual Você Deve Usar?](/pt-BR/guides/mysql-vs-postgresql) — a comparação recurso a recurso por trás da migração

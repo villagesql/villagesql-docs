@@ -1,0 +1,169 @@
+---
+title: "UUIDs no MySQL"
+sidebarTitle: "Usando UUIDs"
+description: "Como usar UUIDs como chaves primárias no MySQL — estratégias de armazenamento, compensações de desempenho e as versões de UUID explicadas."
+keywords: "MySQL UUID primary key, uuid vs auto increment, uuid binary mysql, uuid v7 mysql, mysql uuid performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Inteiros com auto-incremento são simples até deixarem de ser: eles vazam a contagem de linhas, falham em sistemas distribuídos e quebram quando você mescla bancos de dados ou faz sharding. Os UUIDs resolvem tudo isso, mas o tratamento padrão do MySQL os torna lentos para inserir em escala. Veja por que isso acontece e como corrigir.
+
+## O Padrão do MySQL: UUID() como CHAR(36) {#the-mysql-default-uuid-as-char36}
+
+A função interna `UUID()` do MySQL retorna um UUID v1 como uma string de 36 caracteres, como `550e8400-e29b-41d4-a716-446655440000`. Armazená-la em uma coluna `CHAR(36)` funciona, mas é ineficiente:
+
+- 36 bytes em vez de 16 para os mesmos dados
+- A comparação de strings é mais lenta do que a comparação binária
+- UUIDs aleatórios causam divisões de páginas na B-tree a cada inserção (mais sobre isso abaixo)
+
+```sql
+-- This works but has problems at scale
+CREATE TABLE orders (
+    order_id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+    user_id  INT NOT NULL
+);
+```
+
+## A Solução Alternativa Padrão: BINARY(16) {#the-standard-workaround-binary16}
+
+O MySQL fornece `UUID_TO_BIN()` e `BIN_TO_UUID()` para converter entre a forma de string e a forma binária compacta. Usar `BINARY(16)` reduz o armazenamento pela metade e acelera as comparações:
+
+```sql
+CREATE TABLE orders (
+    order_id BINARY(16) PRIMARY KEY,
+    user_id  INT NOT NULL
+);
+
+-- Store: convert string UUID to binary
+INSERT INTO orders (order_id, user_id)
+VALUES (UUID_TO_BIN(UUID()), 101);
+
+-- Retrieve: convert back to readable format
+SELECT BIN_TO_UUID(order_id), user_id FROM orders;
+```
+
+A `UUID_TO_BIN()` aceita um segundo argumento opcional (`1`) que reordena os bits do timestamp para que os UUIDs v1 sejam ordenados cronologicamente — uma correção parcial para o problema de desempenho de inserção.
+
+## O Problema Restante: Inserções Aleatórias Fragmentam os Índices {#the-remaining-problem-random-inserts-fragment-indexes}
+
+O InnoDB do MySQL usa um índice clusterizado, o que significa que as linhas são armazenadas fisicamente na ordem da chave primária. Quando você insere uma linha com um UUID aleatório, o InnoDB precisa encontrar o lugar dela no meio do índice e, possivelmente, dividir uma página para abrir espaço. Sob carga contínua, isso causa amplificação de escrita e fragmentação do índice.
+
+O UUID v7 corrige isso ao embutir um timestamp Unix nos bits mais altos do identificador. Os novos UUIDs são sempre maiores do que os existentes, portanto as inserções sempre são anexadas à folha mais à direita do índice — sem divisões.
+
+## Com o VillageSQL: Tipo UUID Nativo e Todas as Versões {#with-villagesql-native-uuid-type-and-all-versions}
+
+A extensão `vsql_uuid` do VillageSQL adiciona um tipo de coluna `UUID` nativo, com armazenamento binário de 16 bytes e sem conversão manual, além de funções de geração para UUID da v1 à v7.
+
+```sql
+INSTALL EXTENSION vsql_uuid;
+```
+
+```sql
+-- Native UUID type — no UUID_TO_BIN/BIN_TO_UUID needed
+CREATE TABLE orders (
+    order_id UUID PRIMARY KEY,
+    user_id  INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- UUID_V7 inserts always append to the index — no page splits
+INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 101);
+INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 102);
+
+-- Sorts chronologically by creation order
+SELECT user_id, created_at FROM orders ORDER BY order_id;
+
+-- Inspect the timestamp embedded in a v7 UUID (as datetime or Unix epoch)
+SELECT UUID_TIMESTAMP(order_id), UUID_EPOCH(order_id) FROM orders LIMIT 1;
+```
+
+### Escolhendo uma versão de UUID {#choosing-a-uuid-version}
+
+| Versão | Use quando |
+|:---|:---|
+| `UUID_V4()` | Você precisa de IDs aleatórios e não se importa com o desempenho de inserção |
+| `UUID_V7()` | Novas linhas, chaves primárias, alto volume de inserção — padrão recomendado |
+| `UUID_V6()` | Sistemas legados v1 que precisam de saída ordenável |
+| `UUID_V1()` | Compatibilidade com sistemas que esperam o formato v1 |
+| `UUID_V3()` / `UUID_V5()` | IDs determinísticos derivados de um nome (v3 = MD5, v5 = SHA-1) |
+
+A `UUID_VERSION(uuid)` retorna o número da versão de um UUID armazenado — útil para rotear IDs por versão. Ela aceita um valor `UUID` ou um literal de string, que é convertido implicitamente — mas uma string inválida gera `ERROR 1525` em vez de retornar 0 ou NULL, portanto ela não é a ferramenta para filtrar texto não confiável; use a `UUID_IS_VALID()`, abaixo, para isso. A `UUID_COMPARE(uuid1, uuid2)` retorna -1, 0 ou 1 para lógica de ordenação explícita. Para uma visão mais ampla sobre quando usar UUIDs em vez de outras abordagens de chave primária, consulte [Escolhendo uma Estratégia de Chave Primária](/pt-BR/guides/primary-key-strategies).
+
+### UUIDs baseados em nome e os namespaces da RFC {#name-based-uuids-and-the-rfc-namespaces}
+
+A `UUID_V3()` e a `UUID_V5()` derivam um UUID de um namespace mais um nome, portanto o mesmo par sempre produz o mesmo UUID. `UUID_NS_DNS()`, `UUID_NS_URL()`, `UUID_NS_OID()` e `UUID_NS_X500()` retornam os quatro namespaces que a RFC 9562 define. Elas retornam texto, que é o que o parâmetro de namespace aceita, portanto elas se compõem diretamente:
+
+```sql
+SELECT UUID_V5(UUID_NS_DNS(), 'example.com');
+-- cfbff0d1-9375-5685-968c-48ce8b15ae17
+```
+
+A `UUID_NIL()` e a `UUID_MAX()` retornam os UUIDs de todos os bits em zero e de todos os bits em um que a mesma RFC reserva, para uso como valores sentinela.
+
+### Validando UUIDs vindos de fora do banco de dados {#validating-uuids-from-outside-the-database}
+
+A `UUID_IS_VALID(string)` retorna 1 quando uma string seria aceita por uma coluna `UUID` e 0 quando não seria. Ela nunca gera erro, seja o que for que receba, portanto pode filtrar valores antes que eles cheguem a uma coluna tipada:
+
+```sql
+SELECT UUID_IS_VALID('550e8400-e29b-41d4-a716-446655440000');  -- 1
+SELECT UUID_IS_VALID('nope');                                  -- 0
+
+-- Reject malformed IDs at the schema level
+CREATE TABLE staging (
+  raw VARCHAR(40),
+  CHECK (UUID_IS_VALID(raw) = 1)
+);
+```
+
+### Usando funções de UUID em colunas geradas e restrições {#using-uuid-functions-in-generated-columns-and-constraints}
+
+As funções de introspecção, validação e constantes são determinísticas, assim como os geradores baseados em nome `UUID_V3()` e `UUID_V5()`. Todas elas podem aparecer em colunas geradas e em restrições CHECK. Os geradores aleatórios e baseados em tempo — `UUID_V4()`, `UUID_V7()` e afins — não podem, porque a saída deles muda a cada chamada. Isso permite derivar ou validar valores armazenados a partir de um UUID no nível do esquema:
+
+```sql
+CREATE TABLE audit_log (
+  id uuid NOT NULL,
+  ver INT AS (UUID_VERSION(id)) STORED,  -- derive the version into a column
+  CHECK (UUID_VERSION(id) IN (4, 7))     -- accept only v4 or v7 IDs
+);
+```
+
+## UUID vs. Auto-Incremento {#uuid-vs-auto-increment}
+
+| | AUTO_INCREMENT | UUID (BINARY/nativo) |
+|:---|:---|:---|
+| **Seguro para sistemas distribuídos** | Não — requer coordenação | Sim |
+| **Vaza a contagem de linhas** | Sim | Não |
+| **Armazenamento** | 4–8 bytes | 16 bytes |
+| **Desempenho de inserção** | Rápido (sempre anexa) | Rápido com v7, lento com v4 |
+| **Legível por humanos** | Sim | Não (binário) |
+| **Seguro para mesclagem** | Não | Sim |
+
+Para a maioria das aplicações com um único banco de dados, `AUTO_INCREMENT` é suficiente. Recorra aos UUIDs quando precisar de IDs globalmente únicos entre sistemas, ao mesclar dados de várias fontes ou quando não quiser expor contagens sequenciais de linhas.
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Posso usar UUID_V7 como DEFAULT? {#can-i-use-uuid_v7-as-a-default}
+Atualmente não. Funções não determinísticas não podem ser usadas em expressões DEFAULT no MySQL. Gere o UUID na sua instrução INSERT.
+
+#### Posso preencher linhas existentes com UUIDs? {#can-i-backfill-existing-rows-with-uuids}
+Sim. Adicione uma coluna `UUID`, preencha-a com `UUID_V7()` em um UPDATE e, em seguida, torne-a a chave primária.
+
+#### O UUID_V7 é um padrão? {#is-uuid_v7-a-standard}
+Sim — definido na RFC 9562, que substitui a RFC 4122.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:---|:---|
+| `FUNCTION <database>.UUID_V7 does not exist` | Execute `INSTALL EXTENSION vsql_uuid` |
+| `DEFAULT (UUID_V7())` rejeitado | Remova o `DEFAULT`; chame `UUID_V7()` em cada INSERT |
+| `Extension 'vsql_uuid' is already installed` | Já instalada — nenhuma ação necessária |
+
+## Veja também {#see-also}
+
+- [Escolhendo uma Estratégia de Chave Primária no MySQL](/pt-BR/guides/primary-key-strategies) — comparando UUIDs com AUTO_INCREMENT e outras estratégias
+- [Gerando Dados Aleatórios no MySQL](/pt-BR/guides/random-data-mysql) — a aleatoriedade por trás do UUID v4
+- [Como o InnoDB Armazena Dados](/pt-BR/guides/innodb-storage) — por que chaves primárias UUID aleatórias causam fragmentação de páginas

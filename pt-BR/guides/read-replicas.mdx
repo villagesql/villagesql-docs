@@ -1,0 +1,58 @@
+---
+title: "Réplicas de Leitura no MySQL"
+sidebarTitle: "Réplicas de Leitura"
+description: "Como escalar leituras com réplicas do MySQL: roteamento de consultas, convivência com o atraso de replicação e o problema de ler as próprias gravações que toda configuração com réplicas enfrenta."
+keywords: "mysql read replica, read replica lag, mysql scale reads, read your own writes, mysql replica routing, replication lag mysql"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma réplica de leitura é um segundo servidor que reproduz tudo o que a origem grava e responde a consultas de leitura. Réplicas escalam leituras de forma quase linear e dão a você uma cópia pronta para failover, ao custo de um problema novo que a sua aplicação precisa assumir: a réplica está sempre um pouco atrasada, e nenhuma opção de configuração faz isso desaparecer. A configuração da replicação em si é coberta em [Noções básicas de replicação](/pt-BR/guides/replication-basics); este guia é sobre usar réplicas bem.
+
+## Para Que Servem as Réplicas {#what-replicas-are-for}
+
+- **Escalar leituras.** Dashboards, buscas, exportações e leituras de API saem da origem, o que preserva a capacidade dela para gravações.
+- **Isolamento para consultas caras.** A agregação de 40 segundos do analista roda em uma réplica e não bloqueia ninguém.
+- **Um warm standby.** Uma réplica atualizada pode ser promovida quando a origem falha.
+
+O que elas não são: uma ferramenta para escalar gravações. Cada réplica reproduz cada gravação que a origem recebe, então réplicas adicionam zero capacidade de gravação.
+
+## Roteando Leituras {#routing-reads}
+
+O MySQL não roteia consultas por você. Algo na sua pilha precisa enviar as gravações para a origem e as leituras escolhidas para as réplicas:
+
+- **Roteamento no nível da aplicação.** A maioria dos frameworks suporta isso diretamente (database routers do Django, `connects_to`/roles do Rails, conexões de leitura/gravação do Laravel). Simples e explícito; a aplicação decide consulta por consulta.
+- **Um proxy.** O ProxySQL e similares roteiam por tipo de instrução ou por regra, então as aplicações mantêm uma única string de conexão. Isso também centraliza o failover.
+
+Comece com o roteamento no nível da aplicação. Ele força a pergunta certa desde cedo: não "esta consulta pode rodar em uma réplica", mas "esta consulta tolera dados desatualizados".
+
+## Atraso de Replicação: A Parte Realmente Difícil {#replication-lag-the-actual-hard-part}
+
+A replicação é assíncrona por padrão. O commit na origem retorna antes de as réplicas aplicarem a mudança, então uma leitura na réplica um instante depois pode não ver uma gravação que já teve sucesso. Meça o atraso a partir da réplica:
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+O campo `Seconds_Behind_Source` é o sinal padrão. Ele geralmente fica perto de zero e dispara sob rajadas de gravações, transações grandes e mudanças de esquema. Crie alertas sobre ele, e conheça a sua tolerância em cada caminho de leitura.
+
+A falha clássica é **ler as próprias gravações**: um usuário salva um perfil (gravação na origem), a página seguinte o carrega de uma réplica, e a réplica ainda não aplicou a gravação. O usuário vê a mudança sumir. Mitigações padrão, da mais barata para a mais cara:
+
+- **Fixar após a gravação.** Depois que uma sessão grava, roteie as leituras dessa sessão para a origem pelos próximos segundos. Muitos frameworks e proxies suportam esse padrão diretamente.
+- **Rotear por tolerância.** Saldos financeiros e páginas recém-editadas leem da origem; páginas de navegação, busca e análises leem das réplicas.
+- **Consistência de sessão via GTIDs.** Depois de uma gravação, capture o identificador da transação e faça a leitura na réplica esperar por ele com `WAIT_FOR_EXECUTED_GTID_SET()`. Preciso, ao custo de transportar o GTID pela requisição.
+
+## Duas Regras Práticas {#two-practical-rules}
+
+- **Réplicas devem ter hardware igual ou superior, não sobras.** Uma réplica mais lenta que a origem fica para trás exatamente sob a carga que fez você adicionar réplicas.
+- **Ensaie a promoção.** Uma réplica que você nunca promoveu é um backup que você nunca restaurou. Pratique o caminho de failover antes de precisar dele.
+
+O VillageSQL herda esse mecanismo de replicação sem mudanças do MySQL 8.4, então tudo acima se aplica a ele também.
+
+## Veja também {#see-also}
+
+- [Noções básicas de replicação](/pt-BR/guides/replication-basics) — configurando a replicação sobre a qual este guia se apoia
+- [Log binário](/pt-BR/guides/binary-logging) — o fluxo de log que as réplicas reproduzem
+- [Pool de conexões](/pt-BR/guides/connection-pooling) — pool por papel depois que leituras e gravações se separam

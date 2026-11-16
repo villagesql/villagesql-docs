@@ -1,0 +1,146 @@
+---
+title: "Views no MySQL"
+sidebarTitle: "Criando Views"
+description: "Como as views do MySQL funcionam: criando e consultando views, views atualizáveis, WITH CHECK OPTION, algoritmos de view (MERGE vs TEMPTABLE) e quando as views ajudam ou atrapalham."
+keywords: "mysql views, mysql create view, mysql updatable view, mysql view with check option, mysql view algorithm, mysql view vs table, mysql view performance"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma view é uma consulta nomeada armazenada no banco de dados. Consultar uma view parece idêntico a consultar uma tabela, mas o SELECT da view é executado no momento da consulta — não há dados armazenados separadamente.
+
+## Criando e Consultando Views {#creating-and-querying-views}
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Query it like a table
+SELECT * FROM active_customers WHERE email LIKE '%@example.com';
+```
+
+Para ver a definição subjacente:
+
+```sql
+SHOW CREATE VIEW active_customers\G
+```
+
+Para modificar uma view, use `CREATE OR REPLACE VIEW`:
+
+```sql
+CREATE OR REPLACE VIEW active_customers AS
+SELECT id, name, email, created_at
+FROM customers
+WHERE status = 'active';
+```
+
+Para excluir uma view:
+
+```sql
+DROP VIEW active_customers;
+```
+
+## Views Atualizáveis {#updatable-views}
+
+Algumas views aceitam `INSERT`, `UPDATE` e `DELETE` por meio da view. Uma view é atualizável quando ela se mapeia de forma limpa para uma única tabela subjacente:
+
+- Cada coluna que você grava pertence a uma única tabela subjacente. Uma view sobre um JOIN ainda é atualizável sob essa regra, mas um `INSERT` por meio dela toca silenciosamente apenas uma tabela e não insere nenhuma linha na outra. Gravar colunas de ambas as tabelas subjacentes em um único `INSERT`, porém, não é silencioso — isso gera `ERROR 1393: Can not modify more than one base table through a join view`
+- Sem `DISTINCT`
+- Sem funções de agregação (`SUM`, `COUNT`, etc.)
+- Sem `GROUP BY` ou `HAVING`
+- Sem subconsultas na cláusula `WHERE` que referenciem a mesma tabela
+- Sem `UNION`
+
+```sql
+-- This view is updatable
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM customers
+WHERE status = 'active';
+
+-- Update through the view
+UPDATE active_customers SET email = 'new@example.com' WHERE id = 42;
+```
+
+O MySQL atualiza a tabela `customers` subjacente. Se a view filtra linhas, você pode fazer um `UPDATE` em uma linha para um valor que a torne invisível por meio da view — a linha continua existindo na tabela base, mas desaparece da view.
+
+## WITH CHECK OPTION {#with-check-option}
+
+O `WITH CHECK OPTION` impede inserções e atualizações por meio de uma view que tornariam a linha invisível por meio da view:
+
+```sql
+CREATE VIEW active_customers AS
+SELECT id, name, email, status
+FROM customers
+WHERE status = 'active'
+WITH CHECK OPTION;
+
+-- Fails: setting status = 'inactive' would hide the row from the view
+UPDATE active_customers SET status = 'inactive' WHERE id = 42;
+-- ERROR 1369: CHECK OPTION failed 'mydb.active_customers'
+```
+
+Use `WITH CHECK OPTION` quando uma view representa um subconjunto significativo dos dados e você quer garantir que as inserções e atualizações por meio dela permaneçam nesse subconjunto.
+
+## Algoritmos de View {#view-algorithms}
+
+O MySQL executa as views usando um de dois algoritmos:
+
+| Algoritmo | Comportamento | Quando o MySQL o escolhe |
+|:----------|:---------|:----------------------|
+| `MERGE` | Reescreve a consulta externa para embutir o SELECT da view — sem tabela temporária | Views simples sem agregações, DISTINCT, GROUP BY, UNION |
+| `TEMPTABLE` | Materializa a view primeiro em uma tabela temporária e, em seguida, executa a consulta externa | Views com agregações, DISTINCT, GROUP BY, UNION |
+
+`TEMPTABLE` significa que o resultado inteiro da view é calculado antes de a consulta externa ser executada — o otimizador não consegue empurrar as condições `WHERE` da consulta externa para dentro da view. Para que a filtragem funcione de forma eficiente em uma view `TEMPTABLE`, o filtro precisa estar dentro da própria definição da view.
+
+Especifique o algoritmo explicitamente para evitar surpresas:
+
+```sql
+CREATE ALGORITHM=MERGE VIEW active_customers AS
+SELECT id, name, email FROM customers WHERE status = 'active';
+```
+
+Se o MySQL não conseguir atender ao algoritmo solicitado, ele gera o Warning 1354 e armazena a view como `ALGORITHM=UNDEFINED` — é isso que o `SHOW CREATE VIEW` reporta, não `TEMPTABLE`. O otimizador então materializa essas views no momento da execução.
+
+## Views Não São Indexadas {#views-are-not-indexed}
+
+Uma view não tem índices próprios. As consultas a uma view `MERGE` podem usar os índices da tabela subjacente. As consultas a uma view `TEMPTABLE` não podem — a tabela temporária não tem índices.
+
+Para um resultado de view consultado com frequência que você precisa indexar, as opções são:
+- Garantir que a view use o algoritmo `MERGE` e indexar as colunas da tabela subjacente
+- Substituir a view por uma tabela real, preenchida por um job ou por um gatilho
+
+## Perguntas Frequentes {#frequently-asked-questions}
+
+#### Quando devo usar uma view? {#when-should-i-use-a-view}
+
+As views funcionam bem para controle de acesso (expor um subconjunto de colunas ou linhas a um usuário), para simplificar um join complexo que várias consultas usam e para apresentar uma interface estável quando o esquema subjacente pode mudar. Elas não são uma ferramenta de desempenho — elas não armazenam dados em cache nem os guardam.
+
+#### Posso fazer join entre views? {#can-i-join-views}
+
+Sim. Fazer join entre duas views `MERGE` é, na prática, fazer join entre as duas consultas subjacentes — o MySQL reescreve tudo. Fazer join entre views `TEMPTABLE` é mais lento, pois cada view é materializada de forma independente primeiro. Para joins complexos, uma [expressão de tabela comum](/pt-BR/tutorial/cte) frequentemente dá mais controle sobre a execução.
+
+#### As views são atualizadas automaticamente quando a tabela subjacente muda? {#do-views-update-automatically-when-the-underlying-table-changes}
+
+A definição da view é armazenada como texto SQL. Se você adicionar uma coluna à tabela base, o `SELECT *` da view não a incluirá — você precisa de um `CREATE OR REPLACE VIEW`. Se você renomear ou excluir uma coluna que a view referencia, a view se torna inválida e as consultas a ela geram erro até que você a recrie.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Solução |
+|:--------|:---------|
+| `ERROR 1369: CHECK OPTION failed` | A atualização esconderia a linha da view — verifique as condições WHERE da view |
+| Consulta à view lenta apesar dos índices na tabela base | A view pode estar usando o algoritmo TEMPTABLE — verifique no `EXPLAIN` a presença de "DERIVED"; reestruture ou mude para uma CTE |
+| `UPDATE` por meio da view atualiza as linhas erradas | A view não é atualizável devido a JOIN ou agregação — atualize a tabela base diretamente |
+| `ERROR 1356: View references invalid table` | A tabela subjacente foi renomeada ou excluída — recrie a view |
+
+## Veja também {#see-also}
+
+- [Normalização no MySQL](/pt-BR/guides/normalization) — as views podem simplificar consultas a esquemas normalizados
+- [Desempenho de JOIN no MySQL e erros comuns](/pt-BR/guides/joins) — as views frequentemente encapsulam a lógica de join
+- [Como os joins do MySQL funcionam](/pt-BR/tutorial/joins) — a sintaxe de join que uma definição de view usa
+- [Subconsultas vs JOINs no MySQL](/pt-BR/guides/subqueries-vs-joins) — as formas de consulta que as views envolvem
+- [Soft Deletes no MySQL](/pt-BR/guides/soft-deletes) — escondendo linhas excluídas atrás de uma view de linhas ativas

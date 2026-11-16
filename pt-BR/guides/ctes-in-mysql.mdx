@@ -1,0 +1,247 @@
+---
+title: "Quando uma CTE do MySQL supera uma tabela derivada"
+sidebarTitle: "Desempenho de CTEs"
+description: "Se o otimizador do MySQL incorpora uma CTE ou a materializa, como perceber isso no EXPLAIN e quando uma CTE é a forma errada para a consulta que você está escrevendo."
+keywords: "mysql cte performance, mysql cte vs derived table, mysql materialize cte, mysql cte slow, mysql cte optimizer, mysql recursive cte cycles, cte_max_recursion_depth"
+---
+
+import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
+
+<VillagesqlBanner />
+
+Uma CTE e uma tabela derivada retornam as mesmas linhas, então a escolha entre
+elas geralmente é uma questão de leitura. Deixa de ser apenas uma questão de
+leitura quando o otimizador materializa uma delas, o que ele faz com mais
+frequência do que a maioria dos textos sugere. Este guia trata de como saber
+qual dos dois casos você obteve e dos casos em que uma CTE é a forma errada.
+
+O tutorial ensina a sintaxe em si:
+[expressões de tabela comuns](/pt-BR/tutorial/cte), [CTEs recursivas](/pt-BR/tutorial/recursive-cte)
+e [tabelas derivadas](/pt-BR/tutorial/derived-tables).
+
+Todo plano nesta página veio de 1 servidor contra o banco de dados de exemplo
+Sakila. Os custos e as estimativas de linhas vêm das estatísticas amostradas do
+InnoDB e das suas configurações de `optimizer_switch`, então os seus números
+serão diferentes. A forma de cada plano é a parte que se mantém.
+
+## A regra: mesclável ou não {#the-rule-mergeable-or-not}
+
+Uma CTE é incorporada à consulta externa ou construída primeiro como uma tabela
+temporária, e qual das duas você obtém é decidido pelo que a CTE contém, não
+por quantas vezes você a nomeia.
+
+Uma CTE cujo corpo é um `SELECT` simples com `WHERE` e `JOIN` é mesclada e
+desaparece do plano por completo:
+
+```sql
+EXPLAIN FORMAT=TREE WITH g AS (SELECT film_id, title, rating FROM film WHERE rating = 'G')
+SELECT title FROM g WHERE film_id < 50\G
+```
+
+```text
+-> Filter: ((film.rating = 'G') and (film.film_id < 50))  (cost=10.1 rows=9.8)
+    -> Index range scan on film using PRIMARY over (film_id < 50)  (cost=10.1 rows=49)
+```
+
+Nenhum nó de CTE, e a condição externa chegou ao índice. Uma CTE que contém
+`GROUP BY`, `DISTINCT`, `LIMIT`, `UNION` ou uma função de janela não pode ser
+mesclada, porque as condições da consulta externa não são equivalentes quando
+aplicadas antes dessas operações. Uma CTE assim é materializada.
+
+Os planos abaixo mostram esse segundo caso. Leia-os como sendo sobre o conteúdo
+da CTE, não sobre a palavra `WITH`.
+
+## Verifique qual dos dois casos você obteve {#check-which-one-you-got}
+
+`EXPLAIN FORMAT=TREE` diz isso com todas as letras. O `EXPLAIN` padrão não diz:
+a coluna `Extra` dele não traz a palavra nas consultas desta página.
+
+```sql
+EXPLAIN FORMAT=TREE WITH counts AS (SELECT rating, COUNT(*) AS films FROM film GROUP BY rating)
+SELECT rating, films FROM counts WHERE films > 200\G
+```
+
+```text
+-> Table scan on counts  (cost=2.5..2.5 rows=0)
+    -> Materialize CTE counts  (cost=0..0 rows=0)
+        -> Filter: (count(0) > 200)
+            -> Table scan on <temporary>
+                -> Aggregate using temporary table
+                    -> Table scan on film  (cost=103 rows=1000)
+```
+
+`Materialize CTE counts`, embora a CTE seja nomeada uma única vez. O `GROUP BY`
+dentro dela é o que força isso, e o servidor grava as linhas em uma tabela
+temporária e as lê de volta.
+
+**Uma tabela derivada que contém o mesmo `GROUP BY` recebe o mesmo plano.**
+Escrita como `FROM (SELECT rating, COUNT(*) ... GROUP BY rating) AS counts`, a
+árvore é idêntica exceto pelo nome do nó, e o custo é o mesmo. Então, em uma
+consulta com uma única referência, a CTE não supera em nada a tabela derivada:
+as 2 formas diferem em como são lidas, e o otimizador as trata do mesmo jeito.
+
+Faça referência à mesma CTE duas vezes e o texto muda para `if needed`, com a
+segunda referência reutilizando o mesmo resultado materializado:
+
+```sql
+EXPLAIN FORMAT=TREE WITH counts AS (SELECT rating, COUNT(*) AS films FROM film GROUP BY rating)
+SELECT a.rating, a.films FROM counts AS a JOIN counts AS b ON a.films = b.films\G
+```
+
+```text
+-> Nested loop inner join  (cost=2502 rows=0)
+    -> Table scan on a  (cost=2.5..2.5 rows=0)
+        -> Materialize CTE counts if needed  (cost=0..0 rows=0)
+            -> Table scan on <temporary>
+                -> Aggregate using temporary table
+                    -> Table scan on film  (cost=103 rows=1000)
+    -> Index lookup on b using <auto_key0> (films=a.films)  (cost=0.25..2.5 rows=10)
+        -> Materialize CTE counts if needed (query plan printed elsewhere)  (cost=0..0 rows=0)
+```
+
+É aí que as 2 formas realmente se separam. A consulta interna cara executa uma
+vez e as duas referências leem o resultado. Escrita com tabelas derivadas, a
+mesma consulta nomeia a subconsulta duas vezes e a calcula duas vezes.
+
+## O que a materialização custa a você {#what-materializing-costs-you}
+
+Uma CTE materializada é uma tabela temporária, o que significa 2 coisas que
+vale a pena saber.
+
+Ela abre mão dos índices das tabelas base. Uma vez que as linhas estão em uma
+tabela temporária, a consulta externa varre essa tabela. O servidor pode
+construir uma `auto_key` na hora, como fez para o join acima, e esse não é o
+índice que você tinha na tabela real. Compare com o plano mesclado no topo
+desta página, onde a condição externa chegou à `PRIMARY`.
+
+O pushdown suaviza isso. `derived_condition_pushdown` está ativado por padrão e
+move para dentro o que pode, e é por isso que `Filter: (count(0) > 200)` aparece
+*dentro* do nó `Materialize` acima, e não fora dele. Ele não consegue mover
+tudo, então quando um plano mostra a CTE produzindo muito mais linhas do que o
+resultado mantém, escreva a restrição dentro da CTE você mesmo.
+
+## Quando uma CTE é a forma errada {#when-a-cte-is-the-wrong-shape}
+
+- **Uma única etapa curta.** Uma tabela derivada a mantém onde ela é usada.
+  Nomear uma subconsulta de 1 linha adiciona um salto para o leitor.
+- **Um filtro que o otimizador não empurrou para dentro.** Se o plano mostra a
+  CTE materializando todas as linhas e a consulta externa descartando a maioria
+  delas, escreva o filtro dentro.
+- **Trabalho linha a linha contra um índice.** Uma subconsulta correlacionada ou
+  um join pode usar o índice em cada busca. Uma CTE materializada já abriu mão
+  disso.
+
+Uma CTE é a forma certa quando a consulta tem 2 ou mais etapas nomeadas, quando
+o mesmo resultado é necessário duas vezes ou quando a alternativa é uma
+subconsulta aninhada tão fundo que ninguém consegue ver onde ela termina.
+
+Ela também é a mais fácil das 2 para depurar. A definição de uma CTE pode ser
+executada sozinha selecionando a partir dela, o que informa se a primeira etapa
+está certa antes de você olhar a segunda. Extrair uma tabela derivada do meio
+de uma cláusula `FROM` para executá-la à mão é o mesmo trabalho feito
+manualmente todas as vezes.
+
+## CTEs recursivas em hierarquias reais {#recursive-ctes-on-real-hierarchies}
+
+O Sakila não tem hierarquia, então esta seção usa uma tabela própria. Crie-a ao
+lado dos dados de exemplo e execute `DROP TABLE employees;` quando terminar de
+usá-la:
+
+```sql
+CREATE TABLE employees (
+    id         INT PRIMARY KEY,
+    name       VARCHAR(50) NOT NULL,
+    manager_id INT NULL
+);
+
+INSERT INTO employees VALUES
+    (1,'Ada',NULL), (2,'Brem',1), (3,'Chi',1), (4,'Dov',2), (5,'Eze',4);
+```
+
+A semente seleciona as raízes, e o membro recursivo faz o join da tabela com as
+linhas já produzidas. A coluna `depth` é ao mesmo tempo a resposta e a guarda.
+
+```sql
+WITH RECURSIVE org_chart AS (
+    SELECT id, name, manager_id, 0 AS depth
+    FROM employees
+    WHERE manager_id IS NULL
+  UNION ALL
+    SELECT e.id, e.name, e.manager_id, oc.depth + 1
+    FROM employees AS e
+    INNER JOIN org_chart AS oc ON e.manager_id = oc.id
+    WHERE oc.depth < 100
+)
+SELECT depth, name FROM org_chart ORDER BY depth, name;
+```
+
+```text
++-------+------+
+| depth | name |
++-------+------+
+|     0 | Ada  |
+|     1 | Brem |
+|     1 | Chi  |
+|     2 | Dov  |
+|     3 | Eze  |
++-------+------+
+5 rows in set (0.00 sec)
+```
+
+**Ciclos são o modo de falha.** Se A se reporta a B e B se reporta a A, nada na
+consulta para, e ela executa até atingir o limite de profundidade:
+
+```text
+ERROR 3636 (HY000): Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.
+```
+
+`WHERE oc.depth < 100` na consulta acima é o que evita isso. Ele transforma um
+percurso sem limite em um percurso limitado, e funciona quer os dados estejam
+limpos ou não.
+
+A mensagem de erro sugere aumentar `cte_max_recursion_depth`, o que é correto
+apenas quando a recursão realmente termina e precisa de mais rodadas do que o
+padrão de 1.000. Uma série legítima de 1.500 passos atinge o mesmo erro, e
+`SET SESSION cte_max_recursion_depth = 5000` é a resposta correta nesse caso.
+Em dados cíclicos é a resposta errada: a consulta continua sem nunca terminar,
+e falha mais tarde em vez disso.
+
+## Disponibilidade e terminologia {#availability-and-terminology}
+
+As CTEs chegaram no MySQL 8.0 e estão presentes em todas as versões desde
+então, incluindo a 8.4 e a 9.x. Um servidor que responde `ERROR 1064` a uma
+cláusula `WITH` é anterior a elas; verifique com `SELECT VERSION()`.
+
+O padrão chama a primeira parte de uma CTE recursiva de **membro âncora** e a
+segunda de **membro recursivo**. O tutorial chama a primeira de semente, que é
+a mesma coisa, e as próprias mensagens do MySQL usam os termos do padrão.
+
+## CTEs funcionam em INSERT, UPDATE e DELETE {#ctes-work-in-insert-update-and-delete}
+
+```sql
+WITH stale_orders AS (
+    SELECT id FROM orders WHERE created_at < NOW() - INTERVAL 1 YEAR
+)
+DELETE FROM orders WHERE id IN (SELECT id FROM stale_orders);
+```
+
+A CTE é avaliada primeiro, então as linhas que ela nomeia são decididas antes
+que a instrução altere qualquer coisa.
+
+## Solução de Problemas {#troubleshooting}
+
+| Problema | Causa e correção |
+|:--------|:---------|
+| Uma CTE é mais lenta do que a subconsulta que ela substituiu | Ela foi materializada. Procure `Materialize CTE` no `EXPLAIN FORMAT=TREE`. |
+| A CTE lê muito mais linhas do que o resultado precisa | O filtro externo não foi empurrado para dentro. Mova-o para dentro da CTE. |
+| `ERROR 1146: Table '<database>.cte_name' doesn't exist` | A CTE faz referência a si mesma sem `RECURSIVE`. Escreva `WITH RECURSIVE`. |
+| `ERROR 3636` em dados que você espera que terminem | Ciclos nos dados. Adicione uma coluna de profundidade e uma guarda `WHERE depth < N`. |
+| `ERROR 3636` em uma série realmente profunda | Aumente `cte_max_recursion_depth` para a sessão. |
+| `ERROR 1064` em `WITH` | O servidor é anterior ao suporte a CTEs. Verifique com `SELECT VERSION()`. |
+
+## Veja também {#see-also}
+
+- [Subconsultas vs JOINs no MySQL](/pt-BR/guides/subqueries-vs-joins) — a outra forma com a qual esta compete
+- [Desempenho de GROUP BY no MySQL](/pt-BR/guides/group-by-having) — a tabela temporária que uma CTE pode ajudar você a evitar
+- [Views no MySQL](/pt-BR/guides/views) — persistir uma consulta nomeada como um objeto do esquema em vez disso
+- [Expressões de tabela comuns](/pt-BR/tutorial/cte) — o tutorial, se você quiser a sintaxe primeiro
