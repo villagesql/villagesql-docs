@@ -573,55 +573,88 @@ SELECT vsql_tvector.tvector_concat(v, '[6,7]') AS c FROM v3;
 ```
 
 <Info>
-**Changed in 0.0.8-dev.** A varargs function can use the same hook to name a bare literal's type. `ba_concat_typed`, a typed sibling of `ba_concat_all` (above), names every argument as `bytearray`, so a string literal is read as that type without a cast. An `INT` column, or a column of a different custom type, is checked against `bytearray` and aborts the statement. A named literal is encoded like any other `bytearray` literal, so `as_custom()` sees the space-padded 8-byte form.
+**Changed in 0.0.8-dev.** A varargs function can use the same hook. `tvector_concat` takes exactly two arguments, and its signature says that both are `TVECTOR`s. `tvector_concat_all` takes any number of arguments and has no signature, so a bare `'[6,7]'` among them is a string until its hook names it. The hook rejects a column of another custom type, names each constant as a `TVECTOR` with `set_arg(i, TVECTOR, params)`, and returns the sum of the dimensions.
 
 ```cpp
-#include <villagesql/vsql.h>
-#include <cstring>
+// Excerpt from villagesql/examples/vsql-tvector/src/tvector.cc, which also
+// defines kTVectorTypeName ("TVECTOR") and the helper arg_error().
+void tvector_concat_all_bind(vsql::BindArgs args, vsql::BindResult out) {
+  if (args.size() == 0) {
+    out.error("requires at least one argument");
+    return;
+  }
 
-constexpr size_t kBytearrayLen = 8;
-
-void ba_concat_typed_bind(vsql::BindArgs args, vsql::BindResult out) {
+  // Establish the types before anything reads parameters.
   for (size_t i = 0; i < args.size(); i++) {
-    out.set_arg_type(i, "bytearray");
+    const vsql::BindArgType arg = args.at(i);
+    if (arg.is_custom() && arg.custom_type() != kTVectorTypeName) {
+      out.error(arg_error(
+          i, "is a " + std::string(arg.custom_type()) + ", not a TVECTOR"));
+      return;
+    }
   }
-}
 
-void ba_concat_typed_prerun(vsql::PrerunArgs args, vsql::PrerunResult out) {
-  out.request_buffer_size(args.size() * kBytearrayLen);
-}
-
-void ba_concat_typed(vsql::VarArgs args, vsql::StringResult out) {
-  auto dst = out.buffer();
-  size_t off = 0;
-  for (auto a : args) {
-    if (a.is_null() || !a.is_custom()) { out.set_null(); return; }
-    auto bytes = a.as_custom();
-    if (off + bytes.size() > dst.size()) { out.error("ba_concat_typed: result too long"); return; }
-    memcpy(dst.data() + off, bytes.data(), bytes.size());
-    off += bytes.size();
+  std::string error_msg;
+  size_t bpe = 0;
+  if (common_element_width(args, bpe, error_msg)) {
+    out.error(error_msg);
+    return;
   }
-  out.set_length(off);
+
+  int64_t total = 0;
+  for (size_t i = 0; i < args.size(); i++) {
+    TVectorParams params{};
+    bool needs_publish = false;
+    if (bind_params_for_vector(args, i, bpe, params, needs_publish,
+                               error_msg)) {
+      out.error(error_msg);
+      return;
+    }
+    // Name the type and hand back the parameters together.
+    if (needs_publish) out.set_arg(i, TVECTOR, params);
+    total += params.dimension;
+  }
+
+  if (total > kTVectorMaxDimension) {
+    out.error("combined dimension " + std::to_string(total) +
+              " exceeds the maximum of " +
+              std::to_string(kTVectorMaxDimension));
+    return;
+  }
+  out.set_return(TVectorParams{.dimension = total, .bytes_per_elem = bpe});
 }
 
-// Registration:
-// make_func<&ba_concat_typed>("ba_concat_typed")
-//     .returns(vsql::STRING).varargs()
-//     .prerun<&ba_concat_typed_prerun>()
-//     .bind_and_check_types<&ba_concat_typed_bind>()
-//     .build()
+// Registration, inside make_extension():
+// .func(make_func<&tvector_concat_all>("tvector_concat_all")
+//     .returns(TVECTOR)
+//     .varargs()
+//     .bind_and_check_types<&tvector_concat_all_bind>()
+//     .deterministic()
+//     .build())
 ```
 
+With the `v2` and `v3` tables above, `tvector_concat` refuses a third argument, and `tvector_concat_all` takes two columns and a literal:
+
 ```sql
-SELECT ba_concat_typed('ab', 'cd') AS result;
+SELECT vsql_tvector.tvector_concat(v2.v, v3.v, '[6,7]') AS c FROM v2, v3;
 ```
 
 ```text
-+------------------+
-| result           |
-+------------------+
-| ab      cd       |
-+------------------+
+ERROR 3219 (HY000): Cannot initialize function 'tvector_concat': wrong number of arguments (expected 2, got 3)
+```
+
+```sql
+SELECT vsql_tvector.tvector_concat_all(v2.v, v3.v, '[6,7]') AS c,
+       vsql_tvector.tvector_dim(vsql_tvector.tvector_concat_all(v2.v, v3.v, '[6,7]')) AS dim
+FROM v2, v3;
+```
+
+```text
++-----------------+------+
+| c               | dim  |
++-----------------+------+
+| [1,2,3,4,5,6,7] |    7 |
++-----------------+------+
 ```
 </Info>
 
