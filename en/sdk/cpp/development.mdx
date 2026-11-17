@@ -437,6 +437,10 @@ first one that is both varargs and has a bind hook, with:
 ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned an error: VDF '<function>' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
 ```
 
+<Info>
+**Changed in 0.0.8-dev.** A varargs VDF can declare `.bind_and_check_types<&Hook>()` too. A variadic call has no signature, so the hook is the only thing that can say what a bare string literal among the arguments should be: `BindResult::set_arg_type(i, type_name)` names argument `i` as one of this extension's own custom types, and naming a type registered by a different extension aborts the statement. Naming a type only sets a type on an argument the server could not type on its own, which today means a string constant. For a column or a nested VDF's result, the name is only checked against the type the argument already carries, and a disagreement aborts the statement. `set_arg(i, type_name, p)` sets a constant argument's type and its parameters together; parameters given for an argument whose type the hook did not name abort the statement. A varargs function's hook runs before the type-checking pass described below, and supplies the type each argument is checked against.
+</Info>
+
 <Warning>
 `.bind_and_check_types<&Hook>()` and `<villagesql/vsql/bind_check_types.h>`
 are declared only in the opt-in dev ABI headers (`-DVSQL_USE_DEV_ABI=ON`) and
@@ -458,6 +462,10 @@ already resolved, such as a bare string literal, gets its parameters from
 the hook alone. A parameterized return type's parameters also come from the
 hook, in place of the built-in rule that copies them from an argument.
 
+<Info>
+**Changed in 0.0.8-dev.** A prepared-statement parameter has no value until `EXECUTE`, so a hook never sees one as a constant at the first `PREPARE`; the server postpones the hook call to `EXECUTE` instead, once the parameter is bound. `PREPARE s FROM 'SELECT vsql_tvector.tvector_dim(?)'` now succeeds, and only `EXECUTE` with a value that is not a vector literal fails, with `ERROR 3219 (HY000): Cannot initialize function 'tvector_dim': argument 1 is not a vector literal`. A hook reads a string constant through `const_value()` in the charset of the parameter that the constant is passed to. A varargs call has no parameters, so its hook reads every string constant as utf8mb4 text, and a constant that is not valid utf8mb4, such as `_binary 0xFF`, stops the statement with `ERROR 3854 (HY000): Cannot convert string '\xFF' from binary to utf8mb4`. A fixed-arity function's hook reads a constant that is passed to a custom-type parameter as the bytes that the caller wrote.
+</Info>
+
 The [`vsql_tvector`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/examples/vsql-tvector/src/tvector.cc)
 example extension in the server source tree registers such a hook on
 `tvector_concat`:
@@ -477,8 +485,12 @@ struct TVectorParams {
   size_t bytes_per_elem;  // 4 for float, 8 for double
 
   static TVectorParams parse(const std::map<std::string, std::string> &params) {
+    // Params that were never resolved may lack a dimension; 0 makes encode
+    // and decode fail cleanly.
     auto dim_it = params.find("dimension");
-    int64_t dim = strtoll(dim_it->second.c_str(), nullptr, 10);
+    int64_t dim = dim_it == params.end()
+                      ? 0
+                      : strtoll(dim_it->second.c_str(), nullptr, 10);
     size_t bytes = kDefaultBytesPerElem;
     auto type_it = params.find("type");
     if (type_it != params.end() && type_it->second == "double") bytes = 8;
@@ -589,6 +601,116 @@ SELECT vsql_tvector.tvector_concat(v, '[6,7]') AS c FROM v3;
 | [3,4,5,6,7] |
 +-------------+
 ```
+
+<Info>
+**Changed in 0.0.8-dev.** A varargs function can use the same hook. `tvector_concat` takes exactly two arguments, and its signature says that both are `TVECTOR`s. `tvector_concat_all` takes any number of arguments and has no signature, so a bare `'[6,7]'` among them is a string until its hook names it. The hook rejects a column of another custom type, names each constant as a `TVECTOR` with `set_arg(i, TVECTOR, params)`, and returns the sum of the dimensions.
+
+```cpp
+// Excerpt from villagesql/examples/vsql-tvector/src/tvector.cc, which also
+// defines kTVectorTypeName ("TVECTOR") and the helper arg_error().
+void tvector_concat_all_bind(vsql::BindArgs args, vsql::BindResult out) {
+  if (args.size() == 0) {
+    out.error("requires at least one argument");
+    return;
+  }
+
+  // Establish the types before anything reads parameters.
+  for (size_t i = 0; i < args.size(); i++) {
+    const vsql::BindArgType arg = args.at(i);
+    if (arg.is_custom() && arg.custom_type() != kTVectorTypeName) {
+      out.error(arg_error(
+          i, "is a " + std::string(arg.custom_type()) + ", not a TVECTOR"));
+      return;
+    }
+  }
+
+  std::string error_msg;
+  size_t bpe = 0;
+  if (common_element_width(args, bpe, error_msg)) {
+    out.error(error_msg);
+    return;
+  }
+
+  int64_t total = 0;
+  for (size_t i = 0; i < args.size(); i++) {
+    TVectorParams params{};
+    bool needs_publish = false;
+    if (bind_params_for_vector(args, i, bpe, params, needs_publish,
+                               error_msg)) {
+      out.error(error_msg);
+      return;
+    }
+    // Name the type and hand back the parameters together.
+    if (needs_publish) out.set_arg(i, TVECTOR, params);
+    total += params.dimension;
+  }
+
+  if (total > kTVectorMaxDimension) {
+    out.error("combined dimension " + std::to_string(total) +
+              " exceeds the maximum of " +
+              std::to_string(kTVectorMaxDimension));
+    return;
+  }
+  out.set_return(TVectorParams{.dimension = total, .bytes_per_elem = bpe});
+}
+
+// Registration, inside make_extension():
+// .func(make_func<&tvector_concat_all>("tvector_concat_all")
+//     .returns(TVECTOR)
+//     .varargs()
+//     .bind_and_check_types<&tvector_concat_all_bind>()
+//     .deterministic()
+//     .build())
+```
+
+`bind_params_for_vector()` does the per-argument check. An argument that the server already resolved as a `TVECTOR` carries its parameters. Any other argument must be a constant, and the hook counts the constant's elements to learn its dimension:
+
+```cpp
+// Excerpt from bind_params_for_vector() in the same file.
+const vsql::BindArgType arg = args.at(index);
+needs_publish = false;
+if (const TVectorParams *known = arg.params<TVectorParams>()) {
+  params = *known;
+  return false;
+}
+
+if (!arg.has_const_value()) {
+  error_msg =
+      arg_error(index, "must be a TVECTOR or a constant vector literal");
+  return true;
+}
+const int64_t n = count_vector_elements(arg.const_value(), bpe);
+// ... rejects a count that is negative (not a vector literal), zero, or
+// above kTVectorMaxDimension, each with its own message ...
+params = TVectorParams{.dimension = n, .bytes_per_elem = bpe};
+needs_publish = true;
+return false;
+```
+
+With the `v2` and `v3` tables above, `tvector_concat` refuses a third argument, and `tvector_concat_all` takes two columns and a literal:
+
+```sql
+SELECT vsql_tvector.tvector_concat(v2.v, v3.v, '[6,7]') AS c FROM v2, v3;
+```
+
+```text
+ERROR 3219 (HY000): Cannot initialize function 'tvector_concat': wrong number of arguments (expected 2, got 3)
+```
+
+```sql
+SELECT vsql_tvector.tvector_concat_all(v2.v, v3.v, '[6,7]') AS c,
+       vsql_tvector.tvector_dim(vsql_tvector.tvector_concat_all(v2.v, v3.v, '[6,7]')) AS dim
+FROM v2, v3;
+```
+
+```text
++-----------------+------+
+| c               | dim  |
++-----------------+------+
+| [1,2,3,4,5,6,7] |    7 |
++-----------------+------+
+```
+</Info>
 
 ## Extension Load and Unload Hooks
 
