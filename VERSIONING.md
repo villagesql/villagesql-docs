@@ -150,9 +150,8 @@ the current one.
   (`docsVersion` in `src/_data/site.js`). Deploy it after the new docs are
   live.
 - **`vsql-extension-template` and `vsql-extension-template-rust`:** update the
-  pinned `villagesql-version` in each repository's CI workflows: both
-  `.github/workflows/ci.yml` and `_github/workflows/ci.yml` in the C++
-  template, and `_github/workflows/ci.yml` in the Rust template. The scaffold
+  pinned `villagesql-version` in `.github/workflows/ci.yml` in the C++
+  template and in `_github/workflows/ci.yml` in the Rust template. The scaffold
   pins a release so that an extension author's build does not change under
   them, so only this step moves it.
 
