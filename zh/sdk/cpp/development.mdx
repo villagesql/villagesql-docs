@@ -7,7 +7,7 @@ description: "C++ 扩展的 VDF 编写深度参考——参数和结果类型、
 本指南是编写 C++ VDF 实现的深度参考。它是 [使用 C++ 创建扩展](/zh/extensions/build/create) 的补充，后者涵盖端到端的构建步骤；也是 [C++ 测试](/zh/sdk/cpp/testing) 的补充，后者涵盖测试与迭代循环。
 
 <Warning>
-VEF 协议 3 自 v0.0.4 版本起已稳定。协议 4 正在开发中，并且仅通过选择加入的开发 ABI 标头提供 (`-DVSQL_USE_DEV_ABI=ON`)。使用旧协议 2 构建的扩展会被服务器拒绝，必须重新构建。
+默认情况下，扩展针对稳定标头构建，并在更新的服务器版本上继续工作。使用开发标头 (`-DVSQL_USE_DEV_ABI=ON`) 构建的扩展可能在更新的服务器版本上停止工作，因为开发标头及定义它们的协议可能在不同版本之间发生变化。如果发生这种情况，请针对新版本重新构建该扩展。请参阅[旧版协议](/zh/extensions/build/older-protocols)。
 </Warning>
 
 ## 编写扩展函数
@@ -20,13 +20,17 @@ VEF 协议 3 自 v0.0.4 版本起已稳定。协议 4 正在开发中，并且�
 
 ## 异常安全 {#exception-safety}
 
-控制异常是扩展的责任。SDK 不会将您的实现包装在 `try`/`catch` 中，服务器也不会，因此从入口点逃逸的异常会跨越 C ABI 边界展开，在其之上没有任何处理程序，服务器进程会终止。普通的 SQL 输入就会触发这一点：`std::stoi()` 在遇到非数字字符串时会抛出异常，而 `nlohmann::json::dump()` 在遇到非有效 UTF-8 的文本时会抛出异常。
+SDK 会捕获从 VDF 主体、聚合的函数或自定义类型的操作（encode、decode、compare、hash、内建默认值以及参数函数）中逃逸的异常。客户端看到的结果取决于调用该函数的是什么：
 
-<Info>
-**0.0.8-dev 中的变更。** 在开发版 ABI（协议 4，`-DVSQL_USE_DEV_ABI=ON`）上，SDK 会捕获从 VDF 主体、聚合的函数或自定义类型的操作（encode、decode、compare、hash、内建默认值以及参数函数）中逃逸的异常。该语句会以 VDF 错误失败，而服务器不会终止。稳定版 ABI 不变。
-</Info>
+- 在 SQL 中调用 VDF 会失败，错误为 `VDF error in function '<name>': VDF threw an exception (<what>)`，其中 `<what>` 是该异常的 `what()` 文本。
+- 服务器存储值时 encode 中的异常会使语句失败，错误为 `VDF threw an exception (<what>)`。
+- 服务器读取已存储的值时 decode 中的异常会使语句失败，错误为 `Invalid value in column '<col>' of type '<type>' at row <N>: check server log for details`。只有服务器的错误日志包含异常文本。
+- 服务器比较、排序或分组已存储的值时 compare 或 hash 中的异常不会使语句失败。服务器会将该异常写入错误日志并继续运行。compare 发生异常之后，服务器会将这两个值视为相等，因此 `WHERE` 和 `ORDER BY` 可能返回错误的结果。
+- 聚合的 `clear` 中的异常不会使语句失败，也不会被记录。`clear` 未重置的任何状态都会延续下去，因此该分组的结果可能出错。
 
-请包装您注册的每一个入口点的主体：VDF、聚合函数、prerun 和 postrun 钩子，以及自定义类型的各项操作。
+SDK 不会捕获从您注册的 `bind`、prerun 或 postrun 钩子中逃逸的异常。这样的异常会跨越 C ABI 边界展开，在其之上没有任何处理程序，服务器进程会终止。普通的 SQL 输入就会触发这一点：`std::stoi()` 在遇到非数字字符串时会抛出异常，而 `nlohmann::json::dump()` 在遇到非有效 UTF-8 的文本时会抛出异常。
+
+请包装您注册的每一个入口点的主体：VDF、聚合函数、`bind`、prerun 和 postrun 钩子，以及自定义类型的各项操作。
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -54,11 +58,9 @@ VDF 参数和结果作为类型安全的参数和结果类型传递。框架会�
 
 **参数类型：** `IntArg`、`RealArg`、`StringArg`、`CustomArg`——每个都提供 `is_null()` 和 `value()`。对于参数化的自定义类型，`CustomArgWith<P>` 添加了一个 `params()` 访问器，该访问器返回缓存的解析参数结构（请参阅 [参数化类型](/zh/sdk/cpp/type-operations#parameterized-types)）。
 
-**结果类型：** `IntResult`、`RealResult`、`StringResult`、`CustomResult`——每个都提供 `set_null()`、`warning(msg)` 和 `error(msg)`。标量结果还提供 `set(value)`。缓冲区结果提供 `buffer()` 和 `set_length(len)`。`StringResult` 此外还提供 `set(std::string_view)`，它从视图中复制最多 `buffer().size()` 个字节，并在一次调用中设置长度。对于参数化的自定义类型，`CustomResultWith<P>` 添加了一个 `params()` 访问器。
+**结果类型：** `IntResult`、`RealResult`、`StringResult`、`CustomResult`——每个都提供 `set_null()`、`warning(msg)` 和 `error(msg)`。标量结果还提供 `set(value)`。缓冲区结果提供 `buffer()` 和 `set_length(len)`。`StringResult` 此外还提供 `set(std::string_view)`，它把视图中 `buffer()` 能容纳的部分复制进去，然后向 `set_length()` 报告视图的完整大小，以便服务器在放不下时扩大缓冲区并重试。`StringResult` 值被标记为 `utf8mb4_bin`。对于参数化的自定义类型，`CustomResultWith<P>` 添加了一个 `params()` 访问器。
 
-<Info>
-**0.0.8-dev 中的变更。** 用 `.returns(REAL)` 注册的函数在参数为 `INT` 或没有参数时，会保留结果的小数部分。在 0.0.7 中，这样的函数返回整数：返回 `a / 2.0` 的函数会返回 `2`（参数为 `3` 时），并且 `CREATE TABLE ... AS SELECT` 会将其列的类型设为 `double(22,0)`。
-</Info>
+用 `.returns(REAL)` 注册的函数在参数为 `INT` 或没有参数时，会保留结果的小数部分。
 
 **Span 类型：** 面向字节的参数和结果类型上的 `value()` 和 `buffer()` 返回一个 `vsql::Span<T>`——一个非所有权视图，用于连续的 `T` 序列，具有 `data()`、`size()`、`empty()`、`begin()`/`end()` 和 `operator[]`。在 C++20 中，它是 `std::span<T>` 的别名；在 C++17 中，此 SDK 提供了一个最小的兼容实现，因此相同的代码可以在任何标准中编译。它通过 `<villagesql/vsql.h>` 提供。
 
@@ -148,15 +150,13 @@ void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
 void count_result(const CountState &s, IntResult out) { out.set(s); }
 ```
 
-`StringResult` 聚合 VDF 返回文本：结果报告 `utf8mb4_bin` 字符集和排序规则，因此客户端将其显示为字符而不是十六进制——与标量 VDF STRING 路径相同。它还以相同的方式支持 `.max_result_length(n)`——这需要选择加入的开发 ABI 标头 (`-DVSQL_USE_DEV_ABI=ON`) 和协议 4——调整物化聚合结果（`GROUP BY`/`DISTINCT` 临时表、`CREATE TABLE ... SELECT` 或 UNION）的大小，使其不会在参数宽度处被截断。有关调整大小的规则和上限，请参阅 [自定义缓冲区大小](/zh/extensions/build/create#custom-buffer-sizes)。
+`StringResult` 聚合 VDF 返回文本：结果报告 `utf8mb4_bin` 字符集和排序规则，因此客户端将其显示为字符而不是十六进制——与标量 VDF STRING 路径相同。它还以相同的方式支持 `.max_result_length(n)`，调整物化聚合结果（`GROUP BY`/`DISTINCT` 临时表、`CREATE TABLE ... SELECT` 或 UNION）的大小，使其不会在参数宽度处被截断。有关调整大小的规则和上限，请参阅 [自定义缓冲区大小](/zh/extensions/build/create#custom-buffer-sizes)。
 
 ## 每个语句的状态（Prerun 和 Postrun） {#per-statement-state-prerun-and-postrun}
 
 某些 VDF 需要跨单个查询触及的每一行都存在的状态——调用计数器、缓存结果、打开的资源。在 **prerun** 钩子中分配它，在 VDF 主体中访问它，并在 **postrun** 钩子中释放它。这两个钩子都为每个语句运行一次；VDF 主体为每一行运行一次。
 
-<Info>
-**0.0.8-dev 中的变更。** 只要 prerun 成功，即使语句在第一行之前失败，postrun 也会运行。
-</Info>
+只要 prerun 成功，即使语句在第一行之前失败，postrun 也会运行。
 
 使用 `.prerun<&Hook>()` 和 `.postrun<&Hook>()` 注册它们。所需的签名是：
 
@@ -328,17 +328,11 @@ void ba_concat_all(VarArgs args, StringResult out) {
 void my_hook(vsql::BindArgs args, vsql::BindResult out);
 ```
 
-`.bind_and_check_types()` 和 `.varargs()` 在同一个函数上互斥——可变参数 VDF 没有固定的参数列表供该钩子推理。在生成器链中先声明 `.varargs()` 再声明 `.bind_and_check_types<&Hook>()` 是编译时 `static_assert` 失败。以相反的顺序声明它们可以编译，但服务器加载该扩展时会拒绝它：注册过程会遍历每个函数最终构建出的状态，并拒绝第一个既是可变参数又带有绑定钩子的函数，错误为：
-
-```text
-ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned an error: VDF '<function>' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
-```
-
-<Warning>
-`.bind_and_check_types<&Hook>()` 和 `<villagesql/vsql/bind_check_types.h>` 仅在选择加入的开发 ABI 标头中声明 (`-DVSQL_USE_DEV_ABI=ON`)，并且需要 VEF 协议 4。默认的稳定 ABI 构建两者都没有，因此注册钩子会导致编译失败。
-</Warning>
+可变参数 VDF 也可以声明 `.bind_and_check_types<&Hook>()`。可变参数调用没有签名，因此只有该钩子能说明参数中的裸字符串字面量应当是什么类型：`BindResult::set_arg_type(i, type_name)` 将参数 `i` 指定为本扩展自己的某个自定义类型，而指定由其他扩展注册的类型会中止语句。指定类型只会为服务器自身无法确定类型的参数设置类型，目前这意味着字符串常量。对于列或嵌套 VDF 的结果，该名称只会与参数已经携带的类型进行核对，不一致则中止语句。`set_arg(i, type_name, p)` 同时设置常量参数的类型及其参数；为钩子未指定类型的参数给出参数会中止语句。可变参数函数的钩子在下文描述的类型检查遍历之前运行，并提供每个参数所要核对的类型。
 
 服务器在它对函数参数进行的两次遍历之间调用该钩子：第一次遍历检查每个参数的基础类型，接着运行该钩子，第二次遍历则对钩子给出了答案的每个参数应用其答案。安装了钩子后，第一次遍历不会在同一自定义类型的参数之间收集共享参数，因此它们之间无需彼此一致。自身类型尚未解析的参数（例如裸字符串字面量）只能从钩子获得其参数。参数化返回类型的参数同样来自钩子，取代了从某个参数复制它们的内置规则。
+
+预处理语句参数在 `EXECUTE` 之前没有值，因此钩子在第一次 `PREPARE` 时绝不会把它视为常量；服务器会将钩子调用推迟到 `EXECUTE`，即参数绑定之后。`PREPARE s FROM 'SELECT vsql_tvector.tvector_dim(?)'` 会成功，只有以非向量字面量的值执行 `EXECUTE` 才会失败，错误为 `ERROR 3219 (HY000): Cannot initialize function 'tvector_dim': argument 1 is not a vector literal`。钩子通过 `const_value()` 读取字符串常量，所用字符集为该常量所传入的参数的字符集。可变参数调用没有参数，因此其钩子将每个字符串常量读取为 utf8mb4 文本，而不是有效 utf8mb4 的常量（例如 `_binary 0xFF`）会使语句停止，错误为 `ERROR 3854 (HY000): Cannot convert string '\xFF' from binary to utf8mb4`。固定参数数量的函数的钩子将传入自定义类型参数的常量读取为调用方所写的字节。
 
 服务器源代码树中的 [`vsql_tvector`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/examples/vsql-tvector/src/tvector.cc) 示例扩展在 `tvector_concat` 上注册了这样一个钩子：
 
@@ -357,8 +351,12 @@ struct TVectorParams {
   size_t bytes_per_elem;  // 4 for float, 8 for double
 
   static TVectorParams parse(const std::map<std::string, std::string> &params) {
+    // Params that were never resolved may lack a dimension; 0 makes encode
+    // and decode fail cleanly.
     auto dim_it = params.find("dimension");
-    int64_t dim = strtoll(dim_it->second.c_str(), nullptr, 10);
+    int64_t dim = dim_it == params.end()
+                      ? 0
+                      : strtoll(dim_it->second.c_str(), nullptr, 10);
     size_t bytes = kDefaultBytesPerElem;
     auto type_it = params.find("type");
     if (type_it != params.end() && type_it->second == "double") bytes = 8;
@@ -475,10 +473,6 @@ SELECT vsql_tvector.tvector_concat(v, '[6,7]') AS c FROM v3;
 ```text
 ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers an on_init hook without an on_deinit
 ```
-
-<Warning>
-`.on_init<&Fn>()` 和 `.on_deinit<&Fn>()` 仅在选择加入的开发 ABI 标头中声明 (`-DVSQL_USE_DEV_ABI=ON`)。默认的稳定 ABI 构建没有这两个方法，因此注册钩子会导致编译失败。
-</Warning>
 
 `on_init` 在每次加载时运行一次——在 `INSTALL EXTENSION` 时，以及在每次服务器启动时——时机是在服务器验证该扩展并填充其所需功能之后，因此已注册的系统变量此时已经持有其配置值。特别是在启动时，`on_init` 会推迟到持久化的系统变量值应用完毕之后，因此它绝不会看到编译时默认值取代了通过 `SET PERSIST` 设置的值。对于被服务器拒绝的扩展，它绝不会运行。`on_deinit` 在卸载时运行——`UNINSTALL EXTENSION` 或服务器关闭——时机是在服务器清空这些功能之前，因此它看到的实时状态与 `on_init` 看到的相同。
 

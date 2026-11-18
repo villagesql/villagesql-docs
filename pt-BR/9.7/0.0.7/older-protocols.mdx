@@ -1,0 +1,198 @@
+---
+noindex: true
+audience: extension-author
+title: "Protocolos Mais Antigos"
+description: "O que é um protocolo do VEF, como o servidor escolhe um ao carregar uma extensão e referência para os protocolos 1 e 3."
+---
+
+Quando o servidor chama uma função em uma extensão, ele passa os argumentos e lê o resultado de volta por meio de um conjunto fixo de estruturas C. Os tipos personalizados funcionam da mesma forma: a extensão descreve cada tipo em uma estrutura que o servidor lê quando você instala a extensão e cada vez que o servidor inicia. Um protocolo é uma versão numerada dessas estruturas e das regras para preenchê-las.
+
+Cada novo protocolo acrescenta campos às estruturas sem mover os campos que uma extensão mais antiga lê, e o servidor mantém o código que lê cada protocolo estável mais antigo. É por isso que o servidor ainda consegue carregar uma extensão que foi compilada para um protocolo mais antigo.
+
+Você não define o número do protocolo por conta própria. O SDK com o qual você compila a extensão é que o define: cada versão do SDK compila extensões para um protocolo estável, e seus cabeçalhos de desenvolvimento (`-DVSQL_USE_DEV_ABI=ON`) compilam para o protocolo de desenvolvimento. Para mover uma extensão para um protocolo mais novo, recompile-a com um SDK mais novo.
+
+## Como o servidor escolhe um protocolo {#how-the-server-picks-a-protocol}
+
+Quando você instala uma extensão, o servidor oferece seu protocolo mais novo e a extensão declara o protocolo para o qual foi compilada. O servidor e a extensão passam então a usar o menor dos dois números. Por exemplo, um servidor que oferece o Protocol 4 conversa com uma extensão compilada para o Protocol 3 usando o Protocol 3, e não dá a essa extensão nenhum recurso que o Protocol 4 acrescenta.
+
+Para ver o protocolo de cada extensão instalada, consulte `INFORMATION_SCHEMA.EXTENSION_REGISTRATION`:
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION;
+```
+
+A coluna `NEGOTIATED_PROTOCOL` contém o protocolo acordado entre o servidor e a extensão.
+
+## Protocolos estáveis e de desenvolvimento {#stable-and-development-protocols}
+
+Os protocolos de número ímpar são estáveis. Hoje o servidor aceita todos os protocolos estáveis, desde o Protocol 1, de modo que uma extensão que você compilou para um protocolo estável continua podendo ser instalada em servidores mais novos sem recompilação.
+
+Os protocolos de número par são versões de desenvolvimento. O servidor aceita apenas seu próprio protocolo de desenvolvimento, e as estruturas desse protocolo podem mudar entre dois builds do servidor. Uma extensão compilada com os cabeçalhos de desenvolvimento (`-DVSQL_USE_DEV_ABI=ON`) pode parar de funcionar depois que você atualiza o servidor. Se isso acontecer, recompile-a contra o novo servidor.
+
+Quando uma versão promove o protocolo de desenvolvimento ao próximo número estável, o servidor deixa de aceitar o número de desenvolvimento antigo. `INSTALL EXTENSION` então falha com `extension uses obsolete unstable protocol version`, seguido dos números antigo e atual. A mesma verificação é executada quando o servidor inicia, de modo que um servidor não inicia enquanto tiver uma extensão desse tipo instalada. Recompilar a extensão não resolve, porque o servidor continua carregando a cópia que guardou no diretório de dados quando você instalou a extensão. Antes de atualizar para uma versão que promove o protocolo de desenvolvimento, execute esta consulta no seu servidor atual:
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION
+WHERE NEGOTIATED_PROTOCOL % 2 = 0;
+```
+
+Se ela retornar alguma linha, faça um dump de todos os seus bancos de dados com `mysqldump --all-databases`, instale suas extensões em um novo diretório de dados da nova versão e depois carregue o dump. Antes de instalar uma extensão que você compilou com os cabeçalhos de desenvolvimento, recompile-a contra a nova versão.
+
+| Protocolo | Status | Compilado por |
+|----------|--------|----------|
+| 1 | Estável | SDK 0.0.1 a 0.0.3 |
+| 2 | Sem suporte | Cabeçalhos de desenvolvimento do 0.0.3 |
+| 3 | Estável | SDK 0.0.4 a 0.0.7 |
+| 4 | Desenvolvimento | Cabeçalhos de desenvolvimento do 0.0.4 a 0.0.7 |
+
+
+## Protocolo 3 {#protocol-3}
+
+Os SDKs 0.0.4 a 0.0.7 compilam extensões do Protocol 3.
+
+
+## Protocolo 1 {#protocol-1}
+
+O Protocol 1 é estável desde a versão 0.0.1. O servidor ainda o aceita, mas ele provavelmente será descontinuado em uma versão futura. Escreva novas extensões com a API tipada dos guias [Criando Extensões em C++](/pt-BR/9.7/0.0.7/create) e [Desenvolvimento em C++](/pt-BR/9.7/0.0.7/development). Esta seção é uma referência para extensões existentes escritas no estilo do Protocol 1. Um SDK mais novo ainda compila esse estilo, e compila a extensão para seu próprio protocolo estável.
+
+
+### API de Tipos Baseada em Pointers de Função
+
+Os tipos personalizados do Protocol 1 são registrados usando pointers de função explícitos em vez do template `vsql::make_type<>`. As assinaturas das funções diferem das equivalentes tipadas. Elas recebem pointers brutos e comprimentos, e não recebem objetos `Arg` e `Result`.
+
+#### Assinaturas de Funções
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+#### Registro
+
+Esta forma exige `#include <villagesql/extension.h>` (não `<villagesql/vsql.h>`) e `using namespace villagesql;`.
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+constexpr const char* MYTYPE = "mytype";
+
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()` (com um NTTP de string em tempo de compilação) é a forma preferida. `make_type(MYTYPE)` (sem parâmetro de template) é a forma do Protocol 1 — ela continua com suporte, mas provavelmente será descontinuada em uma versão futura.
+
+### Estilo de ABI Bruta (Funções)
+
+As implementações de VDF do Protocol 1 podem passar as structs C brutas diretamente em vez de usar wrappers tipados. Este estilo continua com suporte, mas provavelmente será descontinuado em uma versão futura — use a [API tipada de argumento/resultado](/pt-BR/9.7/0.0.7/development#argument-and-result-types) para todo código novo.
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  if (a->is_null || b->is_null) {
+    result->type = VEF_RESULT_NULL;
+    return;
+  }
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&add_impl>("add_impl")
+                  .returns(INT)
+                  .param(INT)
+                  .param(INT)
+                  .build()))
+```
+
+Esta assinatura bruta por argumento — `void(vef_context_t*, vef_invalue_t* arg0, ..., vef_vdf_result_t*)` — é detectada apenas pelo `make_func<>()` de `<villagesql/extension.h>`. O `make_func<>()` de `<villagesql/vsql.h>` rejeita em tempo de compilação qualquer assinatura bruta `vef_context_t*`/`vef_invalue_t*`/`vef_vdf_result_t*`.
+
+#### Constantes de Resultado
+
+A ABI bruta comunica o estado do resultado por meio de `vef_return_value_type_t` definido em `result->type`:
+
+| Constante | Valor | Significado |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | Sucesso — a saída está no campo de union apropriado |
+| `VEF_RESULT_NULL` | 1 | O resultado é SQL NULL |
+| `VEF_RESULT_WARNING` | 2 | Aviso em nível de linha — a execução continua, NULL é retornado para esta linha e um aviso SQL (3200) é adicionado |
+| `VEF_RESULT_ERROR` | 3 | Erro fatal — a execução da instrução é abortada; a mensagem está em `result->error_msg` |
+
+Com a API tipada, `out.set()`, `out.set_null()`, `out.warning()` e `out.error()` tratam disso automaticamente.
+
+#### Registro de Agregados no Protocol 1
+
+O construtor `make_func<>()` de `<villagesql/extension.h>` não possui os membros `.clear<>()` ou `.accumulate<>()`. Esses métodos existem apenas no construtor separado `make_aggregate_func<State, &result_fn>()` de `<villagesql/vsql.h>`, que usa assinaturas tipadas baseadas em `State&` em vez de pointers brutos `vef_context_t*`/`vef_vdf_args_t*`. Use a [abordagem tipada de agregados](/pt-BR/9.7/0.0.7/development#aggregate-vdfs) para todo código novo. Um registro bruto em `VEF_PROTOCOL_3` ou superior também pode definir manualmente os callbacks `clear` e `accumulate` em `vef_func_desc_t`.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <optional>
+using namespace vsql;
+
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_aggregate_func<SumState, &my_result>("my_agg")
+                  .returns(INT).param(INT)
+                  .clear<&my_clear>()        // void(SumState&)
+                  .accumulate<&my_acc>()     // void(SumState&, IntArg)
+                  .build()))
+```

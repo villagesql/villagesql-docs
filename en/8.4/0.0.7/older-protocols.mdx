@@ -1,0 +1,198 @@
+---
+noindex: true
+audience: extension-author
+title: "Older Protocols"
+description: "What a VEF protocol is, how the server picks one when it loads an extension, and reference for protocols 1 and 3."
+---
+
+When the server calls a function in an extension, it passes the arguments and reads back the result through a fixed set of C structures. Custom types work the same way: the extension describes each type in a structure that the server reads when you install the extension and each time the server starts. A protocol is a numbered version of those structures and of the rules for filling them in.
+
+Each new protocol adds to the structures without moving the fields that an older extension reads, and the server keeps the code that reads each older stable protocol. That is why the server can still load an extension that was built for an older protocol.
+
+You do not set the protocol number yourself. The SDK that you build the extension with sets it: each SDK release builds extensions for one stable protocol, and its development headers (`-DVSQL_USE_DEV_ABI=ON`) build for the development protocol. To move an extension to a newer protocol, rebuild it with a newer SDK.
+
+## How the server picks a protocol
+
+When you install an extension, the server offers its newest protocol and the extension declares the protocol that it was built for. The server and the extension then use the lower of the two numbers. For example, a server that offers protocol 4 talks to an extension built for protocol 3 at protocol 3, and it does not give that extension any feature that protocol 4 adds.
+
+To see the protocol for each installed extension, query `INFORMATION_SCHEMA.EXTENSION_REGISTRATION`:
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION;
+```
+
+The `NEGOTIATED_PROTOCOL` column holds the protocol that the server and the extension agreed on.
+
+## Stable and development protocols
+
+Odd-numbered protocols are stable. Today the server accepts every stable protocol, back to protocol 1, so an extension that you built for a stable protocol keeps installing on newer servers without a rebuild.
+
+Even-numbered protocols are development versions. The server accepts only its own development protocol, and the structures of that protocol can change between two server builds. An extension built with the development headers (`-DVSQL_USE_DEV_ABI=ON`) can stop working after you update the server. If it does, rebuild it against the new server.
+
+When a release promotes the development protocol to the next stable number, the server stops accepting the old development number. `INSTALL EXTENSION` then fails with `extension uses obsolete unstable protocol version`, followed by the old and current numbers. The same check runs when the server starts, so a server does not start while it has such an extension installed. A rebuilt copy of the extension does not help, because the server keeps loading the copy that it stored in the data directory when you installed the extension. Before you upgrade to a release that promotes the development protocol, run this query on your current server:
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION
+WHERE NEGOTIATED_PROTOCOL % 2 = 0;
+```
+
+If it returns a row, dump all your databases with `mysqldump --all-databases`, install your extensions on a new data directory of the new release, and then load the dump. Rebuild an extension that you built with the development headers against the new release before you install it.
+
+| Protocol | Status | Built by |
+|----------|--------|----------|
+| 1 | Stable | SDK 0.0.1 through 0.0.3 |
+| 2 | Unsupported | Development headers of 0.0.3 |
+| 3 | Stable | SDK 0.0.4 through 0.0.7 |
+| 4 | Development | Development headers of 0.0.4 through 0.0.7 |
+
+
+## Protocol 3
+
+SDK 0.0.4 through 0.0.7 build protocol 3 extensions.
+
+
+## Protocol 1
+
+Protocol 1 has been stable since 0.0.1. The server still accepts it, but it is likely to be deprecated in a future release. Write new extensions with the typed API in the [Creating Extensions in C++](/en/8.4/0.0.7/create) and [C++ Development](/en/8.4/0.0.7/development) guides. This section is a reference for existing extensions written in the protocol 1 style. A newer SDK still compiles that style, and it builds the extension for its own stable protocol.
+
+
+### Function-Pointer Type API
+
+Protocol 1 custom types are registered using explicit function pointers instead of the `vsql::make_type<>` template. The function signatures differ from the typed equivalents. They take raw pointers and lengths, and do not take `Arg` and `Result` objects.
+
+#### Function Signatures
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+#### Registration
+
+This form requires `#include <villagesql/extension.h>` (not `<villagesql/vsql.h>`) and `using namespace villagesql;`.
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+constexpr const char* MYTYPE = "mytype";
+
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()` (with a compile-time string NTTP) is the preferred form. `make_type(MYTYPE)` (no template parameter) is the Protocol 1 form — it remains supported but is likely to be deprecated in a future release.
+
+### Raw ABI Style (Functions)
+
+Protocol 1 VDF implementations can pass the raw C structs directly instead of using typed wrappers. This style remains supported but is likely to be deprecated in a future release — use the [typed argument/result API](/en/8.4/0.0.7/development#argument-and-result-types) for all new code.
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  if (a->is_null || b->is_null) {
+    result->type = VEF_RESULT_NULL;
+    return;
+  }
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&add_impl>("add_impl")
+                  .returns(INT)
+                  .param(INT)
+                  .param(INT)
+                  .build()))
+```
+
+This per-argument raw signature — `void(vef_context_t*, vef_invalue_t* arg0, ..., vef_vdf_result_t*)` — is only detected by `make_func<>()` from `<villagesql/extension.h>`. The `make_func<>()` from `<villagesql/vsql.h>` rejects any raw `vef_context_t*`/`vef_invalue_t*`/`vef_vdf_result_t*` signature at compile time.
+
+#### Result Constants
+
+The raw ABI communicates result state via `vef_return_value_type_t` set on `result->type`:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | Success — the output is in the appropriate union field |
+| `VEF_RESULT_NULL` | 1 | The result is SQL NULL |
+| `VEF_RESULT_WARNING` | 2 | Row-level warning — execution continues, NULL is returned for this row, and a SQL warning (3200) is added |
+| `VEF_RESULT_ERROR` | 3 | Fatal error — statement execution is aborted; message is in `result->error_msg` |
+
+With the typed API, `out.set()`, `out.set_null()`, `out.warning()`, and `out.error()` handle this automatically.
+
+#### Aggregate Registration in Protocol 1
+
+The `make_func<>()` builder from `<villagesql/extension.h>` has no `.clear<>()` or `.accumulate<>()` member. Those methods exist only on the separate `make_aggregate_func<State, &result_fn>()` builder from `<villagesql/vsql.h>`, which uses `State&`-based typed signatures rather than raw `vef_context_t*`/`vef_vdf_args_t*` pointers. Use the [typed aggregate approach](/en/8.4/0.0.7/development#aggregate-vdfs) for all new code. A raw registration at `VEF_PROTOCOL_3` or higher can also set the `clear` and `accumulate` callbacks in `vef_func_desc_t` by hand.
+
+```cpp
+#include <villagesql/vsql.h>
+#include <optional>
+using namespace vsql;
+
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_aggregate_func<SumState, &my_result>("my_agg")
+                  .returns(INT).param(INT)
+                  .clear<&my_clear>()        // void(SumState&)
+                  .accumulate<&my_acc>()     // void(SumState&, IntArg)
+                  .build()))
+```

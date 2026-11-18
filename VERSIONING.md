@@ -144,17 +144,13 @@ introduction in `snippets/extensions-en.mdx`. Leave a sentence such as
 "requires VillageSQL 0.0.4 or later" alone: it states a minimum version, not
 the current one.
 
-### 4. Other repositories
+### 4. Extension templates
 
-- **`villagesql-website`:** update the version shown on the site
-  (`docsVersion` in `src/_data/site.js`). Deploy it after the new docs are
-  live.
-- **`vsql-extension-template` and `vsql-extension-template-rust`:** update the
-  pinned `villagesql-version` in each repository's CI workflows: both
-  `.github/workflows/ci.yml` and `_github/workflows/ci.yml` in the C++
-  template, and `_github/workflows/ci.yml` in the Rust template. The scaffold
-  pins a release so that an extension author's build does not change under
-  them, so only this step moves it.
+In `vsql-extension-template` and `vsql-extension-template-rust`, update the
+pinned `villagesql-version` in `.github/workflows/ci.yml` in the C++ template
+and in `_github/workflows/ci.yml` in the Rust template. The scaffold pins a
+release so that an extension author's build does not change under them, so only
+this step moves it.
 
 ## Server builds and their names
 

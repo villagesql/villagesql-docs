@@ -7,7 +7,7 @@ description: "C++ 拡張機能向けの VDF 作成の詳細 — 引数と結果�
 このガイドは、C++ VDF 実装を作成するための詳細なリファレンスです。エンドツーエンドのビルド手順をカバーする [Creating Extensions in C++](/ja/extensions/build/create) と、テストと反復のループをカバーする [C++ Testing](/ja/sdk/cpp/testing) の補完資料です。
 
 <Warning>
-VEF Protocol 3 は v0.0.4 で安定版となりました。Protocol 4 は開発中で、オプトイン形式の dev ABI ヘッダー（`-DVSQL_USE_DEV_ABI=ON`）経由でのみ利用可能です。古い Protocol 2 に対してビルドされた拡張機能はサーバーによって拒否され、再ビルドが必要です。
+デフォルトでは、拡張機能は安定版ヘッダーに対してビルドされ、新しいサーバーリリースでも動作し続けます。開発ヘッダー（`-DVSQL_USE_DEV_ABI=ON`）でビルドした拡張機能は、新しいサーバーリリースで動作しなくなることがあります。開発ヘッダーと、それを定義するプロトコルは、リリース間で変更される可能性があるためです。その場合は、新しいリリースに対して拡張機能を再ビルドしてください。[古いプロトコル](/ja/extensions/build/older-protocols) を参照してください。
 </Warning>
 
 ## 拡張機能関数の作成
@@ -20,13 +20,17 @@ VEF Protocol 3 は v0.0.4 で安定版となりました。Protocol 4 は開発�
 
 ## 例外安全性 {#exception-safety}
 
-例外の封じ込めは拡張機能の責任です。SDK は実装を `try`/`catch` でラップせず、サーバーもラップしません。そのため、エントリポイントから抜け出した例外は、上位のどこにもハンドラーがないまま C ABI 境界を越えてスタックを巻き戻し、サーバープロセスが終了します。通常の SQL 入力でもこれに到達します: `std::stoi()` は数値以外の文字列でスローし、`nlohmann::json::dump()` は有効な UTF-8 ではないテキストでスローします。
+SDK は、VDF 本体、集計の関数、またはカスタム型の操作（encode、decode、compare、hash、組み込みデフォルト、およびパラメータ関数）から抜け出した例外を捕捉します。クライアントに見える結果は、その関数を呼び出したものによって異なります：
 
-<Info>
-**0.0.8-dev での変更点。** dev ABI（Protocol 4、`-DVSQL_USE_DEV_ABI=ON`）では、SDK は VDF 本体、集計の関数、またはカスタム型の操作（encode、decode、compare、hash、組み込みデフォルト、およびパラメータ関数）から抜け出した例外を捕捉します。サーバーが終了する代わりに、ステートメントは VDF エラーで失敗します。安定版 ABI は変更されません。
-</Info>
+- SQL からの VDF 呼び出しは `VDF error in function '<name>': VDF threw an exception (<what>)` で失敗します。`<what>` は例外の `what()` テキストです。
+- サーバーが値を格納するときの encode での例外は、ステートメントを `VDF threw an exception (<what>)` で失敗させます。
+- サーバーが保存された値を読み取るときの decode での例外は、ステートメントを `Invalid value in column '<col>' of type '<type>' at row <N>: check server log for details` で失敗させます。例外のテキストはサーバーのエラーログにのみ記録されます。
+- サーバーが保存された値を比較、ソート、またはグループ化するときの compare または hash での例外は、ステートメントを失敗させません。サーバーは例外をエラーログに書き込み、処理を続行します。compare での例外の後、サーバーは 2 つの値を等しいものとして扱うため、`WHERE` と `ORDER BY` は誤った結果を返す可能性があります。
+- 集計の `clear` での例外は、ステートメントを失敗させず、ログにも記録されません。`clear` がリセットしなかった状態はそのまま引き継がれるため、そのグループの結果は誤ったものになる可能性があります。
 
-登録するすべてのエントリポイントの本体をラップしてください: VDF、集計関数、prerun および postrun フック、およびカスタム型の演算です。
+SDK は、登録した `bind`、prerun、または postrun フックから抜け出した例外は捕捉しません。そのような例外は、上位のどこにもハンドラーがないまま C ABI 境界を越えてスタックを巻き戻し、サーバープロセスが終了します。通常の SQL 入力でもこれに到達します: `std::stoi()` は数値以外の文字列でスローし、`nlohmann::json::dump()` は有効な UTF-8 ではないテキストでスローします。
+
+登録するすべてのエントリポイントの本体をラップしてください: VDF、集計関数、`bind`、prerun および postrun フック、およびカスタム型の演算です。
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -54,11 +58,9 @@ VDF のパラメータと結果は、型安全な引数型と結果型として�
 
 **引数型:** `IntArg`, `RealArg`, `StringArg`, `CustomArg` — 各型は `is_null()` と `value()` を提供します。パラメータ化されたカスタム型の場合、`CustomArgWith<P>` はキャッシュされた解析済みの params 構造体を返す `params()` アクセサを追加します（[Parameterized Types](/ja/sdk/cpp/type-operations#parameterized-types) を参照）。
 
-**結果型:** `IntResult`, `RealResult`, `StringResult`, `CustomResult` — 各型は `set_null()`, `warning(msg)`, `error(msg)` を提供します。スカラー結果には `set(value)` も提供されます。バッファ結果には `buffer()` と `set_length(len)` が提供されます。`StringResult` にはさらに `set(std::string_view)` が提供され、ビューから最大 `buffer().size()` バイトをコピーして長さを一度に設定します。パラメータ化されたカスタム型の場合、`CustomResultWith<P>` は `params()` アクセサを追加します。
+**結果型:** `IntResult`, `RealResult`, `StringResult`, `CustomResult` — 各型は `set_null()`, `warning(msg)`, `error(msg)` を提供します。スカラー結果には `set(value)` も提供されます。バッファ結果には `buffer()` と `set_length(len)` が提供されます。`StringResult` にはさらに `set(std::string_view)` が提供され、ビューのうち `buffer()` に収まる分だけをコピーし、その後ビューの完全なサイズを `set_length()` に報告します。これにより、収まらなかった場合にサーバーはバッファを拡張して再試行できます。`StringResult` の値には `utf8mb4_bin` のラベルが付きます。パラメータ化されたカスタム型の場合、`CustomResultWith<P>` は `params()` アクセサを追加します。
 
-<Info>
-**0.0.8-dev での変更点。** `.returns(REAL)` で登録された関数は、引数が `INT` の場合や引数を取らない場合でも、結果の小数部分を保持します。0.0.7 では、そのような関数は整数を返します。`a / 2.0` を返す関数は `2` を返し（引数が `3` のとき）、`CREATE TABLE ... AS SELECT` はそのカラムに `double(22,0)` 型を与えます。
-</Info>
+`.returns(REAL)` で登録された関数は、引数が `INT` の場合や引数を取らない場合でも、結果の小数部分を保持します。
 
 **Span 型:** バイト指向の引数型と結果型における `value()` と `buffer()` は `vsql::Span<T>` を返します — `data()`, `size()`, `empty()`, `begin()`/`end()`, `operator[]` を持つ、連続した `T` の範囲に対する非所有ビューです。C++20 では `std::span<T>` のエイリアスであり、C++17 では SDK が最小限の互換実装を提供するため、どちらの標準でも同じコードがコンパイルされます。`<villagesql/vsql.h>` を介して利用可能です。
 
@@ -148,15 +150,13 @@ void count_acc(CountState &s, IntArg v) { if (!v.is_null()) s++; }
 void count_result(const CountState &s, IntResult out) { out.set(s); }
 ```
 
-`StringResult` の集計 VDF はテキストを返します。結果は `utf8mb4_bin` の文字セットと照合順序を報告するため、クライアントは 16 進数ではなく文字として表示します — スカラー VDF の STRING パスと同じです。また、`.max_result_length(n)`（オプトイン形式の dev ABI ヘッダー（`-DVSQL_USE_DEV_ABI=ON`）と Protocol 4 が必要）も同様に適用し、マテリアライズされた集計結果（`GROUP BY`/`DISTINCT` の一時テーブル、`CREATE TABLE ... SELECT`、または UNION）のサイズを設定して引数幅で切り捨てられないようにします。サイズ設定のルールと上限については [Custom Buffer Sizes](/ja/extensions/build/create#custom-buffer-sizes) を参照してください。
+`StringResult` の集計 VDF はテキストを返します。結果は `utf8mb4_bin` の文字セットと照合順序を報告するため、クライアントは 16 進数ではなく文字として表示します — スカラー VDF の STRING パスと同じです。また、`.max_result_length(n)` も同様に適用し、マテリアライズされた集計結果（`GROUP BY`/`DISTINCT` の一時テーブル、`CREATE TABLE ... SELECT`、または UNION）のサイズを設定して引数幅で切り捨てられないようにします。サイズ設定のルールと上限については [Custom Buffer Sizes](/ja/extensions/build/create#custom-buffer-sizes) を参照してください。
 
 ## ステートメントごとの状態（Prerun と Postrun） {#per-statement-state-prerun-and-postrun}
 
 一部の VDF では、単一のクエリがアクセスするすべての行にわたる状態が必要です — 呼び出しカウンター、キャッシュされた結果、オープンリソースなど。**prerun** フックで割り当て、VDF 本体からアクセスし、**postrun** フックで解放します。両方のフックはステートメントごとに 1 回実行され、VDF 本体は行ごとに 1 回実行されます。
 
-<Info>
-**0.0.8-dev での変更点。** prerun が成功していれば、ステートメントが最初の行より前に失敗した場合にも postrun が実行されます。
-</Info>
+prerun が成功していれば、ステートメントが最初の行より前に失敗した場合にも postrun が実行されます。
 
 `.prerun<&Hook>()` と `.postrun<&Hook>()` で登録します。必要なシグネチャは次の通りです：
 
@@ -328,17 +328,11 @@ void ba_concat_all(VarArgs args, StringResult out) {
 void my_hook(vsql::BindArgs args, vsql::BindResult out);
 ```
 
-`.bind_and_check_types()` と `.varargs()` は同じ関数上で排他です — 可変長引数 VDF には、フックが判断の対象とする固定の引数リストがありません。ビルダーチェーンで `.bind_and_check_types<&Hook>()` より前に `.varargs()` を宣言すると、コンパイル時の `static_assert` の失敗になります。逆の順序で宣言するとコンパイルは通りますが、サーバーがロードするときに拡張機能は拒否されます: 登録はすべての関数の最終的なビルド済み状態を走査し、可変長引数であり、かつバインドフックを持つ最初の関数を、次のエラーで拒否します：
-
-```text
-ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned an error: VDF '<function>' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
-```
-
-<Warning>
-`.bind_and_check_types<&Hook>()` と `<villagesql/vsql/bind_check_types.h>` は、オプトイン形式の dev ABI ヘッダー（`-DVSQL_USE_DEV_ABI=ON`）でのみ宣言されており、VEF Protocol 4 が必要です。デフォルトの安定版 ABI ビルドにはどちらもないため、フックを登録するとコンパイルに失敗します。
-</Warning>
+可変長引数 VDF も `.bind_and_check_types<&Hook>()` を宣言できます。可変長引数の呼び出しにはシグネチャがないため、引数の中にある素の文字列リテラルが何であるべきかを示せるのはフックだけです: `BindResult::set_arg_type(i, type_name)` は、引数 `i` をこの拡張機能自身のカスタム型の 1 つとして指定します。別の拡張機能が登録した型を指定すると、ステートメントは中止されます。型の指定は、サーバーが自力で型付けできなかった引数にのみ型を設定します。現時点では、これは文字列定数を意味します。カラムやネストされた VDF の結果に対しては、指定した名前はその引数がすでに持つ型と照合されるだけで、不一致があればステートメントは中止されます。`set_arg(i, type_name, p)` は、定数引数の型とそのパラメータを一緒に設定します。フックが型を指定していない引数にパラメータを与えると、ステートメントは中止されます。可変長引数関数のフックは、後述の型検査パスより前に実行され、各引数の検査対象となる型を供給します。
 
 サーバーは、関数の引数に対して行う 2 つのパスの間にこのフックを呼び出します: 最初のパスは各引数の基本型を検査し、次にフックが実行され、2 番目のパスはフックが答えを返した各引数にその答えを適用します。フックがインストールされている場合、最初のパスは同じカスタム型の引数間で共有パラメータを収集しないため、引数同士が一致している必要はありません。素の文字列リテラルのように、自身の型がまだ解決されていない引数は、フックからのみパラメータを得ます。パラメータ化された戻り型のパラメータも、引数からコピーする組み込みルールの代わりに、フックから得られます。
+
+プリペアドステートメントのパラメータは `EXECUTE` まで値を持たないため、最初の `PREPARE` でフックがそれを定数として見ることはありません。代わりにサーバーは、パラメータがバインドされた後の `EXECUTE` までフックの呼び出しを延期します。`PREPARE s FROM 'SELECT vsql_tvector.tvector_dim(?)'` は成功し、ベクトルリテラルではない値での `EXECUTE` だけが `ERROR 3219 (HY000): Cannot initialize function 'tvector_dim': argument 1 is not a vector literal` で失敗します。フックは、定数が渡されるパラメータの文字セットで、`const_value()` を通じて文字列定数を読み取ります。可変長引数の呼び出しにはパラメータがないため、そのフックはすべての文字列定数を utf8mb4 テキストとして読み取り、`_binary 0xFF` のような有効な utf8mb4 ではない定数は、ステートメントを `ERROR 3854 (HY000): Cannot convert string '\xFF' from binary to utf8mb4` で停止させます。固定引数数の関数のフックは、カスタム型パラメータに渡された定数を、呼び出し側が書いたバイト列のまま読み取ります。
 
 サーバーのソースツリーにあるサンプル拡張機能 [`vsql_tvector`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/examples/vsql-tvector/src/tvector.cc) は、`tvector_concat` にこのようなフックを登録しています：
 
@@ -357,8 +351,12 @@ struct TVectorParams {
   size_t bytes_per_elem;  // 4 for float, 8 for double
 
   static TVectorParams parse(const std::map<std::string, std::string> &params) {
+    // Params that were never resolved may lack a dimension; 0 makes encode
+    // and decode fail cleanly.
     auto dim_it = params.find("dimension");
-    int64_t dim = strtoll(dim_it->second.c_str(), nullptr, 10);
+    int64_t dim = dim_it == params.end()
+                      ? 0
+                      : strtoll(dim_it->second.c_str(), nullptr, 10);
     size_t bytes = kDefaultBytesPerElem;
     auto type_it = params.find("type");
     if (type_it != params.end() && type_it->second == "double") bytes = 8;
@@ -475,10 +473,6 @@ SELECT vsql_tvector.tvector_concat(v, '[6,7]') AS c FROM v3;
 ```text
 ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers an on_init hook without an on_deinit
 ```
-
-<Warning>
-`.on_init<&Fn>()` と `.on_deinit<&Fn>()` は、オプトイン形式の dev ABI ヘッダー（`-DVSQL_USE_DEV_ABI=ON`）でのみ宣言されています。デフォルトの安定版 ABI ビルドにはどちらのメソッドもないため、フックを登録するとコンパイルに失敗します。
-</Warning>
 
 `on_init` はロードごとに 1 回実行されます — `INSTALL EXTENSION` 時と、サーバー起動のたびに — サーバーが拡張機能を検証し、必要な機能を設定した後に実行されるため、登録済みのシステム変数はすでに設定された値を保持しています。特に起動時には、`on_init` は永続化されたシステム変数の値が適用されるまで遅延されるため、`SET PERSIST` で設定された値の代わりにコンパイル時のデフォルトを見ることは決してありません。サーバーが拒否した拡張機能に対しては決して実行されません。`on_deinit` はアンロード時 — `UNINSTALL EXTENSION` またはサーバーシャットダウン時 — に、サーバーが同じ機能の設定を解除する前に実行されるため、`on_init` と同じライブ状態を見ます。
 
