@@ -1,0 +1,198 @@
+---
+noindex: true
+audience: extension-author
+title: "旧版协议"
+description: "什么是 VEF 协议、服务器在加载扩展时如何选择协议，以及协议 1 和协议 3 的参考。"
+---
+
+当服务器调用扩展中的函数时，它通过一组固定的 C 结构体传入参数并读回结果。自定义类型的工作方式相同：扩展在一个结构体中描述每个类型，服务器在你安装该扩展时以及每次服务器启动时读取该结构体。协议是这些结构体及其填写规则的一个带编号的版本。
+
+每个新协议都会向这些结构体添加内容，但不会移动旧扩展所读取的字段，并且服务器会保留读取每个旧版稳定协议的代码。这就是服务器仍能加载为旧版协议构建的扩展的原因。
+
+你不需要自己设置协议编号。构建扩展所用的 SDK 会设置它：每个 SDK 版本为一个稳定协议构建扩展，其开发版 ABI 头文件（`-DVSQL_USE_DEV_ABI=ON`）则为开发协议构建扩展。要将扩展迁移到更新的协议，请使用更新的 SDK 重新构建它。
+
+## 服务器如何选择协议 {#how-the-server-picks-a-protocol}
+
+当你安装扩展时，服务器提供其最新的协议，扩展则声明其构建时所针对的协议。然后服务器和扩展使用两个编号中较低的那个。例如，提供协议 4 的服务器会以协议 3 与为协议 3 构建的扩展通信，并且不会向该扩展提供协议 4 新增的任何功能。
+
+要查看每个已安装扩展所用的协议，请查询 `INFORMATION_SCHEMA.EXTENSION_REGISTRATION`：
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION;
+```
+
+`NEGOTIATED_PROTOCOL` 列保存服务器和扩展商定的协议。
+
+## 稳定协议和开发协议 {#stable-and-development-protocols}
+
+奇数编号的协议是稳定协议。目前服务器接受每一个稳定协议，一直追溯到协议 1，因此你为稳定协议构建的扩展无需重新构建即可继续安装到更新的服务器上。
+
+偶数编号的协议是开发版本。服务器只接受它自己的开发协议，并且该协议的结构体可能在两个服务器构建版本之间发生变化。使用开发版 ABI 头文件（`-DVSQL_USE_DEV_ABI=ON`）构建的扩展可能在你更新服务器后停止工作。如果发生这种情况，请针对新服务器重新构建它。
+
+当某个版本将开发协议提升为下一个稳定编号时，服务器会停止接受旧的开发编号。此时 `INSTALL EXTENSION` 会失败，并报错 `extension uses obsolete unstable protocol version`，后面跟着旧编号和当前编号。服务器启动时也会执行同样的检查，因此在安装有此类扩展的情况下服务器不会启动。重新构建扩展并不能解决这个问题，因为服务器会继续加载安装扩展时保存在数据目录中的副本。在升级到会提升开发协议的版本之前，请在当前服务器上运行以下查询：
+
+```sql
+SELECT EXTENSION_NAME, NEGOTIATED_PROTOCOL
+FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION
+WHERE NEGOTIATED_PROTOCOL % 2 = 0;
+```
+
+如果查询返回了行，请使用 `mysqldump --all-databases` 导出所有数据库，在新版本的新数据目录中安装扩展，然后导入导出的数据。对于使用开发版 ABI 头文件构建的扩展，请在安装之前针对新版本重新构建。
+
+| 协议 | 状态 | 构建工具 |
+|----------|--------|----------|
+| 1 | 稳定 | SDK 0.0.1 至 0.0.3 |
+| 2 | 不再支持 | 0.0.3 的开发版 ABI 头文件 |
+| 3 | 稳定 | SDK 0.0.4 至 0.0.7 |
+| 4 | 开发版 | 0.0.4 至 0.0.7 的开发版 ABI 头文件 |
+
+
+## 协议 3 {#protocol-3}
+
+SDK 0.0.4 至 0.0.7 构建协议 3 扩展。
+
+
+## 协议 1 {#protocol-1}
+
+协议 1 自 0.0.1 起一直保持稳定。服务器仍然接受它，但它很可能会在未来版本中被弃用。请使用 [使用 C++ 创建扩展](/zh/9.7/0.0.7/create) 和 [C++ 开发](/zh/9.7/0.0.7/development) 指南中的类型化 API 编写新扩展。本节是以协议 1 样式编写的现有扩展的参考。更新的 SDK 仍能编译这种样式，并为其自身的稳定协议构建该扩展。
+
+
+### 函数指针类型 API
+
+协议 1 中的自定义类型使用显式函数指针进行注册，而不是使用 `vsql::make_type<>` 模板。函数签名与类型化的等效签名不同。它们接受原始指针和长度，而不接受 `Arg` 和 `Result` 对象。
+
+#### 函数签名
+
+```cpp
+// Encode: Convert string representation to binary.
+// Returns false on success, true on error.
+bool encode_mytype(unsigned char* buffer, size_t buffer_size,
+                   const char* from, size_t from_len, size_t* length) {
+    // Parse 'from' string and write binary to 'buffer'.
+    // Set *length to bytes written.
+    // Return false on success, true on error (e.g., set *length = 0).
+}
+
+// Decode: Convert binary to string representation.
+// Returns false on success, true on error.
+bool decode_mytype(const unsigned char* buffer, size_t buffer_size,
+                   char* to, size_t to_size, size_t* to_length) {
+    // Read binary from 'buffer' and write string to 'to'.
+    // Set *to_length to string length.
+    // Return false on success, true on error.
+}
+
+// Compare: enables ORDER BY and indexing (required).
+int compare_mytype(const unsigned char* data1, size_t len1,
+                   const unsigned char* data2, size_t len2) {
+    // Return: negative if data1<data2, 0 if equal, positive if data1>data2.
+}
+
+// Hash: custom hash (optional, uses default binary hash if omitted).
+size_t hash_mytype(const unsigned char* data, size_t len) {
+    // Return hash value for the binary data.
+}
+```
+
+#### 注册
+
+这种形式需要 `#include <villagesql/extension.h>`（而不是 `<villagesql/vsql.h>`）以及 `using namespace villagesql;`。
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+constexpr const char* MYTYPE = "mytype";
+
+VEF_GENERATE_ENTRY_POINTS(
+  make_extension()
+    .type(make_type(MYTYPE)
+      .persisted_length(16)              // Fixed storage size in bytes
+      .max_decode_buffer_length(64)      // Max string representation size
+      .encode(&encode_mytype)
+      .decode(&decode_mytype)
+      .compare(&compare_mytype)          // Enables ORDER BY and indexes
+      .hash(&hash_mytype)                // Optional custom hash
+      .build())
+    .func(make_func<&mytype_constructor>("MYTYPE")  // Constructor function
+      .returns(MYTYPE)
+      .param(REAL)
+      .param(REAL)
+      .build())
+);
+```
+
+`vsql::make_type<kMyTypeName>()`（带有编译时字符串 NTTP）是首选形式。`make_type(MYTYPE)`（没有模板参数）是协议 1 形式——它仍受支持，但很可能会在未来版本中被弃用。
+
+### 原始 ABI 样式（函数）
+
+协议 1 VDF 实现可以直接传递原始 C 结构体，而不是使用类型化包装器。这种样式仍受支持，但很可能会在未来版本中被弃用——对于所有新代码，请使用 [类型化参数/结果 API](/zh/9.7/0.0.7/development#argument-and-result-types)。
+
+```cpp
+#include <villagesql/extension.h>
+using namespace villagesql;
+
+void add_impl(vef_context_t* ctx,
+              vef_invalue_t* a, vef_invalue_t* b,
+              vef_vdf_result_t* result) {
+  if (a->is_null || b->is_null) {
+    result->type = VEF_RESULT_NULL;
+    return;
+  }
+  result->int_value = a->int_value + b->int_value;
+  result->type = VEF_RESULT_VALUE;
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&add_impl>("add_impl")
+                  .returns(INT)
+                  .param(INT)
+                  .param(INT)
+                  .build()))
+```
+
+这种逐参数传递的原始签名——`void(vef_context_t*, vef_invalue_t* arg0, ..., vef_vdf_result_t*)`——只有来自 `<villagesql/extension.h>` 的 `make_func<>()` 才能识别。来自 `<villagesql/vsql.h>` 的 `make_func<>()` 会在编译时拒绝任何原始的 `vef_context_t*`/`vef_invalue_t*`/`vef_vdf_result_t*` 签名。
+
+#### 结果常量
+
+原始 ABI 通过在 `result->type` 上设置的 `vef_return_value_type_t` 来传达结果状态：
+
+| 常量 | 值 | 含义 |
+|----------|-------|---------|
+| `VEF_RESULT_VALUE` | 0 | 成功——输出位于相应的联合体字段中 |
+| `VEF_RESULT_NULL` | 1 | 结果为 SQL NULL |
+| `VEF_RESULT_WARNING` | 2 | 行级警告——执行继续，该行返回 NULL，并添加一条 SQL 警告 (3200) |
+| `VEF_RESULT_ERROR` | 3 | 致命错误——语句执行被中止；消息位于 `result->error_msg` 中 |
+
+使用类型化 API 时，`out.set()`、`out.set_null()`、`out.warning()` 和 `out.error()` 会自动处理这一点。
+
+#### 协议 1 中的聚合注册
+
+来自 `<villagesql/extension.h>` 的 `make_func<>()` 构建器没有 `.clear<>()` 或 `.accumulate<>()` 成员。这些方法只存在于来自 `<villagesql/vsql.h>` 的独立构建器 `make_aggregate_func<State, &result_fn>()` 上，该构建器使用基于 `State&` 的类型化签名，而不是原始的 `vef_context_t*`/`vef_vdf_args_t*` 指针。对于所有新代码，请使用 [类型化聚合方法](/zh/9.7/0.0.7/development#aggregate-vdfs)。`VEF_PROTOCOL_3` 或更高版本的原始注册也可以手动在 `vef_func_desc_t` 中设置 `clear` 和 `accumulate` 回调。
+
+```cpp
+#include <villagesql/vsql.h>
+#include <optional>
+using namespace vsql;
+
+using SumState = std::optional<long long>;
+
+void my_clear(SumState &s) { s = std::nullopt; }
+void my_acc(SumState &s, IntArg v) {
+  if (!v.is_null()) s = s.value_or(0) + v.value();
+}
+void my_result(const SumState &s, IntResult out) {
+  if (!s.has_value()) { out.set_null(); return; }
+  out.set(s.value());
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_aggregate_func<SumState, &my_result>("my_agg")
+                  .returns(INT).param(INT)
+                  .clear<&my_clear>()        // void(SumState&)
+                  .accumulate<&my_acc>()     // void(SumState&, IntArg)
+                  .build()))
+```
