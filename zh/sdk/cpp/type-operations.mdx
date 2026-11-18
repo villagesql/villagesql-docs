@@ -87,6 +87,20 @@ ERROR 3219 (HY000): Failed to install extension 'vsql_huge_fixed_test': type 'HU
 行预算，而只有 `CREATE TABLE` 才能衡量它，因此达到或接近上限的类型仍可能在那里
 以 `ER_TOO_BIG_ROWSIZE` 失败。同等宽度的普通 `VARBINARY` 的行为也是如此。
 
+类型还可以在必需的从文本编码之外，声明第二个编码，即从其二进制形式编码——固定长度类型和参数化类型都可以：
+
+```cpp
+// Encode: binary -> binary. Same reporting contract as TypeEncodeFunc.
+using TypeEncodeBinaryFunc = void (*)(vsql::Span<const unsigned char> from,
+                                      vsql::CustomResult out);
+```
+
+使用 `.from_binary<&f>()` 注册它；它可以从 SQL 以 `TYPE::from_binary` 调用，签名为 `(BINARY) -> CUSTOM(this type)`。与 `.from_string<&f>()` 一样，参数化类型的参数可以从常量参数推断。需要 `VEF_PROTOCOL_5`。
+
+服务器在调用 encode 之前会将字符串转换为 utf8mb4，因为 encode 将 `from` 解析为文本。已经是 utf8mb4 的字符串会原样到达 encode。binary 字符集中的值则不同：`_binary '...'` 字符串、十六进制或位字面量（`0x...`、`X'...'`、`b'...'`）、`VARBINARY` 列值、以 binary 绑定的预处理语句参数，以及该类型的 VDF 参数，都是该类型的二进制形式，而不是其文本。对于扩展协商到 VEF 协议 5 或更高版本的类型，这样的值会进入 `.from_binary<&f>()` 而不是 `encode`——或者，如果该类型没有声明 `from_binary`，则被直接拒绝（`Type '%s' has no binary form; pass the value as a character string`），`IGNORE` 不会把这个错误降级为警告。来自 VEF 协议 5 之前构建的扩展的类型无法声明 `from_binary`，其从文本编码会以字节形式接收 binary 字符集中的值。只要服务器把值转换为该类型，就会发生这种情况：将值存入列（`INSERT`、`UPDATE`、`INSERT ... SELECT`、`LOAD DATA`）、将字面量与该类型比较或将其作为该类型的值传递，以及绑定预处理语句参数。直接调用该类型的 `TYPE::from_string()` VDF 遵循任何 VDF 的 `STRING` 参数的规则：协商到协议 5 以下的扩展得到按原样写入的参数字节，从协议 5 起服务器会先将其转换为 utf8mb4。
+
+`.to_binary<&f>()` 是 `.from_binary<&f>()` 的逆操作：一个 `(CUSTOM(this type)) -> BINARY` 的解码，注册为可从 SQL 调用的 `TYPE::to_binary`，同样需要 `VEF_PROTOCOL_5`。服务器自身从不调用它：对自定义类型值使用 `CAST(v AS BINARY)`、`CONVERT(v USING binary)` 和 `HEX(v)` 都会被拒绝。`TYPE::to_binary` 和 `TYPE::to_string` 是值以任一形式显式离开该类型的方式。它返回的二进制形式会到达客户端，因此必须在每个平台上相同：由该类型决定其多字节数字的字节序（TVECTOR 使用小端浮点数），而不论主机自身的字节序如何。
+
 ## 内建默认值 {#intrinsic-default}
 
 当 `NOT NULL` 自定义类型列在 `IGNORE` 模式下接收到 `NULL` 时（例如 `INSERT IGNORE` 或 `UPDATE IGNORE`），服务器会调用内建默认值来生成一个回退值，而不是引发错误。内建默认值提供一个字符串表示；服务器使用该类型的 `from_string` 函数将其转换为二进制。
@@ -108,7 +122,7 @@ ERROR 3219 (HY000): Type 'my_ext.MYTYPE' failed to initialize: from_string VDF e
 </Note>
 
 可以用两种方式之一提供内建默认值。两者互斥：同时声明
-`.intrinsic_default_str()` 和 `.intrinsic_default_vdf()`，在使用开发 ABI 标头 (`-DVSQL_USE_DEV_ABI=ON`) 时是编译时错误；在使用稳定标头时，服务器会在 `INSTALL EXTENSION` 时拒绝该类型。
+`.intrinsic_default_str()` 和 `.intrinsic_default_vdf()` 是编译时错误。
 
 **字符串字面量：`.intrinsic_default_str()`**
 
@@ -234,12 +248,12 @@ bool mytype_resolve_params_fn(const std::map<std::string, std::string> &params,
 在类型构建器上注册 `.params<>()`。使用 `.int_to_params<&mytype_int_to_params_fn>()`
 处理 `MYTYPE(N)` 整数语法，使用 `.resolve_params<&mytype_resolve_params_fn>()` 来验证参数并计算存储大小。调用 `.max_persisted_length(N)` 并传入所有有效参数化下持久化字节大小的上界；服务器在类型参数推断路径上用它来确定编码缓冲区的大小（此时它尚未推断出参数，因此无法查询 `resolve_params`），并且会拒绝解析出的超过该上界的固定 `persisted_length`。对于基于 VDF 的内建默认值，请使用带有 VDF 名称的 `.intrinsic_default_vdf()`，并通过 `make_intrinsic_default<&mytype_default>("vdf_name")` 单独注册该 VDF。
 
-在针对开发 ABI 标头 (`-DVSQL_USE_DEV_ABI=ON`) 构建时，只要注册了 `.params<>()` 或 `.int_to_params<>()`，`build()` 就要求
+只要注册了 `.params<>()` 或 `.int_to_params<>()`，`build()` 就要求
 `.resolve_params<>()`：`int_to_params` 只是把 `MYTYPE(N)` 简写改写为参数字符串，
-而 `resolve_params` 才是验证参数并解析存储大小的关口。在那里省略它是编译时错误；在使用稳定标头时，服务器会在 `INSTALL EXTENSION` 时拒绝该类型。
+而 `resolve_params` 才是验证参数并解析存储大小的关口。省略它是编译时错误。
 
 <Warning>
-`.max_persisted_length()` 需要 VEF 协议 3 或更高版本。使用它的类型无法被协议 3 之前的服务器加载。它仅对可变长度类型或参数化类型有效；设置了它的固定长度非参数化类型在使用开发 ABI 标头 (`-DVSQL_USE_DEV_ABI=ON`) 时将无法编译，而在使用稳定标头构建时，服务器会在 `INSTALL EXTENSION` 时拒绝它。
+`.max_persisted_length()` 需要 VEF 协议 3 或更高版本。使用它的类型无法被协议 3 之前的服务器加载。它仅对可变长度类型或参数化类型有效；设置了它的固定长度非参数化类型将无法编译。
 </Warning>
 
 `resolve_params` 报告的大小还会在 `CREATE TABLE` 时进行验证，此时列的参数已经确定。
@@ -324,7 +338,7 @@ CREATE TABLE t3 (v vsql_tvector.TVECTOR('dimension=3,dimension=4'));
 
 ### 重写参数并提供默认值
 
-`resolve_params` 还有第二个会修改参数的重载，仅在选择加入的开发 ABI 标头 (`-DVSQL_USE_DEV_ABI=ON`) 中声明：它以非常量引用的方式接收参数映射，以便类型可以重写它——通常是为了填充作者省略的默认值。以相同的方式注册它（`.resolve_params<&fn>()` 接受任一形式；只注册其中一个）：
+`resolve_params` 还有第二个会修改参数的重载：它以非常量引用的方式接收参数映射，以便类型可以重写它——通常是为了填充作者省略的默认值。以相同的方式注册它（`.resolve_params<&fn>()` 接受任一形式；只注册其中一个）：
 
 ```cpp
 bool mytype_resolve_params_fn(std::map<std::string, std::string> &params,
@@ -371,13 +385,13 @@ SHOW CREATE TABLE bits;   -- b persists as BITFIELD('max_number_of_bits=4096')
 可变长度自定义类型按每个值决定其持久化大小，而不是使用单一的固定占用空间。通过在类型构建器上调用 `.variable_length_type()` 来声明一个可变长度类型，该调用会设置类型的 `variable_length` 标志。
 
 <Warning>
-`.variable_length_type()` 将类型所需的协议提升至 VEF 协议 4。服务器仅在协议 4 或更高版本读取 `variable_length` 标志。请针对选择加入的开发 ABI 标头进行构建 (`-DVSQL_USE_DEV_ABI=ON`)；旧版服务器不会读取该标志。
+`.variable_length_type()` 将类型所需的协议提升至 VEF 协议 5。服务器仅在协议 5 或更高版本读取 `variable_length` 标志；旧版服务器不会读取该标志。
 </Warning>
 
 可变长度类型还必须调用 `.max_persisted_length(N)`。如果省略它，`build()` 将在编译时失败——服务器需要这个上界来为底层字段分配缓冲区。可变长度类型不得同时调用
 `.persisted_length()`：它的大小是按每个值决定的，因此 `build()` 会在编译时拒绝这种组合。
 
-`.variable_length_type()` 是单调的：在协议 3 的设置器（`max_persisted_length()`、`params()`、`int_to_params()`）之前或之后调用它，都不会将协议要求降回到协议 4 以下。
+`.variable_length_type()` 是单调的：在协议 3 的设置器（`max_persisted_length()`、`params()`、`int_to_params()`）之前或之后调用它，都不会将协议要求降回到协议 5 以下。
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -388,7 +402,7 @@ constexpr int64_t kMyTypeMaxPersistedLength = 4096;
 
 constexpr auto MYTYPE =
     vsql::make_type<kMyTypeName>()
-        .variable_length_type()  // per-value sizing; requires Protocol 4
+        .variable_length_type()  // per-value sizing; requires Protocol 5
         .max_persisted_length(kMyTypeMaxPersistedLength)
         .max_decode_buffer_length(64)
         .from_string<&my_encode>()

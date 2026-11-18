@@ -101,6 +101,20 @@ tabela usam o mesmo orçamento de 65535 bytes por linha, que somente `CREATE TAB
 avaliar, portanto um tipo no limite ou perto dele ainda pode falhar lá com
 `ER_TOO_BIG_ROWSIZE`. Um `VARBINARY` simples da mesma largura se comporta da mesma forma.
 
+Um tipo também pode declarar um segundo encode, a partir da sua forma binária, ao lado do encode obrigatório a partir de texto — tanto para um tipo de comprimento fixo quanto para um parametrizado:
+
+```cpp
+// Encode: binary -> binary. Same reporting contract as TypeEncodeFunc.
+using TypeEncodeBinaryFunc = void (*)(vsql::Span<const unsigned char> from,
+                                      vsql::CustomResult out);
+```
+
+Registre-o com `.from_binary<&f>()`; ele pode ser chamado a partir do SQL como `TYPE::from_binary`, com a assinatura `(BINARY) -> CUSTOM(this type)`. Assim como com `.from_string<&f>()`, os parâmetros de um tipo parametrizado podem ser inferidos a partir de um argumento constante. Requer `VEF_PROTOCOL_5`.
+
+O servidor converte uma string para utf8mb4 antes de chamar o encode, porque o encode analisa `from` como texto. Uma string que já é utf8mb4 chega ao encode sem alteração. Um valor no charset binário é diferente: uma string `_binary '...'`, um literal hexadecimal ou de bits (`0x...`, `X'...'`, `b'...'`), um valor de coluna `VARBINARY`, um parâmetro de instrução preparada vinculado como binário e um argumento de VDF do tipo são todos a forma binária do tipo, e não o seu texto. Para um tipo cuja extensão negociou o VEF Protocol 5 ou posterior, tal valor vai para `.from_binary<&f>()` em vez de `encode` — ou, se o tipo não declara nenhum `from_binary`, é rejeitado de imediato (`Type '%s' has no binary form; pass the value as a character string`), um erro que `IGNORE` não rebaixa a um aviso. Um tipo de uma extensão compilada antes do VEF Protocol 5, que não pode declarar `from_binary`, recebe um valor no charset binário no seu encode a partir de texto, como os seus bytes. Isso acontece em todo lugar em que o servidor transforma um valor em um valor do tipo: ao armazená-lo em uma coluna (`INSERT`, `UPDATE`, `INSERT ... SELECT`, `LOAD DATA`), ao comparar um literal com o tipo ou passá-lo como o seu valor, e ao vincular um parâmetro de instrução preparada. Uma chamada direta à VDF `TYPE::from_string()` do tipo segue a regra de qualquer parâmetro `STRING` de VDF: uma extensão que negociou abaixo do Protocol 5 recebe os bytes do argumento como foram escritos, e a partir do Protocol 5 o servidor o converte primeiro para utf8mb4.
+
+`.to_binary<&f>()` é o inverso de `.from_binary<&f>()`: um decode `(CUSTOM(this type)) -> BINARY`, registrado como o `TYPE::to_binary` chamável a partir do SQL, que também requer `VEF_PROTOCOL_5`. O servidor nunca o chama por conta própria: `CAST(v AS BINARY)`, `CONVERT(v USING binary)` e `HEX(v)` são todos rejeitados em um valor de tipo personalizado. `TYPE::to_binary` e `TYPE::to_string` são a forma como um valor sai explicitamente do tipo, em qualquer uma das duas formas. A forma binária que ele retorna chega aos clientes, então ela deve ser a mesma em todas as plataformas: o tipo decide a ordem dos bytes dos seus números de vários bytes (o TVECTOR usa floats little-endian), seja qual for a ordem de bytes do próprio host.
+
 ## Padrão Intrínseco {#intrinsic-default}
 
 Quando uma coluna de tipo personalizado `NOT NULL` recebe `NULL` no modo `IGNORE`
@@ -133,8 +147,7 @@ a string vazia não seja uma entrada válida.
 
 Forneça o padrão intrínseco de uma de duas formas. As duas são mutuamente exclusivas:
 declarar tanto `.intrinsic_default_str()` quanto `.intrinsic_default_vdf()` é um
-erro de compilação com os cabeçalhos da dev ABI (`-DVSQL_USE_DEV_ABI=ON`); com os
-cabeçalhos estáveis, o servidor rejeita o tipo no `INSTALL EXTENSION`.
+erro de compilação.
 
 **Literal de string: `.intrinsic_default_str()`**
 
@@ -287,18 +300,17 @@ Para um padrão intrínseco baseado em VDF, use `.intrinsic_default_vdf()` com o
 registre a VDF separadamente via `make_intrinsic_default<&mytype_default>("vdf_name")`.
 
 `build()` exige `.resolve_params<>()` sempre que `.params<>()` ou `.int_to_params<>()` estiver
-registrado, quando você compila com os cabeçalhos da dev ABI (`-DVSQL_USE_DEV_ABI=ON`): `int_to_params` apenas reescreve a
+registrado: `int_to_params` apenas reescreve a
 forma abreviada `MYTYPE(N)` em uma string de parâmetros, enquanto `resolve_params` é o
 portão que valida os parâmetros e resolve o tamanho de armazenamento. Omiti-lo é um
-erro de compilação nesse caso; com os cabeçalhos estáveis, o servidor rejeita o tipo no `INSTALL EXTENSION`.
+erro de compilação.
 
 <Warning>
 `.max_persisted_length()` requer o VEF Protocol 3 ou superior. Um tipo que o utiliza
 não pode ser carregado por servidores anteriores ao Protocol 3. Ele é válido apenas para
 tipos de comprimento variável ou parametrizados; um tipo de comprimento fixo não
-parametrizado que o define falha ao compilar com os cabeçalhos da dev ABI
-(`-DVSQL_USE_DEV_ABI=ON`), e o servidor o rejeita no `INSTALL EXTENSION` quando
-compilado com os cabeçalhos estáveis.
+parametrizado que o define falha ao
+compilar.
 </Warning>
 
 Os tamanhos que `resolve_params` reporta também são validados no momento do `CREATE TABLE`,
@@ -399,8 +411,7 @@ O texto dos parâmetros de tipo é convertido do conjunto de caracteres da conex
 
 ### Reescrevendo parâmetros e fornecendo padrões
 
-`resolve_params` tem uma segunda sobrecarga, mutável, declarada apenas nos cabeçalhos
-opcionais da dev ABI (`-DVSQL_USE_DEV_ABI=ON`): ela recebe o mapa de parâmetros por
+`resolve_params` tem uma segunda sobrecarga, mutável: ela recebe o mapa de parâmetros por
 referência não constante, de modo que o tipo pode reescrevê-lo — normalmente para preencher padrões que o
 autor omitiu. Registre-a da mesma forma (`.resolve_params<&fn>()` aceita
 qualquer forma; registre apenas uma):
@@ -460,10 +471,9 @@ usar um único footprint fixo. Declare um chamando `.variable_length_type()`
 no construtor do tipo, o que define a flag `variable_length` do tipo.
 
 <Warning>
-`.variable_length_type()` eleva o protocol exigido pelo tipo para o VEF Protocol 4.
-O servidor lê a flag `variable_length` apenas no protocol 4 ou superior. Compile
-com os cabeçalhos opcionais da dev ABI (`-DVSQL_USE_DEV_ABI=ON`); servidores mais antigos não
-leem a flag.
+`.variable_length_type()` eleva o protocol exigido pelo tipo para o VEF Protocol 5.
+O servidor lê a flag `variable_length` apenas no protocol 5 ou superior; servidores
+mais antigos não leem a flag.
 </Warning>
 
 Os tipos de comprimento variável também devem chamar `.max_persisted_length(N)`. `build()` falha
@@ -474,7 +484,7 @@ combinação em tempo de compilação.
 
 `.variable_length_type()` é monotônico: chamá-lo antes ou depois dos setters do Protocol 3
 (`max_persisted_length()`, `params()`, `int_to_params()`) não reduz
-a exigência de protocol de volta para abaixo do Protocol 4.
+a exigência de protocol de volta para abaixo do Protocol 5.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -485,7 +495,7 @@ constexpr int64_t kMyTypeMaxPersistedLength = 4096;
 
 constexpr auto MYTYPE =
     vsql::make_type<kMyTypeName>()
-        .variable_length_type()  // per-value sizing; requires Protocol 4
+        .variable_length_type()  // per-value sizing; requires Protocol 5
         .max_persisted_length(kMyTypeMaxPersistedLength)
         .max_decode_buffer_length(64)
         .from_string<&my_encode>()

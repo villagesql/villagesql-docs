@@ -7,7 +7,7 @@ description: "Profundidade na criação de VDFs para extensões C++ — tipos de
 Este guia é a referência aprofundada para escrever implementações de VDF em C++. Ele é o complemento de [Criando Extensões em C++](/pt-BR/extensions/build/create), que cobre as etapas de compilação de ponta a ponta, e de [Testes em C++](/pt-BR/sdk/cpp/testing), que cobre o ciclo de teste e iteração.
 
 <Warning>
-O Protocol 3 do VEF é estável desde a v0.0.4. O Protocol 4 está em desenvolvimento e está disponível apenas por meio de cabeçalhos de ABI de desenvolvimento opcionais (`-DVSQL_USE_DEV_ABI=ON`). Extensões compiladas com o antigo Protocol 2 são rejeitadas pelo servidor e precisam ser recompiladas.
+Por padrão, uma extensão é compilada com os cabeçalhos estáveis e continua funcionando em versões mais novas do servidor. Uma extensão compilada com os cabeçalhos de desenvolvimento (`-DVSQL_USE_DEV_ABI=ON`) pode parar de funcionar em uma versão mais nova do servidor, porque os cabeçalhos de desenvolvimento, e o protocolo que os define, podem mudar entre versões. Se isso acontecer, recompile a extensão contra a nova versão. Consulte [Protocolos Mais Antigos](/pt-BR/extensions/build/older-protocols).
 </Warning>
 
 ## Escrevendo Funções de Extensão
@@ -21,17 +21,22 @@ As funções de extensão são escritas em C++ e registradas com o VEF. Inclua u
 
 ## Segurança de Exceções {#exception-safety}
 
-Conter as exceções é responsabilidade da extensão. O SDK não envolve a sua
-implementação em um `try`/`catch`, e o servidor também não, então uma exceção
-que escapa de um ponto de entrada desenrola a pilha através da fronteira da ABI C
-sem nenhum tratador acima dela e o processo do servidor é encerrado. Uma entrada
+O SDK captura uma exceção que escapa do corpo de uma VDF, das funções de uma agregação ou das operações de um tipo personalizado: encode, decode, compare, hash, o padrão intrínseco e as funções de parâmetro. O que o cliente vê depende de quem chamou a função:
+
+- Uma chamada de VDF em SQL falha com `VDF error in function '<name>': VDF threw an exception (<what>)`, onde `<what>` é o texto do `what()` da exceção.
+- Uma exceção em encode enquanto o servidor armazena um valor faz a instrução falhar com `VDF threw an exception (<what>)`.
+- Uma exceção em decode enquanto o servidor lê um valor armazenado faz a instrução falhar com `Invalid value in column '<col>' of type '<type>' at row <N>: check server log for details`. Somente o log de erros do servidor tem o texto da exceção.
+- Uma exceção em compare ou hash enquanto o servidor compara, ordena ou agrupa valores armazenados não faz a instrução falhar. O servidor escreve a exceção no seu log de erros e continua. Depois de uma exceção em compare, o servidor trata os dois valores como iguais, então `WHERE` e `ORDER BY` podem retornar resultados errados.
+- Uma exceção no `clear` de uma agregação não faz a instrução falhar e não é registrada no log. Qualquer estado que `clear` não redefiniu é mantido, então o resultado desse grupo pode estar errado.
+
+O SDK não captura uma exceção que escapa de um gancho `bind`, prerun ou postrun
+que você registra. Essa exceção desenrola a pilha através da fronteira da ABI C
+sem nenhum tratador acima dela, e o processo do servidor é encerrado. Uma entrada
 SQL comum chega a isso: `std::stoi()` lança uma exceção em uma string não numérica, e
 `nlohmann::json::dump()` lança uma exceção em um texto que não é UTF-8 válido.
 
-Na dev ABI (Protocolo 4, `-DVSQL_USE_DEV_ABI=ON`), o SDK captura uma exceção que escapa do corpo de uma VDF, das funções de uma agregação ou das operações de um tipo personalizado: encode, decode, compare, hash, o padrão intrínseco e as funções de parâmetro. A instrução falha com um erro de VDF em vez de o servidor ser encerrado. A ABI estável não muda.
-
 Envolva o corpo de cada ponto de entrada que você registrar: VDFs, funções de
-agregação, ganchos prerun e postrun, e as operações de um tipo personalizado.
+agregação, ganchos `bind`, prerun e postrun, e as operações de um tipo personalizado.
 
 ```cpp
 #include <villagesql/vsql.h>
@@ -76,7 +81,7 @@ escalares também fornecem `set(value)`. Os resultados de buffer fornecem `buffe
 view e define o comprimento em uma única chamada. Para tipos personalizados parametrizados,
 `CustomResultWith<P>` adiciona um acessador `params()`.
 
-Uma função registrada com `.returns(REAL)` mantém a fração do seu resultado quando os seus argumentos são `INT` ou quando ela não recebe argumentos. Na versão 0.0.7, tal função retorna um número inteiro: uma função que retorna `a / 2.0` retorna `2` para o argumento `3`, e `CREATE TABLE ... AS SELECT` dá à sua coluna o tipo `double(22,0)`.
+Uma função registrada com `.returns(REAL)` mantém a fração do seu resultado quando os seus argumentos são `INT` ou quando ela não recebe argumentos.
 
 **Tipo Span:** `value()` e `buffer()` nos tipos de argumento e resultado
 orientados a bytes retornam um `vsql::Span<T>` — uma view não proprietária sobre uma sequência
@@ -193,8 +198,7 @@ void count_result(const CountState &s, IntResult out) { out.set(s); }
 Uma VDF agregada com `StringResult` retorna texto: o resultado informa o
 charset e a collation `utf8mb4_bin`, de modo que os clientes o exibem como caracteres
 em vez de hexadecimal — o mesmo que o caminho STRING da VDF escalar. Ela também respeita
-`.max_result_length(n)` — o que exige os cabeçalhos de ABI de desenvolvimento
-opcionais (`-DVSQL_USE_DEV_ABI=ON`) e o Protocol 4 — da mesma forma, dimensionando um resultado agregado materializado
+`.max_result_length(n)` da mesma forma, dimensionando um resultado agregado materializado
 (uma tabela temporária de `GROUP BY`/`DISTINCT`, `CREATE TABLE ... SELECT` ou UNION) de modo que ele
 não seja truncado na largura do argumento. Consulte
 [Tamanhos de Buffer Personalizados](/pt-BR/extensions/build/create#custom-buffer-sizes) para as
@@ -399,26 +403,7 @@ função, com a assinatura:
 void my_hook(vsql::BindArgs args, vsql::BindResult out);
 ```
 
-`.bind_and_check_types()` e `.varargs()` são mutuamente exclusivos na mesma
-função — uma VDF com varargs não tem uma lista fixa de argumentos sobre a qual o
-gancho possa raciocinar. Declarar `.varargs()` antes de
-`.bind_and_check_types<&Hook>()` na cadeia do construtor é uma falha de
-`static_assert` em tempo de compilação. Declará-los na outra ordem compila, mas
-a extensão é rejeitada quando o servidor a carrega: o registro percorre o estado
-final construído de cada função e rejeita a primeira que é varargs e tem um
-gancho de bind ao mesmo tempo, com:
-
-```text
-ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned an error: VDF '<function>' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
-```
-
-<Warning>
-`.bind_and_check_types<&Hook>()` e `<villagesql/vsql/bind_check_types.h>`
-são declarados apenas nos cabeçalhos de ABI de desenvolvimento opcionais
-(`-DVSQL_USE_DEV_ABI=ON`) e exigem o Protocol 4 do VEF. Uma compilação padrão
-com a ABI estável não tem nenhum dos dois, então registrar um gancho falha na
-compilação.
-</Warning>
+Uma VDF com varargs também pode declarar `.bind_and_check_types<&Hook>()`. Uma chamada variádica não tem assinatura, então o gancho é a única coisa que pode dizer o que um literal de string simples entre os argumentos deve ser: `BindResult::set_arg_type(i, type_name)` nomeia o argumento `i` como um dos tipos personalizados da própria extensão, e nomear um tipo registrado por uma extensão diferente aborta a instrução. Nomear um tipo só define um tipo em um argumento que o servidor não conseguiu tipar por conta própria, o que hoje significa uma constante de string. Para uma coluna ou o resultado de uma VDF aninhada, o nome é apenas verificado contra o tipo que o argumento já carrega, e uma discordância aborta a instrução. `set_arg(i, type_name, p)` define o tipo de um argumento constante e os seus parâmetros juntos; parâmetros dados para um argumento cujo tipo o gancho não nomeou abortam a instrução. O gancho de uma função com varargs é executado antes da passagem de verificação de tipos descrita abaixo, e fornece o tipo contra o qual cada argumento é verificado.
 
 O servidor chama o gancho entre duas passagens que ele faz sobre os argumentos de
 uma função: a primeira passagem verifica o tipo base de cada argumento, o gancho
@@ -430,6 +415,8 @@ cujo próprio tipo ainda não está resolvido, como um literal de string simples
 recebe seus parâmetros apenas do gancho. Os parâmetros de um tipo de retorno
 parametrizado também vêm do gancho, no lugar da regra interna que os copia de um
 argumento.
+
+Um parâmetro de instrução preparada não tem valor até o `EXECUTE`, então um gancho nunca o vê como uma constante no primeiro `PREPARE`; em vez disso, o servidor adia a chamada do gancho para o `EXECUTE`, depois que o parâmetro é vinculado. `PREPARE s FROM 'SELECT vsql_tvector.tvector_dim(?)'` é bem-sucedido, e somente o `EXECUTE` com um valor que não é um literal de vetor falha, com `ERROR 3219 (HY000): Cannot initialize function 'tvector_dim': argument 1 is not a vector literal`. Um gancho lê uma constante de string através de `const_value()` no charset do parâmetro ao qual a constante é passada. Uma chamada com varargs não tem parâmetros, então o seu gancho lê toda constante de string como texto utf8mb4, e uma constante que não é utf8mb4 válido, como `_binary 0xFF`, interrompe a instrução com `ERROR 3854 (HY000): Cannot convert string '\xFF' from binary to utf8mb4`. O gancho de uma função de aridade fixa lê uma constante que é passada a um parâmetro de tipo personalizado como os bytes que o chamador escreveu.
 
 A extensão de exemplo [`vsql_tvector`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/examples/vsql-tvector/src/tvector.cc)
 na árvore de código-fonte do servidor registra um gancho desses em
@@ -577,12 +564,6 @@ incompleto por algum outro caminho é rejeitada no carregamento:
 ```text
 ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers an on_init hook without an on_deinit
 ```
-
-<Warning>
-`.on_init<&Fn>()` e `.on_deinit<&Fn>()` são declarados apenas nos cabeçalhos de ABI
-de desenvolvimento opcionais (`-DVSQL_USE_DEV_ABI=ON`). Uma compilação padrão com a
-ABI estável não tem nenhum dos dois métodos, então registrar um gancho falha na compilação.
-</Warning>
 
 `on_init` é executado uma vez por carregamento — no `INSTALL EXTENSION`, e
 novamente a cada inicialização do servidor — depois que o servidor validou a

@@ -7,7 +7,7 @@ description: "C++ 확장을 위한 VDF 작성 심층 참조 — 인자 및 결�
 이 가이드는 C++ VDF 구현을 작성하기 위한 심층 참조입니다. 종단간 빌드 단계를 다루는 [C++로 확장 만들기](/ko/extensions/build/create), 그리고 테스트-반복 루프를 다루는 [C++ 테스트](/ko/sdk/cpp/testing)의 동반 자료입니다.
 
 <Warning>
-VEF 프로토콜 3은 v0.0.4부터 안정적입니다. 프로토콜 4는 개발 중이며, 선택적으로 활성화하는 개발 ABI 헤더(`-DVSQL_USE_DEV_ABI=ON`)를 통해서만 사용할 수 있습니다. 이전 프로토콜 2로 빌드된 확장은 서버에서 거부되며 재빌드가 필요합니다.
+기본적으로 확장은 안정 헤더에 맞춰 빌드되며, 더 새로운 서버 릴리스에서도 계속 동작합니다. 개발 헤더(`-DVSQL_USE_DEV_ABI=ON`)로 빌드한 확장은 더 새로운 서버 릴리스에서 동작을 멈출 수 있습니다. 개발 헤더와 그 헤더를 정의하는 프로토콜은 릴리스 간에 바뀔 수 있기 때문입니다. 그런 경우 새 릴리스에 맞춰 확장을 재빌드하세요. [이전 프로토콜](/ko/extensions/build/older-protocols)을 참조하세요.
 </Warning>
 
 ## 확장 함수 작성
@@ -21,14 +21,19 @@ VEF 프로토콜 3은 v0.0.4부터 안정적입니다. 프로토콜 4는 개발 
 
 ## 예외 안전성 {#exception-safety}
 
-예외를 가두는 것은 확장의 책임입니다. SDK는 사용자의 구현을 `try`/`catch`로
-감싸지 않으며 서버도 마찬가지이므로, 엔트리 포인트를 벗어난 예외는 그 위
-어디에도 핸들러가 없는 상태로 C ABI 경계를 넘어 스택을 풀고 서버 프로세스가
-종료됩니다. 일반적인 SQL 입력이 이 상황에 도달합니다: `std::stoi()`는 숫자가
-아닌 문자열에서 예외를 던지고, `nlohmann::json::dump()`는 유효한 UTF-8이 아닌
-텍스트에서 예외를 던집니다.
+SDK는 VDF 본문, 집계의 함수, 또는 사용자 정의 유형의 연산(encode, decode, compare, hash, 내장 기본값, 매개변수 함수)을 벗어난 예외를 잡습니다. 클라이언트가 보는 내용은 무엇이 그 함수를 호출했는지에 따라 다릅니다:
 
-개발 ABI(프로토콜 4, `-DVSQL_USE_DEV_ABI=ON`)에서는 SDK가 VDF 본문, 집계의 함수, 또는 사용자 정의 유형의 연산(encode, decode, compare, hash, 내장 기본값, 매개변수 함수)을 벗어난 예외를 잡습니다. 서버가 종료되는 대신 해당 문이 VDF 오류로 실패합니다. 안정 ABI는 변경되지 않습니다.
+- SQL에서의 VDF 호출은 `VDF error in function '<name>': VDF threw an exception (<what>)`으로 실패합니다. 여기서 `<what>`은 예외의 `what()` 텍스트입니다.
+- 서버가 값을 저장하는 동안 encode에서 발생한 예외는 `VDF threw an exception (<what>)`으로 문을 실패시킵니다.
+- 서버가 저장된 값을 읽는 동안 decode에서 발생한 예외는 `Invalid value in column '<col>' of type '<type>' at row <N>: check server log for details`로 문을 실패시킵니다. 예외 텍스트는 서버의 오류 로그에만 있습니다.
+- 서버가 저장된 값을 비교, 정렬, 그룹화하는 동안 compare나 hash에서 발생한 예외는 문을 실패시키지 않습니다. 서버는 예외를 오류 로그에 기록하고 계속 진행합니다. compare 예외 뒤에 서버는 두 값을 같다고 취급하므로, `WHERE`와 `ORDER BY`가 잘못된 결과를 반환할 수 있습니다.
+- 집계의 `clear`에서 발생한 예외는 문을 실패시키지 않으며 기록되지도 않습니다. `clear`가 재설정하지 않은 상태가 그대로 이어지므로, 그 그룹의 결과가 잘못될 수 있습니다.
+
+SDK는 사용자가 등록한 `bind`, prerun, postrun 훅을 벗어난 예외는 잡지 않습니다.
+그런 예외는 그 위 어디에도 핸들러가 없는 상태로 C ABI 경계를 넘어 스택을 풀고,
+서버 프로세스가 종료됩니다. 일반적인 SQL 입력이 이 상황에 도달합니다:
+`std::stoi()`는 숫자가 아닌 문자열에서 예외를 던지고, `nlohmann::json::dump()`는
+유효한 UTF-8이 아닌 텍스트에서 예외를 던집니다.
 
 등록하는 모든 엔트리 포인트의 본문을 감싸세요: VDF, 집계 함수, prerun 및
 postrun 훅, 그리고 사용자 정의 타입의 연산.
@@ -76,7 +81,7 @@ VDF 매개변수 및 결과는 타입 안전 인자 및 결과 타입으로 전�
 복사하고 길이를 한 번에 설정합니다. 매개변수화된 사용자 정의 타입의 경우,
 `CustomResultWith<P>`는 `params()` 액세서를 추가합니다.
 
-`.returns(REAL)`로 등록된 함수는 인수가 `INT`이거나 인수가 없을 때도 결과의 소수 부분을 유지합니다. 0.0.7에서는 그런 함수가 정수를 반환합니다. `a / 2.0`을 반환하는 함수는 `2`를 반환하고(인수가 `3`일 때), `CREATE TABLE ... AS SELECT`는 해당 열에 `double(22,0)` 타입을 부여합니다.
+`.returns(REAL)`로 등록된 함수는 인수가 `INT`이거나 인수가 없을 때도 결과의 소수 부분을 유지합니다.
 
 **스팬 타입:** 바이트 기반 인자 및 결과 타입의 `value()` 및 `buffer()`는
 `vsql::Span<T>`를 반환합니다 — `data()`, `size()`, `empty()`,
@@ -190,8 +195,7 @@ void count_result(const CountState &s, IntResult out) { out.set(s); }
 
 `StringResult` 집계 VDF는 텍스트를 반환합니다: 결과는 `utf8mb4_bin` 문자
 집합 및 콜레이션을 보고하므로, 클라이언트는 이를 16진수가 아닌 문자로 표시합니다
-— 스칼라 VDF STRING 경로와 동일합니다. 또한 `.max_result_length(n)`(선택적으로
-활성화하는 개발 ABI 헤더(`-DVSQL_USE_DEV_ABI=ON`)와 프로토콜 4가 필요합니다)을
+— 스칼라 VDF STRING 경로와 동일합니다. 또한 `.max_result_length(n)`을
 동일한 방식으로 존중하여, 구체화된 집계 결과(`GROUP BY`/`DISTINCT` 임시 테이블,
 `CREATE TABLE ... SELECT`, 또는 UNION)의 크기를 조정하여 인자 너비에서
 잘리지 않도록 합니다. 크기 조정 규칙 및 상한선은
@@ -402,23 +406,7 @@ void ba_concat_all(VarArgs args, StringResult out) {
 void my_hook(vsql::BindArgs args, vsql::BindResult out);
 ```
 
-`.bind_and_check_types()`와 `.varargs()`는 동일한 함수에서 상호 배타적입니다 —
-가변 인자 VDF에는 훅이 판단할 고정 인자 목록이 없습니다. 빌더 체인에서
-`.bind_and_check_types<&Hook>()`보다 앞에 `.varargs()`를 선언하면 컴파일 타임
-`static_assert` 실패가 발생합니다. 반대 순서로 선언하면 컴파일은 되지만, 서버가
-로드할 때 확장이 거부됩니다: 등록은 모든 함수의 최종 빌드 상태를 순회하며 가변
-인자이면서 bind 훅을 가진 첫 번째 함수를 다음과 같이 거부합니다:
-
-```text
-ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned an error: VDF '<function>' declares both .varargs() and .bind_and_check_types(). This is not currently supported.
-```
-
-<Warning>
-`.bind_and_check_types<&Hook>()`과 `<villagesql/vsql/bind_check_types.h>`는
-선택적으로 활성화하는 개발 ABI 헤더(`-DVSQL_USE_DEV_ABI=ON`)에만 선언되어
-있으며 VEF 프로토콜 4를 필요로 합니다. 기본 안정 ABI 빌드에는 둘 다 없으므로,
-훅을 등록하면 컴파일에 실패합니다.
-</Warning>
+가변 인자 VDF도 `.bind_and_check_types<&Hook>()`을 선언할 수 있습니다. 가변 인자 호출에는 시그니처가 없으므로, 인자 중의 단순 문자열 리터럴이 어떤 타입이어야 하는지는 훅만이 말할 수 있습니다: `BindResult::set_arg_type(i, type_name)`은 인자 `i`를 이 확장의 사용자 정의 타입 중 하나로 지정하며, 다른 확장이 등록한 타입을 지정하면 문이 중단됩니다. 타입 지정은 서버가 스스로 타입을 정하지 못한 인자에만 타입을 설정하며, 현재 이는 문자열 상수를 뜻합니다. 열이나 중첩된 VDF의 결과에 대해서는 지정한 이름을 인자가 이미 가진 타입과 비교하기만 하며, 서로 다르면 문이 중단됩니다. `set_arg(i, type_name, p)`는 상수 인자의 타입과 매개변수를 함께 설정합니다. 훅이 타입을 지정하지 않은 인자에 매개변수를 주면 문이 중단됩니다. 가변 인자 함수의 훅은 아래에 설명하는 타입 검사 단계 전에 실행되며, 각 인자를 검사할 기준 타입을 제공합니다.
 
 서버는 함수의 인자에 대해 수행하는 두 단계 사이에 훅을 호출합니다: 첫 번째
 단계는 각 인자의 기본 타입을 검사하고, 다음으로 훅이 실행되며, 두 번째 단계는
@@ -427,6 +415,8 @@ ERROR 3219 (HY000): Failed to load VEF extension '<name>': vef_register returned
 서로 일치할 필요가 없습니다. 자체 타입이 아직 해석되지 않은 인자, 예를 들어 단순
 문자열 리터럴은 훅에서만 매개변수를 얻습니다. 매개변수화된 반환 타입의
 매개변수도 인자에서 복사하는 내장 규칙 대신 훅에서 옵니다.
+
+준비된 문의 매개변수는 `EXECUTE` 전까지 값이 없으므로, 첫 `PREPARE`에서 훅은 매개변수를 상수로 보지 못합니다. 서버는 대신 매개변수가 바인딩된 뒤인 `EXECUTE`로 훅 호출을 미룹니다. `PREPARE s FROM 'SELECT vsql_tvector.tvector_dim(?)'`는 성공하며, 벡터 리터럴이 아닌 값으로 `EXECUTE`할 때만 `ERROR 3219 (HY000): Cannot initialize function 'tvector_dim': argument 1 is not a vector literal`로 실패합니다. 훅은 `const_value()`를 통해 문자열 상수를 그 상수가 전달되는 매개변수의 문자 집합으로 읽습니다. 가변 인자 호출에는 매개변수가 없으므로, 그 훅은 모든 문자열 상수를 utf8mb4 텍스트로 읽으며, `_binary 0xFF`처럼 유효한 utf8mb4가 아닌 상수는 `ERROR 3854 (HY000): Cannot convert string '\xFF' from binary to utf8mb4`로 문을 중단시킵니다. 고정 인자 수 함수의 훅은 사용자 정의 타입 매개변수에 전달된 상수를 호출자가 쓴 바이트 그대로 읽습니다.
 
 서버 소스 트리의
 [`vsql_tvector`](https://github.com/villagesql/villagesql-server/blob/main/villagesql/examples/vsql-tvector/src/tvector.cc)
@@ -573,12 +563,6 @@ SELECT vsql_tvector.tvector_concat(v, '[6,7]') AS c FROM v3;
 ```text
 ERROR 3219 (HY000): Failed to load VEF extension '<name>': extension registers an on_init hook without an on_deinit
 ```
-
-<Warning>
-`.on_init<&Fn>()` 및 `.on_deinit<&Fn>()`은 선택적으로 활성화하는 개발 ABI
-헤더(`-DVSQL_USE_DEV_ABI=ON`)에만 선언되어 있습니다. 기본 안정 ABI 빌드에는 두
-메서드가 모두 없으므로, 훅을 등록하면 컴파일에 실패합니다.
-</Warning>
 
 `on_init`은 로드마다 한 번 — `INSTALL EXTENSION` 시점, 그리고 서버가 시작될
 때마다 — 서버가 확장을 검증하고 필요한 기능을 채운 후에 실행되므로, 등록된
