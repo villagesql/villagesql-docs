@@ -150,7 +150,13 @@ In `vsql-extension-template` and `vsql-extension-template-rust`, update the
 pinned `villagesql-version` in `.github/workflows/ci.yml` in the C++ template
 and in `_github/workflows/ci.yml` in the Rust template. The scaffold pins a
 release so that an extension author's build does not change under them, so only
-this step moves it.
+this step moves it. In the Rust template, also update the `villagesql` crate in
+`Cargo.toml` to the latest version on crates.io.
+
+In both templates, check each action in the CI file against its latest release,
+such as `actions/checkout`. Read the release notes for breaking changes, then
+pin the new version to its commit, with the version in a comment:
+`actions/checkout@<commit> # v7.0.1`.
 
 ## Server builds and their names
 
