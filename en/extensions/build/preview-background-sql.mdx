@@ -1,0 +1,356 @@
+---
+audience: extension-author
+title: "Thread Worker and SQL Query"
+description: "The vsql::preview::thread_worker capability runs a background thread driven by the server, and vsql::preview::sql_query executes SQL statements from a background thread."
+---
+
+The capabilities on this page are in preview: their APIs are not stable, and an extension that declares one requires `vsql_allow_preview_extensions = ON` to install. See [Preview Capabilities](/en/extensions/build/preview-capabilities) for how to enable the preview tier and register a capability.
+
+## Thread Worker
+
+The thread worker capability (`vsql::preview::thread_worker`) lets an
+extension run a background thread driven by the server. The thread is started
+and stopped via a control system variable that the server registers at
+extension load; the server invokes the extension's work function on a periodic
+timer, on file-descriptor readiness, or in response to enable/disable events.
+
+The capability name `VEF_PREVIEW_THREAD_WORKER_NAME` is
+`"vsql::preview::thread_worker"`.
+
+### Declaring the Capability
+
+Include the header, declare a `ThreadWorkerCapability` instantiated on your
+work function at file scope, and pass it to `.with()`:
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"suffix"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+The work function is supplied as a non-type template argument
+(`ThreadWorkerCapability<&my_work>`), so it must be a function with the
+signature shown below. The first constructor argument is the thread-name
+suffix; the optional second argument overrides the control sys var name.
+
+### Work Function Signature
+
+```c
+typedef vef_next_wakeup_t (*vef_work_fn_t)(vef_wakeup_reason_t reason,
+                                           struct vef_thread_handle_t *thread,
+                                           void *arg);
+```
+
+`reason` indicates why the server called the function. `thread` is the
+server-owned handle for this worker (NULL on the initial `VEF_WAKEUP_ENABLE`
+call — see below). `arg` is the opaque pointer registered on the descriptor;
+it is passed through unchanged.
+
+### Wakeup Lifecycle
+
+The server calls the work function with one of four reasons:
+
+| Reason | Meaning |
+|---|---|
+| `VEF_WAKEUP_ENABLE` | Worker was just enabled (control sys var flipped ON). The return value sets the initial `poll_fd` and `sleep_ms`. |
+| `VEF_WAKEUP_PERIODIC` | Periodic timer fired (`sleep_ms` elapsed). |
+| `VEF_WAKEUP_POLL_FD` | A watched file descriptor became readable. |
+| `VEF_WAKEUP_DISABLE` | Worker disabled (control sys var OFF) or server shutting down. The return value is ignored. |
+
+The `thread` parameter is NULL when the reason is `VEF_WAKEUP_ENABLE`, because
+the thread handle does not exist yet at that point. For the other three
+reasons, `thread` is non-null.
+
+### Wakeup Return Value
+
+```c
+typedef struct {
+  unsigned int sleep_ms;
+  int poll_fd;
+} vef_next_wakeup_t;
+```
+
+The work function returns a `vef_next_wakeup_t` to update the next wakeup
+configuration. A zero value in either field means "keep the current setting"
+— return a value-initialized struct (`return {};`) to leave both unchanged.
+
+To set a new poll file descriptor, return its value (must be greater than
+zero). To clear an existing poll file descriptor, return `-1` in `poll_fd`.
+
+The return value is ignored when the reason is `VEF_WAKEUP_DISABLE`.
+
+### Thread Name and Control Variable
+
+Two fields on the descriptor control naming:
+
+- `suffix` — the thread-name suffix. The server prepends the extension name,
+  producing thread names like `my_ext/monitor`.
+- `var_name` — optional. When non-null, the server registers this exact name
+  as the control system variable. When null, the server uses the default
+  pattern `{suffix}_enabled`.
+
+The control variable is a server-registered system variable, so it takes the
+extension name as a component prefix. For extension `my_ext` with suffix
+`monitor`, the variable is `my_ext.monitor_enabled`.
+
+Setting it `ON` starts the worker: the server calls the work function with
+`VEF_WAKEUP_ENABLE`, then creates the thread, so the statement does not return
+until that first call has finished. Setting it `ON` again while the worker is
+already running does nothing. Setting it `OFF` returns after the thread has
+exited. The server releases its global system-variable lock around both, so the work function may read system variables, but a query it runs during `VEF_WAKEUP_DISABLE` does not return any rows.
+
+### Complete Example
+
+A minimal extension with a single periodic worker that increments a
+heartbeat counter on each timer tick.
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+#include <atomic>
+
+static std::atomic<unsigned long long> g_heartbeat{0};
+
+static vef_next_wakeup_t heartbeat_work(vef_wakeup_reason_t reason,
+                                        struct vef_thread_handle_t *thread,
+                                        void *arg) {
+  switch (reason) {
+    case VEF_WAKEUP_ENABLE:
+      return {1000, 0};  // tick every 1000 ms, no poll fd
+    case VEF_WAKEUP_PERIODIC:
+      g_heartbeat.fetch_add(1, std::memory_order_relaxed);
+      return {};  // keep current sleep_ms and poll_fd
+    case VEF_WAKEUP_POLL_FD:
+      return {};  // not used in this example
+    case VEF_WAKEUP_DISABLE:
+      return {};  // ignored
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&heartbeat_work>
+    g_worker{"heartbeat"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+With this extension installed (and `vsql_allow_preview_extensions = ON`), the
+server registers a `heartbeat_enabled` system variable under the extension's
+name. For an extension named `my_ext`, enable the worker with:
+
+```sql
+SET GLOBAL my_ext.heartbeat_enabled = ON;
+```
+
+## SQL Query
+
+The sql_query capability (`vsql::preview::sql_query`) lets an extension
+execute SQL statements from a background thread. Queries run inside the
+server through the capability vtable — extensions do not link against any
+MySQL client library.
+
+The capability name `VEF_PREVIEW_SQL_QUERY_NAME` is
+`"vsql::preview::sql_query"`.
+
+<Warning>
+A SQL session must be opened from a thread-worker callback using that
+callback's `vef_thread_handle_t *`. `open()` is not valid from VDFs or from
+arbitrary extension-created threads — it requires the worker session
+context.
+</Warning>
+
+### Declaring the Capability
+
+Include the header, declare a `SqlQueryCapability` at file scope, and pass it
+to `.with()`. It is typically registered alongside a `ThreadWorkerCapability`,
+since sessions are opened from the worker callback:
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
+
+`g_sql.open(handle)` returns a `Session`. Check it with `operator bool` before
+use; an invalid `Session` indicates the capability vtable was not bound or the
+server could not allocate a session. The `Session` is move-only and closes
+itself on destruction.
+
+### Executing Queries
+
+A `Session` produces a `SqlQuery` via `session.sql(sv)`. The query can be run
+in two modes:
+
+- `execute()` — runs the statement and buffers the full result set in a
+  `Result`. Iterate rows by calling `next()` at the caller's pace.
+- `for_each(fn)` — runs the statement and invokes `fn` once per row as rows
+  are produced, without buffering. The returned `Result` carries diagnostics
+  only (no rows).
+
+Both return a `Result`. A non-null `Result` does not mean the statement
+succeeded — call `has_error()` to find out.
+
+Buffered (`execute`):
+
+```cpp
+auto result = session.sql("SELECT id, name FROM t").execute();
+if (result.has_error()) {
+  // result.error().message holds the server error string.
+  return {};
+}
+while (result.next()) {
+  long long id          = result.column_int(0);
+  std::string_view name = result.column_str(1);
+  // ...
+}
+```
+
+`column_str()` returns a `string_view` that is valid only until the next
+`next()` call or until `Result` is destroyed. Copy it if a longer lifetime is
+needed. A `string_view` with `data() == nullptr` indicates SQL NULL.
+
+Streaming (`for_each`):
+
+```cpp
+auto status = session.sql("SELECT 1").for_each(
+    [](const auto &row) {
+      // row.column_int(0), row.column_str(1), etc.
+    });
+if (status.has_error()) {
+  // status.error().message
+}
+```
+
+The `Row` passed to the callback is valid only for the duration of the call —
+do not store references to it across rows. The `Result` returned by
+`for_each` holds no buffered rows; `next()` on it will not yield data. Use it
+only for `has_error()`, `error()`, `warning_count()`, and `warning(i)`.
+
+### Diagnostics
+
+Both `execute()` and `for_each()` surface diagnostics through the returned
+`Result`. A diagnostic is one `Diag`:
+
+```cpp
+struct Diag {
+  uint32_t errno_;
+  vef_sql_diag_severity_t severity;   // NOTE | WARNING | ERROR
+  std::string_view sqlstate;          // 5-char SQLSTATE
+  std::string_view message;           // may be empty
+};
+```
+
+| Field | Meaning |
+|---|---|
+| `errno_` | MySQL error number. `0` on a default-constructed `Diag` returned when there is no error. |
+| `severity` | `VEF_SQL_DIAG_NOTE`, `VEF_SQL_DIAG_WARNING`, or `VEF_SQL_DIAG_ERROR`. |
+| `sqlstate` | 5-character SQLSTATE. |
+| `message` | Server-supplied diagnostic message; may be empty. |
+
+`Result` exposes:
+
+```cpp
+bool         Result::has_error() const;
+Diag         Result::error() const;
+unsigned int Result::warning_count() const;
+Diag         Result::warning(unsigned int i) const;
+```
+
+`error()` returns a default-constructed `Diag` (`errno_ == 0`) when the
+statement succeeded. `warning(i)` returns a default-constructed `Diag` when
+`i >= warning_count()`.
+
+The `sqlstate` and `message` views point into storage owned by the `Result`
+and become invalid when the `Result` is destroyed — copy them if they need to
+outlive it.
+
+### Complete Example
+
+A worker that runs one buffered query and one streaming query on each tick,
+logging diagnostics from both:
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t sql_demo_work(vef_wakeup_reason_t reason,
+                                       struct vef_thread_handle_t *thread,
+                                       void *arg) {
+  if (reason == VEF_WAKEUP_ENABLE) return {5000, 0};
+  if (reason != VEF_WAKEUP_PERIODIC) return {};
+
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+
+  // Buffered: read a small result set.
+  auto rs = session.sql("SELECT id, name FROM mydb.t LIMIT 10").execute();
+  if (rs.has_error()) {
+    auto e = rs.error();
+    // Log e.errno_, e.sqlstate, e.message somewhere extension-owned.
+  } else {
+    while (rs.next()) {
+      long long id          = rs.column_int(0);
+      std::string_view name = rs.column_str(1);
+      (void)id; (void)name;
+    }
+  }
+
+  // Streaming: process rows without buffering.
+  auto status = session.sql("SELECT v FROM mydb.t").for_each(
+      [](const auto &row) {
+        long long v = row.column_int(0);
+        (void)v;
+      });
+  for (unsigned i = 0; i < status.warning_count(); ++i) {
+    auto w = status.warning(i);
+    (void)w;
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&sql_demo_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
