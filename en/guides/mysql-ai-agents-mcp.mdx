@@ -13,7 +13,7 @@ An AI agent that needs to query a database usually talks to it through a hand-wr
 
 ## What vsql_mcp Does
 
-`vsql_mcp` is a Rust extension that serves MCP over the Streamable HTTP transport (spec revision `2025-06-18`) from a background worker inside the server process. It exposes six tools: `list_schemas`, `list_tables`, `describe_table`, `query`, `explain`, and `write`. The `write` tool only appears once you enable it, and it is disabled by default.
+`vsql_mcp` is a Rust extension that serves MCP over the Streamable HTTP transport (spec revision `2025-06-18`) from a background worker inside the server process. It exposes seven tools: `list_schemas`, `list_tables`, `describe_table`, `query`, `explain`, `write`, and `ddl`. The `write` and `ddl` tools only appear once you enable them, and both are disabled by default.
 
 `vsql_mcp` is a preview extension. It uses the VEF preview capabilities `thread_worker`, `sys_var`, and `status_var`, so the server must be started with preview extensions allowed:
 
@@ -182,7 +182,7 @@ curl -X POST http://127.0.0.1:3100/mcp \
 ]}}
 ```
 
-Five tools are listed, not six. `write` is missing because `allow_write` is still OFF, so an agent connecting right now never plans around a tool it cannot use.
+Five tools are listed, not seven. `write` and `ddl` are both missing because `allow_write` and `allow_ddl` are still OFF, so an agent connecting right now never plans around a tool it cannot use.
 
 ## Calling Tools Over MCP
 
@@ -318,6 +318,88 @@ REVOKE UPDATE ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
 SET GLOBAL vsql_mcp.allow_write = OFF;
 ```
 
+## The ddl Tool
+
+`ddl` is disabled by default too. It runs a single `CREATE TABLE`, `CREATE TEMPORARY TABLE`, `ALTER TABLE`, `DROP TABLE`, `RENAME TABLE`, `CREATE INDEX`, or `DROP INDEX` statement, so an agent can change the schema of the exposed database without a separate MySQL client. Enable it and grant `mcp_user` the privileges the statement needs:
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = ON;
+GRANT CREATE, ALTER, DROP, INDEX ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+`ddl` now appears in `tools/list`, the same way `write` did above. Run one `ALTER TABLE` through it:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN summary VARCHAR(500)"}}}'
+```
+
+```json
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"{\"affected_rows\":0}","type":"text"}],"isError":false}}
+```
+
+```sql
+DESCRIBE mcp_guide.posts;
+```
+
+```
++---------+--------------+------+-----+---------+----------------+
+| Field   | Type         | Null | Key | Default | Extra          |
++---------+--------------+------+-----+---------+----------------+
+| id      | int          | NO   | PRI | NULL    | auto_increment |
+| title   | varchar(200) | NO   |     | NULL    |                |
+| author  | varchar(100) | NO   |     | NULL    |                |
+| views   | int          | NO   |     | 0       |                |
+| summary | varchar(500) | YES  |     | NULL    |                |
++---------+--------------+------+-----+---------+----------------+
+```
+
+`ddl` accepts only those table- and index-level forms; every other statement is refused, including one that drops a whole database:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"DROP DATABASE mcp_guide"}}}'
+```
+
+```json
+{"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool accepts a single CREATE, ALTER, DROP or RENAME TABLE, or CREATE or DROP INDEX statement","type":"text"}],"isError":true}}
+```
+
+`ddl` and `allowed_tables` do not work together. `ddl` is listed in `tools/list` only while `allowed_tables` is empty, because the allowlist works by planning a statement with `EXPLAIN`, which cannot plan DDL. Setting `allowed_tables` while `allow_ddl` is still ON removes `ddl` from `tools/list`, and a direct call to it is refused:
+
+```sql
+SET GLOBAL vsql_mcp.allowed_tables = 'posts';
+```
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN x INT"}}}'
+```
+
+```json
+{"id":7,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool cannot be used while vsql_mcp.allowed_tables is set, because the allowlist cannot check a DDL statement","type":"text"}],"isError":true}}
+```
+
+This guide turns `allow_ddl` back off, clears `allowed_tables` again, and revokes the DDL grants before continuing:
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = OFF;
+SET GLOBAL vsql_mcp.allowed_tables = '';
+REVOKE CREATE, ALTER, DROP, INDEX ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
+```
+
 ## Narrowing What an Agent Can Reach
 
 Two settings narrow an agent's reach further than the account's grants alone, useful when one account serves more than `vsql_mcp`.
@@ -375,6 +457,10 @@ No. The listener serves plain HTTP only, on `127.0.0.1`. Put a reverse proxy in 
 #### Why does changing the port not take effect immediately?
 
 A port setting takes effect the next time the server is enabled. Toggle `vsql_mcp.vsql_mcp_enabled` OFF and then ON after changing it.
+
+#### Can other extensions add their own MCP tools?
+
+Yes. Any installed extension can register a `mcp_tools()` function that declares its own tools, and `vsql_mcp` lists each one in `tools/list` as `<extension>__<name>`; a call to it runs the extension's own handler function over the `db_url` connection. These extension tools need `vsql_mcp.db_url` set, the same as every other tool — while it is not set, no extension tools are listed. The `vsql-mcp` repository's README walks through a complete worked example, a `vsql_greet` extension that adds one tool this way.
 
 ## Troubleshooting
 
