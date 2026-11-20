@@ -24,8 +24,10 @@ What a cut does:
      flat names the 0.0.6 archive uses (create, rust-sdk, extensions/vsql-ai).
      Notes about <new>-dev are left out of the copies. Links inside the archive
      point at the archive. Each snippet that an archived page imports is copied
-     to snippets/<old>/, without the notes, and the page imports that copy. The
-     archive gets noindex, and a group in the Past releases menu.
+     to snippets/<old>/, without the notes, and the page imports that copy.
+     Archived pages and snippets lose the comment that tells an editor to
+     re-run gen-extension-pages.py. The archive gets noindex, and a group in
+     the Past releases menu.
   2. Promote. Each codebase's dev server pages replace its stable server pages,
      and a new dev is copied from the new stable.
   3. Notes. On the shared pages and in the snippets, every <new>-dev note
@@ -184,11 +186,21 @@ def note_blocks(text, version):
     return [(m, m.group("body")) for m in NOTE.finditer(text) if f"{version}-dev" in m.group("body")]
 
 
+# A whole note, with the blank line after it, so that removing it leaves one
+# blank line between the paragraphs around it.
+NOTE_LINES = re.compile(r"^<Info>\n(?P<body>.*?)\n</Info>(?:\n\n?|\Z)", re.S | re.M)
+
+
 def strip_notes(text, version):
-    return NOTE.sub(lambda m: "\n" if f"{version}-dev" in m.group("body") else m.group(0), text)
+    return NOTE_LINES.sub(lambda m: "" if f"{version}-dev" in m.group("body") else m.group(0), text)
 
 
 SNIPPET_IMPORT = re.compile(r'(from "/snippets/)([^"]+\.mdx)"')
+
+# The comment that gen-extension-pages.py puts in each extension page and body.
+# It tells an editor to edit the live body and re-run the generator, which is
+# wrong for an archived copy, so the archive leaves it out.
+GENERATOR_COMMENT = re.compile(r"\{/\*(?:(?!\*/).)*?gen-extension-pages\.py(?:(?!\*/).)*\*/\}\n\n?", re.S)
 
 
 def live_snippets(repo):
@@ -328,7 +340,7 @@ def main():
             return m.group(0)
 
         def freeze(text):
-            text = strip_notes(text, new)
+            text = GENERATOR_COMMENT.sub("", strip_notes(text, new))
             # The schema a manifest names by its GitHub address is archived
             # beside the stable one, so the archive names the frozen copy.
             text = SCHEMA_LINK.sub(lambda m: f"{m.group(1)}/{old}/manifest.json.schema.json", text)
@@ -394,7 +406,7 @@ def main():
         src, dst = repo / "snippets" / name, repo / "snippets" / old / name
         if not dry:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(strip_notes(src.read_text(), new))
+            dst.write_text(GENERATOR_COMMENT.sub("", strip_notes(src.read_text(), new)))
     report.append(f"archive snippets/{old}: {len(frozen)} files")
 
     # ---------------------------------------------------------- promote --
