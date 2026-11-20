@@ -1,0 +1,299 @@
+---
+audience: extension-author
+title: "スレッドワーカーと SQL クエリ"
+description: "vsql::preview::thread_worker 機能はサーバーが駆動するバックグラウンドスレッドを実行し、vsql::preview::sql_query 機能はバックグラウンドスレッドから SQL ステートメントを実行します。"
+---
+
+このページの機能はプレビュー段階です。API は安定しておらず、これらの機能を宣言する拡張機能は、`vsql_allow_preview_extensions = ON` が設定されている場合にのみインストールできます。プレビュー層の有効化と機能の登録方法については、[プレビュー機能](/ja/extensions/build/preview-capabilities)を参照してください。
+
+## スレッドワーカー {#thread-worker}
+
+thread worker 機能（`vsql::preview::thread_worker`）は、サーバーによって駆動されるバックグラウンドスレッドを拡張機能が実行できるようにします。スレッドは、サーバーが拡張機能ロード時に登録する制御システム変数を介して開始および停止されます。サーバーは、定期タイマー、ファイルディスクリプタの準備完了（レディ状態）、有効/無効イベントに応じて拡張機能の作業関数を呼び出します。
+
+機能名 `VEF_PREVIEW_THREAD_WORKER_NAME` は `"vsql::preview::thread_worker"` です。
+
+### 機能の宣言
+
+ヘッダーを含め、ファイルスコープで作業関数をインスタンス化した `ThreadWorkerCapability` を宣言し、`.with()` に渡します：
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"suffix"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+作業関数は非型テンプレート引数（`ThreadWorkerCapability<&my_work>`）として渡されるため、以下のシグネチャを持つ関数でなければなりません。最初のコンストラクタ引数はスレッド名サフィックスです。オプションの2番目の引数は制御 sys var 名をオーバーライドします。
+
+### 作業関数シグネチャ
+
+```c
+typedef vef_next_wakeup_t (*vef_work_fn_t)(vef_wakeup_reason_t reason,
+                                           struct vef_thread_handle_t *thread,
+                                           void *arg);
+```
+
+`reason` はサーバーが関数を呼び出した理由を示します。`thread` はサーバー所有のハンドルです（最初の `VEF_WAKEUP_ENABLE` 呼び出し時は NULL — 以下参照）。`arg` は記述子に登録された不透明ポインタで、変更されずに渡されます。
+
+### Wakeup ライフサイクル
+
+サーバーは4つの理由のいずれかで作業関数を呼び出します：
+
+| 理由 | 意味 |
+|---|---|
+| `VEF_WAKEUP_ENABLE` | ワーカーが有効化された（制御 sys var が ON に切り替えられた）。戻り値は初期の `poll_fd` および `sleep_ms` を設定します。 |
+| `VEF_WAKEUP_PERIODIC` | 定期タイマーが発火（`sleep_ms` 経過）。 |
+| `VEF_WAKEUP_POLL_FD` | 監視中のファイルディスクリプタが読み取り可能になりました。 |
+| `VEF_WAKEUP_DISABLE` | ワーカーが無効化（制御 sys var OFF）またはサーバーがシャットダウン中。戻り値は無視されます。 |
+
+理由が `VEF_WAKEUP_ENABLE` の場合、`thread` パラメータは NULL です。この時点でスレッドハンドルはまだ存在しないためです。他の3つの理由では `thread` は非 NULL です。
+
+### Wakeup 戻り値
+
+```c
+typedef struct {
+  unsigned int sleep_ms;
+  int poll_fd;
+} vef_next_wakeup_t;
+```
+
+作業関数は `vef_next_wakeup_t` を返し、次回のワーカー起動設定を更新します。各フィールドのゼロ値は「現在の設定を維持」を意味します — 両方を変更しない場合は値初期化構造体を返します（`return {};`）。
+
+新しい poll ファイルディスクリプタを設定するには、その値を返します（0より大きい必要があります）。既存の poll ファイルディスクリプタをクリアするには、`poll_fd` に `-1` を返します。
+
+理由が `VEF_WAKEUP_DISABLE` の場合、戻り値は無視されます。
+
+### スレッド名と制御変数
+
+記述子の2つのフィールドが命名を制御します：
+
+- `suffix` — スレッド名サフィックス。サーバーは拡張機能名を前置し、`my_ext/monitor` のようなスレッド名を生成します。
+- `var_name` — オプション。NULL でない場合、サーバーはこの名前を制御システム変数として登録します。NULL の場合、サーバーはデフォルトパターン `{suffix}_enabled` を使用します。
+
+制御変数はサーバー登録のシステム変数であるため、拡張機能名をコンポーネントプレフィックスとして取ります。サフィックス `monitor` を持つ拡張機能 `my_ext` の場合、変数は `my_ext.monitor_enabled` です。
+
+`ON` に設定するとワーカーが開始されます。サーバーは `VEF_WAKEUP_ENABLE` で作業関数を呼び出してからスレッドを作成するため、その最初の呼び出しが終了するまで文は戻りません。ワーカーがすでに実行中に再度 `ON` に設定しても何も起こりません。`OFF` に設定した場合、スレッドが終了した後に戻ります。サーバーはその両方の前後でグローバルなシステム変数ロックを解放するため、作業関数はシステム変数を読み取れますが、`VEF_WAKEUP_DISABLE` の間に実行したクエリは行を返しません。
+
+### 完全な例
+
+単一の定期ワーカーを備えた最小限の拡張機能で、タイマー刻みごとにハートビートカウンターをインクリメントします。
+
+```cpp
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+#include <atomic>
+
+static std::atomic<unsigned long long> g_heartbeat{0};
+
+static vef_next_wakeup_t heartbeat_work(vef_wakeup_reason_t reason,
+                                        struct vef_thread_handle_t *thread,
+                                        void *arg) {
+  switch (reason) {
+    case VEF_WAKEUP_ENABLE:
+      return {1000, 0};  // tick every 1000 ms, no poll fd
+    case VEF_WAKEUP_PERIODIC:
+      g_heartbeat.fetch_add(1, std::memory_order_relaxed);
+      return {};  // keep current sleep_ms and poll_fd
+    case VEF_WAKEUP_POLL_FD:
+      return {};  // not used in this example
+    case VEF_WAKEUP_DISABLE:
+      return {};  // ignored
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&heartbeat_work>
+    g_worker{"heartbeat"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker))
+```
+
+この拡張機能をインストールし（`vsql_allow_preview_extensions = ON` が設定されている場合）、サーバーは拡張機能名の下に `heartbeat_enabled` システム変数を登録します。`my_ext` という名前の拡張機能の場合、ワーカーを有効化するには：
+
+```sql
+SET GLOBAL my_ext.heartbeat_enabled = ON;
+```
+
+## SQL クエリ {#sql-query}
+
+sql_query 機能（`vsql::preview::sql_query`）は、バックグラウンドスレッドから SQL 文を実行できるようにします。クエリは機能の vtable を介してサーバー内部で実行され、拡張機能は MySQL クライアントライブラリをリンクしません。
+
+機能名 `VEF_PREVIEW_SQL_QUERY_NAME` は `"vsql::preview::sql_query"` です。
+
+<Warning>
+SQL セッションは、スレッドワーカーのコールバックからそのコールバックの `vef_thread_handle_t *` を使用して開く必要があります。`open()` は VDF または任意の拡張機能作成スレッドから有効ではありません — これはワーカーセッションコンテキストを必要とします。
+</Warning>
+
+### 機能の宣言
+
+ヘッダーを含め、ファイルスコープで `SqlQueryCapability` を宣言し、`.with()` に渡します。通常、`ThreadWorkerCapability` と共に登録されます。セッションはワーカーのコールバックから開かれるためです：
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t my_work(vef_wakeup_reason_t reason,
+                                 struct vef_thread_handle_t *thread,
+                                 void *arg) {
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+  // ...
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&my_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```
+
+`g_sql.open(handle)` は `Session` を返します。使用前に `operator bool` でチェックしてください。無効な `Session` は機能 vtable がバインドされていないか、サーバーがセッションを割り当てられなかったことを示します。`Session` はムーブオンリーで、破棄時に自動的に閉じられます。
+
+### クエリの実行
+
+`Session` は `session.sql(sv)` で `SqlQuery` を生成します。クエリは2つのモードで実行できます：
+
+- `execute()` — 文を実行し、完全な結果セットを `Result` にバッファリングします。`next()` を呼び出して行をイテレートします。
+- `for_each(fn)` — 文を実行し、行が生成されるたびに `fn` を1回呼び出します。バッファリングしません。返される `Result` には診断情報のみ（行なし）が含まれます。
+
+両方とも `Result` を返します。非 NULL の `Result` は文が成功したことを意味しません — `has_error()` を呼び出して確認してください。
+
+バッファリング（`execute`）：
+
+```cpp
+auto result = session.sql("SELECT id, name FROM t").execute();
+if (result.has_error()) {
+  // result.error().message holds the server error string.
+  return {};
+}
+while (result.next()) {
+  long long id          = result.column_int(0);
+  std::string_view name = result.column_str(1);
+  // ...
+}
+```
+
+`column_str()` は `string_view` を返します。これは次の `next()` 呼び出しまたは `Result` 破棄まで有効です。より長い寿命が必要な場合はコピーしてください。`data() == nullptr` の `string_view` は SQL NULL を示します。
+
+ストリーミング（`for_each`）：
+
+```cpp
+auto status = session.sql("SELECT 1").for_each(
+    [](const auto &row) {
+      // row.column_int(0), row.column_str(1), etc.
+    });
+if (status.has_error()) {
+  // status.error().message
+}
+```
+
+コールバックに渡される `Row` はコールバックの実行中のみ有効です — 行間で参照を保持しないでください。`for_each` が返す `Result` はバッファリングされた行を持たず、`next()` はデータを返しません。`has_error()`、`error()`、`warning_count()`、`warning(i)` のみに使用してください。
+
+### 診断
+
+`execute()` および `for_each()` は返される `Result` を介して診断情報を返します。診断は1つの `Diag` です：
+
+```cpp
+struct Diag {
+  uint32_t errno_;
+  vef_sql_diag_severity_t severity;   // NOTE | WARNING | ERROR
+  std::string_view sqlstate;          // 5-char SQLSTATE
+  std::string_view message;           // may be empty
+};
+```
+
+| フィールド | 意味 |
+|---|---|
+| `errno_` | MySQL エラーナンバー。エラーがない場合に返されるデフォルト構築された `Diag` では `0`。 |
+| `severity` | `VEF_SQL_DIAG_NOTE`、`VEF_SQL_DIAG_WARNING`、`VEF_SQL_DIAG_ERROR`。 |
+| `sqlstate` | 5文字の SQLSTATE。 |
+| `message` | サーバー提供の診断メッセージ；空の場合あり。 |
+
+`Result` は以下を公開します：
+
+```cpp
+bool         Result::has_error() const;
+Diag         Result::error() const;
+unsigned int Result::warning_count() const;
+Diag         Result::warning(unsigned int i) const;
+```
+
+`error()` は文が成功した場合、デフォルト構築された `Diag`（`errno_ == 0`）を返します。`warning(i)` は `i >= warning_count()` の場合、デフォルト構築された `Diag` を返します。
+
+`sqlstate` および `message` のビューは `Result` が所有するストレージを指しており、`Result` が破棄されると無効になります — `Result` の生存期間を超えて保持する必要がある場合はコピーしてください。
+
+### 完全な例
+
+タイマー刻みごとに1つのバッファリングクエリと1つのストリーミングクエリを実行し、両方の診断をログ出力するワーカー：
+
+```cpp
+#include <villagesql/preview/sql_query.h>
+#include <villagesql/preview/thread_worker.h>
+#include <villagesql/vsql.h>
+
+static vsql::preview_sql_query::SqlQueryCapability g_sql;
+
+static vef_next_wakeup_t sql_demo_work(vef_wakeup_reason_t reason,
+                                       struct vef_thread_handle_t *thread,
+                                       void *arg) {
+  if (reason == VEF_WAKEUP_ENABLE) return {5000, 0};
+  if (reason != VEF_WAKEUP_PERIODIC) return {};
+
+  auto session = g_sql.open(thread);
+  if (!session) return {};
+
+  // Buffered: read a small result set.
+  auto rs = session.sql("SELECT id, name FROM mydb.t LIMIT 10").execute();
+  if (rs.has_error()) {
+    auto e = rs.error();
+    // Log e.errno_, e.sqlstate, e.message somewhere extension-owned.
+  } else {
+    while (rs.next()) {
+      long long id          = rs.column_int(0);
+      std::string_view name = rs.column_str(1);
+      (void)id; (void)name;
+    }
+  }
+
+  // Streaming: process rows without buffering.
+  auto status = session.sql("SELECT v FROM mydb.t").for_each(
+      [](const auto &row) {
+        long long v = row.column_int(0);
+        (void)v;
+      });
+  for (unsigned i = 0; i < status.warning_count(); ++i) {
+    auto w = status.warning(i);
+    (void)w;
+  }
+  return {};
+}
+
+static vsql::preview_thread_worker::ThreadWorkerCapability<&sql_demo_work>
+    g_worker{"sql_demo"};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_worker)
+        .with(g_sql))
+```

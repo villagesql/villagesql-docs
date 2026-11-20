@@ -1,0 +1,221 @@
+---
+audience: extension-author
+title: "상태 변수, 시스템 변수, 세션 변수"
+description: "vsql::status_var, vsql::sys_var, vsql::session_var 기능을 사용하면 확장 프로그램이 상태 카운터를 노출하고 전역 및 세션별 시스템 변수를 등록할 수 있습니다."
+---
+
+이 페이지의 기능은 미리보기 단계입니다. API는 안정적이지 않으며, 이 기능을 선언하는 확장 프로그램은 설치 시 `vsql_allow_preview_extensions = ON`이 필요합니다. 미리보기 계층을 활성화하고 기능을 등록하는 방법은 [미리보기 기능](/ko/extensions/build/preview-capabilities)을 참조하세요.
+
+## 상태 변수 {#status-variables}
+
+status_var 기능(`vsql::status_var`)은 확장 프로그램이 MySQL 상태 변수로 `long long` 및 `double` 카운터를 노출할 수 있게 해줍니다. 확장 프로그램은 저장소를 소유하고 쓰며, 서버는 상태 변수가 쿼리될 때마다 포인터를 통해 읽습니다.
+
+`vsql::preview_status_var::make_capability()`으로 기능을 구축하고, `make_int(name, value_ptr)` 또는 `make_double(name, value_ptr)`에서 제공하는 디스크립터 목록을 중괄호로 감싸 전달합니다. 템플릿은 중괄호 목록에서 개수를 추론하므로 명시적 크기는 필요하지 않습니다.
+
+### 완전한 예제
+
+```cpp
+#include <villagesql/preview/status_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_status_var;
+
+static long long g_hits   = 0;
+static long long g_misses = 0;
+
+static auto STATUS_VARS = sv::make_capability({
+    sv::make_int("ext_hits",   &g_hits),
+    sv::make_int("ext_misses", &g_misses)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STATUS_VARS))
+```
+
+`make_int`는 `long long *`를 요구하며, `make_double`는 `double *`를 요구합니다. 이 두 유형만 지원됩니다.
+
+### SQL에서 접근
+
+`INSTALL EXTENSION my_ext` 후, 변수는 확장 프로그램 이름을 접두사로 사용하여 사용 가능합니다:
+
+```sql
+SHOW GLOBAL STATUS LIKE 'my_ext%';
+```
+```
+Variable_name       Value
+my_ext.ext_hits     0
+my_ext.ext_misses   0
+```
+
+다중 쿼리 스레드에서 비원자적 `++`를 사용해 동시 증가가 때로 손실될 수 있지만, 이는 `SHOW STATUS`를 통해 노출된 근사 호출 카운터에 대해 허용됩니다.
+
+## 시스템 변수 {#system-variables}
+
+sys_var 기능(`vsql::sys_var`)은 확장 프로그램이 소유한 저장소를 기반으로 하는 MySQL 시스템 변수를 등록할 수 있게 해줍니다. 네 가지 유형이 지원됩니다: `BOOL`(`bool *`), `INT`(`long long *`), `STR`(`char **`), 그리고 `ENUM`(`unsigned long *`, 고정된 순서의 이름 목록에 대한 0 기반 인덱스를 저장). `INT` 디스크립터는 `min_val` 및 `max_val` 경계도 포함하며, 모든 디스크립터는 기본값과 주석을 포함합니다.
+
+`vsql::preview_sys_var::make_capability()`으로 기능을 구축하고, 대응하는 팩토리 함수인 `make_bool`, `make_int`, `make_str`, 그리고 `make_enum`을 사용합니다. 기능 객체는 확장 코드에서의 프로그래밍 접근을 위해 `get()` 및 `set()`을 노출합니다. 둘 다 성공 시 `false`를 반환합니다.
+
+값 변경에 반응하려면 디스크립터에 `.on_change<&fn>()`을 연결합니다. 콜백은 `var_name()` 및 타입 접근자(`as_int()`, `as_str()`, 그리고 `as_enum()`)를 포함하는 `sv::SysVarChange`를 수신합니다.
+
+서버는 전역 시스템 변수 잠금을 보유한 상태에서 그 콜백을 호출합니다. 그곳에서 이 확장 프로그램의 다른 변수를 저장소 포인터를 통해 읽거나 쓰는 것은 안전하며, 서버가 동일한 잠금 아래에서 그 변수들을 읽기 때문에 다른 세션은 새 값을 즉시 봅니다.
+
+<Warning>
+기능의 `get()` 또는 `set()`을 호출하거나, SQL을 실행하거나, 둘 중 하나를 수행하는 스레드를 기다리면 그 잠금에서 교착 상태가 발생합니다. 콜백을 짧고 논블로킹으로 유지하고, SQL이 필요한 작업은 [스레드 워커](/ko/extensions/build/preview-background-sql#thread-worker)에 넘기거나, `sql/sys_vars.cc`의 `event_scheduler_update()`가 하는 것처럼 블로킹 부분 주위에서 `LOCK_global_system_variables`를 해제했다가 반환하기 전에 다시 획득하세요.
+</Warning>
+
+기능 객체는 정적 저장 기간을 가져야 합니다. MySQL은 사용자가 변수를 설정할 때 저장소 포인터에 직접 씁니다.
+
+| 팩토리 | 저장소 유형 | 추가 매개변수 |
+|---------|--------------|------------------|
+| `sv::make_bool` | `bool *` | `def_val` |
+| `sv::make_int` | `long long *` | `def_val`, `min_val`, `max_val` |
+| `sv::make_str` | `char **` | `def_val` |
+| `sv::make_enum` | `unsigned long *` | `names`, `name_count`, `def_val` |
+
+열거형 변수는 이름(`SET GLOBAL my_ext.mode = 'sync'`)으로 또는 이름의 0 기반 인덱스로 설정합니다. 어느 쪽이든 서버는 값을 수락하기 전에 `names`와 대조하여 검증하며, 인식되지 않는 이름이나 범위를 벗어난 인덱스는 저장하는 대신 거부합니다:
+
+```
+ERROR 1231 (42000): Variable 'my_ext.mode' can't be set to the value of 'bogus'
+```
+
+이 검증이 자유 형식의 `make_str`과 구별되는 점입니다: 값 공간이 닫혀 있고 `SET` 시점에 강제됩니다. 편의 오버로드는 `static const char *const NAMES[] = {...}` 배열에서 `name_count`를 추론하므로, 개수 인수를 생략할 수 있습니다.
+
+### 완전한 예제
+
+```cpp
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_sys_var;
+
+static bool      g_enabled   = true;
+static long long g_threshold = 1000;
+static char     *g_log_file  = nullptr;
+static unsigned long g_mode  = 0;  // index into MODE_NAMES; default "off"
+
+static const char *const MODE_NAMES[] = {"off", "on", "sync"};
+
+static void on_threshold_change(sv::SysVarChange c) {
+  // c.var_name() identifies the variable; c.as_int().value() returns the new value
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled",      "Enable feature",  &g_enabled,   true),
+    sv::make_int ("threshold_ms", "Threshold in ms", &g_threshold, 1000, 0, 3600000)
+        .on_change<&on_threshold_change>(),
+    sv::make_str ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log"),
+    sv::make_enum("mode",         "Operating mode",  &g_mode,      MODE_NAMES, 0)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SYS_VARS))
+```
+
+### SQL에서 접근
+
+`INSTALL EXTENSION my_ext` 후, 변수는 확장 프로그램 이름을 구성 접두사로 사용하여 접근 가능합니다:
+
+```sql
+SELECT @@global.my_ext.threshold_ms;
+SET GLOBAL my_ext.threshold_ms = 500;
+SET GLOBAL my_ext.log_file = '/var/log/myext.log';
+SET GLOBAL my_ext.mode = 'sync';
+```
+
+### 확장 코드에서 읽기 및 쓰기
+
+INT 및 BOOL 변수의 경우, 전역 저장소 포인터를 직접 읽습니다 — MySQL은 이들을 원자적으로 업데이트합니다. MySQL을 통해 변수를 업데이트하려면(잠금, 범위 검증, 지속성이 서버에서 처리되도록), `SYS_VARS.set(extension_name, var_name, scope, value)`를 호출합니다. `set` 및 `get` 둘 다 성공 시 `false`를 반환합니다. 둘 중 어느 것도 `on_change` 콜백에서 호출할 수 없습니다: 둘 다 시스템 변수 잠금에서 교착 상태가 발생합니다.
+
+```cpp
+bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
+```
+
+`set`과 `get`은 확장 프로그램 이름과 변수 이름을 `const char *`로 받습니다. `INT` 변수는 정수 값으로만 설정됩니다. 문자열 값으로 `set`을 호출하면 실패하고 `true`를 반환합니다(`INT` 변수의 경우). `BOOL`, `STRING`, `DOUBLE`, `ENUM` 변수는 문자열 값으로 설정하세요.
+
+`scope` 인수는 다음과 같이 지속성을 제어합니다:
+
+| 범위 | 동작 |
+|-------|----------|
+| `nullptr` | 실행 중 값만 업데이트, 지속되지 않음. |
+| `"PERSIST"` | 실행 중 값을 업데이트하고 `mysqld-auto.cnf`에 쓰기. |
+| `"PERSIST_ONLY"` | `mysqld-auto.cnf`에만 쓰기; 다음 재시작 시 적용. |
+
+## 세션 변수 {#session-variables}
+
+session_var 기능(`vsql::session_var`)은 확장 프로그램이 세션별(THD 로컬) 시스템 변수를 등록할 수 있게 해줍니다 — 플러그인의 `MYSQL_THDVAR_*`에 기능적으로 상응하는 것입니다. 이는 [`vsql::sys_var`](#system-variables)의 세션 범위 형제입니다: sys_var는 모든 연결이 공유하는 하나의 값을 갖는 반면, session_var는 각 연결에 `SET SESSION`으로 설정하는 자체 값을 부여합니다. 새 세션의 시작점은 디스크립터의 기본값 또는 `SET GLOBAL`로 마지막으로 저장된 값입니다. 변수의 범위는 등록 시 고정됩니다 — 세션별 변수에는 이 기능을, 전역 변수에는 `vsql::sys_var`를 사용하세요.
+
+두 가지 유형만 지원됩니다: `INT`(`long long`)와 `STR`(`std::string`). `BOOL` 또는 `DOUBLE` 세션 변수는 없으며, `on_change` 콜백 메커니즘도 없습니다 — `vsql::sys_var`와 달리, 확장 프로그램은 세션 변수의 값을 변경 시 알림을 받는 것이 아니라 다시 읽어서만 관찰합니다.
+
+### 기능 선언
+
+`vsql::preview_session_var::make_capability()`으로 기능을 구축하고, `make_int(name, comment)` 또는 `make_str(name, comment)`에서 제공하는 디스크립터 목록을 중괄호로 감싸 전달합니다. 각 디스크립터는 플루언트 `.default_()`, `.min()`, `.max()` 설정자로 구성합니다(`min`/`max`는 `INT`에만 적용됩니다):
+
+```cpp
+#include <villagesql/preview/session_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_session_var;
+
+static auto SESSION_VARS = sv::make_capability({
+    sv::make_int("session_int_var", "Search width")
+        .default_(20)
+        .min(1)
+        .max(4096),
+    sv::make_str("label", "Per-session label")
+        .default_("default"),
+});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SESSION_VARS))
+```
+
+`make_int`는 제약 없이 시작합니다(기본값 `0`, 전체 `long long` 범위). `make_str`은 빈 문자열 기본값으로 시작합니다. 기능 객체는 이 페이지의 다른 모든 미리보기 기능과 마찬가지로 정적 저장 기간이 필요합니다.
+
+### 세션 값 읽기
+
+두 가지 읽기 경로가 있으며, 둘 다 *호출하는* 연결의 스레드에 대해 해석됩니다 — 따라서 둘 다 **연결 스레드(연결에서 실행되는 VDF 또는 콜백)에서 호출해야 하며, 백그라운드 스레드 워커에서는 절대 호출하면 안 됩니다**:
+
+- `SESSION_VARS.get_session_int(name, out)` / `get_session_str(name, out)` — 이름 기반이며, 호출마다 변수를 다시 해석합니다. 가끔 읽는 경우에 사용하세요. `STR` 변수의 경우 이것이 유일한 경로입니다: 잠금 없는 문자열 빠른 경로는 없는데, `STR` 슬롯은 별도로 할당된 버퍼에 대한 포인터를 보유하며 동시에 실행되는 `SET SESSION` 또는 `UNINSTALL`이 그 버퍼를 해제할 수 있기 때문입니다.
+- `SESSION_VARS.int_var(name)`은 첫 `read()` 시 지연 해석하고 결과를 캐시하는 `IntVar`를 반환하므로, 기능이 로드되기 전에 파일/정적 범위에서 선언할 수 있습니다. 이후의 각 `read()`는 잠금 없는 스레드별 오프셋 로드입니다 — 이름 조회 없음, 전역 잠금 없음 — 플러그인의 `THDVAR(thd, var)`에 상응합니다. 이 빠른 경로는 `INT` 전용입니다.
+
+```cpp
+static auto SESSION_INT = SESSION_VARS.int_var("session_int_var");
+
+void read_session_int_var_impl(vsql::IntResult out) {
+  long long val = 0;
+  if (SESSION_INT.read(val)) { out.set_null(); return; }
+  out.set(val);
+}
+```
+
+### SQL에서 접근
+
+`INSTALL EXTENSION my_ext` 후, 각 변수는 확장 프로그램 이름을 구성 접두사로 사용하며 `@@session.`과 `@@global.` 둘 다로 읽고 설정할 수 있습니다:
+
+```sql
+SELECT @@global.my_ext.session_int_var;
+SELECT @@session.my_ext.session_int_var;
+SET SESSION my_ext.session_int_var = 100;
+```
+
+두 번째 연결은 첫 번째 연결의 `SET SESSION`에 영향을 받지 않으며, 자체 값을 설정하기 전까지는 컴파일된 기본값을 봅니다. `SET GLOBAL`은 새 세션이나 재설정된 세션이 가져오는 기본값을 변경하며, 이미 설정된 어떤 세션의 값도 변경하지 않습니다.
+
+범위를 벗어난 `INT` 대입은 경계값으로 잘리고 경고가 발생하며, 잘못된 유형의 대입은 거부됩니다. 일반 MySQL 시스템 변수와 정확히 동일합니다:
+
+```sql
+SET SESSION my_ext.session_int_var = 999999;  -- max is 4096
+```
+```text
+Warning	1292	Truncated incorrect my_ext.session_int_var value: '999999'
+```
+```sql
+SET SESSION my_ext.session_int_var = "hello";
+```
+```text
+ERROR 1232 (42000): Incorrect argument type to variable 'my_ext.session_int_var'
+```
+
+### 재시작 동작
+
+`SET PERSIST`와 `SET PERSIST_ONLY`는 다른 MySQL 시스템 변수와 마찬가지로 세션 변수의 전역 값에 대해 작동합니다: 값은 서버 재시작 후에도 유지되고, 각 새 세션은 그 값에서 시작합니다. `SET SESSION` 값은 연결별 상태이며 재시작 후 유지되지 않습니다. `SET PERSIST`가 없으면, 확장 프로그램이 여전히 설치된 상태로 재시작한 후 각 변수는 컴파일된 기본값으로 다시 나타납니다.

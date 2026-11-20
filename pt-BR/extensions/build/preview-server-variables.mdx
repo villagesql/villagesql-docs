@@ -1,0 +1,309 @@
+---
+audience: extension-author
+title: "Variáveis de Status, de Sistema e de Sessão"
+description: "As capabilities vsql::status_var, vsql::sys_var e vsql::session_var permitem que uma extensão exponha contadores de status e registre variáveis de sistema globais e por sessão."
+---
+
+As capabilities desta página estão em Preview: suas APIs não são estáveis, e uma extensão que declara uma delas requer `vsql_allow_preview_extensions = ON` para instalar. Consulte [Capabilities Preview](/pt-BR/extensions/build/preview-capabilities) para saber como habilitar o nível Preview e registrar uma capability.
+
+## Variáveis de Status {#status-variables}
+
+A capability status_var (`vsql::status_var`) permite que uma extensão
+exponha contadores `long long` e `double` como variáveis de status do MySQL. A
+extensão é dona do armazenamento e escreve nele; o servidor lê através dos
+pointers cada vez que a variável de status é consultada.
+
+Construa a capability com `vsql::preview_status_var::make_capability()`, passando
+uma lista entre chaves de descritores de `make_int(name, value_ptr)` ou
+`make_double(name, value_ptr)`. O template deduz a contagem a partir da lista
+entre chaves, então nenhum tamanho explícito é necessário.
+
+### Exemplo Completo
+
+```cpp
+#include <villagesql/preview/status_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_status_var;
+
+static long long g_hits   = 0;
+static long long g_misses = 0;
+
+static auto STATUS_VARS = sv::make_capability({
+    sv::make_int("ext_hits",   &g_hits),
+    sv::make_int("ext_misses", &g_misses)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STATUS_VARS))
+```
+
+`make_int` requer um `long long *`; `make_double` requer um `double *`. Esses são
+os únicos dois tipos compatíveis.
+
+### Acessando a partir do SQL
+
+Após `INSTALL EXTENSION my_ext`, a variável fica visível com o nome da extensão
+como prefixo:
+
+```sql
+SHOW GLOBAL STATUS LIKE 'my_ext%';
+```
+```
+Variable_name       Value
+my_ext.ext_hits     0
+my_ext.ext_misses   0
+```
+
+Incrementos concorrentes de múltiplas threads de consulta usando um `++`
+não-atômico podem ocasionalmente ser perdidos; isso é aceitável para contadores
+aproximados de chamadas expostos via `SHOW STATUS`.
+
+## Variáveis de Sistema {#system-variables}
+
+A capability sys_var (`vsql::sys_var`) permite que uma extensão registre
+variáveis de sistema do MySQL respaldadas por armazenamento de propriedade da
+extensão. Há suporte para quatro tipos: `BOOL` (`bool *`), `INT`
+(`long long *`), `STR` (`char **`) e `ENUM`
+(`unsigned long *`, que armazena um índice com base zero em uma lista fixa e
+ordenada de nomes). Os descritores `INT` também carregam limites `min_val` e
+`max_val`; todos os descritores carregam um valor padrão e um comentário.
+
+Construa a capability com `vsql::preview_sys_var::make_capability()` e as funções
+de fábrica correspondentes `make_bool`, `make_int`, `make_str` e `make_enum`. O objeto de
+capability também expõe `get()` e `set()` para acesso programático a partir do
+código da extensão. Ambos retornam `false` em caso de sucesso.
+
+Para reagir a mudanças de valor, encadeie `.on_change<&fn>()` em um descritor. O
+callback recebe um `sv::SysVarChange` com `var_name()` e acessadores tipados
+(`as_int()`, `as_str()` e `as_enum()`).
+
+O servidor chama esse callback enquanto mantém o seu lock global de variáveis de
+sistema. Ler ou escrever outra variável desta extensão através do seu pointer de
+armazenamento é seguro ali, e as outras sessões veem o novo valor imediatamente,
+porque o servidor lê essas variáveis sob o mesmo lock.
+
+<Warning>
+Chamar o `get()` ou o `set()` da capability, executar SQL ou esperar por uma
+thread que faça uma dessas coisas causa deadlock nesse lock. Mantenha o callback
+curto e não bloqueante, entregue a uma [thread de trabalho](/pt-BR/extensions/build/preview-background-sql#thread-worker) o
+trabalho que precisa de SQL, ou libere o `LOCK_global_system_variables` em volta
+da parte bloqueante e retome-o antes de retornar, como o
+`event_scheduler_update()` faz em `sql/sys_vars.cc`.
+</Warning>
+
+O objeto de capability deve ter duração de armazenamento estática. O MySQL
+escreve diretamente nos pointers de armazenamento quando o usuário define uma
+variável.
+
+| Fábrica | Tipo de armazenamento | Parâmetros extras |
+|---------|--------------|------------------|
+| `sv::make_bool` | `bool *` | `def_val` |
+| `sv::make_int` | `long long *` | `def_val`, `min_val`, `max_val` |
+| `sv::make_str` | `char **` | `def_val` |
+| `sv::make_enum` | `unsigned long *` | `names`, `name_count`, `def_val` |
+
+Uma variável enum é definida pelo nome (`SET GLOBAL my_ext.mode = 'sync'`) ou
+pelo índice com base zero do nome; em ambos os casos o servidor valida o valor
+contra `names` antes de aceitá-lo, rejeitando um nome não reconhecido ou um
+índice fora do intervalo em vez de armazená-lo:
+
+```
+ERROR 1231 (42000): Variable 'my_ext.mode' can't be set to the value of 'bogus'
+```
+
+Essa validação é o que a distingue de um `make_str` de formato livre: o espaço
+de valores é fechado e imposto no momento do `SET`. Uma sobrecarga de
+conveniência deduz `name_count` a partir de um array
+`static const char *const NAMES[] = {...}`, então o argumento de contagem pode
+ser omitido.
+
+### Exemplo Completo
+
+```cpp
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_sys_var;
+
+static bool      g_enabled   = true;
+static long long g_threshold = 1000;
+static char     *g_log_file  = nullptr;
+static unsigned long g_mode  = 0;  // index into MODE_NAMES; default "off"
+
+static const char *const MODE_NAMES[] = {"off", "on", "sync"};
+
+static void on_threshold_change(sv::SysVarChange c) {
+  // c.var_name() identifies the variable; c.as_int().value() returns the new value
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled",      "Enable feature",  &g_enabled,   true),
+    sv::make_int ("threshold_ms", "Threshold in ms", &g_threshold, 1000, 0, 3600000)
+        .on_change<&on_threshold_change>(),
+    sv::make_str ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log"),
+    sv::make_enum("mode",         "Operating mode",  &g_mode,      MODE_NAMES, 0)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SYS_VARS))
+```
+
+### Acessando a partir do SQL
+
+Após `INSTALL EXTENSION my_ext`, as variáveis ficam acessíveis usando o nome da
+extensão como prefixo de componente:
+
+```sql
+SELECT @@global.my_ext.threshold_ms;
+SET GLOBAL my_ext.threshold_ms = 500;
+SET GLOBAL my_ext.log_file = '/var/log/myext.log';
+SET GLOBAL my_ext.mode = 'sync';
+```
+
+### Lendo e Escrevendo a partir do Código da Extensão
+
+Para variáveis INT e BOOL, leia o pointer de armazenamento global diretamente —
+o MySQL atualiza esses valores atomicamente. Para atualizar uma variável através
+do MySQL (de forma que travamento, validação de intervalo e persistência sejam
+tratados pelo servidor), chame
+`SYS_VARS.set(extension_name, var_name, scope, value)`. Tanto `set` quanto `get`
+retornam `false` em caso de sucesso. Nenhum dos dois pode ser chamado a partir de
+um callback `on_change`: ambos causam deadlock no lock de variáveis de sistema.
+
+```cpp
+bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
+```
+
+`set` e `get` recebem o nome da extensão e o nome da variável como `const char *`. Uma variável `INT` é definida somente com um valor inteiro; `set` com um valor de string falha (retorna `true`) para uma variável `INT`. Defina as variáveis `BOOL`, `STRING`, `DOUBLE` e `ENUM` com um valor de string.
+
+O argumento `scope` controla a persistência:
+
+| Escopo | Comportamento |
+|-------|----------|
+| `nullptr` | Atualiza apenas o valor em execução, não persistido. |
+| `"PERSIST"` | Atualiza o valor em execução e escreve em `mysqld-auto.cnf`. |
+| `"PERSIST_ONLY"` | Escreve apenas em `mysqld-auto.cnf`; entra em vigor na próxima reinicialização. |
+
+## Variáveis de Sessão {#session-variables}
+
+A capability session_var (`vsql::session_var`) permite que uma extensão registre
+variáveis de sistema por sessão (locais ao THD) — o equivalente funcional do
+`MYSQL_THDVAR_*` de um plugin. Ela é a irmã com escopo de sessão de
+[`vsql::sys_var`](#system-variables): uma sys_var tem um único valor
+compartilhado por todas as conexões, enquanto uma session_var dá a cada conexão
+o seu próprio valor, definido com `SET SESSION`. O ponto de partida de uma nova
+sessão é o padrão do descritor, ou o valor armazenado por último com
+`SET GLOBAL`. O escopo de uma variável é fixado no registro — use esta
+capability para variáveis por sessão, e `vsql::sys_var` para as globais.
+
+Há suporte para apenas dois tipos: `INT` (`long long`) e `STR` (`std::string`).
+Não há variável de sessão `BOOL` ou `DOUBLE`, e não há mecanismo de callback
+`on_change` — diferente de `vsql::sys_var`, uma extensão observa o valor de uma
+variável de sessão apenas lendo-o de volta, e não sendo notificada quando ele
+muda.
+
+### Declarando a Capability
+
+Construa a capability com `vsql::preview_session_var::make_capability()`,
+passando uma lista entre chaves de descritores de `make_int(name, comment)` ou
+`make_str(name, comment)`, cada um configurado com os setters fluentes
+`.default_()`, `.min()` e `.max()` (`min`/`max` se aplicam apenas a `INT`):
+
+```cpp
+#include <villagesql/preview/session_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_session_var;
+
+static auto SESSION_VARS = sv::make_capability({
+    sv::make_int("session_int_var", "Search width")
+        .default_(20)
+        .min(1)
+        .max(4096),
+    sv::make_str("label", "Per-session label")
+        .default_("default"),
+});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SESSION_VARS))
+```
+
+`make_int` começa sem restrições (padrão `0`, intervalo completo de
+`long long`); `make_str` começa com uma string vazia como padrão. O objeto de
+capability precisa de duração de armazenamento estática, como toda outra
+capability Preview desta página.
+
+### Lendo Valores de Sessão
+
+Há dois caminhos de leitura, ambos resolvidos contra a thread da conexão
+*chamadora* — então ambos **devem ser chamados na thread da conexão (uma VDF ou
+um callback em execução na conexão), nunca a partir de um thread worker em
+segundo plano**:
+
+- `SESSION_VARS.get_session_int(name, out)` / `get_session_str(name, out)` —
+  indexado pelo nome, resolve a variável novamente a cada chamada. Use-o para
+  leituras ocasionais, e para variáveis `STR` ele é o único caminho: não há um
+  caminho rápido sem lock para strings, porque um slot `STR` contém um pointer
+  para um buffer alocado separadamente, que um `SET SESSION` ou `UNINSTALL`
+  concorrente pode liberar.
+- `SESSION_VARS.int_var(name)` retorna um `IntVar` que se resolve de forma
+  preguiçosa no seu primeiro `read()` e armazena o resultado em cache, de modo
+  que pode ser declarado no escopo do arquivo/estático antes que a capability
+  tenha carregado. Cada `read()` seguinte é uma carga por offset por thread sem
+  lock — sem busca por nome, sem lock global — o equivalente do
+  `THDVAR(thd, var)` de um plugin. Esse caminho rápido é apenas para `INT`.
+
+```cpp
+static auto SESSION_INT = SESSION_VARS.int_var("session_int_var");
+
+void read_session_int_var_impl(vsql::IntResult out) {
+  long long val = 0;
+  if (SESSION_INT.read(val)) { out.set_null(); return; }
+  out.set(val);
+}
+```
+
+### Acessando a partir do SQL
+
+Após `INSTALL EXTENSION my_ext`, cada variável recebe o nome da extensão como
+prefixo de componente e pode ser lida e definida tanto com `@@session.` quanto
+com `@@global.`:
+
+```sql
+SELECT @@global.my_ext.session_int_var;
+SELECT @@session.my_ext.session_int_var;
+SET SESSION my_ext.session_int_var = 100;
+```
+
+Uma segunda conexão não é afetada pelo `SET SESSION` da primeira conexão, e vê o
+padrão compilado até definir o seu próprio valor; `SET GLOBAL` altera o padrão
+que as sessões novas ou redefinidas recebem, e não o valor já definido de
+qualquer sessão.
+
+As atribuições `INT` fora do intervalo são limitadas ao valor-limite e geram um
+aviso, e uma atribuição com o tipo errado é rejeitada, exatamente como em uma
+variável de sistema comum do MySQL:
+
+```sql
+SET SESSION my_ext.session_int_var = 999999;  -- max is 4096
+```
+```text
+Warning	1292	Truncated incorrect my_ext.session_int_var value: '999999'
+```
+```sql
+SET SESSION my_ext.session_int_var = "hello";
+```
+```text
+ERROR 1232 (42000): Incorrect argument type to variable 'my_ext.session_int_var'
+```
+
+### Comportamento na Reinicialização
+
+`SET PERSIST` e `SET PERSIST_ONLY` funcionam no valor global de uma variável de
+sessão como em qualquer variável de sistema do MySQL: o valor sobrevive a uma
+reinicialização do servidor, e cada nova sessão começa nele. Um valor de
+`SET SESSION` é estado por conexão e não sobrevive a uma reinicialização. Sem
+`SET PERSIST`, cada variável reaparece no seu padrão compilado depois de uma
+reinicialização com a extensão ainda instalada.

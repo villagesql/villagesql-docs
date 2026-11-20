@@ -1,0 +1,299 @@
+---
+audience: extension-author
+title: "Keyring アクセスと MySQL サービス"
+description: "vsql::preview::keyring 機能は MySQL キーリング内のシークレットを読み書きし、vsql::preview::mysql_services 機能を使用すると拡張機能が MySQL レジストリサービスを利用できます。"
+---
+
+このページの機能はプレビュー段階です。API は安定しておらず、これらの機能を宣言する拡張機能は、`vsql_allow_preview_extensions = ON` が設定されている場合にのみインストールできます。プレビュー層の有効化と機能の登録方法については、[プレビュー機能](/ja/extensions/build/preview-capabilities)を参照してください。
+
+## Keyring アクセス {#keyring-access}
+
+keyring 機能（`vsql::preview::keyring`）は、MySQL keyring コンポーネントに格納されたシークレットを拡張機能が読み書きできるようにします。APIキー、暗号化キー、またはSQLテーブルに保存したくないその他のシークレットに使用します。
+
+機能名 `VEF_PREVIEW_KEYRING_NAME` は `"vsql::preview::keyring"` です。
+
+keyring コンポーネント（たとえば `component_keyring_file`）は、[Keyring Component Installation](https://dev.mysql.com/doc/refman/8.4/en/keyring-component-installation.html) に記載されているとおり、コンポーネントマニフェストとその設定ファイルを通じてサーバー起動時にロードされている必要があります。`INSTALL COMPONENT` ではそれを利用可能にできません。ロードされていない場合、操作は `KeyringCapability::Status::UNAVAILABLE` を返します。
+
+### ステータス値
+
+`KeyringCapability::Status` は `read()`（`ReadResult` 内）および `write()` から返されるスコープ付き列挙型です：
+
+| ステータス | 意味 |
+|---|---|
+| `Status::OK` | 操作が成功しました。 |
+| `Status::NOT_FOUND` | キーが存在しません（読み取りのみ）。 |
+| `Status::UNAVAILABLE` | keyring コンポーネントがインストールされていません。 |
+| `Status::ERROR` | その他の失敗。 |
+
+### 機能の宣言
+
+ヘッダーを含め、ファイルスコープで機能オブジェクトを宣言し、`.with()` に渡します：
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_keyring))
+```
+
+`g_keyring` オブジェクトはロード時にサーバーによって初期化されます。keyring コンポーネントがインストールされていない場合、`read()` および `write()` は実行時に `Status::UNAVAILABLE` を返します — 別の利用可能性チェックで処理をガードする代わりに、各呼び出しでステータスを確認してください。
+
+### 読み書き
+
+```cpp
+struct KeyringCapability::ReadResult {
+  KeyringCapability::Status status;
+  std::string value;
+};
+
+[[nodiscard]] KeyringCapability::ReadResult
+KeyringCapability::read(std::string_view data_id,
+                        std::string_view auth_id = {}) const;
+
+[[nodiscard]] KeyringCapability::Status
+KeyringCapability::write(std::string_view data_id,
+                         std::string_view auth_id,
+                         std::string_view data) const;
+```
+
+`data_id` はキー識別子です。`auth_id` は所有ユーザーです — 内部キー（特定のユーザーに関連付けられていない）を読み書きするには空文字列（または `read` では省略、デフォルトは `{}`）を渡します。
+
+`read` は値で `ReadResult` を返します。構造化バインディングでバインドします：
+
+```cpp
+auto [status, value] = g_keyring.read("my_secret");
+if (status == KeyringCapability::Status::OK) {
+  // value contains the secret bytes
+}
+```
+
+`Status::OK` 以外のステータスの場合、`value` は空です。
+
+`write` は直接 `Status` を返し、`data` を `data_id` / `auth_id` で格納します。`component_keyring_file` では、既存のキーへの書き込みは `Status::ERROR` を返します。
+
+### 完全な例
+
+これはサーバーの `villagesql/test-extensions/` ツリーにある `vsql_keyring_reader` テスト拡張機能の簡略化されたバージョンです。2つの VDF を登録します：`keyring_read` および `keyring_store`。
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+void keyring_read(StringArg data_id, StringArg auth_id, StringResult out) {
+  if (data_id.is_null()) { out.set_null(); return; }
+
+  const auto [status, value] =
+      g_keyring.read(data_id.value(), auth_id.is_null() ? "" : auth_id.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  if (status != KeyringCapability::Status::OK) { out.set_null(); return; }
+
+  auto buf = out.buffer();
+  if (value.size() <= buf.size())
+    memcpy(buf.data(), value.data(), value.size());
+  out.set_length(value.size());
+}
+
+void keyring_store(StringArg data_id, StringArg auth_id, StringArg value,
+                   IntResult out) {
+  if (data_id.is_null() || value.is_null()) { out.set(1); return; }
+
+  KeyringCapability::Status status = g_keyring.write(
+      data_id.value(), auth_id.is_null() ? "" : auth_id.value(), value.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  out.set(status == KeyringCapability::Status::OK ? 0 : 1);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&keyring_read>("keyring_read")
+                  .returns(STRING).param(STRING).param(STRING).build())
+        .func(make_func<&keyring_store>("keyring_store")
+                  .returns(INT).param(STRING).param(STRING).param(STRING).build())
+        .with(g_keyring))
+```
+
+## MySQL サービス {#mysql-services}
+
+mysql_services 機能（`vsql::preview::mysql_services`）は、拡張機能が MySQL レジストリサービスを利用できるようにします — MySQL コンポーネントが利用するのと同じサービスで、インストールされたコンポーネントまたはサーバーコアによって提供されます。拡張機能は必要なすべてのサービスを1か所で宣言します。サーバーは拡張機能のロード時に各サービスを取得し、拡張機能のアンロード時に解放します。
+
+機能名 `VEF_PREVIEW_MYSQL_SERVICES_NAME` は `"vsql::preview::mysql_services"` です。
+
+サーバーの機構に専用の VEF 機能がない場合にこれを使用します。セッション属性と keyring 自身のコンポーネントサービスは、どちらもこの方法で利用できます。サポートされるのは利用のみです。拡張機能自身の実装をレジストリに登録することは今後の作業として計画されており、この機能には含まれません。
+
+### 機能の宣言
+
+ファイルスコープで `MysqlServices` オブジェクトを1つ宣言し、利用する各サービスを `VSQL_REQUIRE_SERVICE` で指定し、そのオブジェクトを `.with()` に渡します。各サービスについて MySQL 自身のヘッダーを含めてください — サービスの型とメソッドはそのヘッダーで宣言されています：
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(services))
+```
+
+`VSQL_REQUIRE_SERVICE(services, name, var)` は、サーバーが取得したサービスを書き込む参照 `var` を宣言し、`name` を `services` に登録します。`var` は自動的に `static` として宣言されます。`MysqlServices` オブジェクトも `static` である必要があり、手動で宣言する参照も同様です。サーバーはロード時にそれらを介して書き込むため、それらは拡張機能より長く存続する必要があります。
+
+### 特定の実装の指定 {#pinning-a-specific-implementation}
+
+`VSQL_REQUIRE_SERVICE` は `name` を2回使用します — C++ の `SERVICE_TYPE(name)` として、およびサーバーがレジストリで検索する文字列として。この修飾なしの名前では、サーバーはサービスのデフォルト実装を取得します。
+
+代わりに1つの実装を指定するには、修飾されたレジストリ名 — MySQL の `PROVIDES_SERVICE(component, service)` が生成する `service.component` の形式 — を使用します。以下は、デフォルトではなく `component_keyring_file` コンポーネントの keyring リーダーを要求します：
+
+```cpp
+static preview_mysql_services::ServiceRef<SERVICE_TYPE(keyring_reader_with_status)>
+    reader;
+static const int reader_req =
+    (services.require<SERVICE_TYPE(keyring_reader_with_status)>(
+         "keyring_reader_with_status.component_keyring_file", reader),
+     0);
+```
+
+修飾された名前は修飾なしの名前と同じ方法で取得されるため、通常のルールが適用されます。その実装が登録されていない場合、拡張機能は別の実装にフォールバックするのではなくインストールに失敗します。
+
+### MySQL のヘッダーに対するビルド {#building-against-mysqls-headers}
+
+サービス定義は VEF ではなく MySQL のコンポーネントフレームワークに属しており、サーバーはそれらをインストールしません。そのため `mysql/components/services/*.h` は、拡張機能 SDK にも、`make install` が構築するもの（リリース tarball や Docker イメージを含む）にも存在しません。サービスを利用する拡張機能は、VillageSQL サーバーのソースツリーに対してビルドします：
+
+| インクルードパス | 提供内容 |
+|---|---|
+| `<source>/include` | サービス定義、`mysql/components/services/*.h` |
+| `<build>/include` | `mysqld_error.h` など、ビルド時に生成されるヘッダー |
+
+ツリー内のテスト拡張機能は、`vsql_add_test_extension()` の `MYSQL_HEADERS` フラグから両方を取得します。このフラグはそれらを `MYSQL_INCLUDE_DIR` および `MYSQL_GENERATED_INCLUDE_DIR` として渡します。ツリー外のビルドは独自のインクルードパスを設定します。
+
+2つのビルド失敗は、原因となった行とは別の場所で報告されます。
+
+サービスの MySQL ヘッダーを省略すると、`VSQL_REQUIRE_SERVICE` に何も解決しない名前が残るため、エラーは不足しているインクルードではなくマクロの位置に表示されます（clang 17）：
+
+```text
+error: unknown type name 'mysql_service_mysql_current_thread_reader_t'
+```
+
+一部のサービス定義は `<cstddef>` を含めずに `size_t` を使用するため、それらのヘッダーの1つをすべての villagesql ヘッダーより前に置くと、MySQL 自身のヘッダー内で失敗します：
+
+```text
+error: unknown type name 'size_t'
+```
+
+このページの例のように、`<cstddef>` を最初に含めてください。
+
+### サービスの呼び出し {#calling-a-service}
+
+サービス参照は独自の `valid()` を公開し、`->` はサービスに転送します。参照には `.` を、サービスには `->` を使用します：
+
+```cpp
+if (!thd_reader.valid()) { out.error("service unavailable"); return; }
+MYSQL_THD thd = nullptr;
+if (thd_reader->get(&thd) || thd == nullptr) { out.set_null(); return; }
+```
+
+すべての `->` 呼び出しの前に `valid()` を確認してください。`->` は取得されたポインタを返しますが、サービスが取得されなかった場合そのポインタは NULL です。
+
+取得に失敗したサービスはインストールを失敗させるため、実行中の関数の内部では、必要なサービスは有効です。それでも確認は重要です。手動で宣言され `require()` に渡されなかった `ServiceRef` には何も書き込まれないためです。コンパイルは通り、拡張機能はインストールされ、`valid()` は拡張機能の生存期間を通じて false のままになります。
+
+サービスが*何であるか* — そのメソッド、パラメータ、戻り値 — は、ここではなく MySQL によって文書化されています。`NAME` という名前のサービスについては、サーバーツリーの `include/mysql/components/services/NAME.h` を読んでください。その `BEGIN_SERVICE_DEFINITION(NAME)` ブロックが、各メソッドを独自のドキュメントとともに宣言しています。`bool` の戻り値が `false` の場合は成功、`true` の場合は失敗を意味するという MySQL の慣習を含め、そのヘッダーが指定するとおりに呼び出してください。
+
+### 取得の失敗 {#acquisition-failure}
+
+宣言されたすべてのサービスは、拡張機能のロード時、その関数が呼び出せるようになる前に取得されます。そのため、登録されていないサービスは後から表面化するのではなくロードを失敗させます。`INSTALL EXTENSION` は失敗し、そのサービス名を示します。
+
+以下の `vsql_mysql_services_missing_test` は、レジストリに存在しないサービスを必要とするツリー内のテスト拡張機能です。これはインストールできるものではありません — これは失敗を記録した方法であり、このサーバーが提供しないサービスをあなた自身の拡張機能が必要とする場合に生成される出力です：
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mysql_services_missing_test': failed to acquire MySQL service 'vsql_intentionally_missing'
+```
+
+他に2つのインストール失敗が、この機能の外側から同じ機能に到達します：`MysqlServices` オブジェクトを `.with()` に渡さない場合と、`vsql_allow_preview_extensions` が OFF のサーバーにインストールする場合です。どちらも[登録パターン](/ja/extensions/build/preview-capabilities#registration-pattern)で説明しています。
+
+### 完全な例
+
+サーバーの `villagesql/test-extensions/` ツリーにある `vsql_mysql_services_session_test` の簡略化されたバージョンです。2つのサービスを組み合わせて、呼び出し元のセッションで実行中の SQL コマンドを読み取ります。一方は現在の `THD` を返し、もう一方はそこから名前付き属性を読み取ります。どちらもすべてのサーバーに登録されているサーバーコアのサービスであるため、事前に何かをインストールする必要はありません：
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/defs/mysql_string_defs.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+VSQL_REQUIRE_SERVICE(services, mysql_thd_attributes, attrs);
+
+// session_sql_command() -> STRING: the name of the SQL command running on the
+// calling session, or NULL when the THD or the attribute cannot be read.
+void session_sql_command(StringResult out) {
+  if (!thd_reader.valid() || !attrs.valid()) {
+    out.error("MySQL session services are not available");
+    return;
+  }
+
+  MYSQL_THD thd = nullptr;
+  // MySQL convention: a false return means success.
+  if (thd_reader->get(&thd) || thd == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  mysql_cstring_with_length value{nullptr, 0};
+  if (attrs->get(thd, "sql_command", &value) || value.str == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  out.set(std::string_view(value.str, value.length));
+}
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(services).func(
+    make_func<&session_sql_command>("session_sql_command")
+        .returns(STRING)
+        .no_params()
+        .build()))
+```
+
+インストールして関数を呼び出します：
+
+```sql
+INSTALL EXTENSION my_ext;
+SELECT my_ext.session_sql_command() AS sql_command;
+```
+
+```text
++-------------+
+| sql_command |
++-------------+
+| select      |
++-------------+
+```

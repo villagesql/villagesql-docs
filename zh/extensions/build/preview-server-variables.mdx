@@ -1,0 +1,222 @@
+---
+audience: extension-author
+title: "状态变量、系统变量和会话变量"
+description: "vsql::status_var、vsql::sys_var 和 vsql::session_var 功能允许扩展程序公开状态计数器，并注册全局和每会话的系统变量。"
+---
+
+本页中的功能处于预览阶段：其 API 并不稳定，声明这些功能的扩展程序需要 `vsql_allow_preview_extensions = ON` 才能安装。有关如何启用预览层和注册功能，请参阅[预览功能](/zh/extensions/build/preview-capabilities)。
+
+## 状态变量 {#status-variables}
+
+`status_var` 功能 (`vsql::status_var`) 允许扩展程序将 `long long` 和 `double` 计数器作为 MySQL 状态变量公开。扩展程序拥有存储空间并写入其中；服务器每次查询状态变量时，都会通过指针读取。
+
+使用 `vsql::preview_status_var::make_capability()` 构建功能，并传递来自 `make_int(name, value_ptr)` 或 `make_double(name, value_ptr)` 的大括号列表。模板从大括号列表中推断计数，因此不需要显式大小。
+
+### 完整示例
+
+```cpp
+#include <villagesql/preview/status_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_status_var;
+
+static long long g_hits   = 0;
+static long long g_misses = 0;
+
+static auto STATUS_VARS = sv::make_capability({
+    sv::make_int("ext_hits",   &g_hits),
+    sv::make_int("ext_misses", &g_misses)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STATUS_VARS))
+```
+
+`make_int` 需要一个 `long long *`；`make_double` 需要一个 `double *`。仅支持这两种类型。
+
+### 从 SQL 访问
+
+在 `INSTALL EXTENSION my_ext` 之后，该变量将以扩展程序名称作为前缀显示：
+
+```sql
+SHOW GLOBAL STATUS LIKE 'my_ext%';
+```
+```
+Variable_name       Value
+my_ext.ext_hits     0
+my_ext.ext_misses   0
+```
+
+来自多个查询线程的并发递增（使用非原子 `++`）可能会偶尔丢失；这对于通过 `SHOW STATUS` 公开的近似调用计数器是可以接受的。
+
+## 系统变量 {#system-variables}
+
+`sys_var` 功能 (`vsql::sys_var`) 允许扩展程序注册由扩展程序拥有的存储空间支持的 MySQL 系统变量。支持四种类型：`BOOL` (`bool *`)、`INT` (`long long *`)、`STR` (`char **`)，以及 `ENUM` (`unsigned long *`，存储一个从零开始的索引，指向一个固定且有序的名称列表)。`INT` 描述符还携带 `min_val` 和 `max_val` 边界；所有描述符都携带默认值和注释。
+
+使用 `vsql::preview_sys_var::make_capability()` 和相应的工厂函数 `make_bool`、`make_int`、`make_str` 和 `make_enum` 构建功能。功能对象还公开 `get()` 和 `set()`，以便从扩展程序代码中进行编程访问。两者都返回 `false` 表示成功。
+
+要响应值更改，请在描述符上链接 `.on_change<&fn>()`。回调将接收一个 `sv::SysVarChange`，其中包含 `var_name()` 和类型化的访问器 (`as_int()`、`as_str()` 和 `as_enum()`)。
+
+服务器在持有其全局系统变量锁的同时调用该回调。在那里通过存储指针读取或写入本扩展程序的另一个变量是安全的，并且其他会话会立即看到新值，因为服务器也在同一把锁下读取这些变量。
+
+<Warning>
+调用该功能的 `get()` 或 `set()`、运行 SQL，或者等待执行上述任一操作的线程，都会在该锁上死锁。请让回调保持简短且非阻塞，将需要 SQL 的工作交给[线程工作器](/zh/extensions/build/preview-background-sql#thread-worker)，或者在阻塞部分前后释放并重新获取 `LOCK_global_system_variables`，就像 `sql/sys_vars.cc` 中的 `event_scheduler_update()` 那样。
+</Warning>
+
+功能对象必须具有静态存储期。当用户设置变量时，MySQL 会直接写入存储指针。
+
+| 工厂 | 存储类型 | 附加参数 |
+|---|---|---|
+| `sv::make_bool` | `bool *` | `def_val` |
+| `sv::make_int` | `long long *` | `def_val`、`min_val`、`max_val` |
+| `sv::make_str` | `char **` | `def_val` |
+| `sv::make_enum` | `unsigned long *` | `names`、`name_count`、`def_val` |
+
+枚举变量可以按名称设置 (`SET GLOBAL my_ext.mode = 'sync'`)，也可以按该名称从零开始的索引设置；无论哪种方式，服务器都会在接受该值之前根据 `names` 对其进行验证，拒绝无法识别的名称或超出范围的索引，而不是存储它：
+
+```
+ERROR 1231 (42000): Variable 'my_ext.mode' can't be set to the value of 'bogus'
+```
+
+正是这种验证使它区别于自由形式的 `make_str`：值空间是封闭的，并在 `SET` 时强制执行。一个便捷重载可以从 `static const char *const NAMES[] = {...}` 数组推断 `name_count`，因此可以省略计数参数。
+
+### 完整示例
+
+```cpp
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_sys_var;
+
+static bool      g_enabled   = true;
+static long long g_threshold = 1000;
+static char     *g_log_file  = nullptr;
+static unsigned long g_mode  = 0;  // index into MODE_NAMES; default "off"
+
+static const char *const MODE_NAMES[] = {"off", "on", "sync"};
+
+static void on_threshold_change(sv::SysVarChange c) {
+  // c.var_name() identifies the variable; c.as_int().value() returns the new value
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled",      "Enable feature",  &g_enabled,   true),
+    sv::make_int ("threshold_ms", "Threshold in ms", &g_threshold, 1000, 0, 3600000)
+        .on_change<&on_threshold_change>(),
+    sv::make_str ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log"),
+    sv::make_enum("mode",         "Operating mode",  &g_mode,      MODE_NAMES, 0)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SYS_VARS))
+```
+
+### 从 SQL 访问
+
+安装 `INSTALL EXTENSION my_ext` 后，可以使用扩展名作为组件前缀来访问变量：
+
+```sql
+SELECT @@global.my_ext.threshold_ms;
+SET GLOBAL my_ext.threshold_ms = 500;
+SET GLOBAL my_ext.log_file = '/var/log/myext.log';
+SET GLOBAL my_ext.mode = 'sync';
+```
+
+### 从扩展代码读取和写入
+
+对于 INT 和 BOOL 变量，直接读取全局存储指针——MySQL 以原子方式更新这些变量。要通过 MySQL 更新变量（以便服务器处理锁定、范围验证和持久性），请调用
+`SYS_VARS.set(extension_name, var_name, scope, value)`。`set` 和 `get` 都成功时返回 `false`。两者都不能从 `on_change` 回调中调用：它们都会在系统变量锁上死锁。
+
+```cpp
+bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
+```
+
+`set` 和 `get` 以 `const char *` 接收扩展名和变量名。`INT` 变量只能用整数值设置；用字符串值调用 `set` 会失败并返回 `true`（针对 `INT` 变量）。`BOOL`、`STRING`、`DOUBLE` 和 `ENUM` 变量请用字符串值设置。
+
+`scope` 参数控制持久性：
+
+| 范围 | 行为 |
+|-------|----------|
+| `nullptr` | 仅更新运行时值，不持久化。 |
+| `"PERSIST"` | 更新运行时值并写入 `mysqld-auto.cnf`。 |
+| `"PERSIST_ONLY"` | 仅写入 `mysqld-auto.cnf`；在下次重启时生效。 |
+
+## 会话变量 {#session-variables}
+
+session_var 功能 (`vsql::session_var`) 允许扩展程序注册按会话（THD 本地）的系统变量——在功能上等同于插件的 `MYSQL_THDVAR_*`。它是 [`vsql::sys_var`](#system-variables) 的会话作用域同类：sys_var 只有一个由每个连接共享的值，而 session_var 为每个连接提供各自的值，通过 `SET SESSION` 设置。新会话的起始值是描述符的默认值，或者 `SET GLOBAL` 最后存储的值。变量的作用域在注册时固定——按会话的变量使用此功能，全局变量使用 `vsql::sys_var`。
+
+仅支持两种类型：`INT` (`long long`) 和 `STR` (`std::string`)。没有 `BOOL` 或 `DOUBLE` 会话变量，也没有 `on_change` 回调机制——与 `vsql::sys_var` 不同，扩展程序只能通过读回会话变量的值来观察它，而不会在它更改时收到通知。
+
+### 声明功能
+
+使用 `vsql::preview_session_var::make_capability()` 构建功能，并传递来自 `make_int(name, comment)` 或 `make_str(name, comment)` 的大括号描述符列表，每个描述符都通过流式的 `.default_()`、`.min()` 和 `.max()` 设置器进行配置（`min`/`max` 仅适用于 `INT`）：
+
+```cpp
+#include <villagesql/preview/session_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_session_var;
+
+static auto SESSION_VARS = sv::make_capability({
+    sv::make_int("session_int_var", "Search width")
+        .default_(20)
+        .min(1)
+        .max(4096),
+    sv::make_str("label", "Per-session label")
+        .default_("default"),
+});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SESSION_VARS))
+```
+
+`make_int` 起初不受约束（默认值 `0`，完整的 `long long` 范围）；`make_str` 起初以空字符串为默认值。功能对象需要静态存储期，与本页上的其他每一个预览功能相同。
+
+### 读取会话值
+
+有两条读取路径，两者都针对*调用方*连接的线程进行解析——因此两者都**必须在连接线程上调用（在该连接上运行的 VDF 或回调），绝不能从后台线程工作器调用**：
+
+- `SESSION_VARS.get_session_int(name, out)` / `get_session_str(name, out)`——按名称键控，每次调用都重新解析变量。请将其用于偶尔的读取；对于 `STR` 变量，它是唯一的路径：没有无锁的字符串快速路径，因为 `STR` 槽位持有一个指向单独分配的缓冲区的指针，而并发的 `SET SESSION` 或 `UNINSTALL` 可能会释放该缓冲区。
+- `SESSION_VARS.int_var(name)` 返回一个 `IntVar`，它在首次 `read()` 时惰性地解析自身并缓存结果，因此可以在功能加载之前于文件/静态作用域声明它。之后的每次 `read()` 都是一次无锁的按线程偏移量加载——没有名称查找，没有全局锁——等同于插件的 `THDVAR(thd, var)`。此快速路径仅适用于 `INT`。
+
+```cpp
+static auto SESSION_INT = SESSION_VARS.int_var("session_int_var");
+
+void read_session_int_var_impl(vsql::IntResult out) {
+  long long val = 0;
+  if (SESSION_INT.read(val)) { out.set_null(); return; }
+  out.set(val);
+}
+```
+
+### 从 SQL 访问
+
+在 `INSTALL EXTENSION my_ext` 之后，每个变量都以扩展程序名称作为组件前缀，并且可以同时通过 `@@session.` 和 `@@global.` 读取/设置：
+
+```sql
+SELECT @@global.my_ext.session_int_var;
+SELECT @@session.my_ext.session_int_var;
+SET SESSION my_ext.session_int_var = 100;
+```
+
+第二个连接不受第一个连接的 `SET SESSION` 影响，并且在设置自己的值之前会看到编译时的默认值；`SET GLOBAL` 更改的是新会话或重置后的会话所采用的默认值，而不是任何会话已经设置的值。
+
+超出范围的 `INT` 赋值会被截断到边界并发出警告，类型错误的赋值会被拒绝，与普通的 MySQL 系统变量完全相同：
+
+```sql
+SET SESSION my_ext.session_int_var = 999999;  -- max is 4096
+```
+```text
+Warning	1292	Truncated incorrect my_ext.session_int_var value: '999999'
+```
+```sql
+SET SESSION my_ext.session_int_var = "hello";
+```
+```text
+ERROR 1232 (42000): Incorrect argument type to variable 'my_ext.session_int_var'
+```
+
+### 重启行为
+
+`SET PERSIST` 和 `SET PERSIST_ONLY` 对会话变量的全局值的作用与对任何 MySQL 系统变量相同：该值在服务器重启后仍然存在，并且每个新会话都从它开始。`SET SESSION` 的值是按连接的状态，不会在重启后保留。如果没有 `SET PERSIST`，在扩展程序仍然安装的情况下重启后，每个变量都会重新回到其编译时的默认值。

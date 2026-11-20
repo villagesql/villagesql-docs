@@ -1,0 +1,160 @@
+---
+audience: extension-author
+title: "语句事件"
+description: "vsql::preview::statement_event 功能在每个查询执行完成后运行扩展程序的处理程序，并传入查询文本、耗时、行数和连接身份。"
+---
+
+本页中的功能处于预览阶段：其 API 并不稳定，声明这些功能的扩展程序需要 `vsql_allow_preview_extensions = ON` 才能安装。有关如何启用预览层和注册功能，请参阅[预览功能](/zh/extensions/build/preview-capabilities)。
+
+## 语句事件 {#statement-events}
+
+语句事件功能 (`vsql::preview::statement_event`) 在每个查询完成执行后运行一个扩展提供的处理程序。服务器在查询自己的线程上同步调用该处理程序，并传递执行元数据——查询文本、计时、行计数、连接标识以及优化器质量指标。可将其用于慢查询日志记录、审计或指标收集。
+
+功能名称 `VEF_PREVIEW_STATEMENT_EVENT_NAME` 是
+`"vsql::preview::statement_event"`。
+
+### 声明功能
+
+在文件范围内声明一个以触发阶段和处理程序函数实例化的 `StatementEventCapability`，并将其传递给 `.with()`：
+
+```cpp
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/vsql.h>
+
+namespace se = vsql::preview_statement_event;
+
+static void on_statement(const se::StatementEventArgs &args,
+                         se::StatementEventResult &result) {
+  // inspect args; optionally write an advisory message via result
+}
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &on_statement>
+    g_statement_event;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_statement_event))
+```
+
+第一个模板参数是触发阶段，一个 `vef_statement_event_phase_t` 值。`VEF_STATEMENT_EVENT_POSTEXECUTE` 在查询完成执行后触发（无论成功还是失败），并且是此版本中唯一实现的阶段。其他 `vef_statement_event_phase_t` 值是保留的；为其中之一声明处理程序会导致服务器拒绝 `INSTALL EXTENSION`。
+
+### 处理程序参数
+
+`StatementEventArgs` 是已完成查询的只读视图；在 POSTEXECUTE 阶段，每个字段都已填充。部分访问器：
+
+| 访问器 | 含义 |
+|---|---|
+| `query()` | 查询文本，作为 `string_view`。当服务器有该语句的重写形式时，这就是该形式——即与常规日志和慢查询日志所记录的相同的脱敏文本。 |
+| `query_time_secs()` | 挂钟执行时间，以秒为单位。 |
+| `lock_time_secs()` | 等待锁所花费的时间，以秒为单位。 |
+| `rows_sent()`、`rows_examined()`、`rows_affected()` | 行计数器。 |
+| `user()`、`client_ip()`、`connection_id()` | 连接标识。 |
+| `schema()` | 默认数据库（schema），如果未选择则为 `NULL`。 |
+| `status()` | 成功时为 `0`，否则为 MySQL 错误代码。 |
+| `warning_count()` | 语句运行期间产生的 note 和 warning 数量；语句失败时，为出错之前产生的数量。 |
+| `digest_text()` | 规范化的查询形式，用于对相似查询进行分组。 |
+| `no_index_used()` | 当查询在没有可用索引的情况下运行时为 `true`。 |
+| `digest_hash()` | 语句摘要，形式为 64 个小写十六进制字符——即 `performance_schema` 以 `DIGEST` 公开的值。它是对相同语句进行分组的紧凑键；只要 `digest_text()` 为 `NULL`，它也为 `NULL`。 |
+| `read_first()`、`read_last()`、`read_key()`、`read_next()`、`read_prev()`、`read_rnd()`、`read_rnd_next()` | 每语句的处理程序行访问计数器（慢日志的 `Read_*` 字段）。它们量化了 `no_index_used()` 仅作标记的访问方法——例如，`read_rnd_next()` 数值偏高表示全表扫描。 |
+| `client_pid()`、`client_name()`、`program_name()` | 客户端在握手时一次性发送的连接属性 (`_pid`、`_client_name`、`program_name`)：客户端的操作系统进程 id、连接器/驱动程序库（例如 `libmysql`、`mysql-connector-j`）和应用程序名称（例如 `mysql`、`mysqldump`）。当客户端未发送相应属性时，每一项均为 `NULL`。 |
+
+由于 `query()` 在存在重写形式时返回服务器的重写形式，因此携带凭据的语句在送达处理程序时，其中的机密信息（如密码）已被混淆，而不是以明文形式呈现，这与常规日志和慢查询日志已经对它们进行脱敏的方式相匹配：`SET PASSWORD`、`CREATE`/`ALTER USER ... IDENTIFIED BY`、`CHANGE REPLICATION SOURCE ... SOURCE_PASSWORD` 以及 `CREATE SERVER ... OPTIONS(PASSWORD ...)`。没有重写规则的语句会逐字传递。
+
+诸如 `query()`、`sqlstate()` 和 `error_message()` 之类的字符串访问器指向仅在处理程序调用期间有效的存储——如果您在处理程序返回后需要它们，请复制这些字节。
+
+`StatementEventResult::error_msg(fmt, ...)` 写入一条 printf 格式化的消息。在 POSTEXECUTE 阶段，该消息是建议性的：服务器会记录它，但不会将其传播到客户端。
+
+### 完整示例
+
+[`vsql_slow_query_log`](https://github.com/villagesql/villagesql-server/tree/main/villagesql/test-extensions/vsql-slow-query-log) 测试扩展的精简形式。它记录每个执行时间超过阈值的查询，将语句事件功能与[系统变量](/zh/extensions/build/preview-server-variables#system-variables)结合以进行运行时配置：
+
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+namespace sv = vsql::preview_sys_var;
+namespace se = vsql::preview_statement_event;
+
+static bool g_enabled;
+static long long g_threshold_ms;
+static char *g_log_filename;
+static std::mutex g_log_mutex;
+
+static void slow_query_hook(const se::StatementEventArgs &args,
+                            se::StatementEventResult &result) {
+  if (!g_enabled) return;
+  if (args.query_time_secs() * 1000.0 < static_cast<double>(g_threshold_ms))
+    return;
+
+  time_t now = static_cast<time_t>(args.query_start_utime() / 1000000);
+  char ts[32];
+  struct tm tm_utc;
+  gmtime_r(&now, &tm_utc);
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+  std::lock_guard<std::mutex> lock(g_log_mutex);
+  FILE *f = fopen(g_log_filename, "a");
+  if (f == nullptr) {
+    result.error_msg("failed to open '%s': %s", g_log_filename,
+                     strerror(errno));
+    return;
+  }
+
+  fprintf(f, "# Time: %s\n", ts);
+  fprintf(f, "# User@Host: %s @ %s  Id: %lu\n", args.user() ? args.user() : "",
+          args.client_ip() ? args.client_ip() : "", args.connection_id());
+  fprintf(f,
+          "# Schema: %s  Query_time: %.6f  Lock_time: %.6f"
+          "  Rows_sent: %llu  Rows_examined: %llu\n",
+          args.schema() ? args.schema() : "", args.query_time_secs(),
+          args.lock_time_secs(), (unsigned long long)args.rows_sent(),
+          (unsigned long long)args.rows_examined());
+  fprintf(f, "SET timestamp=%llu;\n", (unsigned long long)now);
+  auto q = args.query();
+  fprintf(f, "%.*s;\n", (int)q.size(), q.data());
+  fclose(f);
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled", "Enable the slow query log", &g_enabled, false),
+    sv::make_int("threshold_ms", "Minimum execution time to log, in ms",
+                 &g_threshold_ms, 1000, 0, 3600000),
+    sv::make_str("log_file", "Path to the slow query log file",
+                 &g_log_filename, "/tmp/vsql_slow_query.log")});
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &slow_query_hook>
+    STATEMENT_EVENT;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension().with(SYS_VARS).with(STATEMENT_EVENT))
+```
+
+#### 从 SQL 启用
+
+启用预览层后（请参阅[启用预览层](/zh/extensions/build/preview-capabilities#enabling-the-preview-tier)），构建该扩展，将其 `.veb` 文件复制到 `veb_dir` 中，安装它，并通过其系统变量进行配置：
+
+```sql
+INSTALL EXTENSION vsql_slow_query_log;
+SET GLOBAL vsql_slow_query_log.enabled = ON;
+SET GLOBAL vsql_slow_query_log.threshold_ms = 500;
+```
+
+每个比阈值慢的查询都会追加到配置的日志文件中：
+
+```
+# Time: 2026-06-22T22:53:44Z
+# User@Host: root @   Id: 27
+# Schema:   Query_time: 0.605084  Lock_time: 0.000000  Rows_sent: 1  Rows_examined: 1
+SET timestamp=1782168824;
+SELECT SLEEP(0.6);
+```

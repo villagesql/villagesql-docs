@@ -1,0 +1,221 @@
+---
+audience: extension-author
+title: "ステータス変数、システム変数、セッション変数"
+description: "vsql::status_var、vsql::sys_var、vsql::session_var の各機能を使用すると、拡張機能がステータスカウンターを公開し、グローバルおよびセッションごとのシステム変数を登録できます。"
+---
+
+このページの機能はプレビュー段階です。API は安定しておらず、これらの機能を宣言する拡張機能は、`vsql_allow_preview_extensions = ON` が設定されている場合にのみインストールできます。プレビュー層の有効化と機能の登録方法については、[プレビュー機能](/ja/extensions/build/preview-capabilities)を参照してください。
+
+## ステータス変数 {#status-variables}
+
+status_var 機能（`vsql::status_var`）は、拡張機能が MySQL ステータス変数として `long long` および `double` カウンターを公開できるようにします。拡張機能はストレージを所有し、値を書き込みます。サーバーはステータス変数がクエリされるたびにポインタ経由で読み取ります。
+
+`vsql::preview_status_var::make_capability()` で機能を構築し、`make_int(name, value_ptr)` または `make_double(name, value_ptr)` から得られる記述子のブレースリストを渡します。テンプレートはブレースリストからカウントを推測するため、明示的なサイズは必要ありません。
+
+### 完全な例
+
+```cpp
+#include <villagesql/preview/status_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_status_var;
+
+static long long g_hits   = 0;
+static long long g_misses = 0;
+
+static auto STATUS_VARS = sv::make_capability({
+    sv::make_int("ext_hits",   &g_hits),
+    sv::make_int("ext_misses", &g_misses)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STATUS_VARS))
+```
+
+`make_int` には `long long *` が必要です。`make_double` には `double *` が必要です。これらがサポートされる唯一の2つの型です。
+
+### SQL からのアクセス
+
+`INSTALL EXTENSION my_ext` 後、変数は拡張機能名をプレフィックスとして表示されます：
+
+```sql
+SHOW GLOBAL STATUS LIKE 'my_ext%';
+```
+```
+Variable_name       Value
+my_ext.ext_hits     0
+my_ext.ext_misses   0
+```
+
+複数のクエリスレッドが非アトミックな `++` で同時にインクリメントする場合、まれに値が失われる可能性がありますが、`SHOW STATUS` で公開される近似カウンターとしては許容されます。
+
+## システム変数 {#system-variables}
+
+sys_var 機能（`vsql::sys_var`）は、拡張機能所有のストレージに紐付けられた MySQL システム変数を登録できるようにします。4つの型がサポートされます：`BOOL`（`bool *`）、`INT`（`long long *`）、`STR`（`char **`）、そして `ENUM`（`unsigned long *`、固定された順序付きの名前リストに対するゼロ始まりのインデックスを格納）。`INT` 記述子には `min_val` および `max_val` の境界も含まれます。すべての記述子にはデフォルト値とコメントが含まれます。
+
+`vsql::preview_sys_var::make_capability()` で機能を構築し、対応するファクトリ関数 `make_bool`、`make_int`、`make_str`、および `make_enum` を使用します。機能オブジェクトは `get()` および `set()` を公開し、拡張機能コードからのプログラム的アクセスを可能にします。両方とも成功時に `false` を返します。
+
+値の変更に反応するには、記述子に `.on_change<&fn>()` をチェーンします。コールバックは `var_name()` および型付きアクセサ（`as_int()`、`as_str()`、および `as_enum()`）を備えた `sv::SysVarChange` を受け取ります。
+
+サーバーは、グローバルなシステム変数ロックを保持したままそのコールバックを呼び出します。その中でこの拡張機能の別の変数をストレージポインタ経由で読み書きすることは安全です。また、サーバーが同じロックの下でそれらの変数を読み取るため、他のセッションはすぐに新しい値を参照できます。
+
+<Warning>
+機能の `get()` または `set()` を呼び出すこと、SQL を実行すること、あるいはそのいずれかを行うスレッドを待機することは、そのロックでデッドロックします。コールバックは短くブロックしないように保ち、SQL を必要とする処理は[スレッドワーカー](/ja/extensions/build/preview-background-sql#thread-worker)に渡すか、`sql/sys_vars.cc` の `event_scheduler_update()` が行うように、ブロックする部分の前後で `LOCK_global_system_variables` を解放し、戻る前に再取得してください。
+</Warning>
+
+機能オブジェクトは静的ストレージ持続期間でなければなりません。MySQL はユーザーが変数を設定する際にストレージポインタに直接書き込みます。
+
+| ファクトリ | ストレージ型 | 追加パラメータ |
+|---------|--------------|------------------|
+| `sv::make_bool` | `bool *` | `def_val` |
+| `sv::make_int` | `long long *` | `def_val`, `min_val`, `max_val` |
+| `sv::make_str` | `char **` | `def_val` |
+| `sv::make_enum` | `unsigned long *` | `names`, `name_count`, `def_val` |
+
+enum 変数は名前（`SET GLOBAL my_ext.mode = 'sync'`）または名前のゼロ始まりのインデックスで設定します。いずれの場合も、サーバーは受け入れる前に値を `names` と照合して検証し、認識できない名前や範囲外のインデックスは格納せずに拒否します：
+
+```
+ERROR 1231 (42000): Variable 'my_ext.mode' can't be set to the value of 'bogus'
+```
+
+この検証が、自由形式の `make_str` との違いです。値の空間は閉じており、`SET` 時に強制されます。便利なオーバーロードは `static const char *const NAMES[] = {...}` 配列から `name_count` を推論するため、個数の引数は省略できます。
+
+### 完全な例
+
+```cpp
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_sys_var;
+
+static bool      g_enabled   = true;
+static long long g_threshold = 1000;
+static char     *g_log_file  = nullptr;
+static unsigned long g_mode  = 0;  // index into MODE_NAMES; default "off"
+
+static const char *const MODE_NAMES[] = {"off", "on", "sync"};
+
+static void on_threshold_change(sv::SysVarChange c) {
+  // c.var_name() identifies the variable; c.as_int().value() returns the new value
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled",      "Enable feature",  &g_enabled,   true),
+    sv::make_int ("threshold_ms", "Threshold in ms", &g_threshold, 1000, 0, 3600000)
+        .on_change<&on_threshold_change>(),
+    sv::make_str ("log_file",     "Log file path",   &g_log_file,  "/tmp/myext.log"),
+    sv::make_enum("mode",         "Operating mode",  &g_mode,      MODE_NAMES, 0)});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SYS_VARS))
+```
+
+### SQL からのアクセス
+
+`INSTALL EXTENSION my_ext` 後、変数には拡張機能名をコンポーネントプレフィックスとしてアクセスできます：
+
+```sql
+SELECT @@global.my_ext.threshold_ms;
+SET GLOBAL my_ext.threshold_ms = 500;
+SET GLOBAL my_ext.log_file = '/var/log/myext.log';
+SET GLOBAL my_ext.mode = 'sync';
+```
+
+### 拡張機能コードからの読み書き
+
+INT および BOOL 変数については、グローバルストレージポインタを直接読み取ります — MySQL はそれらをアトミックに更新します。MySQL を介して変数を更新するには（ロック、範囲検証、永続化をサーバーが処理するため）、`SYS_VARS.set(extension_name, var_name, scope, value)` を呼び出します。`set` および `get` は成功時に `false` を返します。どちらも `on_change` コールバックから呼び出すことはできません。両方ともシステム変数ロックでデッドロックします。
+
+```cpp
+bool err = SYS_VARS.set("my_ext", "threshold_ms", nullptr, value);
+```
+
+`set` と `get` は、拡張機能名と変数名を `const char *` として受け取ります。`INT` 変数は整数値でのみ設定できます。文字列値での `set` は失敗し、`true` を返します（`INT` 変数の場合）。`BOOL`、`STRING`、`DOUBLE`、`ENUM` の各変数は文字列値で設定してください。
+
+`scope` 引数は永続化を制御します：
+
+| スコープ | 動作 |
+|-------|-------|
+| `nullptr` | 実行中の値のみ更新、永続化されません。 |
+| `"PERSIST"` | 実行中の値を更新し、`mysqld-auto.cnf` に書き込みます。 |
+| `"PERSIST_ONLY"` | `mysqld-auto.cnf` にのみ書き込み、次回起動時に有効になります。 |
+
+## セッション変数 {#session-variables}
+
+session_var 機能（`vsql::session_var`）は、セッションごと（THD ローカル）のシステム変数を拡張機能が登録できるようにします — プラグインの `MYSQL_THDVAR_*` に機能的に相当するものです。これは [`vsql::sys_var`](#system-variables) のセッションスコープ版です。sys_var はすべての接続で共有される1つの値を持ちますが、session_var は各接続に `SET SESSION` で設定する独自の値を与えます。新しいセッションの開始点は、記述子のデフォルト、または `SET GLOBAL` で最後に格納された値です。変数のスコープは登録時に固定されます — セッションごとの変数にはこの機能を、グローバルな変数には `vsql::sys_var` を使用してください。
+
+サポートされる型は2つだけです：`INT`（`long long`）と `STR`（`std::string`）。`BOOL` や `DOUBLE` のセッション変数はなく、`on_change` コールバックの仕組みもありません — `vsql::sys_var` とは異なり、拡張機能はセッション変数の値を読み返すことによってのみ観測し、変更時に通知されることはありません。
+
+### 機能の宣言
+
+`vsql::preview_session_var::make_capability()` で機能を構築し、`make_int(name, comment)` または `make_str(name, comment)` から得られる記述子のブレースリストを渡します。各記述子はメソッドチェーン形式の `.default_()`、`.min()`、`.max()` セッターで設定します（`min`/`max` は `INT` にのみ適用されます）：
+
+```cpp
+#include <villagesql/preview/session_var.h>
+#include <villagesql/vsql.h>
+
+namespace sv = vsql::preview_session_var;
+
+static auto SESSION_VARS = sv::make_capability({
+    sv::make_int("session_int_var", "Search width")
+        .default_(20)
+        .min(1)
+        .max(4096),
+    sv::make_str("label", "Per-session label")
+        .default_("default"),
+});
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(SESSION_VARS))
+```
+
+`make_int` は制約なしで始まります（デフォルト `0`、`long long` の全範囲）。`make_str` は空文字列のデフォルトで始まります。機能オブジェクトは、このページの他のすべてのプレビュー機能と同様に、静的ストレージ持続期間が必要です。
+
+### セッション値の読み取り
+
+読み取りパスは2つあり、どちらも*呼び出し元*の接続のスレッドに対して解決されます — そのため、どちらも**接続スレッド上（接続上で実行される VDF またはコールバック）で呼び出さなければならず、バックグラウンドのスレッドワーカーから呼び出してはいけません**：
+
+- `SESSION_VARS.get_session_int(name, out)` / `get_session_str(name, out)` — 名前をキーとし、呼び出しのたびに変数を再解決します。たまに読み取る場合にはこれを使用してください。また `STR` 変数にとってはこれが唯一のパスです。`STR` スロットは別途割り当てられたバッファへのポインタを保持しており、同時に実行される `SET SESSION` や `UNINSTALL` がそれを解放しうるため、ロックフリーの文字列用高速パスはありません。
+- `SESSION_VARS.int_var(name)` は、最初の `read()` で自身を遅延解決して結果をキャッシュする `IntVar` を返すため、機能がロードされる前にファイル/静的スコープで宣言できます。それ以降の各 `read()` は、ロックフリーのスレッドごとのオフセットロードです — 名前のルックアップもグローバルロックもなく — プラグインの `THDVAR(thd, var)` に相当します。この高速パスは `INT` のみです。
+
+```cpp
+static auto SESSION_INT = SESSION_VARS.int_var("session_int_var");
+
+void read_session_int_var_impl(vsql::IntResult out) {
+  long long val = 0;
+  if (SESSION_INT.read(val)) { out.set_null(); return; }
+  out.set(val);
+}
+```
+
+### SQL からのアクセス
+
+`INSTALL EXTENSION my_ext` 後、各変数は拡張機能名をコンポーネントプレフィックスとして取り、`@@session.` と `@@global.` の両方で読み取りおよび設定できます：
+
+```sql
+SELECT @@global.my_ext.session_int_var;
+SELECT @@session.my_ext.session_int_var;
+SET SESSION my_ext.session_int_var = 100;
+```
+
+2つ目の接続は、1つ目の接続の `SET SESSION` の影響を受けず、自身の値を設定するまではコンパイル時のデフォルトを参照します。`SET GLOBAL` は、新しいセッションやリセットされたセッションが引き継ぐデフォルトを変更するのであって、すでに設定済みのどのセッションの値も変更しません。
+
+範囲外の `INT` の代入は境界にクランプされて警告が出され、型の誤った代入は拒否されます。通常の MySQL システム変数とまったく同じです：
+
+```sql
+SET SESSION my_ext.session_int_var = 999999;  -- max is 4096
+```
+```text
+Warning	1292	Truncated incorrect my_ext.session_int_var value: '999999'
+```
+```sql
+SET SESSION my_ext.session_int_var = "hello";
+```
+```text
+ERROR 1232 (42000): Incorrect argument type to variable 'my_ext.session_int_var'
+```
+
+### 再起動時の動作
+
+`SET PERSIST` と `SET PERSIST_ONLY` は、他の MySQL システム変数と同様に、セッション変数のグローバル値に対して機能します。値はサーバーの再起動後も維持され、各新しいセッションはその値から始まります。`SET SESSION` の値は接続ごとの状態であり、再起動後には維持されません。`SET PERSIST` を使用しない場合、拡張機能がインストールされたままの再起動後には、各変数はコンパイル時のデフォルトで再び現れます。

@@ -101,6 +101,7 @@ def main():
         )
     intro = lines[: cuts[0][0]]
     sections = []
+    renamed = {}  # anchor of a translated heading that gained {#id} -> id
     for n, (i, _, text, cid) in enumerate(cuts):
         end = cuts[n + 1][0] if n + 1 < len(cuts) else len(lines)
         want = sections_cfg[n]["id"]
@@ -110,6 +111,7 @@ def main():
         sec = lines[i:end]
         if args.lang != "en" and cid is None:
             sec[0] = f"## {text} {{#{want}}}"
+            renamed[slugify(text)] = want
         elif cid is not None and cid != want:
             sys.exit(f"section {n} has {{#{cid}}}, expected {{#{want}}}")
         sections.append((want, sections_cfg[n]["page"], text, sec))
@@ -137,11 +139,11 @@ def main():
 
     def fix_local_links(text, page):
         def repl(m):
-            a = m.group(1)
+            a = renamed.get(m.group(1), m.group(1))
             target = anchor_page.get(a)
             if target is None:
                 sys.exit(f"link to #{a} matches no heading on the old page")
-            return m.group(0) if target == page else f"]({url(target, a)})"
+            return f"](#{a})" if target == page else f"]({url(target, a)})"
         return re.sub(r"\]\(#([^)\s]+)\)", repl, text)
 
     def fix_index(text):
@@ -190,10 +192,11 @@ def main():
         text = f.read_text()
 
         def repl(m):
-            target = anchor_page.get(m.group(1))
+            a = renamed.get(m.group(1), m.group(1))
+            target = anchor_page.get(a)
             if target is None:
-                sys.exit(f"{f}: link to #{m.group(1)} matches no heading")
-            return m.group(0) if target == OVERVIEW else url(target, m.group(1))
+                sys.exit(f"{f}: link to #{a} matches no heading")
+            return url(target, a)
         new = old.sub(repl, text)
         if new != text:
             outputs[f] = new

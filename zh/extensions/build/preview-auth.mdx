@@ -1,0 +1,391 @@
+---
+audience: extension-author
+title: "身份验证方法"
+description: "vsql::preview::auth 功能允许扩展程序提供服务器身份验证方法：声明该功能、实现处理程序、暂存活动角色以及自动创建账户。"
+---
+
+本页中的功能处于预览阶段：其 API 并不稳定，声明这些功能的扩展程序需要 `vsql_allow_preview_extensions = ON` 才能安装。有关如何启用预览层和注册功能，请参阅[预览功能](/zh/extensions/build/preview-capabilities)。
+
+## 身份验证方法 {#authentication-methods}
+
+auth 功能 (`vsql::preview::auth`) 允许扩展程序提供一种服务器身份验证方法。账户通过 `CREATE USER ... IDENTIFIED WITH <method-name>` 选择使用它；在连接时，如果该名称不是已加载的 MySQL 认证插件，服务器会查询 VEF 认证注册表，并在握手过程中调用扩展程序的处理程序。当您需要针对服务器不了解的凭据来源（持有者令牌、外部身份提供方或自定义质询）对账户进行身份验证，而又不想编写 MySQL 认证插件时，请使用它。
+
+功能名称 `VEF_PREVIEW_AUTH_NAME` 为 `"vsql::preview::auth"`。
+
+该处理程序是一个类型化函数，它接收一个 `AuthContext`：它通过这个由服务器拥有的上下文读写握手数据包来与客户端通信，并且永远不会看到 MySQL 的内部认证结构。
+
+<Warning>
+认证结果是故障关闭的。服务器会将 `AuthResult::kOk` 以外的任何结果都视为拒绝连接——这里刻意没有“可能”或故障开放的结果。返回 `AuthResult::kReject`、返回 `AuthResult::kError` 或者从未设置有效账户的处理程序都会拒绝此次登录。
+</Warning>
+
+### 声明功能
+
+包含头文件，编写一个类型化处理程序，使用流式的 `make_auth<>` 构建器构建一个描述符，并将该描述符交给一个 `AuthCapability` 令牌，再把该令牌传递给 `.with()`。预览功能头文件不属于 `<villagesql/vsql.h>` 总括头文件，因此请显式包含 `<villagesql/preview/auth.h>`：
+
+```cpp
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+AuthResult authenticate(AuthContext &c) {
+  // ... validate the client and set the effective account ...
+  return AuthResult::kOk;
+}
+
+constexpr auto MY_AUTH =
+    vsql::preview_auth::make_auth<&authenticate>("my_auth")
+        .client_plugin("mysql_clear_password")
+        .build();
+
+static vsql::preview_auth::AuthCapability g_auth{MY_AUTH};
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_auth))
+```
+
+该构建器有六个组成部分：
+
+| 元素 | 含义 |
+|---|---|
+| `make_auth<&handler>("name")` | 启动构建器。处理程序是一个编译期模板参数，因此空处理程序或签名错误的处理程序是编译错误，而不是运行时失败。`"name"` 是账户绑定的认证方法名称 (`IDENTIFIED WITH <name>`)，最长为 `VEF_AUTH_MAX_NAME_LEN`（64）字节。 |
+| `.client_plugin(name)` | 可选。覆盖服务器在握手期间通告的客户端认证插件。 |
+| `.accepts_client_plugin(callback)` | 可选。接收 `bool (*)(const char *offered)`。返回 `true` 会保留客户端提供的插件；返回 `false` 会将客户端切换到 `.client_plugin()`。 |
+| `.auto_create(callback)` | 可选。让该方法选择接受针对不存在账户的登录（请参阅[自动创建账户](#auto-creating-accounts)）。 |
+| `.roles_mode(callback)` | 可选。选择服务器如何将处理程序暂存的角色与账户已被授予的角色进行协调——仅激活、同时授予，或完全同步（请参阅[自动授予角色](#auto-granting-roles)）。 |
+| `.build()` | 产生您交给 `AuthCapability` 的描述符。 |
+
+`AuthCapability g_auth{descriptor}` 是由 `.with()` 使用的自注册令牌。请将其声明为 `static`，以便它比注册过程存活得更久。
+
+`client_plugin` 是可选的。`make_auth` 将通告的插件默认设置为 `"mysql_clear_password"`——每个 MySQL 客户端都附带的最低共同标准——因此从不调用 `.client_plugin()` 的方法仍然可以安装，简单的客户端仍然可以连接。调用 `.client_plugin(name)` 可以请求不同的插件；`mysql_clear_password` 会在密码槽位中原样接收持有者令牌。
+
+如果客户端提供的插件不是该方法请求的插件，则它会被切换到所请求的插件并原样重发其凭据，这会耗费一次往返，并且需要客户端愿意进行该切换。`.accepts_client_plugin(&callback)` 让该方法可以改为保留客户端提供的插件：服务器将每个提供的名称传递给该回调，包括所请求的插件本身——无论回调返回什么，它都会被接受。未设置回调的方法不接受任何其他提议，因此其他每一个提议都会切换到所请求的插件。接受是最终的——服务器此后不会再切换回所请求的插件——因此只接受处理程序确实能解析其帧格式的插件。服务器在握手协商期间、在处理程序的首次读取之前查询该回调，因此它必须是一个纯谓词：没有数据包 I/O，不阻塞，没有副作用。
+
+### 处理程序约定 {#the-handler-contract}
+
+处理程序符合 `AuthHandler` 类型——它接收一个 `AuthContext &` 并返回一个 `AuthResult`：
+
+```cpp
+AuthResult authenticate(AuthContext &c);
+```
+
+它在握手期间于连接线程上同步调用。`AuthContext` 封装了服务器拥有的每次尝试的上下文；只在调用期间持有它，不要保留它。请调用它的方法，而不要通过函数表传递上下文指针。基于令牌的处理程序会使用的方法：
+
+| 方法 | 用途 |
+|---|---|
+| `c.read_packet()` | 读取客户端发送的下一个数据包。以 `Span<const unsigned char>` 形式返回字节，在下一次读取之前有效（协议或连接错误时为空）。与 `mysql_clear_password` 搭配时，一次读取即可得到持有者令牌。 |
+| `c.write_packet(data)` | 向客户端发送一个数据包（例如一个质询）。接收 `Span<const unsigned char>`，失败时返回 `true`。 |
+| `c.user_name()` | 客户端连接时使用的账户名。 |
+| `c.auth_string()` | `IDENTIFIED WITH <m> AS '...'` 中的 `AS '...'` 子句，若无则为空。 |
+| `c.host_or_ip()` | 客户端主机或 IP。 |
+| `c.client_auth_plugin()` | 客户端在其握手回复中通告的客户端认证插件（例如 `"mysql_clear_password"`）。当该方法接受了这个提议时，它也是为处理程序读取的凭据构造帧的插件，因此处理程序可以按名称解析，而不必嗅探字节。强制切换到 `.client_plugin()` 不会更新它，因此在那条路径上它仍然报告客户端最初提供的插件。未知时为空。 |
+| `c.authenticate_as(account)` | 设置会话运行时的有效账户（由 `CURRENT_USER()` 显示）。在返回 `AuthResult::kOk` 之前必须设置。 |
+| `c.set_external_user(identity)` | 为审计跟踪设置原始外部身份 (`@@external_user`)。 |
+| `c.set_active_roles(roles, n_roles)` | 暂存会话的活动角色（请参阅[暂存活动角色](#staging-active-roles)）。 |
+| `c.account_unknown()` | 当正在进行身份验证的账户不存在，且此次登录因该方法的 `.auto_create()` 选择而被路由到该方法时，为 `true`。针对已存在账户的登录则为 `false`。 |
+| `c.request_provision(account, roles, n_roles)` | 请求服务器创建 `account` 并向其授予 `roles`（请参阅[自动创建账户](#auto-creating-accounts)）。 |
+
+处理程序返回三种结果之一：
+
+| 结果 | 含义 |
+|---|---|
+| `AuthResult::kOk` | 身份验证成功。处理程序必须已调用 `authenticate_as()`；会话以该账户身份运行。 |
+| `AuthResult::kReject` | 身份验证失败——凭据错误或策略拒绝。 |
+| `AuthResult::kError` | 内部错误导致无法作出判定（例如，密钥来源不可用）。服务器对它的处理与拒绝完全相同。 |
+
+`AuthResult::kReject` 和 `AuthResult::kError` 都会拒绝连接。只有 `AuthResult::kOk` 才会成功。
+
+当处理程序将连接账户映射到另一个有效账户时——就像下面的示例将连接账户映射到 `vsql_auth_test_user` 那样——这就是代理，它需要 `GRANT PROXY`，与 MySQL 插件认证路径上的做法完全一样。
+
+### 暂存活动角色 {#staging-active-roles}
+
+`c.set_active_roles(roles, n_roles)` 暂存应在会话上激活的角色，替代此次登录中账户的默认角色激活。`roles` 是一个包含 `n_roles` 个以 NUL 结尾名称的数组；这些字符串会被复制，因此调用方无需保留它们。服务器在账户解析*之后*应用它们，使用与 `SET ROLE` 相同的、经过授权检查的激活方式：只有确实授予了已认证账户的角色才会激活，未被授予的名称会被静默跳过——因此，除非该方法设置了 `.roles_mode()`，否则令牌无法授予或提升超出 DBA 所配置范围的权限。传递 `n_roles == 0` 则不激活任何角色（等同于 `SET ROLE NONE`）。
+
+### 完整示例
+
+一个最小的认证器，浓缩自服务器源代码树中 `villagesql/test-extensions/vsql-auth-test/` 处的 `vsql_auth_test` 扩展程序，任何发行版都不包含它。它接受一个固定令牌，将连接映射到 `vsql_auth_test_user`，并请求 `mysql_clear_password`，以便令牌原样到达密码槽位。（树内扩展程序还添加了额外的令牌路径、一个 `.accepts_client_plugin()` 回调，以及下文介绍的两个选择项，用于驱动其测试套件。）
+
+```cpp
+#include <cstring>
+
+#include <villagesql/preview/auth.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using vsql::preview_auth::AuthContext;
+using vsql::preview_auth::AuthResult;
+
+namespace {
+
+constexpr char kToken[] = "vsql-auth-test-token";
+constexpr char kMappedAccount[] = "vsql_auth_test_user";
+
+AuthResult authenticate(AuthContext &c) {
+  auto pkt = c.read_packet();
+  if (pkt.empty()) return AuthResult::kError;
+
+  // mysql_clear_password sends a NUL-terminated string; drop the trailing NUL.
+  size_t len = pkt.size();
+  if (len && pkt[len - 1] == '\0') --len;
+
+  if (len != std::strlen(kToken) ||
+      std::memcmp(pkt.data(), kToken, len) != 0) {
+    return AuthResult::kReject;
+  }
+
+  c.authenticate_as(kMappedAccount);
+  // @@external_user records the connecting identity, not the mapped account.
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .build();
+vsql::preview_auth::AuthCapability g_auth{AUTH_METHOD};
+
+}  // namespace
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(g_auth))
+```
+
+### 绑定账户并连接 {#binding-an-account-and-connecting}
+
+在启用预览层后（请参阅[启用预览层](/zh/extensions/build/preview-capabilities#enabling-the-preview-tier)），构建该扩展程序，将其 `.veb` 文件复制到 `veb_dir` 中，安装它，并将一个账户绑定到该方法。由于处理程序会映射到第二个账户，因此也要创建该账户，并授予它 `PROXY` 权限，使连接账户可以取得其身份：
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+```
+
+`CREATE USER ... IDENTIFIED WITH vsql_auth_test` 之所以被接受，是因为 `vsql_auth_test` 是一个已注册的 VEF 认证方法——与接受已安装插件名称的方式相同。
+
+只有 `IDENTIFIED WITH <method>` 形式被接受，并可选地带 `AS '...'`。添加 `BY '...'` 是要求该方法将密码转换为存储的凭据——这是 MySQL 插件通过 `generate_authentication_string()` 完成的工作——而如今没有任何 VEF 认证方法声明该钩子，因此服务器会拒绝它：
+
+```sql
+CREATE USER auth_user IDENTIFIED WITH vsql_auth_test BY 'secret';
+```
+
+```text
+ERROR 1827 (HY000): The password hash doesn't have the expected format.
+```
+
+绑定的方法名称会写入账户的 `plugin` 列，而不是表的默认值，该账户下次登录时读取的正是这一列：
+
+```sql
+SELECT plugin FROM mysql.user WHERE user = 'auth_user';
+```
+
+```text
++----------------+
+| plugin         |
++----------------+
+| vsql_auth_test |
++----------------+
+```
+
+该方法请求 `mysql_clear_password`，因此客户端必须传递 `--enable-cleartext-plugin` 才能以明文发送令牌。在令牌正确时，会话以映射后的账户身份运行，并通过 `@@external_user` 公开连接账户：
+
+```bash
+mysql --enable-cleartext-plugin --user=auth_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER(), @@external_user"
+```
+
+```text
++-----------------------+-----------------+
+| CURRENT_USER()        | @@external_user |
++-----------------------+-----------------+
+| vsql_auth_test_user@% | auth_user       |
++-----------------------+-----------------+
+```
+
+卸载该扩展程序会移除该方法；绑定到它的账户将无法再进行身份验证：
+
+```sql
+UNINSTALL EXTENSION vsql_auth_test;
+```
+
+### 自动创建账户 {#auto-creating-accounts}
+
+一种方法也可以处理针对尚不存在账户的登录，并让服务器在登录成功时顺带创建该账户。如果没有这项功能，未知账户会在任何方法运行之前就被拒绝。
+
+使用 `.auto_create(&callback)` 选择启用。该回调不接受参数并返回 `bool`；服务器在每次未知账户登录时调用它，而不是在注册时读取一次，因此该方法可以遵循它自己的运行时设置，而不必在扩展程序加载时就固定这一选择：
+
+```cpp
+bool auto_create_enabled() { return true; }
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .auto_create(&auto_create_enabled)
+        .build();
+```
+
+不使用 `.auto_create()`，或从回调返回 `false`，都会保持标准行为：未知账户被拒绝。同一时间只能有一个已安装的方法选择启用它——如果有两个返回 `true`，服务器不会去猜测，而是向错误日志记录一条警告，并像没有任何方法选择启用一样拒绝未知账户。
+
+在处理程序中，`c.account_unknown()` 用于区分这两种情况。请先验证凭据，然后描述要创建什么并以其身份进行身份验证：
+
+```cpp
+if (c.account_unknown()) {
+  const char *roles[] = {"vsql_role_granted"};
+  c.request_provision(c.user_name(), roles, 1);
+  c.authenticate_as(c.user_name());
+  c.set_external_user(c.user_name());
+  return AuthResult::kOk;
+}
+```
+
+`request_provision(account, roles, n_roles)` 记录意图，不返回任何内容。服务器会在处理程序返回 `AuthResult::kOk` 之后自行运行 DDL，并且仅针对作为未知账户被路由进来的登录——因此处理程序随后拒绝的登录不会创建任何东西，而指定一个已存在账户的请求会保留该账户原有的绑定，并仍然授予指定的角色。服务器运行的是 `CREATE USER IF NOT EXISTS <account>@'%' IDENTIFIED WITH <method>`，随后为每个指定的角色执行一条 `GRANT`：该账户始终为主机 `%` 创建并绑定到对其进行身份验证的方法，而且 `account` 不必是连接的用户名。如果无法完成创建——例如在 `super_read_only` 服务器上——则登录会失败，而不会在没有账户的情况下继续。
+
+服务器不会把自动的 `CREATE USER`、其 `GRANT`，以及角色协调的 `GRANT` 和 `REVOKE` 写入二进制日志。复制拓扑中的每台服务器都会自行创建和协调该账户。
+
+角色的行为与[暂存活动角色](#staging-active-roles)中一致：角色归 DBA 所有。每个名称都必须已经作为可授予的角色存在，无法授予的角色会被记录并跳过，而不会使登录失败，因此令牌可以指定角色，但永远无法创建或提升角色。账户名来自客户端，因此服务器会将其作为标识符加引号——精心构造的名称只会变成一个名字古怪的账户，而绝不会变成第二条语句。
+
+`vsql_auth_test` 扩展程序为连接用户配置角色 `vsql_role_granted`，并将这一选择项置于 `vsql_auth_test.auto_create` 之后，该变量初始为 `OFF`。先将它打开并创建该角色，然后以一个不存在的账户进行连接：
+
+```sql
+INSTALL EXTENSION vsql_auth_test;
+SET GLOBAL vsql_auth_test.auto_create = ON;
+CREATE ROLE vsql_role_granted;
+GRANT SELECT ON *.* TO vsql_role_granted;
+```
+
+```bash
+mysql --enable-cleartext-plugin --user=auto_created_user \
+      --password=vsql-auth-test-token \
+      -e "SELECT CURRENT_USER() AS who, @@external_user AS ext"
+```
+
+```text
++---------------------+-------------------+
+| who                 | ext               |
++---------------------+-------------------+
+| auto_created_user@% | auto_created_user |
++---------------------+-------------------+
+```
+
+该账户现在已经存在，绑定到该方法，并持有已授予的角色：
+
+```sql
+SELECT user, host, plugin FROM mysql.user WHERE user = 'auto_created_user';
+```
+
+```text
++-------------------+------+----------------+
+| user              | host | plugin         |
++-------------------+------+----------------+
+| auto_created_user | %    | vsql_auth_test |
++-------------------+------+----------------+
+```
+
+```sql
+SHOW GRANTS FOR 'auto_created_user'@'%';
+```
+
+```text
++----------------------------------------------------------+
+| Grants for auto_created_user@%                           |
++----------------------------------------------------------+
+| GRANT USAGE ON *.* TO `auto_created_user`@`%`            |
+| GRANT `vsql_role_granted`@`%` TO `auto_created_user`@`%` |
++----------------------------------------------------------+
+```
+
+错误的令牌仍然会故障关闭，并且不会配置任何东西：
+
+```bash
+mysql --enable-cleartext-plugin --user=never_created --password=wrong-token \
+      -e "SELECT 1"
+```
+
+```text
+ERROR 1045 (28000): Access denied for user 'never_created'@'localhost' (using password: NO)
+```
+
+<Warning>
+选择启用会使未知账户与已存在账户之间的差别变得可观察，而标准的未知账户拒绝行为刻意隐藏了这一点：针对未知账户的被拒绝登录报告 `(using password: NO)`，针对拥有普通密码的账户的被拒绝登录报告 `(using password: YES)`，而有效的凭据会创建该账户。这是此功能所作的取舍；在为一个凭据被广泛持有的方法启用该选择项之前，请权衡这一点。
+</Warning>
+
+### 自动授予角色 {#auto-granting-roles}
+
+默认情况下，令牌指定的角色只有在账户已经持有它时才会生效；账户未持有的角色会被跳过，并且服务器会记录原因 (`VEF auth: role '<role>'@'<host>' requested for account '<user>'@'<host>' is not granted; skipping`)。`.roles_mode(&callback)` 改变了这一点：该回调返回一个 `vef_auth_roles_mode_t`——`VEF_AUTH_ROLES_ACTIVATE`（默认值）、`VEF_AUTH_ROLES_GRANT` 或 `VEF_AUTH_ROLES_SYNC`——服务器据此在每次登录时将暂存的角色与账户已被授予的角色进行协调。
+
+该回调在形态上与 `.auto_create()` 一致——不接受参数——但返回的是模式枚举而不是 `bool`，并且服务器在每次登录时调用它，实时读取其背后的任何设置：
+
+```cpp
+unsigned long g_auto_grant = 0;  // 0=ACTIVATE, 1=GRANT, 2=SYNC
+vef_auth_roles_mode_t roles_mode_cb() {
+  return static_cast<vef_auth_roles_mode_t>(g_auto_grant);
+}
+
+constexpr auto AUTH_METHOD =
+    vsql::preview_auth::make_auth<&authenticate>("vsql_auth_test")
+        .client_plugin("mysql_clear_password")
+        .roles_mode(&roles_mode_cb)
+        .build();
+```
+
+这两个选择项在登录过程中的不同时间点运行。`.auto_create()` 决定针对尚不存在账户的登录是否允许配置一个账户；`.roles_mode()` 在之后运行，作用于登录所解析到的任何账户——无论是刚刚配置的账户还是已经存在的账户——因此无论哪种情况都应用同样的协调。`VEF_AUTH_ROLES_ACTIVATE` 或根本不设置回调，都会保持仅激活的默认行为。
+
+`VEF_AUTH_ROLES_GRANT` 是累加的：它授予账户缺少的暂存角色，并且从不运行撤销步骤。`VEF_AUTH_ROLES_SYNC` 会运行该步骤：它撤销令牌未声明的每一个已授予角色，因此从令牌中删除的角色也会在下次登录时从账户中删除——但由操作员通过 `ALTER USER` 设置为账户 `DEFAULT ROLE` 的角色除外，SYNC 从不撤销它。在这两种模式下，不作为数据库角色存在的暂存角色会使其 `GRANT` 失败，并被记录和跳过，而不会使登录失败。
+
+`vsql_auth_test` 将其公开为 `vsql_auth_test.auto_grant`，这是一个 `OFF`/`ON`/`SYNC` 枚举（同样初始为 `OFF`），其索引顺序与上述模式顺序一致。它的 `-token-roles` 令牌暂存 `vsql_role_granted` 和 `vsql_role_denied`，而下面的账户两者都不持有。在该设置关闭时，登录不会改动该账户的角色：
+
+```sql
+CREATE USER IF NOT EXISTS auth_user IDENTIFIED WITH vsql_auth_test;
+CREATE USER IF NOT EXISTS vsql_auth_test_user;
+GRANT SELECT ON *.* TO vsql_auth_test_user;
+GRANT PROXY ON vsql_auth_test_user TO auth_user;
+CREATE ROLE IF NOT EXISTS vsql_role_granted, vsql_role_denied;
+```
+
+以与上面相同的方式，使用密码 `vsql-auth-test-token-roles` 以 `auth_user` 身份连接，并通过 `SELECT CURRENT_ROLE()` 查询哪些角色处于活动状态：
+
+```text
++----------------+
+| CURRENT_ROLE() |
++----------------+
+| NONE           |
++----------------+
+```
+
+打开该设置并重复同一次登录：
+
+```sql
+SET GLOBAL vsql_auth_test.auto_grant = ON;
+```
+
+```text
++------------------------------------------------+
+| CURRENT_ROLE()                                 |
++------------------------------------------------+
+| `vsql_role_denied`@`%`,`vsql_role_granted`@`%` |
++------------------------------------------------+
+```
+
+现在两个角色都处于活动状态，并且 `SHOW GRANTS` 会显示服务器添加的授予：
+
+```sql
+SHOW GRANTS FOR vsql_auth_test_user;
+```
+
+```text
++-----------------------------------------------------------------------------------+
+| Grants for vsql_auth_test_user@%                                                  |
++-----------------------------------------------------------------------------------+
+| GRANT SELECT ON *.* TO `vsql_auth_test_user`@`%`                                  |
+| GRANT `vsql_role_denied`@`%`,`vsql_role_granted`@`%` TO `vsql_auth_test_user`@`%` |
++-----------------------------------------------------------------------------------+
+```
+
+<Warning>
+在 `vsql_auth_test.auto_grant` 设置为 `ON` 或 `SYNC` 时，一个有效的令牌就足以获得它所指定的任何角色。不作为数据库角色存在的角色会使其 `GRANT` 失败并被跳过，因此令牌仍然无法凭空创造一个从未创建过的角色，但决定账户可以取得哪些现有角色的不再是 DBA，而是该认证方法。`SYNC` 更进一步：当账户下次登录时，它还会撤销 DBA 在带外授予、但令牌从未声明的角色——操作员仍然可以通过将某个角色设置为账户的 `DEFAULT ROLE` 来使其免受此影响，SYNC 不会动它。从 `vsql_auth_test_user` 撤销的角色不会从已经激活它的会话中消失：在撤销之后，在同一会话中再次查询 `CURRENT_ROLE()`，仍然会列出该角色。
+</Warning>

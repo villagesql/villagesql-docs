@@ -1,0 +1,379 @@
+---
+audience: extension-author
+title: "Acesso ao Keyring e Serviços do MySQL"
+description: "A capability vsql::preview::keyring lê e grava segredos no keyring do MySQL, e a vsql::preview::mysql_services permite que uma extensão consuma serviços do registro do MySQL."
+---
+
+As capabilities desta página estão em Preview: suas APIs não são estáveis, e uma extensão que declara uma delas requer `vsql_allow_preview_extensions = ON` para instalar. Consulte [Capabilities Preview](/pt-BR/extensions/build/preview-capabilities) para saber como habilitar o nível Preview e registrar uma capability.
+
+## Acesso ao Keyring {#keyring-access}
+
+A capability keyring (`vsql::preview::keyring`) permite que as extensões leiam e
+escrevam segredos armazenados no componente keyring do MySQL. As extensões a
+usam para coisas como chaves de API, chaves de criptografia ou outros segredos
+que não deveriam ficar em tabelas SQL.
+
+O nome da capability `VEF_PREVIEW_KEYRING_NAME` é `"vsql::preview::keyring"`.
+
+Um componente keyring (por exemplo, `component_keyring_file`) deve ser carregado
+na inicialização do servidor por meio de um manifesto de componente e do seu
+arquivo de configuração, como descrito em
+[Keyring Component Installation](https://dev.mysql.com/doc/refman/8.4/en/keyring-component-installation.html);
+`INSTALL COMPONENT` não o torna disponível. Sem um, as operações retornam
+`KeyringCapability::Status::UNAVAILABLE`.
+
+### Valores de Status
+
+`KeyringCapability::Status` é um enum com escopo retornado por `read()` (dentro
+de `ReadResult`) e por `write()`:
+
+| Status | Significado |
+|---|---|
+| `Status::OK` | A operação teve sucesso. |
+| `Status::NOT_FOUND` | A chave não existe (apenas leitura). |
+| `Status::UNAVAILABLE` | Nenhum componente keyring está instalado. |
+| `Status::ERROR` | Outra falha. |
+
+### Declarando a Capability
+
+Inclua o cabeçalho, declare um objeto de capability no escopo do arquivo e
+passe-o para `.with()`:
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_keyring))
+```
+
+O objeto `g_keyring` é populado pelo servidor no momento do carregamento. Os
+métodos `read()` e `write()` retornam `Status::UNAVAILABLE` em tempo de execução
+quando nenhum componente keyring está instalado — verifique esse status em cada
+chamada em vez de depender de uma verificação de disponibilidade separada.
+
+### Lendo e Escrevendo
+
+```cpp
+struct KeyringCapability::ReadResult {
+  KeyringCapability::Status status;
+  std::string value;
+};
+
+[[nodiscard]] KeyringCapability::ReadResult
+KeyringCapability::read(std::string_view data_id,
+                        std::string_view auth_id = {}) const;
+
+[[nodiscard]] KeyringCapability::Status
+KeyringCapability::write(std::string_view data_id,
+                         std::string_view auth_id,
+                         std::string_view data) const;
+```
+
+`data_id` é o identificador da chave. `auth_id` é o usuário proprietário — passe
+uma string vazia (ou omita-o em `read`, que assume `{}` como padrão) para ler ou
+escrever chaves internas não associadas a um usuário específico.
+
+`read` retorna um `ReadResult` por valor. Vincule-o com structured bindings:
+
+```cpp
+auto [status, value] = g_keyring.read("my_secret");
+if (status == KeyringCapability::Status::OK) {
+  // value contains the secret bytes
+}
+```
+
+Em qualquer status diferente de `Status::OK`, `value` fica vazio.
+
+`write` retorna `Status` diretamente e armazena `data` sob `data_id` /
+`auth_id`. Com `component_keyring_file`, escrever uma chave existente retorna
+`Status::ERROR`.
+
+### Exemplo Completo
+
+Esta é uma versão simplificada da extensão de teste `vsql_keyring_reader`, na
+árvore `villagesql/test-extensions/` do servidor. Ela registra 2 VDFs: `keyring_read` e
+`keyring_store`.
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+void keyring_read(StringArg data_id, StringArg auth_id, StringResult out) {
+  if (data_id.is_null()) { out.set_null(); return; }
+
+  const auto [status, value] =
+      g_keyring.read(data_id.value(), auth_id.is_null() ? "" : auth_id.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  if (status != KeyringCapability::Status::OK) { out.set_null(); return; }
+
+  auto buf = out.buffer();
+  if (value.size() <= buf.size())
+    memcpy(buf.data(), value.data(), value.size());
+  out.set_length(value.size());
+}
+
+void keyring_store(StringArg data_id, StringArg auth_id, StringArg value,
+                   IntResult out) {
+  if (data_id.is_null() || value.is_null()) { out.set(1); return; }
+
+  KeyringCapability::Status status = g_keyring.write(
+      data_id.value(), auth_id.is_null() ? "" : auth_id.value(), value.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  out.set(status == KeyringCapability::Status::OK ? 0 : 1);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&keyring_read>("keyring_read")
+                  .returns(STRING).param(STRING).param(STRING).build())
+        .func(make_func<&keyring_store>("keyring_store")
+                  .returns(INT).param(STRING).param(STRING).param(STRING).build())
+        .with(g_keyring))
+```
+
+## Serviços do MySQL {#mysql-services}
+
+A capability mysql_services (`vsql::preview::mysql_services`) permite que uma
+extensão consuma serviços do registro do MySQL — os mesmos serviços que um
+componente do MySQL consome, fornecidos por um componente instalado ou pelo
+núcleo do servidor. A extensão declara em um único lugar todos os serviços de
+que precisa; o servidor adquire cada um quando a extensão é carregada e o libera
+quando a extensão é descarregada.
+
+O nome da capability `VEF_PREVIEW_MYSQL_SERVICES_NAME` é
+`"vsql::preview::mysql_services"`.
+
+Recorra a ela quando um recurso do servidor não tiver uma capability VEF
+própria. Os atributos de sessão e os próprios serviços de componente do keyring
+são alcançáveis por esse caminho. Somente o consumo é suportado: registrar a
+implementação da própria extensão no registro é um trabalho futuro planejado e
+não faz parte desta capability.
+
+### Declarando a Capability
+
+Declare um objeto `MysqlServices` no escopo do arquivo, nomeie cada serviço que
+você consome com `VSQL_REQUIRE_SERVICE` e passe o objeto para `.with()`. Inclua
+o cabeçalho do próprio MySQL para cada serviço — é nesse cabeçalho que o tipo e
+os métodos do serviço são declarados:
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(services))
+```
+
+`VSQL_REQUIRE_SERVICE(services, name, var)` declara `var`, a referência na qual
+o servidor escreve o serviço adquirido, e registra `name` em `services`. Ele
+declara `var` como `static` para você. O objeto `MysqlServices` também precisa
+ser `static`, assim como qualquer referência que você declare manualmente: o
+servidor escreve através deles no carregamento, e eles precisam sobreviver à
+extensão.
+
+### Fixando uma Implementação Específica
+
+`VSQL_REQUIRE_SERVICE` usa `name` duas vezes — como o `SERVICE_TYPE(name)` do
+C++ e como a string que o servidor procura no registro. Sob esse nome simples, o
+servidor adquire a implementação padrão do serviço.
+
+Para nomear uma implementação em vez disso, use seu nome qualificado no
+registro — `service.component`, a forma que o
+`PROVIDES_SERVICE(component, service)` do MySQL gera. Isto pede o leitor de
+keyring do componente `component_keyring_file` em vez do padrão:
+
+```cpp
+static preview_mysql_services::ServiceRef<SERVICE_TYPE(keyring_reader_with_status)>
+    reader;
+static const int reader_req =
+    (services.require<SERVICE_TYPE(keyring_reader_with_status)>(
+         "keyring_reader_with_status.component_keyring_file", reader),
+     0);
+```
+
+Um nome qualificado é adquirido da mesma maneira que um nome simples, então vale
+a regra de sempre: se aquela implementação exata não estiver registrada, a
+extensão falha ao instalar em vez de recorrer a outra.
+
+### Compilando com os Cabeçalhos do MySQL
+
+As definições de serviço pertencem ao framework de componentes do MySQL, e não
+ao VEF, e o servidor não as instala. Portanto, `mysql/components/services/*.h`
+está ausente do SDK de extensões e de tudo o que é gerado por `make install`, o
+que inclui o tarball de release e a imagem Docker. Uma extensão que consome
+serviços é compilada contra uma árvore de código-fonte do servidor VillageSQL:
+
+| Caminho de include | Fornece |
+|---|---|
+| `<source>/include` | as definições de serviço, `mysql/components/services/*.h` |
+| `<build>/include` | cabeçalhos gerados em tempo de compilação, como `mysqld_error.h` |
+
+As extensões de teste internas à árvore obtêm ambos a partir da flag
+`MYSQL_HEADERS` de `vsql_add_test_extension()`, que os repassa como
+`MYSQL_INCLUDE_DIR` e `MYSQL_GENERATED_INCLUDE_DIR`. Uma compilação fora da
+árvore define seus próprios caminhos de include.
+
+Duas falhas de compilação aparecem em um lugar diferente da linha que as causou.
+
+Omitir o cabeçalho MySQL de um serviço deixa `VSQL_REQUIRE_SERVICE` com um nome
+que não resolve para nada, então o erro aparece na macro em vez de no include
+ausente (clang 17):
+
+```text
+error: unknown type name 'mysql_service_mysql_current_thread_reader_t'
+```
+
+Algumas definições de serviço usam `size_t` sem incluir `<cstddef>`, então
+colocar um desses cabeçalhos antes de todos os cabeçalhos villagesql falha
+dentro do próprio cabeçalho do MySQL:
+
+```text
+error: unknown type name 'size_t'
+```
+
+Inclua `<cstddef>` primeiro, como fazem os exemplos desta página.
+
+### Chamando um Serviço
+
+Uma referência de serviço expõe o seu próprio `valid()`, e `->` encaminha para o
+serviço. Use `.` para a referência e `->` para o serviço:
+
+```cpp
+if (!thd_reader.valid()) { out.error("service unavailable"); return; }
+MYSQL_THD thd = nullptr;
+if (thd_reader->get(&thd) || thd == nullptr) { out.set_null(); return; }
+```
+
+Verifique `valid()` antes de cada chamada com `->`. `->` retorna o pointer
+adquirido, que é nulo quando o serviço não foi adquirido.
+
+Um serviço que falha ao ser adquirido faz a instalação falhar, então, dentro de
+uma função em execução, um serviço requerido é válido. A verificação ainda
+importa, porque um `ServiceRef` declarado manualmente e nunca passado para
+`require()` nunca é escrito: ele compila, a extensão instala, e `valid()` é
+falso por toda a vida da extensão.
+
+O que um serviço *é* — seus métodos, seus parâmetros e o que eles retornam — é
+documentado pelo MySQL, não aqui. Para um serviço chamado `NAME`, leia
+`include/mysql/components/services/NAME.h` na árvore do servidor: seu bloco
+`BEGIN_SERVICE_DEFINITION(NAME)` declara cada método com a sua própria
+documentação. Chame-os exatamente como aquele cabeçalho especifica, incluindo a
+convenção do MySQL de que um retorno `bool` `false` significa sucesso e `true`
+significa falha.
+
+### Falha na Aquisição
+
+Todo serviço declarado é adquirido quando a extensão é carregada, antes que
+qualquer uma de suas funções possa ser chamada, então um serviço que não está
+registrado faz o carregamento falhar em vez de aparecer mais tarde. O
+`INSTALL EXTENSION` falha e nomeia o serviço.
+
+`vsql_mysql_services_missing_test`, abaixo, é uma extensão de teste interna à
+árvore que requer um serviço que o registro não tem. Não é algo que você possa
+instalar — é como a falha foi capturada, e é o que a sua própria extensão produz
+se ela requerer um serviço que este servidor não fornece:
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mysql_services_missing_test': failed to acquire MySQL service 'vsql_intentionally_missing'
+```
+
+Outras duas falhas de instalação chegam a esta capability de fora dela: deixar o
+objeto `MysqlServices` fora de `.with()` e instalar em um servidor com
+`vsql_allow_preview_extensions` OFF. Ambas são cobertas em
+[Padrão de Registro](/pt-BR/extensions/build/preview-capabilities#registration-pattern).
+
+### Exemplo Completo
+
+Uma versão simplificada de `vsql_mysql_services_session_test`, na árvore
+`villagesql/test-extensions/` do servidor. Ela lê o comando SQL em execução na
+sessão que a chamou compondo dois serviços: um devolve o `THD` atual, o outro lê
+um atributo nomeado a partir dele. Ambos são serviços do núcleo do servidor,
+registrados em todo servidor, então nada precisa ser instalado antes:
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/defs/mysql_string_defs.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+VSQL_REQUIRE_SERVICE(services, mysql_thd_attributes, attrs);
+
+// session_sql_command() -> STRING: the name of the SQL command running on the
+// calling session, or NULL when the THD or the attribute cannot be read.
+void session_sql_command(StringResult out) {
+  if (!thd_reader.valid() || !attrs.valid()) {
+    out.error("MySQL session services are not available");
+    return;
+  }
+
+  MYSQL_THD thd = nullptr;
+  // MySQL convention: a false return means success.
+  if (thd_reader->get(&thd) || thd == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  mysql_cstring_with_length value{nullptr, 0};
+  if (attrs->get(thd, "sql_command", &value) || value.str == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  out.set(std::string_view(value.str, value.length));
+}
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(services).func(
+    make_func<&session_sql_command>("session_sql_command")
+        .returns(STRING)
+        .no_params()
+        .build()))
+```
+
+Instale-a e chame a função:
+
+```sql
+INSTALL EXTENSION my_ext;
+SELECT my_ext.session_sql_command() AS sql_command;
+```
+
+```text
++-------------+
+| sql_command |
++-------------+
+| select      |
++-------------+
+```
