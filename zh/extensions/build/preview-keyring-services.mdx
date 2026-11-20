@@ -1,0 +1,299 @@
+---
+audience: extension-author
+title: "密钥环访问和 MySQL 服务"
+description: "vsql::preview::keyring 功能读写 MySQL 密钥环中的机密，vsql::preview::mysql_services 功能允许扩展程序使用 MySQL 注册表服务。"
+---
+
+本页中的功能处于预览阶段：其 API 并不稳定，声明这些功能的扩展程序需要 `vsql_allow_preview_extensions = ON` 才能安装。有关如何启用预览层和注册功能，请参阅[预览功能](/zh/extensions/build/preview-capabilities)。
+
+## 密钥环访问 {#keyring-access}
+
+密钥环功能 (`vsql::preview::keyring`) 允许扩展程序读取和写入存储在 MySQL 密钥环组件中的密钥。扩展程序可将其用于 API 密钥、加密密钥或其他不应存储在 SQL 表中的密钥。
+
+功能名称 `VEF_PREVIEW_KEYRING_NAME` 为 `"vsql::preview::keyring"`。
+
+密钥环组件（例如 `component_keyring_file`）必须在服务器启动时通过组件清单及其配置文件加载，如 [Keyring Component Installation](https://dev.mysql.com/doc/refman/8.4/en/keyring-component-installation.html) 中所述；`INSTALL COMPONENT` 不会使其可用。如果没有密钥环组件，则操作将返回 `KeyringCapability::Status::UNAVAILABLE`。
+
+### 状态值
+
+`KeyringCapability::Status` 是一个作用域枚举，由 `read()`（在 `ReadResult` 中）和 `write()` 返回：
+
+| 状态 | 含义 |
+|---|---|
+| `Status::OK` | 操作成功。 |
+| `Status::NOT_FOUND` | 密钥不存在（仅限读取）。 |
+| `Status::UNAVAILABLE` | 没有安装密钥环组件。 |
+| `Status::ERROR` | 其他错误。 |
+
+### 声明功能
+
+包含头文件，在文件范围内声明一个功能对象，并将其传递给 `.with()`：
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_keyring))
+```
+
+服务器将在加载时填充 `g_keyring` 对象。如果未安装密钥环组件，则 `read()` 和 `write()` 方法在运行时将返回 `Status::UNAVAILABLE`——请在每次调用时检查该状态，而不是基于单独的可用性探测。
+
+### 读取和写入
+
+```cpp
+struct KeyringCapability::ReadResult {
+  KeyringCapability::Status status;
+  std::string value;
+};
+
+[[nodiscard]] KeyringCapability::ReadResult
+KeyringCapability::read(std::string_view data_id,
+                        std::string_view auth_id = {}) const;
+
+[[nodiscard]] KeyringCapability::Status
+KeyringCapability::write(std::string_view data_id,
+                         std::string_view auth_id,
+                         std::string_view data) const;
+```
+
+`data_id` 是密钥标识符。`auth_id` 是所有者用户——传递一个空字符串（或在 `read` 上省略它，`read` 默认使用 `{}`）以读取或写入与特定用户无关的内部密钥。
+
+`read` 按值返回一个 `ReadResult`。使用结构化绑定将其绑定：
+
+```cpp
+auto [status, value] = g_keyring.read("my_secret");
+if (status == KeyringCapability::Status::OK) {
+  // value contains the secret bytes
+}
+```
+
+对于任何状态（`Status::OK` 除外），`value` 都是空的。
+
+`write` 直接返回 `Status`，并将 `data` 存储在 `data_id` / `auth_id` 下。使用 `component_keyring_file` 时，写入已存在的密钥会返回 `Status::ERROR`。
+
+### 完整示例
+
+这是服务器 `villagesql/test-extensions/` 目录中的 `vsql_keyring_reader` 测试扩展程序的简化版本。它注册了 2 个 VDF：`keyring_read` 和 `keyring_store`。
+
+```cpp
+#include <villagesql/preview/keyring.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+using KeyringCapability = vsql::preview_keyring::KeyringCapability;
+
+static KeyringCapability g_keyring;
+
+void keyring_read(StringArg data_id, StringArg auth_id, StringResult out) {
+  if (data_id.is_null()) { out.set_null(); return; }
+
+  const auto [status, value] =
+      g_keyring.read(data_id.value(), auth_id.is_null() ? "" : auth_id.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  if (status != KeyringCapability::Status::OK) { out.set_null(); return; }
+
+  auto buf = out.buffer();
+  if (value.size() <= buf.size())
+    memcpy(buf.data(), value.data(), value.size());
+  out.set_length(value.size());
+}
+
+void keyring_store(StringArg data_id, StringArg auth_id, StringArg value,
+                   IntResult out) {
+  if (data_id.is_null() || value.is_null()) { out.set(1); return; }
+
+  KeyringCapability::Status status = g_keyring.write(
+      data_id.value(), auth_id.is_null() ? "" : auth_id.value(), value.value());
+  if (status == KeyringCapability::Status::UNAVAILABLE) {
+    out.error("No keyring component is installed");
+    return;
+  }
+  out.set(status == KeyringCapability::Status::OK ? 0 : 1);
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&keyring_read>("keyring_read")
+                  .returns(STRING).param(STRING).param(STRING).build())
+        .func(make_func<&keyring_store>("keyring_store")
+                  .returns(INT).param(STRING).param(STRING).param(STRING).build())
+        .with(g_keyring))
+```
+
+## MySQL 服务 {#mysql-services}
+
+mysql_services 功能 (`vsql::preview::mysql_services`) 允许扩展程序使用 MySQL 注册表服务——MySQL 组件所使用的正是这些服务，它们由已安装的组件或服务器核心提供。扩展程序在一处声明它需要的每一项服务；服务器在扩展程序加载时获取每一项服务，并在扩展程序卸载时释放它们。
+
+功能名称 `VEF_PREVIEW_MYSQL_SERVICES_NAME` 为 `"vsql::preview::mysql_services"`。
+
+当某项服务器设施没有自己的 VEF 功能时，请使用它。会话属性和密钥环自身的组件服务都可以通过这种方式访问。仅支持使用服务：将扩展程序自己的实现注册到注册表中是计划中的后续工作，不属于此功能的范围。
+
+### 声明功能
+
+在文件范围内声明一个 `MysqlServices` 对象，用 `VSQL_REQUIRE_SERVICE` 命名您使用的每一项服务，并将该对象传递给 `.with()`。请为每一项服务包含 MySQL 自己的头文件——服务的类型和方法都在该头文件中声明：
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(/* ... */)
+        .with(services))
+```
+
+`VSQL_REQUIRE_SERVICE(services, name, var)` 声明 `var`（服务器将获取到的服务写入其中的引用），并在 `services` 上注册 `name`。它会为您将 `var` 声明为 `static`。`MysqlServices` 对象也需要是 `static` 的，您手动声明的任何引用同样如此：服务器在加载时通过它们写入，它们必须比扩展程序存活得更久。
+
+### 固定特定实现 {#pinning-a-specific-implementation}
+
+`VSQL_REQUIRE_SERVICE` 两次使用 `name`——既作为 C++ 的 `SERVICE_TYPE(name)`，也作为服务器在注册表中查找的字符串。在该裸名称下，服务器获取该服务的默认实现。
+
+要改为指定某一个实现，请使用其限定的注册表名称——`service.component`，即 MySQL 的 `PROVIDES_SERVICE(component, service)` 生成的形式。下面请求的是 `component_keyring_file` 组件提供的密钥环读取器，而不是默认实现：
+
+```cpp
+static preview_mysql_services::ServiceRef<SERVICE_TYPE(keyring_reader_with_status)>
+    reader;
+static const int reader_req =
+    (services.require<SERVICE_TYPE(keyring_reader_with_status)>(
+         "keyring_reader_with_status.component_keyring_file", reader),
+     0);
+```
+
+限定名称的获取方式与裸名称相同，因此通常的规则同样适用：如果该确切实现未注册，则扩展程序将安装失败，而不会回退到另一个实现。
+
+### 基于 MySQL 的头文件构建 {#building-against-mysqls-headers}
+
+服务定义属于 MySQL 的组件框架，而不属于 VEF，并且服务器不会安装它们。因此，`mysql/components/services/*.h` 不在扩展 SDK 中，也不在 `make install` 构建的任何内容中，其中包括发行版压缩包和 Docker 镜像。使用服务的扩展程序需要基于 VillageSQL 服务器源代码树构建：
+
+| 包含路径 | 提供内容 |
+|---|---|
+| `<source>/include` | 服务定义，`mysql/components/services/*.h` |
+| `<build>/include` | 构建时生成的头文件，例如 `mysqld_error.h` |
+
+树内测试扩展程序从 `vsql_add_test_extension()` 上的 `MYSQL_HEADERS` 标志获得这两者，该标志将它们作为 `MYSQL_INCLUDE_DIR` 和 `MYSQL_GENERATED_INCLUDE_DIR` 传递。树外构建则设置自己的包含路径。
+
+有两种构建失败出现的位置与导致它们的那一行不同。
+
+遗漏某项服务的 MySQL 头文件会使 `VSQL_REQUIRE_SERVICE` 得到一个无法解析的名称，因此错误出现在该宏上，而不是出现在缺失的 include 上（clang 17）：
+
+```text
+error: unknown type name 'mysql_service_mysql_current_thread_reader_t'
+```
+
+某些服务定义使用了 `size_t` 却没有包含 `<cstddef>`，因此将其中某个头文件放在所有 villagesql 头文件之前，会在 MySQL 自己的头文件内部失败：
+
+```text
+error: unknown type name 'size_t'
+```
+
+请像本页示例那样，首先包含 `<cstddef>`。
+
+### 调用服务 {#calling-a-service}
+
+服务引用自身提供 `valid()`，而 `->` 转发到服务。对引用使用 `.`，对服务使用 `->`：
+
+```cpp
+if (!thd_reader.valid()) { out.error("service unavailable"); return; }
+MYSQL_THD thd = nullptr;
+if (thd_reader->get(&thd) || thd == nullptr) { out.set_null(); return; }
+```
+
+在每次 `->` 调用之前检查 `valid()`。`->` 返回获取到的指针，当服务未被获取时该指针为空。
+
+获取失败的服务会导致安装失败，因此在一个正在运行的函数内部，所需的服务是有效的。这项检查仍然重要，因为手动声明且从未传递给 `require()` 的 `ServiceRef` 永远不会被写入：它可以编译，扩展程序可以安装，而 `valid()` 在扩展程序的整个生命周期内都为 false。
+
+服务*是什么*——它的方法、这些方法的参数以及返回值——由 MySQL 记录，而不是在此处记录。对于名为 `NAME` 的服务，请阅读服务器源代码树中的 `include/mysql/components/services/NAME.h`：其 `BEGIN_SERVICE_DEFINITION(NAME)` 块声明了每个方法，并附有各自的文档。请完全按照该头文件的规定调用它们，包括 MySQL 的约定：`bool` 返回 `false` 表示成功，返回 `true` 表示失败。
+
+### 获取失败 {#acquisition-failure}
+
+每一项声明的服务都在扩展程序加载时获取，早于其任何函数被调用，因此未注册的服务会使加载失败，而不是稍后才浮现。`INSTALL EXTENSION` 会失败并指出该服务。
+
+下面的 `vsql_mysql_services_missing_test` 是一个树内测试扩展程序，它要求一项注册表中不存在的服务。它不是您可以安装的东西——它是此失败被捕获的方式，也是当您自己的扩展程序要求此服务器不提供的服务时所产生的结果：
+
+```text
+ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mysql_services_missing_test': failed to acquire MySQL service 'vsql_intentionally_missing'
+```
+
+另有两种安装失败并非源于此功能本身，但同样会影响它：将 `MysqlServices` 对象排除在 `.with()` 之外，以及在 `vsql_allow_preview_extensions` 为 OFF 的服务器上安装。两者都在[注册模式](/zh/extensions/build/preview-capabilities#registration-pattern)中介绍。
+
+### 完整示例
+
+`vsql_mysql_services_session_test` 的简化版本，位于服务器的 `villagesql/test-extensions/` 树中。它通过组合两项服务，读取调用会话上正在运行的 SQL 命令：一项返回当前的 `THD`，另一项从中读取指定的属性。两者都是每台服务器上都注册的服务器核心服务，因此无需先安装任何东西：
+
+```cpp
+#include <cstddef>
+
+#include <mysql/components/services/defs/mysql_string_defs.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
+#include <villagesql/preview/mysql_services.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+
+static preview_mysql_services::MysqlServices services;
+VSQL_REQUIRE_SERVICE(services, mysql_current_thread_reader, thd_reader);
+VSQL_REQUIRE_SERVICE(services, mysql_thd_attributes, attrs);
+
+// session_sql_command() -> STRING: the name of the SQL command running on the
+// calling session, or NULL when the THD or the attribute cannot be read.
+void session_sql_command(StringResult out) {
+  if (!thd_reader.valid() || !attrs.valid()) {
+    out.error("MySQL session services are not available");
+    return;
+  }
+
+  MYSQL_THD thd = nullptr;
+  // MySQL convention: a false return means success.
+  if (thd_reader->get(&thd) || thd == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  mysql_cstring_with_length value{nullptr, 0};
+  if (attrs->get(thd, "sql_command", &value) || value.str == nullptr) {
+    out.set_null();
+    return;
+  }
+
+  out.set(std::string_view(value.str, value.length));
+}
+
+VEF_GENERATE_ENTRY_POINTS(make_extension().with(services).func(
+    make_func<&session_sql_command>("session_sql_command")
+        .returns(STRING)
+        .no_params()
+        .build()))
+```
+
+安装它并调用该函数：
+
+```sql
+INSTALL EXTENSION my_ext;
+SELECT my_ext.session_sql_command() AS sql_command;
+```
+
+```text
++-------------+
+| sql_command |
++-------------+
+| select      |
++-------------+
+```

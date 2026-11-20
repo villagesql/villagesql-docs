@@ -1,0 +1,253 @@
+---
+audience: extension-author
+title: "Armazenamento de Colunas"
+description: "As capabilities vsql::preview::column_store e vsql::preview::storage permitem que uma extensão registre no InnoDB um layout binário em disco personalizado para um de seus tipos personalizados."
+---
+
+As capabilities desta página estão em Preview: suas APIs não são estáveis, e uma extensão que declara uma delas requer `vsql_allow_preview_extensions = ON` para instalar. Consulte [Capabilities Preview](/pt-BR/extensions/build/preview-capabilities) para saber como habilitar o nível Preview e registrar uma capability.
+
+O column storage permite que uma extensão registre um layout binário
+personalizado em disco diretamente com o InnoDB para um de seus tipos
+personalizados, em vez de rotear os bytes do tipo através do payload VARBINARY da
+linha. Use-o quando o seu tipo precisa de um formato em disco que o VARBINARY não
+consegue expressar — por exemplo, um array compactado de floats que precisa
+residir em páginas dedicadas. Este é um recurso de capability: ele habilita novos
+layouts de armazenamento, não é um botão de ajuste para os existentes.
+
+<Warning>
+  O column storage é uma ABI Preview — em desenvolvimento ativo e pode mudar
+  entre versões. Atualmente cobre apenas a persistência em nível de linha; uma
+  coluna com armazenamento personalizado aceita apenas um
+  [índice personalizado](/pt-BR/extensions/build/custom-indexes), e um índice comum é recusado com
+  `ERROR 3219 (HY000): InnoDB: Indexing for types with column storage is supported only with custom index.`
+</Warning>
+
+## Declarando as Capabilities
+
+Duas capabilities Preview trabalham juntas:
+
+- `vsql::preview::storage` — abre acesso à infraestrutura de armazenamento do
+  InnoDB (mini-transações, segmentos, páginas). Declare uma `StorageCapability`
+  no escopo do arquivo.
+- `vsql::preview::column_store` — vincula uma implementação de armazenamento por
+  tipo a um dos tipos personalizados da extensão. Declare uma
+  `ColumnStoreCapability` no escopo do arquivo usando
+  `make_column_store<Ctx>(TYPE).…build()`.
+
+Ambas devem ser passadas para `.with()` em `make_extension()`:
+
+```cpp
+#include <villagesql/preview/storage_builder.h>
+#include <villagesql/preview/storage_api.h>
+#include <villagesql/vsql.h>
+
+namespace storage = vsql::preview_storage;
+using vsql::preview_storage_builder::ColumnStoreCapability;
+using vsql::preview_storage_builder::make_column_store;
+using vsql::preview_storage_builder::StorageCapability;
+
+struct MyCtx {
+  storage::Space::Ref space = 0;
+  storage::Segment::PageRef root_page = storage::Page::INVALID_REF;
+};
+
+static auto STORAGE = StorageCapability{};
+
+static constexpr auto kMyStorage =
+    make_column_store<MyCtx>(MY_TYPE)
+        .create<&MyStorage::create>()
+        .drop<&MyStorage::drop>()
+        .load<&MyStorage::load>()
+        .insert<&MyStorage::insert>()
+        .select<&MyStorage::select>()
+        .mark_delete<&MyStorage::mark_delete>()
+        .purge<&MyStorage::purge>()
+        .build();
+
+static auto COLUMN_STORE = ColumnStoreCapability().column_store(kMyStorage);
+
+using namespace vsql;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(STORAGE)
+        .with(COLUMN_STORE)
+        .type(MY_TYPE))
+```
+
+`make_column_store<MyCtx>(MY_TYPE)` liga a implementação a um tipo personalizado
+registrado na mesma extensão. Todos os sete slots são obrigatórios no momento do
+`build()`, porque cada um mapeia para um ponto distinto no ciclo de vida da
+coluna que o InnoDB alcançará durante a operação normal.
+
+## As Sete Funções de Armazenamento
+
+Toda função recebe `storage::Column::StorageCtx<MyCtx>*`, cujo acessador `user()`
+retorna o estado por coluna da extensão e cujo `arena()` fornece alocação
+gerenciada pelo servidor para objetos auxiliares. Toda função retorna `false` em
+caso de sucesso e `true` em caso de erro, escrevendo uma mensagem em `error_msg`
+(capacidade `error_msg_len`). O servidor escreve essa mensagem no seu log de erros; um `create` ou `insert` que falha
+faz a instrução falhar com `ERROR 3219 (HY000): InnoDB: Custom type operation failed. See server error log for details.`
+
+```cpp
+// CREATE TABLE / ALTER TABLE ADD COLUMN.
+// col_len is the type's persisted length. Reserve segments here and store
+// space + root_page in ctx->user() so DML functions can reach them.
+bool create(storage::Column::StorageCtx<MyCtx>*, storage::Space::Ref,
+            storage::Segment::TrxRef, uint32_t col_len,
+            char* error_msg, uint32_t error_msg_len);
+
+// DROP TABLE / ALTER TABLE DROP COLUMN.
+// Release any segments reserved in create(). Arena memory is freed by the
+// server after this call returns.
+bool drop(storage::Column::StorageCtx<MyCtx>*, storage::Segment::TrxRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// Called when the server reattaches to existing storage (e.g. after restart).
+// Recover space and root_page from the StorageRef set in create().
+bool load(storage::Column::StorageCtx<MyCtx>*, storage::Column::StorageRef,
+          char* error_msg, uint32_t error_msg_len);
+
+// INSERT. col_data is the encoded value; rowid_prefix identifies the owning
+// row. Write into your storage layout and return a Column::Ref the server
+// stores in the row payload in place of the value bytes.
+bool insert(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Segment::TrxRef, storage::Column::Data col_data,
+            storage::Column::Data rowid_prefix, storage::Column::Ref* col_ref,
+            char* error_msg, uint32_t error_msg_len);
+
+// SELECT. Given the Column::Ref produced by insert, populate col_data and
+// rowid_prefix, and report the writing transaction and delete-mark status.
+bool select(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+            storage::Column::Ref, storage::Column::Data* col_data,
+            storage::Column::Data* rowid_prefix, storage::Segment::TrxRef*,
+            bool* delete_marked, char* error_msg, uint32_t error_msg_len);
+
+// DELETE (in-transaction). Set or clear the delete-mark flag. The actual
+// bytes must remain readable until purge() runs.
+bool mark_delete(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+                 storage::Segment::TrxRef, storage::Column::Ref,
+                 bool delete_mark, char* error_msg, uint32_t error_msg_len);
+
+// InnoDB purge. Reclaim storage for entries whose deleting transaction is
+// no longer visible to any active snapshot.
+bool purge(storage::Column::StorageCtx<MyCtx>*, storage::MtrCtx::Ref,
+           storage::Segment::TrxRef, storage::Column::Ref,
+           char* error_msg, uint32_t error_msg_len);
+```
+
+`mark_delete` e `purge` são distintos porque o MVCC do InnoDB requer que as
+linhas excluídas permaneçam legíveis por snapshots mais antigos até que o purge
+seja executado.
+
+## Contexto por Coluna e a Arena
+
+O SDK C++ constrói `MyCtx` por padrão antes de chamar `create` ou `load` —
+`ctx->user()` já está populado quando a sua função é acionada. `MyCtx` deve ser
+construível por padrão; o SDK C++ chama `T()` sem argumentos.
+
+Use `ctx->user()` diretamente para inicializar o estado. Não chame
+`ctx->arena().construct<MyCtx>()` — isso aloca uma segunda instância não utilizada
+e `ctx->user()` não aponta para ela.
+
+```cpp
+bool MyStorage::create(storage::Column::StorageCtx<MyCtx>* ctx,
+                       storage::Space::Ref space, storage::Segment::TrxRef trx,
+                       uint32_t col_len,
+                       char* error_msg, uint32_t error_msg_len) {
+  storage::Segment::PageRef root;
+  if (storage::Segment::create(space, 1, trx, root) != storage::Error::SUCCESS) {
+    snprintf(error_msg, error_msg_len, "%s", storage::last_error().data());
+    return true;
+  }
+
+  ctx->user()->space = space;
+  ctx->user()->root_page = root;
+  // Encode space and root into StorageRef so load() can recover both.
+  ctx->set_ref((static_cast<storage::Column::StorageRef>(space) << 32) |
+               static_cast<storage::Column::StorageRef>(root));
+  return false;
+}
+```
+
+`load` segue o mesmo padrão — `ctx->user()` é pré-populado e `storage_ref` carrega
+o valor compactado armazenado por `ctx->set_ref()` em `create`:
+
+```cpp
+bool MyStorage::load(storage::Column::StorageCtx<MyCtx>* ctx,
+                     storage::Column::StorageRef storage_ref,
+                     char* error_msg, uint32_t error_msg_len) {
+  ctx->user()->space =
+      static_cast<storage::Space::Ref>(storage_ref >> 32);
+  ctx->user()->root_page =
+      static_cast<storage::Segment::PageRef>(storage_ref & 0xFFFFFFFF);
+  ctx->set_ref(storage_ref);
+  return false;
+}
+```
+
+Use `ctx->arena()` apenas para alocar objetos auxiliares que são grandes demais ou
+dinâmicos demais para embutir diretamente em `MyCtx`. O SDK C++ destrói a arena
+(e chama `~MyCtx()`) automaticamente após o retorno de `drop`, independentemente
+de `drop` ter sucesso.
+
+## Utilitários de Acesso ao InnoDB
+
+Inclua `<villagesql/preview/storage_api.h>` para os primitivos do InnoDB. Todas as
+leituras e escritas de página devem ocorrer dentro de uma mini-transação:
+
+```cpp
+storage::MtrCtx mtr;
+storage::MtrCtx::Ref mtr_ref = mtr.start();
+if (mtr_ref == nullptr) { /* OOM — handle error */ return true; }
+// ... page operations ...
+mtr.commit();
+```
+
+Confirmar a mini-transação libera os latches de página e escreve os registros do
+redo log que tornam as mudanças duráveis.
+
+**Segmentos** são reservados no momento do `create` — veja os exemplos de
+`create` e `load` em Contexto por Coluna acima para o padrão completo de
+configuração. Durante as operações DML, obtenha uma referência de segmento a
+partir da página raiz para alocar novas páginas:
+
+```cpp
+storage::Page root;
+root.load(ctx->user()->space, ctx->user()->root_page,
+          storage::Page::Latch::EXCLUSIVE, mtr_ref);
+storage::Segment::Ref seg = storage::Segment::get_header(root, 0);
+storage::Page data_page;
+data_page.load_new(seg, mtr_ref);  // allocates a fresh page
+```
+
+**Páginas** são lidas com um latch compartilhado e escritas com um exclusivo.
+Passe `mtr_ref` para as chamadas de escrita para que o InnoDB registre a mudança:
+
+```cpp
+// Read: a shared latch
+storage::Page page;
+page.load(ctx->user()->space, page_num, storage::Page::Latch::SHARED, mtr_ref);
+uint32_t v = page.read_integer_4(storage::Page::HEADER_SIZE + offset);
+```
+
+```cpp
+// Write: an exclusive latch. Do not load a page for writing
+// when the same mini-transaction already holds it with a shared latch.
+storage::Page page;
+page.load(ctx->user()->space, page_num, storage::Page::Latch::EXCLUSIVE, mtr_ref);
+page.write_integer_4(storage::Page::HEADER_SIZE + offset, v, mtr_ref);
+```
+
+Constantes de layout de página:
+
+| Constante | Valor | Notas |
+|---|---|---|
+| `storage::Page::HEADER_SIZE` | `38` | Os dados da extensão começam neste offset. |
+| `storage::Page::TRAILER_SIZE` | `8` | Não escreva além de `page_size - TRAILER_SIZE`. |
+| `storage::Page::get_size(space)` | runtime | Use em vez de codificar 16384 fixamente. |
+
+Os acessadores de página rejeitam um offset dentro da região de cabeçalho ou de
+trailer: um build de release pula a leitura ou a escrita, e um build sem
+`NDEBUG` falha em um `assert`. O InnoDB usa esses intervalos de bytes para sua
+própria contabilidade e checksum.

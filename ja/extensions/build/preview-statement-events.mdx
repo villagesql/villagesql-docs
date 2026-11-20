@@ -1,0 +1,157 @@
+---
+audience: extension-author
+title: "ステートメントイベント"
+description: "vsql::preview::statement_event 機能は、各クエリの実行完了後に拡張機能のハンドラーを実行し、クエリテキスト、タイミング、行数、接続の識別情報を渡します。"
+---
+
+このページの機能はプレビュー段階です。API は安定しておらず、これらの機能を宣言する拡張機能は、`vsql_allow_preview_extensions = ON` が設定されている場合にのみインストールできます。プレビュー層の有効化と機能の登録方法については、[プレビュー機能](/ja/extensions/build/preview-capabilities)を参照してください。
+
+statement event 機能（`vsql::preview::statement_event`）は、各クエリの実行完了後に拡張機能提供のハンドラを実行します。サーバーはハンドラをクエリ自身のスレッドで同期的に呼び出し、実行メタデータ — クエリテキスト、タイミング、行数、接続元の識別情報、オプティマイザ品質インジケータ — を渡します。スロークエリのログ記録、監査、メトリクス収集に使用します。
+
+機能名 `VEF_PREVIEW_STATEMENT_EVENT_NAME` は `"vsql::preview::statement_event"` です。
+
+## 機能の宣言
+
+発火フェーズとハンドラ関数でインスタンス化した `StatementEventCapability` をファイルスコープで宣言し、`.with()` に渡します：
+
+```cpp
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/vsql.h>
+
+namespace se = vsql::preview_statement_event;
+
+static void on_statement(const se::StatementEventArgs &args,
+                         se::StatementEventResult &result) {
+  // inspect args; optionally write an advisory message via result
+}
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &on_statement>
+    g_statement_event;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .with(g_statement_event))
+```
+
+最初のテンプレート引数は発火フェーズで、`vef_statement_event_phase_t` 値です。`VEF_STATEMENT_EVENT_POSTEXECUTE` はクエリの実行完了後に、成功または失敗にかかわらず発火し、このバージョンで実装されている唯一のフェーズです。その他の `vef_statement_event_phase_t` 値は予約されており、そのいずれかに対してハンドラを宣言すると、サーバーは `INSTALL EXTENSION` を拒否します。
+
+## ハンドラ引数
+
+`StatementEventArgs` は完了したクエリの読み取り専用ビューです。POSTEXECUTE フェーズではすべてのフィールドに値が設定されています。主なアクセサ：
+
+| アクセサ | 意味 |
+|---|---|
+| `query()` | クエリテキスト、`string_view` として。サーバーが文の書き換え形式を持つ場合、これはその形式です — 一般ログとスローログが記録するのと同じ、難読化（伏字化）されたテキストです。 |
+| `query_time_secs()` | 実行時間（ウォールクロック時間、秒）。 |
+| `lock_time_secs()` | ロック待機に費やした時間（秒）。 |
+| `rows_sent()`, `rows_examined()`, `rows_affected()` | 行カウンター。 |
+| `user()`, `client_ip()`, `connection_id()` | 接続元の識別情報。 |
+| `schema()` | デフォルトスキーマ、選択されていない場合は `NULL`。 |
+| `status()` | 成功時は `0`、それ以外は MySQL エラーコード。 |
+| `warning_count()` | ステートメントの実行中に発生した注意と警告の数。ステートメントが失敗した場合は、エラーの前に発生した数。 |
+| `digest_text()` | 類似クエリをグループ化するための正規化されたクエリ形式。 |
+| `no_index_used()` | クエリが使用可能なインデックスなしで実行された場合 `true`。 |
+| `digest_hash()` | 64文字の小文字16進数によるステートメントダイジェスト — `performance_schema` が `DIGEST` として公開する値です。同一の文をグループ化するためのコンパクトなキーで、`digest_text()` が `NULL` の場合は常に `NULL` です。 |
+| `read_first()`, `read_last()`, `read_key()`, `read_next()`, `read_prev()`, `read_rnd()`, `read_rnd_next()` | 文ごとのハンドラ行アクセスカウンター（スローログの `Read_*` フィールド）。`no_index_used()` がフラグを立てるだけのアクセス方法を定量化します — 例えば `read_rnd_next()` が大きい場合は、フルテーブルスキャンを示します。 |
+| `client_pid()`, `client_name()`, `program_name()` | ハンドシェイク時に1回送信される、クライアント提供の接続属性（`_pid`、`_client_name`、`program_name`）：クライアントの OS プロセス ID、コネクタ/ドライバライブラリ（例：`libmysql`、`mysql-connector-j`）、およびアプリケーション名（例：`mysql`、`mysqldump`）です。クライアントがその属性を送信しなかった場合、それぞれ `NULL` になります。 |
+
+`query()` は存在する場合サーバーの書き換え形式を返すため、認証情報を含む文はシークレットが平文ではなく難読化された状態で到着し、一般ログとスローログが既にそれらを難読化（伏字化）する方法と一致します：`SET PASSWORD`、`CREATE`/`ALTER USER ... IDENTIFIED BY`、`CHANGE REPLICATION SOURCE ... SOURCE_PASSWORD`、`CREATE SERVER ... OPTIONS(PASSWORD ...)`。書き換えルールのない文はそのまま配信されます。
+
+`query()`、`sqlstate()`、`error_message()` などの文字列アクセサは、ハンドラ呼び出しの実行中のみ有効なストレージを指しています — ハンドラが返った後にそれらが必要な場合はバイトをコピーしてください。
+
+`StatementEventResult::error_msg(fmt, ...)` は printf 形式のメッセージを書き込みます。POSTEXECUTE フェーズでは、メッセージは参考情報（アドバイザリ）であり、サーバーはログに記録しますが、クライアントには伝播しません。
+
+## 完全な例
+
+[`vsql_slow_query_log`](https://github.com/villagesql/villagesql-server/tree/main/villagesql/test-extensions/vsql-slow-query-log) テスト拡張機能の簡略化された形式です。実行時間がしきい値を超える各クエリをログに記録し、statement event 機能を[システム変数](/ja/extensions/build/preview-server-variables#system-variables)と組み合わせて実行時設定を行います：
+
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+
+#include <villagesql/preview/statement_event.h>
+#include <villagesql/preview/sys_var.h>
+#include <villagesql/vsql.h>
+
+using namespace vsql;
+namespace sv = vsql::preview_sys_var;
+namespace se = vsql::preview_statement_event;
+
+static bool g_enabled;
+static long long g_threshold_ms;
+static char *g_log_filename;
+static std::mutex g_log_mutex;
+
+static void slow_query_hook(const se::StatementEventArgs &args,
+                            se::StatementEventResult &result) {
+  if (!g_enabled) return;
+  if (args.query_time_secs() * 1000.0 < static_cast<double>(g_threshold_ms))
+    return;
+
+  time_t now = static_cast<time_t>(args.query_start_utime() / 1000000);
+  char ts[32];
+  struct tm tm_utc;
+  gmtime_r(&now, &tm_utc);
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+  std::lock_guard<std::mutex> lock(g_log_mutex);
+  FILE *f = fopen(g_log_filename, "a");
+  if (f == nullptr) {
+    result.error_msg("failed to open '%s': %s", g_log_filename,
+                     strerror(errno));
+    return;
+  }
+
+  fprintf(f, "# Time: %s\n", ts);
+  fprintf(f, "# User@Host: %s @ %s  Id: %lu\n", args.user() ? args.user() : "",
+          args.client_ip() ? args.client_ip() : "", args.connection_id());
+  fprintf(f,
+          "# Schema: %s  Query_time: %.6f  Lock_time: %.6f"
+          "  Rows_sent: %llu  Rows_examined: %llu\n",
+          args.schema() ? args.schema() : "", args.query_time_secs(),
+          args.lock_time_secs(), (unsigned long long)args.rows_sent(),
+          (unsigned long long)args.rows_examined());
+  fprintf(f, "SET timestamp=%llu;\n", (unsigned long long)now);
+  auto q = args.query();
+  fprintf(f, "%.*s;\n", (int)q.size(), q.data());
+  fclose(f);
+}
+
+static auto SYS_VARS = sv::make_capability({
+    sv::make_bool("enabled", "Enable the slow query log", &g_enabled, false),
+    sv::make_int("threshold_ms", "Minimum execution time to log, in ms",
+                 &g_threshold_ms, 1000, 0, 3600000),
+    sv::make_str("log_file", "Path to the slow query log file",
+                 &g_log_filename, "/tmp/vsql_slow_query.log")});
+
+static se::StatementEventCapability<VEF_STATEMENT_EVENT_POSTEXECUTE,
+                                    &slow_query_hook>
+    STATEMENT_EVENT;
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension().with(SYS_VARS).with(STATEMENT_EVENT))
+```
+
+### SQL からの有効化
+
+プレビュー層を有効化した上で（[プレビュー層の有効化](/ja/extensions/build/preview-capabilities#enabling-the-preview-tier)を参照）、拡張機能をビルドし、その `.veb` ファイルを `veb_dir` にコピーしてインストールし、そのシステム変数を通じて設定します：
+
+```sql
+INSTALL EXTENSION vsql_slow_query_log;
+SET GLOBAL vsql_slow_query_log.enabled = ON;
+SET GLOBAL vsql_slow_query_log.threshold_ms = 500;
+```
+
+しきい値より遅い各クエリは、設定されたログファイルに追記されます：
+
+```
+# Time: 2026-06-22T22:53:44Z
+# User@Host: root @   Id: 27
+# Schema:   Query_time: 0.605084  Lock_time: 0.000000  Rows_sent: 1  Rows_examined: 1
+SET timestamp=1782168824;
+SELECT SLEEP(0.6);
+```
