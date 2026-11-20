@@ -9,13 +9,13 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 
 <VillagesqlBanner />
 
-An AI agent that needs to query a database usually talks to it through a hand-written tool or a sidecar process. The `vsql_mcp` extension removes that layer: it runs a Model Context Protocol server inside the VillageSQL process itself, so any MCP client can discover the schema and run queries directly.
+An AI agent that needs to query a database usually talks to it through a hand-written tool or a sidecar process. The `vsql_mcp` extension removes that layer: it runs a Model Context Protocol server inside the VillageSQL process itself, so an MCP client can discover the schema and run queries directly.
 
 ## What vsql_mcp Does
 
 `vsql_mcp` is a Rust extension that serves MCP over the Streamable HTTP transport (spec revision `2025-06-18`) from a background worker inside the server process. It exposes six tools: `list_schemas`, `list_tables`, `describe_table`, `query`, `explain`, and `write`. The `write` tool only appears once you enable it, and it is disabled by default.
 
-`vsql_mcp` is a preview extension. It uses the VEF preview capabilities `thread_worker`, `sys_var`, `status_var`, and `sql_query`, so the server must be started with preview extensions allowed:
+`vsql_mcp` is a preview extension. It uses the VEF preview capabilities `thread_worker`, `sys_var`, and `status_var`, so the server must be started with preview extensions allowed:
 
 ```bash
 mysqld --vsql_allow_preview_extensions=ON ...
@@ -65,7 +65,7 @@ Installing it registers its configuration and status variables. Nothing listens 
 
 ## Creating a Least-Privilege Account
 
-`vsql_mcp` runs most tool calls, including `query`, `write`, `explain`, and the table-DDL resource, over a loopback connection to the server using an account you configure. Only `list_schemas`, `list_tables`, and `describe_table` run in-process without that account. Create a dedicated account scoped to the one database this guide uses, with `SELECT` only:
+`vsql_mcp` runs every tool call and resource read over a loopback connection to the server, using an account you configure. Create a dedicated account scoped to the one database this guide uses, with `SELECT` only:
 
 ```sql
 CREATE USER 'mcp_user'@'127.0.0.1' IDENTIFIED BY 'ChangeMe-guide-2026!';
@@ -97,7 +97,6 @@ SHOW STATUS LIKE 'vsql_mcp%';
 | Variable_name              | Value |
 +----------------------------+-------+
 | vsql_mcp.http_port         | 3100  |
-| vsql_mcp.https_port        | 0     |
 | vsql_mcp.rows_returned_total | 0   |
 | vsql_mcp.sessions_active   | 0     |
 | vsql_mcp.tool_calls_total  | 0     |
@@ -136,7 +135,7 @@ curl -i -X POST http://127.0.0.1:3100/mcp \
 HTTP/1.1 200 OK
 Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606
 
-{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.7"}}}
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.10"}}}
 ```
 
 Every following request on this connection needs that session ID. Omitting it fails with a JSON-RPC error, not a silent default:
@@ -310,7 +309,7 @@ SELECT id, title, views FROM mcp_guide.posts WHERE id = 1;
 +----+----------------------------------+-------+
 ```
 
-`allow_write` and the account's grants are two separate gates, and a real write requires both open. There is no row ceiling on a write the way `max_rows` caps a read: an unqualified `DELETE` empties the table regardless of any other setting. An agent with write access to a production database carries the same risk as any other autonomous process with broad write access: it can act on a plan that made sense to it and not to you, faster than a human review step can catch it. Give `db_url` an account whose grants match exactly the blast radius you are willing to accept, and treat `allow_write` as a decision made per database, not a default to leave on because a demo needed it.
+`allow_write` and the account's grants are two separate gates, and a real write requires both open. There is no row ceiling on a write the way `max_rows` caps a read: an unqualified `DELETE` against a table the write is otherwise allowed to reach empties it in one call. An agent with write access to a production database carries the same risk as any other autonomous process with broad write access: it can act on a plan that made sense to it and not to you, faster than a human review step can catch it. Give `db_url` an account whose grants match exactly the blast radius you are willing to accept, and treat `allow_write` as a decision made per database, not a default to leave on because a demo needed it.
 
 This guide turns `allow_write` back off and revokes `UPDATE` before continuing, which is also the safer resting state for a database an agent has standing access to.
 
@@ -367,15 +366,15 @@ No. The agent authenticates to `vsql_mcp` with the bearer token set in `vsql_mcp
 
 #### Can I expose more than one schema?
 
-Yes, but leaving `vsql_mcp.schema` empty exposes more than you may expect. `list_schemas` then returns every schema on the server, `mysql`, `sys`, and `performance_schema` included, and it does not filter by what the `db_url` account can reach: the listing runs in-process against `information_schema.SCHEMATA` rather than over the account's connection. Scoping `vsql_mcp.schema` to one schema is what limits discovery. The account's grants still govern what `query` and `write` can actually read, so a listed schema is not necessarily a readable one.
+Yes, but leaving `vsql_mcp.schema` empty exposes every schema `information_schema.SCHEMATA` names for the `db_url` account. `list_schemas` queries that view over the same loopback connection as every other tool, so MySQL's own privilege rules decide what comes back: an account with a grant on only one database sees that database plus the schemas MySQL always names there, such as `information_schema` and `performance_schema`, and not `mysql` or `sys`. `SCHEMATA` naming a schema is not the same as the account being able to read its tables — `performance_schema` shows up for an account with no grant on it, and most of its tables stay refused. Scoping `vsql_mcp.schema` to one schema is still the simplest way to limit discovery to exactly one database you intend an agent to read.
 
 #### Does vsql_mcp support TLS?
 
-Yes. Setting both `vsql_mcp.ssl_cert` and `vsql_mcp.ssl_key` to PEM file paths serves HTTPS on `vsql_mcp.ssl_port` (default `3143`). Leaving either one empty turns TLS off regardless of the port setting.
+No. The listener serves plain HTTP only, on `127.0.0.1`. Put a reverse proxy in front of it for TLS or for access from outside the local host.
 
 #### Why does changing the port not take effect immediately?
 
-Port and TLS settings take effect the next time the server is enabled. Toggle `vsql_mcp.vsql_mcp_enabled` OFF and then ON after changing them.
+A port setting takes effect the next time the server is enabled. Toggle `vsql_mcp.vsql_mcp_enabled` OFF and then ON after changing it.
 
 ## Troubleshooting
 
