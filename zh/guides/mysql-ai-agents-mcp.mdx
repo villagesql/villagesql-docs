@@ -15,7 +15,7 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 
 `vsql_mcp` 是一个 Rust 扩展，从服务器进程内的后台工作线程通过 Streamable HTTP 传输（规范修订版 `2025-06-18`）提供 MCP 服务。它暴露六个工具：`list_schemas`、`list_tables`、`describe_table`、`query`、`explain` 和 `write`。`write` 工具只有在您启用它之后才会出现，它默认是禁用的。
 
-`vsql_mcp` 是预览扩展。它使用 VEF 预览能力 `thread_worker`、`sys_var`、`status_var` 和 `sql_query`，所以服务器必须在允许预览扩展的状态下启动：
+`vsql_mcp` 是预览扩展。它使用 VEF 预览能力 `thread_worker`、`sys_var` 和 `status_var`，所以服务器必须在允许预览扩展的状态下启动：
 
 ```bash
 mysqld --vsql_allow_preview_extensions=ON ...
@@ -65,7 +65,7 @@ INSTALL EXTENSION vsql_mcp;
 
 ## 创建最小权限账户 {#creating-a-least-privilege-account}
 
-`vsql_mcp` 运行的大多数工具调用，包括 `query`、`write`、`explain` 和表 DDL 资源，都通过一个回环连接、使用您配置的账户访问服务器。只有 `list_schemas`、`list_tables` 和 `describe_table` 在进程内运行，不需要该账户。请创建一个专用账户，范围限定在本指南使用的这一个数据库，并且只有 `SELECT`：
+`vsql_mcp` 使用您配置的账户，通过一个回环连接到服务器来运行每一次工具调用和资源读取。请创建一个专用账户，范围限定在本指南使用的这一个数据库，并且只有 `SELECT`：
 
 ```sql
 CREATE USER 'mcp_user'@'127.0.0.1' IDENTIFIED BY 'ChangeMe-guide-2026!';
@@ -97,7 +97,6 @@ SHOW STATUS LIKE 'vsql_mcp%';
 | Variable_name              | Value |
 +----------------------------+-------+
 | vsql_mcp.http_port         | 3100  |
-| vsql_mcp.https_port        | 0     |
 | vsql_mcp.rows_returned_total | 0   |
 | vsql_mcp.sessions_active   | 0     |
 | vsql_mcp.tool_calls_total  | 0     |
@@ -136,7 +135,7 @@ curl -i -X POST http://127.0.0.1:3100/mcp \
 HTTP/1.1 200 OK
 Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606
 
-{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.7"}}}
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.10"}}}
 ```
 
 此后这个连接上的每一个请求都需要那个会话 ID。省略它会以 JSON-RPC 错误失败，而不是静默地使用默认值：
@@ -310,7 +309,7 @@ SELECT id, title, views FROM mcp_guide.posts WHERE id = 1;
 +----+----------------------------------+-------+
 ```
 
-`allow_write` 和账户的授权是两道独立的关卡，一次真实的写入需要两者都打开。写入没有像 `max_rows` 限制读取那样的行数上限：一条不带条件的 `DELETE` 会清空整个表，与其他任何设置无关。拥有生产数据库写入权限的代理，与任何其他拥有广泛写入权限的自主进程承担同样的风险：它可能执行一个对它合理、对您不合理的计划，而且比人工审查步骤能拦下的速度更快。请给 `db_url` 一个授权恰好与您愿意接受的影响范围相匹配的账户，并把 `allow_write` 视为按数据库逐一做出的决定，而不是因为某次演示需要就一直开着的默认值。
+`allow_write` 和账户的授权是两道独立的关卡，一次真实的写入需要两者都打开。写入没有像 `max_rows` 限制读取那样的行数上限：对写入本可访问的表执行一条不带条件的 `DELETE`，一次调用就会清空该表。拥有生产数据库写入权限的代理，与任何其他拥有广泛写入权限的自主进程承担同样的风险：它可能执行一个对它合理、对您不合理的计划，而且比人工审查步骤能拦下的速度更快。请给 `db_url` 一个授权恰好与您愿意接受的影响范围相匹配的账户，并把 `allow_write` 视为按数据库逐一做出的决定，而不是因为某次演示需要就一直开着的默认值。
 
 本指南在继续之前把 `allow_write` 关回去并撤销 `UPDATE`，对于一个代理拥有常驻访问权限的数据库，这也是更安全的常态。
 
@@ -367,15 +366,15 @@ SET GLOBAL vsql_mcp.allowed_tables = 'posts';
 
 #### 我可以暴露多个架构吗？ {#can-i-expose-more-than-one-schema}
 
-可以，但把 `vsql_mcp.schema` 留空会暴露比您预期更多的东西。此时 `list_schemas` 会返回服务器上的每一个架构，包括 `mysql`、`sys` 和 `performance_schema`，而且它不会按 `db_url` 账户能访问的范围过滤：该列表在进程内针对 `information_schema.SCHEMATA` 运行，而不是通过该账户的连接。把 `vsql_mcp.schema` 限定到一个架构才是限制发现范围的方法。账户的授权仍然决定 `query` 和 `write` 实际能读什么，所以被列出的架构不一定是可读的架构。
+可以，但把 `vsql_mcp.schema` 留空会暴露 `db_url` 账户能看到的每一个架构。`list_schemas` 通过与其他所有工具相同的回环连接查询 `information_schema.SCHEMATA`，所以返回什么由 MySQL 自身的权限规则决定：只在一个数据库上拥有授权的账户，只能看到该数据库，再加上 MySQL 始终展示的架构（例如 `information_schema`），而看不到 `mysql` 或 `sys`。把 `vsql_mcp.schema` 限定到一个架构仍然是把发现范围精确限制到一个数据库的最简单方法，而且由于同一个连接同时服务于这两者，`list_schemas` 展示的架构也就是该账户实际可读的架构。
 
 #### vsql_mcp 支持 TLS 吗？ {#does-vsql_mcp-support-tls}
 
-支持。把 `vsql_mcp.ssl_cert` 和 `vsql_mcp.ssl_key` 都设置为 PEM 文件路径后，会在 `vsql_mcp.ssl_port`（默认 `3143`）上提供 HTTPS。两者任一留空都会关闭 TLS，与端口设置无关。
+不支持。监听器只在 `127.0.0.1` 上提供纯 HTTP 服务。如果需要 TLS 或需要从本地主机之外访问，请在它前面放一个反向代理。
 
 #### 为什么更改端口不会立即生效？ {#why-does-changing-the-port-not-take-effect-immediately}
 
-端口和 TLS 设置在服务器下一次被启用时生效。更改它们之后，请把 `vsql_mcp.vsql_mcp_enabled` 切换为 OFF 再切换为 ON。
+端口设置在服务器下一次被启用时生效。更改它之后，请把 `vsql_mcp.vsql_mcp_enabled` 切换为 OFF 再切换为 ON。
 
 ## 故障排除 {#troubleshooting}
 
