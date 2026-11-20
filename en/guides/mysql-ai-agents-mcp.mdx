@@ -9,13 +9,13 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 
 <VillagesqlBanner />
 
-An AI agent that needs to query a database usually talks to it through a hand-written tool or a sidecar process. The `vsql_mcp` extension removes that layer: it runs a Model Context Protocol server inside the VillageSQL process itself, so any MCP client can discover the schema and run queries directly.
+An AI agent that needs to query a database usually talks to it through a hand-written tool or a sidecar process. The `vsql_mcp` extension removes that layer: it runs a Model Context Protocol server inside the VillageSQL process itself, so an MCP client can discover the schema and run queries directly.
 
 ## What vsql_mcp Does
 
-`vsql_mcp` is a Rust extension that serves MCP over the Streamable HTTP transport (spec revision `2025-06-18`) from a background worker inside the server process. It exposes six tools: `list_schemas`, `list_tables`, `describe_table`, `query`, `explain`, and `write`. The `write` tool only appears once you enable it, and it is disabled by default.
+`vsql_mcp` is a Rust extension that serves MCP over the Streamable HTTP transport (spec revision `2025-06-18`) from a background worker inside the server process. It exposes seven tools: `list_schemas`, `list_tables`, `describe_table`, `query`, `explain`, `write`, and `ddl`. The `write` and `ddl` tools only appear once you enable them, and both are disabled by default.
 
-`vsql_mcp` is a preview extension. It uses the VEF preview capabilities `thread_worker`, `sys_var`, `status_var`, and `sql_query`, so the server must be started with preview extensions allowed:
+`vsql_mcp` is a preview extension. It uses the VEF preview capabilities `thread_worker`, `sys_var`, and `status_var`, so the server must be started with preview extensions allowed:
 
 ```bash
 mysqld --vsql_allow_preview_extensions=ON ...
@@ -65,7 +65,7 @@ Installing it registers its configuration and status variables. Nothing listens 
 
 ## Creating a Least-Privilege Account
 
-`vsql_mcp` runs most tool calls, including `query`, `write`, `explain`, and the table-DDL resource, over a loopback connection to the server using an account you configure. Only `list_schemas`, `list_tables`, and `describe_table` run in-process without that account. Create a dedicated account scoped to the one database this guide uses, with `SELECT` only:
+`vsql_mcp` runs every tool call and resource read over a loopback connection to the server, using an account you configure. Create a dedicated account scoped to the one database this guide uses, with `SELECT` only:
 
 ```sql
 CREATE USER 'mcp_user'@'127.0.0.1' IDENTIFIED BY 'ChangeMe-guide-2026!';
@@ -97,7 +97,6 @@ SHOW STATUS LIKE 'vsql_mcp%';
 | Variable_name              | Value |
 +----------------------------+-------+
 | vsql_mcp.http_port         | 3100  |
-| vsql_mcp.https_port        | 0     |
 | vsql_mcp.rows_returned_total | 0   |
 | vsql_mcp.sessions_active   | 0     |
 | vsql_mcp.tool_calls_total  | 0     |
@@ -136,7 +135,7 @@ curl -i -X POST http://127.0.0.1:3100/mcp \
 HTTP/1.1 200 OK
 Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606
 
-{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.7"}}}
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.10"}}}
 ```
 
 Every following request on this connection needs that session ID. Omitting it fails with a JSON-RPC error, not a silent default:
@@ -183,7 +182,7 @@ curl -X POST http://127.0.0.1:3100/mcp \
 ]}}
 ```
 
-Five tools are listed, not six. `write` is missing because `allow_write` is still OFF, so an agent connecting right now never plans around a tool it cannot use.
+Five tools are listed, not seven. `write` and `ddl` are both missing because `allow_write` and `allow_ddl` are still OFF, so an agent connecting right now never plans around a tool it cannot use.
 
 ## Calling Tools Over MCP
 
@@ -310,13 +309,95 @@ SELECT id, title, views FROM mcp_guide.posts WHERE id = 1;
 +----+----------------------------------+-------+
 ```
 
-`allow_write` and the account's grants are two separate gates, and a real write requires both open. There is no row ceiling on a write the way `max_rows` caps a read: an unqualified `DELETE` empties the table regardless of any other setting. An agent with write access to a production database carries the same risk as any other autonomous process with broad write access: it can act on a plan that made sense to it and not to you, faster than a human review step can catch it. Give `db_url` an account whose grants match exactly the blast radius you are willing to accept, and treat `allow_write` as a decision made per database, not a default to leave on because a demo needed it.
+`allow_write` and the account's grants are two separate gates, and a real write requires both open. There is no row ceiling on a write the way `max_rows` caps a read: an unqualified `DELETE` against a table the write is otherwise allowed to reach empties it in one call. An agent with write access to a production database carries the same risk as any other autonomous process with broad write access: it can act on a plan that made sense to it and not to you, faster than a human review step can catch it. Give `db_url` an account whose grants match exactly the blast radius you are willing to accept, and treat `allow_write` as a decision made per database, not a default to leave on because a demo needed it.
 
 This guide turns `allow_write` back off and revokes `UPDATE` before continuing, which is also the safer resting state for a database an agent has standing access to.
 
 ```sql
 REVOKE UPDATE ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
 SET GLOBAL vsql_mcp.allow_write = OFF;
+```
+
+## The ddl Tool
+
+`ddl` is disabled by default too. It runs a single `CREATE TABLE`, `CREATE TEMPORARY TABLE`, `ALTER TABLE`, `DROP TABLE`, `RENAME TABLE`, `CREATE INDEX`, or `DROP INDEX` statement, so an agent can change the schema of the exposed database without a separate MySQL client. Enable it and grant `mcp_user` the privileges the statement needs:
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = ON;
+GRANT CREATE, ALTER, DROP, INDEX ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+`ddl` now appears in `tools/list`, the same way `write` did above. Run one `ALTER TABLE` through it:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN summary VARCHAR(500)"}}}'
+```
+
+```json
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"{\"affected_rows\":0}","type":"text"}],"isError":false}}
+```
+
+```sql
+DESCRIBE mcp_guide.posts;
+```
+
+```
++---------+--------------+------+-----+---------+----------------+
+| Field   | Type         | Null | Key | Default | Extra          |
++---------+--------------+------+-----+---------+----------------+
+| id      | int          | NO   | PRI | NULL    | auto_increment |
+| title   | varchar(200) | NO   |     | NULL    |                |
+| author  | varchar(100) | NO   |     | NULL    |                |
+| views   | int          | NO   |     | 0       |                |
+| summary | varchar(500) | YES  |     | NULL    |                |
++---------+--------------+------+-----+---------+----------------+
+```
+
+`ddl` accepts only those table- and index-level forms; every other statement is refused, including one that drops a whole database:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"DROP DATABASE mcp_guide"}}}'
+```
+
+```json
+{"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool accepts a single CREATE, ALTER, DROP or RENAME TABLE, or CREATE or DROP INDEX statement","type":"text"}],"isError":true}}
+```
+
+`ddl` and `allowed_tables` do not work together. `ddl` is listed in `tools/list` only while `allowed_tables` is empty, because the allowlist works by planning a statement with `EXPLAIN`, which cannot plan DDL. Setting `allowed_tables` while `allow_ddl` is still ON removes `ddl` from `tools/list`, and a direct call to it is refused:
+
+```sql
+SET GLOBAL vsql_mcp.allowed_tables = 'posts';
+```
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN x INT"}}}'
+```
+
+```json
+{"id":7,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool cannot be used while vsql_mcp.allowed_tables is set, because the allowlist cannot check a DDL statement","type":"text"}],"isError":true}}
+```
+
+This guide turns `allow_ddl` back off, clears `allowed_tables` again, and revokes the DDL grants before continuing:
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = OFF;
+SET GLOBAL vsql_mcp.allowed_tables = '';
+REVOKE CREATE, ALTER, DROP, INDEX ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
 ```
 
 ## Narrowing What an Agent Can Reach
@@ -367,15 +448,19 @@ No. The agent authenticates to `vsql_mcp` with the bearer token set in `vsql_mcp
 
 #### Can I expose more than one schema?
 
-Yes, but leaving `vsql_mcp.schema` empty exposes more than you may expect. `list_schemas` then returns every schema on the server, `mysql`, `sys`, and `performance_schema` included, and it does not filter by what the `db_url` account can reach: the listing runs in-process against `information_schema.SCHEMATA` rather than over the account's connection. Scoping `vsql_mcp.schema` to one schema is what limits discovery. The account's grants still govern what `query` and `write` can actually read, so a listed schema is not necessarily a readable one.
+Yes, but leaving `vsql_mcp.schema` empty exposes every schema `information_schema.SCHEMATA` names for the `db_url` account. `list_schemas` queries that view over the same loopback connection as every other tool, so MySQL's own privilege rules decide what comes back: an account with a grant on only one database sees that database plus the schemas MySQL always names there, such as `information_schema` and `performance_schema`, and not `mysql` or `sys`. `SCHEMATA` naming a schema is not the same as the account being able to read its tables — `performance_schema` shows up for an account with no grant on it, and most of its tables stay refused. Scoping `vsql_mcp.schema` to one schema is still the simplest way to limit discovery to exactly one database you intend an agent to read.
 
 #### Does vsql_mcp support TLS?
 
-Yes. Setting both `vsql_mcp.ssl_cert` and `vsql_mcp.ssl_key` to PEM file paths serves HTTPS on `vsql_mcp.ssl_port` (default `3143`). Leaving either one empty turns TLS off regardless of the port setting.
+No. The listener serves plain HTTP only, on `127.0.0.1`. Put a reverse proxy in front of it for TLS or for access from outside the local host.
 
 #### Why does changing the port not take effect immediately?
 
-Port and TLS settings take effect the next time the server is enabled. Toggle `vsql_mcp.vsql_mcp_enabled` OFF and then ON after changing them.
+A port setting takes effect the next time the server is enabled. Toggle `vsql_mcp.vsql_mcp_enabled` OFF and then ON after changing it.
+
+#### Can other extensions add their own MCP tools?
+
+Yes. Any installed extension can register a `mcp_tools()` function that declares its own tools, and `vsql_mcp` lists each one in `tools/list` as `<extension>__<name>`; a call to it runs the extension's own handler function over the `db_url` connection. These extension tools need `vsql_mcp.db_url` set, the same as every other tool — while it is not set, no extension tools are listed. The `vsql-mcp` repository's README walks through a complete worked example, a `vsql_greet` extension that adds one tool this way.
 
 ## Troubleshooting
 
