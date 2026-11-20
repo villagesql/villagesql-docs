@@ -79,11 +79,13 @@ The script does these steps, in order:
   `en/9.7/0.0.7/`, with the shared pages beside them, and does the same for
   each translation. The copies leave out the `0.0.8-dev` notes, point their
   links at the archive, get `noindex`, and get a group in the Past releases
-  menu.
+  menu. Each snippet that a copy imports, such as an extension page's body, is
+  frozen in `snippets/0.0.7/`, so a later edit to the snippet does not change
+  the archive.
 - **Promote.** Each server's dev pages replace its stable pages, and a new
   dev copy starts from the new stable.
-- **Notes.** Every `Changed in 0.0.8-dev` note on a shared page becomes normal
-  page text. The script lists each one; read the sentences around it.
+- **Notes.** Every `Changed in 0.0.8-dev` note on a shared page or in a
+  snippet becomes normal page text. The script lists each one; read the sentences around it.
 - **Labels and redirects.** The menu labels, `dev-releases.mdx`, and
   `past-releases.mdx` name the new numbers, and every version number keeps
   resolving.

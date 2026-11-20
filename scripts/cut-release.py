@@ -23,11 +23,13 @@ What a cut does:
      <codebase>/<old>/, and the shared pages are copied in beside them under the
      flat names the 0.0.6 archive uses (create, rust-sdk, extensions/vsql-ai).
      Notes about <new>-dev are left out of the copies. Links inside the archive
-     point at the archive. The archive gets noindex, and a group in the Past
-     releases menu.
+     point at the archive. Each snippet that an archived page imports is copied
+     to snippets/<old>/, without the notes, and the page imports that copy. The
+     archive gets noindex, and a group in the Past releases menu.
   2. Promote. Each codebase's dev server pages replace its stable server pages,
      and a new dev is copied from the new stable.
-  3. Notes. On the shared pages, every <new>-dev note becomes normal page text.
+  3. Notes. On the shared pages and in the snippets, every <new>-dev note
+     becomes normal page text.
      The script lists each one, so that a person can check the sentences around
      it.
   4. Labels and redirects. The dev menu groups, dev-releases.mdx, and
@@ -186,6 +188,16 @@ def strip_notes(text, version):
     return NOTE.sub(lambda m: "\n" if f"{version}-dev" in m.group("body") else m.group(0), text)
 
 
+SNIPPET_IMPORT = re.compile(r'(from "/snippets/)([^"]+\.mdx)"')
+
+
+def live_snippets(repo):
+    """The snippets that pages import, without the frozen copies in snippets/<release>/."""
+    root = repo / "snippets"
+    return [p for p in sorted(root.rglob("*.mdx"))
+            if not re.fullmatch(r"\d+\.\d+\.\d+", p.relative_to(root).parts[0])]
+
+
 def unwrap_notes(text, version):
     """Turn each <version>-dev note into a plain paragraph. Drops the bold label."""
     def plain(m):
@@ -242,6 +254,27 @@ def main():
             f = repo / (prefix + address + ".mdx")
             if f.exists() and f"{new}-dev" in strip_notes(f.read_text(), new):
                 problems.append(f"{prefix}{address}.mdx: '{new}-dev' appears outside an <Info> note")
+    for f in live_snippets(repo):
+        if f"{new}-dev" in strip_notes(f.read_text(), new):
+            problems.append(f"{f.relative_to(repo)}: '{new}-dev' appears outside an <Info> note")
+    if (repo / "snippets" / old).exists():
+        problems.append(f"snippets/{old} already exists")
+    # The archive step freezes each imported snippet as one copy for every
+    # codebase, so the copy must import nothing and link to no docs page.
+    archived = [p for c in codebases for prefix in PREFIXES
+                for p in (repo / (prefix + c) / "stable").rglob("*.mdx")]
+    archived += [p for address in shared for prefix in PREFIXES
+                 if (p := repo / (prefix + address + ".mdx")).exists()]
+    for p in archived:
+        t = p.read_text()
+        if t.count("/snippets/") != len(SNIPPET_IMPORT.findall(t)):
+            problems.append(f"{p.relative_to(repo)}: names /snippets/ outside an import the archive can freeze")
+        for m in SNIPPET_IMPORT.finditer(t):
+            s = repo / "snippets" / m.group(2)
+            if not s.exists():
+                problems.append(f"{p.relative_to(repo)}: imports snippets/{m.group(2)}, which does not exist")
+            elif re.search(r"^import |\]\(/|href=\"/", s.read_text(), re.M):
+                problems.append(f"snippets/{m.group(2)}: imports a file or links to a docs page, so one frozen copy cannot serve every archive")
     for c in codebases:
         server_names = {str(p.relative_to(eng / c / "stable"))[:-4] for p in (eng / c / "stable").rglob("*.mdx")}
         for address, name in shared.items():
@@ -264,6 +297,14 @@ def main():
     report = []
 
     # ---------------------------------------------------------- archive --
+    # An archived page imports a frozen copy of each snippet, in
+    # snippets/<old>/, so a later edit to the snippet does not reach it.
+    frozen = set()
+
+    def freeze_import(m):
+        frozen.add(m.group(2))
+        return f'{m.group(1)}{old}/{m.group(2)}"'
+
     for c in codebases:
         archive_map = {}
         for prefix in PREFIXES:
@@ -293,6 +334,7 @@ def main():
             text = SCHEMA_LINK.sub(lambda m: f"{m.group(1)}/{old}/manifest.json.schema.json", text)
             text = stable_link.sub(lambda m: f"/{m.group(1)}{c}/{old}/", text)
             text = other_link.sub(to_own, text)
+            text = SNIPPET_IMPORT.sub(freeze_import, text)
             return shared_link.sub(lambda m: "/" + archive_map[m.group(1)], text)
 
         copied = 0
@@ -304,10 +346,11 @@ def main():
                         continue
                     dst = repo / (prefix + c) / old / f.relative_to(src_dir)
                     copied += 1
+                    text = freeze(f.read_text()) if f.suffix == ".mdx" else None
                     if not dry:
                         dst.parent.mkdir(parents=True, exist_ok=True)
-                        if f.suffix == ".mdx":
-                            dst.write_text(freeze(f.read_text()))
+                        if text is not None:
+                            dst.write_text(text)
                         else:
                             shutil.copy2(f, dst)
             for address, name in shared.items():
@@ -315,9 +358,10 @@ def main():
                 if f.exists():
                     dst = repo / (prefix + c) / old / (name + ".mdx")
                     copied += 1
+                    text = freeze(f.read_text())
                     if not dry:
                         dst.parent.mkdir(parents=True, exist_ok=True)
-                        dst.write_text(freeze(f.read_text()))
+                        dst.write_text(text)
         # The schema files stay in the old mysql-<n>/ folders, because extension
         # manifests name them by their GitHub address. Archive them there too.
         legacy = "mysql-" + c.removeprefix("mysql-")
@@ -343,6 +387,15 @@ def main():
         pages = past["groups"][0]["pages"]
         position = 1 + sum(1 for p in pages[1:] if isinstance(p, dict) and p["group"].endswith(f"· {old}"))
         pages.insert(position, group)
+
+    # The checks above refuse a snippet that imports or links to a docs page,
+    # so one frozen copy serves every codebase's archive.
+    for name in sorted(frozen):
+        src, dst = repo / "snippets" / name, repo / "snippets" / old / name
+        if not dry:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(strip_notes(src.read_text(), new))
+    report.append(f"archive snippets/{old}: {len(frozen)} files")
 
     # ---------------------------------------------------------- promote --
     for c in codebases:
@@ -393,17 +446,15 @@ def main():
                     report.append(f"added {target} to the {LABEL[c]} menu, group {homes[0]['group']}")
 
     # ------------------------------------------------------------ notes --
-    for address in shared:
-        for prefix in PREFIXES:
-            f = repo / (prefix + address + ".mdx")
-            if not f.exists():
-                continue
-            t = f.read_text()
-            for m, body in note_blocks(t, new):
-                line = t.count("\n", 0, m.start()) + 2
-                report.append(f"note to check: {prefix}{address}.mdx:{line}")
-            if not dry:
-                f.write_text(unwrap_notes(t, new))
+    # The shared pages, and the snippets that hold most of their text.
+    files = [repo / (prefix + address + ".mdx") for address in shared for prefix in PREFIXES]
+    for f in [f for f in files if f.exists()] + live_snippets(repo):
+        t = f.read_text()
+        for m, body in note_blocks(t, new):
+            line = t.count("\n", 0, m.start()) + 2
+            report.append(f"note to check: {f.relative_to(repo)}:{line}")
+        if not dry:
+            f.write_text(unwrap_notes(t, new))
 
     # ------------------------------------------------ labels and redirects --
     raw_after = json.dumps(docs, indent=2, ensure_ascii=False) + "\n"
