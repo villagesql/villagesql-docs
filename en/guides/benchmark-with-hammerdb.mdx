@@ -1,0 +1,157 @@
+---
+title: "Benchmark VillageSQL with HammerDB"
+sidebarTitle: "Benchmarking with HammerDB"
+description: "How to benchmark VillageSQL with HammerDB: start a server, build a TPROC-C schema, run a timed test from the HammerDB Docker image, and read the NOPM result."
+keywords: "mysql benchmark, hammerdb mysql, hammerdb villagesql, tproc-c, mysql oltp benchmark, mysql load test, nopm"
+---
+
+HammerDB is the open-source database benchmark hosted by the [TPC-Council on GitHub](https://github.com/TPC-Council/HammerDB). It supports VillageSQL as its own database, with two workloads: TPROC-C, an OLTP workload derived from the TPC-C specification, and TPROC-H, an analytic workload derived from TPC-H. This guide uses Docker to run TPROC-C against a VillageSQL server.
+
+## Prerequisites
+
+- Docker. Both the VillageSQL server and HammerDB run in containers, so you don't install either one on the host.
+- About 5 GB of free disk space: about 2 GB for the two images, and about 3 GB for the data that the test below writes. Most of that data is the server's binary log, which grows with the length of the run.
+
+## Start a VillageSQL server
+
+Create a Docker network so that the HammerDB container can reach the server by name, then start the server on it:
+
+```bash
+docker network create hammerdb-net
+docker run -d --name vsql-bench --network hammerdb-net \
+  -e MYSQL_ROOT_PASSWORD=hammerdb villagesql/server:latest
+```
+
+The server takes a few seconds to initialize. It's ready when this command prints a version:
+
+```bash
+docker exec vsql-bench mysql -uroot -phammerdb -e "SELECT VERSION();"
+```
+
+To benchmark a server you already run, skip this step. Set `vsql_host`, `vsql_user`, and `vsql_pass` in the scripts below to that server's address and credentials, and drop `--network hammerdb-net` from the HammerDB commands.
+
+## Write the HammerDB scripts
+
+HammerDB runs from its command-line interface, `hammerdbcli`, which reads a script of settings and commands. Create a folder for the scripts:
+
+```bash
+mkdir hammerdb-scripts && cd hammerdb-scripts
+```
+
+Save this as `build.tcl`. It builds the TPROC-C schema in a database named `tpcc`:
+
+```tcl
+dbset db vsql
+dbset bm TPROC-C
+diset connection vsql_host vsql-bench
+diset connection vsql_port 3306
+diset connection vsql_ssl true
+diset connection vsql_ssl_linux_capath ""
+diset connection vsql_ssl_ca ""
+diset connection vsql_ssl_cert ""
+diset connection vsql_ssl_key ""
+diset tpcc vsql_user root
+diset tpcc vsql_pass hammerdb
+diset tpcc vsql_dbase tpcc
+diset tpcc vsql_count_ware 4
+diset tpcc vsql_num_vu 4
+buildschema
+```
+
+Save this as `run.tcl`. It runs a timed test: one minute of ramp-up, then two minutes of measurement, with four virtual users:
+
+```tcl
+dbset db vsql
+dbset bm TPROC-C
+diset connection vsql_host vsql-bench
+diset connection vsql_port 3306
+diset connection vsql_ssl true
+diset connection vsql_ssl_linux_capath ""
+diset connection vsql_ssl_ca ""
+diset connection vsql_ssl_cert ""
+diset connection vsql_ssl_key ""
+diset tpcc vsql_user root
+diset tpcc vsql_pass hammerdb
+diset tpcc vsql_dbase tpcc
+diset tpcc vsql_driver timed
+diset tpcc vsql_rampup 1
+diset tpcc vsql_duration 2
+loadscript
+vuset vu 4
+vucreate
+vurun
+```
+
+`dbset db vsql` selects VillageSQL. The five `ssl` lines turn on TLS without certificate files. The `root` account authenticates with `caching_sha2_password`, which needs an encrypted connection over TCP, and HammerDB's default certificate folder, `/etc/mysql/certs`, doesn't exist in the image.
+
+## Build the schema
+
+Run `build.tcl` from the HammerDB VillageSQL image, with the scripts folder mounted:
+
+```bash
+docker run --rm --network hammerdb-net -v "$PWD":/scripts \
+  tpcorg/hammerdb:v6.1.1-villagesql ./hammerdbcli auto /scripts/build.tcl
+```
+
+Each virtual user loads warehouses, then HammerDB creates the stored procedures and gathers statistics. The build ends with these lines:
+
+```text
+Vuser 1:TPCC SCHEMA COMPLETE
+Vuser 1:FINISHED SUCCESS
+ALL VIRTUAL USERS COMPLETE
+```
+
+HammerDB prints `ALL VIRTUAL USERS COMPLETE` even when the build fails, so look for `FINISHED FAILED` in the output. If it's there, see [Troubleshooting](#troubleshooting).
+
+## Run the test
+
+```bash
+docker run --rm --network hammerdb-net -v "$PWD":/scripts \
+  tpcorg/hammerdb:v6.1.1-villagesql ./hammerdbcli auto /scripts/run.tcl
+```
+
+After the ramp-up and the timed run, HammerDB prints the result:
+
+```text
+Vuser 1:TEST RESULT : System achieved <nopm> NOPM from <tpm> VillageSQL TPM
+```
+
+NOPM (new orders per minute) is HammerDB's recommended primary metric. HammerDB measures it from the test schema itself, so it doesn't depend on how a particular database counts transactions.
+
+HammerDB results are not TPC-C results. Don't compare them with published TPC-C results or report them as tpmC.
+
+## Scale the test
+
+The test above checks that the setup works. To measure a server, raise these settings:
+
+| Setting | In the test above | What it controls |
+|---|---|---|
+| `vsql_count_ware` | 4 | The number of warehouses, which sets the size of the data |
+| `vsql_num_vu` | 4 | The number of virtual users that load the schema in parallel |
+| `vuset vu` | 4 | The number of virtual users that run the test |
+| `vsql_rampup` / `vsql_duration` | 1 / 2 minutes | The minutes of ramp-up before measurement, and the minutes measured |
+
+The [HammerDB documentation](https://www.hammerdb.com/docs/) covers every TPROC-C setting, the TPROC-H workload, and the HammerDB GUI.
+
+## Troubleshooting
+
+| Error | Cause and fix |
+|---|---|
+| `Authentication plugin 'caching_sha2_password' reported error: Authentication requires secure connection.` | The script connects without TLS. Add the five `ssl` lines from the scripts above. |
+| `Database tpcc exists but is not empty, specify a new or empty database name` | An earlier build left the `tpcc` database. Drop it with `docker exec vsql-bench mysql -uroot -phammerdb -e "DROP DATABASE tpcc;"`, or set `vsql_dbase` to a new name. |
+| `SSL connection error: SSL_CTX_set_default_verify_paths failed` | `vsql_ssl` is `true`, but HammerDB is looking for certificate files. Set `vsql_ssl_linux_capath`, `vsql_ssl_ca`, `vsql_ssl_cert`, and `vsql_ssl_key` to `""`. |
+
+## Clean up
+
+Remove the server container with its data volume, and the network:
+
+```bash
+docker rm -fv vsql-bench
+docker network rm hammerdb-net
+```
+
+## See also
+
+- [MySQL on Docker](/en/guides/mysql-on-docker) — running the server container for longer than a benchmark
+- [Diagnosing slow queries](/en/guides/mysql-query-performance) — what to look at when a result is lower than you expect
+- [InnoDB storage](/en/guides/innodb-storage) — how the buffer pool and the data size shape a TPROC-C result
