@@ -41,6 +41,10 @@ Translated pages cover the shared pages, the Guides and the Tutorial
 included, and the stable server pages. The dev pages are English only. A
 page with no translation in a language is left out of that language's menu.
 
+The Guides do not have version slots, so a guide is translated in the same
+pull request as its English change, with the steps in "Translate what
+changed" below. The release cut does not wait for them.
+
 The `manifest.json.schema.json` files stay at their old paths
 (`mysql-8.4/stable/`, `mysql-8.4/0.0.6/`, and so on), because extension
 manifests name them by their GitHub address.
@@ -95,7 +99,8 @@ The script does these steps, in order:
 ### 2. Translate what changed
 
 Translate into ja, ko, zh, and pt-BR only what changed in the English pages
-since the last cut. Keep every translated sentence whose English did not
+since the last cut. The Guides are already translated, because each guide
+change carries its own translation. Keep every translated sentence whose English did not
 change, translate new and changed text, and delete text that English removed.
 A new page is translated in full.
 
