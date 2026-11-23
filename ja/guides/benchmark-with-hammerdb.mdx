@@ -1,0 +1,157 @@
+---
+title: "HammerDB で VillageSQL をベンチマークする"
+sidebarTitle: "HammerDB でのベンチマーク"
+description: "HammerDB で VillageSQL をベンチマークする方法: サーバーを起動し、TPROC-C スキーマを構築し、HammerDB の Docker イメージから時間指定のテストを実行し、NOPM の結果を読み取ります。"
+keywords: "mysql benchmark, hammerdb mysql, hammerdb villagesql, tproc-c, mysql oltp benchmark, mysql load test, nopm"
+---
+
+HammerDB は、[GitHub の TPC-Council](https://github.com/TPC-Council/HammerDB) がホストするオープンソースのデータベースベンチマークです。VillageSQL を独立したデータベースとしてサポートしており、2 つのワークロードがあります。TPC-C 仕様から派生した OLTP ワークロードの TPROC-C と、TPC-H から派生した分析ワークロードの TPROC-H です。このガイドでは、Docker を使って VillageSQL サーバーに対して TPROC-C を実行します。
+
+## 前提条件 {#prerequisites}
+
+- Docker。VillageSQL サーバーと HammerDB はどちらもコンテナで動くため、どちらもホストにインストールする必要はありません。
+- 約 5 GB のディスク空き容量。2 つのイメージに約 2 GB、以下のテストが書き込むデータに約 3 GB です。そのデータの大部分はサーバーのバイナリログで、実行時間が長いほど大きくなります。
+
+## VillageSQL サーバーの起動 {#start-a-villagesql-server}
+
+HammerDB コンテナが名前でサーバーに到達できるように Docker ネットワークを作成し、そのネットワーク上でサーバーを起動します。
+
+```bash
+docker network create hammerdb-net
+docker run -d --name vsql-bench --network hammerdb-net \
+  -e MYSQL_ROOT_PASSWORD=hammerdb villagesql/server:latest
+```
+
+サーバーの初期化には数秒かかります。次のコマンドがバージョンを表示すれば、準備は完了です。
+
+```bash
+docker exec vsql-bench mysql -uroot -phammerdb -e "SELECT VERSION();"
+```
+
+すでに稼働しているサーバーをベンチマークする場合は、この手順を省略してください。以下のスクリプトの `vsql_host`、`vsql_user`、および `vsql_pass` をそのサーバーのアドレスと認証情報に設定し、HammerDB のコマンドから `--network hammerdb-net` を取り除きます。
+
+## HammerDB スクリプトの作成 {#write-the-hammerdb-scripts}
+
+HammerDB はコマンドラインインターフェースの `hammerdbcli` から実行します。`hammerdbcli` は、設定とコマンドを記述したスクリプトを読み込みます。スクリプト用のフォルダーを作成します。
+
+```bash
+mkdir hammerdb-scripts && cd hammerdb-scripts
+```
+
+次の内容を `build.tcl` として保存します。このスクリプトは、`tpcc` という名前のデータベースに TPROC-C スキーマを構築します。
+
+```tcl
+dbset db vsql
+dbset bm TPROC-C
+diset connection vsql_host vsql-bench
+diset connection vsql_port 3306
+diset connection vsql_ssl true
+diset connection vsql_ssl_linux_capath ""
+diset connection vsql_ssl_ca ""
+diset connection vsql_ssl_cert ""
+diset connection vsql_ssl_key ""
+diset tpcc vsql_user root
+diset tpcc vsql_pass hammerdb
+diset tpcc vsql_dbase tpcc
+diset tpcc vsql_count_ware 4
+diset tpcc vsql_num_vu 4
+buildschema
+```
+
+次の内容を `run.tcl` として保存します。このスクリプトは、4 人の仮想ユーザーで時間指定のテストを実行します。1 分間のランプアップの後、2 分間計測します。
+
+```tcl
+dbset db vsql
+dbset bm TPROC-C
+diset connection vsql_host vsql-bench
+diset connection vsql_port 3306
+diset connection vsql_ssl true
+diset connection vsql_ssl_linux_capath ""
+diset connection vsql_ssl_ca ""
+diset connection vsql_ssl_cert ""
+diset connection vsql_ssl_key ""
+diset tpcc vsql_user root
+diset tpcc vsql_pass hammerdb
+diset tpcc vsql_dbase tpcc
+diset tpcc vsql_driver timed
+diset tpcc vsql_rampup 1
+diset tpcc vsql_duration 2
+loadscript
+vuset vu 4
+vucreate
+vurun
+```
+
+`dbset db vsql` は VillageSQL を選択します。5 つの `ssl` 行は、証明書ファイルなしで TLS を有効にします。`root` アカウントは `caching_sha2_password` で認証しますが、これは TCP 経由では暗号化された接続を必要とします。また、HammerDB のデフォルトの証明書フォルダーである `/etc/mysql/certs` は、イメージ内に存在しません。
+
+## スキーマの構築 {#build-the-schema}
+
+スクリプトのフォルダーをマウントして、HammerDB の VillageSQL イメージから `build.tcl` を実行します。
+
+```bash
+docker run --rm --network hammerdb-net -v "$PWD":/scripts \
+  tpcorg/hammerdb:v6.1.1-villagesql ./hammerdbcli auto /scripts/build.tcl
+```
+
+各仮想ユーザーがウェアハウスをロードし、その後 HammerDB がストアドプロシージャを作成して統計情報を収集します。構築は次の行で終わります。
+
+```text
+Vuser 1:TPCC SCHEMA COMPLETE
+Vuser 1:FINISHED SUCCESS
+ALL VIRTUAL USERS COMPLETE
+```
+
+HammerDB は、構築が失敗した場合でも `ALL VIRTUAL USERS COMPLETE` を表示するため、出力に `FINISHED FAILED` がないか確認してください。ある場合は、[トラブルシューティング](#troubleshooting)を参照してください。
+
+## テストの実行 {#run-the-test}
+
+```bash
+docker run --rm --network hammerdb-net -v "$PWD":/scripts \
+  tpcorg/hammerdb:v6.1.1-villagesql ./hammerdbcli auto /scripts/run.tcl
+```
+
+ランプアップと時間指定の実行が終わると、HammerDB は結果を表示します。
+
+```text
+Vuser 1:TEST RESULT : System achieved <nopm> NOPM from <tpm> VillageSQL TPM
+```
+
+NOPM（new orders per minute、1 分あたりの新規注文数）は、HammerDB が推奨する主要な指標です。HammerDB はこれをテストスキーマそのものから計測するため、個々のデータベースがトランザクションをどう数えるかには依存しません。
+
+HammerDB の結果は TPC-C の結果ではありません。公開されている TPC-C の結果と比較したり、tpmC として報告したりしないでください。
+
+## テストのスケールアップ {#scale-the-test}
+
+上のテストは、セットアップが動作することを確認するものです。サーバーの性能を計測するには、次の設定値を引き上げます。
+
+| 設定 | 上のテストでの値 | 制御する内容 |
+|---|---|---|
+| `vsql_count_ware` | 4 | ウェアハウスの数。データのサイズを決めます |
+| `vsql_num_vu` | 4 | スキーマを並列にロードする仮想ユーザーの数 |
+| `vuset vu` | 4 | テストを実行する仮想ユーザーの数 |
+| `vsql_rampup` / `vsql_duration` | 1 / 2 分 | 計測前のランプアップ時間（分）と計測時間（分） |
+
+[HammerDB のドキュメント](https://www.hammerdb.com/docs/)は、TPROC-C のすべての設定、TPROC-H ワークロード、および HammerDB の GUI を扱っています。
+
+## トラブルシューティング {#troubleshooting}
+
+| エラー | 原因と解決策 |
+|---|---|
+| `Authentication plugin 'caching_sha2_password' reported error: Authentication requires secure connection.` | スクリプトが TLS なしで接続しています。上のスクリプトにある 5 つの `ssl` 行を追加します。 |
+| `Database tpcc exists but is not empty, specify a new or empty database name` | 以前の構築で `tpcc` データベースが残っています。`docker exec vsql-bench mysql -uroot -phammerdb -e "DROP DATABASE tpcc;"` で削除するか、`vsql_dbase` を新しい名前に設定します。 |
+| `SSL connection error: SSL_CTX_set_default_verify_paths failed` | `vsql_ssl` は `true` ですが、HammerDB が証明書ファイルを探しています。`vsql_ssl_linux_capath`、`vsql_ssl_ca`、`vsql_ssl_cert`、および `vsql_ssl_key` を `""` に設定します。 |
+
+## クリーンアップ {#clean-up}
+
+サーバーコンテナをそのデータボリュームとともに削除し、ネットワークも削除します。
+
+```bash
+docker rm -fv vsql-bench
+docker network rm hammerdb-net
+```
+
+## 関連項目 {#see-also}
+
+- [Docker 上の MySQL](/ja/guides/mysql-on-docker) — ベンチマークより長い期間、サーバーコンテナを実行する
+- [遅いクエリの診断](/ja/guides/mysql-query-performance) — 結果が予想より低いときに確認すべき点
+- [InnoDB ストレージ](/ja/guides/innodb-storage) — バッファプールとデータサイズが TPROC-C の結果をどう左右するか
