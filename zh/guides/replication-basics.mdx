@@ -28,6 +28,8 @@ MySQL 复制把变更从一台服务器（源）复制到一台或多台服务�
 server_id = 1
 log_bin = /var/log/mysql/mysql-bin
 binlog_format = ROW
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 创建复制用户：
@@ -49,6 +51,8 @@ mysqldump --single-transaction --source-data=1 --all-databases \
 ```ini
 [mysqld]
 server_id = 2
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 恢复快照并启动复制：
@@ -62,12 +66,13 @@ CHANGE REPLICATION SOURCE TO
     SOURCE_HOST = '192.168.1.10',
     SOURCE_USER = 'repl',
     SOURCE_PASSWORD = 'repl_password',
+    SOURCE_SSL = 1,
     SOURCE_AUTO_POSITION = 1;
 
 START REPLICA;
 ```
 
-`SOURCE_AUTO_POSITION = 1` 启用基于 GTID 的复制。如果您不使用 GTID，请改为指定 `SOURCE_LOG_FILE` 和 `SOURCE_LOG_POS`（值来自快照文件的头部）。
+`SOURCE_AUTO_POSITION = 1` 使用基于 GTID 的复制，这需要两台服务器上都设置 `gtid_mode = ON` 和 `enforce_gtid_consistency = ON`。如果您不使用 GTID，请改为指定 `SOURCE_LOG_FILE` 和 `SOURCE_LOG_POS`（值来自快照文件的头部）。
 
 ## GTID 复制 {#gtid-replication}
 
@@ -108,8 +113,9 @@ SHOW REPLICA STATUS\G
 - **应用器并行度**：MySQL 8.4 默认已经并行应用事件——`replica_parallel_workers` 为 4，`replica_parallel_type` 为 `LOGICAL_CLOCK`。如果副本仍然落后，请提高工作线程数：
 
 ```sql
-SET GLOBAL replica_parallel_workers = 4;
-SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+STOP REPLICA SQL_THREAD;
+SET GLOBAL replica_parallel_workers = 8;
+START REPLICA SQL_THREAD;
 ```
 
 - **副本上的长时间查询**：锁定行的查询会阻塞 SQL 线程。
@@ -123,7 +129,7 @@ SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
 | 架构 | 一致性保证 | 故障转移 | 写入开销 | 复杂度 |
 |:-------------|:---------------------|:---------|:--------------|:-----------|
 | **异步复制**（默认） | 无——副本可能任意落后 | 手动；可能丢失一些事务 | 最小——源不等待 | 低 |
-| **半同步复制** | 源提交前至少有一个副本已收到事件 | 手动；最多丢失一个事务 | 每次写入增加约 1 个 RTT | 低–中 |
+| **半同步复制** | 源提交前至少有一个副本已收到事件（直到 `rpl_semi_sync_source_timeout`（默认 10 秒）到期而未收到确认为止） | 手动；最多丢失一个事务 | 每次写入增加约 1 个 RTT | 低–中 |
 | **组复制** | 提交前所有成员达成一致（多主或单主） | 组内自动 | 较高——每个事务一轮共识 | 高 |
 | **InnoDB Cluster** | 与组复制相同（基于它构建） | 自动，由 MySQL Router 负责客户端故障转移 | 与组复制相同 | 高 |
 
@@ -199,7 +205,7 @@ MySQL 支持从较旧的源复制到较新的副本，但不支持反过来。�
 
 | 问题 | 解决方案 |
 |:--------|:---------|
-| `Replica_IO_Running: No` | 检查 `Last_IO_Error`——通常是连接或认证失败；核实 SOURCE_HOST、用户、密码和 REPLICATION SLAVE 授权 |
+| `Replica_IO_Running: Connecting` 或 `No` | 检查 `Last_IO_Error`——通常是连接或认证失败；核实 SOURCE_HOST、用户、密码、REPLICATION SLAVE 授权，以及 `caching_sha2_password` 账户所需的 `SOURCE_SSL = 1` |
 | `Replica_SQL_Running: No` | 检查 `Last_SQL_Error`——通常是数据冲突；决定是跳过该事件还是修复根本原因 |
 | 复制延迟持续增长 | 把 `replica_parallel_workers` 提高到默认值 4 以上；检查副本上是否有长时间查询阻塞了应用器 |
 | 副本上出现 `ERROR 1062: Duplicate entry` | 副本上有源没有的行——说明有人手动写入了副本；谨慎使用 `replica_skip_errors` 或重新同步 |

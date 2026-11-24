@@ -62,14 +62,14 @@ mysql -u root -p myapp < myapp_backup.sql
 完整备份只能保护到最后一次备份的时间点。二进制日志让您可以重放备份之后发生的每一次更改。
 
 **要求：**
-- 已启用二进制日志（`log_bin = ON`）
+- 已启用二进制日志（在 8.4 中默认开启；`SHOW VARIABLES LIKE 'log_bin'` 显示 `ON`）
 - 备份时使用了 `--source-data=2`（记录起始 binlog 位置）
 
 **工作流程：**
 
 1. 恢复完整备份：
 ```bash
-mysql -u root -p < myapp_backup.sql
+mysql -u root -p myapp < myapp_backup.sql
 ```
 
 2. 从转储文件中找到 binlog 起始位置：
@@ -138,8 +138,11 @@ MySQL Shell 转储工具默认压缩输出（zstd），并且可以在多个 CPU
 ```bash
 #!/bin/bash
 # mysql-backup.sh
+set -euo pipefail
+umask 077  # the dump holds account password hashes; keep it owner-only
 DATE=$(date +%Y-%m-%d)
 BACKUP_DIR=/backups/mysql
+mkdir -p "$BACKUP_DIR"
 
 mysqldump \
   --single-transaction \
@@ -152,7 +155,7 @@ mysqldump \
 find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
 ```
 
-备份用户只需要 `SELECT`、`LOCK TABLES`、`SHOW VIEW`、`TRIGGER`、`EVENT`、`RELOAD` 和 `PROCESS` 权限——而不是 `ALL PRIVILEGES`。没有 `PROCESS` 时，`mysqldump` 仍能完成，但在它尝试转储表空间元数据时，每次运行都会向 stderr 打印一条 "Access denied ... PROCESS privilege" 错误。
+备份用户只需要 `SELECT`、`LOCK TABLES`、`SHOW VIEW`、`TRIGGER`、`EVENT`、`RELOAD`、`PROCESS` 和 `REPLICATION CLIENT` 权限——而不是 `ALL PRIVILEGES`。没有 `PROCESS` 时，`mysqldump` 仍能完成，但在它尝试转储表空间元数据时，每次运行都会向 stderr 打印一条 "Access denied ... PROCESS privilege" 错误。
 
 ## 验证备份 {#verifying-backups}
 
@@ -162,9 +165,9 @@ find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
 # Test restore to a separate instance
 mysql -u root -p --host=test-server < all_databases.sql
 
-# Quick sanity check — verify row counts
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+# Quick check — verify row counts
+mysql -u root -p --host=test-server -e "SELECT COUNT(*) FROM myapp.orders;"
+mysql -u root -p --host=production-server -e "SELECT COUNT(*) FROM myapp.orders;"
 ```
 
 至少每月一次的自动恢复测试可以在损坏、权限问题和磁盘空间问题造成影响之前发现它们。
@@ -173,7 +176,7 @@ mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
 
 #### `--single-transaction` 适用于所有存储引擎吗？ {#does---single-transaction-work-with-all-storage-engines}
 
-不适用。`--single-transaction` 使用一致读快照，只有 InnoDB 支持。同一数据库中的 MyISAM 表在转储期间仍会被 `LOCK TABLES` 锁住。如果您混用了多种引擎，单靠 `--single-transaction` 不足以得到完全一致的转储。
+不适用。`--single-transaction` 使用一致读快照，只有 InnoDB 支持。同一数据库中的 MyISAM 表不会被锁定，也不属于该快照，因此它们的行在转储期间可能发生变化。如果您混用了多种引擎，单靠 `--single-transaction` 不足以得到完全一致的转储。
 
 #### 我应该保留备份多久？ {#how-long-should-i-retain-backups}
 
@@ -187,9 +190,9 @@ mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
 
 | 问题 | 解决方案 |
 |:--------|:---------|
-| `mysqldump` 在大表上挂起 | 添加 `--quick`，逐行流式输出，而不是把整张表缓冲在内存中 |
+| `mysqldump` 在大表上挂起 | `mysqldump` 已经逐行流式输出（`--quick` 默认开启）。使用 `SHOW PROCESSLIST` 查找是否有其他会话持有被转储表上的锁，或者使用 `--single-transaction` |
 | 恢复失败并报 `ERROR 1824: Failed to open the referenced table`（或某一行上的 `ERROR 1452`） | `mysqldump` 默认已经在输出中加上了 `SET FOREIGN_KEY_CHECKS=0`，因此原样恢复的完整转储不会遇到此问题。它出现在恢复手工编辑过的或部分的转储时（只提取了部分表，或删除了外键检查的那几行）——此时请在文件开头添加 `SET FOREIGN_KEY_CHECKS=0;` |
-| 转储文件太大 | 使用压缩：`mysqldump ... \| gzip > backup.sql.gz`；恢复时用 `zcat backup.sql.gz \| mysql ...` |
+| 转储文件太大 | 使用压缩：`mysqldump ... \| gzip > backup.sql.gz`；恢复时用 `gzip -dc backup.sql.gz \| mysql ...` |
 | 时间点恢复遗漏了更改 | 二进制日志文件有缺口——确认范围内的所有日志文件都已按顺序重放 |
 | 备份用户无法转储触发器 | 授予 `TRIGGER` 权限：`GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |
 
