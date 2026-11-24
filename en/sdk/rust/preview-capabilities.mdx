@@ -437,7 +437,7 @@ use villagesql::{InValue, VdfReturn};
 
 static KEYRING: KeyringCapability = KeyringCapability::new();
 
-const MAX_RESULT_LEN: usize = 8192;
+const MAX_SECRET_LEN: usize = 1024;
 
 fn keyring_read_impl(args: &[InValue]) -> VdfReturn {
     let Some(&InValue::String(data_id)) = args.first() else {
@@ -447,9 +447,10 @@ fn keyring_read_impl(args: &[InValue]) -> VdfReturn {
         return VdfReturn::null();
     };
 
-    match KEYRING.read_to_vec(&data_id, None) {
-        Ok(Some(secret)) => match String::from_utf8(secret) {
-            Ok(s) => VdfReturn::String(s),
+    let mut buf = [0u8; MAX_SECRET_LEN];
+    match KEYRING.read(&data_id, None, &mut buf) {
+        Ok(Some(n)) => match std::str::from_utf8(&buf[..n]) {
+            Ok(s) => VdfReturn::string(s),
             Err(_) => VdfReturn::null(),
         },
         Ok(None) => VdfReturn::null(),
@@ -462,7 +463,7 @@ villagesql::extension! {
         villagesql::func!(
             keyring_read_impl, "keyring_read",
             [villagesql::Type::String] -> villagesql::Type::String,
-            buffer_size: MAX_RESULT_LEN
+            buffer_size: MAX_SECRET_LEN
         ),
     ],
     requires: [
@@ -477,30 +478,34 @@ under `data_id` — a normal outcome, not an error. `write(data_id, auth_id,
 data)` returns `Ok(())` on success. `auth_id` is the owning user; pass
 `None` for internal keys not associated with a specific user.
 
-`read_to_vec(data_id, auth_id)` — used in the example above — wraps `read`:
-it allocates its own buffer, starting at 4096 bytes, and retries with a
-larger one, sized to what the server reports needing, when the secret
-doesn't fit, up to 3 attempts, so callers don't have to size a buffer up
-front.
-
-`read` and `write` both return `Err(KeyringError)` on failure:
-`CapabilityUnavailable` (the capability was never wired up), `NoComponent`
-(no keyring component on the server), or `Other`.
+Both return `Err(KeyringError)` on failure: `CapabilityUnavailable` (the
+capability was never wired up), `NoComponent` (no keyring component on the
+server), or `Other`.
 
 The keyring has no size probe: on a released server, a secret larger than the
 buffer you pass to `read` comes back as `Ok(None)`, indistinguishable from a
 missing key. Size your buffer for the largest secret you expect to store.
 
 <Info>
-**Changed in 0.0.9-dev.** Building against this SDK's `main` branch (not yet
-published to crates.io) against a matching 0.0.9-dev server, `read` can
-return `Err(KeyringError::BufferTooSmall { required })` for an oversized
-secret — a recoverable signal naming the buffer size it needs — and
-`read_to_vec`, shown above, retries automatically by resizing to `required`.
-`KeyringError` is `#[non_exhaustive]` on this SDK version, so a `match` on it
-needs a wildcard arm regardless of which server it talks to. The paragraph
-above describes a released server, where no such signal exists; this SDK
-adds a real one only when it reaches a server that sends it.
+**Changed in 0.0.9-dev.** A 0.0.9-dev server reports a secret that does not
+fit the buffer. SDK 0.0.7 returns that report as `Err(KeyringError::Other)`.
+The next SDK release returns `Err(KeyringError::BufferTooSmall { required })`,
+where `required` is the buffer size in bytes that the secret needs. It also
+adds `read_to_vec(data_id, auth_id)`, which allocates a 4096-byte buffer and,
+when the secret does not fit, retries with a buffer of `required` bytes, for
+up to 3 reads in total. Raise `buffer_size` in `func!` to the largest secret
+the function returns:
+
+```rust
+match KEYRING.read_to_vec(&data_id, None) {
+    Ok(Some(secret)) => match String::from_utf8(secret) {
+        Ok(s) => VdfReturn::String(s),
+        Err(_) => VdfReturn::null(),
+    },
+    Ok(None) => VdfReturn::null(),
+    Err(e) => VdfReturn::error(format!("keyring: {e}")),
+}
+```
 </Info>
 
 ## Next Steps
