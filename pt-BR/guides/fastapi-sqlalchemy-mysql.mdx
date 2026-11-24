@@ -16,7 +16,7 @@ O tratamento assíncrono de requisições do FastAPI só compensa se as chamadas
 O SQLAlchemy 2.0 traz dialetos para dois drivers MySQL assíncronos: `asyncmy` e `aiomysql`. Nenhum dos dois é documentado como a recomendação oficial sobre o outro. O `asyncmy` é um driver compilado escrito em Cython e distribui wheels pré-compilados para as versões atuais do Python, e é por isso que ele é usado neste guia:
 
 ```bash
-pip install "sqlalchemy[asyncio]" asyncmy cryptography
+pip install "sqlalchemy[asyncio]>=2.0,<2.1" asyncmy cryptography
 ```
 
 Instalar o `sqlalchemy` puro em vez de `sqlalchemy[asyncio]` é a primeira armadilha real. A camada ORM assíncrona do SQLAlchemy faz a ponte entre código assíncrono e síncrono com a biblioteca `greenlet`, e ela não é uma dependência do pacote base. Pular o extra `[asyncio]` produz este erro na primeira vez que você toca no engine assíncrono:
@@ -45,7 +45,7 @@ CREATE USER IF NOT EXISTS 'fastapi_app'@'127.0.0.1' IDENTIFIED BY 'fastapi_pw_12
 GRANT ALL PRIVILEGES ON fastapi_guide.* TO 'fastapi_app'@'127.0.0.1';
 ```
 
-O usuário tem escopo em `127.0.0.1`, não em `localhost`. A string de conexão deste guia se conecta via TCP a `127.0.0.1`, então a concessão precisa corresponder a esse host; uma conexão por socket Unix é comparada com `localhost` em vez disso, independentemente das concessões baseadas em IP da conta.
+O usuário tem escopo em `127.0.0.1`, o que corresponde à conexão TCP da string de conexão deste guia. Uma conexão por socket Unix é comparada com `localhost` em vez disso, então esta conta não consegue fazer login pelo socket.
 
 ## Estrutura do Projeto {#project-layout}
 
@@ -69,7 +69,7 @@ fastapi-sqlalchemy-mysql/
 ```
 fastapi
 uvicorn[standard]
-sqlalchemy[asyncio]>=2.0
+sqlalchemy[asyncio]>=2.0,<2.1
 asyncmy
 cryptography
 alembic
@@ -190,7 +190,7 @@ INFO  [alembic.runtime.migration] Running upgrade  -> 4f5ba2a8774a, create posts
 Confirmando diretamente no servidor ativo:
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SHOW TABLES;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "SHOW TABLES;"
 ```
 
 ```
@@ -200,7 +200,7 @@ posts
 ```
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "DESCRIBE posts;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "DESCRIBE posts;"
 ```
 
 ```
@@ -235,7 +235,7 @@ class PostRead(BaseModel):
     created_at: datetime.datetime
 ```
 
-`from_attributes=True` permite que `PostRead` construa a sua resposta diretamente a partir de uma instância ORM `Post`, em vez de um dicionário.
+`from_attributes=True` permite que `PostRead.model_validate()` leia uma instância ORM `Post`, em vez de um dicionário.
 
 ## As Rotas do FastAPI {#the-fastapi-routes}
 
@@ -268,7 +268,7 @@ async def create_post(payload: PostCreate, session: AsyncSession = Depends(get_s
     return post
 ```
 
-Uma sessão global compartilhada entre requisições acaba levando a consultas intercaladas chegando fora de ordem na mesma conexão sob carga concorrente. Uma sessão criada por requisição por meio de `Depends()` evita isso, já que cada requisição recebe a sua própria sessão e a sua própria conexão retirada do pool.
+Uma sessão global compartilhada entre requisições coloca todas as requisições em uma única transação, então o rollback de uma requisição descarta silenciosamente as gravações de outra. Uma sessão criada por requisição por meio de `Depends()` evita isso, já que cada requisição recebe a sua própria sessão e a sua própria conexão retirada do pool.
 
 ## Executando e Verificando {#running-and-verifying}
 
@@ -309,7 +309,7 @@ com um status HTTP 201. Listar novamente mostra a nova linha:
 Consultar o banco de dados diretamente confirma que a escrita chegou, e não apenas a resposta da API:
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SELECT * FROM posts;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "SELECT * FROM posts;"
 ```
 
 ```
@@ -340,9 +340,8 @@ Sim. O `env.py` do template assíncrono ainda executa `revision --autogenerate` 
 | `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` | Um atributo ORM foi lido fora de uma chamada com `await`, geralmente porque a sessão expirou o objeto no commit; defina `expire_on_commit=False` na fábrica de sessões |
 | `sqlalchemy.orm.exc.DetachedInstanceError` | A sessão do objeto já fechou antes de um atributo ser lido; mantenha `expire_on_commit=False`, ou leia todos os atributos necessários antes de a requisição terminar |
 | `alembic.ini` aparece no diretório errado após `alembic init -t async <path>` | Execute `alembic init` de dentro do diretório do projeto; o arquivo ini segue o diretório de trabalho atual, não o argumento de caminho |
-| `alembic revision --autogenerate` produz uma migração vazia | `target_metadata` em `alembic/env.py` ainda é `None`, ou os modelos nunca foram importados e por isso nunca foram registrados em `Base.metadata` |
-| `Access denied for user 'fastapi_app'@'127.0.0.1'` | O usuário foi criado para um host diferente, como `localhost`; a string de conexão deste guia usa TCP para `127.0.0.1`, então a concessão precisa corresponder a esse host |
-| A resposta do FastAPI está sem campos presentes no modelo | `PostRead` precisa de `model_config = ConfigDict(from_attributes=True)` para ler de um objeto ORM em vez de um dicionário |
+| `alembic revision --autogenerate` produz uma migração vazia | Os modelos nunca foram importados em `alembic/env.py` e por isso nunca foram registrados em `Base.metadata` |
+| `Access denied for user 'fastapi_app'@'localhost'` | A conta não existe para o host do cliente, ou a senha está errada; este guia cria `'fastapi_app'@'127.0.0.1'`, então conecte-se via TCP a `127.0.0.1` com a senha de `DATABASE_URL` |
 
 ## Veja também {#see-also}
 

@@ -43,7 +43,7 @@ WHERE tracking_number IS NOT NULL
 LIMIT 50;
 ```
 
-Execute isso em um loop a partir da sua aplicação até não restarem linhas com `shipping_status IS NULL`. Processe em lotes para ficar dentro dos limites de taxa da API.
+Execute isso em um loop a partir da sua aplicação, adicionando `AND id > <last_id>` à cláusula `WHERE` e `ORDER BY id` antes do `LIMIT`, para que cada lote comece depois da última linha que o lote anterior tentou; uma linha cuja requisição falha continua com `shipping_status IS NULL`. Processe em lotes para ficar dentro dos limites de taxa da API.
 
 Depois do preenchimento, as consultas usam a coluna armazenada — nenhuma chamada de API por consulta:
 
@@ -85,34 +85,25 @@ Busque somente para as linhas que realmente precisam, usando WHERE para filtrar 
 ```sql
 -- Only enrich rows missing geocoordinates
 UPDATE locations
+JOIN (
+  SELECT id,
+         JSON_UNQUOTE(JSON_EXTRACT(
+           CONVERT(
+             vsql_http.http_get(
+               CONCAT('https://api.geocode.example.com/json?address=',
+                      vsql_http.url_encode(address))
+             ) USING utf8mb4
+           ),
+           '$.content'
+         )) AS body
+  FROM locations
+  WHERE lat IS NULL
+    AND address IS NOT NULL
+  LIMIT 25
+) AS r ON r.id = locations.id
 SET
-  lat = CAST(JSON_VALUE(
-    JSON_UNQUOTE(JSON_EXTRACT(
-      CONVERT(
-        vsql_http.http_get(
-          CONCAT('https://api.geocode.example.com/json?address=',
-                 vsql_http.url_encode(address))
-        ) USING utf8mb4
-      ),
-      '$.content'
-    )),
-    '$.lat'
-  ) AS DECIMAL(10,7)),
-  lng = CAST(JSON_VALUE(
-    JSON_UNQUOTE(JSON_EXTRACT(
-      CONVERT(
-        vsql_http.http_get(
-          CONCAT('https://api.geocode.example.com/json?address=',
-                 vsql_http.url_encode(address))
-        ) USING utf8mb4
-      ),
-      '$.content'
-    )),
-    '$.lng'
-  ) AS DECIMAL(10,7))
-WHERE lat IS NULL
-  AND address IS NOT NULL
-LIMIT 25;
+  locations.lat = CAST(JSON_VALUE(r.body, '$.lat') AS DECIMAL(10,7)),
+  locations.lng = CAST(JSON_VALUE(r.body, '$.lng') AS DECIMAL(10,7));
 ```
 
 Observe `url_encode()` envolvendo o endereço — sempre codifique dados do usuário antes de embuti-los em uma URL.
@@ -136,7 +127,7 @@ SELECT
   END AS result;
 ```
 
-Em loops de UPDATE em massa, as linhas que recebem uma resposta NULL ou diferente de 200 mantêm o valor da coluna em NULL, então você pode executar o UPDATE de novo para tentar novamente as linhas que falharam.
+Em loops de UPDATE em massa, as linhas cuja requisição falha (NULL) ou cujo corpo não tem um campo `status` mantêm o valor da coluna em NULL, então você pode executar o UPDATE de novo para tentar novamente. O UPDATE acima lê `status` do corpo da resposta e não testa o código de status HTTP, então uma resposta diferente de 200 cujo corpo tem um campo `status` é armazenada.
 
 ## Considerações de Desempenho {#performance-considerations}
 

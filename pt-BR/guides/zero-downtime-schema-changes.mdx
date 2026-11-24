@@ -53,14 +53,14 @@ trx_query: ALTER TABLE orders ADD INDEX idx_status (status), ALGORITHM=INPLACE, 
 A partir de uma terceira conexão, aberta e executada enquanto o `ALTER` acima ainda estava no estado `altering table`, um `INSERT` e um `SELECT` na mesma tabela foram ambos concluídos imediatamente:
 
 ```sql
-INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
-VALUES (999999, 'pending', 500, NOW(), 0, 0);
+INSERT INTO orders (customer_id, status, amount_cents, created_at)
+VALUES (999999, 'pending', 500, NOW());
 -- 0.009s
 SELECT COUNT(*) FROM orders WHERE status='paid';
 -- 0.271s
 ```
 
-Nenhuma das instruções esperou o `ALTER` terminar. Esse é todo o sentido do `LOCK=NONE`: a reconstrução da tabela acontece em segundo plano, usando o log de DDL online do InnoDB para capturar as alterações concorrentes, e o DML na tabela prossegue sobre as estruturas de dados originais até que a reconstrução alcance as alterações e seja colocada no lugar.
+Nenhuma das instruções esperou o `ALTER` terminar. Esse é todo o sentido do `LOCK=NONE`: a construção do índice acontece em segundo plano, usando o log de DDL online do InnoDB para capturar as alterações concorrentes, e o DML na tabela prossegue até que a construção alcance as alterações e seja confirmada.
 
 ## ALGORITHM=INSTANT vs. ALGORITHM=INPLACE {#algorithminstant-vs-algorithminplace}
 
@@ -71,14 +71,14 @@ ALTER TABLE orders ADD COLUMN priority TINYINT NOT NULL DEFAULT 0, ALGORITHM=INS
 -- 0.011s
 ```
 
-Forçando o mesmo tipo de alteração, a adição de uma coluna com valor padrão, por meio de `ALGORITHM=INPLACE` em vez disso:
+Forçando o mesmo tipo de alteração, a adição de uma coluna `NOT NULL` com um valor padrão constante, por meio de `ALGORITHM=INPLACE` em vez disso:
 
 ```sql
 ALTER TABLE orders ADD COLUMN priority2 TINYINT NOT NULL DEFAULT 0, ALGORITHM=INPLACE, LOCK=NONE;
--- 0.244s
+-- 2.890s
 ```
 
-Nesta tabela de 3,27 milhões de linhas, o `INSTANT` foi cerca de 20 vezes mais rápido do que o `INPLACE` para o que é, funcionalmente, a mesma adição de coluna. O `INPLACE` ainda precisa tocar nas entradas do dicionário de dados da tabela e se coordenar com qualquer DML concorrente; o `INSTANT` não faz nenhuma das duas coisas. A diferença cresce com o tamanho da tabela: o `INSTANT` permanece constante, independentemente do número de linhas, enquanto o `INPLACE` cresce com ele.
+Nesta tabela de 3,27 milhões de linhas, o `INSTANT` foi muito mais rápido do que o `INPLACE` para o que é, funcionalmente, a mesma adição de coluna. O `INPLACE` reconstrói a tabela, enquanto o `INSTANT` altera somente os metadados. A diferença cresce com o tamanho da tabela: o `INSTANT` permanece constante, independentemente do número de linhas, enquanto o `INPLACE` cresce com ele.
 
 O `INSTANT` não está disponível para todas as operações. Adicionar uma coluna com um valor padrão `BLOB`/`TEXT`, ou alterar o tipo de uma coluna existente, recai em `INPLACE` ou `COPY`. Adicionar uma coluna em qualquer posição, inclusive no meio de uma tabela, também usa `INSTANT` (MySQL 8.0.29+).
 
@@ -100,7 +100,7 @@ Solicitar `ALGORITHM=INSTANT` para a mesma alteração falha da mesma forma, com
 ERROR 1846 (0A000) at line 2: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table to change column type. Try ALGORITHM=COPY/INPLACE.
 ```
 
-O único algoritmo que o MySQL aceita para esta instrução é o `COPY`, que reconstrói a tabela inteira e mantém um bloqueio exclusivo durante todo o processo. Executá-lo na mesma tabela e inserir uma linha a partir de uma segunda conexão durante a reconstrução demonstra a diferença diretamente:
+O único algoritmo que o MySQL aceita para esta instrução é o `COPY`, que reconstrói a tabela inteira e bloqueia as gravações durante todo o processo. Executá-lo na mesma tabela e inserir uma linha a partir de uma segunda conexão durante a reconstrução demonstra a diferença diretamente:
 
 ```sql
 ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=COPY;
@@ -147,7 +147,7 @@ Ambos os erros acontecem no momento da análise e da validação, antes de o MyS
 
 O caso `MODIFY COLUMN ... ALGORITHM=COPY` acima é aquele em que o DDL online não pode ajudar: ele precisa da reescrita completa das linhas, mas você não quer manter um bloqueio durante todo o processo em uma tabela ativa. O `gh-ost` lida com isso construindo uma cópia da tabela (uma tabela "fantasma") com o novo esquema e, em seguida, copiando as linhas existentes para ela em segundo plano, enquanto transmite o log binário, em vez de usar gatilhos, para reproduzir todas as gravações feitas na tabela original durante a cópia. Ele termina com uma breve renomeação atômica para fazer a troca.
 
-O `gh-ost` se recusa a migrar uma tabela que outra tabela referencia com uma chave estrangeira: a tabela `order_items` da seção anterior tem uma `FOREIGN KEY (order_id) REFERENCES orders(id)`, e executar o `gh-ost` contra `orders` com essa restrição ainda em vigor falha imediatamente com `FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out`. Exclua essa chave estrangeira primeiro (ou passe `--discard-foreign-keys`, que a exclui para você e não a recria) antes de executar o `gh-ost` contra uma tabela que outras tabelas referenciam.
+O `gh-ost` se recusa a migrar uma tabela que outra tabela referencia com uma chave estrangeira: a tabela `order_items` da seção anterior tem uma `FOREIGN KEY (order_id) REFERENCES orders(id)`, e executar o `gh-ost` contra `orders` com essa restrição ainda em vigor falha imediatamente com `FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out`. Exclua essa chave estrangeira primeiro, antes de executar o `gh-ost` contra uma tabela que outras tabelas referenciam.
 
 Ele foi instalado e executado, com a chave estrangeira de `order_items` excluída, contra a mesma tabela de 3.276.802 linhas, exatamente para esse tipo de alteração:
 
@@ -220,7 +220,7 @@ Por padrão, o `gh-ost` renomeia a tabela original com um sufixo (`_del` na exec
 |:---|:---|
 | `ERROR 1846: ALGORITHM=INPLACE is not supported` | A operação exige uma reescrita completa. Use `ALGORITHM=COPY` em uma janela de manutenção, ou `gh-ost`/`pt-online-schema-change` em uma tabela ativa. |
 | `ERROR 1846: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table...` | A alteração não é somente de metadados. Tente `ALGORITHM=INPLACE, LOCK=NONE` primeiro e, em seguida, recorra ao `COPY` se isso também falhar. |
-| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | Exclua primeiro a chave estrangeira que faz a referência, faça a alteração do índice e, em seguida, recrie a chave estrangeira. |
+| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | Exclua primeiro a chave estrangeira que faz a referência, faça a alteração do índice e, em seguida, recrie a chave estrangeira. As colunas referenciadas ainda precisam de uma chave única própria, ou a recriação da chave estrangeira falha com `ERROR 6125: Failed to add the foreign key constraint. Missing unique key for constraint`. |
 | `ERROR 3780: Referencing column ... and referenced column ... are incompatible` | As colunas filha e pai de uma chave estrangeira precisam permanecer com tipos compatíveis. Altere os dois lados juntos, ou exclua a chave estrangeira durante a migração. |
 | Um `ALTER` com algoritmo `COPY` está segurando os gravadores sem fim à vista | Verifique o estado dele no `SHOW PROCESSLIST` e há quanto tempo ele está em execução na `information_schema.INNODB_TRX`. Se não for aceitável esperar até o fim, encerre-o e mude para o `gh-ost`. |
 | O `gh-ost` se recusa a iniciar | Confirme `binlog_format=ROW` e que a tabela de destino tem uma chave primária ou uma chave única; ambos são obrigatórios. |
