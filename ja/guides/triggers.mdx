@@ -87,19 +87,25 @@ WHERE trigger_schema = DATABASE();
 `BEFORE` トリガーで `NEW` の値を変更すると、書き込まれる内容が変わります。
 
 ```sql
+DELIMITER $$
+
 CREATE TRIGGER normalize_email
     BEFORE INSERT ON users
     FOR EACH ROW
 BEGIN
     SET NEW.email = LOWER(TRIM(NEW.email));
-END;
+END$$
+
+DELIMITER ;
 ```
 
 ## イベントごとの複数トリガー {#multiple-triggers-per-event}
 
-MySQL は、同じテーブルとイベントに対する複数のトリガーをサポートします。`FOLLOWS` と `PRECEDES` キーワードが実行順序を制御します。
+MySQL は、同じテーブルとイベントに対する複数のトリガーをサポートします。`FOLLOWS` と `PRECEDES` キーワードが実行順序を制御します。次のトリガーは、`orders` に対する既存の `AFTER INSERT` トリガー `another_trigger` の後に実行されます。
 
 ```sql
+DELIMITER $$
+
 CREATE TRIGGER audit_insert
     AFTER INSERT ON orders
     FOR EACH ROW
@@ -107,7 +113,9 @@ CREATE TRIGGER audit_insert
 BEGIN
     INSERT INTO audit_log (action, table_name, row_id, happened_at)
     VALUES ('INSERT', 'orders', NEW.id, NOW());
-END;
+END$$
+
+DELIMITER ;
 ```
 
 `FOLLOWS`/`PRECEDES` がない場合、MySQL は作成時刻に基づいて実行順序を割り当てます。
@@ -117,6 +125,8 @@ END;
 操作を中止して呼び出し元にエラーを返すには、`SIGNAL` を使います。
 
 ```sql
+DELIMITER $$
+
 CREATE TRIGGER enforce_minimum_price
     BEFORE INSERT ON products
     FOR EACH ROW
@@ -125,7 +135,9 @@ BEGIN
         SIGNAL SQLSTATE '45000'
             SET MESSAGE_TEXT = 'Price must be at least $0.01';
     END IF;
-END;
+END$$
+
+DELIMITER ;
 ```
 
 `BEFORE` トリガーがエラーをシグナルすると、挿入/更新/削除は中止され、何も書き込まれません。
@@ -134,8 +146,8 @@ END;
 
 MySQL のトリガーには、知っておくべきいくつかの制限があります。
 - トリガーは、結果セットを返すストアドプロシージャを呼び出せません
-- トリガーは `COMMIT`、`ROLLBACK`、`SAVEPOINT` を直接使えません(周囲のトランザクションに参加します)
-- トリガーは、自分が定義されているテーブルを参照できません(ほとんどのコンテキストで、同じテーブルへの直接クエリによる再帰的なトリガー呼び出しはできません)
+- トリガーは `COMMIT`、`ROLLBACK`、`START TRANSACTION` を直接使えません(周囲のトランザクションに参加します)
+- トリガーは、自分が定義されているテーブルを変更できません(読み取ることはできます)
 - `AFTER` トリガーは `NEW` の値を変更できません — 行はすでに書き込まれています
 - MySQL はステートメントレベルのトリガーをサポートしません(すべてのトリガーは `FOR EACH ROW` です)
 
@@ -157,7 +169,7 @@ MySQL のトリガーには、知っておくべきいくつかの制限があ�
 
 #### LOAD DATA INFILE の実行中にトリガーは起動しますか? {#do-triggers-fire-during-load-data-infile}
 
-はい。`INSERT` トリガーは、`LOAD DATA INFILE` でロードされる各行に対して起動します。トリガーが大きな作業を行う場合、LOAD DATA による一括ロードは、まずステージングテーブルにロードしてから INSERT...SELECT でコピーするよりもはるかに遅くなります(INSERT...SELECT もトリガーを起動しますが、`SET @disable_trigger = TRUE` とトリガー内の条件チェックで一時的に無効化できます)。
+はい。`INSERT` トリガーは、`LOAD DATA INFILE` でロードされる各行に対して起動します。トリガーが大きな作業を行う場合、ロードは行数に比例して遅くなります。`INSERT...SELECT` もトリガーを起動するため、まずステージングテーブルにロードしてもこれは避けられません。一括ロードでトリガーの作業を省くには、`SET @disable_trigger = TRUE` のようなセッション変数を設定し、トリガーの中でそれを判定します。
 
 #### トリガーからストアドプロシージャを呼び出せますか? {#can-triggers-call-stored-procedures}
 
@@ -172,9 +184,9 @@ MySQL のトリガーには、知っておくべきいくつかの制限があ�
 | 問題 | 解決策 |
 |:--------|:---------|
 | トリガーが起動しない | トリガーが存在することを確認する: `SHOW TRIGGERS LIKE 'table_name'` — イベント(INSERT/UPDATE/DELETE)とタイミング(BEFORE/AFTER)が期待どおりかも確認する |
-| `ERROR 1442: Can't update table in stored function/trigger` | ほとんどのコンテキストで、トリガーは自分が定義されているテーブルに直接 INSERT/UPDATE/DELETE できない — 別のテーブルに書き込むか、DML の後に呼び出すストアドプロシージャを使う |
-| AFTER トリガーの変更が永続化されない | `AFTER` トリガーは `NEW` を変更できない — 書き込まれる行を変更する必要があるなら `BEFORE` に切り替える |
-| トリガーが一括挿入を遅くしている | トリガーは行ごとに起動する — 一括ロードでは、トリガーを一時的に無効化するか、ステージングテーブルへのロードを検討する |
+| `ERROR 1442: Can't update table '<table>' in stored function/trigger because it is already used by statement which invoked this stored function/trigger` | トリガーは自分が定義されているテーブルに直接 INSERT/UPDATE/DELETE できない — 別のテーブルに書き込むか、DML の後に呼び出すストアドプロシージャを使う |
+| `ERROR 1362: Updating of NEW row is not allowed in after trigger` | `AFTER` トリガーは `NEW` を変更できない — 書き込まれる行を変更する必要があるなら `BEFORE` に切り替える |
+| トリガーが一括挿入を遅くしている | トリガーは、`LOAD DATA` と `INSERT...SELECT` も含め、行ごとに起動する — 一括ロードでは、トリガーが判定するセッション変数でトリガーの作業を省くか、ロードの間トリガーを削除して後で作成し直す |
 | トリガー内の `SIGNAL` がアプリに届かない | トリガーからのエラーを握りつぶすドライバーがある — `SHOW WARNINGS` を確認し、ドライバーのエラー処理の設定を検証する |
 
 ## 関連項目 {#see-also}

@@ -62,14 +62,14 @@ mysql -u root -p myapp < myapp_backup.sql
 フルバックアップは、最後のバックアップの時点までしか保護してくれません。バイナリログがあれば、バックアップを取った後に行われたすべての変更を再生できます。
 
 **要件:**
-- バイナリログが有効であること（`log_bin = ON`）
+- バイナリログが有効であること（8.4 ではデフォルトで有効です。`SHOW VARIABLES LIKE 'log_bin'` が `ON` を表示します）
 - バックアップ取得時に `--source-data=2` を使っていること（開始時の binlog の位置を記録します）
 
 **ワークフロー:**
 
 1. フルバックアップを復元します。
 ```bash
-mysql -u root -p < myapp_backup.sql
+mysql -u root -p myapp < myapp_backup.sql
 ```
 
 2. ダンプファイルから binlog の開始位置を探します。
@@ -138,8 +138,11 @@ MySQL Shell のダンプユーティリティはデフォルトで出力を圧�
 ```bash
 #!/bin/bash
 # mysql-backup.sh
+set -euo pipefail
+umask 077  # the dump holds account password hashes; keep it owner-only
 DATE=$(date +%Y-%m-%d)
 BACKUP_DIR=/backups/mysql
+mkdir -p "$BACKUP_DIR"
 
 mysqldump \
   --single-transaction \
@@ -152,7 +155,7 @@ mysqldump \
 find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
 ```
 
-バックアップユーザーに必要な権限は `SELECT`、`LOCK TABLES`、`SHOW VIEW`、`TRIGGER`、`EVENT`、`RELOAD`、および `PROCESS` だけです。`ALL PRIVILEGES` は不要です。`PROCESS` がなくても `mysqldump` は完了しますが、テーブルスペースのメタデータをダンプしようとする際に、実行のたびに「Access denied ... PROCESS privilege」エラーを stderr に出力します。
+バックアップユーザーに必要な権限は `SELECT`、`LOCK TABLES`、`SHOW VIEW`、`TRIGGER`、`EVENT`、`RELOAD`、`PROCESS`、および `REPLICATION CLIENT` だけです。`ALL PRIVILEGES` は不要です。`PROCESS` がなくても `mysqldump` は完了しますが、テーブルスペースのメタデータをダンプしようとする際に、実行のたびに「Access denied ... PROCESS privilege」エラーを stderr に出力します。
 
 ## バックアップの検証 {#verifying-backups}
 
@@ -162,9 +165,9 @@ find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
 # Test restore to a separate instance
 mysql -u root -p --host=test-server < all_databases.sql
 
-# Quick sanity check — verify row counts
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+# Quick check — verify row counts
+mysql -u root -p --host=test-server -e "SELECT COUNT(*) FROM myapp.orders;"
+mysql -u root -p --host=production-server -e "SELECT COUNT(*) FROM myapp.orders;"
 ```
 
 少なくとも月に 1 回の自動復元テストを行えば、破損、権限の問題、およびディスク容量の問題を、問題になる前に発見できます。
@@ -173,7 +176,7 @@ mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
 
 #### `--single-transaction` はすべてのストレージエンジンで機能しますか? {#does---single-transaction-work-with-all-storage-engines}
 
-いいえ。`--single-transaction` は一貫した読み取りスナップショットを使いますが、これをサポートするのは InnoDB だけです。同じデータベース内の MyISAM テーブルは、それでもダンプの間は `LOCK TABLES` でロックされます。エンジンが混在している場合、`--single-transaction` だけでは完全に一貫したダンプには不十分です。
+いいえ。`--single-transaction` は一貫した読み取りスナップショットを使いますが、これをサポートするのは InnoDB だけです。同じデータベース内の MyISAM テーブルはロックされず、スナップショットにも含まれないため、ダンプの間にその行が変わることがあります。エンジンが混在している場合、`--single-transaction` だけでは完全に一貫したダンプには不十分です。
 
 #### バックアップはどのくらいの期間保持すべきですか? {#how-long-should-i-retain-backups}
 
@@ -187,9 +190,9 @@ mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
 
 | 問題 | 解決策 |
 |:--------|:---------|
-| `mysqldump` が大きなテーブルでハングする | `--quick` を追加して、テーブル全体をメモリにバッファするのではなく、行を 1 行ずつストリームします |
+| `mysqldump` が大きなテーブルでハングする | `mysqldump` はすでに行を 1 行ずつストリームしています（`--quick` はデフォルトで有効です）。`SHOW PROCESSLIST` で、ダンプ対象のテーブルのロックを保持している別のセッションを探すか、`--single-transaction` を使います |
 | 復元が `ERROR 1824: Failed to open the referenced table`（または行に対する `ERROR 1452`）で失敗する | `mysqldump` はデフォルトで出力を `SET FOREIGN_KEY_CHECKS=0` で囲むため、フルダンプをそのまま復元する場合はこの問題は起きません。手で編集したダンプや部分的なダンプ（一部のテーブルだけを抽出した、または FK チェックの行を削除した）を復元する場合に発生します。その場合は先頭に `SET FOREIGN_KEY_CHECKS=0;` を追加します |
-| ダンプファイルが大きすぎる | 圧縮を使います: `mysqldump ... \| gzip > backup.sql.gz`。復元は `zcat backup.sql.gz \| mysql ...` で行います |
+| ダンプファイルが大きすぎる | 圧縮を使います: `mysqldump ... \| gzip > backup.sql.gz`。復元は `gzip -dc backup.sql.gz \| mysql ...` で行います |
 | ポイントインタイムリカバリで変更が欠けた | バイナリログファイルに抜けがあります。範囲内のすべてのログファイルが順番どおりに再生されたことを確認します |
 | バックアップユーザーがトリガーをダンプできない | `TRIGGER` 権限を付与します: `GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |
 

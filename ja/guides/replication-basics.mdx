@@ -28,6 +28,8 @@ MySQL レプリケーションは、1 台のサーバー（ソース）から 1 
 server_id = 1
 log_bin = /var/log/mysql/mysql-bin
 binlog_format = ROW
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 レプリケーションユーザーを作成します。
@@ -49,6 +51,8 @@ mysqldump --single-transaction --source-data=1 --all-databases \
 ```ini
 [mysqld]
 server_id = 2
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 スナップショットを復元し、レプリケーションを開始します。
@@ -62,12 +66,13 @@ CHANGE REPLICATION SOURCE TO
     SOURCE_HOST = '192.168.1.10',
     SOURCE_USER = 'repl',
     SOURCE_PASSWORD = 'repl_password',
+    SOURCE_SSL = 1,
     SOURCE_AUTO_POSITION = 1;
 
 START REPLICA;
 ```
 
-`SOURCE_AUTO_POSITION = 1` は GTID ベースのレプリケーションを有効にします。GTID を使わない場合は、代わりに `SOURCE_LOG_FILE` と `SOURCE_LOG_POS` を指定します（値はスナップショットファイルのヘッダーにあります）。
+`SOURCE_AUTO_POSITION = 1` は GTID ベースのレプリケーションを使います。これには、両方のサーバーで `gtid_mode = ON` と `enforce_gtid_consistency = ON` が必要です。GTID を使わない場合は、代わりに `SOURCE_LOG_FILE` と `SOURCE_LOG_POS` を指定します（値はスナップショットファイルのヘッダーにあります）。
 
 ## GTID レプリケーション {#gtid-replication}
 
@@ -108,8 +113,9 @@ SHOW REPLICA STATUS\G
 - **アプライヤの並列度**: MySQL 8.4 はデフォルトですでにイベントを並列に適用します。`replica_parallel_workers` は 4、`replica_parallel_type` は `LOGICAL_CLOCK` です。それでもレプリカが遅れる場合はワーカー数を増やします。
 
 ```sql
-SET GLOBAL replica_parallel_workers = 4;
-SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+STOP REPLICA SQL_THREAD;
+SET GLOBAL replica_parallel_workers = 8;
+START REPLICA SQL_THREAD;
 ```
 
 - **レプリカ上の長時間実行クエリ**: 行をロックするクエリは SQL スレッドをブロックします。
@@ -123,7 +129,7 @@ SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
 | アーキテクチャ | 一貫性の保証 | フェイルオーバー | 書き込みのオーバーヘッド | 複雑さ |
 |:-------------|:---------------------|:---------|:--------------|:-----------|
 | **非同期レプリケーション**（デフォルト） | なし — レプリカは任意の長さで遅れうる | 手動。一部のトランザクションが失われうる | 最小 — ソースは待たない | 低 |
-| **半同期レプリケーション** | ソースがコミットする前に少なくとも 1 つのレプリカがイベントを受信済み | 手動。失われるのは最大 1 トランザクション | 各書き込みに約 1 RTT が加わる | 低〜中 |
+| **半同期レプリケーション** | ソースがコミットする前に少なくとも 1 つのレプリカがイベントを受信済み（受信確認がないまま `rpl_semi_sync_source_timeout`（デフォルトは 10 秒）が経過するまで） | 手動。失われるのは最大 1 トランザクション | 各書き込みに約 1 RTT が加わる | 低〜中 |
 | **グループレプリケーション** | コミット前に全メンバーが合意（マルチプライマリまたはシングルプライマリ） | グループ内で自動 | 高い — トランザクションごとに合意ラウンド | 高 |
 | **InnoDB Cluster** | グループレプリケーションと同じ（その上に構築） | クライアントのフェイルオーバーに MySQL Router を使って自動 | グループレプリケーションと同じ | 高 |
 
@@ -199,7 +205,7 @@ MySQL は古いソースから新しいレプリカへのレプリケーショ�
 
 | 問題 | 解決策 |
 |:--------|:---------|
-| `Replica_IO_Running: No` | `Last_IO_Error` を確認する — 通常は接続または認証の失敗。SOURCE_HOST、ユーザー、パスワード、および REPLICATION SLAVE の付与を確認する |
+| `Replica_IO_Running: Connecting` または `No` | `Last_IO_Error` を確認する — 通常は接続または認証の失敗。SOURCE_HOST、ユーザー、パスワード、REPLICATION SLAVE の付与、および `caching_sha2_password` アカウントの場合は `SOURCE_SSL = 1` を確認する |
 | `Replica_SQL_Running: No` | `Last_SQL_Error` を確認する — 通常はデータの競合。イベントをスキップするか根本原因を修正するかを決める |
 | レプリケーションラグが増え続ける | `replica_parallel_workers` をデフォルトの 4 より増やす。アプライヤをブロックしているレプリカ上の長時間実行クエリを確認する |
 | レプリカで `ERROR 1062: Duplicate entry` | レプリカにソースにない行がある — レプリカへの手動書き込みを示す。`replica_skip_errors` を慎重に使うか、再同期する |
