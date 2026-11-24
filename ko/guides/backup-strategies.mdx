@@ -62,14 +62,14 @@ mysql -u root -p myapp < myapp_backup.sql
 전체 백업은 마지막 백업 시점까지만 보호합니다. 바이너리 로깅을 사용하면 백업 이후에 이루어진 모든 변경 사항을 재생할 수 있습니다.
 
 **요구 사항:**
-- 바이너리 로깅 활성화(`log_bin = ON`)
+- 바이너리 로깅 활성화(8.4에서는 기본으로 켜져 있음. `SHOW VARIABLES LIKE 'log_bin'`이 `ON`을 표시)
 - 백업 시 `--source-data=2` 사용(시작 binlog 위치 기록)
 
 **워크플로:**
 
 1. 전체 백업 복원:
 ```bash
-mysql -u root -p < myapp_backup.sql
+mysql -u root -p myapp < myapp_backup.sql
 ```
 
 2. 덤프 파일에서 binlog 시작 위치 찾기:
@@ -138,8 +138,11 @@ MySQL Shell 덤프 유틸리티는 기본적으로 출력을 압축하며(zstd),
 ```bash
 #!/bin/bash
 # mysql-backup.sh
+set -euo pipefail
+umask 077  # the dump holds account password hashes; keep it owner-only
 DATE=$(date +%Y-%m-%d)
 BACKUP_DIR=/backups/mysql
+mkdir -p "$BACKUP_DIR"
 
 mysqldump \
   --single-transaction \
@@ -152,7 +155,7 @@ mysqldump \
 find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
 ```
 
-백업 사용자에게는 `SELECT`, `LOCK TABLES`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `RELOAD`, `PROCESS` 권한만 필요합니다 — `ALL PRIVILEGES`는 필요하지 않습니다. `PROCESS`가 없어도 `mysqldump`는 완료되지만, 테이블스페이스 메타데이터를 덤프하려고 시도하면서 실행할 때마다 "Access denied ... PROCESS privilege" 오류를 stderr에 출력합니다.
+백업 사용자에게는 `SELECT`, `LOCK TABLES`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `RELOAD`, `PROCESS`, `REPLICATION CLIENT` 권한만 필요합니다 — `ALL PRIVILEGES`는 필요하지 않습니다. `PROCESS`가 없어도 `mysqldump`는 완료되지만, 테이블스페이스 메타데이터를 덤프하려고 시도하면서 실행할 때마다 "Access denied ... PROCESS privilege" 오류를 stderr에 출력합니다.
 
 ## 백업 검증하기 {#verifying-backups}
 
@@ -162,9 +165,9 @@ find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
 # Test restore to a separate instance
 mysql -u root -p --host=test-server < all_databases.sql
 
-# Quick sanity check — verify row counts
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+# Quick check — verify row counts
+mysql -u root -p --host=test-server -e "SELECT COUNT(*) FROM myapp.orders;"
+mysql -u root -p --host=production-server -e "SELECT COUNT(*) FROM myapp.orders;"
 ```
 
 최소 월 1회 자동화된 복원 테스트를 수행하면 손상, 권한 문제, 디스크 공간 문제를 실제로 문제가 되기 전에 발견할 수 있습니다.
@@ -173,7 +176,7 @@ mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
 
 #### `--single-transaction`은 모든 스토리지 엔진에서 동작하나요? {#does---single-transaction-work-with-all-storage-engines}
 
-아니요. `--single-transaction`은 일관된 읽기 스냅샷을 사용하며, 이는 InnoDB만 지원합니다. 같은 데이터베이스의 MyISAM 테이블은 덤프 중에 여전히 `LOCK TABLES`로 잠깁니다. 엔진이 혼합되어 있다면 `--single-transaction`만으로는 완전히 일관된 덤프에 충분하지 않습니다.
+아니요. `--single-transaction`은 일관된 읽기 스냅샷을 사용하며, 이는 InnoDB만 지원합니다. 같은 데이터베이스의 MyISAM 테이블은 잠기지 않고 스냅샷에도 포함되지 않으므로, 덤프 중에 행이 바뀔 수 있습니다. 엔진이 혼합되어 있다면 `--single-transaction`만으로는 완전히 일관된 덤프에 충분하지 않습니다.
 
 #### 백업을 얼마나 오래 보관해야 하나요? {#how-long-should-i-retain-backups}
 
@@ -187,9 +190,9 @@ mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
 
 | 문제 | 해결 방법 |
 |:--------|:---------|
-| `mysqldump`가 큰 테이블에서 멈춤 | 테이블 전체를 메모리에 버퍼링하는 대신 행을 하나씩 스트리밍하도록 `--quick` 추가 |
+| `mysqldump`가 큰 테이블에서 멈춤 | `mysqldump`는 이미 행을 하나씩 스트리밍합니다(`--quick`이 기본으로 켜져 있음). `SHOW PROCESSLIST`로 덤프 대상 테이블에 잠금을 보유한 다른 세션을 찾거나 `--single-transaction` 사용 |
 | 복원이 `ERROR 1824: Failed to open the referenced table`(또는 행에서 `ERROR 1452`)로 실패함 | `mysqldump`는 기본적으로 출력을 `SET FOREIGN_KEY_CHECKS=0`으로 감싸므로, 전체 덤프를 그대로 복원하면 이 문제가 발생하지 않습니다. 직접 편집했거나 부분적인 덤프(일부 테이블만 추출했거나 FK 검사 줄을 제거한 경우)를 복원할 때 나타납니다 — 이 경우 맨 위에 `SET FOREIGN_KEY_CHECKS=0;`을 추가하세요 |
-| 덤프 파일이 너무 큼 | 압축 사용: `mysqldump ... \| gzip > backup.sql.gz`; 복원은 `zcat backup.sql.gz \| mysql ...` |
+| 덤프 파일이 너무 큼 | 압축 사용: `mysqldump ... \| gzip > backup.sql.gz`; 복원은 `gzip -dc backup.sql.gz \| mysql ...` |
 | 특정 시점 복구에서 변경 사항이 누락됨 | 바이너리 로그 파일에 간격이 있음 — 범위 내 모든 로그 파일이 순서대로 재생되었는지 확인 |
 | 백업 사용자가 트리거를 덤프할 수 없음 | `TRIGGER` 권한 부여: `GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |
 

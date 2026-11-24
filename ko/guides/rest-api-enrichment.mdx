@@ -43,7 +43,7 @@ WHERE tracking_number IS NOT NULL
 LIMIT 50;
 ```
 
-`shipping_status IS NULL`인 행이 남지 않을 때까지 애플리케이션에서 이것을 반복 실행하세요. API 속도 제한 안에 머물도록 배치로 처리하세요.
+애플리케이션에서 이것을 반복 실행하되, `WHERE` 절에 `AND id > <last_id>`를, `LIMIT` 앞에 `ORDER BY id`를 추가하여 각 배치가 이전 배치가 시도한 마지막 행 다음부터 시작하게 하세요. 요청이 실패한 행은 `shipping_status IS NULL`로 남습니다. API 속도 제한 안에 머물도록 배치로 처리하세요.
 
 채우고 나면 쿼리는 저장된 열을 읽습니다 — 쿼리마다 API 호출이 없습니다:
 
@@ -85,34 +85,25 @@ API를 호출하기 전에 WHERE로 필터링하여 실제로 필요한 행에 �
 ```sql
 -- Only enrich rows missing geocoordinates
 UPDATE locations
+JOIN (
+  SELECT id,
+         JSON_UNQUOTE(JSON_EXTRACT(
+           CONVERT(
+             vsql_http.http_get(
+               CONCAT('https://api.geocode.example.com/json?address=',
+                      vsql_http.url_encode(address))
+             ) USING utf8mb4
+           ),
+           '$.content'
+         )) AS body
+  FROM locations
+  WHERE lat IS NULL
+    AND address IS NOT NULL
+  LIMIT 25
+) AS r ON r.id = locations.id
 SET
-  lat = CAST(JSON_VALUE(
-    JSON_UNQUOTE(JSON_EXTRACT(
-      CONVERT(
-        vsql_http.http_get(
-          CONCAT('https://api.geocode.example.com/json?address=',
-                 vsql_http.url_encode(address))
-        ) USING utf8mb4
-      ),
-      '$.content'
-    )),
-    '$.lat'
-  ) AS DECIMAL(10,7)),
-  lng = CAST(JSON_VALUE(
-    JSON_UNQUOTE(JSON_EXTRACT(
-      CONVERT(
-        vsql_http.http_get(
-          CONCAT('https://api.geocode.example.com/json?address=',
-                 vsql_http.url_encode(address))
-        ) USING utf8mb4
-      ),
-      '$.content'
-    )),
-    '$.lng'
-  ) AS DECIMAL(10,7))
-WHERE lat IS NULL
-  AND address IS NOT NULL
-LIMIT 25;
+  locations.lat = CAST(JSON_VALUE(r.body, '$.lat') AS DECIMAL(10,7)),
+  locations.lng = CAST(JSON_VALUE(r.body, '$.lng') AS DECIMAL(10,7));
 ```
 
 주소를 감싸는 `url_encode()`에 주목하세요 — 사용자 데이터를 URL에 넣기 전에 항상 인코딩하세요.
@@ -136,7 +127,7 @@ SELECT
   END AS result;
 ```
 
-대량 UPDATE 루프에서는 NULL 또는 200이 아닌 응답을 받은 행의 열 값이 NULL로 남으므로, UPDATE를 다시 실행해 실패한 행을 재시도할 수 있습니다.
+대량 UPDATE 루프에서는 요청이 실패했거나(NULL) 본문에 `status` 필드가 없는 행의 열 값이 NULL로 남으므로, UPDATE를 다시 실행해 그 행을 재시도할 수 있습니다. 위의 UPDATE는 응답 본문에서 `status`를 읽고 HTTP 상태 코드는 검사하지 않으므로, 본문에 `status` 필드가 있는 200이 아닌 응답은 저장됩니다.
 
 ## 성능 고려 사항 {#performance-considerations}
 

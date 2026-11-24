@@ -16,7 +16,7 @@ FastAPI의 비동기 요청 처리는 그 아래의 데이터베이스 호출도
 SQLAlchemy 2.0은 두 가지 비동기 MySQL 드라이버인 `asyncmy`와 `aiomysql`을 위한 방언을 제공합니다. 어느 쪽도 다른 쪽보다 공식 권장으로 문서화되어 있지 않습니다. `asyncmy`는 Cython으로 작성된 컴파일된 드라이버로 현재 Python 버전용으로 미리 빌드된 휠을 제공하며, 이 가이드에서 사용하는 이유입니다:
 
 ```bash
-pip install "sqlalchemy[asyncio]" asyncmy cryptography
+pip install "sqlalchemy[asyncio]>=2.0,<2.1" asyncmy cryptography
 ```
 
 `sqlalchemy[asyncio]` 대신 그냥 `sqlalchemy`를 설치하는 것이 첫 번째 실제 함정입니다. SQLAlchemy의 비동기 ORM 계층은 `greenlet` 라이브러리로 비동기 코드와 동기 코드를 잇는데, 이는 기본 패키지의 의존성이 아닙니다. `[asyncio]` 추가 항목을 건너뛰면 비동기 엔진을 처음 건드릴 때 다음 오류가 발생합니다:
@@ -45,7 +45,7 @@ CREATE USER IF NOT EXISTS 'fastapi_app'@'127.0.0.1' IDENTIFIED BY 'fastapi_pw_12
 GRANT ALL PRIVILEGES ON fastapi_guide.* TO 'fastapi_app'@'127.0.0.1';
 ```
 
-사용자는 `localhost`가 아니라 `127.0.0.1`로 범위가 지정됩니다. 이 가이드의 연결 문자열은 TCP로 `127.0.0.1`에 연결하므로 권한 부여가 그 호스트와 일치해야 합니다. Unix 소켓 연결은 계정의 IP 기반 권한 부여와 관계없이 `localhost`에 대조됩니다.
+사용자는 `127.0.0.1`로 범위가 지정되며, 이는 이 가이드의 연결 문자열이 사용하는 TCP 연결과 일치합니다. Unix 소켓 연결은 대신 `localhost`에 대조되므로, 이 계정은 소켓으로는 로그인하지 못합니다.
 
 ## 프로젝트 레이아웃 {#project-layout}
 
@@ -69,7 +69,7 @@ fastapi-sqlalchemy-mysql/
 ```
 fastapi
 uvicorn[standard]
-sqlalchemy[asyncio]>=2.0
+sqlalchemy[asyncio]>=2.0,<2.1
 asyncmy
 cryptography
 alembic
@@ -190,7 +190,7 @@ INFO  [alembic.runtime.migration] Running upgrade  -> 4f5ba2a8774a, create posts
 실제 서버에서 직접 확인합니다:
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SHOW TABLES;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "SHOW TABLES;"
 ```
 
 ```
@@ -200,7 +200,7 @@ posts
 ```
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "DESCRIBE posts;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "DESCRIBE posts;"
 ```
 
 ```
@@ -235,7 +235,7 @@ class PostRead(BaseModel):
     created_at: datetime.datetime
 ```
 
-`from_attributes=True`는 `PostRead`가 딕셔너리 대신 `Post` ORM 인스턴스에서 직접 응답을 만들 수 있게 합니다.
+`from_attributes=True`는 `PostRead.model_validate()`가 딕셔너리 대신 `Post` ORM 인스턴스를 읽을 수 있게 합니다.
 
 ## FastAPI 라우트 {#the-fastapi-routes}
 
@@ -268,7 +268,7 @@ async def create_post(payload: PostCreate, session: AsyncSession = Depends(get_s
     return post
 ```
 
-요청 간에 공유되는 전역 세션은 동시 부하에서 결국 같은 연결에 쿼리가 뒤섞여 순서 없이 도달하는 결과를 낳습니다. `Depends()`를 통해 요청마다 만들어지는 세션은 각 요청이 자체 세션과 풀에서 체크아웃한 자체 연결을 받으므로 그 문제를 피합니다.
+요청 간에 공유되는 전역 세션은 모든 요청을 하나의 트랜잭션에 넣으므로, 한 요청의 롤백이 다른 요청의 쓰기를 조용히 버립니다. `Depends()`를 통해 요청마다 만들어지는 세션은 각 요청이 자체 세션과 풀에서 체크아웃한 자체 연결을 받으므로 그 문제를 피합니다.
 
 ## 실행 및 확인 {#running-and-verifying}
 
@@ -309,7 +309,7 @@ HTTP 201 상태와 함께 반환됩니다. 다시 목록을 조회하면 새 행
 데이터베이스를 직접 쿼리하면 API 응답뿐 아니라 쓰기가 실제로 반영되었음을 확인할 수 있습니다:
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SELECT * FROM posts;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "SELECT * FROM posts;"
 ```
 
 ```
@@ -340,9 +340,8 @@ id  title             body                                       created_at
 | `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` | ORM 속성이 `await`된 호출 바깥에서 읽힘, 보통 세션이 커밋 시 객체를 만료시켰기 때문; 세션 팩토리에 `expire_on_commit=False`를 설정 |
 | `sqlalchemy.orm.exc.DetachedInstanceError` | 속성을 읽기 전에 객체의 세션이 이미 닫힘; `expire_on_commit=False`를 유지하거나, 요청이 끝나기 전에 필요한 모든 속성을 읽기 |
 | `alembic init -t async <path>` 후 `alembic.ini`가 잘못된 디렉토리에 나타남 | 프로젝트 디렉토리 안에서 `alembic init`을 실행; ini 파일은 경로 인수가 아니라 현재 작업 디렉토리를 따름 |
-| `alembic revision --autogenerate`가 빈 마이그레이션을 생성 | `alembic/env.py`의 `target_metadata`가 여전히 `None`이거나, 모델을 가져오지 않아 `Base.metadata`에 등록되지 않음 |
-| `Access denied for user 'fastapi_app'@'127.0.0.1'` | 사용자가 `localhost` 같은 다른 호스트용으로 만들어짐; 이 가이드의 연결 문자열은 TCP로 `127.0.0.1`에 연결하므로 권한 부여가 그 호스트와 일치해야 함 |
-| FastAPI 응답에 모델에 있는 필드가 빠짐 | `PostRead`가 딕셔너리 대신 ORM 객체에서 읽으려면 `model_config = ConfigDict(from_attributes=True)`가 필요함 |
+| `alembic revision --autogenerate`가 빈 마이그레이션을 생성 | `alembic/env.py`에서 모델을 가져오지 않아 `Base.metadata`에 등록되지 않음 |
+| `Access denied for user 'fastapi_app'@'localhost'` | 클라이언트의 호스트에 대한 계정이 없거나 비밀번호가 틀림; 이 가이드는 `'fastapi_app'@'127.0.0.1'`을 만들므로, `DATABASE_URL`의 비밀번호로 TCP를 통해 `127.0.0.1`에 연결 |
 
 ## 함께 보기 {#see-also}
 
