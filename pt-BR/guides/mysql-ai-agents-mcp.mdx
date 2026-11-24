@@ -13,7 +13,7 @@ Um agente de IA que precisa consultar um banco de dados normalmente fala com ele
 
 ## O que o vsql_mcp Faz {#what-vsql_mcp-does}
 
-`vsql_mcp` é uma extensão em Rust que serve MCP pelo transporte Streamable HTTP (revisão da especificação `2025-06-18`) a partir de um worker em segundo plano dentro do processo do servidor. Ela expõe seis ferramentas: `list_schemas`, `list_tables`, `describe_table`, `query`, `explain` e `write`. A ferramenta `write` só aparece depois que você a ativa, e ela vem desativada por padrão.
+`vsql_mcp` é uma extensão em Rust que serve MCP pelo transporte Streamable HTTP (revisão da especificação `2025-06-18`) a partir de um worker em segundo plano dentro do processo do servidor. Ela expõe sete ferramentas: `list_schemas`, `list_tables`, `describe_table`, `query`, `explain`, `write` e `ddl`. As ferramentas `write` e `ddl` só aparecem depois que você as ativa, e as duas vêm desativadas por padrão.
 
 `vsql_mcp` é uma extensão Preview. Ela usa as capabilities Preview do VEF `thread_worker`, `sys_var` e `status_var`, então as extensões Preview precisam estar permitidas antes de você instalá-la. Inicie o servidor com `--vsql_allow_preview_extensions=ON`, ou execute isto, que tem efeito imediato:
 
@@ -182,7 +182,7 @@ curl -X POST http://127.0.0.1:3100/mcp \
 ]}}
 ```
 
-Cinco ferramentas são listadas, e não seis. `write` está ausente porque `allow_write` ainda está OFF, então um agente que se conecta agora nunca planeja em torno de uma ferramenta que não pode usar.
+Cinco ferramentas são listadas, e não sete. `write` e `ddl` estão ausentes porque `allow_write` e `allow_ddl` ainda estão OFF, então um agente que se conecta agora nunca planeja em torno de uma ferramenta que não pode usar.
 
 ## Chamando Ferramentas pelo MCP {#calling-tools-over-mcp}
 
@@ -318,6 +318,88 @@ REVOKE UPDATE ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
 SET GLOBAL vsql_mcp.allow_write = OFF;
 ```
 
+## A Ferramenta ddl {#the-ddl-tool}
+
+`ddl` também vem desativada por padrão. Ela executa uma única instrução `CREATE TABLE`, `CREATE TEMPORARY TABLE`, `ALTER TABLE`, `DROP TABLE`, `RENAME TABLE`, `CREATE INDEX` ou `DROP INDEX`, então um agente pode alterar o esquema do banco de dados exposto sem um cliente MySQL separado. Ative-a e conceda a `mcp_user` os privilégios de que a instrução precisa:
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = ON;
+GRANT CREATE, ALTER, DROP, INDEX ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+`ddl` agora aparece em `tools/list`, da mesma forma que `write` acima. Execute um `ALTER TABLE` por ela:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN summary VARCHAR(500)"}}}'
+```
+
+```json
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"{\"affected_rows\":0}","type":"text"}],"isError":false}}
+```
+
+```sql
+DESCRIBE mcp_guide.posts;
+```
+
+```
++---------+--------------+------+-----+---------+----------------+
+| Field   | Type         | Null | Key | Default | Extra          |
++---------+--------------+------+-----+---------+----------------+
+| id      | int          | NO   | PRI | NULL    | auto_increment |
+| title   | varchar(200) | NO   |     | NULL    |                |
+| author  | varchar(100) | NO   |     | NULL    |                |
+| views   | int          | NO   |     | 0       |                |
+| summary | varchar(500) | YES  |     | NULL    |                |
++---------+--------------+------+-----+---------+----------------+
+```
+
+`ddl` aceita somente essas formas no nível de tabela e de índice; qualquer outra instrução é recusada, inclusive uma que remove um banco de dados inteiro:
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"DROP DATABASE mcp_guide"}}}'
+```
+
+```json
+{"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool accepts a single CREATE, ALTER, DROP or RENAME TABLE, or CREATE or DROP INDEX statement","type":"text"}],"isError":true}}
+```
+
+`ddl` e `allowed_tables` não funcionam juntos. `ddl` é listada em `tools/list` somente enquanto `allowed_tables` está vazio, porque a lista de permissões funciona planejando uma instrução com `EXPLAIN`, que não consegue planejar DDL. Definir `allowed_tables` enquanto `allow_ddl` ainda está ON remove `ddl` de `tools/list`, e uma chamada direta a ela é recusada:
+
+```sql
+SET GLOBAL vsql_mcp.allowed_tables = 'posts';
+```
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN x INT"}}}'
+```
+
+```json
+{"id":7,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool cannot be used while vsql_mcp.allowed_tables is set, because the allowlist cannot check a DDL statement","type":"text"}],"isError":true}}
+```
+
+Este guia desativa `allow_ddl` de novo, limpa `allowed_tables` outra vez e revoga as concessões de DDL antes de continuar:
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = OFF;
+SET GLOBAL vsql_mcp.allowed_tables = '';
+REVOKE CREATE, ALTER, DROP, INDEX ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
+```
+
 ## Restringindo o que um Agente Pode Alcançar {#narrowing-what-an-agent-can-reach}
 
 Duas configurações restringem o alcance de um agente para além das concessões da conta sozinhas, úteis quando uma conta serve a mais do que o `vsql_mcp`.
@@ -366,7 +448,7 @@ Não. O agente se autentica no `vsql_mcp` com o token bearer definido em `vsql_m
 
 #### Posso expor mais de um esquema? {#can-i-expose-more-than-one-schema}
 
-Sim, mas deixar `vsql_mcp.schema` vazio expõe todo esquema que a conta de `db_url` consegue ver. `list_schemas` consulta `information_schema.SCHEMATA` pela mesma conexão de loopback que toda outra ferramenta, então as próprias regras de privilégio do MySQL decidem o que volta: uma conta com concessão em apenas um banco de dados vê esse banco de dados mais os esquemas que o MySQL sempre mostra, como `information_schema`, e não vê `mysql` nem `sys`. Restringir `vsql_mcp.schema` a um esquema continua sendo a forma mais simples de limitar a descoberta a exatamente um banco de dados, e um esquema que `list_schemas` mostra é um que a conta de fato consegue ler, já que a mesma conexão serve às duas coisas.
+Sim, mas deixar `vsql_mcp.schema` vazio expõe todo esquema que `information_schema.SCHEMATA` nomeia para a conta de `db_url`. `list_schemas` consulta essa view pela mesma conexão de loopback que toda outra ferramenta, então as próprias regras de privilégio do MySQL decidem o que volta: uma conta com concessão em apenas um banco de dados vê esse banco de dados mais os esquemas que o MySQL sempre nomeia ali, como `information_schema` e `performance_schema`, e não vê `mysql` nem `sys`. O fato de `SCHEMATA` nomear um esquema não significa que a conta consegue ler as tabelas dele — `performance_schema` aparece para uma conta sem nenhuma concessão nele, e a maioria das suas tabelas continua recusada. Restringir `vsql_mcp.schema` a um esquema continua sendo a forma mais simples de limitar a descoberta a exatamente um banco de dados que você pretende que um agente leia.
 
 #### O vsql_mcp suporta TLS? {#does-vsql_mcp-support-tls}
 
@@ -375,6 +457,10 @@ Não. O listener serve apenas HTTP puro, em `127.0.0.1`. Coloque um proxy revers
 #### Por que mudar a porta não tem efeito imediato? {#why-does-changing-the-port-not-take-effect-immediately}
 
 Uma configuração de porta tem efeito na próxima vez que o servidor é ativado. Alterne `vsql_mcp.vsql_mcp_enabled` para OFF e depois para ON depois de mudá-la.
+
+#### Outras extensões podem adicionar as suas próprias ferramentas MCP? {#can-other-extensions-add-their-own-mcp-tools}
+
+Sim. Qualquer extensão instalada pode registrar uma função `mcp_tools()` que declara as suas próprias ferramentas, e o `vsql_mcp` lista cada uma em `tools/list` como `<extension>__<name>`; uma chamada a ela executa a função handler da própria extensão pela conexão de `db_url`. Essas ferramentas de extensão precisam de `vsql_mcp.db_url` definido, assim como toda outra ferramenta — enquanto ele não está definido, nenhuma ferramenta de extensão é listada. O README do repositório `vsql-mcp` percorre um exemplo completo, uma extensão `vsql_greet` que adiciona uma ferramenta dessa forma.
 
 ## Solução de Problemas {#troubleshooting}
 

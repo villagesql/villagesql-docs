@@ -13,7 +13,7 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 
 ## vsql_mcp 做什么 {#what-vsql_mcp-does}
 
-`vsql_mcp` 是一个 Rust 扩展，从服务器进程内的后台工作线程通过 Streamable HTTP 传输（规范修订版 `2025-06-18`）提供 MCP 服务。它暴露六个工具：`list_schemas`、`list_tables`、`describe_table`、`query`、`explain` 和 `write`。`write` 工具只有在您启用它之后才会出现，它默认是禁用的。
+`vsql_mcp` 是一个 Rust 扩展，从服务器进程内的后台工作线程通过 Streamable HTTP 传输（规范修订版 `2025-06-18`）提供 MCP 服务。它暴露七个工具：`list_schemas`、`list_tables`、`describe_table`、`query`、`explain`、`write` 和 `ddl`。`write` 和 `ddl` 工具只有在您启用它们之后才会出现，两者默认都是禁用的。
 
 `vsql_mcp` 是预览扩展。它使用 VEF 预览能力 `thread_worker`、`sys_var` 和 `status_var`，所以在安装它之前必须允许预览扩展。使用 `--vsql_allow_preview_extensions=ON` 启动服务器，或者运行以下语句，它会立即生效：
 
@@ -182,7 +182,7 @@ curl -X POST http://127.0.0.1:3100/mcp \
 ]}}
 ```
 
-列出的是五个工具，而不是六个。`write` 不在其中，因为 `allow_write` 仍然是 OFF，所以此刻连接的代理不会围绕一个它无法使用的工具来做计划。
+列出的是五个工具，而不是七个。`write` 和 `ddl` 都不在其中，因为 `allow_write` 和 `allow_ddl` 仍然是 OFF，所以此刻连接的代理不会围绕一个它无法使用的工具来做计划。
 
 ## 通过 MCP 调用工具 {#calling-tools-over-mcp}
 
@@ -318,6 +318,88 @@ REVOKE UPDATE ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
 SET GLOBAL vsql_mcp.allow_write = OFF;
 ```
 
+## ddl 工具 {#the-ddl-tool}
+
+`ddl` 默认也是禁用的。它运行单条 `CREATE TABLE`、`CREATE TEMPORARY TABLE`、`ALTER TABLE`、`DROP TABLE`、`RENAME TABLE`、`CREATE INDEX` 或 `DROP INDEX` 语句，所以代理无需另外的 MySQL 客户端就能更改被暴露数据库的架构。启用它，并授予 `mcp_user` 该语句所需的权限：
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = ON;
+GRANT CREATE, ALTER, DROP, INDEX ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+`ddl` 现在出现在 `tools/list` 中，与上面的 `write` 一样。通过它运行一条 `ALTER TABLE`：
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN summary VARCHAR(500)"}}}'
+```
+
+```json
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"{\"affected_rows\":0}","type":"text"}],"isError":false}}
+```
+
+```sql
+DESCRIBE mcp_guide.posts;
+```
+
+```
++---------+--------------+------+-----+---------+----------------+
+| Field   | Type         | Null | Key | Default | Extra          |
++---------+--------------+------+-----+---------+----------------+
+| id      | int          | NO   | PRI | NULL    | auto_increment |
+| title   | varchar(200) | NO   |     | NULL    |                |
+| author  | varchar(100) | NO   |     | NULL    |                |
+| views   | int          | NO   |     | 0       |                |
+| summary | varchar(500) | YES  |     | NULL    |                |
++---------+--------------+------+-----+---------+----------------+
+```
+
+`ddl` 只接受这些表级和索引级的形式；其他所有语句都会被拒绝，包括删除整个数据库的语句：
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"DROP DATABASE mcp_guide"}}}'
+```
+
+```json
+{"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool accepts a single CREATE, ALTER, DROP or RENAME TABLE, or CREATE or DROP INDEX statement","type":"text"}],"isError":true}}
+```
+
+`ddl` 和 `allowed_tables` 不能一起使用。只有在 `allowed_tables` 为空时，`ddl` 才会列在 `tools/list` 中，因为允许列表的工作方式是用 `EXPLAIN` 为语句生成执行计划，而 `EXPLAIN` 无法为 DDL 生成执行计划。在 `allow_ddl` 仍为 ON 时设置 `allowed_tables` 会把 `ddl` 从 `tools/list` 中移除，直接调用它也会被拒绝：
+
+```sql
+SET GLOBAL vsql_mcp.allowed_tables = 'posts';
+```
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN x INT"}}}'
+```
+
+```json
+{"id":7,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool cannot be used while vsql_mcp.allowed_tables is set, because the allowlist cannot check a DDL statement","type":"text"}],"isError":true}}
+```
+
+本指南在继续之前把 `allow_ddl` 关回去，再次清空 `allowed_tables`，并撤销 DDL 授权：
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = OFF;
+SET GLOBAL vsql_mcp.allowed_tables = '';
+REVOKE CREATE, ALTER, DROP, INDEX ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
+```
+
 ## 缩小代理能触及的范围 {#narrowing-what-an-agent-can-reach}
 
 有两项设置能把代理的触及范围缩得比账户授权本身更小，当一个账户不只服务于 `vsql_mcp` 时很有用。
@@ -366,7 +448,7 @@ SET GLOBAL vsql_mcp.allowed_tables = 'posts';
 
 #### 我可以暴露多个架构吗？ {#can-i-expose-more-than-one-schema}
 
-可以，但把 `vsql_mcp.schema` 留空会暴露 `db_url` 账户能看到的每一个架构。`list_schemas` 通过与其他所有工具相同的回环连接查询 `information_schema.SCHEMATA`，所以返回什么由 MySQL 自身的权限规则决定：只在一个数据库上拥有授权的账户，只能看到该数据库，再加上 MySQL 始终展示的架构（例如 `information_schema`），而看不到 `mysql` 或 `sys`。把 `vsql_mcp.schema` 限定到一个架构仍然是把发现范围精确限制到一个数据库的最简单方法，而且由于同一个连接同时服务于这两者，`list_schemas` 展示的架构也就是该账户实际可读的架构。
+可以，但把 `vsql_mcp.schema` 留空会暴露 `information_schema.SCHEMATA` 为 `db_url` 账户列出的每一个架构。`list_schemas` 通过与其他所有工具相同的回环连接查询该视图，所以返回什么由 MySQL 自身的权限规则决定：只在一个数据库上拥有授权的账户，只能看到该数据库，再加上 MySQL 始终在其中列出的架构（例如 `information_schema` 和 `performance_schema`），而看不到 `mysql` 或 `sys`。`SCHEMATA` 列出某个架构，并不等于该账户能读取其中的表——`performance_schema` 会出现在对它没有任何授权的账户面前，而它的大多数表仍然会被拒绝。把 `vsql_mcp.schema` 限定到一个架构仍然是把发现范围精确限制到您打算让代理读取的那一个数据库的最简单方法。
 
 #### vsql_mcp 支持 TLS 吗？ {#does-vsql_mcp-support-tls}
 
@@ -375,6 +457,10 @@ SET GLOBAL vsql_mcp.allowed_tables = 'posts';
 #### 为什么更改端口不会立即生效？ {#why-does-changing-the-port-not-take-effect-immediately}
 
 端口设置在服务器下一次被启用时生效。更改它之后，请把 `vsql_mcp.vsql_mcp_enabled` 切换为 OFF 再切换为 ON。
+
+#### 其他扩展可以添加自己的 MCP 工具吗？ {#can-other-extensions-add-their-own-mcp-tools}
+
+可以。任何已安装的扩展都可以注册一个 `mcp_tools()` 函数来声明它自己的工具，`vsql_mcp` 会把每个工具以 `<extension>__<name>` 的形式列在 `tools/list` 中；对它的调用会通过 `db_url` 连接运行该扩展自己的处理函数。这些扩展工具与其他所有工具一样需要设置 `vsql_mcp.db_url`——在它未设置时，不会列出任何扩展工具。`vsql-mcp` 仓库的 README 完整演示了一个实际示例：一个以这种方式添加一个工具的 `vsql_greet` 扩展。
 
 ## 故障排除 {#troubleshooting}
 
