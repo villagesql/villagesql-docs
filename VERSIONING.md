@@ -116,10 +116,11 @@ A new page is translated in full.
 - **Mechanical check:**
   `python3 ~/scripts/check_translations.py --docs . --version stable --langs ja,ko,zh,pt-BR`.
   It exits 1 when it finds no pages.
-- **Review: Gemini (`agy`),** one call per changed page, comparing the
-  translation with English. A Fable helper per language then checks each
-  finding against English and applies the correct ones. English is the
-  authority, not the reviewer.
+- **Review: Gemini 4 Neon (`agy --model gemini-4-neon-high`),** one call per
+  changed page, comparing the translation with English. Name the model: the
+  default model stalled with no output on ja, ko, and zh pages. A Fable
+  helper per language then checks each finding against English and applies
+  the correct ones. English is the authority, not the reviewer.
 
 Then make the 9.7 server-page translations from the 8.4 ones, with no second
 translation run:
