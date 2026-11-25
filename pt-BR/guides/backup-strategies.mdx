@@ -62,14 +62,14 @@ Para restaurar todos os bancos de dados: `mysql -u root -p < all_databases.sql`
 Os backups completos só protegem você até o momento do último backup. O log binário permite reproduzir cada mudança feita depois que o backup foi tirado.
 
 **Requisitos:**
-- Log binário habilitado (`log_bin = ON`)
+- Log binário habilitado (ativo por padrão no 8.4; `SHOW VARIABLES LIKE 'log_bin'` mostra `ON`)
 - `--source-data=2` usado ao tirar o backup (registra a posição inicial do binlog)
 
 **Fluxo de trabalho:**
 
 1. Restaure o backup completo:
 ```bash
-mysql -u root -p < myapp_backup.sql
+mysql -u root -p myapp < myapp_backup.sql
 ```
 
 2. Encontre a posição inicial do binlog no arquivo de dump:
@@ -138,8 +138,11 @@ Um cron job que executa um dump noturno é a configuração de produção mais c
 ```bash
 #!/bin/bash
 # mysql-backup.sh
+set -euo pipefail
+umask 077  # the dump holds account password hashes; keep it owner-only
 DATE=$(date +%Y-%m-%d)
 BACKUP_DIR=/backups/mysql
+mkdir -p "$BACKUP_DIR"
 
 mysqldump \
   --single-transaction \
@@ -152,7 +155,7 @@ mysqldump \
 find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
 ```
 
-O usuário de backup precisa apenas dos privilégios `SELECT`, `LOCK TABLES`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `RELOAD` e `PROCESS` — não de `ALL PRIVILEGES`. Sem `PROCESS`, o `mysqldump` ainda conclui, mas imprime um erro "Access denied ... PROCESS privilege" no stderr a cada execução enquanto tenta fazer o dump dos metadados de tablespace.
+O usuário de backup precisa apenas dos privilégios `SELECT`, `LOCK TABLES`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `RELOAD`, `PROCESS` e `REPLICATION CLIENT` — não de `ALL PRIVILEGES`. Sem `PROCESS`, o `mysqldump` ainda conclui, mas imprime um erro "Access denied ... PROCESS privilege" no stderr a cada execução enquanto tenta fazer o dump dos metadados de tablespace.
 
 ## Verificando Backups {#verifying-backups}
 
@@ -162,9 +165,9 @@ Um backup que você não testou não é um backup. Verifique regularmente:
 # Test restore to a separate instance
 mysql -u root -p --host=test-server < all_databases.sql
 
-# Quick sanity check — verify row counts
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+# Quick check — verify row counts
+mysql -u root -p --host=test-server -e "SELECT COUNT(*) FROM myapp.orders;"
+mysql -u root -p --host=production-server -e "SELECT COUNT(*) FROM myapp.orders;"
 ```
 
 Testes de restauração automatizados pelo menos uma vez por mês detectam corrupção, problemas de permissão e problemas de espaço em disco antes que eles tenham consequências.
@@ -173,7 +176,7 @@ Testes de restauração automatizados pelo menos uma vez por mês detectam corru
 
 #### `--single-transaction` funciona com todos os mecanismos de armazenamento? {#does---single-transaction-work-with-all-storage-engines}
 
-Não. `--single-transaction` usa um snapshot de leitura consistente, que só o InnoDB suporta. As tabelas MyISAM no mesmo banco de dados ainda são bloqueadas com `LOCK TABLES` durante o dump. Se você tem mecanismos mistos, `--single-transaction` sozinho não é suficiente para um dump totalmente consistente.
+Não. `--single-transaction` usa um snapshot de leitura consistente, que só o InnoDB suporta. As tabelas MyISAM no mesmo banco de dados não são bloqueadas e não fazem parte do snapshot, então suas linhas podem mudar durante o dump. Se você tem mecanismos mistos, `--single-transaction` sozinho não é suficiente para um dump totalmente consistente.
 
 #### Por quanto tempo devo reter os backups? {#how-long-should-i-retain-backups}
 
@@ -187,9 +190,9 @@ Somente se o servidor for desligado antes (cópia a frio). Um servidor MySQL em 
 
 | Problema | Solução |
 |:--------|:---------|
-| O `mysqldump` trava em tabelas grandes | Adicione `--quick` para transmitir as linhas uma de cada vez em vez de armazenar a tabela inteira em memória |
+| O `mysqldump` trava em tabelas grandes | O `mysqldump` já transmite as linhas uma de cada vez (`--quick` vem ativado por padrão). Procure com `SHOW PROCESSLIST` outra sessão que mantenha um bloqueio em uma tabela do dump, ou use `--single-transaction` |
 | A restauração falha com `ERROR 1824: Failed to open the referenced table` (ou `ERROR 1452` em uma linha) | O `mysqldump` já envolve sua saída em `SET FOREIGN_KEY_CHECKS=0` por padrão, então um dump completo restaurado como está não atinge esse erro. Ele aparece ao restaurar um dump editado à mão ou parcial (somente algumas tabelas extraídas, ou as linhas de verificação de FK removidas) — nesse caso, adicione `SET FOREIGN_KEY_CHECKS=0;` no início |
-| O arquivo de dump é grande demais | Use compressão: `mysqldump ... \| gzip > backup.sql.gz`; restaure com `zcat backup.sql.gz \| mysql ...` |
+| O arquivo de dump é grande demais | Use compressão: `mysqldump ... \| gzip > backup.sql.gz`; restaure com `gzip -dc backup.sql.gz \| mysql ...` |
 | A recuperação pontual deixou mudanças de fora | Os arquivos de log binário têm uma lacuna — confirme que todos os arquivos de log do intervalo foram reproduzidos em sequência |
 | O usuário de backup não consegue fazer dump dos triggers | Conceda o privilégio `TRIGGER`: `GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |
 

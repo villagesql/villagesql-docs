@@ -10,8 +10,9 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 <VillagesqlBanner />
 
 <Note>
-  本指南使用的是预览能力。请使用
-  `--vsql_allow_preview_extensions=ON` 启动服务器，否则 `INSTALL EXTENSION` 会被拒绝。
+  本指南使用的是预览能力。请先运行
+  `SET PERSIST vsql_allow_preview_extensions = ON`，或者使用
+  `--vsql_allow_preview_extensions=ON` 启动服务器；否则 `INSTALL EXTENSION` 会被拒绝。
 </Note>
 
 一旦已经有了身份提供方，数据库密码就变得难以管理。它们单独签发、单独轮换，并且在拿到密码的人离开之后依然存在。VillageSQL 的 `vsql_oauth2` 扩展让账户改用 JSON Web Token 登录：提供方签发令牌，服务器验证签名和过期时间，令牌中的一个声明指明账户。
@@ -53,12 +54,12 @@ GRANT SELECT ON shop.* TO 'analyst'@'%';
 
 ```sql
 CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
-CREATE USER 'alice@example.com';
+CREATE USER 'alice@example.com' ACCOUNT LOCK;
 GRANT SELECT ON shop.* TO 'alice@example.com';
 GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
 ```
 
-没有人直接以 `alice@example.com` 登录，所以它不需要自己的密码。运行着 `validate_password` 的服务器会拒绝创建没有密码的账户，并回应 `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`。在这种情况下，请给该账户一个没有人持有的密码，或者一个完全不允许登录的认证插件。
+`ACCOUNT LOCK` 阻止任何人直接以 `alice@example.com` 登录，而代理登录对被锁定的账户仍然有效。运行着 `validate_password` 的服务器会拒绝创建没有密码的账户，无论是否锁定，并回应 `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`。在这种情况下，请给该账户一个没有人持有的密码，或者一个完全不允许登录的认证插件。
 
 没有代理授权时，登录会被拒绝，并报 `ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing proxy privilege.`
 
@@ -148,11 +149,11 @@ FROM mysql.role_edges WHERE TO_USER = 'dana';
   `roles_filter`，并把这个声明视为您的提供方必须被信任才能设置的东西。
 </Warning>
 
-`auto_grant` 关闭时，同一个令牌仍能登录，角色会被跳过而不是授予，`CURRENT_ROLE()` 为 `NONE`。每个被跳过的角色都会写入错误日志：`VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`。`auto_create` 对账户的行为与之相同，它会在服务器从未见过的主体第一次登录时创建一个账户。两者默认都是关闭的，而且两者都把这台服务器的控制权交给了您的提供方。
+`auto_grant` 关闭时，账户尚未持有的角色会被跳过而不是授予；如果令牌声明的全是这样的角色，`CURRENT_ROLE()` 为 `NONE`。每个被跳过的角色都会写入错误日志：`VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`。`auto_create` 对账户的行为与之相同，它会在服务器从未见过的主体第一次登录时创建一个账户。两者默认都是关闭的，而且两者都把这台服务器的控制权交给了您的提供方。
 
 ## 被拒绝的令牌看起来像密码错误 {#a-rejected-token-looks-like-a-wrong-password}
 
-每一种失败都产生同一个错误，而且是那个普通的错误：
+每一种签名、过期、签发方和受众失败都产生同一个错误，而且是那个普通的错误：
 
 ```
 ERROR 1045 (28000): Access denied for user 'analyst'@'localhost' (using password: NO)
@@ -170,14 +171,15 @@ ERROR 1045 (28000): Access denied for user 'analyst'@'localhost' (using password
 解码载荷只需要一个 shell，不需要其他工具：
 
 ```bash
-echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null
+p=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')
+echo "$p$(printf '%*s' $(( (4 - ${#p} % 4) % 4 )) '' | tr ' ' '=')" | base64 -d
 ```
 
 ## 故障排除 {#troubleshooting}
 
 | 症状 | 修复 |
 |---|---|
-| 安装时报 `ERROR 3219 ... requires preview capabilities` | 使用 `--vsql_allow_preview_extensions=ON` 启动服务器 |
+| 安装时报 `ERROR 3219 ... requires preview capabilities` | 运行 `SET PERSIST vsql_allow_preview_extensions = ON`，然后重新安装 |
 | 每次尝试都报 `Access denied` | 逐一完成上面的四项检查。无论什么原因，消息都是一样的 |
 | 客户端从不发送令牌 | 传入 `--enable-cleartext-plugin`。其他客户端有各自启用 `mysql_clear_password` 的方式 |
 | 登录原本正常，然后一起失效 | 提供方轮换了密钥。检查 `jwks_url` 可以访问，并且令牌的 `kid` 出现在它返回的文档中 |

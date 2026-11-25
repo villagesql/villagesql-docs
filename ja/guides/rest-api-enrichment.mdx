@@ -43,7 +43,7 @@ WHERE tracking_number IS NOT NULL
 LIMIT 50;
 ```
 
-`shipping_status IS NULL` の行がなくなるまで、アプリケーションからこれをループで実行します。API のレート制限内に収まるよう、バッチで処理してください。
+アプリケーションからこれをループで実行します。`WHERE` 句に `AND id > <last_id>` を、`LIMIT` の前に `ORDER BY id` を追加して、各バッチが前のバッチで最後に試みた行の次から始まるようにします。リクエストが失敗した行は `shipping_status IS NULL` のままです。API のレート制限内に収まるよう、バッチで処理してください。
 
 バックフィル後、クエリは保存された列を参照し、クエリごとの API 呼び出しはありません。
 
@@ -85,34 +85,25 @@ API を呼び出す前に WHERE でフィルタリングし、本当に必要な
 ```sql
 -- Only enrich rows missing geocoordinates
 UPDATE locations
+JOIN (
+  SELECT id,
+         JSON_UNQUOTE(JSON_EXTRACT(
+           CONVERT(
+             vsql_http.http_get(
+               CONCAT('https://api.geocode.example.com/json?address=',
+                      vsql_http.url_encode(address))
+             ) USING utf8mb4
+           ),
+           '$.content'
+         )) AS body
+  FROM locations
+  WHERE lat IS NULL
+    AND address IS NOT NULL
+  LIMIT 25
+) AS r ON r.id = locations.id
 SET
-  lat = CAST(JSON_VALUE(
-    JSON_UNQUOTE(JSON_EXTRACT(
-      CONVERT(
-        vsql_http.http_get(
-          CONCAT('https://api.geocode.example.com/json?address=',
-                 vsql_http.url_encode(address))
-        ) USING utf8mb4
-      ),
-      '$.content'
-    )),
-    '$.lat'
-  ) AS DECIMAL(10,7)),
-  lng = CAST(JSON_VALUE(
-    JSON_UNQUOTE(JSON_EXTRACT(
-      CONVERT(
-        vsql_http.http_get(
-          CONCAT('https://api.geocode.example.com/json?address=',
-                 vsql_http.url_encode(address))
-        ) USING utf8mb4
-      ),
-      '$.content'
-    )),
-    '$.lng'
-  ) AS DECIMAL(10,7))
-WHERE lat IS NULL
-  AND address IS NOT NULL
-LIMIT 25;
+  locations.lat = CAST(JSON_VALUE(r.body, '$.lat') AS DECIMAL(10,7)),
+  locations.lng = CAST(JSON_VALUE(r.body, '$.lng') AS DECIMAL(10,7));
 ```
 
 住所を `url_encode()` で包んでいる点に注意してください。ユーザーデータを URL に埋め込む前には、必ずエンコードします。
@@ -136,7 +127,7 @@ SELECT
   END AS result;
 ```
 
-一括 UPDATE のループでは、NULL または 200 以外のレスポンスを受け取った行は列の値が NULL のままになるため、UPDATE を再実行して失敗した行を再試行できます。
+一括 UPDATE のループでは、リクエストが失敗した行（NULL）や、ボディに `status` フィールドがない行は列の値が NULL のままになるため、UPDATE を再実行して再試行できます。上の UPDATE はレスポンスボディから `status` を読み取り、HTTP ステータスコードは検査しないため、ボディに `status` フィールドがある 200 以外のレスポンスは保存されます。
 
 ## パフォーマンスに関する考慮事項 {#performance-considerations}
 

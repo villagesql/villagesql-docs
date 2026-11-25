@@ -16,7 +16,7 @@ FastAPI の非同期リクエスト処理が効果を発揮するのは、その
 SQLAlchemy 2.0 は、2 つの非同期 MySQL ドライバ、`asyncmy` と `aiomysql` のダイアレクトを同梱しています。どちらか一方が公式の推奨として文書化されているわけではありません。`asyncmy` は Cython で書かれたコンパイル済みのドライバで、現行の Python バージョン向けにビルド済みの wheel を提供しています。このガイドでそれを使うのはそのためです。
 
 ```bash
-pip install "sqlalchemy[asyncio]" asyncmy cryptography
+pip install "sqlalchemy[asyncio]>=2.0,<2.1" asyncmy cryptography
 ```
 
 `sqlalchemy[asyncio]` ではなく素の `sqlalchemy` をインストールするのが、最初の本当の罠です。SQLAlchemy の非同期 ORM 層は `greenlet` ライブラリで非同期コードと同期コードをつないでおり、それは基本パッケージの依存関係ではありません。`[asyncio]` エクストラを省略すると、非同期エンジンに初めて触れたときに次のエラーが出ます。
@@ -45,7 +45,7 @@ CREATE USER IF NOT EXISTS 'fastapi_app'@'127.0.0.1' IDENTIFIED BY 'fastapi_pw_12
 GRANT ALL PRIVILEGES ON fastapi_guide.* TO 'fastapi_app'@'127.0.0.1';
 ```
 
-ユーザーのスコープは `localhost` ではなく `127.0.0.1` です。このガイドの接続文字列は TCP で `127.0.0.1` に接続するため、権限付与はそのホストに一致しなければなりません。Unix ソケット接続は、アカウントの IP ベースの権限付与に関係なく、代わりに `localhost` に対して照合されます。
+ユーザーのスコープは `127.0.0.1` で、このガイドの接続文字列が使う TCP 接続に一致します。Unix ソケット接続は代わりに `localhost` に対して照合されるため、このアカウントはソケット経由ではログインできません。
 
 ## プロジェクトのレイアウト {#project-layout}
 
@@ -69,7 +69,7 @@ fastapi-sqlalchemy-mysql/
 ```
 fastapi
 uvicorn[standard]
-sqlalchemy[asyncio]>=2.0
+sqlalchemy[asyncio]>=2.0,<2.1
 asyncmy
 cryptography
 alembic
@@ -190,7 +190,7 @@ INFO  [alembic.runtime.migration] Running upgrade  -> 4f5ba2a8774a, create posts
 実際のサーバーに対して直接確認します。
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SHOW TABLES;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "SHOW TABLES;"
 ```
 
 ```
@@ -200,7 +200,7 @@ posts
 ```
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "DESCRIBE posts;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "DESCRIBE posts;"
 ```
 
 ```
@@ -235,7 +235,7 @@ class PostRead(BaseModel):
     created_at: datetime.datetime
 ```
 
-`from_attributes=True` により、`PostRead` は辞書ではなく `Post` ORM インスタンスから直接レスポンスを構築できます。
+`from_attributes=True` により、`PostRead.model_validate()` は辞書ではなく `Post` ORM インスタンスを読み取れます。
 
 ## FastAPI のルート {#the-fastapi-routes}
 
@@ -268,7 +268,7 @@ async def create_post(payload: PostCreate, session: AsyncSession = Depends(get_s
     return post
 ```
 
-リクエスト間で共有されるグローバルなセッションは、並行負荷のもとで、やがて同じ接続に順序の乱れたクエリが交互に届く事態を招きます。`Depends()` を通じてリクエストごとに作成されるセッションはそれを回避します。各リクエストが独自のセッションと、プールから取り出した独自の接続を得るためです。
+リクエスト間で共有されるグローバルなセッションは、すべてのリクエストを 1 つのトランザクションに入れるため、あるリクエストのロールバックが別のリクエストの書き込みを黙って破棄します。`Depends()` を通じてリクエストごとに作成されるセッションはそれを回避します。各リクエストが独自のセッションと、プールから取り出した独自の接続を得るためです。
 
 ## 実行と確認 {#running-and-verifying}
 
@@ -309,7 +309,7 @@ HTTP 201 ステータスとともに返ります。もう一度一覧すると�
 データベースを直接クエリすると、API のレスポンスだけでなく、書き込みが実際に届いたことを確認できます。
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SELECT * FROM posts;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "SELECT * FROM posts;"
 ```
 
 ```
@@ -340,9 +340,8 @@ id  title             body                                       created_at
 | `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` | ORM の属性が `await` された呼び出しの外で読まれました。通常は、セッションがコミット時にオブジェクトを期限切れにしたためです。セッションファクトリに `expire_on_commit=False` を設定します |
 | `sqlalchemy.orm.exc.DetachedInstanceError` | 属性が読まれる前に、オブジェクトのセッションがすでに閉じていました。`expire_on_commit=False` を維持するか、リクエストが終わる前に必要なすべての属性を読みます |
 | `alembic init -t async <path>` の後、`alembic.ini` が誤ったディレクトリに現れる | `alembic init` をプロジェクトディレクトリの中から実行します。ini ファイルはパス引数ではなく、現在の作業ディレクトリに従います |
-| `alembic revision --autogenerate` が空のマイグレーションを生成する | `alembic/env.py` の `target_metadata` がまだ `None` であるか、モデルがインポートされていないため `Base.metadata` に登録されていません |
-| `Access denied for user 'fastapi_app'@'127.0.0.1'` | ユーザーが `localhost` などの別のホスト向けに作成されています。このガイドの接続文字列は TCP で `127.0.0.1` に接続するため、権限付与はそのホストに一致しなければなりません |
-| FastAPI のレスポンスに、モデルにあるフィールドが欠けている | `PostRead` が辞書ではなく ORM オブジェクトから読み取るには、`model_config = ConfigDict(from_attributes=True)` が必要です |
+| `alembic revision --autogenerate` が空のマイグレーションを生成する | `alembic/env.py` でモデルがインポートされていないため、`Base.metadata` に登録されていません |
+| `Access denied for user 'fastapi_app'@'localhost'` | クライアントのホストに対するアカウントが存在しないか、パスワードが間違っています。このガイドは `'fastapi_app'@'127.0.0.1'` を作成するため、`DATABASE_URL` のパスワードを使って TCP で `127.0.0.1` に接続します |
 
 ## 関連項目 {#see-also}
 

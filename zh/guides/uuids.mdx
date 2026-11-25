@@ -17,7 +17,7 @@ MySQL 内置的 `UUID()` 函数返回一个 v1 UUID，形式为 36 个字符的�
 
 - 相同的数据占用 36 字节而不是 16 字节
 - 字符串比较比二进制比较慢
-- 随机 UUID 在每次插入时都会导致 B 树页分裂（下文详述）
+- 随机 UUID 会在整个索引中导致 B 树页分裂（下文详述）
 
 ```sql
 -- This works but has problems at scale
@@ -51,11 +51,11 @@ SELECT BIN_TO_UUID(order_id), user_id FROM orders;
 
 MySQL 的 InnoDB 使用聚簇索引，这意味着行按主键顺序物理存储。当您插入一个带有随机 UUID 的行时，InnoDB 必须找到它在索引中间的位置，并可能分裂一个页来腾出空间。在持续负载下，这会导致写放大和索引碎片化。
 
-UUID v7 通过在标识符的高位嵌入 Unix 时间戳来解决这个问题。新的 UUID 总是大于现有的 UUID，因此插入总是追加到索引最右边的叶子——不会分裂。
+UUID v7 通过在标识符的高位嵌入 Unix 时间戳来解决这个问题。新的 UUID 大于此前任何一个毫秒生成的所有 UUID，因此插入会追加到索引最右边的叶子。
 
 ## 使用 VillageSQL：原生 UUID 类型和所有版本 {#with-villagesql-native-uuid-type-and-all-versions}
 
-VillageSQL 的 `vsql_uuid` 扩展增加了一个原生 `UUID` 列类型，采用 16 字节二进制存储且无需手动转换，并提供了 UUID v1 到 v7 的生成函数。
+VillageSQL 的 `vsql_uuid` 扩展增加了一个原生 `UUID` 列类型，采用 16 字节二进制存储且无需手动转换，并提供了 UUID v1、v3、v4、v5、v6 和 v7 的生成函数。
 
 ```sql
 INSTALL EXTENSION vsql_uuid;
@@ -69,11 +69,11 @@ CREATE TABLE orders (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- UUID_V7 inserts always append to the index — no page splits
+-- UUID_V7 values sort by creation millisecond, so inserts append to the index
 INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 101);
 INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 102);
 
--- Sorts chronologically by creation order
+-- Sorts by creation millisecond
 SELECT user_id, created_at FROM orders ORDER BY order_id;
 
 -- Inspect the timestamp embedded in a v7 UUID (as datetime or Unix epoch)
@@ -105,7 +105,7 @@ SELECT UUID_V5(UUID_NS_DNS(), 'example.com');
 
 ### 验证来自数据库外部的 UUID {#validating-uuids-from-outside-the-database}
 
-当字符串会被 `UUID` 列接受时，`UUID_IS_VALID(string)` 返回 1，否则返回 0。无论传入什么，它都不会引发错误，因此可以在值到达类型化列之前对其进行筛查：
+当字符串会被 `UUID` 列接受时，`UUID_IS_VALID(string)` 返回 1，不会被接受时返回 0，参数为 NULL 时返回 NULL。对于文本参数，它不会引发错误，因此可以在值到达类型化列之前对其进行筛查：
 
 ```sql
 SELECT UUID_IS_VALID('550e8400-e29b-41d4-a716-446655440000');  -- 1
@@ -138,7 +138,7 @@ CREATE TABLE audit_log (
 | **泄露行数** | 是 | 否 |
 | **存储** | 4–8 字节 | 16 字节 |
 | **插入性能** | 快（总是追加） | v7 快，v4 慢 |
-| **人类可读** | 是 | 否（二进制） |
+| **人类可读** | 是 | 原生类型：是。BINARY(16)：否 |
 | **合并安全** | 否 | 是 |
 
 对于大多数单数据库应用程序，`AUTO_INCREMENT` 就足够了。当您需要跨系统的全局唯一 ID、合并来自多个来源的数据，或者不想暴露顺序行数时，再选择 UUID。
@@ -146,7 +146,7 @@ CREATE TABLE audit_log (
 ## 常见问题 {#frequently-asked-questions}
 
 #### 我可以把 UUID_V7 用作 DEFAULT 吗？ {#can-i-use-uuid_v7-as-a-default}
-目前不行。在 MySQL 中，非确定性函数不能用于 DEFAULT 表达式。请在 INSERT 语句中生成 UUID。
+不行。`UUID_V7()` 在 `DEFAULT` 表达式中会被拒绝并报 `ERROR 3770`。请在 INSERT 语句中生成 UUID。
 
 #### 我可以用 UUID 回填现有行吗？ {#can-i-backfill-existing-rows-with-uuids}
 可以。添加一个 `UUID` 列，用 UPDATE 中的 `UUID_V7()` 填充它，然后将其设为主键。
@@ -160,7 +160,7 @@ CREATE TABLE audit_log (
 |:---|:---|
 | `FUNCTION <database>.UUID_V7 does not exist` | 运行 `INSTALL EXTENSION vsql_uuid` |
 | `DEFAULT (UUID_V7())` 被拒绝 | 去掉 `DEFAULT`；在每条 INSERT 中调用 `UUID_V7()` |
-| `Extension 'vsql_uuid' is already installed` | 已经安装——无需操作 |
+| `Extension 'vsql_uuid' is already installed` | 该扩展已经安装——无需操作 |
 
 ## 另请参阅 {#see-also}
 

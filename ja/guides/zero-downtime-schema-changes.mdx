@@ -53,14 +53,14 @@ trx_query: ALTER TABLE orders ADD INDEX idx_status (status), ALGORITHM=INPLACE, 
 上の `ALTER` がまだ `altering table` 状態にある間に開いて実行した 3 つ目の接続から、同じテーブルに対する `INSERT` と `SELECT` はどちらもすぐに完了しました。
 
 ```sql
-INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
-VALUES (999999, 'pending', 500, NOW(), 0, 0);
+INSERT INTO orders (customer_id, status, amount_cents, created_at)
+VALUES (999999, 'pending', 500, NOW());
 -- 0.009s
 SELECT COUNT(*) FROM orders WHERE status='paid';
 -- 0.271s
 ```
 
-どちらのステートメントも `ALTER` の完了を待ちませんでした。これこそが `LOCK=NONE` の要点です。テーブルの再構築は、並行する変更を取り込む InnoDB のオンライン DDL ログを使ってバックグラウンドで行われ、テーブルに対する DML は、再構築が追いついて入れ替わるまで、元のデータ構造に対して進みます。
+どちらのステートメントも `ALTER` の完了を待ちませんでした。これこそが `LOCK=NONE` の要点です。インデックスの構築は、並行する変更を取り込む InnoDB のオンライン DDL ログを使ってバックグラウンドで行われ、テーブルに対する DML は、構築が追いついてコミットされるまで進みます。
 
 ## ALGORITHM=INSTANT と ALGORITHM=INPLACE {#algorithminstant-vs-algorithminplace}
 
@@ -71,14 +71,14 @@ ALTER TABLE orders ADD COLUMN priority TINYINT NOT NULL DEFAULT 0, ALGORITHM=INS
 -- 0.011s
 ```
 
-同じ形の変更、つまりデフォルト値付きの列の追加を、代わりに `ALGORITHM=INPLACE` で強制すると次のようになります。
+同じ形の変更、つまり定数のデフォルト値を持つ `NOT NULL` 列の追加を、代わりに `ALGORITHM=INPLACE` で強制すると次のようになります。
 
 ```sql
 ALTER TABLE orders ADD COLUMN priority2 TINYINT NOT NULL DEFAULT 0, ALGORITHM=INPLACE, LOCK=NONE;
--- 0.244s
+-- 2.890s
 ```
 
-この 327 万行のテーブルでは、機能的に同じ列の追加に対して、`INSTANT` は `INPLACE` のおよそ 20 倍速くなりました。`INPLACE` はテーブルのデータディクショナリのエントリに触れ、並行する DML と調整する必要があります。`INSTANT` はどちらもしません。その差はテーブルサイズとともに広がります。`INSTANT` は行数に関係なく一定のままですが、`INPLACE` はそれに比例します。
+この 327 万行のテーブルでは、機能的に同じ列の追加に対して、`INSTANT` は `INPLACE` よりはるかに速くなりました。`INPLACE` はテーブルを再構築しますが、`INSTANT` はメタデータを変更するだけです。その差はテーブルサイズとともに広がります。`INSTANT` は行数に関係なく一定のままですが、`INPLACE` はそれに比例します。
 
 `INSTANT` はすべての操作に使えるわけではありません。`BLOB`/`TEXT` のデフォルト値を持つ列の追加や、既存の列の型の変更は、`INPLACE` または `COPY` にフォールバックします。テーブルの途中を含む任意の位置への列の追加も `INSTANT` を使います(MySQL 8.0.29 以降)。
 
@@ -100,7 +100,7 @@ ERROR 1846 (0A000) at line 2: ALGORITHM=INPLACE is not supported. Reason: Cannot
 ERROR 1846 (0A000) at line 2: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table to change column type. Try ALGORITHM=COPY/INPLACE.
 ```
 
-このステートメントに対して MySQL が受け入れる唯一のアルゴリズムは `COPY` で、これはテーブル全体を再構築し、その間、排他ロックを取得します。同じテーブルに対してそれを実行し、再構築中に 2 つ目の接続から行を挿入すると、違いが直接示されます。
+このステートメントに対して MySQL が受け入れる唯一のアルゴリズムは `COPY` で、これはテーブル全体を再構築し、その間、書き込みをブロックします。同じテーブルに対してそれを実行し、再構築中に 2 つ目の接続から行を挿入すると、違いが直接示されます。
 
 ```sql
 ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=COPY;
@@ -147,7 +147,7 @@ ERROR 3780 (HY000) at line 2: Referencing column 'order_id' and referenced colum
 
 上の `MODIFY COLUMN ... ALGORITHM=COPY` のケースが、オンライン DDL が役に立たないケースです。全行の書き換えが必要ですが、稼働中のテーブルでその間ずっとロックを保持したくはありません。`gh-ost` は、新しいスキーマを持つテーブルのコピー(「ゴースト」テーブル)を作り、既存の行をバックグラウンドでそこにコピーしながら、トリガーを使う代わりにバイナリログをストリーミングして、コピー中に元のテーブルに行われたすべての書き込みを再生することで、これを処理します。最後に短いアトミックなリネームでカットオーバーします。
 
-`gh-ost` は、別のテーブルが外部キーで参照しているテーブルの移行を拒否します。前のセクションの `order_items` テーブルは `FOREIGN KEY (order_id) REFERENCES orders(id)` を持っており、その制約を残したまま `orders` に対して `gh-ost` を実行すると、`FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out` ですぐに失敗します。他のテーブルが参照しているテーブルに対して `gh-ost` を実行する前に、その外部キーを先に削除してください(または `--discard-foreign-keys` を渡します。これは外部キーを代わりに削除し、再作成はしません)。
+`gh-ost` は、別のテーブルが外部キーで参照しているテーブルの移行を拒否します。前のセクションの `order_items` テーブルは `FOREIGN KEY (order_id) REFERENCES orders(id)` を持っており、その制約を残したまま `orders` に対して `gh-ost` を実行すると、`FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out` ですぐに失敗します。他のテーブルが参照しているテーブルに対して `gh-ost` を実行する前に、その外部キーを先に削除してください。
 
 これをインストールし、`order_items` の外部キーを削除した状態で、まさにこの種の変更のために、同じ 3,276,802 行のテーブルに対して実行しました。
 
@@ -218,7 +218,7 @@ Copy: 1812000/3276803 55.3%; Applied: 1; Backlog: 1/1000; Time: 7s(total), 7s(co
 |:---|:---|
 | `ERROR 1846: ALGORITHM=INPLACE is not supported` | その操作には完全な書き換えが必要。メンテナンスウィンドウで `ALGORITHM=COPY` を使うか、稼働中のテーブルでは `gh-ost`/`pt-online-schema-change` を使う。 |
 | `ERROR 1846: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table...` | その変更はメタデータだけでは済まない。まず `ALGORITHM=INPLACE, LOCK=NONE` を試し、それも失敗したら `COPY` にフォールバックする。 |
-| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | 参照している外部キーを先に削除し、インデックスを変更し、その後で外部キーを再作成する。 |
+| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | 参照している外部キーを先に削除し、インデックスを変更し、その後で外部キーを再作成する。参照される列には引き続き独自のユニークキーが必要で、それがないと外部キーの再作成は `ERROR 6125: Failed to add the foreign key constraint. Missing unique key for constraint` で失敗する。 |
 | `ERROR 3780: Referencing column ... and referenced column ... are incompatible` | 外部キーの子と親の列は型の互換性を保つ必要がある。両側を一緒に変更するか、移行の間だけ外部キーを削除する。 |
 | `COPY` アルゴリズムの `ALTER` が終わりの見えないまま書き込み側を止めている | `SHOW PROCESSLIST` でその状態を、`information_schema.INNODB_TRX` で実行時間を確認する。待ちきれないなら、kill して `gh-ost` に切り替える。 |
 | `gh-ost` が起動を拒否する | `binlog_format=ROW` であることと、対象テーブルに主キーまたは一意キーがあることを確認する。どちらも必須。 |

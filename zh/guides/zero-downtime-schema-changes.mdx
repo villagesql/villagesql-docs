@@ -53,14 +53,14 @@ trx_query: ALTER TABLE orders ADD INDEX idx_status (status), ALGORITHM=INPLACE, 
 在上面的 `ALTER` 仍处于 `altering table` 状态时打开第三个连接，从中针对同一张表运行的 `INSERT` 和 `SELECT` 都立即完成：
 
 ```sql
-INSERT INTO orders (customer_id, status, amount_cents, created_at, priority, priority2)
-VALUES (999999, 'pending', 500, NOW(), 0, 0);
+INSERT INTO orders (customer_id, status, amount_cents, created_at)
+VALUES (999999, 'pending', 500, NOW());
 -- 0.009s
 SELECT COUNT(*) FROM orders WHERE status='paid';
 -- 0.271s
 ```
 
-两条语句都没有等待 `ALTER` 完成。这正是 `LOCK=NONE` 的全部意义：表重建在后台进行，使用 InnoDB 的在线 DDL 日志捕获并发变更，针对该表的 DML 继续在原有的数据结构上执行，直到重建追上进度并完成切换。
+两条语句都没有等待 `ALTER` 完成。这正是 `LOCK=NONE` 的全部意义：索引构建在后台进行，使用 InnoDB 的在线 DDL 日志捕获并发变更，针对该表的 DML 继续执行，直到构建追上进度并提交。
 
 ## ALGORITHM=INSTANT 与 ALGORITHM=INPLACE {#algorithminstant-vs-algorithminplace}
 
@@ -71,14 +71,14 @@ ALTER TABLE orders ADD COLUMN priority TINYINT NOT NULL DEFAULT 0, ALGORITHM=INS
 -- 0.011s
 ```
 
-把同样形态的变更——添加一个带默认值的可空列——改为强制通过 `ALGORITHM=INPLACE` 执行：
+把同样形态的变更——添加一个带常量默认值的 `NOT NULL` 列——改为强制通过 `ALGORITHM=INPLACE` 执行：
 
 ```sql
 ALTER TABLE orders ADD COLUMN priority2 TINYINT NOT NULL DEFAULT 0, ALGORITHM=INPLACE, LOCK=NONE;
--- 0.244s
+-- 2.890s
 ```
 
-在这张 327 万行的表上，对于功能上相同的列添加，`INSTANT` 比 `INPLACE` 快了大约 20 倍。`INPLACE` 仍然需要触及表的数据字典条目，并与任何并发 DML 协调；`INSTANT` 两者都不需要。这个差距随表的大小而增长：`INSTANT` 的耗时与行数无关，保持恒定，而 `INPLACE` 随行数增长。
+在这张 327 万行的表上，对于功能上相同的列添加，`INSTANT` 比 `INPLACE` 快得多。`INPLACE` 会重建表，而 `INSTANT` 只更改元数据。这个差距随表的大小而增长：`INSTANT` 的耗时与行数无关，保持恒定，而 `INPLACE` 随行数增长。
 
 `INSTANT` 并非对每个操作都可用。添加带 `BLOB`/`TEXT` 默认值的列，或更改现有列的类型，会回退到 `INPLACE` 或 `COPY`。在任意位置（包括表的中间）添加列也使用 `INSTANT`（MySQL 8.0.29+）。
 
@@ -100,7 +100,7 @@ ERROR 1846 (0A000) at line 2: ALGORITHM=INPLACE is not supported. Reason: Cannot
 ERROR 1846 (0A000) at line 2: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table to change column type. Try ALGORITHM=COPY/INPLACE.
 ```
 
-MySQL 对这条语句唯一接受的算法是 `COPY`，它会重建整张表，并在整个过程中持有排他锁。针对同一张表运行它，并在重建期间从第二个连接插入一行，直接展示了这种差别：
+MySQL 对这条语句唯一接受的算法是 `COPY`，它会重建整张表，并在整个过程中阻塞写入。针对同一张表运行它，并在重建期间从第二个连接插入一行，直接展示了这种差别：
 
 ```sql
 ALTER TABLE orders MODIFY COLUMN amount_cents BIGINT NOT NULL, ALGORITHM=COPY;
@@ -147,7 +147,7 @@ ERROR 3780 (HY000) at line 2: Referencing column 'order_id' and referenced colum
 
 上面的 `MODIFY COLUMN ... ALGORITHM=COPY` 就是在线 DDL 无能为力的情形：它需要完整的行重写，但您不想在线上表上持锁这么久。`gh-ost` 的处理方式是：用新模式构建该表的一个副本（"ghost" 表），然后在后台把现有行复制进去，同时通过流式读取二进制日志（而不是使用触发器）来重放复制期间对原表的每一次写入。最后用一次短暂的原子重命名完成切换。
 
-`gh-ost` 拒绝迁移被其他表以外键引用的表：上一节中的 `order_items` 表有一个 `FOREIGN KEY (order_id) REFERENCES orders(id)`，在该约束仍然存在的情况下针对 `orders` 运行 `gh-ost` 会立即失败，并报 `FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out`。在针对被其他表引用的表运行 `gh-ost` 之前，请先删除该外键（或传入 `--discard-foreign-keys`，它会替您删除外键且不会重新创建）。
+`gh-ost` 拒绝迁移被其他表以外键引用的表：上一节中的 `order_items` 表有一个 `FOREIGN KEY (order_id) REFERENCES orders(id)`，在该约束仍然存在的情况下针对 `orders` 运行 `gh-ost` 会立即失败，并报 `FATAL found 1 parent-side foreign keys on ... orders. Parent-side foreign keys are not supported. Bailing out`。在针对被其他表引用的表运行 `gh-ost` 之前，请先删除该外键。
 
 在删除了 `order_items` 的外键之后，正是为了这类变更，针对同一张 3,276,802 行的表安装并运行了 `gh-ost`：
 
@@ -218,7 +218,7 @@ Copy: 1812000/3276803 55.3%; Applied: 1; Backlog: 1/1000; Time: 7s(total), 7s(co
 |:---|:---|
 | `ERROR 1846: ALGORITHM=INPLACE is not supported` | 该操作需要完整重写。在维护窗口中使用 `ALGORITHM=COPY`，或在线上表上使用 `gh-ost`/`pt-online-schema-change`。 |
 | `ERROR 1846: ALGORITHM=INSTANT is not supported. Reason: Need to rebuild the table...` | 该变更不是纯元数据变更。先尝试 `ALGORITHM=INPLACE, LOCK=NONE`，如果也失败，再回退到 `COPY`。 |
-| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | 先删除引用它的外键，完成索引变更，然后重新创建外键。 |
+| `ERROR 1553: Cannot drop index 'PRIMARY': needed in a foreign key constraint` | 先删除引用它的外键，完成索引变更，然后重新创建外键。被引用的列仍然需要有自己的唯一键，否则重新创建外键会失败并报 `ERROR 6125: Failed to add the foreign key constraint. Missing unique key for constraint`。 |
 | `ERROR 3780: Referencing column ... and referenced column ... are incompatible` | 外键中的子表列和父表列必须保持类型兼容。同时更改两边，或在迁移期间删除外键。 |
 | 一个 `COPY` 算法的 `ALTER` 一直阻塞着写入者，看不到尽头 | 在 `SHOW PROCESSLIST` 中查看它的状态，在 `information_schema.INNODB_TRX` 中查看它已运行多久。如果无法接受等它结束，就终止它并改用 `gh-ost`。 |
 | `gh-ost` 拒绝启动 | 确认 `binlog_format=ROW`，并且目标表有主键或唯一键；两者都是必需的。 |

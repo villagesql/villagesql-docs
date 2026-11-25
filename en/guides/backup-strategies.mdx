@@ -62,14 +62,14 @@ To restore all databases: `mysql -u root -p < all_databases.sql`
 Full backups only protect you to the point of the last backup. Binary logging lets you replay every change made after the backup was taken.
 
 **Requirements:**
-- Binary logging enabled (`log_bin = ON`)
+- Binary logging enabled (on by default in 8.4; `SHOW VARIABLES LIKE 'log_bin'` shows `ON`)
 - `--source-data=2` used when taking the backup (records the starting binlog position)
 
 **Workflow:**
 
 1. Restore the full backup:
 ```bash
-mysql -u root -p < myapp_backup.sql
+mysql -u root -p myapp < myapp_backup.sql
 ```
 
 2. Find the binlog starting position from the dump file:
@@ -138,8 +138,11 @@ A cron job running a nightly dump is the most common production setup:
 ```bash
 #!/bin/bash
 # mysql-backup.sh
+set -euo pipefail
+umask 077  # the dump holds account password hashes; keep it owner-only
 DATE=$(date +%Y-%m-%d)
 BACKUP_DIR=/backups/mysql
+mkdir -p "$BACKUP_DIR"
 
 mysqldump \
   --single-transaction \
@@ -152,7 +155,7 @@ mysqldump \
 find "$BACKUP_DIR" -name "*.sql.gz" -mtime +14 -delete
 ```
 
-The backup user needs only `SELECT`, `LOCK TABLES`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `RELOAD`, and `PROCESS` privileges — not `ALL PRIVILEGES`. Without `PROCESS`, `mysqldump` still completes but prints an "Access denied ... PROCESS privilege" error to stderr for every run while it tries to dump tablespace metadata.
+The backup user needs only `SELECT`, `LOCK TABLES`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `RELOAD`, `PROCESS`, and `REPLICATION CLIENT` privileges — not `ALL PRIVILEGES`. Without `PROCESS`, `mysqldump` still completes but prints an "Access denied ... PROCESS privilege" error to stderr for every run while it tries to dump tablespace metadata.
 
 ## Verifying Backups
 
@@ -162,9 +165,9 @@ A backup you haven't tested is not a backup. Verify regularly:
 # Test restore to a separate instance
 mysql -u root -p --host=test-server < all_databases.sql
 
-# Quick sanity check — verify row counts
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" test-server
-mysql -u root -p -e "SELECT COUNT(*) FROM myapp.orders;" production-server
+# Quick check — verify row counts
+mysql -u root -p --host=test-server -e "SELECT COUNT(*) FROM myapp.orders;"
+mysql -u root -p --host=production-server -e "SELECT COUNT(*) FROM myapp.orders;"
 ```
 
 Automated restore testing at least monthly catches corruption, permission issues, and disk space problems before they matter.
@@ -173,7 +176,7 @@ Automated restore testing at least monthly catches corruption, permission issues
 
 #### Does `--single-transaction` work with all storage engines?
 
-No. `--single-transaction` uses a consistent read snapshot, which only InnoDB supports. MyISAM tables in the same database are still locked with `LOCK TABLES` during the dump. If you have mixed engines, `--single-transaction` alone isn't sufficient for a fully consistent dump.
+No. `--single-transaction` uses a consistent read snapshot, which only InnoDB supports. MyISAM tables in the same database are not locked and are not part of the snapshot, so their rows can change during the dump. If you have mixed engines, `--single-transaction` alone isn't sufficient for a fully consistent dump.
 
 #### How long should I retain backups?
 
@@ -187,9 +190,9 @@ Only if the server is shut down first (cold copy). A running MySQL server writes
 
 | Problem | Solution |
 |:--------|:---------|
-| `mysqldump` hangs on large tables | Add `--quick` to stream rows one at a time instead of buffering the whole table in memory |
+| `mysqldump` hangs on large tables | `mysqldump` already streams rows one at a time (`--quick` is on by default). Look for another session holding a lock on a dumped table with `SHOW PROCESSLIST`, or use `--single-transaction` |
 | Restore fails with `ERROR 1824: Failed to open the referenced table` (or `ERROR 1452` on a row) | `mysqldump` already wraps its output in `SET FOREIGN_KEY_CHECKS=0` by default, so a full dump restored as-is won't hit this. It shows up when restoring a hand-edited or partial dump (only some tables extracted, or the FK-check lines removed) — add `SET FOREIGN_KEY_CHECKS=0;` at the top in that case |
-| Dump file is too large | Use compression: `mysqldump ... \| gzip > backup.sql.gz`; restore with `zcat backup.sql.gz \| mysql ...` |
+| Dump file is too large | Use compression: `mysqldump ... \| gzip > backup.sql.gz`; restore with `gzip -dc backup.sql.gz \| mysql ...` |
 | Point-in-time recovery missed changes | Binary log files have a gap — confirm all log files in the range were replayed in sequence |
 | Backup user can't dump triggers | Grant `TRIGGER` privilege: `GRANT TRIGGER ON myapp.* TO 'backup_user'@'localhost'` |
 

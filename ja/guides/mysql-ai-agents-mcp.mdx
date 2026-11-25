@@ -13,12 +13,12 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 
 ## vsql_mcp の機能 {#what-vsql_mcp-does}
 
-`vsql_mcp` は Rust 製の拡張機能で、サーバープロセス内のバックグラウンドワーカーから、Streamable HTTP トランスポート（仕様リビジョン `2025-06-18`）で MCP を提供します。6 つのツールを公開します: `list_schemas`、`list_tables`、`describe_table`、`query`、`explain`、および `write` です。`write` ツールは有効にした場合にだけ現れ、デフォルトでは無効です。
+`vsql_mcp` は Rust 製の拡張機能で、サーバープロセス内のバックグラウンドワーカーから、Streamable HTTP トランスポート（仕様リビジョン `2025-06-18`）で MCP を提供します。7 つのツールを公開します: `list_schemas`、`list_tables`、`describe_table`、`query`、`explain`、`write`、および `ddl` です。`write` ツールと `ddl` ツールは有効にした場合にだけ現れ、どちらもデフォルトでは無効です。
 
-`vsql_mcp` はプレビュー拡張機能です。VEF のプレビュー機能である `thread_worker`、`sys_var`、および `status_var` を使うため、サーバーはプレビュー拡張機能を許可して起動する必要があります。
+`vsql_mcp` はプレビュー拡張機能です。VEF のプレビュー機能である `thread_worker`、`sys_var`、および `status_var` を使うため、インストールする前にプレビュー拡張機能を許可する必要があります。サーバーを `--vsql_allow_preview_extensions=ON` で起動するか、次を実行します。これは直ちに有効になります。
 
-```bash
-mysqld --vsql_allow_preview_extensions=ON ...
+```sql
+SET PERSIST vsql_allow_preview_extensions = ON;
 ```
 
 インストールの前にフラグを確認します。
@@ -135,7 +135,7 @@ curl -i -X POST http://127.0.0.1:3100/mcp \
 HTTP/1.1 200 OK
 Mcp-Session-Id: f5330e8b88f9c5ffed95fdfdc2b42606
 
-{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.10"}}}
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vsql_mcp","version":"0.0.11"}}}
 ```
 
 この接続での以降のすべてのリクエストには、このセッション ID が必要です。省略すると、黙ってデフォルトになるのではなく、JSON-RPC エラーで失敗します。
@@ -182,7 +182,7 @@ curl -X POST http://127.0.0.1:3100/mcp \
 ]}}
 ```
 
-一覧にあるのは 6 つではなく 5 つのツールです。`allow_write` がまだ OFF なので `write` はなく、今接続するエージェントは、使えないツールを前提に計画を立てることがありません。
+一覧にあるのは 7 つではなく 5 つのツールです。`allow_write` と `allow_ddl` がまだ OFF なので `write` と `ddl` はどちらもなく、今接続するエージェントは、使えないツールを前提に計画を立てることがありません。
 
 ## MCP 経由でのツールの呼び出し {#calling-tools-over-mcp}
 
@@ -218,7 +218,7 @@ curl -X POST http://127.0.0.1:3100/mcp \
 
 これは `posts` テーブルの実際のサンプルデータで、直接の SQL 接続ではなく MCP プロトコルを通して返されたものです。
 
-`query` は単一の読み取り専用ステートメントしか受け付けません。それ以外は、データベースに届く前に拒否されます。
+`query` は単一の読み取り専用ステートメントしか受け付けません。それ以外は拒否されます。
 
 ```bash
 curl -X POST http://127.0.0.1:3100/mcp \
@@ -318,6 +318,88 @@ REVOKE UPDATE ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
 SET GLOBAL vsql_mcp.allow_write = OFF;
 ```
 
+## ddl ツール {#the-ddl-tool}
+
+`ddl` もデフォルトでは無効です。このツールは `CREATE TABLE`、`CREATE TEMPORARY TABLE`、`ALTER TABLE`、`DROP TABLE`、`RENAME TABLE`、`CREATE INDEX`、または `DROP INDEX` のステートメントを 1 つ実行するため、エージェントは別の MySQL クライアントなしで、公開されたデータベースのスキーマを変更できます。これを有効にし、ステートメントに必要な権限を `mcp_user` に付与します。
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = ON;
+GRANT CREATE, ALTER, DROP, INDEX ON mcp_guide.* TO 'mcp_user'@'127.0.0.1';
+```
+
+これで、上の `write` と同じように、`ddl` が `tools/list` に現れます。これを通じて `ALTER TABLE` を 1 つ実行します。
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN summary VARCHAR(500)"}}}'
+```
+
+```json
+{"id":4,"jsonrpc":"2.0","result":{"content":[{"text":"{\"affected_rows\":0}","type":"text"}],"isError":false}}
+```
+
+```sql
+DESCRIBE mcp_guide.posts;
+```
+
+```
++---------+--------------+------+-----+---------+----------------+
+| Field   | Type         | Null | Key | Default | Extra          |
++---------+--------------+------+-----+---------+----------------+
+| id      | int          | NO   | PRI | NULL    | auto_increment |
+| title   | varchar(200) | NO   |     | NULL    |                |
+| author  | varchar(100) | NO   |     | NULL    |                |
+| views   | int          | NO   |     | 0       |                |
+| summary | varchar(500) | YES  |     | NULL    |                |
++---------+--------------+------+-----+---------+----------------+
+```
+
+`ddl` が受け付けるのは、これらのテーブルレベルとインデックスレベルの形式だけです。データベース全体を削除するステートメントを含め、それ以外のステートメントはすべて拒否されます。
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"DROP DATABASE mcp_guide"}}}'
+```
+
+```json
+{"id":5,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool accepts a single CREATE, ALTER, DROP or RENAME TABLE, or CREATE or DROP INDEX statement","type":"text"}],"isError":true}}
+```
+
+`ddl` と `allowed_tables` は併用できません。`ddl` が `tools/list` に表示されるのは、`allowed_tables` が空の間だけです。許可リストはステートメントを `EXPLAIN` でプランニングすることで機能しますが、`EXPLAIN` は DDL をプランニングできないためです。`allow_ddl` が ON のまま `allowed_tables` を設定すると、`ddl` は `tools/list` から消え、直接呼び出しても拒否されます。
+
+```sql
+SET GLOBAL vsql_mcp.allowed_tables = 'posts';
+```
+
+```bash
+curl -X POST http://127.0.0.1:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer a-long-random-token" \
+  -H "Mcp-Session-Id: 206c4b9eb22d816f1a30e1a3b4d2c82f" \
+  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"ddl","arguments":{"sql":"ALTER TABLE mcp_guide.posts ADD COLUMN x INT"}}}'
+```
+
+```json
+{"id":7,"jsonrpc":"2.0","result":{"content":[{"text":"the ddl tool cannot be used while vsql_mcp.allowed_tables is set, because the allowlist cannot check a DDL statement","type":"text"}],"isError":true}}
+```
+
+このガイドでは、先に進む前に `allow_ddl` をオフに戻し、`allowed_tables` を再び空にして、DDL の権限を取り消します。
+
+```sql
+SET GLOBAL vsql_mcp.allow_ddl = OFF;
+SET GLOBAL vsql_mcp.allowed_tables = '';
+REVOKE CREATE, ALTER, DROP, INDEX ON mcp_guide.* FROM 'mcp_user'@'127.0.0.1';
+```
+
 ## エージェントの到達範囲を絞る {#narrowing-what-an-agent-can-reach}
 
 2 つの設定が、アカウントの権限だけよりもさらにエージェントの到達範囲を絞ります。1 つのアカウントが `vsql_mcp` 以外にも使われている場合に役立ちます。
@@ -362,11 +444,11 @@ SET GLOBAL vsql_mcp.allowed_tables = 'posts';
 
 #### エージェントはデータベースの認証情報に直接アクセスする必要がありますか? {#does-an-agent-need-direct-access-to-the-database-credentials}
 
-いいえ。エージェントは、`vsql_mcp.bearer_token` に設定したベアラートークンで `vsql_mcp` に対して認証します。`vsql_mcp.db_url` が指定するデータベースアカウントは、拡張機能がツールのクエリを実行するために内部でだけ使われます。エージェントがそのアカウントのパスワードを見ることはありません。
+いいえ。エージェントは、`vsql_mcp.bearer_token` に設定したベアラートークンで `vsql_mcp` に対して認証し、拡張機能は `vsql_mcp.db_url` が指定するアカウントとしてツールのクエリを実行します。それでも、エージェントはそのアカウントのパスワードを読み取れます。すべてのアカウントは、`query` ツール経由も含め、`SHOW VARIABLES` で `db_url` を読み取れるためです。そのアカウントには、エージェントに許可する操作だけを付与してください。
 
 #### 複数のスキーマを公開できますか? {#can-i-expose-more-than-one-schema}
 
-はい。ただし、`vsql_mcp.schema` を空のままにすると、`db_url` のアカウントが見えるすべてのスキーマが公開されます。`list_schemas` は、他のすべてのツールと同じループバック接続経由で `information_schema.SCHEMATA` に問い合わせるため、何が返ってくるかは MySQL 自身の権限ルールが決めます。1 つのデータベースにしか権限を持たないアカウントには、そのデータベースと、`information_schema` のように MySQL が常に示すスキーマだけが見え、`mysql` や `sys` は見えません。`vsql_mcp.schema` を 1 つのスキーマに絞ることは、依然として発見の範囲をちょうど 1 つのデータベースに限定する最も簡単な方法であり、`list_schemas` が示すスキーマは、同じ接続が両方に使われるため、アカウントが実際に読めるスキーマでもあります。
+はい。ただし、`vsql_mcp.schema` を空のままにすると、`information_schema.SCHEMATA` が `db_url` のアカウントに示すすべてのスキーマが公開されます。`list_schemas` は、他のすべてのツールと同じループバック接続経由でそのビューに問い合わせるため、何が返ってくるかは MySQL 自身の権限ルールが決めます。1 つのデータベースにしか権限を持たないアカウントには、そのデータベースと、`information_schema` や `performance_schema` のように MySQL がそこに常に示すスキーマだけが見え、`mysql` や `sys` は見えません。`SCHEMATA` がスキーマの名前を示すことは、アカウントがそのスキーマのテーブルを読めることと同じではありません。`performance_schema` は、それに対する権限を持たないアカウントにも現れますが、そのテーブルのほとんどは拒否されたままです。`vsql_mcp.schema` を 1 つのスキーマに絞ることは、依然として、発見の範囲をエージェントに読ませるつもりのちょうど 1 つのデータベースに限定する最も簡単な方法です。
 
 #### vsql_mcp は TLS をサポートしていますか? {#does-vsql_mcp-support-tls}
 
@@ -375,6 +457,10 @@ SET GLOBAL vsql_mcp.allowed_tables = 'posts';
 #### ポートの変更がすぐに反映されないのはなぜですか? {#why-does-changing-the-port-not-take-effect-immediately}
 
 ポートの設定は、次にサーバーを有効にしたときに反映されます。変更した後、`vsql_mcp.vsql_mcp_enabled` を OFF にしてから ON に切り替えてください。
+
+#### 他の拡張機能が独自の MCP ツールを追加できますか? {#can-other-extensions-add-their-own-mcp-tools}
+
+はい。インストール済みのどの拡張機能も、独自のツールを宣言する `mcp_tools()` 関数を登録できます。`vsql_mcp` はそれぞれを `<extension>__<name>` として `tools/list` に表示し、その呼び出しは、`db_url` の接続上で拡張機能自身のハンドラ関数を実行します。これらの拡張機能ツールには、他のすべてのツールと同じく `vsql_mcp.db_url` の設定が必要です。設定されていない間は、拡張機能ツールは表示されません。`vsql-mcp` リポジトリの README では、この方法でツールを 1 つ追加する `vsql_greet` 拡張機能という完全な実例を順を追って説明しています。
 
 ## トラブルシューティング {#troubleshooting}
 

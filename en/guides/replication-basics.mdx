@@ -28,6 +28,8 @@ This is asynchronous by default — the source doesn't wait for replicas to conf
 server_id = 1
 log_bin = /var/log/mysql/mysql-bin
 binlog_format = ROW
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 Create a replication user:
@@ -49,6 +51,8 @@ mysqldump --single-transaction --source-data=1 --all-databases \
 ```ini
 [mysqld]
 server_id = 2
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 Restore the snapshot and start replication:
@@ -62,12 +66,13 @@ CHANGE REPLICATION SOURCE TO
     SOURCE_HOST = '192.168.1.10',
     SOURCE_USER = 'repl',
     SOURCE_PASSWORD = 'repl_password',
+    SOURCE_SSL = 1,
     SOURCE_AUTO_POSITION = 1;
 
 START REPLICA;
 ```
 
-`SOURCE_AUTO_POSITION = 1` enables GTID-based replication. If you're not using GTIDs, specify `SOURCE_LOG_FILE` and `SOURCE_LOG_POS` instead (values from the snapshot file header).
+`SOURCE_AUTO_POSITION = 1` uses GTID-based replication, which needs `gtid_mode = ON` and `enforce_gtid_consistency = ON` on both servers. If you're not using GTIDs, specify `SOURCE_LOG_FILE` and `SOURCE_LOG_POS` instead (values from the snapshot file header).
 
 ## GTID Replication
 
@@ -108,8 +113,9 @@ Replication lag happens when the replica's SQL thread can't keep up with the sou
 - **Applier parallelism**: MySQL 8.4 already applies events in parallel by default — `replica_parallel_workers` is 4 and `replica_parallel_type` is `LOGICAL_CLOCK`. Raise the worker count if the replica still falls behind:
 
 ```sql
-SET GLOBAL replica_parallel_workers = 4;
-SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+STOP REPLICA SQL_THREAD;
+SET GLOBAL replica_parallel_workers = 8;
+START REPLICA SQL_THREAD;
 ```
 
 - **Long-running queries on the replica**: queries that lock rows block the SQL thread.
@@ -123,7 +129,7 @@ The default setup — one source, one or more async replicas — isn't the only 
 | Architecture | Consistency guarantee | Failover | Write overhead | Complexity |
 |:-------------|:---------------------|:---------|:--------------|:-----------|
 | **Async replication** (default) | None — replica may lag arbitrarily | Manual; some transactions may be lost | Minimal — source doesn't wait | Low |
-| **Semi-sync replication** | At least one replica has received the event before the source commits | Manual; at most one transaction lost | ~1 RTT added to each write | Low–Medium |
+| **Semi-sync replication** | At least one replica has received the event before the source commits (until `rpl_semi_sync_source_timeout`, 10 s by default, expires with no acknowledgement) | Manual; at most one transaction lost | ~1 RTT added to each write | Low–Medium |
 | **Group Replication** | All members agree before commit (multi-primary or single-primary) | Automatic within the group | Higher — consensus round per transaction | High |
 | **InnoDB Cluster** | Same as Group Replication (built on it) | Automatic with MySQL Router for client failover | Same as Group Replication | High |
 
@@ -199,7 +205,7 @@ In asynchronous replication (the default), the source commits without waiting fo
 
 | Problem | Solution |
 |:--------|:---------|
-| `Replica_IO_Running: No` | Check `Last_IO_Error` — typically a connection or auth failure; verify SOURCE_HOST, user, password, and REPLICATION SLAVE grant |
+| `Replica_IO_Running: Connecting` or `No` | Check `Last_IO_Error` — typically a connection or auth failure; verify SOURCE_HOST, user, password, the REPLICATION SLAVE grant, and `SOURCE_SSL = 1` for a `caching_sha2_password` account |
 | `Replica_SQL_Running: No` | Check `Last_SQL_Error` — usually a data conflict; decide whether to skip the event or fix the root cause |
 | Replication lag growing | Raise `replica_parallel_workers` above its default of 4; check for long-running queries on the replica blocking the applier |
 | `ERROR 1062: Duplicate entry` on replica | Replica has a row the source doesn't — indicates manual writes to the replica; use `replica_skip_errors` cautiously or resync |

@@ -28,6 +28,8 @@ MySQL 복제는 한 서버(소스)의 변경을 하나 이상의 서버(복제�
 server_id = 1
 log_bin = /var/log/mysql/mysql-bin
 binlog_format = ROW
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 복제 사용자를 만듭니다:
@@ -49,6 +51,8 @@ mysqldump --single-transaction --source-data=1 --all-databases \
 ```ini
 [mysqld]
 server_id = 2
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 스냅샷을 복원하고 복제를 시작합니다:
@@ -62,12 +66,13 @@ CHANGE REPLICATION SOURCE TO
     SOURCE_HOST = '192.168.1.10',
     SOURCE_USER = 'repl',
     SOURCE_PASSWORD = 'repl_password',
+    SOURCE_SSL = 1,
     SOURCE_AUTO_POSITION = 1;
 
 START REPLICA;
 ```
 
-`SOURCE_AUTO_POSITION = 1`은 GTID 기반 복제를 활성화합니다. GTID를 사용하지 않는다면 대신 `SOURCE_LOG_FILE`과 `SOURCE_LOG_POS`를 지정하세요(값은 스냅샷 파일 헤더에 있습니다).
+`SOURCE_AUTO_POSITION = 1`은 GTID 기반 복제를 사용하며, 두 서버 모두에 `gtid_mode = ON`과 `enforce_gtid_consistency = ON`이 필요합니다. GTID를 사용하지 않는다면 대신 `SOURCE_LOG_FILE`과 `SOURCE_LOG_POS`를 지정하세요(값은 스냅샷 파일 헤더에 있습니다).
 
 ## GTID 복제 {#gtid-replication}
 
@@ -108,8 +113,9 @@ SHOW REPLICA STATUS\G
 - **적용기 병렬성**: MySQL 8.4는 이미 기본적으로 이벤트를 병렬로 적용합니다 — `replica_parallel_workers`는 4이고 `replica_parallel_type`은 `LOGICAL_CLOCK`입니다. 복제본이 여전히 뒤처지면 워커 수를 올리세요:
 
 ```sql
-SET GLOBAL replica_parallel_workers = 4;
-SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+STOP REPLICA SQL_THREAD;
+SET GLOBAL replica_parallel_workers = 8;
+START REPLICA SQL_THREAD;
 ```
 
 - **복제본에서 오래 실행되는 쿼리**: 행을 잠그는 쿼리가 SQL 스레드를 막습니다.
@@ -123,7 +129,7 @@ SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
 | 아키텍처 | 일관성 보장 | 장애 조치 | 쓰기 오버헤드 | 복잡도 |
 |:-------------|:---------------------|:---------|:--------------|:-----------|
 | **비동기 복제**(기본값) | 없음 — 복제본이 임의로 뒤처질 수 있음 | 수동; 일부 트랜잭션이 손실될 수 있음 | 최소 — 소스가 기다리지 않음 | 낮음 |
-| **반동기 복제** | 소스가 커밋하기 전에 최소 한 복제본이 이벤트를 수신 | 수동; 최대 한 트랜잭션 손실 | 각 쓰기에 ~1 RTT 추가 | 낮음–중간 |
+| **반동기 복제** | 소스가 커밋하기 전에 최소 한 복제본이 이벤트를 수신(확인 응답 없이 `rpl_semi_sync_source_timeout`, 기본 10초가 만료될 때까지) | 수동; 최대 한 트랜잭션 손실 | 각 쓰기에 ~1 RTT 추가 | 낮음–중간 |
 | **그룹 복제** | 커밋 전에 모든 멤버가 합의(다중 프라이머리 또는 단일 프라이머리) | 그룹 안에서 자동 | 더 높음 — 트랜잭션마다 합의 라운드 | 높음 |
 | **InnoDB Cluster** | 그룹 복제와 동일(그 위에 구축) | 클라이언트 장애 조치를 위한 MySQL Router와 함께 자동 | 그룹 복제와 동일 | 높음 |
 
@@ -199,7 +205,7 @@ MySQL은 오래된 소스에서 새로운 복제본으로의 복제를 지원하
 
 | 문제 | 해결 방법 |
 |:--------|:---------|
-| `Replica_IO_Running: No` | `Last_IO_Error` 확인 — 보통 연결 또는 인증 실패; SOURCE_HOST, 사용자, 비밀번호, REPLICATION SLAVE 권한을 확인 |
+| `Replica_IO_Running: Connecting` 또는 `No` | `Last_IO_Error` 확인 — 보통 연결 또는 인증 실패; SOURCE_HOST, 사용자, 비밀번호, REPLICATION SLAVE 권한, 그리고 `caching_sha2_password` 계정의 경우 `SOURCE_SSL = 1`을 확인 |
 | `Replica_SQL_Running: No` | `Last_SQL_Error` 확인 — 보통 데이터 충돌; 이벤트를 건너뛸지 근본 원인을 고칠지 결정 |
 | 복제 지연이 커짐 | `replica_parallel_workers`를 기본값 4보다 올림; 복제본에서 적용기를 막는 오래 실행되는 쿼리를 확인 |
 | 복제본에서 `ERROR 1062: Duplicate entry` | 복제본에 소스에 없는 행이 있음 — 복제본에 대한 수동 쓰기를 뜻함; `replica_skip_errors`를 신중하게 사용하거나 재동기화 |

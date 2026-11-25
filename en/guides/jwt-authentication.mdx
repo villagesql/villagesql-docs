@@ -10,8 +10,9 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 <VillagesqlBanner />
 
 <Note>
-  This guide uses a preview capability. Start the server with
-  `--vsql_allow_preview_extensions=ON`, or `INSTALL EXTENSION` is refused.
+  This guide uses a preview capability. Run
+  `SET PERSIST vsql_allow_preview_extensions = ON` first, or start the server with
+  `--vsql_allow_preview_extensions=ON`; otherwise `INSTALL EXTENSION` is refused.
 </Note>
 
 Database passwords are awkward to manage once an identity provider already exists. They are issued separately, rotated separately, and they outlive the person who was given one. VillageSQL's `vsql_oauth2` extension lets an account sign in with a JSON Web Token instead: the provider issues it, the server verifies the signature and the expiry, and a claim inside the token names the account.
@@ -53,12 +54,12 @@ The session runs as the account the token names, not as the account that connect
 
 ```sql
 CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
-CREATE USER 'alice@example.com';
+CREATE USER 'alice@example.com' ACCOUNT LOCK;
 GRANT SELECT ON shop.* TO 'alice@example.com';
 GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
 ```
 
-Nobody signs in as `alice@example.com` directly, so it needs no password of its own. A server running `validate_password` refuses to create an account without one, answering `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`. Where that applies, give the account a password nobody holds, or an authentication plugin that permits no login at all.
+`ACCOUNT LOCK` stops anyone signing in as `alice@example.com` directly, and the proxy login still works for a locked account. A server running `validate_password` refuses to create an account without a password, locked or not, answering `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`. Where that applies, give the account a password nobody holds, or an authentication plugin that permits no login at all.
 
 Without the proxy grant the login is refused with `ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing proxy privilege.`
 
@@ -149,11 +150,11 @@ FROM mysql.role_edges WHERE TO_USER = 'dana';
   provider must be trusted to set.
 </Warning>
 
-With `auto_grant` off, the same token logs in, the role is skipped rather than granted, and `CURRENT_ROLE()` is `NONE`. Each skipped role is written to the error log: `VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`. `auto_create` behaves the same way for accounts, creating one at first login for a subject the server has never seen. Both are off by default, and both hand your provider authority over this server.
+With `auto_grant` off, a role that the account does not already hold is skipped rather than granted, and `CURRENT_ROLE()` is `NONE` for a token that claims only such roles. Each skipped role is written to the error log: `VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`. `auto_create` behaves the same way for accounts, creating one at first login for a subject the server has never seen. Both are off by default, and both hand your provider authority over this server.
 
 ## A rejected token looks like a wrong password
 
-Every failure produces one error, and it is the ordinary one:
+Every signature, expiry, issuer, and audience failure produces one error, and it is the ordinary one:
 
 ```
 ERROR 1045 (28000): Access denied for user 'analyst'@'localhost' (using password: NO)
@@ -171,14 +172,15 @@ So debug from the token rather than from the error. Decode it and check four thi
 Decoding the payload needs no tools beyond a shell:
 
 ```bash
-echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null
+p=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')
+echo "$p$(printf '%*s' $(( (4 - ${#p} % 4) % 4 )) '' | tr ' ' '=')" | base64 -d
 ```
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `ERROR 3219 ... requires preview capabilities` on install | Start the server with `--vsql_allow_preview_extensions=ON` |
+| `ERROR 3219 ... requires preview capabilities` on install | Run `SET PERSIST vsql_allow_preview_extensions = ON`, then install again |
 | `Access denied` on every attempt | Work through the four checks above. The message is the same for every cause |
 | The client never sends the token | Pass `--enable-cleartext-plugin`. Other clients have their own opt-in for `mysql_clear_password` |
 | Logins worked, then stopped together | The provider rotated its keys. Check `jwks_url` is reachable and that the token's `kid` appears in the document it returns |

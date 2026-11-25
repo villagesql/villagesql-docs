@@ -28,6 +28,8 @@ Isso é assíncrono por padrão — a origem não espera as réplicas confirmare
 server_id = 1
 log_bin = /var/log/mysql/mysql-bin
 binlog_format = ROW
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 Crie um usuário de replicação:
@@ -49,6 +51,8 @@ mysqldump --single-transaction --source-data=1 --all-databases \
 ```ini
 [mysqld]
 server_id = 2
+gtid_mode = ON
+enforce_gtid_consistency = ON
 ```
 
 Restaure o snapshot e inicie a replicação:
@@ -62,12 +66,13 @@ CHANGE REPLICATION SOURCE TO
     SOURCE_HOST = '192.168.1.10',
     SOURCE_USER = 'repl',
     SOURCE_PASSWORD = 'repl_password',
+    SOURCE_SSL = 1,
     SOURCE_AUTO_POSITION = 1;
 
 START REPLICA;
 ```
 
-`SOURCE_AUTO_POSITION = 1` habilita a replicação baseada em GTID. Se você não usa GTIDs, especifique `SOURCE_LOG_FILE` e `SOURCE_LOG_POS` em vez disso (valores do cabeçalho do arquivo de snapshot).
+`SOURCE_AUTO_POSITION = 1` usa a replicação baseada em GTID, que precisa de `gtid_mode = ON` e `enforce_gtid_consistency = ON` nos dois servidores. Se você não usa GTIDs, especifique `SOURCE_LOG_FILE` e `SOURCE_LOG_POS` em vez disso (valores do cabeçalho do arquivo de snapshot).
 
 ## Replicação com GTID {#gtid-replication}
 
@@ -108,8 +113,9 @@ O atraso de replicação acontece quando a thread SQL da réplica não consegue 
 - **Paralelismo do aplicador**: o MySQL 8.4 já aplica eventos em paralelo por padrão — `replica_parallel_workers` é 4 e `replica_parallel_type` é `LOGICAL_CLOCK`. Aumente a contagem de workers se a réplica ainda ficar para trás:
 
 ```sql
-SET GLOBAL replica_parallel_workers = 4;
-SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';
+STOP REPLICA SQL_THREAD;
+SET GLOBAL replica_parallel_workers = 8;
+START REPLICA SQL_THREAD;
 ```
 
 - **Consultas de longa duração na réplica**: consultas que bloqueiam linhas bloqueiam a thread SQL.
@@ -123,7 +129,7 @@ A configuração padrão — uma origem, uma ou mais réplicas assíncronas — 
 | Arquitetura | Garantia de consistência | Failover | Sobrecarga de gravação | Complexidade |
 |:-------------|:---------------------|:---------|:--------------|:-----------|
 | **Replicação assíncrona** (padrão) | Nenhuma — a réplica pode atrasar arbitrariamente | Manual; algumas transações podem ser perdidas | Mínima — a origem não espera | Baixa |
-| **Replicação semissíncrona** | Pelo menos uma réplica recebeu o evento antes de a origem fazer o commit | Manual; no máximo uma transação perdida | ~1 RTT adicionado a cada gravação | Baixa–Média |
+| **Replicação semissíncrona** | Pelo menos uma réplica recebeu o evento antes de a origem fazer o commit (até que `rpl_semi_sync_source_timeout`, 10 s por padrão, expire sem nenhuma confirmação) | Manual; no máximo uma transação perdida | ~1 RTT adicionado a cada gravação | Baixa–Média |
 | **Group Replication** | Todos os membros concordam antes do commit (multi-primary ou single-primary) | Automático dentro do grupo | Maior — rodada de consenso por transação | Alta |
 | **InnoDB Cluster** | Igual ao Group Replication (construído sobre ele) | Automático, com o MySQL Router para failover dos clientes | Igual ao Group Replication | Alta |
 
@@ -199,7 +205,7 @@ Na replicação assíncrona (o padrão), a origem faz o commit sem esperar que q
 
 | Problema | Solução |
 |:--------|:---------|
-| `Replica_IO_Running: No` | Verifique `Last_IO_Error` — normalmente uma falha de conexão ou autenticação; confira SOURCE_HOST, usuário, senha e o grant REPLICATION SLAVE |
+| `Replica_IO_Running: Connecting` ou `No` | Verifique `Last_IO_Error` — normalmente uma falha de conexão ou autenticação; confira SOURCE_HOST, usuário, senha, o grant REPLICATION SLAVE e `SOURCE_SSL = 1` para uma conta `caching_sha2_password` |
 | `Replica_SQL_Running: No` | Verifique `Last_SQL_Error` — geralmente um conflito de dados; decida entre pular o evento ou corrigir a causa raiz |
 | Atraso de replicação crescendo | Aumente `replica_parallel_workers` acima do padrão de 4; verifique se há consultas de longa duração na réplica bloqueando o aplicador |
 | `ERROR 1062: Duplicate entry` na réplica | A réplica tem uma linha que a origem não tem — indica gravações manuais na réplica; use `replica_skip_errors` com cautela ou ressincronize |

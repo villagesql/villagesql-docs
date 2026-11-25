@@ -17,7 +17,7 @@ MySQL의 내장 `UUID()` 함수는 `550e8400-e29b-41d4-a716-446655440000` 같은
 
 - 같은 데이터에 16바이트 대신 36바이트
 - 문자열 비교는 바이너리 비교보다 느림
-- 랜덤 UUID는 삽입할 때마다 B-트리 페이지 분할을 일으킴(아래에서 더 설명)
+- 랜덤 UUID는 인덱스 전체에 걸쳐 B-트리 페이지 분할을 일으킴(아래에서 더 설명)
 
 ```sql
 -- This works but has problems at scale
@@ -51,11 +51,11 @@ SELECT BIN_TO_UUID(order_id), user_id FROM orders;
 
 MySQL의 InnoDB는 클러스터형 인덱스를 사용합니다. 즉, 행이 기본 키 순서로 물리적으로 저장됩니다. 랜덤 UUID로 행을 삽입하면, InnoDB는 인덱스 중간에서 그 행이 들어갈 자리를 찾아야 하고 공간을 만들기 위해 페이지를 분할해야 할 수도 있습니다. 지속적인 부하 아래에서 이것은 쓰기 증폭과 인덱스 단편화를 일으킵니다.
 
-UUID v7은 식별자의 상위 비트에 Unix 타임스탬프를 넣어 이것을 해결합니다. 새 UUID는 항상 기존 것보다 크므로, 삽입은 항상 인덱스의 가장 오른쪽 리프에 추가됩니다. 분할이 없습니다.
+UUID v7은 식별자의 상위 비트에 Unix 타임스탬프를 넣어 이것을 해결합니다. 새 UUID는 이전 밀리초에 생성된 모든 UUID보다 크므로, 삽입은 인덱스의 가장 오른쪽 리프에 추가됩니다.
 
 ## VillageSQL과 함께: 네이티브 UUID 유형과 모든 버전 {#with-villagesql-native-uuid-type-and-all-versions}
 
-VillageSQL의 `vsql_uuid` 확장은 16바이트 바이너리 저장과 수동 변환이 필요 없는 네이티브 `UUID` 열 유형을 추가하고, UUID v1부터 v7까지의 생성 함수를 더합니다.
+VillageSQL의 `vsql_uuid` 확장은 16바이트 바이너리 저장과 수동 변환이 필요 없는 네이티브 `UUID` 열 유형을 추가하고, UUID v1, v3, v4, v5, v6, v7의 생성 함수를 더합니다.
 
 ```sql
 INSTALL EXTENSION vsql_uuid;
@@ -69,11 +69,11 @@ CREATE TABLE orders (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- UUID_V7 inserts always append to the index — no page splits
+-- UUID_V7 values sort by creation millisecond, so inserts append to the index
 INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 101);
 INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 102);
 
--- Sorts chronologically by creation order
+-- Sorts by creation millisecond
 SELECT user_id, created_at FROM orders ORDER BY order_id;
 
 -- Inspect the timestamp embedded in a v7 UUID (as datetime or Unix epoch)
@@ -105,7 +105,7 @@ SELECT UUID_V5(UUID_NS_DNS(), 'example.com');
 
 ### 데이터베이스 바깥에서 온 UUID 검증하기 {#validating-uuids-from-outside-the-database}
 
-`UUID_IS_VALID(string)`은 문자열이 `UUID` 열에 받아들여질 때 1을, 아닐 때 0을 반환합니다. 무엇을 넘기든 절대 오류를 내지 않으므로, 값이 유형이 지정된 열에 도달하기 전에 걸러낼 수 있습니다:
+`UUID_IS_VALID(string)`은 문자열이 `UUID` 열에 받아들여질 때 1을, 아닐 때 0을, 인수가 NULL일 때 NULL을 반환합니다. 텍스트 인수에 대해서는 오류를 내지 않으므로, 값이 유형이 지정된 열에 도달하기 전에 걸러낼 수 있습니다:
 
 ```sql
 SELECT UUID_IS_VALID('550e8400-e29b-41d4-a716-446655440000');  -- 1
@@ -138,7 +138,7 @@ CREATE TABLE audit_log (
 | **행 수 노출** | 예 | 아니요 |
 | **저장 공간** | 4–8바이트 | 16바이트 |
 | **삽입 성능** | 빠름(항상 추가) | v7은 빠르고, v4는 느림 |
-| **사람이 읽을 수 있음** | 예 | 아니요(바이너리) |
+| **사람이 읽을 수 있음** | 예 | 네이티브 유형: 예. BINARY(16): 아니요 |
 | **병합에 안전** | 아니요 | 예 |
 
 대부분의 단일 데이터베이스 애플리케이션에서는 `AUTO_INCREMENT`로 충분합니다. 시스템 전체에서 전역적으로 고유한 ID가 필요할 때, 여러 소스의 데이터를 병합할 때, 또는 순차적인 행 수를 노출하고 싶지 않을 때 UUID를 사용하세요.
@@ -146,7 +146,7 @@ CREATE TABLE audit_log (
 ## 자주 묻는 질문 {#frequently-asked-questions}
 
 #### UUID_V7을 DEFAULT로 쓸 수 있나요? {#can-i-use-uuid_v7-as-a-default}
-현재는 안 됩니다. MySQL에서 비결정적 함수는 DEFAULT 식에 사용할 수 없습니다. INSERT 문에서 UUID를 생성하세요.
+아니요. `UUID_V7()`은 `DEFAULT` 식에서 `ERROR 3770`으로 거부됩니다. INSERT 문에서 UUID를 생성하세요.
 
 #### 기존 행을 UUID로 채울 수 있나요? {#can-i-backfill-existing-rows-with-uuids}
 예. `UUID` 열을 추가하고, UPDATE에서 `UUID_V7()`로 채운 다음, 기본 키로 만드세요.
@@ -160,7 +160,7 @@ CREATE TABLE audit_log (
 |:---|:---|
 | `FUNCTION <database>.UUID_V7 does not exist` | `INSTALL EXTENSION vsql_uuid` 실행 |
 | `DEFAULT (UUID_V7())` 거부됨 | `DEFAULT`를 제거하고, 각 INSERT에서 `UUID_V7()` 호출 |
-| `Extension 'vsql_uuid' is already installed` | 이미 설치됨. 조치 필요 없음 |
+| `Extension 'vsql_uuid' is already installed` | 확장이 이미 설치되어 있음. 조치 필요 없음 |
 
 ## 함께 보기 {#see-also}
 

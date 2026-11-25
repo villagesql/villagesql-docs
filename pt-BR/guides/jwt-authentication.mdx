@@ -10,8 +10,9 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 <VillagesqlBanner />
 
 <Note>
-  Este guia usa uma capability Preview. Inicie o servidor com
-  `--vsql_allow_preview_extensions=ON`, ou o `INSTALL EXTENSION` é recusado.
+  Este guia usa uma capability Preview. Execute antes
+  `SET PERSIST vsql_allow_preview_extensions = ON`, ou inicie o servidor com
+  `--vsql_allow_preview_extensions=ON`; caso contrário, o `INSTALL EXTENSION` é recusado.
 </Note>
 
 Senhas de banco de dados são incômodas de gerenciar quando já existe um provedor de identidade. Elas são emitidas separadamente, rotacionadas separadamente, e sobrevivem à pessoa que as recebeu. A extensão `vsql_oauth2` do VillageSQL permite que uma conta faça login com um JSON Web Token em vez disso: o provedor o emite, o servidor verifica a assinatura e a expiração, e uma claim dentro do token nomeia a conta.
@@ -53,12 +54,12 @@ A sessão é executada como a conta que o token nomeia, não como a conta que se
 
 ```sql
 CREATE USER 'oidc_user'@'%' IDENTIFIED WITH vsql_oauth2;
-CREATE USER 'alice@example.com';
+CREATE USER 'alice@example.com' ACCOUNT LOCK;
 GRANT SELECT ON shop.* TO 'alice@example.com';
 GRANT PROXY ON 'alice@example.com' TO 'oidc_user'@'%';
 ```
 
-Ninguém faz login como `alice@example.com` diretamente, então ela não precisa de uma senha própria. Um servidor executando `validate_password` se recusa a criar uma conta sem senha, respondendo `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`. Onde isso se aplica, dê à conta uma senha que ninguém possui, ou um plugin de autenticação que não permite login algum.
+`ACCOUNT LOCK` impede que alguém faça login como `alice@example.com` diretamente, e o login por proxy continua funcionando para uma conta bloqueada. Um servidor executando `validate_password` se recusa a criar uma conta sem senha, bloqueada ou não, respondendo `ERROR 1819 (HY000): Your password does not satisfy the current policy requirements`. Onde isso se aplica, dê à conta uma senha que ninguém possui, ou um plugin de autenticação que não permite login algum.
 
 Sem a concessão de proxy, o login é recusado com `ERROR 6126 (HY000): Access denied for user 'oidc_user'@'localhost', missing proxy privilege.`
 
@@ -149,11 +150,11 @@ FROM mysql.role_edges WHERE TO_USER = 'dana';
   provedor precisa ser confiável para definir.
 </Warning>
 
-Com `auto_grant` desativado, o mesmo token faz login, a role é ignorada em vez de concedida, e `CURRENT_ROLE()` é `NONE`. Cada role ignorada é gravada no log de erros: `VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`. `auto_create` se comporta da mesma forma para contas, criando uma no primeiro login para um subject que o servidor nunca viu. Ambos vêm desativados por padrão, e ambos entregam ao seu provedor autoridade sobre este servidor.
+Com `auto_grant` desativado, uma role que a conta ainda não possui é ignorada em vez de concedida, e `CURRENT_ROLE()` é `NONE` para um token que reivindica apenas roles desse tipo. Cada role ignorada é gravada no log de erros: `VEF auth: role 'shop_reader'@'%' requested for account 'dana'@'%' is not granted; skipping`. `auto_create` se comporta da mesma forma para contas, criando uma no primeiro login para um subject que o servidor nunca viu. Ambos vêm desativados por padrão, e ambos entregam ao seu provedor autoridade sobre este servidor.
 
 ## Um token rejeitado parece uma senha errada {#a-rejected-token-looks-like-a-wrong-password}
 
-Toda falha produz um único erro, e é o erro comum:
+Toda falha de assinatura, expiração, emissor e audiência produz um único erro, e é o erro comum:
 
 ```
 ERROR 1045 (28000): Access denied for user 'analyst'@'localhost' (using password: NO)
@@ -171,14 +172,15 @@ Então depure a partir do token, e não do erro. Decodifique-o e verifique quatr
 Decodificar o payload não precisa de nenhuma ferramenta além de um shell:
 
 ```bash
-echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null
+p=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')
+echo "$p$(printf '%*s' $(( (4 - ${#p} % 4) % 4 )) '' | tr ' ' '=')" | base64 -d
 ```
 
 ## Solução de Problemas {#troubleshooting}
 
 | Sintoma | Correção |
 |---|---|
-| `ERROR 3219 ... requires preview capabilities` na instalação | Inicie o servidor com `--vsql_allow_preview_extensions=ON` |
+| `ERROR 3219 ... requires preview capabilities` na instalação | Execute `SET PERSIST vsql_allow_preview_extensions = ON` e instale novamente |
 | `Access denied` em toda tentativa | Percorra as quatro verificações acima. A mensagem é a mesma para toda causa |
 | O cliente nunca envia o token | Passe `--enable-cleartext-plugin`. Outros clientes têm a sua própria opção para ativar `mysql_clear_password` |
 | Os logins funcionavam, e então pararam todos juntos | O provedor rotacionou as chaves. Verifique se `jwks_url` está acessível e se o `kid` do token aparece no documento que ela retorna |

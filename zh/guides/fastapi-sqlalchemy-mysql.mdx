@@ -16,7 +16,7 @@ import VillagesqlBanner from '/snippets/villagesql-banner.mdx';
 SQLAlchemy 2.0 为两个异步 MySQL 驱动提供方言：`asyncmy` 和 `aiomysql`。文档没有把其中任何一个列为相对另一个的官方推荐。`asyncmy` 是用 Cython 编写的编译型驱动，为当前的 Python 版本提供预构建的 wheel，这就是本指南使用它的原因：
 
 ```bash
-pip install "sqlalchemy[asyncio]" asyncmy cryptography
+pip install "sqlalchemy[asyncio]>=2.0,<2.1" asyncmy cryptography
 ```
 
 安装普通的 `sqlalchemy` 而不是 `sqlalchemy[asyncio]` 是第一个真正的陷阱。SQLAlchemy 的异步 ORM 层用 `greenlet` 库桥接异步和同步代码，而它不是基础包的依赖。跳过 `[asyncio]` 附加项，在您第一次使用异步引擎时就会产生这个错误：
@@ -45,7 +45,7 @@ CREATE USER IF NOT EXISTS 'fastapi_app'@'127.0.0.1' IDENTIFIED BY 'fastapi_pw_12
 GRANT ALL PRIVILEGES ON fastapi_guide.* TO 'fastapi_app'@'127.0.0.1';
 ```
 
-该用户的范围是 `127.0.0.1`，而不是 `localhost`。本指南中的连接字符串通过 TCP 连接到 `127.0.0.1`，所以授权必须与该主机匹配；Unix 套接字连接则匹配 `localhost`，与账户基于 IP 的授权无关。
+该用户的范围是 `127.0.0.1`，与本指南连接字符串中的 TCP 连接相匹配。Unix 套接字连接则匹配 `localhost`，因此该账户无法通过套接字登录。
 
 ## 项目布局 {#project-layout}
 
@@ -69,7 +69,7 @@ fastapi-sqlalchemy-mysql/
 ```
 fastapi
 uvicorn[standard]
-sqlalchemy[asyncio]>=2.0
+sqlalchemy[asyncio]>=2.0,<2.1
 asyncmy
 cryptography
 alembic
@@ -190,7 +190,7 @@ INFO  [alembic.runtime.migration] Running upgrade  -> 4f5ba2a8774a, create posts
 直接在运行中的服务器上确认：
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SHOW TABLES;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "SHOW TABLES;"
 ```
 
 ```
@@ -200,7 +200,7 @@ posts
 ```
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "DESCRIBE posts;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "DESCRIBE posts;"
 ```
 
 ```
@@ -235,7 +235,7 @@ class PostRead(BaseModel):
     created_at: datetime.datetime
 ```
 
-`from_attributes=True` 让 `PostRead` 直接从 `Post` ORM 实例而不是字典构建响应。
+`from_attributes=True` 让 `PostRead.model_validate()` 读取 `Post` ORM 实例而不是字典。
 
 ## FastAPI 路由 {#the-fastapi-routes}
 
@@ -268,7 +268,7 @@ async def create_post(payload: PostCreate, session: AsyncSession = Depends(get_s
     return post
 ```
 
-跨请求共享的全局会话，在并发负载下最终会导致交错的查询以错误的顺序打到同一个连接上。通过 `Depends()` 为每个请求创建的会话避免了这一点，因为每个请求都获得自己的会话和自己从池中取出的连接。
+跨请求共享的全局会话会把每个请求都放进同一个事务，因此一个请求的回滚会静默丢弃另一个请求的写入。通过 `Depends()` 为每个请求创建的会话避免了这一点，因为每个请求都获得自己的会话和自己从池中取出的连接。
 
 ## 运行与验证 {#running-and-verifying}
 
@@ -309,7 +309,7 @@ curl -s -X POST http://127.0.0.1:8010/posts \
 直接查询数据库可以确认写入确实落地，而不只是 API 的响应：
 
 ```bash
-mysql -S /tmp/mysql.sock -u root -D fastapi_guide -e "SELECT * FROM posts;"
+mysql -h 127.0.0.1 -P 3306 -u root -p -D fastapi_guide -e "SELECT * FROM posts;"
 ```
 
 ```
@@ -340,9 +340,8 @@ id  title             body                                       created_at
 | `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` | 某个 ORM 属性在 `await` 调用之外被读取，通常是因为会话在提交时使对象过期了；在会话工厂上设置 `expire_on_commit=False` |
 | `sqlalchemy.orm.exc.DetachedInstanceError` | 在读取属性之前对象的会话已经关闭；保留 `expire_on_commit=False`，或在请求结束前读取每个需要的属性 |
 | `alembic init -t async <path>` 之后 `alembic.ini` 出现在错误的目录中 | 在项目目录内运行 `alembic init`；ini 文件跟随当前工作目录，而不是路径参数 |
-| `alembic revision --autogenerate` 生成空迁移 | `alembic/env.py` 中的 `target_metadata` 仍然是 `None`，或者模型从未被导入，所以它们从未在 `Base.metadata` 上注册 |
-| `Access denied for user 'fastapi_app'@'127.0.0.1'` | 该用户是为另一个主机（如 `localhost`）创建的；本指南的连接字符串通过 TCP 连接到 `127.0.0.1`，所以授权必须与该主机匹配 |
-| FastAPI 响应缺少模型上存在的字段 | `PostRead` 需要 `model_config = ConfigDict(from_attributes=True)` 才能从 ORM 对象而不是字典读取 |
+| `alembic revision --autogenerate` 生成空迁移 | 模型从未在 `alembic/env.py` 中被导入，所以它们从未在 `Base.metadata` 上注册 |
+| `Access denied for user 'fastapi_app'@'localhost'` | 该账户对客户端所在的主机不存在，或者密码错误；本指南创建的是 `'fastapi_app'@'127.0.0.1'`，因此请通过 TCP 连接到 `127.0.0.1`，并使用 `DATABASE_URL` 中的密码 |
 
 ## 另请参阅 {#see-also}
 

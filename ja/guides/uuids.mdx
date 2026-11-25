@@ -17,7 +17,7 @@ MySQL 組み込みの `UUID()` 関数は、`550e8400-e29b-41d4-a716-446655440000
 
 - 同じデータに 16 バイトではなく 36 バイトを使う
 - 文字列の比較はバイナリの比較より遅い
-- ランダムな UUID は挿入のたびに B ツリーのページ分割を引き起こす（詳細は後述）
+- ランダムな UUID はインデックスの至るところで B ツリーのページ分割を引き起こす（詳細は後述）
 
 ```sql
 -- This works but has problems at scale
@@ -51,11 +51,11 @@ SELECT BIN_TO_UUID(order_id), user_id FROM orders;
 
 MySQL の InnoDB はクラスタ化インデックスを使用します。つまり、行は物理的に主キーの順序で格納されます。ランダムな UUID を持つ行を挿入すると、InnoDB はインデックスの途中でその行の位置を探し、場所を空けるためにページを分割しなければならないことがあります。継続的な負荷のもとでは、これが書き込みの増幅とインデックスの断片化を引き起こします。
 
-UUID v7 は、識別子の上位ビットに Unix タイムスタンプを埋め込むことでこれを解決します。新しい UUID は常に既存のものより大きいため、挿入は常にインデックスの右端のリーフに追加されます。分割は起こりません。
+UUID v7 は、識別子の上位ビットに Unix タイムスタンプを埋め込むことでこれを解決します。新しい UUID は、それより前のミリ秒に生成されたすべての UUID より大きいため、挿入はインデックスの右端のリーフに追加されます。
 
 ## VillageSQL の場合: ネイティブの UUID 型とすべてのバージョン {#with-villagesql-native-uuid-type-and-all-versions}
 
-VillageSQL の `vsql_uuid` 拡張機能は、16 バイトのバイナリ格納で手動の変換が不要なネイティブの `UUID` 列型と、UUID v1 から v7 までの生成関数を追加します。
+VillageSQL の `vsql_uuid` 拡張機能は、16 バイトのバイナリ格納で手動の変換が不要なネイティブの `UUID` 列型と、UUID v1、v3、v4、v5、v6、v7 の生成関数を追加します。
 
 ```sql
 INSTALL EXTENSION vsql_uuid;
@@ -69,11 +69,11 @@ CREATE TABLE orders (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- UUID_V7 inserts always append to the index — no page splits
+-- UUID_V7 values sort by creation millisecond, so inserts append to the index
 INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 101);
 INSERT INTO orders (order_id, user_id) VALUES (UUID_V7(), 102);
 
--- Sorts chronologically by creation order
+-- Sorts by creation millisecond
 SELECT user_id, created_at FROM orders ORDER BY order_id;
 
 -- Inspect the timestamp embedded in a v7 UUID (as datetime or Unix epoch)
@@ -105,7 +105,7 @@ SELECT UUID_V5(UUID_NS_DNS(), 'example.com');
 
 ### データベース外部からの UUID の検証 {#validating-uuids-from-outside-the-database}
 
-`UUID_IS_VALID(string)` は、文字列が `UUID` 列に受け入れられる場合は 1 を、受け入れられない場合は 0 を返します。何を渡してもエラーを発生させないため、型付きの列に到達する前に値を選別できます。
+`UUID_IS_VALID(string)` は、文字列が `UUID` 列に受け入れられる場合は 1 を、受け入れられない場合は 0 を、引数が NULL の場合は NULL を返します。テキストの引数に対してエラーを発生させないため、型付きの列に到達する前に値を選別できます。
 
 ```sql
 SELECT UUID_IS_VALID('550e8400-e29b-41d4-a716-446655440000');  -- 1
@@ -138,7 +138,7 @@ CREATE TABLE audit_log (
 | **行数を漏らす** | はい | いいえ |
 | **ストレージ** | 4〜8 バイト | 16 バイト |
 | **挿入パフォーマンス** | 高速（常に末尾に追加） | v7 では高速、v4 では低速 |
-| **人間が読める** | はい | いいえ（バイナリ） |
+| **人間が読める** | はい | ネイティブ型: はい。BINARY(16): いいえ |
 | **マージしても安全** | いいえ | はい |
 
 ほとんどの単一データベースのアプリケーションでは、`AUTO_INCREMENT` で問題ありません。システムをまたいでグローバルに一意な ID が必要な場合、複数のソースからデータをマージする場合、または連続した行数を公開したくない場合に UUID を選んでください。
@@ -146,7 +146,7 @@ CREATE TABLE audit_log (
 ## よくある質問 {#frequently-asked-questions}
 
 #### UUID_V7 を DEFAULT として使用できますか？
-現時点ではできません。MySQL では、非決定論的な関数を DEFAULT 式で使用できません。INSERT ステートメントの中で UUID を生成してください。
+いいえ。`UUID_V7()` は、`DEFAULT` 式では `ERROR 3770` で拒否されます。INSERT ステートメントの中で UUID を生成してください。
 
 #### 既存の行に UUID をバックフィルできますか？
 はい。`UUID` 列を追加し、UPDATE で `UUID_V7()` を使って値を入れ、それを主キーにします。
@@ -160,7 +160,7 @@ CREATE TABLE audit_log (
 |:---|:---|
 | `FUNCTION <database>.UUID_V7 does not exist` | `INSTALL EXTENSION vsql_uuid` を実行します |
 | `DEFAULT (UUID_V7())` が拒否される | `DEFAULT` を削除し、各 INSERT で `UUID_V7()` を呼び出します |
-| `Extension 'vsql_uuid' is already installed` | すでにロードされています。対応は不要です |
+| `Extension 'vsql_uuid' is already installed` | 拡張機能はすでにインストールされています。対応は不要です |
 
 ## 関連項目 {#see-also}
 
