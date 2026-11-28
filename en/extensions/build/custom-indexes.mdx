@@ -14,19 +14,36 @@ custom type and names the functions the index computes with. Both live in
 `<villagesql/preview/index_builder.h>`.
 
 <Warning>
-Supported today: the DDL that creates, alters, and drops a custom index; index
-maintenance on `INSERT`; and one query shape, a nearest-neighbour ordering
-served by the index.
+Supported today: the DDL that creates, alters, and drops a custom index on an
+empty table; index maintenance on `INSERT`; and one query shape, a
+nearest-neighbour ordering served by the index.
 
-Not supported: `DELETE` on a table whose custom index declares `Index::Storage::REF_LOOKUP`, an `UPDATE` that changes an indexed column or the primary key, and every
-access pattern other than nearest-neighbour search. Four of the twelve
-required hooks — `mark_delete`, `purge`, `save`, and `restore` — must exist for
-the builder to compile and the server never calls them.
+Not supported without forcing `ALGORITHM=COPY`: `CREATE INDEX ... USING
+EXTENDED` on a table that already holds rows. Also not supported at all:
+`DELETE` on a table whose custom index declares `Index::Storage::REF_LOOKUP`;
+an `UPDATE` that changes an indexed column or the primary key; and every
+access pattern other than nearest-neighbour search.
+Four of the twelve required hooks — `mark_delete`, `purge`, `save`, and
+`restore` — must exist for the builder to compile and the server never calls
+them.
 
 Statements naming a custom index are refused unless
 `vsql_allow_preview_extensions` is `ON`, the same setting that installing a
 preview extension already requires.
 </Warning>
+
+<Info>
+**Changed in 0.0.9-dev.** The server now calls `mark_delete`, `purge`, `save`,
+and `restore`, and a thirteenth hook, `validate`, is required. An
+`UPDATE` or `DELETE` on any column, including an indexed column or the primary
+key, now succeeds and keeps the index correct — see the DML section below for
+the current index-type signatures this needs. Building a custom index over a
+table that already holds rows, and some forms of `ALTER TABLE` that rebuild a
+table with a custom index through InnoDB's native path, currently crash the
+server instead of refusing cleanly unless the statement forces
+`ALGORITHM=COPY` — this is a regression, not an intended 0.0.9 change; see the
+warnings further down this page before relying on either.
+</Info>
 
 ## The Three Pieces
 
@@ -58,6 +75,11 @@ struct that holds whatever run-time state the extension needs. All twelve hooks
 are required, in three groups, in this order. The builder does not compile if one
 is missing — the failing assertion names the hook.
 
+<Info>
+**Changed in 0.0.9-dev.** A thirteenth hook, `validate`, is required in the
+scan group, after `fetch` — see below.
+</Info>
+
 The lifecycle hooks create the index storage, load it when the table opens, and
 drop it:
 
@@ -85,6 +107,12 @@ bool purge(Ctx *, const Index &, Segment::TrxRef,
            IndexScanKey::KeyPartData *pkeys, char *, uint32_t);
 ```
 
+<Info>
+**Changed in 0.0.9-dev.** The server now calls `mark_delete` and `purge` on an
+`UPDATE` or `DELETE` that touches an indexed row — stubbing them leaves every
+updated or deleted row's old index entry behind. Signatures are unchanged.
+</Info>
+
 The scan hooks answer queries. The server calls `begin`, `position`, `fetch`, and
 `end`, and passes `position` only `Index::CursorOp::Next`. `save` and `restore`
 must exist and are stubs, like the two DML hooks above:
@@ -100,6 +128,32 @@ bool save(Index::Cursor, char *, uint32_t);
 bool restore(Index::Cursor, MtrCtx::Ref, bool *, char *, uint32_t);
 void end(Index::Cursor *);
 ```
+
+<Info>
+**Changed in 0.0.9-dev.** The server now calls `save` and `restore`, to
+preserve and restore the cursor's position across a mini-transaction boundary
+such as a lock wait — stubbing them loses the scan's place. `fetch` gains a
+`key_column_refs` output (filled instead of `keys` when the index declares
+`HAS_COLUMN_REF`) and a `trx_ref` output (the transaction that inserted the
+entry, set only for a locking read), and a new hook, `validate`, is required
+after it:
+
+```cpp
+bool fetch(Index::Cursor, IndexScanKey::KeyPartRef *key_ref,
+           IndexScanKey::KeyPartRef *key_column_refs,
+           IndexScanKey::KeyPartData *keys, IndexScanKey::KeyPartData *pkeys,
+           Segment::TrxRef *trx_ref, char *, uint32_t);
+bool validate(Index::Cursor, Segment::TrxRef trx_ref, bool *valid,
+              char *, uint32_t);
+```
+
+For a locking read (one with no read view), the server calls `validate` after
+it locks the row `fetch` returned, passing back the `trx_ref` `fetch` gave it.
+`validate` sets `*valid` to whether the entry still exists, was created by that
+transaction, and is not marked deleted; the server trusts `*valid` only when
+`validate` returns success. A scan with a read view filters by visibility
+itself and never calls `validate`.
+</Info>
 
 Every hook that can fail takes a message buffer and its length as the last two
 arguments, and returns `true` on failure after writing the message there.
@@ -169,6 +223,19 @@ The server leaves both as null function pointers unless the index declared
 `HAS_COLUMN_REF`, and the SDK calls them unguarded, so calling either without it
 crashes rather than returning an error.
 
+<Info>
+**Changed in 0.0.9-dev.** `get_key_data()` takes two more optional arguments,
+`trx_ref` and `delete_trx_ref`, after `key_data`: `trx_ref` is the transaction
+that wrote the value, and `delete_trx_ref` is the transaction that marked it
+deleted, or 0 if it is not marked deleted. The server fills both only for a
+locking read; a scan with a read view filters by visibility itself and leaves
+them untouched. Existing calls that omit them are unaffected. `Index` also
+gains `is_transaction_active(trx_ref)`, which reports whether a transaction
+reference is still active: `true` is a snapshot that may already be stale by
+the time it returns, `false` is permanent (the transaction has committed or
+rolled back).
+</Info>
+
 ### Index Options
 
 `WITH (M = 8, ef_construction = 64)` in the DDL reaches the extension as index
@@ -197,7 +264,7 @@ for (uint32_t i = 0; i < count; i++) {
 `params` is null when the DDL carried no `WITH` clause, so `count` is the value
 to test first. A `parse` that returns failure aborts the DDL, and the message it
 wrote goes to the server error log — the client sees only
-`ERROR 1030 (HY000): Got error 168 - 'Unknown (generic) error from engine' from storage engine`, so
+`ERROR 3219 (HY000): InnoDB: Custom type operation failed. See server error log for details.`, so
 name the index and the offending key in the message.
 
 `index.options<HNSWOptions>()` returns a pointer to the parsed struct. It is
@@ -413,12 +480,35 @@ is accepted. The index implementation enforces any key-size limit it needs.
 
 ## Reading and Writing Through a Custom Index
 
-Rows go in with `INSERT`, and the index is maintained as they do. Creating the
-index on a table that already holds rows works too, and builds the index over
-them. The build blocks writes to the table rather than running as an online DDL; reads
-continue. A custom index takes the offline build path with `ALGORITHM=INPLACE`, `ALGORITHM=COPY`, or
-no clause, because nothing yet replays concurrent writes into one. `ALGORITHM=INSTANT` and
-`LOCK=NONE` are refused.
+Rows go in with `INSERT`, and the index is maintained as they do.
+`CREATE INDEX ... USING EXTENDED`, and adding one with `ALTER TABLE ... ADD
+INDEX`, only work on a table that has no rows yet — build the index before
+loading data:
+
+```sql
+CREATE TABLE t3 (id INT PRIMARY KEY, a SVECTOR(4) NOT NULL) ENGINE=InnoDB;
+INSERT INTO t3 VALUES (1, '[1.0,0.0,0.0,0.0]'), (2, '[2.0,0.0,0.0,0.0]');
+
+CREATE INDEX idx_t3 ON t3 (a) USING EXTENDED(hnsw);
+```
+```
+ERROR 3219 (HY000): InnoDB: Custom type operation failed. See server error log for details.
+```
+
+The server error log carries the reason: `CREATE INDEX ... USING EXTENDED on a
+non-empty table is not supported yet; create the index before loading data.`
+Adding `ALGORITHM=COPY` to the same statement avoids the restriction, because
+`COPY` copies the table row by row instead of building the index through
+InnoDB's bulk loader, and succeeds in building the index over the existing
+rows.
+
+<Warning>
+On `main` today this statement does not refuse cleanly — it crashes the server
+with an assertion failure instead, from the same bulk-loader code that the
+0.0.8 guard above is meant to keep a custom index out of. `ALGORITHM=COPY`
+still avoids it, since `COPY` never reaches that code. This is a regression,
+not an intended 0.0.9 restriction.
+</Warning>
 
 One query shape is served by a custom index:
 `ORDER BY <distance>(<column>, <reference>) LIMIT K` as the only ordering term,
@@ -446,8 +536,8 @@ EXPLAIN FORMAT=TREE
 ```
 
 ```
--> Limit: 2 row(s)  (cost=0.55 rows=2)
-    -> Custom index distance scan on idx_vec  (cost=0.55 rows=3)
+-> Limit: 2 row(s)
+    -> Index KNN scan on docs using idx_vec (vec <-> '[1.0,2.0,3.0,4.0]'), limit 2
 ```
 
 The server does not filter the index's own hits by the reading transaction's
@@ -462,13 +552,28 @@ An `UPDATE` that changes an indexed column is refused:
 UPDATE docs SET vec = '[0.0,0.0,0.0,0.0]' WHERE id = 1;
 ```
 ```
-ERROR 3219 (HY000): UPDATE that changes an indexed column on a table with a custom index (USING EXTENDED) is not supported yet.
+ERROR 3219 (HY000): InnoDB: Custom type operation failed. See server error log for details.
 ```
 
-An `UPDATE` that changes the primary key draws the same error, as does a
-`REPLACE` that hits an existing row or an `INSERT ... ON DUPLICATE KEY UPDATE` that assigns an indexed
-column or the primary key. An `UPDATE` or an `INSERT ... ON DUPLICATE KEY UPDATE` that assigns only
-unindexed columns succeeds.
+The server error log carries the specific reason: `UPDATE that changes an
+indexed column on a table with a custom index (USING EXTENDED) is not
+supported yet.` An `UPDATE` that changes the primary key draws the same
+error, because the primary key orders the table's own clustered index. An
+`UPDATE` that assigns only unindexed columns succeeds.
+
+<Info>
+**Changed in 0.0.9-dev.** This refusal is gone. An `UPDATE` or `DELETE` now
+succeeds on any column, including an indexed column or the primary key, and on
+every custom index, including one declaring `REF_LOOKUP`; `REPLACE` and
+`INSERT ... ON DUPLICATE KEY UPDATE` work the same way. The index is kept
+correct, not left pointing at stale data — `mark_delete` and `purge` run as
+part of the same statement. `UPDATE` and `DELETE` can themselves use the
+`ORDER BY <distance>(...) LIMIT K` shape above as their own access path, the
+same as `SELECT`, choosing the same access path under `REPEATABLE READ` and
+`READ COMMITTED` alike. Only `SERIALIZABLE` disables a custom index entirely,
+for every statement, because it cannot provide the range locks
+`SERIALIZABLE` needs.
+</Info>
 
 An `ALTER TABLE` that changes the primary key of a table with a custom index is
 refused regardless of `ALGORITHM`:
@@ -480,10 +585,33 @@ ALTER TABLE docs MODIFY id BIGINT NOT NULL;
 ERROR 3219 (HY000): VillageSQL: Changing the primary key of a table with a USING EXTENDED index is not supported
 ```
 
+<Info>
+**Changed in 0.0.9-dev.** This refusal is gone too, and nothing currently
+replaces it with a correctness check — the result depends on which DDL
+algorithm InnoDB picks for the specific change, not on anything the statement
+says. `ALTER TABLE docs MODIFY id BIGINT NOT NULL`, the statement above, now
+succeeds silently: InnoDB can only do that particular change by copying the
+table row by row (the same path `ALGORITHM=COPY` forces), which keeps the
+index correct as a side effect of using `insert()` for every row. A change
+that InnoDB performs through its native rebuilder instead — `ALTER TABLE ...
+DROP PRIMARY KEY, ADD PRIMARY KEY (...)` is one — crashes the server, the same
+regression described above for building the index over existing rows. Force
+`ALGORITHM=COPY` on any `ALTER TABLE` that touches the primary key of a table
+with a custom index until this is resolved.
+</Info>
+
 Adding a column, or modifying a column other than the primary key, leaves the
 table's existing custom index in place. Forcing a table rebuild with
 `ALGORITHM=COPY` or `ALGORITHM=INPLACE` also leaves the index in place, and a
 rebuilt index survives a restart.
+
+<Warning>
+On `main` today, forcing a rebuild of a table that already has rows and a
+custom index — `ALGORITHM=INPLACE, FORCE` with no other change included —
+crashes the server with the same assertion failure as building a custom index
+over existing rows, above. `ALGORITHM=COPY` still rebuilds the table and the
+index correctly. This is the same regression, not a second one.
+</Warning>
 
 ## What the Server Reports
 
