@@ -297,7 +297,19 @@ ALTER TABLE t2 ADD INDEX idx_d (b vsql_vector.hnsw_inner_product)
 
 ## 通过自定义索引读取和写入 {#reading-and-writing-through-a-custom-index}
 
-行通过 `INSERT` 写入，索引也随之得到维护。在已经包含行的表上创建索引同样可行，并且会基于这些行构建索引。该构建会阻塞对表的写入，而不是作为在线 DDL 运行；读取则继续进行。使用 `ALGORITHM=INPLACE`、`ALGORITHM=COPY` 或不带子句时，自定义索引都走离线构建路径，因为目前还没有任何机制能把并发写入重放到自定义索引中。`ALGORITHM=INSTANT` 和 `LOCK=NONE` 会被拒绝。
+行通过 `INSERT` 写入，索引也随之得到维护。`CREATE INDEX ... USING EXTENDED`，以及用 `ALTER TABLE ... ADD INDEX` 添加索引，只在表还没有任何行时才有效 —— 请先创建索引，再加载数据：
+
+```sql
+CREATE TABLE t3 (id INT PRIMARY KEY, a SVECTOR(4) NOT NULL) ENGINE=InnoDB;
+INSERT INTO t3 VALUES (1, '[1.0,0.0,0.0,0.0]'), (2, '[2.0,0.0,0.0,0.0]');
+
+CREATE INDEX idx_t3 ON t3 (a) USING EXTENDED(hnsw);
+```
+```
+ERROR HY000: InnoDB: Custom type operation failed. See server error log for details.
+```
+
+服务器错误日志会记录原因：`CREATE INDEX ... USING EXTENDED on a non-empty table is not supported yet; create the index before loading data.`。在同一条语句上加上 `ALGORITHM=COPY` 可以绕开这一限制，因为 `COPY` 是逐行复制表，而不是通过 InnoDB 的批量加载器构建索引，因此能在已有行上成功构建索引。`ALGORITHM=INSTANT` 和 `LOCK=NONE` 会被拒绝。
 
 自定义索引只为一种查询形态提供服务：以 `ORDER BY <distance>(<column>, <reference>) LIMIT K` 作为唯一的排序项、升序，且 `<reference>` 为常量或已绑定值的预处理语句参数。`NULL` 或空的 `<reference>` 永远不会获得距离扫描。索引必须是单列索引，其类型必须声明 `Index::Support::KNN` 和 `Index::Storage::HAS_ROW_REF`，并且其绑定的配置文件必须提供该距离函数。列和参考值可以按任一顺序给出。不满足其中任何一个条件的查询会以表扫描加排序的方式运行，且没有警告。`EXPLAIN` 会指明访问方式：
 
